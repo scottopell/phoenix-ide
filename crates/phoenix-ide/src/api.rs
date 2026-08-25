@@ -19,6 +19,7 @@ mod lifecycle_handlers;
 mod local_reveal;
 pub(crate) mod pr_monitoring;
 mod process_sample;
+mod product_conversations;
 mod release_updates;
 mod resource_monitor;
 mod spa_routes;

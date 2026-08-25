@@ -3,6 +3,7 @@
 pub use phoenix_core::domain::pr_feedback_status::PrFeedbackStatus;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use ts_rs::TS;
 
 /// Request to create a new conversation with initial message
 #[derive(Debug, Deserialize)]
@@ -188,6 +189,134 @@ pub struct ConversationSearchHit {
 #[derive(Debug, Serialize)]
 pub struct ConversationSearchResponse {
     pub hits: Vec<ConversationSearchHit>,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProductConversationListResponse {
+    pub product_conversations: Vec<ProductConversationListRow>,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProductConversationListRow {
+    pub product_conversation_id: String,
+    pub canonical_route: String,
+    pub canonical_root: ProductConversationTranscriptRowView,
+    pub ordinary_lifecycle: OrdinaryProductConversationLifecycleView,
+    pub root_transcript_row_id: String,
+    pub latest_transcript_row_id: String,
+    pub updated_at: String,
+    pub presentation: ProductConversationPresentationView,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProductConversationSnapshotView {
+    pub product_conversation_id: String,
+    pub canonical_route: String,
+    pub requested_transcript_row_id: String,
+    pub canonical_root: ProductConversationTranscriptRowView,
+    pub ordinary_lifecycle: OrdinaryProductConversationLifecycleView,
+    pub root_transcript_row_id: String,
+    pub latest_transcript_row_id: String,
+    pub writable_transcript_row_id: Option<String>,
+    pub updated_at: String,
+    pub presentation: ProductConversationPresentationView,
+    pub work_identity: Option<ProductConversationWorkIdentityView>,
+    pub source: Option<ProductConversationSourceView>,
+    pub chain_qa_compatibility: ProductConversationChainQaCompatibilityView,
+    pub segments: Vec<ProductConversationSegmentView>,
+    pub before: Option<String>,
+    pub has_older: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum OrdinaryProductConversationLifecycleView {
+    Open,
+    History,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProductConversationTranscriptRowView {
+    pub transcript_row_id: String,
+    pub slug: Option<String>,
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProductConversationPresentationView {
+    pub display_name: String,
+    pub presentation_mode: String,
+    pub requires_action: bool,
+    pub archived: bool,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProductConversationWorkIdentityView {
+    pub work_transcript_row_id: String,
+    pub worktree_path: String,
+    pub branch_name: String,
+    pub base_branch: String,
+    pub task_id: Option<String>,
+    pub task_title: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProductConversationSegmentView {
+    pub segment_ordinal: i64,
+    pub transcript_row_id: String,
+    pub slug: Option<String>,
+    pub title: Option<String>,
+    pub messages: Vec<crate::api::wire::EnrichedMessage>,
+    pub handoff: Option<ProductConversationHandoffView>,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProductConversationHandoffView {
+    pub predecessor_transcript_row_id: String,
+    pub successor_transcript_row_id: String,
+    pub continuation_message_id: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(tag = "status", rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ProductConversationSourceView {
+    Present {
+        source_product_conversation_id: String,
+        source_conversation_id: String,
+        relation: ProductConversationSourceRelationView,
+        relation_key: String,
+    },
+    Deleted {
+        source_product_conversation_id: String,
+        source_conversation_id: String,
+        relation: ProductConversationSourceRelationView,
+        relation_key: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ProductConversationSourceRelationView {
+    ApprovedTask,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProductConversationChainQaCompatibilityView {
+    pub root_transcript_row_id: String,
+    pub url: String,
 }
 
 /// Response with a single conversation

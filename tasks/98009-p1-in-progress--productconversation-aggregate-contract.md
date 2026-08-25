@@ -1,0 +1,1 @@
+Expose a typed, read-only ProductConversation aggregate contract keyed by root identity. It resolves root/member transcript IDs or slugs to one ordinary aggregate, supplies ordered transcript segments with exact persisted continuation handoffs and typed derived-task provenance, and leaves lifecycle/Close/UI/legacy Chain behavior unchanged.
