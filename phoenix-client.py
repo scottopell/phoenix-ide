@@ -340,8 +340,20 @@ class PhoenixClient:
         return resp.json()
 
     def get_deployment(self) -> dict:
-        """Deployment info: build, network, TLS, resources, disk layout."""
+        """Deployment info: build, network, TLS, log, ownership, locality."""
         resp = self.http.get(f"{self.base_url}/api/deployment")
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_about_resources(self) -> dict:
+        """Live resource usage sample (CPU, memory, handles)."""
+        resp = self.http.get(f"{self.base_url}/api/about/resources")
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_deployment_disk(self) -> dict:
+        """On-disk locations with sizes (database, logs, TLS, worktrees)."""
+        resp = self.http.get(f"{self.base_url}/api/deployment/disk")
         resp.raise_for_status()
         return resp.json()
 
@@ -918,12 +930,18 @@ def print_tasks(tasks: list[dict]) -> None:
 
 
 def parse_kv_pairs(pairs: tuple[str, ...]) -> dict[str, str]:
-    """Parse repeated --flag KEY=VALUE options into a dict."""
+    """Parse repeated --flag KEY=VALUE options into a dict.
+
+    Splits on the LAST '=' so the key (question text) can contain '=' — e.g.
+    --respond 'Is 2+2=4?=yes' → key='Is 2+2=4?', value='yes'. A value
+    containing '=' cannot be expressed this way; for that, use a structured
+    input (not yet supported).
+    """
     out: dict[str, str] = {}
     for pair in pairs:
         if '=' not in pair:
             raise click.UsageError(f"Expected KEY=VALUE, got: {pair!r}")
-        key, _, value = pair.partition('=')
+        key, _, value = pair.rpartition('=')
         key = key.strip()
         if not key:
             raise click.UsageError(f"Empty key in: {pair!r}")
@@ -1055,19 +1073,27 @@ def main(message, conversation, directory, images, model, list_models, list_proj
 
     client = PhoenixClient(resolved_url, password=password)
 
-    # Platform & config (REQ-CLI-012) run before authentication: these are
-    # diagnostics (version/deployment/env/mcp-status/usage-overview) plus the
-    # conversation-scoped trajectory-export. /api/version is auth-exempt; the
-    # others will get a clean 401 from the server if auth is on and no
-    # password is supplied, rather than prompting and failing non-interactive
-    # automation. Process every selected flag so `--version --deployment --env`
-    # prints all three, not just the first.
+    # /api/version is auth-exempt (api/auth.rs::is_exempt_path), so --version
+    # can run before the auth gate — useful for credential-less connection/
+    # build discovery. The other platform/config projections (deployment, env,
+    # mcp-status, usage-overview, trajectory-export) are NOT auth-exempt and
+    # must run after ensure_authenticated() so they can prompt for a password.
     if show_version:
         click.echo("=== VERSION ===")
         _print_json(client.get_version())
+        return
+
+    client.ensure_authenticated()
+
+    # Platform & config (REQ-CLI-012) — protected projections. Process every
+    # selected flag so `--deployment --env` prints both, not just the first.
     if deployment:
         click.echo("=== DEPLOYMENT ===")
         _print_json(client.get_deployment())
+        click.echo("=== DEPLOYMENT RESOURCES ===")
+        _print_json(client.get_about_resources())
+        click.echo("=== DEPLOYMENT DISK ===")
+        _print_json(client.get_deployment_disk())
     if show_env:
         click.echo("=== ENV ===")
         _print_json(client.get_env())
@@ -1081,10 +1107,8 @@ def main(message, conversation, directory, images, model, list_models, list_proj
         conv = client.get_conversation(conversation)
         click.echo("=== TRAJECTORY EXPORT ===")
         _print_json(client.trajectory_export(conv['id']))
-    if show_version or deployment or show_env or mcp_status or usage_overview or trajectory_export:
+    if deployment or show_env or mcp_status or usage_overview or trajectory_export:
         return
-
-    client.ensure_authenticated()
 
     if list_models:
         data = client.get_models()
@@ -1150,6 +1174,27 @@ def main(message, conversation, directory, images, model, list_models, list_proj
 
     # Interaction + Introspection (REQ-CLI-009 / 010) -- require -c
     # (validation already done above, before auth.)
+    # Reject mutually-exclusive conversation-scoped flags: each is a distinct
+    # action/projection, and combining them silently runs only the first.
+    conv_scoped = [
+        ('--respond', respond),
+        ('--dismiss-question', dismiss_question),
+        ('--dismiss-error', dismiss_error),
+        ('--cancel-steer', cancel_steer),
+        ('--continue', continue_conv),
+        ('--diff', diff),
+        ('--git-status', git_status),
+        ('--usage', usage),
+        ('--system-prompt', system_prompt),
+        ('--tasks', tasks),
+        ('--proposals', proposals),
+    ]
+    selected = [name for name, flag in conv_scoped if flag]
+    if len(selected) > 1:
+        raise click.UsageError(
+            f"Conflicting conversation-scoped flags: {', '.join(selected)}. "
+            f"Pass at most one."
+        )
     if respond or dismiss_question or dismiss_error or cancel_steer:
         conv = client.get_conversation(conversation)
         if respond:

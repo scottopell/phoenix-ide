@@ -195,4 +195,4 @@ THE SYSTEM SHALL fetch and print the corresponding read-only server state and ex
 - `--usage-overview`: aggregate token usage across all conversations
 - `--trajectory-export` (requires `--conversation`): full trajectory export
 
-**Rationale:** Diagnostics for an agent debugging a connection, checking MCP server health, or inspecting aggregate usage. These are plain `GET`s with no request body, cheap to add, and let the agent observe the running system without the web UI.
+**Rationale:** An agent debugging a connection, checking MCP server health, or inspecting aggregate usage needs read-only visibility into the running system without the web UI. These diagnostics let the agent observe build identity, deployment posture, environment, MCP health, and token usage.
