@@ -363,6 +363,11 @@ impl SendChatApplicationService {
     }
 }
 
+pub(crate) fn accepts_user_message_direct_or_steering(state: &ConvState) -> bool {
+    let acceptability = check_user_message_acceptable(state);
+    acceptability.is_ok() || should_enqueue_steering(&acceptability)
+}
+
 fn should_enqueue_steering(acceptability: &Result<(), TransitionError>) -> bool {
     matches!(
         acceptability,

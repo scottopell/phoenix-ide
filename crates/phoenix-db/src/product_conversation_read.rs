@@ -52,6 +52,16 @@ pub struct ProductConversationTranscriptRow {
     /// Durable append watermark for this transcript segment.
     pub tail_sequence_id: i64,
     pub tail_message_id: Option<String>,
+    pub work_identity: Option<ProductConversationWorkIdentity>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProductConversationWorkIdentity {
+    pub worktree_path: String,
+    pub branch_name: String,
+    pub base_branch: String,
+    pub task_id: Option<String>,
+    pub task_title: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +98,38 @@ impl ProductConversationSourceKind {
             "approved_task" => Some(Self::ApprovedTask),
             _ => None,
         }
+    }
+}
+
+fn work_identity_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<Option<ProductConversationWorkIdentity>, sqlx::Error> {
+    let attached_work_scope_id: Option<String> = row.try_get("work_scope_id")?;
+    let environment_kind: Option<String> = row.try_get("environment_kind")?;
+    let worktree_path: Option<String> = row.try_get("worktree_path")?;
+    let branch_name: Option<String> = row.try_get("branch_name")?;
+    let base_branch: Option<String> = row.try_get("base_branch")?;
+    match (
+        attached_work_scope_id,
+        environment_kind.as_deref(),
+        worktree_path,
+        branch_name,
+        base_branch,
+    ) {
+        (
+            Some(_),
+            Some("allocated_worktree"),
+            Some(worktree_path),
+            Some(branch_name),
+            Some(base_branch),
+        ) => Ok(Some(ProductConversationWorkIdentity {
+            worktree_path,
+            branch_name,
+            base_branch,
+            task_id: row.try_get("cm_task_id")?,
+            task_title: row.try_get("cm_task_title")?,
+        })),
+        _ => Ok(None),
     }
 }
 
@@ -190,11 +232,11 @@ impl Database {
                     .try_get::<String, _>("product_conversation_id")?
                     .parse::<ProductConversationId>()
                     .map_err(|error| DbError::Serialization(error.to_string()))?;
-                let lifecycle = row.try_get::<String, _>("ordinary_lifecycle")?;
-                let lifecycle = OrdinaryProductConversationLifecycle::from_db_str(&lifecycle)
-                    .ok_or_else(|| {
-                        DbError::Serialization(format!("unknown ordinary lifecycle: {lifecycle}"))
-                    })?;
+                let lifecycle = if row.try_get("latest_archived")? {
+                    OrdinaryProductConversationLifecycle::History
+                } else {
+                    OrdinaryProductConversationLifecycle::Open
+                };
                 let latest_state = serde_json::from_str(&row.try_get::<String, _>("latest_state")?)
                     .map_err(|error| DbError::Serialization(error.to_string()))?;
                 Ok(ProductConversationListProjection {
@@ -280,8 +322,14 @@ impl Database {
                      FROM messages message
                      WHERE message.conversation_id = transcript.id
                      ORDER BY message.sequence_id DESC, message.message_id DESC
-                     LIMIT 1) AS tail_message_id
+                     LIMIT 1) AS tail_message_id,
+                    conversation.work_scope_id, environment.environment_kind,
+                    environment.worktree_path, environment.branch_name, environment.base_branch,
+                    conversation.cm_task_id, conversation.cm_task_title
              FROM transcript
+             JOIN conversations conversation ON conversation.id = transcript.id
+             LEFT JOIN work_scope_environments environment
+               ON environment.work_scope_id = conversation.work_scope_id
              ORDER BY ordinal",
         )
         .bind(product_conversation_id.as_str())
@@ -296,6 +344,7 @@ impl Database {
                 segment_ordinal: ordinal,
                 tail_sequence_id: row.try_get("tail_sequence_id")?,
                 tail_message_id: row.try_get("tail_message_id")?,
+                work_identity: work_identity_from_row(&row)?,
             });
         }
         let Some(root) = transcript_rows.first().cloned() else {
@@ -454,8 +503,15 @@ impl Database {
                     COALESCE((SELECT MAX(message.sequence_id) FROM messages message WHERE message.conversation_id = transcript.id), 0) AS tail_sequence_id,
                     (SELECT message.message_id FROM messages message
                      WHERE message.conversation_id = transcript.id
-                     ORDER BY message.sequence_id DESC, message.message_id DESC LIMIT 1) AS tail_message_id
-             FROM transcript ORDER BY ordinal",
+                     ORDER BY message.sequence_id DESC, message.message_id DESC LIMIT 1) AS tail_message_id,
+                    conversation.work_scope_id, environment.environment_kind,
+                    environment.worktree_path, environment.branch_name, environment.base_branch,
+                    conversation.cm_task_id, conversation.cm_task_title
+             FROM transcript
+             JOIN conversations conversation ON conversation.id = transcript.id
+             LEFT JOIN work_scope_environments environment
+               ON environment.work_scope_id = conversation.work_scope_id
+             ORDER BY ordinal",
         ).bind(product_conversation_id.as_str()).fetch_all(&mut *connection).await?;
         let mut transcript_rows = Vec::with_capacity(rows.len());
         for row in rows {
@@ -465,6 +521,7 @@ impl Database {
                 segment_ordinal: row.try_get("ordinal")?,
                 tail_sequence_id: row.try_get("tail_sequence_id")?,
                 tail_message_id: row.try_get("tail_message_id")?,
+                work_identity: work_identity_from_row(&row)?,
             });
         }
         let Some(root) = transcript_rows.first().cloned() else {

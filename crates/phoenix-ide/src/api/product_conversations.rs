@@ -20,6 +20,7 @@ use crate::db::{
     DbError, ProductConversationAggregate, ProductConversationListProjection,
     ProductConversationSegment, ProductConversationSource, ProductConversationSourceKind,
 };
+use crate::send_chat_service::accepts_user_message_direct_or_steering;
 
 const DEFAULT_MESSAGE_LIMIT: usize = 50;
 const MAX_MESSAGE_LIMIT: usize = 200;
@@ -144,10 +145,15 @@ async fn snapshot_view(
     message_limit: usize,
     page: Vec<(i64, crate::db::Message)>,
 ) -> Result<ProductConversationSnapshotView, AppError> {
-    let lifecycle = aggregate
-        .product_conversation
-        .ordinary_lifecycle()
-        .ok_or_else(|| AppError::Internal("ordinary aggregate lost lifecycle".to_string()))?;
+    let lifecycle = lifecycle_from_archived(
+        aggregate
+            .segments
+            .last()
+            .expect("aggregate has segment")
+            .transcript_row
+            .conversation
+            .archived,
+    );
     let generation = aggregate_generation(&aggregate);
     let tail_watermarks = aggregate_tail_watermarks(&aggregate);
     let (messages, has_older, page_messages, boundary_message_ids) =
@@ -364,23 +370,28 @@ fn presentation(
 fn work_identity(
     aggregate: &ProductConversationAggregate,
 ) -> Option<ProductConversationWorkIdentityView> {
-    let row = aggregate.segments.iter().rev().find(|segment| {
-        segment
-            .transcript_row
-            .conversation
-            .conv_mode
-            .branch_name()
-            .is_some()
-    })?;
-    let mode = &row.transcript_row.conversation.conv_mode;
+    let row = aggregate
+        .segments
+        .iter()
+        .rev()
+        .find(|segment| segment.transcript_row.work_identity.is_some())?;
+    let identity = row.transcript_row.work_identity.as_ref()?;
     Some(ProductConversationWorkIdentityView {
         work_transcript_row_id: row.transcript_row.conversation.id.clone(),
-        worktree_path: mode.worktree_path()?.to_string(),
-        branch_name: mode.branch_name()?.to_string(),
-        base_branch: mode.base_branch()?.to_string(),
-        task_id: mode.task_id().map(str::to_string),
-        task_title: mode.task_title().map(str::to_string),
+        worktree_path: identity.worktree_path.clone(),
+        branch_name: identity.branch_name.clone(),
+        base_branch: identity.base_branch.clone(),
+        task_id: identity.task_id.clone(),
+        task_title: identity.task_title.clone(),
     })
+}
+
+fn lifecycle_from_archived(archived: bool) -> OrdinaryProductConversationLifecycle {
+    if archived {
+        OrdinaryProductConversationLifecycle::History
+    } else {
+        OrdinaryProductConversationLifecycle::Open
+    }
 }
 
 fn source_view(source: &ProductConversationSource) -> ProductConversationSourceView {
@@ -450,9 +461,7 @@ async fn writable_transcript_row_id(
         .effective_conversation_state(&latest.id)
         .await
         .unwrap_or(latest.state);
-    crate::state_machine::check_user_message_acceptable(&effective_state)
-        .is_ok()
-        .then_some(latest.id)
+    accepts_user_message_direct_or_steering(&effective_state).then_some(latest.id)
 }
 
 fn validate_cursor(
@@ -747,6 +756,151 @@ mod tests {
                 .unwrap();
         assert!(snapshot["chain_qa_compatibility"].is_null());
         assert!(snapshot["writable_transcript_row_id"].is_null());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_uses_shipped_archived_authority_not_dormant_product_lifecycle() {
+        let state = make_test_state().await;
+        let conversation = state
+            .db
+            .create_conversation("archived", "archived", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?")
+            .bind(conversation.product_conversation_id.as_str())
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+
+        let response = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/product-conversations/{}", conversation.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let open: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(open["ordinary_lifecycle"], "open");
+
+        state
+            .db
+            .archive_conversation(&conversation.id)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE product_conversations SET ordinary_lifecycle = 'open' WHERE id = ?")
+            .bind(conversation.product_conversation_id.as_str())
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/product-conversations/{}", conversation.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let archived: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(archived["ordinary_lifecycle"], "history");
+    }
+
+    #[tokio::test]
+    async fn work_identity_uses_attached_environment_and_preserves_typed_task_summary() {
+        let state = make_test_state().await;
+        let conversation = state
+            .db
+            .create_conversation("work", "work", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let scope_id = conversation.attached_work_scope_id.as_ref().unwrap();
+        sqlx::query(
+            "UPDATE work_scopes
+             SET environment_kind = 'allocated_worktree', cwd = '/tmp/worktree',
+                 worktree_path = '/tmp/worktree', branch_name = 'feature/work', base_branch = 'main'
+             WHERE id = ?",
+        )
+        .bind(scope_id.as_str())
+        .execute(state.db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE conversations
+             SET cm_kind = 'direct', cm_task_id = '17002', cm_task_title = 'Persist product conversation'
+             WHERE id = ?",
+        )
+        .bind(&conversation.id)
+        .execute(state.db.pool())
+        .await
+        .unwrap();
+
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/product-conversations/{}", conversation.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(snapshot["work_identity"]["worktree_path"], "/tmp/worktree");
+        assert_eq!(snapshot["work_identity"]["branch_name"], "feature/work");
+        assert_eq!(snapshot["work_identity"]["base_branch"], "main");
+        assert_eq!(snapshot["work_identity"]["task_id"], "17002");
+        assert_eq!(
+            snapshot["work_identity"]["task_title"],
+            "Persist product conversation"
+        );
+    }
+
+    #[tokio::test]
+    async fn writable_target_accepts_latest_segment_busy_or_cancelling_steering_states() {
+        let state = make_test_state().await;
+        for (slug, state_value) in [
+            ("busy", ConvState::LlmRequesting { attempt: 1 }),
+            (
+                "cancelling",
+                ConvState::CancellingSubAgents {
+                    pending: vec![],
+                    completed_results: vec![],
+                    cause: phoenix_core::domain::sm_event::CancelCause::UserRequested,
+                    spawn_tool_id: None,
+                },
+            ),
+        ] {
+            let conversation = state
+                .db
+                .create_conversation(slug, slug, "/tmp", true, None, None)
+                .await
+                .unwrap();
+            state
+                .db
+                .update_conversation_state(&conversation.id, &state_value)
+                .await
+                .unwrap();
+            let response = create_router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/product-conversations/{}", conversation.id))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let snapshot: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(snapshot["writable_transcript_row_id"], conversation.id);
+        }
     }
 
     #[allow(clippy::too_many_lines)]
