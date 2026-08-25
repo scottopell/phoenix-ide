@@ -40,6 +40,7 @@ export const OPEN_MESSAGE_VIEWER_EVENT = 'phoenix:open-message-viewer';
 export interface OpenMessageViewerEventDetail {
   sequenceId: number;
   messageId?: string;
+  occurrenceToken?: string;
   presentation: ViewerPresentation;
 }
 
@@ -192,6 +193,9 @@ export function MessageContextMenu({
       detail: {
         sequenceId: menu.message.sequence_id,
         messageId: menu.message.message_id,
+        ...((menu.message.display_data as { productOccurrenceToken?: string } | null | undefined)?.productOccurrenceToken
+          ? { occurrenceToken: (menu.message.display_data as { productOccurrenceToken: string }).productOccurrenceToken }
+          : {}),
         presentation,
       },
     }));

@@ -194,6 +194,7 @@ export interface EmbeddedConversationProjection {
 interface EmbeddedConversationHostProps {
   suppressCanonicalization?: boolean;
   ordinaryComposerEnabled?: boolean;
+  suppressMessageViewerOwner?: boolean;
   onProjectionChange?: (projection: EmbeddedConversationProjection | null) => void;
 }
 
@@ -217,6 +218,7 @@ export function EmbeddedConversationPage({
   suppressCanonicalization = false,
   ordinaryComposerEnabled = true,
   onProjectionChange,
+  suppressMessageViewerOwner = false,
 }: EmbeddedConversationPageProps) {
   const navigate = useNavigate();
   const location = useLocation();
@@ -248,6 +250,7 @@ export function EmbeddedConversationPage({
         showTranscript={showTranscript}
         ordinaryComposerEnabled={ordinaryComposerEnabled}
         suppressCanonicalization={suppressCanonicalization}
+        suppressMessageViewerOwner={suppressMessageViewerOwner}
         {...(onProjectionChange ? { onProjectionChange } : {})}
       />
     </ReviewNotesProvider>
@@ -278,6 +281,7 @@ function ConversationPageContent({
   ordinaryComposerEnabled,
   suppressCanonicalization,
   onProjectionChange,
+  suppressMessageViewerOwner,
 }: {
   slug: string;
   routePrefix: '/c' | '/global';
@@ -286,6 +290,7 @@ function ConversationPageContent({
   ordinaryComposerEnabled: boolean;
   suppressCanonicalization: boolean;
   onProjectionChange?: (projection: EmbeddedConversationProjection | null) => void;
+  suppressMessageViewerOwner: boolean;
 }) {
   const { setConversationReadiness } = useConversationReadiness();
   const navigate = useNavigate();
@@ -1652,15 +1657,16 @@ function ConversationPageContent({
   }, [appendDraftCb, requestComposerFocus]);
 
   useEffect(() => {
+    if (suppressMessageViewerOwner) return undefined;
     const handler = (e: Event) => {
-      const { sequenceId, messageId, presentation } = (e as CustomEvent<OpenMessageViewerEventDetail>).detail ?? {};
+      const { sequenceId, messageId, occurrenceToken, presentation } = (e as CustomEvent<OpenMessageViewerEventDetail>).detail ?? {};
       if (!Number.isSafeInteger(sequenceId) || sequenceId <= 0) return;
       if (presentation !== 'pane' && presentation !== 'fullscreen') return;
-      handleOpenMessageViewer(sequenceId, presentation, messageId);
+      handleOpenMessageViewer(sequenceId, presentation, messageId, occurrenceToken);
     };
     window.addEventListener(OPEN_MESSAGE_VIEWER_EVENT, handler);
     return () => window.removeEventListener(OPEN_MESSAGE_VIEWER_EVENT, handler);
-  }, [handleOpenMessageViewer]);
+  }, [handleOpenMessageViewer, suppressMessageViewerOwner]);
 
   const handleSendNotes = useCallback(
     (formattedNotes: string) => {

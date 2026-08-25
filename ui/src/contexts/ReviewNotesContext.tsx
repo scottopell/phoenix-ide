@@ -35,7 +35,7 @@ export type DiffSection = 'committed' | 'uncommitted';
  */
 export type NoteAnchor =
   | { kind: 'file'; filePath: string; lineNumber: number }
-  | { kind: 'message'; sequenceId: number; messageId?: string | undefined; lineNumber: number }
+  | { kind: 'message'; sequenceId: number; messageId?: string | undefined; occurrenceToken?: string | undefined; lineNumber: number }
   | {
       kind: 'diff';
       section: DiffSection;
@@ -236,13 +236,15 @@ export function useFileReviewNotesData(absolutePath: string): ReviewNote[] {
 
 /** Subscribe to the notes for a single chat message. */
 // eslint-disable-next-line react-refresh/only-export-components
-export function useMessageReviewNotesData(sequenceId: number): ReviewNote[] {
+export function useMessageReviewNotesData(sequenceId: number, occurrenceToken?: string): ReviewNote[] {
   const store = useReviewNotesStore();
   const cacheRef = useRef<ReviewNote[]>([]);
   const getSnapshot = () => {
     const next = store
       .getNotes()
-      .filter((n) => n.anchor.kind === 'message' && n.anchor.sequenceId === sequenceId);
+      .filter((n) => n.anchor.kind === 'message'
+        && n.anchor.sequenceId === sequenceId
+        && (occurrenceToken === undefined || n.anchor.occurrenceToken === occurrenceToken));
     return sameNotes(cacheRef.current, next) ? cacheRef.current : (cacheRef.current = next);
   };
   return useSyncExternalStore(store.subscribe, getSnapshot, getSnapshot);

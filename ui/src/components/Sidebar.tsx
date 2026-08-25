@@ -14,6 +14,7 @@ import { ConversationContext } from '../conversation/ConversationContext';
 import { getProductConversationListRevision, subscribeProductConversationListRevision } from '../notifications';
 
 const COLLAPSED_DOT_LIMIT = 9;
+const PRODUCT_REFRESH_COALESCE_MS = 50;
 
 function collapsedDotConversations(conversations: readonly Conversation[], activeSlug: string | null): readonly Conversation[] {
   if (conversations.length <= COLLAPSED_DOT_LIMIT) return conversations;
@@ -112,6 +113,7 @@ export function Sidebar({
   const [productConversations, setProductConversations] = useState<ProductConversationListRow[]>([]);
   const [productConversationsError, setProductConversationsError] = useState<string | null>(null);
   const [productConversationsRetry, setProductConversationsRetry] = useState(0);
+  const refreshScheduledRef = useRef<number | null>(null);
   const productConversationListRevision = useSyncExternalStore(
     subscribeProductConversationListRevision,
     getProductConversationListRevision,
@@ -155,6 +157,34 @@ export function Sidebar({
       cancelled = true;
     };
   }, [productConversationListRevision, productConversationsRetry]);
+
+  const scheduleProductRefresh = useCallback(() => {
+    if (refreshScheduledRef.current !== null) return;
+    refreshScheduledRef.current = window.setTimeout(() => {
+      refreshScheduledRef.current = null;
+      setProductConversationsRetry((revision) => revision + 1);
+    }, PRODUCT_REFRESH_COALESCE_MS);
+  }, []);
+
+  useEffect(() => () => {
+    if (refreshScheduledRef.current !== null) window.clearTimeout(refreshScheduledRef.current);
+  }, []);
+
+  useEffect(() => {
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') scheduleProductRefresh();
+    };
+    const handleFocus = () => scheduleProductRefresh();
+    const handleOnline = () => scheduleProductRefresh();
+    document.addEventListener('visibilitychange', handleVisibility);
+    window.addEventListener('focus', handleFocus);
+    window.addEventListener('online', handleOnline);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibility);
+      window.removeEventListener('focus', handleFocus);
+      window.removeEventListener('online', handleOnline);
+    };
+  }, [scheduleProductRefresh]);
   const lastArchiveRevealSlugRef = useRef<string | null>(null);
   const openProductConversations = productConversations.filter((row) => row.ordinary_lifecycle !== 'history');
   const archivedProductConversations = productConversations.filter((row) => row.ordinary_lifecycle === 'history');

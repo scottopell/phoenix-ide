@@ -15,6 +15,7 @@ import { useFocusedReviewExit } from './viewer/useFocusedReviewExit';
 interface MessageViewerProps {
   sequenceId: number;
   messageId?: string | undefined;
+  occurrenceToken?: string | undefined;
   messages: Message[];
   onClose: () => void;
   onSendNotes: (notes: string) => void | Promise<void>;
@@ -24,18 +25,22 @@ interface MessageViewerProps {
   inline?: boolean | undefined;
 }
 
-export function MessageViewer({ sequenceId, messageId, messages, onClose, onSendNotes, presentation = 'pane', canTogglePresentation = false, onPresentationChange, inline }: MessageViewerProps) {
+export function MessageViewer({ sequenceId, messageId, occurrenceToken, messages, onClose, onSendNotes, presentation = 'pane', canTogglePresentation = false, onPresentationChange, inline }: MessageViewerProps) {
   useRegisterFocusScope('message-viewer');
   const message = useMemo(() => {
+    if (occurrenceToken) {
+      return messages.find((m) => (m.display_data as { productOccurrenceToken?: string } | null | undefined)?.productOccurrenceToken === occurrenceToken)
+        ?? null;
+    }
     if (messageId) {
       return messages.find((m) => m.message_id === messageId) ?? null;
     }
     return messages.find((m) => m.sequence_id === sequenceId) ?? null;
-  }, [messageId, messages, sequenceId]);
+  }, [messageId, messages, occurrenceToken, sequenceId]);
 
   const content = message ? getMessageMarkdown(message) : '';
   const title = message ? messageTitle(message) : `Message #${sequenceId}`;
-  const notes = useMessageReviewNotes(sequenceId, message?.message_id ?? messageId, onSendNotes);
+  const notes = useMessageReviewNotes(sequenceId, message?.message_id ?? messageId, occurrenceToken, onSendNotes);
   const focused = presentation === 'fullscreen' && canTogglePresentation;
   const returnToPane = useCallback(() => onPresentationChange?.('pane'), [onPresentationChange]);
   const focusedExit = useFocusedReviewExit({
@@ -160,10 +165,11 @@ function messageTitle(message: Message): string {
 function useMessageReviewNotes(
   sequenceId: number,
   messageId: string | undefined,
+  occurrenceToken: string | undefined,
   onSendNotes: (notes: string) => void | Promise<void>,
 ) {
   const commands = useReviewNotesCommands();
-  const messageNotes = useMessageReviewNotesData(sequenceId);
+  const messageNotes = useMessageReviewNotesData(sequenceId, occurrenceToken);
   const [annotating, setAnnotating] = useState<{ sequenceId: number; lineNumber: number; lineContent: string } | null>(null);
   const [showPanel, setShowPanel] = useState(false);
   const [highlightedLine, setHighlightedLine] = useState<number | null>(null);
@@ -192,6 +198,7 @@ function useMessageReviewNotes(
           kind: 'message',
           sequenceId,
           ...(messageId !== undefined ? { messageId } : {}),
+          ...(occurrenceToken !== undefined ? { occurrenceToken } : {}),
           lineNumber: annotating.lineNumber,
         },
         annotating.lineContent,
@@ -199,7 +206,7 @@ function useMessageReviewNotes(
       );
       setAnnotating(null);
     },
-    [annotating, commands, messageId, sequenceId],
+    [annotating, commands, messageId, occurrenceToken, sequenceId],
   );
 
   const send = useCallback(async () => {

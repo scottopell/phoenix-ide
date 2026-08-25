@@ -176,6 +176,33 @@ describe('Sidebar — ProductConversation navigation', () => {
     expect(apiMock.listProductConversations).toHaveBeenCalledTimes(2);
   });
 
+  it('coalesces product-list refresh triggers from visibility, focus, and online without request loops', async () => {
+    const { container } = render(
+      <MemoryRouter initialEntries={['/c/cached-slug']}>
+        <Sidebar
+          collapsed={false}
+          onToggle={vi.fn()}
+          conversations={[makeConv('cached-id', 'cached-slug')]}
+          archivedConversations={[]}
+          activeSlug="cached-slug"
+          onConversationCreated={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-open"]')).not.toBeNull());
+    apiMock.listProductConversations.mockResolvedValueOnce({
+      product_conversations: [makeProductConversation('pc-refreshed')],
+    });
+
+    document.dispatchEvent(new Event('visibilitychange'));
+    window.dispatchEvent(new Event('focus'));
+    window.dispatchEvent(new Event('online'));
+
+    await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-refreshed"]')).not.toBeNull());
+    expect(apiMock.listProductConversations).toHaveBeenCalledTimes(2);
+  });
+
   it('coalesces product-list refresh triggers from conversation store mutations without request loops', async () => {
     const { container } = render(
       <MemoryRouter initialEntries={['/c/cached-slug']}>
