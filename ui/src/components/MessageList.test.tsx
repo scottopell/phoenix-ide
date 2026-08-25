@@ -1917,6 +1917,47 @@ describe('history expansion feedback', () => {
     });
   });
 
+  it('shift+space pages upward and asks for earlier history', async () => {
+    const onLoadOlderMessages = vi.fn();
+    virtualTranscriptMock.captureVisibleAnchor.mockReturnValue({ key: 'msg-1', index: 0, offset: 14 });
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={[makeMessage(1, 'user'), makeMessage(2, 'agent'), makeMessage(3, 'user')]}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-shift-space"
+          hasOlderMessages
+          onLoadOlderMessages={onLoadOlderMessages}
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-shift-space', generation: 1, transcriptGeneration: 1 } }}
+        />,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    Object.defineProperty(scroller, 'scrollHeight', { configurable: true, get: () => 1000 });
+    Object.defineProperty(scroller, 'scrollTop', { configurable: true, get: () => 0 });
+    Object.defineProperty(scroller, 'clientHeight', { configurable: true, get: () => 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
+    act(() => virtualTranscriptMock.rangeChanged?.({
+      renderedRange: { startIndex: 0, endIndex: 2 },
+      visibleRange: { startIndex: 0, endIndex: 1 },
+      viewportTop: 0,
+      layoutRevision: 2,
+    }));
+    onLoadOlderMessages.mockClear();
+
+    // The same key means opposite directions. Clamped at the start of loaded
+    // history, no scroll event follows, so classifying this as downward
+    // leaves the reader with no way to ask for more.
+    fireEvent.keyDown(scroller, { key: ' ', shiftKey: true });
+
+    await waitFor(() => expect(onLoadOlderMessages).toHaveBeenCalled());
+  });
+
+
   it('automatically loads earlier history when the reader approaches the loaded start', async () => {
     const onLoadOlderMessages = vi.fn();
     virtualTranscriptMock.captureVisibleAnchor.mockReturnValue({ key: 'msg-1', index: 0, offset: 14 });
@@ -3810,6 +3851,51 @@ describe('handleTotalListHeightChanged', () => {
       layoutRevision: 3,
     }));
     await waitFor(() => expect(onLoadOlderMessages).toHaveBeenCalledTimes(1));
+  });
+
+  it('an unobservable lift stops withholding tail-follow once its bound expires', () => {
+    vi.useFakeTimers();
+    try {
+    const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={historical}
+          pendingMessages={[]}
+          convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-stale-bound-expiry"
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 600, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
+
+    // A drag whose row is virtualized away: the lift is never reported, and
+    // the reader then simply stops touching the screen.
+    fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
+    fireEvent.touchMove(scroller, { touches: [{ identifier: 1 }] });
+    virtualTranscriptMock.setTailFollowAllowed.mockClear();
+
+    // Nothing else happens. The bound has to expire on its own — otherwise
+    // the gesture stands forever and streamed content keeps arriving against
+    // an interaction that ended.
+    act(() => { vi.advanceTimersByTime(GESTURE_STALE_MS + 100); });
+
+    // The viewport comes to rest at the tail under its own momentum. With the
+    // gesture gone this is an idle arrival, so it confirms.
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 600, clientHeight: 400 });
+    act(() => virtualTranscriptMock.pinnedChanged?.(true));
+
+    const grants = virtualTranscriptMock.setTailFollowAllowed.mock.calls.map(([allowed]) => allowed);
+    expect(grants).toContain(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('re-snaps when viewport shrinks while pinned', () => {

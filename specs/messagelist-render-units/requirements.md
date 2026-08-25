@@ -415,8 +415,9 @@ recursively acquire more of it, while a reader who drags there after such a
 jump is not left at a boundary that never expands
 
 WHEN a gesture the platform never reports as ended is discovered — at the
-next interaction, or once a finger reported down has outlasted the
-gesture-staleness bound without an event of its own
+next interaction, or when a finger reported down outlasts the
+gesture-staleness bound without an event of its own, which SHALL expire on
+its own rather than only when some later input happens to look
 THE SYSTEM SHALL end that gesture without confirming a tail return
 AND SHALL discard its travel evidence rather than carrying it into the next
 gesture

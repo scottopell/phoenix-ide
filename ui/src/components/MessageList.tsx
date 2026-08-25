@@ -829,6 +829,7 @@ function MessageListImpl({
   const scrollerTouchIdsRef = useRef(new Set<number>());
   const lastTouchAtMs = useRef(0);
   const abandonStaleGestureRef = useRef<() => void>(() => {});
+  const staleGestureTimerRef = useRef(0);
 
   const readScrollSnapshot = useCallback((): ScrollSnapshot | null => {
     const s = scrollerRef.current;
@@ -965,9 +966,26 @@ function MessageListImpl({
       const abandonStaleGesture = abandonStaleGestureRef.current = () => {
         if (scrollerTouchIdsRef.current.size > 0
           && Date.now() - lastTouchAtMs.current <= GESTURE_STALE_MS) return;
+        window.clearTimeout(staleGestureTimerRef.current);
+        staleGestureTimerRef.current = 0;
         scrollerTouchIdsRef.current.clear();
         touchStartYRef.current.clear();
         dispatchScrollEvent({ type: 'gestureAbandoned' });
+      };
+      // The bound has to expire on its own. Checking it only when some later
+      // input arrives means a reader who simply stops touching the screen
+      // leaves the gesture standing, and streamed content goes on raising
+      // unread against an interaction that ended.
+      const armStaleGestureTimer = () => {
+        window.clearTimeout(staleGestureTimerRef.current);
+        if (scrollerTouchIdsRef.current.size === 0) {
+          staleGestureTimerRef.current = 0;
+          return;
+        }
+        staleGestureTimerRef.current = window.setTimeout(() => {
+          staleGestureTimerRef.current = 0;
+          abandonStaleGesture();
+        }, GESTURE_STALE_MS + 1);
       };
       // The event's touch list is global — a finger anywhere on the page can
       // appear in it — so every read filters to this scroller's own.
@@ -992,11 +1010,13 @@ function MessageListImpl({
             touchStartYRef.current.set(touch.identifier, touch.clientY);
           }
         }
+        armStaleGestureTimer();
         dispatchTranscriptPositioningRef.current({ type: 'user_interrupted' });
         dispatchScrollEvent({ type: 'touchStarted' });
       };
       const onTouchMove = (e: TouchEvent) => {
         lastTouchAtMs.current = Date.now();
+        armStaleGestureTimer();
         dispatchScrollEvent({ type: 'touchMoved' });
         // Any owned finger dragging down reveals earlier content, so ask each
         // against its own starting point rather than picking one to speak for
@@ -1034,6 +1054,7 @@ function MessageListImpl({
         for (const id of Array.from(touchStartYRef.current.keys())) {
           if (!scrollerTouchIdsRef.current.has(id)) touchStartYRef.current.delete(id);
         }
+        armStaleGestureTimer();
         dispatchScrollEvent({
           type,
           remainingTouches: scrollerTouchIdsRef.current.size,
@@ -1112,7 +1133,11 @@ function MessageListImpl({
         // never moved.
         if (target instanceof HTMLElement && isTextEntry(target)) return;
         if (e.key === ' ' && target instanceof HTMLElement && consumesSpace(target)) return;
-        const upward = UPWARD_KEYS.has(e.key);
+        // Shift+Space is the browser's page-up, so the same key means
+        // opposite directions depending on the modifier.
+        // Shift+Space is the browser's page-up, so the same key means
+        // opposite directions depending on the modifier.
+        const upward = UPWARD_KEYS.has(e.key) || (e.key === ' ' && e.shiftKey);
         // Keys that drive the transcript toward the tail take the viewport
         // over just as upward ones do. Recognising only upward keys left a
         // jump stuck in its positioning phase, which then refused to confirm
@@ -1136,6 +1161,8 @@ function MessageListImpl({
       ref.addEventListener('scroll', onScroll, { passive: true });
       window.addEventListener('keydown', onKeyDown);
       detachGestureListenersRef.current = () => {
+        window.clearTimeout(staleGestureTimerRef.current);
+        staleGestureTimerRef.current = 0;
         ref.removeEventListener('pointerdown', onPointerDown);
         ref.removeEventListener('touchstart', onTouchStart);
         ref.removeEventListener('touchmove', onTouchMove);
