@@ -855,7 +855,7 @@ export function ConversationList({
               row={row}
               isActive={activeSlug === row.product_conversation_id || activeSlug === row.canonical_root.slug || activeSlug === row.canonical_root.transcript_row_id}
               isKeyboardSelected={selectedId === row.product_conversation_id}
-              effectiveCwd={conversations.find((conversation) => (
+              effectiveCwd={[...conversations, ...archivedConversations].find((conversation) => (
                 conversation.id === row.latest_transcript_row_id
                 || conversation.id === row.canonical_root.transcript_row_id
                 || conversation.slug === row.canonical_root.slug

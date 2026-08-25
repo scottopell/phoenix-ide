@@ -352,6 +352,31 @@ describe('ConversationList — product conversations', () => {
     expect(getByText('Retained history')).toBeInTheDocument();
   });
 
+  it('renders History working directory from archived member rows', () => {
+    const archived = makeProductConversation('pc-archived', {
+      ordinary_lifecycle: 'history',
+      latest_transcript_row_id: 'archived-member',
+      canonical_root: { transcript_row_id: 'archived-member', slug: 'archived-root', title: 'Archived Root' },
+    });
+    const archivedMember = makeConv('archived-member', 'archived-root', { archived: true, cwd: '/tmp/archived-work' });
+
+    const { getByText } = render(
+      <MemoryRouter>
+        <ConversationList
+          {...defaultProps}
+          conversations={[]}
+          archivedConversations={[archivedMember]}
+          productConversations={[]}
+          archivedProductConversations={[archived]}
+          listDensity="mobile"
+          showArchived
+        />
+      </MemoryRouter>,
+    );
+
+    expect(getByText('/tmp/archived-work')).toBeInTheDocument();
+  });
+
   it('navigates through aggregate canonical routes when no custom click handler is provided', () => {
     function Location() { return <span data-testid="location">{useLocation().pathname}</span>; }
     const row = makeProductConversation('pc-nav', {

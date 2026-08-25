@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { MemoryRouter, Route, Routes } from 'react-router-dom';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom';
 import { ProductConversationPage } from './ProductConversationPage';
 import { ConversationReadinessProvider } from '../contexts/ConversationReadinessContext';
 import { FileExplorerProvider } from '../components/FileExplorer';
@@ -22,8 +22,11 @@ vi.mock('../components/ConversationNavStack', () => ({
     }> : [];
     return (
       <div>
-        <button onClick={() => (props['onLoadOlderMessages'] as (() => void) | undefined)?.()}>
+        <button onClick={() => (props['onLoadOlderMessages'] as ((basis?: unknown) => void) | undefined)?.()}>
           load older
+        </button>
+        <button onClick={() => (props['onLoadOlderMessages'] as ((basis?: unknown) => void) | undefined)?.({ kind: 'reader_anchor', messageId: 'm-3', viewportStartOffset: 17 })}>
+          load older with anchor
         </button>
         <div data-testid="message-count">{messages.length}</div>
         <div data-testid="message-order">{messages.map((m) => m.message_id).join(',')}</div>
@@ -48,6 +51,11 @@ vi.mock('./ChainPage', () => ({
       <div data-testid="chain-qa-column">
         <div data-testid="chain-qa-persisted-count">{Array.isArray(props['persisted']) ? props['persisted'].length : 0}</div>
         <button onClick={() => (props['onRetryConnection'] as (() => void) | undefined)?.()}>retry chain</button>
+        <textarea
+          aria-label="recall draft"
+          value={String(props['draft'] ?? '')}
+          onChange={(event) => (props['setDraft'] as ((value: string) => void))(event.target.value)}
+        />
       </div>
     );
   },
@@ -197,12 +205,18 @@ function makeChain(overrides: Partial<ChainView> = {}): ChainView {
   };
 }
 
-function renderPage() {
+function NavigateToSecondProduct() {
+  const navigate = useNavigate();
+  return <button onClick={() => navigate('/product-conversations/pc-2')}>open second product</button>;
+}
+
+function renderPage(initialEntry = '/product-conversations/pc-1', withRouteSwitch = false) {
   return render(
     <ConversationReadinessProvider>
-      <MemoryRouter initialEntries={['/product-conversations/pc-1']}>
+      <MemoryRouter initialEntries={[initialEntry]}>
         <ViewerSlotProvider browserSessionActive={false}>
           <FileExplorerProvider>
+            {withRouteSwitch && <NavigateToSecondProduct />}
             <Routes>
               <Route path="/product-conversations/:productConversationId" element={<ProductConversationPage />} />
             </Routes>
@@ -233,12 +247,15 @@ function emitLatestProjection(overrides: Partial<Record<string, unknown>> = {}) 
     onRetryPending: vi.fn(),
     onCancelSteering: vi.fn(),
     onOpenFile: vi.fn(),
+    filePathRootDir: '/tmp/latest-root',
+    systemPrompt: 'Preserve this system prompt',
     ...overrides,
   });
 }
 
 beforeEach(() => {
   vi.clearAllMocks();
+  localStorage.clear();
   conversationNavStackSpy.mockClear();
   embeddedConversationPageSpy.mockClear();
   chainQaColumnSpy.mockClear();
@@ -606,6 +623,78 @@ describe('ProductConversationPage', () => {
     expect(screen.getByTestId('chain-qa-column')).toBeInTheDocument();
     expect(screen.queryByTestId('embedded-conversation-page')).not.toBeInTheDocument();
     expect(screen.getByText('History is read-only.')).toBeInTheDocument();
+  });
+
+  it('discards delayed older-page results after a new product route wins', async () => {
+    const { api } = await import('../api');
+    let resolveOlder!: (value: ProductConversationSnapshotView) => void;
+    const older = new Promise<ProductConversationSnapshotView>((resolve) => { resolveOlder = resolve; });
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot())
+      .mockReturnValueOnce(older)
+      .mockResolvedValueOnce(makeSnapshot({
+        product_conversation_id: 'pc-2',
+        canonical_route: '/product-conversations/pc-2',
+        presentation: { kind: 'state', display_name: 'Product Beta', presentation_mode: 'idle' },
+        segments: [{ segment_ordinal: 1, transcript_row_id: 'row-b', slug: 'row-b', title: 'Beta', messages: [makeMessage('beta-message', 1, 'beta')], handoff: null }],
+        latest_transcript_row_id: 'row-b',
+        writable_transcript_row_id: 'row-b',
+        before: null,
+        has_older: false,
+      }));
+
+    renderPage('/product-conversations/pc-1', true);
+    await waitForPageReady();
+    fireEvent.click(screen.getByRole('button', { name: 'load older' }));
+    fireEvent.click(screen.getByRole('button', { name: 'open second product' }));
+    await screen.findByRole('heading', { name: 'Product Beta' });
+    await act(async () => resolveOlder(makeSnapshot({ segments: [{ segment_ordinal: 0, transcript_row_id: 'row-old', slug: 'old', title: 'Old A', messages: [makeMessage('stale-a', 1)], handoff: null }] })));
+
+    expect(screen.getByRole('heading', { name: 'Product Beta' })).toBeInTheDocument();
+    expect(screen.getByTestId('message-order')).toHaveTextContent('beta-message');
+    expect(screen.getByTestId('message-order')).not.toHaveTextContent('stale-a');
+  });
+
+  it('threads restore basis, root directory, system prompt, and explicit absent work scope', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot({ work_identity: null }))
+      .mockResolvedValueOnce(makeSnapshot({
+        segments: [{ segment_ordinal: 0, transcript_row_id: 'row-old', slug: 'old', title: 'Old', messages: [makeMessage('old-message', 0)], handoff: null }],
+        before: null,
+        has_older: false,
+      }));
+    vi.mocked(api.getChain).mockResolvedValueOnce(makeChain({ work_identity: null }));
+    renderPage();
+    await waitForPageReady();
+    emitLatestProjection();
+    fireEvent.click(screen.getByRole('button', { name: 'load older with anchor' }));
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.['transcriptPositioning']).toEqual(expect.objectContaining({
+      kind: 'positioning',
+      command: expect.objectContaining({ kind: 'restore_after_prefix_expansion', messageId: 'm-3', viewportStartOffset: 17 }),
+    })));
+    expect(conversationNavStackSpy.mock.lastCall?.[0]?.['filePathRootDir']).toBe('/tmp/latest-root');
+    expect(conversationNavStackSpy.mock.lastCall?.[0]?.['systemPrompt']).toBe('Preserve this system prompt');
+    expect(screen.getByText('No managed work scope')).toBeInTheDocument();
+  });
+
+  it('keeps successful pagination visually silent and ignores malformed message hashes', async () => {
+    renderPage('/product-conversations/pc-1#message-%');
+    await waitForPageReady();
+    expect(screen.queryByText(/Earlier history available|Complete snapshot loaded|Loading earlier history/)).not.toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Product Alpha' })).toBeInTheDocument();
+  });
+
+  it('persists recall drafts by product conversation identity across unmount', async () => {
+    const first = renderPage();
+    await waitForPageReady();
+    fireEvent.change(screen.getByLabelText('recall draft'), { target: { value: 'durable aggregate draft' } });
+    first.unmount();
+    expect(localStorage.getItem('phoenix:product-conversation-draft:pc-1')).toBe('durable aggregate draft');
+
+    renderPage();
+    await waitFor(() => expect(screen.getByLabelText('recall draft')).toHaveValue('durable aggregate draft'));
+    expect(localStorage.getItem('phoenix:chain-draft:root-chain')).toBeNull();
   });
 
   it('subscribes to chain streaming with compatibility root id', async () => {

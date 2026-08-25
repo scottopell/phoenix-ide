@@ -187,6 +187,8 @@ export interface EmbeddedConversationProjection {
   onRetryPending: (localId: string) => void;
   onCancelSteering: (localId: string) => void;
   onOpenFile: (filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void;
+  filePathRootDir: string;
+  systemPrompt?: string | undefined;
 }
 
 interface EmbeddedConversationHostProps {
@@ -1732,6 +1734,8 @@ function ConversationPageContent({
       onRetryPending: handleRetry,
       onCancelSteering: handleCancelSteering,
       onOpenFile: handleOpenFileFromPatch,
+      filePathRootDir: conversation?.worktree_path ?? conversation?.cwd ?? '/',
+      systemPrompt: atom.systemPrompt ?? undefined,
     });
     return () => {
       onProjectionChange(null);
@@ -1748,6 +1752,9 @@ function ConversationPageContent({
     handleRetry,
     handleCancelSteering,
     handleOpenFileFromPatch,
+    conversation?.worktree_path,
+    conversation?.cwd,
+    atom.systemPrompt,
   ]);
 
   const localCreateIntent = readCreateIntent(conversationId);
