@@ -3568,11 +3568,15 @@ describe('handleTotalListHeightChanged', () => {
       touches: [{ identifier: 1, clientY: 300 }, { identifier: 2, clientY: 320 }],
       changedTouches: [{ identifier: 2, clientY: 320 }],
     });
+    // An unrelated finger elsewhere on the page sits ahead of ours in the
+    // event's global list, so the baseline cannot be taken positionally.
     fireEvent.touchEnd(scroller, {
-      touches: [{ identifier: 2, clientY: 320 }],
+      touches: [{ identifier: 7, clientY: 100 }, { identifier: 2, clientY: 320 }],
       changedTouches: [{ identifier: 1, clientY: 300 }],
     });
-    fireEvent.touchMove(scroller, { touches: [{ identifier: 2, clientY: 420 }] });
+    fireEvent.touchMove(scroller, {
+      touches: [{ identifier: 7, clientY: 100 }, { identifier: 2, clientY: 420 }],
+    });
 
     await waitFor(() => expect(onLoadOlderMessages).toHaveBeenCalled());
   });

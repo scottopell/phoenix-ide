@@ -915,9 +915,7 @@ function MessageListImpl({
   const dispatchScrollEvent = useCallback((event: ScrollEvent) => {
     const next = reduceScrollMachine(scrollMachineRef.current, event);
     scrollMachineRef.current = next.state;
-    // The policy owns tail-follow intent; the physical layer executes it.
-    // Syncing here, after every reduction, is what keeps the two from
-    // holding separate opinions (scroll_policy.allium, REQ-VT-008).
+    // REQ-VT-008: intent follows every reduction.
     transcriptRef.current?.setTailFollowAllowed(tailFollowGranted(next.state));
     applyScrollEffects(next.effects);
   }, [applyScrollEffects]);
@@ -960,6 +958,14 @@ function MessageListImpl({
         touchStartYRef.current = null;
         dispatchScrollEvent({ type: 'gestureAbandoned' });
       };
+      // The event's touch list is global: a finger anywhere on the page can sit
+      // ahead of this scroller's in it, so a positional read compares the
+      // wrong one against the baseline and reports no movement at all.
+      const ownedTouchY = (e: TouchEvent): number | null => {
+        const owned = Array.from(e.touches)
+          .find((touch) => scrollerTouchIdsRef.current.has(touch.identifier));
+        return owned?.clientY ?? null;
+      };
       const onTouchStart = (e: TouchEvent) => {
         lastTouchAtMs.current = Date.now();
         const live = new Set(Array.from(e.touches).map((touch) => touch.identifier));
@@ -974,15 +980,15 @@ function MessageListImpl({
         for (const touch of Array.from(e.changedTouches)) {
           scrollerTouchIdsRef.current.add(touch.identifier);
         }
-        touchStartYRef.current = e.touches[0]?.clientY ?? null;
+        touchStartYRef.current = ownedTouchY(e);
         dispatchTranscriptPositioningRef.current({ type: 'user_interrupted' });
         dispatchScrollEvent({ type: 'touchStarted' });
       };
       const onTouchMove = (e: TouchEvent) => {
         lastTouchAtMs.current = Date.now();
         dispatchScrollEvent({ type: 'touchMoved' });
-        const currentY = e.touches[0]?.clientY;
-        if (currentY !== undefined && touchStartYRef.current !== null && currentY > touchStartYRef.current) {
+        const currentY = ownedTouchY(e);
+        if (currentY !== null && touchStartYRef.current !== null && currentY > touchStartYRef.current) {
           requestFromUpwardIntent();
         }
       };
@@ -1009,9 +1015,7 @@ function MessageListImpl({
         // The gesture continues while a finger remains, and the next touchmove
         // measures against this baseline — clearing it would silence upward
         // intent for the finger still on the screen.
-        touchStartYRef.current = scrollerTouchIdsRef.current.size > 0
-          ? e.touches[0]?.clientY ?? null
-          : null;
+        touchStartYRef.current = ownedTouchY(e);
         dispatchScrollEvent({
           type,
           remainingTouches: scrollerTouchIdsRef.current.size,
