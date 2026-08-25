@@ -1,0 +1,941 @@
+//! Tests for the chain Q&A backend (REQ-CHN-001 / 004 / 005 / 006).
+
+use super::*;
+use crate::db::{ChainQaStatus, Database, MessageContent};
+use async_trait::async_trait;
+use phoenix_llm::{LlmError, LlmResponse, TokenChunk, Usage};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use tokio::sync::broadcast;
+
+/// Build a 3-member linear chain and return the ids in chain order.
+async fn build_linear_chain(db: &Database, ids: &[&str]) {
+    let root = db
+        .create_conversation(
+            ids[0],
+            &format!("slug-{}", ids[0]),
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    for pair in ids.windows(2) {
+        let predecessor_id = pair[0];
+        let id = pair[1];
+        let now = chrono::Utc::now().to_rfc3339();
+        let scope_id = format!("scope-{id}");
+        let mut tx = db.pool().begin().await.unwrap();
+        sqlx::query("PRAGMA defer_foreign_keys = ON")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO product_continuation_reservations (
+                 predecessor_conversation_id, successor_conversation_id, product_conversation_id
+             ) VALUES (?1, ?2, ?3)",
+        )
+        .bind(predecessor_id)
+        .bind(id)
+        .bind(root.product_conversation_id.as_str())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
+            .bind(id)
+            .bind(predecessor_id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO work_scopes (
+                 id, authority_kind, environment_kind, cwd, created_at, updated_at
+             ) VALUES (?1, 'restricted_explore', 'unowned_cwd', '/tmp', ?2, ?2)",
+        )
+        .bind(&scope_id)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO conversations (
+                 id, product_conversation_id, slug, user_initiated, runtime_role,
+                 work_scope_id, state_updated_at, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, 1, 'user', ?4, ?5, ?5, ?5)",
+        )
+        .bind(id)
+        .bind(root.product_conversation_id.as_str())
+        .bind(format!("slug-{id}"))
+        .bind(scope_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "DELETE FROM product_continuation_reservations
+             WHERE predecessor_conversation_id = ?1",
+        )
+        .bind(predecessor_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+}
+
+/// Convenience: shove a continuation summary as the trailing message of a
+/// conversation, the way `Effect::persist_continuation_message` does at
+/// runtime.
+async fn add_continuation_summary(db: &Database, conv_id: &str, summary: &str) {
+    let msg_id = format!("msg-cont-{conv_id}");
+    db.add_message(
+        &msg_id,
+        conv_id,
+        &MessageContent::continuation(summary),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+}
+
+async fn add_user_message(db: &Database, conv_id: &str, idx: usize, text: &str) {
+    let msg_id = format!("msg-user-{conv_id}-{idx}");
+    db.add_message(&msg_id, conv_id, &MessageContent::user(text), None, None)
+        .await
+        .unwrap();
+}
+
+/// Test LLM service: returns a canned text response and counts calls so
+/// tests can assert "did the leaf summary call fire?".
+#[derive(Debug, Default)]
+struct CountingLlm {
+    response_text: String,
+    calls: AtomicUsize,
+}
+
+impl CountingLlm {
+    fn new(response_text: impl Into<String>) -> Arc<Self> {
+        Arc::new(Self {
+            response_text: response_text.into(),
+            calls: AtomicUsize::new(0),
+        })
+    }
+
+    fn call_count(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl LlmService for CountingLlm {
+    async fn complete(&self, _request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(LlmResponse {
+            content: vec![ContentBlock::text(self.response_text.clone())],
+            end_turn: true,
+            usage: Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+        })
+    }
+
+    async fn complete_streaming(
+        &self,
+        request: &LlmRequest,
+        _chunk_tx: &tokio::sync::mpsc::Sender<TokenChunk>,
+    ) -> Result<LlmResponse, LlmError> {
+        self.complete(request).await
+    }
+
+    #[allow(clippy::unnecessary_literal_bound)] // trait signature requires &str
+    fn model_id(&self) -> &str {
+        "test-model"
+    }
+}
+
+// --- compute_chain_snapshot ------------------------------------------------
+
+#[tokio::test]
+async fn compute_chain_snapshot_sums_message_counts_across_three_members() {
+    let db = Database::open_in_memory().await.unwrap();
+    build_linear_chain(&db, &["s-a", "s-b", "s-c"]).await;
+    add_user_message(&db, "s-a", 0, "first").await;
+    add_user_message(&db, "s-a", 1, "second").await;
+    add_continuation_summary(&db, "s-a", "summary of s-a").await;
+    add_user_message(&db, "s-b", 0, "first b").await;
+    add_continuation_summary(&db, "s-b", "summary of s-b").await;
+    add_user_message(&db, "s-c", 0, "first c").await;
+    add_user_message(&db, "s-c", 1, "second c").await;
+    add_user_message(&db, "s-c", 2, "third c").await;
+
+    let mut members = Vec::new();
+    for id in ["s-a", "s-b", "s-c"] {
+        members.push(db.get_conversation(id).await.unwrap());
+    }
+    let snap = compute_chain_snapshot(&members);
+    assert_eq!(snap.member_count, 3);
+    assert_eq!(snap.total_messages, 3 + 2 + 3);
+}
+
+// --- ChainQa::submit_question end-to-end (synchronous in Phase 2) ---------
+
+/// Wrap a test `LlmService` in a `ModelRegistry` so `get_mid_tier_model`
+/// resolves to it. Uses `ModelRegistry::for_test_with_sonnet`, the
+/// test-only constructor on the registry that bypasses gateway plumbing.
+fn registry_with_service(service: Arc<dyn LlmService>) -> Arc<ModelRegistry> {
+    Arc::new(ModelRegistry::for_test_with_sonnet(service))
+}
+
+/// An FTS5 retriever over the test db's pool, for the Q&A agent's
+/// `search_conversations` tool.
+fn test_retriever(db: &Database) -> Arc<dyn crate::db::MessageRetriever> {
+    Arc::new(db.fts_retriever())
+}
+
+#[tokio::test]
+async fn submit_question_persists_and_completes() {
+    let db = Database::open_in_memory().await.unwrap();
+    build_linear_chain(&db, &["chq-a", "chq-b", "chq-c"]).await;
+    add_continuation_summary(&db, "chq-a", "A summary").await;
+    add_continuation_summary(&db, "chq-b", "B summary").await;
+    add_user_message(&db, "chq-c", 0, "leaf line").await;
+
+    let llm = CountingLlm::new("THE ANSWER");
+    let registry = registry_with_service(llm.clone() as Arc<dyn LlmService>);
+    let qa = ChainQa::new(db.clone(), registry, test_retriever(&db));
+
+    let qa_id = qa
+        .submit_question_blocking("chq-a", "what happened in this chain?")
+        .await
+        .unwrap();
+
+    let history = qa.list_history("chq-a").await.unwrap();
+    assert_eq!(history.len(), 1);
+    let row = &history[0];
+    assert_eq!(row.id, qa_id);
+    assert_eq!(row.status, ChainQaStatus::Completed);
+    assert_eq!(row.question, "what happened in this chain?");
+    assert_eq!(row.answer.as_deref(), Some("THE ANSWER"));
+    assert_eq!(row.chain_members_at_answer, 3);
+    assert!(row.completed_at.is_some());
+    assert_eq!(row.model, "claude-sonnet-5");
+    assert_eq!(
+        llm.call_count(),
+        2,
+        "one planning turn (no tool call → ready) + one streaming answer turn",
+    );
+}
+
+#[tokio::test]
+async fn submit_question_rejects_single_member_root() {
+    let db = Database::open_in_memory().await.unwrap();
+    db.create_conversation("solo-root", "slug-solo", "/tmp", true, None, None)
+        .await
+        .unwrap();
+
+    let llm = CountingLlm::new("unused");
+    let registry = registry_with_service(llm.clone() as Arc<dyn LlmService>);
+    let qa = ChainQa::new(db.clone(), registry, test_retriever(&db));
+
+    let err = qa
+        .submit_question("solo-root", "anything")
+        .await
+        .unwrap_err();
+    matches!(err, ChainQaError::NotAChainRoot(_));
+}
+
+#[tokio::test]
+async fn submit_question_rejects_non_root_member() {
+    let db = Database::open_in_memory().await.unwrap();
+    build_linear_chain(&db, &["nrr-root", "nrr-mid", "nrr-leaf"]).await;
+    add_continuation_summary(&db, "nrr-root", "rs").await;
+    add_continuation_summary(&db, "nrr-mid", "ms").await;
+
+    let llm = CountingLlm::new("unused");
+    let registry = registry_with_service(llm.clone() as Arc<dyn LlmService>);
+    let qa = ChainQa::new(db.clone(), registry, test_retriever(&db));
+
+    let err = qa.submit_question("nrr-mid", "anything").await.unwrap_err();
+    matches!(err, ChainQaError::NotAChainRoot(_));
+}
+
+// --- Streaming integration (Phase 3) --------------------------------------
+
+use crate::chain_runtime::ChainSseEvent;
+
+/// Streaming test LLM: emits a fixed sequence of token deltas via the
+/// streaming channel, then returns an assembled response identical to the
+/// concatenated deltas.
+#[derive(Debug)]
+struct StreamingLlm {
+    deltas: Vec<String>,
+}
+
+impl StreamingLlm {
+    fn new(deltas: &[&str]) -> Arc<Self> {
+        Arc::new(Self {
+            deltas: deltas.iter().map(|s| (*s).to_string()).collect(),
+        })
+    }
+
+    fn assembled(&self) -> String {
+        self.deltas.concat()
+    }
+}
+
+#[async_trait]
+impl LlmService for StreamingLlm {
+    async fn complete(&self, _request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+        Ok(LlmResponse {
+            content: vec![ContentBlock::text(self.assembled())],
+            end_turn: true,
+            usage: Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+        })
+    }
+
+    async fn complete_streaming(
+        &self,
+        _request: &LlmRequest,
+        chunk_tx: &tokio::sync::mpsc::Sender<TokenChunk>,
+    ) -> Result<LlmResponse, LlmError> {
+        for delta in &self.deltas {
+            let _ = chunk_tx.send(TokenChunk::Text(delta.clone())).await;
+            // Yield so the forwarder task gets a chance to drain the
+            // channel before the next chunk arrives — keeps test ordering
+            // deterministic without depending on broadcast capacity.
+            tokio::task::yield_now().await;
+        }
+        Ok(LlmResponse {
+            content: vec![ContentBlock::text(self.assembled())],
+            end_turn: true,
+            usage: Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+        })
+    }
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn model_id(&self) -> &str {
+        "test-model"
+    }
+}
+
+/// Failing streaming LLM: the planning turn succeeds with no tool call (so the
+/// loop proceeds to the final streaming turn), then the streaming answer turn
+/// emits one chunk before erroring — exercising the partial-answer path.
+#[derive(Debug)]
+struct FailingStreamingLlm;
+
+#[async_trait]
+impl LlmService for FailingStreamingLlm {
+    async fn complete(&self, _request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+        // Planning turn: no tool call → the loop moves to the final answer.
+        Ok(LlmResponse {
+            content: vec![ContentBlock::text("")],
+            end_turn: true,
+            usage: Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+        })
+    }
+
+    async fn complete_streaming(
+        &self,
+        _request: &LlmRequest,
+        chunk_tx: &tokio::sync::mpsc::Sender<TokenChunk>,
+    ) -> Result<LlmResponse, LlmError> {
+        let _ = chunk_tx
+            .send(TokenChunk::Text("partial-".to_string()))
+            .await;
+        tokio::task::yield_now().await;
+        Err(LlmError::auth("simulated stream failure"))
+    }
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn model_id(&self) -> &str {
+        "test-model"
+    }
+}
+
+/// Drain `n` events from the broadcast receiver. Treats `Lagged` as a hard
+/// failure so a misbehaving test fixture doesn't silently mask a missing
+/// event.
+async fn drain_n(rx: &mut broadcast::Receiver<ChainSseEvent>, n: usize) -> Vec<ChainSseEvent> {
+    let mut events = Vec::with_capacity(n);
+    for _ in 0..n {
+        let recv = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for chain event");
+        match recv {
+            Ok(ev) => events.push(ev),
+            Err(broadcast::error::RecvError::Closed) => panic!("broadcaster closed early"),
+            Err(broadcast::error::RecvError::Lagged(_)) => panic!("subscriber lagged"),
+        }
+    }
+    events
+}
+
+#[tokio::test]
+async fn submit_question_streams_tokens_and_persists_completed_row() {
+    let db = Database::open_in_memory().await.unwrap();
+    build_linear_chain(&db, &["st-a", "st-b"]).await;
+    add_continuation_summary(&db, "st-a", "summary A").await;
+    add_user_message(&db, "st-b", 0, "leaf").await;
+
+    let llm = StreamingLlm::new(&["Hel", "lo, ", "world!"]);
+    let registry = registry_with_service(llm.clone() as Arc<dyn LlmService>);
+    let qa = ChainQa::new(db.clone(), registry, test_retriever(&db));
+
+    let runtime = qa.runtime_registry().get_or_create("st-a").await;
+    let (mut rx, _guard) = runtime.subscribe();
+
+    let qa_id = qa.submit_question_blocking("st-a", "what?").await.unwrap();
+
+    // Three Token + one Completed = four events.
+    let events = drain_n(&mut rx, 4).await;
+
+    // First three are Token in order, all carrying our qa_id.
+    let mut deltas: Vec<String> = Vec::new();
+    for ev in &events[..3] {
+        match ev {
+            ChainSseEvent::Token { chain_qa_id, delta } => {
+                assert_eq!(chain_qa_id, &qa_id);
+                deltas.push(delta.clone());
+            }
+            other => panic!("expected Token, got {other:?}"),
+        }
+    }
+    assert_eq!(deltas, vec!["Hel", "lo, ", "world!"]);
+
+    // Fourth is Completed with the assembled answer.
+    match &events[3] {
+        ChainSseEvent::Completed {
+            chain_qa_id,
+            full_answer,
+        } => {
+            assert_eq!(chain_qa_id, &qa_id);
+            assert_eq!(full_answer, "Hello, world!");
+        }
+        other => panic!("expected Completed, got {other:?}"),
+    }
+
+    // Persisted row reflects status=Completed with the assembled answer.
+    let history = qa.list_history("st-a").await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].id, qa_id);
+    assert_eq!(history[0].status, ChainQaStatus::Completed);
+    assert_eq!(history[0].answer.as_deref(), Some("Hello, world!"));
+}
+
+#[tokio::test]
+async fn submit_question_streams_failure_event_and_persists_partial() {
+    let db = Database::open_in_memory().await.unwrap();
+    build_linear_chain(&db, &["sf-a", "sf-b"]).await;
+    add_continuation_summary(&db, "sf-a", "summary A").await;
+    add_user_message(&db, "sf-b", 0, "leaf").await;
+
+    let llm: Arc<FailingStreamingLlm> = Arc::new(FailingStreamingLlm);
+    let registry = registry_with_service(llm.clone() as Arc<dyn LlmService>);
+    let qa = ChainQa::new(db.clone(), registry, test_retriever(&db));
+
+    let runtime = qa.runtime_registry().get_or_create("sf-a").await;
+    let (mut rx, _guard) = runtime.subscribe();
+
+    let qa_id = qa.submit_question_blocking("sf-a", "what?").await.unwrap();
+
+    // Token + Failed.
+    let events = drain_n(&mut rx, 2).await;
+    match &events[0] {
+        ChainSseEvent::Token { chain_qa_id, delta } => {
+            assert_eq!(chain_qa_id, &qa_id);
+            assert_eq!(delta, "partial-");
+        }
+        other => panic!("expected Token, got {other:?}"),
+    }
+    match &events[1] {
+        ChainSseEvent::Failed {
+            chain_qa_id,
+            error: _,
+            partial_answer,
+        } => {
+            assert_eq!(chain_qa_id, &qa_id);
+            assert_eq!(partial_answer.as_deref(), Some("partial-"));
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+
+    let history = qa.list_history("sf-a").await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].status, ChainQaStatus::Failed);
+    assert_eq!(history[0].answer.as_deref(), Some("partial-"));
+}
+
+#[tokio::test]
+async fn submit_question_returns_qa_id_before_stream_completes() {
+    // Submission shape: submit_question returns ChainQaId immediately after
+    // INSERT in_flight. The persisted row exists synchronously even though
+    // the streaming model invocation happens in a spawned task.
+    let db = Database::open_in_memory().await.unwrap();
+    build_linear_chain(&db, &["sy-a", "sy-b"]).await;
+    add_continuation_summary(&db, "sy-a", "summary").await;
+    add_user_message(&db, "sy-b", 0, "leaf").await;
+
+    let llm = StreamingLlm::new(&["x"]);
+    let registry = registry_with_service(llm.clone() as Arc<dyn LlmService>);
+    let qa = ChainQa::new(db.clone(), registry, test_retriever(&db));
+
+    let qa_id = qa.submit_question("sy-a", "?").await.unwrap();
+
+    // The row exists in the DB (status may be in_flight or completed
+    // depending on timing — the contract is "exists before submit returns").
+    let history = qa.list_history("sy-a").await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].id, qa_id);
+}
+
+#[tokio::test]
+async fn tab_close_mid_stream_does_not_orphan_invocation() {
+    // Subscriber drops mid-stream; the chain runtime stays alive (in-flight
+    // count is still 1), the model invocation completes, and the row is
+    // updated to Completed. A subscriber that connects late reads the
+    // canonical answer from `list_chain_qa` even though it missed the
+    // token events.
+    let db = Database::open_in_memory().await.unwrap();
+    build_linear_chain(&db, &["tc-a", "tc-b"]).await;
+    add_continuation_summary(&db, "tc-a", "summary").await;
+    add_user_message(&db, "tc-b", 0, "leaf").await;
+
+    let llm = StreamingLlm::new(&["one ", "two ", "three"]);
+    let registry = registry_with_service(llm.clone() as Arc<dyn LlmService>);
+    let qa = ChainQa::new(db.clone(), registry, test_retriever(&db));
+
+    // Subscriber connects, then drops before the stream starts.
+    let runtime = qa.runtime_registry().get_or_create("tc-a").await;
+    {
+        let (_rx, _guard) = runtime.subscribe();
+        // _rx and _guard go out of scope here, dropping the subscription
+        // before the model call runs.
+    }
+    assert_eq!(runtime.subscriber_count(), 0);
+
+    let qa_id = qa.submit_question_blocking("tc-a", "?").await.unwrap();
+
+    // Persisted row is the canonical state for any late reader.
+    let history = qa.list_history("tc-a").await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].id, qa_id);
+    assert_eq!(history[0].status, ChainQaStatus::Completed);
+    assert_eq!(history[0].answer.as_deref(), Some("one two three"));
+}
+
+#[tokio::test]
+async fn chain_runtime_dropped_from_registry_after_qa_completes_with_no_subscribers() {
+    let db = Database::open_in_memory().await.unwrap();
+    build_linear_chain(&db, &["dr-a", "dr-b"]).await;
+    add_continuation_summary(&db, "dr-a", "summary").await;
+    add_user_message(&db, "dr-b", 0, "leaf").await;
+
+    let llm = StreamingLlm::new(&["x"]);
+    let registry = registry_with_service(llm.clone() as Arc<dyn LlmService>);
+    let qa = ChainQa::new(db.clone(), registry, test_retriever(&db));
+
+    qa.submit_question_blocking("dr-a", "?").await.unwrap();
+
+    // After the (synchronous) blocking submit, the in-flight guard has
+    // been dropped and there are no subscribers — the registry should
+    // have released the runtime.
+    assert!(
+        !qa.runtime_registry().contains("dr-a").await,
+        "registry should drop idle runtimes after Q&A finalize",
+    );
+}
+
+/// Scripted agentic LLM exercising the planning→answer split: the first
+/// planning `complete()` issues a `search_conversations` tool call; the next
+/// planning `complete()` returns no tool call (ready); the final streaming turn
+/// (`complete_streaming`) returns the answer. Proves the loop executes a tool,
+/// detects readiness, then streams the answer (REQ-CHN-009).
+#[derive(Debug)]
+struct ScriptedToolLlm {
+    complete_calls: AtomicUsize,
+}
+
+#[async_trait]
+impl LlmService for ScriptedToolLlm {
+    async fn complete(&self, _request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+        let n = self.complete_calls.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            // Planning turn 1: ask to search.
+            Ok(LlmResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "t1".to_string(),
+                    name: "search_conversations".to_string(),
+                    input: serde_json::json!({ "query": "rate limiter" }),
+                }],
+                end_turn: false,
+                usage: Usage::default(),
+                stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+            })
+        } else {
+            // Planning turn 2: no tool call → ready to answer.
+            Ok(LlmResponse {
+                content: vec![ContentBlock::text("")],
+                end_turn: true,
+                usage: Usage::default(),
+                stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+            })
+        }
+    }
+
+    async fn complete_streaming(
+        &self,
+        _request: &LlmRequest,
+        chunk_tx: &tokio::sync::mpsc::Sender<TokenChunk>,
+    ) -> Result<LlmResponse, LlmError> {
+        // Final answer turn: stream the answer.
+        let _ = chunk_tx
+            .send(TokenChunk::Text("final answer after search".to_string()))
+            .await;
+        tokio::task::yield_now().await;
+        Ok(LlmResponse {
+            content: vec![ContentBlock::text("final answer after search")],
+            end_turn: true,
+            usage: Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+        })
+    }
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn model_id(&self) -> &str {
+        "test-model"
+    }
+}
+
+#[tokio::test]
+async fn agent_loop_executes_tool_then_answers() {
+    let db = Database::open_in_memory().await.unwrap();
+    build_linear_chain(&db, &["ag-a", "ag-b"]).await;
+    add_continuation_summary(&db, "ag-a", "set up the limiter").await;
+    add_user_message(&db, "ag-b", 0, "the rate limiter uses a token bucket").await;
+
+    let llm: Arc<ScriptedToolLlm> = Arc::new(ScriptedToolLlm {
+        complete_calls: AtomicUsize::new(0),
+    });
+    let registry = registry_with_service(llm.clone() as Arc<dyn LlmService>);
+    let qa = ChainQa::new(db.clone(), registry, test_retriever(&db));
+
+    // Index must be populated for the search tool to find the leaf message;
+    // add_message indexes on insert, so it already is.
+    let qa_id = qa
+        .submit_question_blocking("ag-a", "how does rate limiting work here?")
+        .await
+        .unwrap();
+
+    let history = qa.list_history("ag-a").await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].id, qa_id);
+    assert_eq!(history[0].status, ChainQaStatus::Completed);
+    assert_eq!(
+        history[0].answer.as_deref(),
+        Some("final answer after search"),
+    );
+    assert_eq!(
+        llm.complete_calls.load(Ordering::SeqCst),
+        2,
+        "one planning turn that searches + one planning turn that's ready (answer streams separately)",
+    );
+}
+
+/// The skeleton and search hits render member ids as `#<id>`, and the tool
+/// tells the model to pass an id "from the skeleton or a search result" — so a
+/// `#`-prefixed id must be accepted, not rejected as out-of-chain.
+#[tokio::test]
+async fn read_conversation_accepts_hash_prefixed_id() {
+    let db = Database::open_in_memory().await.unwrap();
+    build_linear_chain(&db, &["rd-a", "rd-b"]).await;
+    add_user_message(&db, "rd-b", 0, "hello from b").await;
+
+    let llm = CountingLlm::new("unused");
+    let registry = registry_with_service(llm as Arc<dyn LlmService>);
+    let qa = ChainQa::new(db.clone(), registry, test_retriever(&db));
+    let members = vec!["rd-a".to_string(), "rd-b".to_string()];
+
+    let (out, is_error) = qa
+        .execute_tool(
+            "read_conversation",
+            &serde_json::json!({ "conversation_id": "#rd-b" }),
+            &members,
+        )
+        .await;
+
+    assert!(!is_error, "hash-prefixed id should be accepted, got: {out}");
+    assert!(
+        out.contains("hello from b"),
+        "read should return the member's content, got: {out}",
+    );
+}
+
+/// `read_page` streams the requested window without materializing the whole
+/// transcript, and its slicing/“more” marker match a simple full-render slice.
+#[test]
+fn read_page_paginates_large_transcript() {
+    let big = "x".repeat(READ_PAGE_CHARS + 500);
+    let messages = vec![crate::db::Message {
+        message_id: "m0".into(),
+        conversation_id: "c".into(),
+        sequence_id: 0,
+        message_type: MessageType::User,
+        content: MessageContent::user(big),
+        display_data: None,
+        usage_data: None,
+        created_at: chrono::Utc::now(),
+    }];
+
+    // Page 1: full window + a "more" marker pointing at the next cursor.
+    let page1 = read_page(&messages, 0);
+    assert!(
+        page1.starts_with("User: x"),
+        "got: {}",
+        page1.chars().take(20).collect::<String>()
+    );
+    assert!(page1.contains("more content"), "page 1 should signal more");
+    assert!(page1.contains(&format!("cursor={READ_PAGE_CHARS}")));
+
+    // Page 2: the tail, no further marker.
+    let page2 = read_page(&messages, READ_PAGE_CHARS);
+    assert!(!page2.contains("more content"), "page 2 is the final page");
+
+    // A cursor at/after the end yields the terminal marker.
+    assert_eq!(read_page(&messages, 1_000_000), "(end of conversation)");
+}
+
+/// `read_conversation`'s transcript renderer surfaces content that lives outside
+/// plain text: expanded skill bodies, server-side tool blocks, and a visible
+/// marker for image payloads it can't render.
+#[test]
+fn render_full_transcript_surfaces_skill_body_images_and_server_tools() {
+    let mk = |seq: i64, mt: MessageType, content: MessageContent| crate::db::Message {
+        message_id: format!("m{seq}"),
+        conversation_id: "c".to_string(),
+        sequence_id: seq,
+        message_type: mt,
+        content,
+        display_data: None,
+        usage_data: None,
+        created_at: chrono::Utc::now(),
+    };
+
+    let messages = vec![
+        mk(
+            0,
+            MessageType::Skill,
+            MessageContent::Skill(crate::db::SkillContent {
+                name: "build".into(),
+                body: "EXPANDED SKILL BODY".into(),
+                trigger: "/build now".into(),
+                files: vec![],
+            }),
+        ),
+        mk(
+            1,
+            MessageType::User,
+            MessageContent::user_with_images(
+                "look at this",
+                vec![crate::db::ImageData {
+                    data: "AAA".into(),
+                    media_type: "image/png".into(),
+                }],
+            ),
+        ),
+        mk(
+            2,
+            MessageType::Agent,
+            MessageContent::agent(vec![ContentBlock::WebSearchToolResult {
+                tool_use_id: "w1".into(),
+                content: serde_json::json!({ "found": "the answer" }),
+            }]),
+        ),
+    ];
+
+    let rendered = render_full_transcript(&messages);
+    assert!(
+        rendered.contains("EXPANDED SKILL BODY"),
+        "skill body must be included: {rendered}",
+    );
+    assert!(
+        rendered.contains("image(s) attached"),
+        "user image gap must be marked: {rendered}",
+    );
+    assert!(
+        rendered.contains("web search result") && rendered.contains("the answer"),
+        "server-side tool block must be rendered: {rendered}",
+    );
+}
+
+// --- agent loop bounding -----------------------------------------------------
+
+/// An LLM that never stops: every planning `complete()` issues another
+/// `search_conversations` call, so without a turn cap the agent would loop
+/// forever. `complete_streaming` returns the forced final answer.
+#[derive(Debug, Default)]
+struct AlwaysSearchLlm {
+    complete_calls: AtomicUsize,
+}
+
+#[async_trait]
+impl LlmService for AlwaysSearchLlm {
+    async fn complete(&self, _request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+        self.complete_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(LlmResponse {
+            content: vec![ContentBlock::ToolUse {
+                id: "loop".to_string(),
+                name: "search_conversations".to_string(),
+                input: serde_json::json!({ "query": "again" }),
+            }],
+            end_turn: false,
+            usage: Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+        })
+    }
+
+    async fn complete_streaming(
+        &self,
+        _request: &LlmRequest,
+        chunk_tx: &tokio::sync::mpsc::Sender<TokenChunk>,
+    ) -> Result<LlmResponse, LlmError> {
+        let _ = chunk_tx
+            .send(TokenChunk::Text("forced final answer".to_string()))
+            .await;
+        tokio::task::yield_now().await;
+        Ok(LlmResponse {
+            content: vec![ContentBlock::text("forced final answer")],
+            end_turn: true,
+            usage: Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+        })
+    }
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn model_id(&self) -> &str {
+        "test-model"
+    }
+}
+
+/// A runaway tool-caller must be bounded by `MAX_QA_TURNS`, not loop forever.
+/// The final allowed turn streams the answer instead of planning, so planning
+/// `complete()` runs exactly `MAX_QA_TURNS - 1` times and the Q&A still settles
+/// as `Completed`.
+#[tokio::test]
+async fn agent_loop_is_bounded_when_tools_never_stop() {
+    let db = Database::open_in_memory().await.unwrap();
+    build_linear_chain(&db, &["lp-a", "lp-b"]).await;
+    add_user_message(&db, "lp-b", 0, "leaf content").await;
+
+    let llm: Arc<AlwaysSearchLlm> = Arc::new(AlwaysSearchLlm::default());
+    let registry = registry_with_service(llm.clone() as Arc<dyn LlmService>);
+    let qa = ChainQa::new(db.clone(), registry, test_retriever(&db));
+
+    let qa_id = qa
+        .submit_question_blocking("lp-a", "never satisfied?")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        llm.complete_calls.load(Ordering::SeqCst),
+        MAX_QA_TURNS - 1,
+        "planning turns must be capped at MAX_QA_TURNS - 1",
+    );
+
+    let history = qa.list_history("lp-a").await.unwrap();
+    assert_eq!(history[0].id, qa_id);
+    assert_eq!(history[0].status, ChainQaStatus::Completed);
+    assert_eq!(history[0].answer.as_deref(), Some("forced final answer"));
+}
+
+// --- execute_tool input validation ------------------------------------------
+
+/// A `ChainQa` whose LLM is never invoked — for direct `execute_tool` tests.
+fn qa_for_tool_tests(db: &Database) -> ChainQa {
+    let llm = CountingLlm::new("unused");
+    let registry = registry_with_service(llm as Arc<dyn LlmService>);
+    ChainQa::new(db.clone(), registry, test_retriever(db))
+}
+
+#[tokio::test]
+async fn execute_tool_rejects_blank_search_query() {
+    let db = Database::open_in_memory().await.unwrap();
+    let qa = qa_for_tool_tests(&db);
+    // Blank query is refused before any retrieval, so no index setup is needed.
+    let (out, is_error) = qa
+        .execute_tool(
+            "search_conversations",
+            &serde_json::json!({ "query": "   " }),
+            &["m-a".to_string()],
+        )
+        .await;
+    assert!(is_error, "blank query must be an error: {out}");
+    assert!(out.contains("non-empty"), "got: {out}");
+}
+
+#[tokio::test]
+async fn execute_tool_read_conversation_requires_an_id() {
+    let db = Database::open_in_memory().await.unwrap();
+    let qa = qa_for_tool_tests(&db);
+    let (out, is_error) = qa
+        .execute_tool(
+            "read_conversation",
+            &serde_json::json!({}),
+            &["m-a".to_string()],
+        )
+        .await;
+    assert!(is_error, "missing id must be an error: {out}");
+    assert!(out.contains("requires 'conversation_id'"), "got: {out}");
+}
+
+#[tokio::test]
+async fn execute_tool_read_conversation_refuses_out_of_scope_member() {
+    let db = Database::open_in_memory().await.unwrap();
+    let qa = qa_for_tool_tests(&db);
+    // The agent is scope-bound to the chain: a read outside the member set is
+    // refused (REQ-RET-008), even if that conversation exists elsewhere.
+    let (out, is_error) = qa
+        .execute_tool(
+            "read_conversation",
+            &serde_json::json!({ "conversation_id": "outsider" }),
+            &["sc-a".to_string()],
+        )
+        .await;
+    assert!(is_error, "out-of-scope read must be an error: {out}");
+    assert!(out.contains("not part of this chain"), "got: {out}");
+}
+
+#[tokio::test]
+async fn execute_tool_read_conversation_clamps_oversized_cursor() {
+    let db = Database::open_in_memory().await.unwrap();
+    build_linear_chain(&db, &["cc-a", "cc-b"]).await;
+    add_user_message(&db, "cc-a", 0, "some content").await;
+    let qa = qa_for_tool_tests(&db);
+
+    // A cursor past the end must yield the terminal marker, never panic on the
+    // u64→usize narrowing.
+    let (out, is_error) = qa
+        .execute_tool(
+            "read_conversation",
+            &serde_json::json!({ "conversation_id": "cc-a", "cursor": u64::MAX }),
+            &["cc-a".to_string(), "cc-b".to_string()],
+        )
+        .await;
+    assert!(!is_error, "oversized cursor is not an error: {out}");
+    assert_eq!(out, "(end of conversation)");
+}
+
+#[tokio::test]
+async fn execute_tool_rejects_unknown_tool_name() {
+    let db = Database::open_in_memory().await.unwrap();
+    let qa = qa_for_tool_tests(&db);
+    let (out, is_error) = qa
+        .execute_tool("frobnicate", &serde_json::json!({}), &["m-a".to_string()])
+        .await;
+    assert!(is_error, "unknown tool must be an error: {out}");
+    assert!(out.contains("unknown tool 'frobnicate'"), "got: {out}");
+}

@@ -10462,7 +10462,7 @@ mod scope_liveness_tests {
         // A → B → C, all on the shared worktree.
         let scope = create_handleless_work_conv(&mgr, "A", worktree, None).await;
         create_handleless_work_conv(&mgr, "B", worktree, Some("A")).await;
-        create_handleless_work_conv(&mgr, "C", worktree, Some("B")).await;
+        create_handleless_work_conv(&mgr, "C", worktree, Some("A")).await;
         set_context_exhausted(&mgr, "A").await;
         set_context_exhausted(&mgr, "B").await;
         wire_continuation(&mgr, "A", "B").await;
@@ -10498,7 +10498,7 @@ mod scope_liveness_tests {
 
         let scope = create_handleless_work_conv(&mgr, "A", worktree, None).await;
         create_handleless_work_conv(&mgr, "B", worktree, Some("A")).await;
-        create_handleless_work_conv(&mgr, "C", worktree, Some("B")).await; // stays non-terminal (live)
+        create_handleless_work_conv(&mgr, "C", worktree, Some("A")).await; // stays non-terminal (live)
         set_context_exhausted(&mgr, "A").await;
         set_context_exhausted(&mgr, "B").await;
         wire_continuation(&mgr, "A", "B").await;

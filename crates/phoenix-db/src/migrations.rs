@@ -380,6 +380,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "retain_dormant_product_lifecycle_projection",
         sql: MIGRATION_072,
     },
+    Migration {
+        version: 73,
+        name: "forbid_recursive_subordinate_parents",
+        sql: MIGRATION_073,
+    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -2066,6 +2071,39 @@ BEGIN
 END;
 
 CREATE UNIQUE INDEX close_obligations_one_active_per_product ON close_obligations(product_conversation_id) WHERE phase <> 'completed';
+";
+
+const MIGRATION_073: &str = r"
+DROP TRIGGER IF EXISTS conversations_validate_product_parent_on_insert;
+DROP TRIGGER IF EXISTS conversations_validate_product_parent_on_update;
+
+CREATE TRIGGER conversations_validate_product_parent_on_insert
+BEFORE INSERT ON conversations
+FOR EACH ROW WHEN
+    (NEW.runtime_role = 'sub_agent' AND NOT EXISTS (
+        SELECT 1 FROM conversations parent
+        WHERE parent.id = NEW.parent_conversation_id
+          AND parent.product_conversation_id = NEW.product_conversation_id
+          AND parent.runtime_role IN ('user', 'coordinator')
+    ))
+    OR (NEW.runtime_role <> 'sub_agent' AND NEW.parent_conversation_id IS NOT NULL)
+BEGIN
+    SELECT RAISE(ABORT, 'subordinate parent must be a same-ProductConversation user or coordinator');
+END;
+
+CREATE TRIGGER conversations_validate_product_parent_on_update
+BEFORE UPDATE OF parent_conversation_id, product_conversation_id, runtime_role ON conversations
+FOR EACH ROW WHEN
+    (NEW.runtime_role = 'sub_agent' AND NOT EXISTS (
+        SELECT 1 FROM conversations parent
+        WHERE parent.id = NEW.parent_conversation_id
+          AND parent.product_conversation_id = NEW.product_conversation_id
+          AND parent.runtime_role IN ('user', 'coordinator')
+    ))
+    OR (NEW.runtime_role <> 'sub_agent' AND NEW.parent_conversation_id IS NOT NULL)
+BEGIN
+    SELECT RAISE(ABORT, 'subordinate parent must be a same-ProductConversation user or coordinator');
+END;
 ";
 
 const MIGRATION_072: &str = r"
@@ -11999,7 +12037,8 @@ mod tests {
             "INSERT INTO _migrations (version, name)
              VALUES (70, 'temporarily_skip_product_conversation_migration'),
                     (71, 'temporarily_skip_product_conversation_lifecycle_correction'),
-                    (72, 'temporarily_skip_product_conversation_lifecycle_retention')",
+                    (72, 'temporarily_skip_product_conversation_lifecycle_retention'),
+                    (73, 'temporarily_skip_recursive_subordinate_parent_invariant')",
         )
         .execute(&pool)
         .await
@@ -12864,6 +12903,13 @@ mod tests {
 
     async fn setup_schema_before_migration_070(pool: &SqlitePool) {
         setup_legacy_conversations_table(pool).await;
+        sqlx::raw_sql(
+            "DROP TRIGGER IF EXISTS conversations_validate_product_parent_on_insert;
+             DROP TRIGGER IF EXISTS conversations_validate_product_parent_on_update;",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
         sqlx::query(
             "CREATE TABLE _migrations (
                  version INTEGER PRIMARY KEY,
@@ -12878,13 +12924,14 @@ mod tests {
             "INSERT INTO _migrations (version, name)
              VALUES (70, 'temporarily_skip_product_conversation_migration'),
                     (71, 'temporarily_skip_product_conversation_lifecycle_correction'),
-                    (72, 'temporarily_skip_product_conversation_lifecycle_retention')",
+                    (72, 'temporarily_skip_product_conversation_lifecycle_retention'),
+                    (73, 'temporarily_skip_recursive_subordinate_parent_invariant')",
         )
         .execute(pool)
         .await
         .unwrap();
         run_pending_migrations(pool).await.unwrap();
-        sqlx::query("DELETE FROM _migrations WHERE version IN (70, 71, 72)")
+        sqlx::query("DELETE FROM _migrations WHERE version IN (70, 71, 72, 73)")
             .execute(pool)
             .await
             .unwrap();
@@ -12929,7 +12976,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 4);
 
         for blank_id in ["   ", "\t", "\n", " \t\n "] {
             assert!(sqlx::query(
@@ -13035,7 +13082,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 4);
         let membership: String = sqlx::query_scalar(
             "SELECT product_conversation_id FROM conversations WHERE id = 'orphan-worker'",
         )
@@ -13417,6 +13464,26 @@ mod tests {
         .execute(&pool)
         .await
         .is_err());
+        assert!(sqlx::query(
+            "INSERT INTO conversations (
+                 id, product_conversation_id, parent_conversation_id, runtime_role,
+                 user_initiated, state_updated_at, created_at, updated_at
+             ) VALUES (
+                 'recursive-child', 'ordinary-a', 'a-fork', 'sub_agent', 0,
+                 '2025-01-01', '2025-01-01', '2025-01-01'
+             )",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            "UPDATE conversations SET parent_conversation_id = 'a-fork'
+             WHERE id = 'valid-child'",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+
         assert!(sqlx::query(
             "UPDATE conversations SET parent_conversation_id = NULL
              WHERE id = 'valid-child'",
