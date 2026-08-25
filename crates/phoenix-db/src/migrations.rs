@@ -2126,7 +2126,8 @@ CREATE TRIGGER consume_continuation_dispatch_intent
 AFTER INSERT ON messages
 WHEN EXISTS (
     SELECT 1 FROM continuation_dispatch_intents intent
-    WHERE intent.message_id = NEW.message_id
+    WHERE (NEW.message_id = intent.message_id
+           OR NEW.message_id = intent.successor_conversation_id || ':' || intent.message_id)
       AND intent.successor_conversation_id = NEW.conversation_id
 )
 BEGIN
@@ -2140,12 +2141,16 @@ BEGIN
     JOIN messages continuation
       ON continuation.conversation_id = intent.parent_conversation_id
      AND continuation.message_type = 'continuation'
-    WHERE intent.message_id = NEW.message_id
+    WHERE (NEW.message_id = intent.message_id
+           OR NEW.message_id = intent.successor_conversation_id || ':' || intent.message_id)
       AND intent.successor_conversation_id = NEW.conversation_id
     ORDER BY continuation.sequence_id DESC, continuation.message_id DESC
     LIMIT 1;
 
-    DELETE FROM continuation_dispatch_intents WHERE message_id = NEW.message_id;
+    DELETE FROM continuation_dispatch_intents
+    WHERE successor_conversation_id = NEW.conversation_id
+      AND (message_id = NEW.message_id
+           OR NEW.message_id = successor_conversation_id || ':' || message_id);
 END;
 ";
 

@@ -286,13 +286,22 @@ pub struct ProductConversationSegmentView {
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 #[ts(export, export_to = "../../../ui/src/generated/")]
-pub struct ProductConversationHandoffView {
-    pub predecessor_transcript_row_id: String,
-    pub successor_transcript_row_id: String,
-    pub continuation_message_id: String,
-    pub accepted_successor_message_id: String,
-    pub summary: String,
+pub enum ProductConversationHandoffView {
+    Completed {
+        predecessor_transcript_row_id: String,
+        successor_transcript_row_id: String,
+        continuation_message_id: String,
+        accepted_successor_message_id: String,
+        summary: String,
+    },
+    Historical {
+        predecessor_transcript_row_id: String,
+        successor_transcript_row_id: String,
+        continuation_message_id: String,
+        summary: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, TS)]

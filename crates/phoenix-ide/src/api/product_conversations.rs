@@ -17,9 +17,9 @@ use super::types::{
 };
 use super::AppState;
 use crate::db::{
-    DbError, ProductConversationAggregate, ProductConversationListProjection,
-    ProductConversationSegment, ProductConversationSegmentCeiling, ProductConversationSource,
-    ProductConversationSourceKind,
+    DbError, ProductConversationAggregate, ProductConversationHandoff,
+    ProductConversationListProjection, ProductConversationSegment,
+    ProductConversationSegmentCeiling, ProductConversationSource, ProductConversationSourceKind,
 };
 use crate::send_chat_service::accepts_user_message_direct_or_steering;
 
@@ -268,10 +268,12 @@ fn aggregate_messages(
         .iter()
         .filter_map(|segment| segment.handoff.as_ref())
         .flat_map(|handoff| {
-            [
-                handoff.continuation_message_id.as_str(),
-                handoff.accepted_successor_message_id.as_str(),
-            ]
+            std::iter::once(handoff.continuation_message_id()).chain(
+                handoff
+                    .accepted_is_duplicate_summary()
+                    .then(|| handoff.accepted_successor_message_id())
+                    .flatten(),
+            )
         })
         .collect::<std::collections::HashSet<_>>();
     let mut by_segment = std::collections::HashMap::<String, Vec<_>>::new();
@@ -337,14 +339,38 @@ fn segment_view(
         handoff: segment
             .handoff
             .as_ref()
-            .filter(|handoff| page_boundary_message_ids.contains(&handoff.continuation_message_id))
-            .map(|handoff| ProductConversationHandoffView {
-                predecessor_transcript_row_id: handoff.predecessor_transcript_row_id.clone(),
-                successor_transcript_row_id: handoff.successor_transcript_row_id.clone(),
-                continuation_message_id: handoff.continuation_message_id.clone(),
-                accepted_successor_message_id: handoff.accepted_successor_message_id.clone(),
-                summary: handoff.summary.clone(),
-            }),
+            .filter(|handoff| page_boundary_message_ids.contains(handoff.continuation_message_id()))
+            .map(handoff_view),
+    }
+}
+
+fn handoff_view(handoff: &ProductConversationHandoff) -> ProductConversationHandoffView {
+    match handoff {
+        ProductConversationHandoff::Completed {
+            predecessor_transcript_row_id,
+            successor_transcript_row_id,
+            continuation_message_id,
+            accepted_successor_message_id,
+            summary,
+            ..
+        } => ProductConversationHandoffView::Completed {
+            predecessor_transcript_row_id: predecessor_transcript_row_id.clone(),
+            successor_transcript_row_id: successor_transcript_row_id.clone(),
+            continuation_message_id: continuation_message_id.clone(),
+            accepted_successor_message_id: accepted_successor_message_id.clone(),
+            summary: summary.clone(),
+        },
+        ProductConversationHandoff::Historical {
+            predecessor_transcript_row_id,
+            successor_transcript_row_id,
+            continuation_message_id,
+            summary,
+        } => ProductConversationHandoffView::Historical {
+            predecessor_transcript_row_id: predecessor_transcript_row_id.clone(),
+            successor_transcript_row_id: successor_transcript_row_id.clone(),
+            continuation_message_id: continuation_message_id.clone(),
+            summary: summary.clone(),
+        },
     }
 }
 
@@ -607,7 +633,7 @@ mod tests {
             .add_message(
                 opening_message_id,
                 &successor.id,
-                &MessageContent::user("accepted opening handoff"),
+                &MessageContent::user("exact persisted handoff"),
                 None,
                 None,
             )
@@ -670,7 +696,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!(
-                        "/api/product-conversations/{}?message_limit=1",
+                        "/api/product-conversations/{}?message_limit=2",
                         successor.id
                     ))
                     .body(Body::empty())
@@ -688,6 +714,7 @@ mod tests {
             format!("/product-conversations/{}", root.product_conversation_id)
         );
         assert_eq!(snapshot["segments"][0]["segment_ordinal"], 0);
+        assert_eq!(snapshot["segments"][0]["handoff"]["kind"], "completed");
         assert_eq!(
             snapshot["segments"][0]["handoff"]["continuation_message_id"],
             "handoff"
@@ -705,6 +732,133 @@ mod tests {
                 |message| message["message_id"] != "handoff" && message["message_id"] != "opening"
             ));
         assert_eq!(snapshot["writable_transcript_row_id"], successor.id);
+    }
+
+    #[tokio::test]
+    async fn edited_completed_opening_remains_an_ordinary_message() {
+        let state = make_test_state().await;
+        let root = state
+            .db
+            .create_conversation("root", "root", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        create_completed_continuation(&state, &root, "handoff", "opening").await;
+        sqlx::query("UPDATE messages SET content = ? WHERE message_id = 'opening'")
+            .bind(
+                serde_json::to_string(&MessageContent::user("edited opening").to_stored_json())
+                    .unwrap(),
+            )
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/product-conversations/{}", root.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(snapshot["segments"][0]["handoff"]["kind"], "completed");
+        assert!(snapshot["segments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|segment| segment["messages"].as_array().unwrap())
+            .any(|message| message["message_id"] == "opening"));
+        assert!(snapshot["segments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|segment| segment["messages"].as_array().unwrap())
+            .all(|message| message["message_id"] != "handoff"));
+    }
+
+    #[tokio::test]
+    async fn historical_edge_renders_boundary_without_successor_message_id() {
+        let state = make_test_state().await;
+        let root = state
+            .db
+            .create_conversation("root", "root", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        state
+            .db
+            .update_conversation_state(
+                &root.id,
+                &ConvState::ContextExhausted {
+                    summary: "exhausted".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let successor = match state.db.continue_conversation(&root.id).await.unwrap() {
+            ContinueOutcome::Created(conversation) => conversation,
+            other @ (ContinueOutcome::AlreadyContinued(_)
+            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("expected continuation, got {other:?}")
+            }
+        };
+        state
+            .db
+            .add_message(
+                "legacy-handoff",
+                &root.id,
+                &MessageContent::Continuation(ContinuationContent {
+                    summary: "legacy persisted handoff".to_string(),
+                }),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .add_message(
+                "legacy-opening",
+                &successor.id,
+                &MessageContent::user("legacy opening"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/product-conversations/{}", root.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let handoff = &snapshot["segments"][0]["handoff"];
+        assert_eq!(handoff["kind"], "historical");
+        assert_eq!(handoff["continuation_message_id"], "legacy-handoff");
+        assert!(handoff.get("accepted_successor_message_id").is_none());
+        assert!(snapshot["segments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|segment| segment["messages"].as_array().unwrap())
+            .all(|message| message["message_id"] != "legacy-handoff"));
+        assert!(snapshot["segments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|segment| segment["messages"].as_array().unwrap())
+            .any(|message| message["message_id"] == "legacy-opening"));
     }
 
     #[tokio::test]
