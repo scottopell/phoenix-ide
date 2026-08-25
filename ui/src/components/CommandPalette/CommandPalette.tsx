@@ -105,22 +105,12 @@ export function CommandPalette({ conversations, activeConversation }: CommandPal
         navigate,
         currentSlug,
         archiveCurrent: currentSlug
-          ? () => {
+          ? (() => {
               const activeRoute = activeConvId ?? currentSlug;
               const conv = conversations.find(c => c.id === activeRoute || c.slug === activeRoute);
-              if (!conv) return;
-              // Chain members must archive at the chain level — per-conv
-              // archive returns 409 chain_member. Walk to the chain root and
-              // call the chain endpoint instead. Standalone conversations
-              // keep the per-conv path.
-              const roots = computeChainRoots(conversations);
-              const rootId = roots.get(conv.id);
-              if (rootId) {
-                api.archiveChain(rootId).then(() => navigate('/'));
-              } else {
-                api.archiveConversation(conv.id).then(() => navigate('/'));
-              }
-            }
+              if (!conv || computeChainRoots(conversations).get(conv.id) != null) return undefined;
+              return () => api.archiveConversation(conv.id).then(() => navigate('/'));
+            })()
           : undefined,
       }),
     [navigate, currentSlug, activeConvId, conversations],

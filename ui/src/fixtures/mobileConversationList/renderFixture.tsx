@@ -44,8 +44,6 @@ export function MobileConversationListFixtureBody({ scenario }: Props) {
           onArchive={() => {}}
           onDelete={() => {}}
           onRename={() => {}}
-          onArchiveChain={() => {}}
-          onDeleteChain={() => {}}
           onConversationClick={() => {}}
           listDensity="mobile"
           authChip={<span className="mobile-conversation-list-fixture-auth">✓</span>}
