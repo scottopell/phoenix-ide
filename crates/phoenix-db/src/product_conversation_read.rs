@@ -186,8 +186,13 @@ impl Database {
                  FROM conversations root
                  JOIN product_conversations product ON product.id = root.product_conversation_id
                  WHERE product.kind = 'ordinary'
+                   AND root.user_initiated = 1
                    AND root.runtime_role = 'user'
                    AND root.parent_conversation_id IS NULL
+                   AND NOT (root.archived = 1 AND EXISTS (
+                       SELECT 1 FROM conversation_creation_jobs job
+                       WHERE job.conversation_id = root.id AND job.status = 'deletion_pending'
+                   ))
                    AND NOT EXISTS (
                        SELECT 1 FROM conversations predecessor
                        WHERE predecessor.product_conversation_id = root.product_conversation_id

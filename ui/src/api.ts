@@ -1630,6 +1630,15 @@ export const api = {
     return resp.json();
   },
 
+  async getProductConversationRoute(productConversationId: string): Promise<ConversationRouteResponse> {
+    const resp = await fetch(`/api/product-conversations/${encodeURIComponent(productConversationId)}/route`);
+    if (!resp.ok) {
+      if (resp.status === 404) throw new Error('Conversation not found');
+      throw new Error('Failed to resolve product conversation route');
+    }
+    return resp.json();
+  },
+
   async getConversationRouteBySlug(slug: string): Promise<ConversationRouteResponse> {
     const resp = await fetch(`/api/conversations/by-slug/${encodeURIComponent(slug)}/route`);
     if (!resp.ok) {

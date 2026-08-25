@@ -136,6 +136,10 @@ pub fn create_router(state: AppState) -> Router {
             get(get_product_conversation),
         )
         .route(
+            "/api/product-conversations/:reference/route",
+            get(get_product_conversation_route),
+        )
+        .route(
             "/api/global/coordinator",
             get(get_existing_coordinator).post(ensure_coordinator),
         )
@@ -3402,25 +3406,41 @@ async fn get_conversation_route(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<ConversationRouteResponse>, AppError> {
-    let db = state.runtime.db();
-    let conversation = match db.get_conversation(&id).await {
-        Ok(conversation) => conversation,
-        Err(DbError::ConversationNotFound(_)) => {
-            match db.resolve_ordinary_product_conversation(&id).await {
-                Ok(resolved) => {
-                    db.get_ordinary_product_conversation(&resolved.product_conversation_id)
-                        .await
-                        .map_err(|error| AppError::NotFound(error.to_string()))?
-                        .root
-                        .conversation
-                }
-                Err(DbError::ConversationNotFound(_)) => return Err(AppError::NotFound(id)),
-                Err(error) => return Err(AppError::Internal(error.to_string())),
-            }
-        }
-        Err(error) => return Err(AppError::Internal(error.to_string())),
-    };
+    let conversation = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(product_route_db_to_app)?;
 
+    Ok(Json(ConversationRouteResponse {
+        id: conversation.id,
+        slug: conversation.slug,
+    }))
+}
+
+fn product_route_db_to_app(error: DbError) -> AppError {
+    match error {
+        DbError::ConversationNotFound(id) => AppError::NotFound(id),
+        error => AppError::Internal(error.to_string()),
+    }
+}
+
+async fn get_product_conversation_route(
+    State(state): State<AppState>,
+    Path(reference): Path<String>,
+) -> Result<Json<ConversationRouteResponse>, AppError> {
+    let db = state.runtime.db();
+    let resolved = db
+        .resolve_ordinary_product_conversation(&reference)
+        .await
+        .map_err(product_route_db_to_app)?;
+    let conversation = db
+        .get_ordinary_product_conversation(&resolved.product_conversation_id)
+        .await
+        .map_err(product_route_db_to_app)?
+        .root
+        .conversation;
     Ok(Json(ConversationRouteResponse {
         id: conversation.id,
         slug: conversation.slug,
@@ -16523,7 +16543,7 @@ mod conversation_route_tests {
     use crate::db::{ContinuationContent, ContinueOutcome, ConvState, MessageContent};
 
     #[tokio::test]
-    async fn route_resolves_product_conversation_id_to_its_canonical_root() {
+    async fn product_conversation_route_resolves_product_id_to_its_canonical_root() {
         let state = make_test_state().await;
         let root = state
             .db
@@ -16564,7 +16584,7 @@ mod conversation_route_tests {
             .oneshot(
                 Request::builder()
                     .uri(format!(
-                        "/api/conversations/{}/route",
+                        "/api/product-conversations/{}/route",
                         root.product_conversation_id
                     ))
                     .body(Body::empty())
@@ -16579,6 +16599,62 @@ mod conversation_route_tests {
         assert_eq!(body["id"], root.id);
         assert_eq!(body["slug"], "root-slug");
         assert_ne!(body["id"], successor.id);
+    }
+
+    #[tokio::test]
+    async fn product_route_namespace_does_not_shadow_a_conversation_id() {
+        let state = make_test_state().await;
+        let root = state
+            .db
+            .create_conversation("root", "root", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let colliding = state
+            .db
+            .create_conversation(
+                &root.product_conversation_id.to_string(),
+                "collision",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let direct = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/conversations/{}/route",
+                        root.product_conversation_id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let direct: serde_json::Value =
+            serde_json::from_slice(&to_bytes(direct.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(direct["id"], colliding.id);
+
+        let product = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/product-conversations/{}/route",
+                        root.product_conversation_id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let product: serde_json::Value =
+            serde_json::from_slice(&to_bytes(product.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(product["id"], root.id);
     }
 }
 

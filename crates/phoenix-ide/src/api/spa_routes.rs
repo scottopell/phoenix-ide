@@ -72,6 +72,10 @@ pub const SPA_ROUTES: &[SpaRoute] = &[
         pattern: "/c/:slug",
     },
     SpaRoute::Param {
+        prefix: "/product-conversations/",
+        pattern: "/product-conversations/:productConversationId",
+    },
+    SpaRoute::Param {
         prefix: "/chains/",
         pattern: "/chains/:rootConvId",
     },
@@ -98,6 +102,7 @@ mod tests {
         assert!(is_spa_route("/settings/llm-language"));
         assert!(is_spa_route("/codex/login"));
         assert!(is_spa_route("/c/some-slug"));
+        assert!(is_spa_route("/product-conversations/product-id"));
         assert!(is_spa_route("/chains/root-conv-id"));
     }
 

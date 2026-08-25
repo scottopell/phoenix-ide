@@ -24,6 +24,7 @@ use crate::send_chat_service::accepts_user_message_direct_or_steering;
 
 const DEFAULT_MESSAGE_LIMIT: usize = 50;
 const MAX_MESSAGE_LIMIT: usize = 200;
+const PRODUCT_CONVERSATION_ROUTE_PREFIX: &str = "/product-conversations/";
 
 #[derive(Debug, Deserialize)]
 pub struct SnapshotQuery {
@@ -110,20 +111,25 @@ pub async fn get_product_conversation(
 }
 
 fn canonical_route(aggregate: &ProductConversationAggregate) -> String {
-    format!("/c/{}", aggregate.product_conversation.id())
+    format!(
+        "{PRODUCT_CONVERSATION_ROUTE_PREFIX}{}",
+        aggregate.product_conversation.id()
+    )
 }
 
 fn list_row(projection: &ProductConversationListProjection) -> ProductConversationListRow {
     ProductConversationListRow {
         product_conversation_id: projection.product_conversation_id.to_string(),
-        canonical_route: format!("/c/{}", projection.product_conversation_id),
+        canonical_route: format!(
+            "{PRODUCT_CONVERSATION_ROUTE_PREFIX}{}",
+            projection.product_conversation_id
+        ),
         canonical_root: ProductConversationTranscriptRowView {
             transcript_row_id: projection.root_transcript_row_id.clone(),
             slug: projection.root_slug.clone(),
             title: projection.root_title.clone(),
         },
         ordinary_lifecycle: lifecycle_view(projection.lifecycle),
-        root_transcript_row_id: projection.root_transcript_row_id.clone(),
         latest_transcript_row_id: projection.latest_transcript_row_id.clone(),
         updated_at: projection.updated_at.to_rfc3339(),
         presentation: presentation(
@@ -182,7 +188,6 @@ async fn snapshot_view(
         requested_transcript_row_id,
         canonical_root: transcript_row_view(&aggregate.root),
         ordinary_lifecycle: lifecycle_view(lifecycle),
-        root_transcript_row_id: root_id.clone(),
         latest_transcript_row_id: latest_id.clone(),
         writable_transcript_row_id: writable_transcript_row_id(state, lifecycle, &aggregate).await,
         updated_at: aggregate.updated_at.to_rfc3339(),
@@ -608,7 +613,7 @@ mod tests {
         assert_eq!(rows[0]["canonical_root"]["slug"], "root-slug");
         assert_eq!(
             rows[0]["canonical_route"],
-            format!("/c/{}", root.product_conversation_id)
+            format!("/product-conversations/{}", root.product_conversation_id)
         );
         assert_eq!(rows[0]["presentation"]["display_name"], "Root Slug");
         assert_eq!(rows[0]["latest_transcript_row_id"], successor.id);
@@ -632,7 +637,7 @@ mod tests {
         assert_eq!(snapshot["requested_transcript_row_id"], successor.id);
         assert_eq!(
             snapshot["canonical_route"],
-            format!("/c/{}", root.product_conversation_id)
+            format!("/product-conversations/{}", root.product_conversation_id)
         );
         assert_eq!(snapshot["segments"][0]["segment_ordinal"], 0);
         assert_eq!(
@@ -694,7 +699,7 @@ mod tests {
             .create_conversation("root", "root-slug", "/tmp", true, None, None)
             .await
             .unwrap();
-        let expected_route = format!("/c/{}", root.product_conversation_id);
+        let expected_route = format!("/product-conversations/{}", root.product_conversation_id);
         state
             .db
             .rename_conversation(&root.id, "renamed-root")

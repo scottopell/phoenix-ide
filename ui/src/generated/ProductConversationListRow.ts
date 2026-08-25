@@ -3,4 +3,4 @@ import type { OrdinaryProductConversationLifecycleView } from "./OrdinaryProduct
 import type { ProductConversationPresentationView } from "./ProductConversationPresentationView";
 import type { ProductConversationTranscriptRowView } from "./ProductConversationTranscriptRowView";
 
-export type ProductConversationListRow = { product_conversation_id: string, canonical_route: string, canonical_root: ProductConversationTranscriptRowView, ordinary_lifecycle: OrdinaryProductConversationLifecycleView, root_transcript_row_id: string, latest_transcript_row_id: string, updated_at: string, presentation: ProductConversationPresentationView, };
+export type ProductConversationListRow = { product_conversation_id: string, canonical_route: string, canonical_root: ProductConversationTranscriptRowView, ordinary_lifecycle: OrdinaryProductConversationLifecycleView, latest_transcript_row_id: string, updated_at: string, presentation: ProductConversationPresentationView, };
