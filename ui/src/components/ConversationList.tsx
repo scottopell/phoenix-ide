@@ -2,7 +2,7 @@ import { memo, useState, useEffect, useRef, useMemo, useCallback, useLayoutEffec
 import type { ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { getConvDisplayState } from '../api';
-import type { Conversation, CachedPrSummary } from '../api';
+import type { Conversation, CachedPrSummary, ProductConversationListRow } from '../api';
 import { prReviewState } from './prReviewState';
 import { formatRelativeTime, formatShortDateTime } from '../utils';
 import {
@@ -21,8 +21,10 @@ import './ConversationList.css';
 
 
 interface ConversationListProps {
-  conversations: readonly Conversation[];
-  archivedConversations: readonly Conversation[];
+  conversations?: readonly Conversation[];
+  archivedConversations?: readonly Conversation[];
+  productConversations?: readonly ProductConversationListRow[];
+  archivedProductConversations?: readonly ProductConversationListRow[];
   showArchived: boolean;
   onToggleArchived: () => void;
   onNewConversation: () => void;
@@ -30,6 +32,7 @@ interface ConversationListProps {
   onDelete: (conv: Conversation) => void;
   onRename: (conv: Conversation) => void;
   onConversationClick?: (conv: Conversation) => void;
+  onProductConversationClick?: (productConversation: ProductConversationListRow) => void;
   activeSlug?: string | null;
   sidebarMode?: boolean;
   listDensity?: 'full' | 'mobile' | 'sidebar';
@@ -164,6 +167,89 @@ function isActionableDisplayState(displayState: ReturnType<typeof getConvDisplay
 }
 
 export const SidebarPrBadge = PrBadge;
+
+function productConversationDisplayTitle(row: ProductConversationListRow): string {
+  return row.canonical_root.title?.trim()
+    || row.presentation.display_name?.trim()
+    || row.canonical_root.slug?.trim()
+    || row.canonical_root.transcript_row_id;
+}
+
+function productConversationStatusLabel(row: ProductConversationListRow): string {
+  if (row.presentation.kind === 'needs_action') return 'Needs action';
+  switch (row.presentation.presentation_mode) {
+    case 'working': return 'Working';
+    case 'error': return 'Error';
+    case 'done': return 'Completed';
+    default: return row.ordinary_lifecycle === 'history' ? 'History' : 'Open';
+  }
+}
+
+function productConversationStateDotClass(row: ProductConversationListRow): string {
+  if (row.presentation.kind === 'needs_action') return 'awaiting-approval';
+  switch (row.presentation.presentation_mode) {
+    case 'working':
+      return 'working';
+    case 'error':
+      return 'error';
+    case 'done':
+      return 'terminal';
+    default:
+      return row.ordinary_lifecycle === 'history' ? 'terminal' : 'idle';
+  }
+}
+
+const ProductConversationListRowView = memo(function ProductConversationListRowView({
+  row,
+  isActive,
+  listDensity,
+  onClick,
+}: {
+  row: ProductConversationListRow;
+  isActive: boolean;
+  listDensity: 'full' | 'mobile' | 'sidebar';
+  onClick: (row: ProductConversationListRow) => void;
+}) {
+  const classes = [
+    'conv-item',
+    isActive ? 'active' : '',
+    'product-conversation-list-row',
+  ].filter(Boolean).join(' ');
+  const displayTitle = productConversationDisplayTitle(row);
+  const presentationLabel = row.presentation.display_name;
+  const statusTitle = productConversationStatusLabel(row);
+  return (
+    <li className={classes} data-product-conversation-id={row.product_conversation_id}>
+      <div
+        className="conv-item-main"
+        onClick={() => onClick(row)}
+        title={`Open product conversation "${displayTitle}"`}
+      >
+        <div className="conv-item-slug">
+          <span className="conv-item-slug-main">
+            <span
+              className={`conv-state-dot ${productConversationStateDotClass(row)}`}
+              title={statusTitle}
+            />
+            <span className="conv-item-title">{displayTitle}</span>
+          </span>
+        </div>
+        <div className="conv-item-meta">
+          <span className="conv-item-context">{presentationLabel}</span>
+          <span className="conv-item-date" title={formatShortDateTime(row.updated_at)}>
+            {formatRelativeTime(row.updated_at)}
+          </span>
+        </div>
+      </div>
+      {listDensity !== 'mobile' && (
+        <div className="conv-item-secondary-row">
+          <span className="conv-item-secondary-badge">{row.ordinary_lifecycle === 'history' ? 'Archived' : 'Open'}</span>
+          <span className="conv-item-secondary-context">{statusTitle}</span>
+        </div>
+      )}
+    </li>
+  );
+});
 
 export const ConversationRow = memo(function ConversationRow({
   conv,
@@ -518,8 +604,10 @@ const TerminalGlyph = () => (
 );
 
 export function ConversationList({
-  conversations,
-  archivedConversations,
+  conversations = [],
+  archivedConversations = [],
+  productConversations = [],
+  archivedProductConversations = [],
   showArchived,
   onToggleArchived,
   onNewConversation,
@@ -527,6 +615,7 @@ export function ConversationList({
   onDelete,
   onRename,
   onConversationClick,
+  onProductConversationClick,
   activeSlug,
   sidebarMode,
   listDensity,
@@ -558,6 +647,8 @@ export function ConversationList({
   }, [expandedId]);
 
   const displayList = showArchived ? archivedConversations : conversations;
+  const displayProductList = showArchived ? archivedProductConversations : productConversations;
+  const usingProductRows = displayProductList.length > 0 || productConversations.length > 0 || archivedProductConversations.length > 0;
 
   const groupedItems: SidebarItem[] = useMemo(() => {
     const roots = computeChainRoots(displayList);
@@ -662,7 +753,7 @@ export function ConversationList({
 
   const closeRowMenu = useCallback(() => setExpandedId(null), []);
 
-  const isEmpty = displayList.length === 0;
+  const isEmpty = usingProductRows ? displayProductList.length === 0 : displayList.length === 0;
 
   return (
     <section ref={listRootRef} id="conversation-list" className={`view active ${isSidebarLayout ? 'sidebar-mode' : ''} ${isMobileList ? 'mobile-list-density' : ''}`}>
@@ -734,6 +825,19 @@ export function ConversationList({
           <li className="empty-state">
             <p>{`No ${showArchived ? 'archived' : 'active'} conversations${emptyScopeLabel ? ` in ${emptyScopeLabel}` : ''}`}</p>
           </li>
+        ) : usingProductRows ? (
+          displayProductList.map((row) => (
+            <ProductConversationListRowView
+              key={row.product_conversation_id}
+              row={row}
+              isActive={activeSlug === row.product_conversation_id || activeSlug === row.canonical_root.slug || activeSlug === row.canonical_root.transcript_row_id}
+              listDensity={effectiveListDensity}
+              onClick={(productRow) => {
+                if (onProductConversationClick) onProductConversationClick(productRow);
+                else navigate(productRow.canonical_route);
+              }}
+            />
+          ))
         ) : (
           groupedItems.map((item) => {
             if (item.kind === 'single') {

@@ -538,7 +538,7 @@ export function ChainPage() {
  * push channel on the chain page, so `liveInventory` is omitted; the panel
  * keeps its inventory poll alive even while collapsed to refresh the badge.
  */
-function ChainWorkScopeDock({
+export function ChainWorkScopeDock({
   activeConvId,
   workIdentity,
 }: {
@@ -848,7 +848,7 @@ interface ChainQaColumnProps {
   onRetryConnection: () => void;
 }
 
-function ChainQaColumn({
+export function ChainQaColumn({
   chain,
   persisted,
   inflight,

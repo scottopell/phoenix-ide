@@ -80,6 +80,11 @@ export type { ResourceSample } from './generated/ResourceSample';
 export type { BashRingWindow } from './generated/BashRingWindow';
 export type { BashRingLine } from './generated/BashRingLine';
 import type { BashHandleInspection as BashHandleInspectionType } from './generated/BashHandleInspection';
+export type { ProductConversationListResponse } from './generated/ProductConversationListResponse';
+export type { ProductConversationListRow } from './generated/ProductConversationListRow';
+export type { ProductConversationSnapshotView } from './generated/ProductConversationSnapshotView';
+import type { ProductConversationListResponse as ProductConversationListResponseType } from './generated/ProductConversationListResponse';
+import type { ProductConversationSnapshotView as ProductConversationSnapshotViewType } from './generated/ProductConversationSnapshotView';
 
 export interface ConversationContentSearchHit {
   conversation_id: string;
@@ -1254,6 +1259,10 @@ export interface WakeStatus {
   contracts: WakeContractStatus[];
 }
 
+export const streamApi = {
+  subscribeToChainStream,
+};
+
 export const api = {
   async authStatus(): Promise<AuthStatus> {
     const resp = await fetch('/api/auth/status');
@@ -1639,6 +1648,36 @@ export const api = {
     if (!resp.ok) {
       if (resp.status === 404) throw new Error('Conversation not found');
       throw new Error('Failed to resolve product conversation route');
+    }
+    return resp.json();
+  },
+
+  async listProductConversations(): Promise<ProductConversationListResponseType> {
+    const resp = await fetch('/api/product-conversations');
+    if (!resp.ok) {
+      throw new Error('Failed to fetch product conversations');
+    }
+    return resp.json();
+  },
+
+  async getProductConversationSnapshot(
+    productConversationId: string,
+    options?: { message_limit?: number; before?: string | null },
+  ): Promise<ProductConversationSnapshotViewType> {
+    const params = new URLSearchParams();
+    if (typeof options?.message_limit === 'number') {
+      params.set('message_limit', String(options.message_limit));
+    }
+    if (typeof options?.before === 'string' && options.before.length > 0) {
+      params.set('before', options.before);
+    }
+    const query = params.toString();
+    const resp = await fetch(
+      `/api/product-conversations/${encodeURIComponent(productConversationId)}${query ? `?${query}` : ''}`,
+    );
+    if (!resp.ok) {
+      if (resp.status === 404) throw new Error('Conversation not found');
+      throw new Error('Failed to fetch product conversation snapshot');
     }
     return resp.json();
   },

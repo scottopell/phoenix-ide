@@ -175,8 +175,24 @@ interface ConversationPageProps {
   composerQuickAction?: ComposerQuickAction | undefined;
 }
 
+interface EmbeddedConversationPageProps extends ConversationPageProps {
+  slug: string;
+  showTranscript?: boolean;
+}
+
 export function ConversationPage({ routePrefix = '/c', composerQuickAction }: ConversationPageProps) {
   const { slug } = useParams<{ slug: string }>();
+  return slug
+    ? <EmbeddedConversationPage slug={slug} routePrefix={routePrefix} composerQuickAction={composerQuickAction} />
+    : null;
+}
+
+export function EmbeddedConversationPage({
+  slug,
+  routePrefix = '/c',
+  composerQuickAction,
+  showTranscript = true,
+}: EmbeddedConversationPageProps) {
   const navigate = useNavigate();
   const location = useLocation();
 
@@ -199,8 +215,13 @@ export function ConversationPage({ routePrefix = '/c', composerQuickAction }: Co
           which wraps every conversation route. Mounted above
           ConversationPageContent's viewer early-returns so draft persistence
           survives composer unmounts. */}
-      {slug && <DraftLifecycle slug={slug} />}
-      <ConversationPageContent routePrefix={routePrefix} composerQuickAction={composerQuickAction} />
+      <DraftLifecycle slug={slug} />
+      <ConversationPageContent
+        slug={slug}
+        routePrefix={routePrefix}
+        composerQuickAction={composerQuickAction}
+        showTranscript={showTranscript}
+      />
     </ReviewNotesProvider>
   );
 }
@@ -222,13 +243,16 @@ function RecoveryBanner({ message, recoveryKind }: { message: string; recoveryKi
 }
 
 function ConversationPageContent({
+  slug,
   routePrefix,
   composerQuickAction,
+  showTranscript,
 }: {
+  slug: string;
   routePrefix: '/c' | '/global';
   composerQuickAction?: ComposerQuickAction | undefined;
+  showTranscript: boolean;
 }) {
-  const { slug } = useParams<{ slug: string }>();
   const { setConversationReadiness } = useConversationReadiness();
   const navigate = useNavigate();
   const location = useLocation();
@@ -2077,36 +2101,38 @@ function ConversationPageContent({
           </button>
         </div>
       )}
-      <RenderProfiler id="MessageList">
-      <ConversationNavStack
-        messages={atom.messages}
-        pendingMessages={pendingMessages}
-        convState={convStateForChildren}
-        onRetry={handleRetry}
-        onCancelSteering={isArchived ? undefined : handleCancelSteering}
-        onOpenFile={isArchived ? undefined : handleOpenFileFromPatch}
-        filePathRootDir={conversation.worktree_path ?? conversation.cwd ?? '/'}
-        workScopeKey={isArchived ? undefined : conversation.work_scope_key}
-        enableMessageSidepanel={canOpenMessageSidepanel}
-        enableMessageFullscreen={canOpenMessageSidepanel && isWideDesktop}
-        conversationId={conversationId}
-        slug={slug}
-        systemPrompt={atom.systemPrompt ?? undefined}
-        hasOlderMessages={historyExpansion.coverage === 'tail'}
-        onLoadOlderMessages={loadOlderMessages}
-        onUpdateOlderMessagesRestore={updateOlderMessagesRestore}
-        loadingOlderMessages={historyExpansion.activeRequest !== null}
-        olderHistoryError={historyExpansion.failure?.kind === 'request_failed'
-          ? historyExpansion.failure.message
-          : historyExpansion.failure?.kind === 'target_not_found'
-            ? 'The requested message is not in this conversation.'
-            : historyExpansion.failure?.kind === 'anchor_not_found'
-              ? 'Could not preserve the previous reading position.'
-              : null}
-        transcriptPositioning={transcriptPositioningInputFromHistoryExpansion(historyExpansion)}
-        onHistoryScrollCommandHandled={handleHistoryScrollCommand}
-      />
-      </RenderProfiler>
+      {showTranscript && (
+        <RenderProfiler id="MessageList">
+          <ConversationNavStack
+            messages={atom.messages}
+            pendingMessages={pendingMessages}
+            convState={convStateForChildren}
+            onRetry={handleRetry}
+            onCancelSteering={isArchived ? undefined : handleCancelSteering}
+            onOpenFile={isArchived ? undefined : handleOpenFileFromPatch}
+            filePathRootDir={conversation.worktree_path ?? conversation.cwd ?? '/'}
+            workScopeKey={isArchived ? undefined : conversation.work_scope_key}
+            enableMessageSidepanel={canOpenMessageSidepanel}
+            enableMessageFullscreen={canOpenMessageSidepanel && isWideDesktop}
+            conversationId={conversationId}
+            slug={slug}
+            systemPrompt={atom.systemPrompt ?? undefined}
+            hasOlderMessages={historyExpansion.coverage === 'tail'}
+            onLoadOlderMessages={loadOlderMessages}
+            onUpdateOlderMessagesRestore={updateOlderMessagesRestore}
+            loadingOlderMessages={historyExpansion.activeRequest !== null}
+            olderHistoryError={historyExpansion.failure?.kind === 'request_failed'
+              ? historyExpansion.failure.message
+              : historyExpansion.failure?.kind === 'target_not_found'
+                ? 'The requested message is not in this conversation.'
+                : historyExpansion.failure?.kind === 'anchor_not_found'
+                  ? 'Could not preserve the previous reading position.'
+                  : null}
+            transcriptPositioning={transcriptPositioningInputFromHistoryExpansion(historyExpansion)}
+            onHistoryScrollCommandHandled={handleHistoryScrollCommand}
+          />
+        </RenderProfiler>
+      )}
       {atom.uiError && (
         <div className="sse-error-toast" role="alert">
           <span className="sse-error-text">

@@ -1,7 +1,7 @@
-import { useState, useCallback, useContext, useEffect, useMemo, useRef } from 'react';
+import { useState, useCallback, useContext, useEffect, useRef } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { api, getConvDisplayState } from '../api';
-import type { Conversation, Project } from '../api';
+import type { Conversation, ProductConversationListRow } from '../api';
 import { ConversationList } from './ConversationList';
 import { ConfirmDialog } from './ConfirmDialog';
 import { RenameDialog } from './RenameDialog';
@@ -11,15 +11,8 @@ import { useTheme } from '../hooks';
 import type { CodexLoginPreflight } from '../api';
 import { subscribeModels } from '../modelsPoller';
 import { ConversationContext } from '../conversation/ConversationContext';
-import { getDisambiguatedPathLabels } from '../utils/conversationIdentity';
 
-const PROJECT_FILTER_KEY = 'phoenix:sidebar-project-filter';
 const COLLAPSED_DOT_LIMIT = 9;
-
-function countForProject(conversations: readonly Conversation[], projectId: string | null): number {
-  if (projectId === null) return conversations.length;
-  return conversations.filter((c) => c.project_id === projectId).length;
-}
 
 function collapsedDotConversations(conversations: readonly Conversation[], activeSlug: string | null): readonly Conversation[] {
   if (conversations.length <= COLLAPSED_DOT_LIMIT) return conversations;
@@ -81,6 +74,12 @@ export function Sidebar({
       .then((p) => setCodexPreflight(p))
       .catch(() => { /* chip just hides — non-fatal */ });
   }, []);
+  const [showArchived, setShowArchived] = useState(false);
+  const [productConversations, setProductConversations] = useState<ProductConversationListRow[]>([]);
+  const [deleteTarget, setDeleteTarget] = useState<Conversation | null>(null);
+  const [renameTarget, setRenameTarget] = useState<Conversation | null>(null);
+  const [renameError, setRenameError] = useState<string | undefined>();
+
   // Fetch once at mount, and refetch whenever the credential health flips.
   // The shared models poller fires on credential transitions (login completes,
   // token expires, sign-out wipes), so subscribing keeps the chip in sync
@@ -97,102 +96,22 @@ export function Sidebar({
     return () => { unsub(); };
   }, [refetchCodexPreflight]);
 
-  const [showArchived, setShowArchived] = useState(false);
-  const lastProjectFilterRevealSlugRef = useRef<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    api.listProductConversations()
+      .then((response) => {
+        if (!cancelled) setProductConversations(response.product_conversations);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [conversations.length, archivedConversations.length]);
   const lastArchiveRevealSlugRef = useRef<string | null>(null);
-  const [deleteTarget, setDeleteTarget] = useState<Conversation | null>(null);
-  const [renameTarget, setRenameTarget] = useState<Conversation | null>(null);
-  const [renameError, setRenameError] = useState<string | undefined>();
-  const [projects, setProjects] = useState<Project[]>([]);
-  // Tracks whether `api.getProjects()` has successfully resolved at least
-  // once. The stale-filter cleanup below gates on this so it doesn't
-  // clear during the initial empty-state render, but DOES clear once
-  // we've confirmed (via a successful fetch) that the persisted project
-  // no longer exists -- including the case where the API legitimately
-  // returns an empty list.
-  const [projectsLoaded, setProjectsLoaded] = useState(false);
-  const [activeProjectId, setActiveProjectIdState] = useState<string | null>(() => {
-    try {
-      return localStorage.getItem(PROJECT_FILTER_KEY);
-    } catch {
-      return null;
-    }
-  });
-  const setActiveProjectId = useCallback((id: string | null) => {
-    setActiveProjectIdState(id);
-    try {
-      if (id === null) localStorage.removeItem(PROJECT_FILTER_KEY);
-      else localStorage.setItem(PROJECT_FILTER_KEY, id);
-    } catch {
-      // storage full / disabled — degrade gracefully
-    }
-  }, []);
-
-  // Fetch projects on mount
-  useEffect(() => {
-    api.getProjects().then((rows) => {
-      setProjects(rows);
-      setProjectsLoaded(true);
-    }).catch(() => {
-      // Transient failure: leave projectsLoaded false so the cleanup
-      // effect below doesn't clear the persisted filter on a network
-      // blip. A subsequent conversations-count tick will retry.
-    });
-  }, [conversations.length]); // re-fetch when conversation count changes
-
-  // Clear the persisted filter if the project no longer exists (e.g.,
-  // deleted server-side while the user was offline). Gated on
-  // projectsLoaded so we don't clear during the initial unloaded state,
-  // but DO clear once a successful fetch has confirmed the project is
-  // gone -- including the case where the API returns []. Without this
-  // gate-via-flag (vs. gating on `projects.length > 0`), a stale
-  // filter could survive the deletion of all projects.
-  useEffect(() => {
-    if (
-      projectsLoaded &&
-      activeProjectId &&
-      !projects.some((p) => p.id === activeProjectId)
-    ) {
-      setActiveProjectId(null);
-    }
-  }, [activeProjectId, projects, projectsLoaded, setActiveProjectId]);
-
-  // Filter conversations by selected project
-  const filteredConversations = useMemo(() => {
-    if (!activeProjectId) return conversations;
-    return conversations.filter(c => c.project_id === activeProjectId);
-  }, [conversations, activeProjectId]);
-
-  const filteredArchivedConversations = useMemo(() => {
-    if (!activeProjectId) return archivedConversations;
-    return archivedConversations.filter(c => c.project_id === activeProjectId);
-  }, [archivedConversations, activeProjectId]);
-
-  const projectLabels = useMemo(
-    () => getDisambiguatedPathLabels(projects.map((project) => project.canonical_path)),
-    [projects],
-  );
-  const activeProject = activeProjectId ? projects.find((p) => p.id === activeProjectId) ?? null : null;
-  const activeProjectLabel = activeProject ? projectLabels.get(activeProject.canonical_path) ?? null : null;
-  const scopedActiveCount = filteredConversations.length;
-  const scopedArchivedCount = filteredArchivedConversations.length;
-
-  useEffect(() => {
-    if (!activeSlug) {
-      lastProjectFilterRevealSlugRef.current = null;
-      return;
-    }
-    if (lastProjectFilterRevealSlugRef.current === activeSlug) return;
-
-    const activeConversation = [...conversations, ...archivedConversations]
-      .find((c) => matchesRouteSegment(c, activeSlug));
-    if (!activeConversation) return;
-
-    if (activeProjectId && activeConversation.project_id !== activeProjectId) {
-      setActiveProjectId(null);
-    }
-    lastProjectFilterRevealSlugRef.current = activeSlug;
-  }, [activeProjectId, activeSlug, conversations, archivedConversations, setActiveProjectId]);
+  const openProductConversations = productConversations.filter((row) => row.ordinary_lifecycle !== 'history');
+  const archivedProductConversations = productConversations.filter((row) => row.ordinary_lifecycle === 'history');
+  const scopedActiveCount = openProductConversations.length;
+  const scopedArchivedCount = archivedProductConversations.length;
 
   useEffect(() => {
     if (!activeSlug) {
@@ -415,36 +334,6 @@ export function Sidebar({
           onPreflightInvalidated={refetchCodexPreflight}
         />
       </div>
-      {projects.length > 0 && (
-        <div className="sidebar-project-scope" aria-label="Project scope">
-          <div className="sidebar-section-label">Projects</div>
-          <div className="project-tabs">
-            <button
-              className={`project-tab ${activeProjectId === null ? 'active' : ''}`}
-              onClick={() => setActiveProjectId(null)}
-              aria-pressed={activeProjectId === null}
-            >
-              <span>All</span>
-              <span className="project-tab-count">{conversations.length}</span>
-            </button>
-            {projects.map(p => {
-              const label = projectLabels.get(p.canonical_path) ?? 'Project';
-              return (
-                <button
-                  key={p.id}
-                  className={`project-tab ${activeProjectId === p.id ? 'active' : ''}`}
-                  onClick={() => setActiveProjectId(p.id)}
-                  title={p.canonical_path}
-                  aria-pressed={activeProjectId === p.id}
-                >
-                  <span>{label}</span>
-                  <span className="project-tab-count">{countForProject(conversations, p.id)}</span>
-                </button>
-              );
-            })}
-          </div>
-        </div>
-      )}
       <div className="sidebar-lifecycle-tabs" aria-label="Conversation lifecycle">
         <button
           type="button"
@@ -468,8 +357,8 @@ export function Sidebar({
       <LocalServicesPanel />
       <div className="sidebar-list">
         <ConversationList
-          conversations={filteredConversations}
-          archivedConversations={filteredArchivedConversations}
+          productConversations={openProductConversations}
+          archivedProductConversations={archivedProductConversations}
           showArchived={showArchived}
           onToggleArchived={handleToggleArchived}
           onNewConversation={handleNewClick}
@@ -477,9 +366,9 @@ export function Sidebar({
           onDelete={handleSetDeleteTarget}
           onRename={handleSetRenameTarget}
           onConversationClick={handleConversationClick}
+          onProductConversationClick={(row) => navigate(row.canonical_route)}
           activeSlug={activeSlug}
           sidebarMode
-          emptyScopeLabel={activeProjectLabel}
         />
       </div>
       <ConfirmDialog

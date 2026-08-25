@@ -3425,6 +3425,16 @@ def cmd_qa_new_conversation() -> None:
     )
 
 
+def cmd_qa_product_conversation() -> None:
+    """Capture the product-conversation page at desktop and mobile sizes."""
+    subprocess.run(
+        ["pnpm", "qa:product-conversation"],
+        cwd=ROOT / "ui",
+        check=True,
+        env=node_env(),
+    )
+
+
 def cmd_qa_message_list() -> None:
     """Capture message list Ladle screenshots into ignored local artifacts."""
     subprocess.run(
@@ -10037,6 +10047,7 @@ def main():
     qa_sub.add_parser("mobile-multi-pr-conversation", help="Capture a mobile conversation with two open PRs")
     qa_sub.add_parser("desktop-multi-pr-conversation", help="Capture a desktop conversation with multiple open PRs")
     qa_sub.add_parser("new-conversation", help="Capture the /new page at desktop and mobile sizes")
+    qa_sub.add_parser("product-conversation", help="Capture ProductConversation Ladle screenshots at desktop and mobile sizes")
     qa_sub.add_parser("message-list", help="Capture message list Ladle screenshots")
     qa_sub.add_parser("tool-results", help="Capture tool-result Ladle screenshots at desktop and mobile sizes")
     qa_sub.add_parser("work-actions", help="Capture Work Actions Ladle screenshots")
@@ -10211,6 +10222,8 @@ def main():
             cmd_qa_desktop_multi_pr_conversation()
         elif args.qa_command == "new-conversation":
             cmd_qa_new_conversation()
+        elif args.qa_command == "product-conversation":
+            cmd_qa_product_conversation()
         elif args.qa_command == "message-list":
             cmd_qa_message_list()
         elif args.qa_command == "tool-results":

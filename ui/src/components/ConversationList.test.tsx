@@ -7,7 +7,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, fireEvent, within, act, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
-import type { Conversation } from '../api';
+import type { Conversation, ProductConversationListRow } from '../api';
 
 // Spy on a util that the row body calls during render. Counting these calls
 // is a reliable proxy for component-body executions: when React.memo bails
@@ -143,6 +143,21 @@ const makeConv = (id: string, slug: string, overrides: Partial<Conversation> = {
   browser_session_active: false,
   terminal_uses_tmux: false,
   work_scope_key: `conversation:${id}`,
+  ...overrides,
+});
+
+const makeProductConversation = (id: string, overrides: Partial<ProductConversationListRow> = {}): ProductConversationListRow => ({
+  product_conversation_id: id,
+  canonical_route: `/product-conversations/${id}`,
+  canonical_root: {
+    transcript_row_id: `root-${id}`,
+    slug: `root-${id}`,
+    title: `Root ${id}`,
+  },
+  ordinary_lifecycle: 'open',
+  latest_transcript_row_id: `latest-${id}`,
+  updated_at: '2024-01-01T00:00:00Z',
+  presentation: { kind: 'state', display_name: `Display ${id}`, presentation_mode: 'idle' },
   ...overrides,
 });
 
@@ -293,6 +308,71 @@ const defaultProps = {
   onDelete: vi.fn(),
   onRename: vi.fn(),
 };
+
+describe('ConversationList — product conversations', () => {
+  it('renders open and archived product conversation aggregates with compatibility labels', () => {
+    const open = makeProductConversation('pc-open', {
+      canonical_root: { transcript_row_id: 'root-open', slug: 'root-open', title: 'Open Root' },
+      presentation: { kind: 'state', display_name: 'Working surface', presentation_mode: 'working' },
+    });
+    const archived = makeProductConversation('pc-archived', {
+      ordinary_lifecycle: 'history',
+      canonical_root: { transcript_row_id: 'root-archived', slug: 'root-archived', title: 'Archived Root' },
+      presentation: { kind: 'state', display_name: 'Retained history', presentation_mode: 'done' },
+    });
+
+    const { rerender, getByText, container } = render(
+      <MemoryRouter>
+        <ConversationList
+          {...defaultProps}
+          productConversations={[open]}
+          archivedProductConversations={[archived]}
+          listDensity="mobile"
+        />
+      </MemoryRouter>,
+    );
+
+    expect(getByText('Open Root')).toBeInTheDocument();
+    expect(getByText('Working surface')).toBeInTheDocument();
+    expect(container.querySelector('[data-product-conversation-id="pc-open"]')).not.toBeNull();
+
+    rerender(
+      <MemoryRouter>
+        <ConversationList
+          {...defaultProps}
+          productConversations={[open]}
+          archivedProductConversations={[archived]}
+          listDensity="mobile"
+          showArchived
+        />
+      </MemoryRouter>,
+    );
+
+    expect(getByText('Archived Root')).toBeInTheDocument();
+    expect(getByText('Retained history')).toBeInTheDocument();
+  });
+
+  it('navigates through aggregate canonical routes when no custom click handler is provided', () => {
+    function Location() { return <span data-testid="location">{useLocation().pathname}</span>; }
+    const row = makeProductConversation('pc-nav', {
+      canonical_root: { transcript_row_id: 'root-nav', slug: 'root-nav', title: 'Nav Root' },
+    });
+
+    const { getByText, getByTestId } = render(
+      <MemoryRouter initialEntries={['/']}>
+        <ConversationList
+          {...defaultProps}
+          productConversations={[row]}
+          listDensity="mobile"
+        />
+        <Location />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(getByText('Nav Root'));
+    expect(getByTestId('location')).toHaveTextContent('/product-conversations/pc-nav');
+  });
+});
 
 describe('ConversationList — footer slot', () => {
   it('renders the footer inside the conversation list after the row list', () => {
