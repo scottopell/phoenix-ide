@@ -405,11 +405,6 @@ const MIGRATIONS: &[Migration] = &[
         name: "record_close_retirement_resource_dispatches",
         sql: MIGRATION_077,
     },
-    Migration {
-        version: 78,
-        name: "persist_runtime_resource_instances",
-        sql: MIGRATION_078,
-    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -7511,75 +7506,6 @@ ALTER TABLE conversation_creation_jobs ADD COLUMN cleanup_lease_until TEXT;
 
 CREATE INDEX idx_creation_cleanup_due
     ON conversation_creation_jobs(status, cleanup_lease_until, updated_at);
-";
-
-const MIGRATION_078: &str = r"
-CREATE TABLE runtime_resource_instances (
-    instance_id TEXT PRIMARY KEY NOT NULL,
-    work_scope_id TEXT NOT NULL REFERENCES work_scopes(id) ON DELETE RESTRICT,
-    resource_kind TEXT NOT NULL CHECK (resource_kind IN ('bash', 'tmux', 'pty', 'browser')),
-    state TEXT NOT NULL CHECK (state IN ('live', 'retirement_pending', 'retired', 'needs_repair')),
-    launch_uuid TEXT NOT NULL CHECK (length(trim(launch_uuid)) > 0),
-    pid INTEGER,
-    process_birth TEXT,
-    pgid INTEGER,
-    tmux_socket_path TEXT,
-    tmux_server_token TEXT,
-    browser_session_key TEXT,
-    browser_audience TEXT,
-    browser_profile_path TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    CHECK (
-        (resource_kind = 'bash'
-         AND pid IS NOT NULL AND process_birth IS NOT NULL AND pgid IS NOT NULL
-         AND tmux_socket_path IS NULL AND tmux_server_token IS NULL
-         AND browser_session_key IS NULL AND browser_audience IS NULL AND browser_profile_path IS NULL)
-        OR
-        (resource_kind = 'tmux'
-         AND pid IS NULL AND process_birth IS NULL AND pgid IS NULL
-         AND tmux_socket_path IS NOT NULL AND tmux_server_token IS NOT NULL
-         AND browser_session_key IS NULL AND browser_audience IS NULL AND browser_profile_path IS NULL)
-        OR
-        (resource_kind = 'pty'
-         AND pid IS NOT NULL AND process_birth IS NOT NULL AND pgid IS NULL
-         AND tmux_socket_path IS NULL AND tmux_server_token IS NULL
-         AND browser_session_key IS NULL AND browser_audience IS NULL AND browser_profile_path IS NULL)
-        OR
-        (resource_kind = 'browser'
-         AND pid IS NOT NULL AND process_birth IS NOT NULL AND pgid IS NULL
-         AND tmux_socket_path IS NULL AND tmux_server_token IS NULL
-         AND browser_session_key IS NOT NULL AND browser_audience IS NOT NULL AND browser_profile_path IS NOT NULL)
-    )
-);
-
-CREATE UNIQUE INDEX runtime_resource_instances_live_exact_identity
-ON runtime_resource_instances (
-    work_scope_id, resource_kind, launch_uuid,
-    COALESCE(pid, -1), COALESCE(process_birth, ''), COALESCE(pgid, -1),
-    COALESCE(tmux_socket_path, ''), COALESCE(tmux_server_token, ''),
-    COALESCE(browser_session_key, ''), COALESCE(browser_audience, ''), COALESCE(browser_profile_path, '')
-)
-WHERE state <> 'retired';
-
-CREATE TRIGGER runtime_resource_instances_preserve_identity
-BEFORE UPDATE ON runtime_resource_instances
-FOR EACH ROW
-WHEN NEW.instance_id <> OLD.instance_id
-  OR NEW.work_scope_id <> OLD.work_scope_id
-  OR NEW.resource_kind <> OLD.resource_kind
-  OR NEW.launch_uuid <> OLD.launch_uuid
-  OR NEW.pid IS NOT OLD.pid
-  OR NEW.process_birth IS NOT OLD.process_birth
-  OR NEW.pgid IS NOT OLD.pgid
-  OR NEW.tmux_socket_path IS NOT OLD.tmux_socket_path
-  OR NEW.tmux_server_token IS NOT OLD.tmux_server_token
-  OR NEW.browser_session_key IS NOT OLD.browser_session_key
-  OR NEW.browser_audience IS NOT OLD.browser_audience
-  OR NEW.browser_profile_path IS NOT OLD.browser_profile_path
-BEGIN
-    SELECT RAISE(ABORT, 'runtime resource instance identity is immutable');
-END;
 ";
 
 const MIGRATION_077: &str = r"
