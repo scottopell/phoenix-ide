@@ -201,8 +201,6 @@ pub struct Handle {
     pub controller_scope: ResourceScopeKey,
     pub handle_id: HandleId,
     pub launch_identity: BashLaunchIdentity,
-    pub runtime_resource_instance_id:
-        Option<phoenix_core::runtime_resource::RuntimeResourceInstanceId>,
     pub creator_conversation_id: String,
     pub authority: ResourceAuthority,
     pub cmd: String,
@@ -349,7 +347,6 @@ impl Handle {
             controller_scope,
             handle_id,
             launch_identity,
-            runtime_resource_instance_id: None,
             creator_conversation_id,
             authority,
             cmd,
@@ -359,17 +356,6 @@ impl Handle {
             kill_attempt: RwLock::new(None),
             exit_signal: tx,
             exit_observer: rx,
-        })
-    }
-
-    pub fn with_runtime_resource_instance_id(
-        self: Arc<Self>,
-        runtime_resource_instance_id: phoenix_core::runtime_resource::RuntimeResourceInstanceId,
-    ) -> Arc<Self> {
-        let handle = Arc::into_inner(self).expect("unpublished handle must be uniquely owned");
-        Arc::new(Self {
-            runtime_resource_instance_id: Some(runtime_resource_instance_id),
-            ..handle
         })
     }
 

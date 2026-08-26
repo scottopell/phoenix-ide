@@ -39,10 +39,6 @@ pub(crate) struct CloseResourceLease {
     terminal: TerminalRetirementPermit,
     browser: BrowserRetirementPermit,
     resources: Vec<RetiredResourceIdentity>,
-    runtime_instance_bindings: Vec<(
-        RetiredResourceIdentity,
-        phoenix_core::runtime_resource::RuntimeResourceInstanceId,
-    )>,
 }
 
 impl RuntimeManager {
@@ -117,16 +113,11 @@ impl RuntimeManager {
         let terminal = self.terminals.begin_retirement(&key);
         let browser = self.browser_sessions().begin_retirement(&key).await;
         let mut resources = Vec::new();
-        let mut runtime_instance_bindings = Vec::new();
         for target in &bash.exact_process_groups {
-            let resource = opaque_resource(
+            resources.push(opaque_resource(
                 RetiredResourceKind::BashProcessGroup,
                 target.stable_resource_identity(),
-            );
-            if let Some(instance_id) = target.runtime_resource_instance_id.clone() {
-                runtime_instance_bindings.push((resource.clone(), instance_id));
-            }
-            resources.push(resource);
+            ));
         }
         if tmux.had_entry() {
             resources.push(opaque_resource(
@@ -154,7 +145,6 @@ impl RuntimeManager {
                 terminal,
                 browser,
                 resources: resources.clone(),
-                runtime_instance_bindings,
             },
         );
         resources
@@ -245,37 +235,12 @@ impl RuntimeManager {
             .db()
             .capture_close_retirement_inventory(CaptureCloseRetirementInventoryRequest {
                 attempt_id: attempt_id.clone(),
-                snapshot: snapshot.clone(),
+                snapshot,
                 scopes: requests,
             })
             .await
         {
-            Ok(_) => {
-                for scope in &acquired_scopes {
-                    let bindings = self
-                        .close_retirement_leases
-                        .lock()
-                        .await
-                        .get(&(attempt_id.as_str().to_string(), scope.clone()))
-                        .map(|lease| lease.runtime_instance_bindings.clone())
-                        .unwrap_or_default();
-                    for (resource, instance_id) in bindings {
-                        self.db()
-                            .bind_close_runtime_resource_instance(
-                                crate::db::BindCloseRuntimeResourceInstanceRequest {
-                                    attempt_id: attempt_id.clone(),
-                                    scope: scope.clone(),
-                                    snapshot: snapshot.clone(),
-                                    resource,
-                                    instance_id,
-                                },
-                            )
-                            .await
-                            .map_err(|error| error.to_string())?;
-                    }
-                }
-                Ok(())
-            }
+            Ok(_) => Ok(()),
             Err(error) => {
                 for scope in &acquired_scopes {
                     self.cancel_close_resource_lease(&attempt_id, scope).await;

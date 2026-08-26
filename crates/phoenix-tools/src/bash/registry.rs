@@ -122,8 +122,6 @@ impl BashTeardownFence {
 pub struct BashRetirementTarget {
     pub handle_id: HandleId,
     pub launch_identity: BashLaunchIdentity,
-    pub runtime_resource_instance_id:
-        Option<phoenix_core::runtime_resource::RuntimeResourceInstanceId>,
     pub pgid: i32,
     pub pid: Option<u32>,
     pub kill_pending_kernel: bool,
@@ -1105,7 +1103,6 @@ async fn snapshot_retirement_targets(handles: &[Arc<Handle>]) -> Vec<BashRetirem
         targets.push(BashRetirementTarget {
             handle_id: handle.handle_id.clone(),
             launch_identity: handle.launch_identity.clone(),
-            runtime_resource_instance_id: handle.runtime_resource_instance_id.clone(),
             pgid,
             pid: handle.live_pid().await,
             kill_pending_kernel: handle.is_kill_pending_kernel().await,

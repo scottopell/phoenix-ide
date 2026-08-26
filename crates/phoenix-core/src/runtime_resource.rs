@@ -5,27 +5,11 @@
 //! recovery consumes these facts directly and never reparses an opaque string.
 
 use std::fmt;
-use std::sync::Arc;
-
-use async_trait::async_trait;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::work_scope::WorkScopeId;
-
-/// Durable admission boundary owned by the application persistence layer.
-/// Engines invoke it before publishing a newly created resource to their
-/// process-local registry; engine crates therefore never depend on `phoenix-db`.
-#[async_trait]
-pub trait RuntimeResourceAdmissionSink: Send + Sync {
-    async fn admit_runtime_resource(
-        &self,
-        admission: RuntimeResourceAdmission,
-    ) -> Result<(), String>;
-}
-
-pub type RuntimeResourceAdmissionAuthority = Arc<dyn RuntimeResourceAdmissionSink>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
