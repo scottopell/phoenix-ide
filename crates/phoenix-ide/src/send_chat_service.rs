@@ -117,22 +117,6 @@ impl SendChatApplicationService {
         {
             return Ok(outcome);
         }
-        match self
-            .runtime
-            .db()
-            .product_conversation_admission(&conversation.id)
-            .await
-            .map_err(map_conversation_load_error)?
-        {
-            crate::db::ProductConversationAdmission::Accepted { .. } => {}
-            crate::db::ProductConversationAdmission::Refused(_) => {
-                return Ok(close_admission_fenced_outcome());
-            }
-            crate::db::ProductConversationAdmission::History(_) => {
-                return Ok(history_unavailable_outcome());
-            }
-        }
-
         if conversation.archived {
             return Ok(SendChatOutcome::Rejected {
                 message: "Conversation is archived and unavailable for messaging.".to_string(),
@@ -195,6 +179,22 @@ impl SendChatApplicationService {
                 });
             }
         }
+        match self
+            .runtime
+            .db()
+            .product_conversation_admission(&conversation.id)
+            .await
+            .map_err(map_conversation_load_error)?
+        {
+            crate::db::ProductConversationAdmission::Accepted { .. } => {}
+            crate::db::ProductConversationAdmission::Refused(_) => {
+                return Ok(close_admission_fenced_outcome());
+            }
+            crate::db::ProductConversationAdmission::History(_) => {
+                return Ok(history_unavailable_outcome());
+            }
+        }
+
         let steering_queue = self
             .runtime
             .db()
