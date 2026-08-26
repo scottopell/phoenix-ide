@@ -178,6 +178,7 @@ async fn snapshot_view(
         .get_active_close_obligation_for_product(aggregate.product_conversation.id())
         .await
         .map_err(db_to_app)?
+        .as_ref()
         .map(close_view);
     let generation = aggregate_generation(&aggregate);
     let segment_ceilings = cursor.as_ref().map_or_else(
@@ -535,7 +536,7 @@ fn validate_cursor(
 }
 
 fn close_view(
-    obligation: phoenix_core::domain::close::CloseObligation,
+    obligation: &phoenix_core::domain::close::CloseObligation,
 ) -> ProductConversationCloseView {
     use phoenix_core::domain::close::ClosePhase;
 
