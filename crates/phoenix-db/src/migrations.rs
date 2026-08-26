@@ -2132,22 +2132,10 @@ BEGIN
     SELECT RAISE(ABORT, 'close direct-turn settlement target must be latest active authority');
 END;
 
-INSERT INTO close_attempt_direct_turn_settlement_captures (attempt_id, captured_at)
-SELECT attempt_id, updated_at
-FROM close_obligations
+UPDATE close_obligations
+SET phase = 'awaiting_stop_work_confirmation',
+    updated_at = datetime('now')
 WHERE phase IN ('settling_active_work', 'cancel_requested_during_settlement');
-
-INSERT INTO close_attempt_direct_turn_settlements (
-    attempt_id, turn_id, expected_generation
-)
-SELECT obligation.attempt_id, turn.turn_id, turn.generation
-FROM close_obligations obligation
-JOIN close_attempt_members member ON member.attempt_id = obligation.attempt_id
-JOIN durable_turns turn ON turn.conversation_id = member.conversation_id
-WHERE obligation.phase IN ('settling_active_work', 'cancel_requested_during_settlement')
-  AND member.member_role IN ('latest', 'root_latest')
-  AND turn.owns_conversation = 1
-  AND turn.terminal_kind IS NULL;
 
 CREATE TRIGGER close_attempt_direct_turn_settlements_immutable_identity
 BEFORE UPDATE OF attempt_id, turn_id, expected_generation

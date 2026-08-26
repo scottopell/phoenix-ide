@@ -575,6 +575,13 @@ THE SYSTEM SHALL use the profile's existing typed cancellation command for its e
 accepted-turn identity and generation
 AND SHALL record the same attempt-scoped receipt only after its durable release.
 
+WHEN a database upgrade introduces Close direct-turn settlement receipts while an existing
+Close attempt is already settling active work
+THE SYSTEM SHALL preserve the active Close admission fence
+AND SHALL return that attempt to explicit stop-work confirmation before it captures a new
+exact target set
+AND SHALL NOT infer a receipt target or a settled receipt from post-upgrade turn state.
+
 Once ownership release for that exact accepted turn has begun, a user-visible cancel of
 Close MAY stop further retirement progression but SHALL NOT require or invent a second
 settlement cancellation path; the original settlement completion remains the release
