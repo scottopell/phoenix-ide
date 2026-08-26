@@ -1,6 +1,6 @@
 import { lazy, Suspense, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, useReducer, type MouseEvent as ReactMouseEvent } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
-import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, type Conversation, type ConversationRouteResponse, type FileAttachment, type ImageData } from '../api';
+import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, type Conversation, type ConversationRouteResponse, type FileAttachment, type ImageData, type Message } from '../api';
 import { refreshModels } from '../modelsPoller';
 import {
   canCancelConversationState,
@@ -12,6 +12,7 @@ import { copyToClipboard } from '../utils/clipboard';
 import { generateUUID } from '../utils/uuid';
 import { cacheDB } from '../cache';
 import { terminalPaneStorageKey } from '../storage/terminalPaneStorage';
+import type { PendingUserMessage } from '../hooks/useMessageQueue';
 import {
   decideRouteFocus,
   reduceRouteFocusState,
@@ -175,13 +176,58 @@ interface ConversationPageProps {
   composerQuickAction?: ComposerQuickAction | undefined;
 }
 
+export interface EmbeddedConversationProjection {
+  slug: string;
+  conversationId?: string;
+  conversation: Conversation | null;
+  messages: Message[];
+  pendingMessages: PendingUserMessage[];
+  convState: ReturnType<typeof parseConversationState>;
+  isArchived: boolean;
+  onRetryPending: (localId: string) => void;
+  onCancelSteering: (localId: string) => void;
+  onOpenFile: (filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void;
+  filePathRootDir: string;
+  systemPrompt?: string | undefined;
+  modelContextWindow?: number | undefined;
+}
+
+interface EmbeddedConversationHostProps {
+  suppressCanonicalization?: boolean;
+  ordinaryComposerEnabled?: boolean;
+  suppressMessageViewerOwner?: boolean;
+  suppressTaskApprovalOwner?: boolean;
+  onProjectionChange?: (projection: EmbeddedConversationProjection | null) => void;
+}
+
+interface EmbeddedConversationPageProps extends ConversationPageProps, EmbeddedConversationHostProps {
+  slug: string;
+  showTranscript?: boolean;
+}
+
 export function ConversationPage({ routePrefix = '/c', composerQuickAction }: ConversationPageProps) {
   const { slug } = useParams<{ slug: string }>();
+  return slug
+    ? <EmbeddedConversationPage slug={slug} routePrefix={routePrefix} composerQuickAction={composerQuickAction} />
+    : null;
+}
+
+export function EmbeddedConversationPage({
+  slug,
+  routePrefix = '/c',
+  composerQuickAction,
+  showTranscript = true,
+  suppressCanonicalization = false,
+  ordinaryComposerEnabled = true,
+  onProjectionChange,
+  suppressMessageViewerOwner = false,
+  suppressTaskApprovalOwner = false,
+}: EmbeddedConversationPageProps) {
   const navigate = useNavigate();
   const location = useLocation();
 
   useEffect(() => {
-    if (routePrefix === '/global' || !slug || location.hash.startsWith('#message-')) return;
+    if (suppressCanonicalization || routePrefix === '/global' || !slug || location.hash.startsWith('#message-')) return;
     let cancelled = false;
     api.resolveCoordinatorRoute(slug)
       .then(({ coordinator_id }) => {
@@ -192,15 +238,25 @@ export function ConversationPage({ routePrefix = '/c', composerQuickAction }: Co
       })
       .catch(() => {});
     return () => { cancelled = true; };
-  }, [location.hash, navigate, routePrefix, slug]);
+  }, [location.hash, navigate, routePrefix, slug, suppressCanonicalization]);
   return (
     <ReviewNotesProvider scopeKey={slug}>
       {/* The viewer slot (prose / diff / browser) is provided by DesktopLayout,
           which wraps every conversation route. Mounted above
           ConversationPageContent's viewer early-returns so draft persistence
           survives composer unmounts. */}
-      {slug && <DraftLifecycle slug={slug} />}
-      <ConversationPageContent routePrefix={routePrefix} composerQuickAction={composerQuickAction} />
+      <DraftLifecycle slug={slug} />
+      <ConversationPageContent
+        slug={slug}
+        routePrefix={routePrefix}
+        composerQuickAction={composerQuickAction}
+        showTranscript={showTranscript}
+        ordinaryComposerEnabled={ordinaryComposerEnabled}
+        suppressCanonicalization={suppressCanonicalization}
+        suppressMessageViewerOwner={suppressMessageViewerOwner}
+        suppressTaskApprovalOwner={suppressTaskApprovalOwner}
+        {...(onProjectionChange ? { onProjectionChange } : {})}
+      />
     </ReviewNotesProvider>
   );
 }
@@ -222,13 +278,26 @@ function RecoveryBanner({ message, recoveryKind }: { message: string; recoveryKi
 }
 
 function ConversationPageContent({
+  slug,
   routePrefix,
   composerQuickAction,
+  showTranscript,
+  ordinaryComposerEnabled,
+  suppressCanonicalization,
+  onProjectionChange,
+  suppressMessageViewerOwner,
+  suppressTaskApprovalOwner,
 }: {
+  slug: string;
   routePrefix: '/c' | '/global';
   composerQuickAction?: ComposerQuickAction | undefined;
+  showTranscript: boolean;
+  ordinaryComposerEnabled: boolean;
+  suppressCanonicalization: boolean;
+  onProjectionChange?: (projection: EmbeddedConversationProjection | null) => void;
+  suppressMessageViewerOwner: boolean;
+  suppressTaskApprovalOwner: boolean;
 }) {
-  const { slug } = useParams<{ slug: string }>();
   const { setConversationReadiness } = useConversationReadiness();
   const navigate = useNavigate();
   const location = useLocation();
@@ -491,6 +560,9 @@ function ConversationPageContent({
 
   // Shared models/credential poller — one request loop app-wide.
   const { models: availableModels, credentialStatus, defaultModel } = useModels();
+  const matchingModel = availableModels.find((model) => model.id === atom.conversation?.model);
+  const actualModelContextWindow = matchingModel ? matchingModel.context_window : null;
+  const modelContextWindow = actualModelContextWindow ?? 200_000;
 
   // Task approval overlay
   const [showTaskApproval, setShowTaskApproval] = useState(false);
@@ -854,7 +926,13 @@ function ConversationPageContent({
       const preserveTranscriptRouteId = (
         locationRef.current.state as { preserveTranscriptRouteId?: boolean } | null
       )?.preserveTranscriptRouteId === true;
-      if (route.slug && route.slug !== slug && routePrefix === '/c' && !preserveTranscriptRouteId) {
+      if (
+        route.slug
+        && route.slug !== slug
+        && routePrefix === '/c'
+        && !suppressCanonicalization
+        && !preserveTranscriptRouteId
+      ) {
         navigate({
           pathname: `/c/${route.slug}`,
           search: locationRef.current.search,
@@ -906,7 +984,7 @@ function ConversationPageContent({
       cancelled = true;
       window.removeEventListener('online', handleOnline);
     };
-  }, [slug, navigate, dispatch, eventCursorRef, routePrefix]);
+  }, [slug, navigate, dispatch, eventCursorRef, routePrefix, suppressCanonicalization]);
 
   const loadOlderMessagesForIntent = useCallback(async (intent: HistoryIntent) => {
     if (!slug || !conversationId || historyExpansion.coverage !== 'tail' || historyExpansion.activeRequest) return;
@@ -1588,15 +1666,16 @@ function ConversationPageContent({
   }, [appendDraftCb, requestComposerFocus]);
 
   useEffect(() => {
+    if (suppressMessageViewerOwner) return undefined;
     const handler = (e: Event) => {
-      const { sequenceId, presentation } = (e as CustomEvent<OpenMessageViewerEventDetail>).detail ?? {};
+      const { sequenceId, messageId, occurrenceToken, presentation } = (e as CustomEvent<OpenMessageViewerEventDetail>).detail ?? {};
       if (!Number.isSafeInteger(sequenceId) || sequenceId <= 0) return;
       if (presentation !== 'pane' && presentation !== 'fullscreen') return;
-      handleOpenMessageViewer(sequenceId, presentation);
+      handleOpenMessageViewer(sequenceId, presentation, messageId, occurrenceToken);
     };
     window.addEventListener(OPEN_MESSAGE_VIEWER_EVENT, handler);
     return () => window.removeEventListener(OPEN_MESSAGE_VIEWER_EVENT, handler);
-  }, [handleOpenMessageViewer]);
+  }, [handleOpenMessageViewer, suppressMessageViewerOwner]);
 
   const handleSendNotes = useCallback(
     (formattedNotes: string) => {
@@ -1657,6 +1736,53 @@ function ConversationPageContent({
   }, [parentConvSlugForCallback, navigate]);
 
   const convStateForChildren = atom.phase;
+  const ordinaryComposerEligible = !isArchived
+    && convStateForChildren.type !== 'provisioning'
+    && convStateForChildren.type !== 'creation_failed'
+    && convStateForChildren.type !== 'creation_cancelled'
+    && convStateForChildren.type !== 'context_exhausted'
+    && convStateForChildren.type !== 'awaiting_task_approval'
+    && convStateForChildren.type !== 'handed_off'
+    && convStateForChildren.type !== 'terminal';
+
+  useEffect(() => {
+    if (!onProjectionChange) return;
+    onProjectionChange({
+      slug,
+      ...(conversationId ? { conversationId } : {}),
+      conversation: conversation ?? null,
+      messages: atom.messages,
+      pendingMessages,
+      convState: convStateForChildren,
+      isArchived,
+      onRetryPending: handleRetry,
+      onCancelSteering: handleCancelSteering,
+      onOpenFile: handleOpenFileFromPatch,
+      filePathRootDir: conversation?.worktree_path ?? conversation?.cwd ?? '/',
+      systemPrompt: atom.systemPrompt ?? undefined,
+      ...(actualModelContextWindow ? { modelContextWindow: actualModelContextWindow } : {}),
+    });
+    return () => {
+      onProjectionChange(null);
+    };
+  }, [
+    onProjectionChange,
+    slug,
+    conversationId,
+    conversation,
+    atom.messages,
+    pendingMessages,
+    convStateForChildren,
+    isArchived,
+    handleRetry,
+    handleCancelSteering,
+    handleOpenFileFromPatch,
+    conversation?.worktree_path,
+    conversation?.cwd,
+    atom.systemPrompt,
+    actualModelContextWindow,
+  ]);
+
   const localCreateIntent = readCreateIntent(conversationId);
   const provisioningPrompt = convStateForChildren.type === 'provisioning'
     ? (convStateForChildren.prompt ?? conversation?.creation_prompt ?? localCreateIntent?.prompt ?? null)
@@ -1953,15 +2079,6 @@ function ConversationPageContent({
     }
   }
 
-  // Derived: model context window is a pure function of the current model's
-  // spec. Falls back to 200_000 for legacy surfaces when availableModels hasn't
-  // loaded yet or the model isn't in the registry.
-  const matchingModel = availableModels
-    ? availableModels.find((model) => model.id === atom.conversation?.model)
-    : undefined;
-  const actualModelContextWindow = matchingModel ? matchingModel.context_window : null;
-  const modelContextWindow = actualModelContextWindow ?? 200_000;
-
   // REQ-SEED-003: seed parent breadcrumb. Rendered above the message list
   // when this conversation was spawned from another via a seed action.
   // If `seed_parent_slug` is present we link to it; if not (parent deleted),
@@ -2077,36 +2194,38 @@ function ConversationPageContent({
           </button>
         </div>
       )}
-      <RenderProfiler id="MessageList">
-      <ConversationNavStack
-        messages={atom.messages}
-        pendingMessages={pendingMessages}
-        convState={convStateForChildren}
-        onRetry={handleRetry}
-        onCancelSteering={isArchived ? undefined : handleCancelSteering}
-        onOpenFile={isArchived ? undefined : handleOpenFileFromPatch}
-        filePathRootDir={conversation.worktree_path ?? conversation.cwd ?? '/'}
-        workScopeKey={isArchived ? undefined : conversation.work_scope_key}
-        enableMessageSidepanel={canOpenMessageSidepanel}
-        enableMessageFullscreen={canOpenMessageSidepanel && isWideDesktop}
-        conversationId={conversationId}
-        slug={slug}
-        systemPrompt={atom.systemPrompt ?? undefined}
-        hasOlderMessages={historyExpansion.coverage === 'tail'}
-        onLoadOlderMessages={loadOlderMessages}
-        onUpdateOlderMessagesRestore={updateOlderMessagesRestore}
-        loadingOlderMessages={historyExpansion.activeRequest !== null}
-        olderHistoryError={historyExpansion.failure?.kind === 'request_failed'
-          ? historyExpansion.failure.message
-          : historyExpansion.failure?.kind === 'target_not_found'
-            ? 'The requested message is not in this conversation.'
-            : historyExpansion.failure?.kind === 'anchor_not_found'
-              ? 'Could not preserve the previous reading position.'
-              : null}
-        transcriptPositioning={transcriptPositioningInputFromHistoryExpansion(historyExpansion)}
-        onHistoryScrollCommandHandled={handleHistoryScrollCommand}
-      />
-      </RenderProfiler>
+      {showTranscript && (
+        <RenderProfiler id="MessageList">
+          <ConversationNavStack
+            messages={atom.messages}
+            pendingMessages={pendingMessages}
+            convState={convStateForChildren}
+            onRetry={handleRetry}
+            onCancelSteering={isArchived ? undefined : handleCancelSteering}
+            onOpenFile={isArchived ? undefined : handleOpenFileFromPatch}
+            filePathRootDir={conversation.worktree_path ?? conversation.cwd ?? '/'}
+            workScopeKey={isArchived ? undefined : conversation.work_scope_key}
+            enableMessageSidepanel={canOpenMessageSidepanel}
+            enableMessageFullscreen={canOpenMessageSidepanel && isWideDesktop}
+            conversationId={conversationId}
+            slug={slug}
+            systemPrompt={atom.systemPrompt ?? undefined}
+            hasOlderMessages={historyExpansion.coverage === 'tail'}
+            onLoadOlderMessages={loadOlderMessages}
+            onUpdateOlderMessagesRestore={updateOlderMessagesRestore}
+            loadingOlderMessages={historyExpansion.activeRequest !== null}
+            olderHistoryError={historyExpansion.failure?.kind === 'request_failed'
+              ? historyExpansion.failure.message
+              : historyExpansion.failure?.kind === 'target_not_found'
+                ? 'The requested message is not in this conversation.'
+                : historyExpansion.failure?.kind === 'anchor_not_found'
+                  ? 'Could not preserve the previous reading position.'
+                  : null}
+            transcriptPositioning={transcriptPositioningInputFromHistoryExpansion(historyExpansion)}
+            onHistoryScrollCommandHandled={handleHistoryScrollCommand}
+          />
+        </RenderProfiler>
+      )}
       {atom.uiError && (
         <div className="sse-error-toast" role="alert">
           <span className="sse-error-text">
@@ -2370,7 +2489,7 @@ function ConversationPageContent({
           onAnswered={() => dispatch({ type: 'local_phase_change', phase: { type: 'llm_requesting', attempt: 1 }, expectedConversationId: conversation.id })}
           onDismissed={() => dispatch({ type: 'local_phase_change', phase: { type: 'idle' }, expectedConversationId: conversation.id })}
         />
-      ) : !isArchived && convStateForChildren.type !== 'provisioning' && convStateForChildren.type !== 'creation_failed' && convStateForChildren.type !== 'creation_cancelled' && convStateForChildren.type !== 'context_exhausted' && convStateForChildren.type !== 'awaiting_task_approval' && convStateForChildren.type !== 'handed_off' && convStateForChildren.type !== 'terminal' ? (
+      ) : ordinaryComposerEnabled && ordinaryComposerEligible ? (
         <>
         {conversationId && (
           <WorkControlBar
@@ -2507,7 +2626,7 @@ function ConversationPageContent({
       )}
 
       {/* Task approval overlay — browser back navigates away; SSE restores state on return. */}
-      {showTaskApproval && !isArchived && atom.phase.type === 'awaiting_task_approval' && (
+      {!suppressTaskApprovalOwner && showTaskApproval && !isArchived && atom.phase.type === 'awaiting_task_approval' && (
         <Suspense fallback={null}>
           <TaskApprovalReader
             title={atom.phase.title}

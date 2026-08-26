@@ -39,6 +39,8 @@ export const OPEN_MESSAGE_VIEWER_EVENT = 'phoenix:open-message-viewer';
 
 export interface OpenMessageViewerEventDetail {
   sequenceId: number;
+  messageId?: string;
+  occurrenceToken?: string;
   presentation: ViewerPresentation;
 }
 
@@ -65,7 +67,9 @@ export function MessageContextMenu({
 
       // A compact grouped card carries the sequence id of its owning message;
       // otherwise the nearest .message container owns the interaction.
-      const owningSequenceId = target?.closest<HTMLElement>('[data-sequence-id]')?.dataset['sequenceId'];
+      const owningNode = target?.closest<HTMLElement>('[data-message-id], [data-sequence-id]');
+      const owningSequenceId = owningNode?.dataset['sequenceId'];
+      const owningMessageId = owningNode?.dataset['messageId'];
       let el = e.target as HTMLElement | null;
 
       // Detect tool context while walking up
@@ -103,12 +107,14 @@ export function MessageContextMenu({
       const seqId = owningSequenceId ?? el.dataset['sequenceId'];
       if (!seqId) return;
 
-      const msg = messages.find((m) => String(m.sequence_id) === seqId);
+      const msg = owningMessageId
+        ? messages.find((m) => m.message_id === owningMessageId)
+        : messages.find((m) => String(m.sequence_id) === seqId);
       if (!msg) return;
 
       e.preventDefault();
       window.dispatchEvent(new Event(MESSAGE_CONTEXT_MENU_OPEN_EVENT));
-      const contentElement = target?.closest<HTMLElement>('[data-sequence-id]') ?? el;
+      const contentElement = owningNode ?? el;
       const newMenu: MenuState = { x: e.clientX, y: e.clientY, message: msg, contentElement };
       if (toolContext) newMenu.toolContext = toolContext;
       setMenu(newMenu);
@@ -175,6 +181,8 @@ export function MessageContextMenu({
   if (!menu) return null;
 
   const hasSelection = (window.getSelection()?.toString().length ?? 0) > 0;
+  const isProductHandoffBoundary = !!(menu.message.display_data as { productHistoricalHandoff?: unknown } | null | undefined)?.productHistoricalHandoff;
+  const viewerEnabledForMessage = !isProductHandoffBoundary;
 
   const copyMarkdown = () => {
     const md = getMessageMarkdown(menu.message);
@@ -184,7 +192,14 @@ export function MessageContextMenu({
 
   const openMessage = (presentation: ViewerPresentation) => {
     window.dispatchEvent(new CustomEvent<OpenMessageViewerEventDetail>(OPEN_MESSAGE_VIEWER_EVENT, {
-      detail: { sequenceId: menu.message.sequence_id, presentation },
+      detail: {
+        sequenceId: menu.message.sequence_id,
+        messageId: menu.message.message_id,
+        ...((menu.message.display_data as { productOccurrenceToken?: string } | null | undefined)?.productOccurrenceToken
+          ? { occurrenceToken: (menu.message.display_data as { productOccurrenceToken: string }).productOccurrenceToken }
+          : {}),
+        presentation,
+      },
     }));
     setMenu(null);
   };
@@ -249,7 +264,7 @@ export function MessageContextMenu({
           Copy output
         </button>
       )}
-      {enableMessageSidepanel && getMessageMarkdown(menu.message).trim() && (
+      {viewerEnabledForMessage && enableMessageSidepanel && getMessageMarkdown(menu.message).trim() && (
         <>
           <button className="msg-context-item" onClick={() => openMessage('pane')}>
             Open in sidepanel

@@ -1,7 +1,7 @@
-import { useState, useCallback, useContext, useEffect, useMemo, useRef } from 'react';
+import { useState, useCallback, useContext, useEffect, useRef, useSyncExternalStore } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { api, getConvDisplayState } from '../api';
-import type { Conversation, Project } from '../api';
+import type { Conversation, ProductConversationListRow } from '../api';
 import { ConversationList } from './ConversationList';
 import { ConfirmDialog } from './ConfirmDialog';
 import { RenameDialog } from './RenameDialog';
@@ -11,15 +11,10 @@ import { useTheme } from '../hooks';
 import type { CodexLoginPreflight } from '../api';
 import { subscribeModels } from '../modelsPoller';
 import { ConversationContext } from '../conversation/ConversationContext';
-import { getDisambiguatedPathLabels } from '../utils/conversationIdentity';
+import { getProductConversationListRevision, subscribeProductConversationListRevision } from '../notifications';
 
-const PROJECT_FILTER_KEY = 'phoenix:sidebar-project-filter';
 const COLLAPSED_DOT_LIMIT = 9;
-
-function countForProject(conversations: readonly Conversation[], projectId: string | null): number {
-  if (projectId === null) return conversations.length;
-  return conversations.filter((c) => c.project_id === projectId).length;
-}
+const PRODUCT_REFRESH_COALESCE_MS = 50;
 
 function collapsedDotConversations(conversations: readonly Conversation[], activeSlug: string | null): readonly Conversation[] {
   if (conversations.length <= COLLAPSED_DOT_LIMIT) return conversations;
@@ -29,6 +24,39 @@ function collapsedDotConversations(conversations: readonly Conversation[], activ
   const active = conversations.find((c) => c.slug === activeSlug);
   if (!active) return visible;
   return [...conversations.slice(0, COLLAPSED_DOT_LIMIT - 1), active];
+}
+
+function productRowMatchesRoute(row: ProductConversationListRow, routeIdentity: string | null): boolean {
+  return !!routeIdentity && (
+    row.product_conversation_id === routeIdentity
+    || row.latest_transcript_row_id === routeIdentity
+    || row.canonical_root.transcript_row_id === routeIdentity
+    || row.canonical_root.slug === routeIdentity
+  );
+}
+
+function productRowDotClass(row: ProductConversationListRow): string {
+  if (row.presentation.kind === 'needs_action') return 'awaiting-approval';
+  switch (row.presentation.presentation_mode) {
+    case 'needs_action': return 'awaiting-approval';
+    case 'working': return 'working';
+    case 'error': return 'error';
+    case 'done': return 'terminal';
+    default: return row.ordinary_lifecycle === 'history' ? 'terminal' : 'idle';
+  }
+}
+
+function collapsedDotProductConversations(
+  rows: readonly ProductConversationListRow[],
+  routeIdentity: string | null,
+): readonly ProductConversationListRow[] {
+  if (rows.length <= COLLAPSED_DOT_LIMIT) return rows;
+  const visible = rows.slice(0, COLLAPSED_DOT_LIMIT);
+  if (!routeIdentity || visible.some((row) => productRowMatchesRoute(row, routeIdentity))) return visible;
+
+  const active = rows.find((row) => productRowMatchesRoute(row, routeIdentity));
+  if (!active) return visible;
+  return [...rows.slice(0, COLLAPSED_DOT_LIMIT - 1), active];
 }
 
 const ChevronLeft = () => (
@@ -81,6 +109,20 @@ export function Sidebar({
       .then((p) => setCodexPreflight(p))
       .catch(() => { /* chip just hides — non-fatal */ });
   }, []);
+  const [showArchived, setShowArchived] = useState(false);
+  const [productConversations, setProductConversations] = useState<ProductConversationListRow[]>([]);
+  const [productConversationsError, setProductConversationsError] = useState<string | null>(null);
+  const [productConversationsRetry, setProductConversationsRetry] = useState(0);
+  const refreshScheduledRef = useRef<number | null>(null);
+  const productConversationListRevision = useSyncExternalStore(
+    subscribeProductConversationListRevision,
+    getProductConversationListRevision,
+    getProductConversationListRevision,
+  );
+  const [deleteTarget, setDeleteTarget] = useState<Conversation | null>(null);
+  const [renameTarget, setRenameTarget] = useState<Conversation | null>(null);
+  const [renameError, setRenameError] = useState<string | undefined>();
+
   // Fetch once at mount, and refetch whenever the credential health flips.
   // The shared models poller fires on credential transitions (login completes,
   // token expires, sign-out wipes), so subscribing keeps the chip in sync
@@ -97,102 +139,57 @@ export function Sidebar({
     return () => { unsub(); };
   }, [refetchCodexPreflight]);
 
-  const [showArchived, setShowArchived] = useState(false);
-  const lastProjectFilterRevealSlugRef = useRef<string | null>(null);
-  const lastArchiveRevealSlugRef = useRef<string | null>(null);
-  const [deleteTarget, setDeleteTarget] = useState<Conversation | null>(null);
-  const [renameTarget, setRenameTarget] = useState<Conversation | null>(null);
-  const [renameError, setRenameError] = useState<string | undefined>();
-  const [projects, setProjects] = useState<Project[]>([]);
-  // Tracks whether `api.getProjects()` has successfully resolved at least
-  // once. The stale-filter cleanup below gates on this so it doesn't
-  // clear during the initial empty-state render, but DOES clear once
-  // we've confirmed (via a successful fetch) that the persisted project
-  // no longer exists -- including the case where the API legitimately
-  // returns an empty list.
-  const [projectsLoaded, setProjectsLoaded] = useState(false);
-  const [activeProjectId, setActiveProjectIdState] = useState<string | null>(() => {
-    try {
-      return localStorage.getItem(PROJECT_FILTER_KEY);
-    } catch {
-      return null;
-    }
-  });
-  const setActiveProjectId = useCallback((id: string | null) => {
-    setActiveProjectIdState(id);
-    try {
-      if (id === null) localStorage.removeItem(PROJECT_FILTER_KEY);
-      else localStorage.setItem(PROJECT_FILTER_KEY, id);
-    } catch {
-      // storage full / disabled — degrade gracefully
-    }
+  useEffect(() => {
+    let cancelled = false;
+    api.listProductConversations()
+      .then((response) => {
+        if (!cancelled) {
+          setProductConversations(response.product_conversations);
+          setProductConversationsError(null);
+        }
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setProductConversationsError(error instanceof Error ? error.message : 'Failed to refresh conversations');
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [productConversationListRevision, productConversationsRetry]);
+
+  const scheduleProductRefresh = useCallback(() => {
+    if (refreshScheduledRef.current !== null) return;
+    refreshScheduledRef.current = window.setTimeout(() => {
+      refreshScheduledRef.current = null;
+      setProductConversationsRetry((revision) => revision + 1);
+    }, PRODUCT_REFRESH_COALESCE_MS);
   }, []);
 
-  // Fetch projects on mount
-  useEffect(() => {
-    api.getProjects().then((rows) => {
-      setProjects(rows);
-      setProjectsLoaded(true);
-    }).catch(() => {
-      // Transient failure: leave projectsLoaded false so the cleanup
-      // effect below doesn't clear the persisted filter on a network
-      // blip. A subsequent conversations-count tick will retry.
-    });
-  }, [conversations.length]); // re-fetch when conversation count changes
-
-  // Clear the persisted filter if the project no longer exists (e.g.,
-  // deleted server-side while the user was offline). Gated on
-  // projectsLoaded so we don't clear during the initial unloaded state,
-  // but DO clear once a successful fetch has confirmed the project is
-  // gone -- including the case where the API returns []. Without this
-  // gate-via-flag (vs. gating on `projects.length > 0`), a stale
-  // filter could survive the deletion of all projects.
-  useEffect(() => {
-    if (
-      projectsLoaded &&
-      activeProjectId &&
-      !projects.some((p) => p.id === activeProjectId)
-    ) {
-      setActiveProjectId(null);
-    }
-  }, [activeProjectId, projects, projectsLoaded, setActiveProjectId]);
-
-  // Filter conversations by selected project
-  const filteredConversations = useMemo(() => {
-    if (!activeProjectId) return conversations;
-    return conversations.filter(c => c.project_id === activeProjectId);
-  }, [conversations, activeProjectId]);
-
-  const filteredArchivedConversations = useMemo(() => {
-    if (!activeProjectId) return archivedConversations;
-    return archivedConversations.filter(c => c.project_id === activeProjectId);
-  }, [archivedConversations, activeProjectId]);
-
-  const projectLabels = useMemo(
-    () => getDisambiguatedPathLabels(projects.map((project) => project.canonical_path)),
-    [projects],
-  );
-  const activeProject = activeProjectId ? projects.find((p) => p.id === activeProjectId) ?? null : null;
-  const activeProjectLabel = activeProject ? projectLabels.get(activeProject.canonical_path) ?? null : null;
-  const scopedActiveCount = filteredConversations.length;
-  const scopedArchivedCount = filteredArchivedConversations.length;
+  useEffect(() => () => {
+    if (refreshScheduledRef.current !== null) window.clearTimeout(refreshScheduledRef.current);
+  }, []);
 
   useEffect(() => {
-    if (!activeSlug) {
-      lastProjectFilterRevealSlugRef.current = null;
-      return;
-    }
-    if (lastProjectFilterRevealSlugRef.current === activeSlug) return;
-
-    const activeConversation = [...conversations, ...archivedConversations]
-      .find((c) => matchesRouteSegment(c, activeSlug));
-    if (!activeConversation) return;
-
-    if (activeProjectId && activeConversation.project_id !== activeProjectId) {
-      setActiveProjectId(null);
-    }
-    lastProjectFilterRevealSlugRef.current = activeSlug;
-  }, [activeProjectId, activeSlug, conversations, archivedConversations, setActiveProjectId]);
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') scheduleProductRefresh();
+    };
+    const handleFocus = () => scheduleProductRefresh();
+    const handleOnline = () => scheduleProductRefresh();
+    document.addEventListener('visibilitychange', handleVisibility);
+    window.addEventListener('focus', handleFocus);
+    window.addEventListener('online', handleOnline);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibility);
+      window.removeEventListener('focus', handleFocus);
+      window.removeEventListener('online', handleOnline);
+    };
+  }, [scheduleProductRefresh]);
+  const lastArchiveRevealSlugRef = useRef<string | null>(null);
+  const openProductConversations = productConversations.filter((row) => row.ordinary_lifecycle !== 'history');
+  const archivedProductConversations = productConversations.filter((row) => row.ordinary_lifecycle === 'history');
+  const scopedActiveCount = openProductConversations.length;
+  const scopedArchivedCount = archivedProductConversations.length;
 
   useEffect(() => {
     if (!activeSlug) {
@@ -201,8 +198,10 @@ export function Sidebar({
     }
     if (lastArchiveRevealSlugRef.current === activeSlug) return;
 
-    const inActiveList = conversations.some((c) => matchesRouteSegment(c, activeSlug));
-    const inArchivedList = archivedConversations.some((c) => matchesRouteSegment(c, activeSlug));
+    const inActiveList = conversations.some((c) => matchesRouteSegment(c, activeSlug))
+      || openProductConversations.some((row) => productRowMatchesRoute(row, activeSlug));
+    const inArchivedList = archivedConversations.some((c) => matchesRouteSegment(c, activeSlug))
+      || archivedProductConversations.some((row) => productRowMatchesRoute(row, activeSlug));
     if (!inActiveList && !inArchivedList) return;
 
     if (inArchivedList && !inActiveList && !showArchived) {
@@ -211,7 +210,7 @@ export function Sidebar({
       setShowArchived(false);
     }
     lastArchiveRevealSlugRef.current = activeSlug;
-  }, [activeSlug, conversations, archivedConversations, showArchived]);
+  }, [activeSlug, archivedConversations, archivedProductConversations, conversations, openProductConversations, showArchived]);
 
   const handleNewClick = useCallback(() => {
     navigate('/new');
@@ -298,8 +297,15 @@ export function Sidebar({
   const isOnNewPage = location.pathname === '/' || location.pathname === '/new';
   const isOnTerminalPage = location.pathname === '/terminal';
   const isOnGlobalPage = location.pathname === '/global';
-  const collapsedConversations = collapsedDotConversations(conversations, activeSlug);
-  const collapsedOverflowCount = Math.max(0, conversations.length - collapsedConversations.length);
+  const collapsedProductConversations = collapsedDotProductConversations(openProductConversations, activeSlug);
+  const collapsedConversations = productConversationsError && productConversations.length === 0
+    ? collapsedDotConversations(conversations, activeSlug)
+    : [];
+  const collapsedVisibleCount = collapsedProductConversations.length || collapsedConversations.length;
+  const collapsedTotalCount = collapsedProductConversations.length > 0
+    ? openProductConversations.length
+    : conversations.length;
+  const collapsedOverflowCount = Math.max(0, collapsedTotalCount - collapsedVisibleCount);
 
   if (collapsed) {
     return (
@@ -340,6 +346,17 @@ export function Sidebar({
           compact
         />
         <div className="sidebar-collapsed-dots">
+          {collapsedProductConversations.map((row) => (
+            <button
+              key={row.product_conversation_id}
+              className={`sidebar-dot-btn ${productRowMatchesRoute(row, activeSlug) ? 'active' : ''}`}
+              onClick={() => navigate(row.canonical_route)}
+              title={row.presentation.display_name}
+              aria-label={`Open ${row.presentation.display_name}`}
+            >
+              <span className={`conv-state-dot ${productRowDotClass(row)}`} />
+            </button>
+          ))}
           {collapsedConversations.map(conv => {
             const displayState = getConvDisplayState(conv);
             const isActive = matchesRouteSegment(conv, activeSlug);
@@ -415,36 +432,6 @@ export function Sidebar({
           onPreflightInvalidated={refetchCodexPreflight}
         />
       </div>
-      {projects.length > 0 && (
-        <div className="sidebar-project-scope" aria-label="Project scope">
-          <div className="sidebar-section-label">Projects</div>
-          <div className="project-tabs">
-            <button
-              className={`project-tab ${activeProjectId === null ? 'active' : ''}`}
-              onClick={() => setActiveProjectId(null)}
-              aria-pressed={activeProjectId === null}
-            >
-              <span>All</span>
-              <span className="project-tab-count">{conversations.length}</span>
-            </button>
-            {projects.map(p => {
-              const label = projectLabels.get(p.canonical_path) ?? 'Project';
-              return (
-                <button
-                  key={p.id}
-                  className={`project-tab ${activeProjectId === p.id ? 'active' : ''}`}
-                  onClick={() => setActiveProjectId(p.id)}
-                  title={p.canonical_path}
-                  aria-pressed={activeProjectId === p.id}
-                >
-                  <span>{label}</span>
-                  <span className="project-tab-count">{countForProject(conversations, p.id)}</span>
-                </button>
-              );
-            })}
-          </div>
-        </div>
-      )}
       <div className="sidebar-lifecycle-tabs" aria-label="Conversation lifecycle">
         <button
           type="button"
@@ -452,7 +439,7 @@ export function Sidebar({
           onClick={() => { if (showArchived) handleToggleArchived(); }}
           aria-pressed={!showArchived}
         >
-          <span>Active</span>
+          <span>Open</span>
           <span className="sidebar-lifecycle-count">{scopedActiveCount}</span>
         </button>
         <button
@@ -461,15 +448,24 @@ export function Sidebar({
           onClick={() => { if (!showArchived) handleToggleArchived(); }}
           aria-pressed={showArchived}
         >
-          <span>Archived</span>
+          <span>History</span>
           <span className="sidebar-lifecycle-count">{scopedArchivedCount}</span>
         </button>
       </div>
+      {productConversationsError && (
+        <div className="sidebar-refresh-error" role="status">
+          <span>Showing cached conversations</span>
+          <button type="button" onClick={() => setProductConversationsRetry((revision) => revision + 1)}>Retry</button>
+        </div>
+      )}
       <LocalServicesPanel />
       <div className="sidebar-list">
         <ConversationList
-          conversations={filteredConversations}
-          archivedConversations={filteredArchivedConversations}
+          conversations={conversations}
+          archivedConversations={archivedConversations}
+          productConversations={openProductConversations}
+          archivedProductConversations={archivedProductConversations}
+          productRowsAuthoritative={!productConversationsError}
           showArchived={showArchived}
           onToggleArchived={handleToggleArchived}
           onNewConversation={handleNewClick}
@@ -477,9 +473,9 @@ export function Sidebar({
           onDelete={handleSetDeleteTarget}
           onRename={handleSetRenameTarget}
           onConversationClick={handleConversationClick}
+          onProductConversationClick={(row) => navigate(row.canonical_route)}
           activeSlug={activeSlug}
           sidebarMode
-          emptyScopeLabel={activeProjectLabel}
         />
       </div>
       <ConfirmDialog

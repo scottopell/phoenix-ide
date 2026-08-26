@@ -1,8 +1,8 @@
-import { useState, useEffect, useCallback, useLayoutEffect, useRef } from 'react';
+import { useState, useEffect, useCallback, useLayoutEffect, useRef, useSyncExternalStore } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api';
 import { refreshModels, subscribeModels } from '../modelsPoller';
-import type { Conversation, CodexLoginPreflight } from '../api';
+import type { Conversation, CodexLoginPreflight, ProductConversationListRow } from '../api';
 import { useModels, useAutoAuth, useIsDesktop, useTheme } from '../hooks';
 import {
   useConversationsList,
@@ -27,6 +27,8 @@ import { useAppMachine } from '../hooks/useAppMachine';
 import { useToast } from '../hooks/useToast';
 import { CredentialHelperPanel } from '../components/CredentialHelperPanel';
 import { SettingsDropdown } from '../components/SettingsDropdown';
+import { effectiveVisibleConversationCount } from './conversationListCount';
+import { getProductConversationListRevision, subscribeProductConversationListRevision } from '../notifications';
 
 const MOBILE_LIST_SCROLL_KEY = 'phoenix:mobile-conversation-list-scroll:v1';
 const MOBILE_ARCHIVED_LIST_SCROLL_KEY = 'phoenix:mobile-archived-list-scroll:v1';
@@ -44,12 +46,47 @@ export function ConversationListPage() {
   const { refresh } = useConversationsRefresh();
   const { active: conversations, archived: archivedConversations } = useConversationsList();
   const [showArchived, setShowArchived] = useState(false);
+  const [productConversations, setProductConversations] = useState<ProductConversationListRow[]>([]);
+  const [productListError, setProductListError] = useState<string | null>(null);
+  const [productListRevision, setProductListRevision] = useState(0);
+  const productConversationListRevision = useSyncExternalStore(
+    subscribeProductConversationListRevision,
+    getProductConversationListRevision,
+    getProductConversationListRevision,
+  );
   const mainRef = useRef<HTMLElement | null>(null);
   const didRestoreScrollRef = useRef(false);
   const currentScrollKey = showArchived ? MOBILE_ARCHIVED_LIST_SCROLL_KEY : MOBILE_LIST_SCROLL_KEY;
-  const visibleConversationCount = showArchived ? archivedConversations.length : conversations.length;
+  const openProductConversations = productConversations.filter((row) => row.ordinary_lifecycle !== 'history');
+  const archivedProductConversations = productConversations.filter((row) => row.ordinary_lifecycle === 'history');
+  const visibleConversationCount = effectiveVisibleConversationCount({
+    showArchived,
+    productListError,
+    productCount: productConversations.length,
+    openProductCount: openProductConversations.length,
+    archivedProductCount: archivedProductConversations.length,
+    activeMemberCount: conversations.length,
+    archivedMemberCount: archivedConversations.length,
+  });
   const currentScrollKeyRef = useRef(currentScrollKey);
   currentScrollKeyRef.current = currentScrollKey;
+
+  useEffect(() => {
+    let cancelled = false;
+    api.listProductConversations()
+      .then((response) => {
+        if (cancelled) return;
+        setProductConversations(response.product_conversations);
+        setProductListError(null);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setProductListError(err instanceof Error ? err.message : 'Failed to fetch product conversations');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [productConversationListRevision, productListRevision]);
 
   useEffect(() => {
     if (isDesktop) didRestoreScrollRef.current = false;
@@ -79,7 +116,9 @@ export function ConversationListPage() {
   const loading =
     !hasCompletedFirstFetch &&
     conversations.length === 0 &&
-    archivedConversations.length === 0;
+    archivedConversations.length === 0 &&
+    productConversations.length === 0 &&
+    productListError === null;
 
   // Delete confirmation state
   const [deleteTarget, setDeleteTarget] = useState<Conversation | null>(null);
@@ -293,7 +332,7 @@ export function ConversationListPage() {
     );
   }
 
-  const totalConversations = conversations.length + archivedConversations.length;
+  const totalConversations = productConversations.length;
 
   const authChip = credentialStatus && credentialStatus !== 'not_configured' ? (
     <button
@@ -346,9 +385,18 @@ export function ConversationListPage() {
           </section>
         ) : (
           <>
+            {productListError && (
+              <div role="status" className="coordinator-error">
+                <span>Showing cached conversations — {productListError}</span>
+                <button type="button" onClick={() => setProductListRevision((revision) => revision + 1)}>Retry</button>
+              </div>
+            )}
             <ConversationList
               conversations={conversations}
               archivedConversations={archivedConversations}
+              productConversations={openProductConversations}
+              archivedProductConversations={archivedProductConversations}
+              productRowsAuthoritative={!productListError}
               showArchived={showArchived}
               onToggleArchived={handleToggleArchived}
               onNewConversation={handleNewConversation}
@@ -356,6 +404,7 @@ export function ConversationListPage() {
               onDelete={handleSetDeleteTarget}
               onRename={handleSetRenameTarget}
               onConversationClick={handleConversationClick}
+              onProductConversationClick={(row) => navigate(row.canonical_route)}
               listDensity={isDesktop ? 'full' : 'mobile'}
               authChip={authChip}
               utilityActions={(

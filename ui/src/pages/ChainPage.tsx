@@ -538,7 +538,7 @@ export function ChainPage() {
  * push channel on the chain page, so `liveInventory` is omitted; the panel
  * keeps its inventory poll alive even while collapsed to refresh the badge.
  */
-function ChainWorkScopeDock({
+export function ChainWorkScopeDock({
   activeConvId,
   workIdentity,
 }: {
@@ -842,13 +842,13 @@ interface ChainQaColumnProps {
   setDraft: (s: string) => void;
   submitting: boolean;
   sseLost: boolean;
-  onSubmit: (e: FormEvent<HTMLFormElement>) => void;
+  onSubmit?: (e: FormEvent<HTMLFormElement>) => void;
   onReask: (question: string) => void;
   activeTextareaRef: React.RefObject<HTMLTextAreaElement>;
   onRetryConnection: () => void;
 }
 
-function ChainQaColumn({
+export function ChainQaColumn({
   chain,
   persisted,
   inflight,
@@ -871,7 +871,7 @@ function ChainQaColumn({
               draft={draft}
               setDraft={setDraft}
               submitting={submitting}
-              onSubmit={onSubmit}
+              {...(onSubmit ? { onSubmit } : {})}
               activeTextareaRef={activeTextareaRef}
             />
           </li>
@@ -965,7 +965,7 @@ function ActivePairCard({
   draft = '',
   setDraft = () => {},
   submitting = false,
-  onSubmit = () => {},
+  onSubmit,
   activeTextareaRef,
 }: ChainQaPairCardProps) {
   // Autofocus on mount. The ref is also used by the parent to refocus after
@@ -975,11 +975,11 @@ function ActivePairCard({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const canSubmit = draft.trim().length > 0 && !submitting;
+  const canSubmit = draft.trim().length > 0 && !submitting && !!onSubmit;
 
   return (
     <article className="chain-qa-pair chain-qa-pair--active">
-      <form className="chain-qa-pair-form" onSubmit={onSubmit}>
+      <form className="chain-qa-pair-form" {...(onSubmit ? { onSubmit } : {})}>
         <div className="chain-qa-pair-row">
           <span className="chain-qa-pair-label">Q:</span>
           <div className="chain-qa-pair-content">
@@ -993,7 +993,7 @@ function ActivePairCard({
                   e.preventDefault();
                   if (canSubmit) {
                     // Single submit path — mirror the form submit.
-                    onSubmit({
+                    onSubmit?.({
                       preventDefault: () => {},
                     } as unknown as FormEvent<HTMLFormElement>);
                   }

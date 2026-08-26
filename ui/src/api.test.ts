@@ -277,6 +277,43 @@ describe('conversation message history clients', () => {
       '/api/conversations/conv-1/messages/around/17?before=4&after=6',
     );
   });
+
+  it('GETs the product conversation list', async () => {
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ product_conversations: [] }),
+    } as unknown as Response);
+
+    await api.listProductConversations();
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/product-conversations');
+  });
+
+  it('GETs a product conversation snapshot with message_limit and before params', async () => {
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ segments: [], has_older: false, before: null }),
+    } as unknown as Response);
+
+    await api.getProductConversationSnapshot('pc-1', { message_limit: 100, before: 'cursor-1' });
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/product-conversations/pc-1?message_limit=100&before=cursor-1');
+  });
+
+  it('preserves snapshot HTTP status for stale-cursor recovery', async () => {
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 400,
+    } as unknown as Response);
+
+    await expect(api.getProductConversationSnapshot('pc-1', { before: 'stale' }))
+      .rejects.toMatchObject({ status: 400 });
+  });
 });
 
 describe('api.regenerateConversationName', () => {

@@ -1,13 +1,15 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { notifyProductConversationListMayHaveChanged } from '../notifications';
 import { render, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import type { Conversation, Project } from '../api';
+import type { Conversation, ProductConversationListRow } from '../api';
 
 const { apiMock } = vi.hoisted(() => ({
   apiMock: {
     codexLoginPreflight: vi.fn(),
     deploymentInfo: vi.fn(),
     getProjects: vi.fn(),
+    listProductConversations: vi.fn(),
     getLocalServices: vi.fn(),
     archiveConversation: vi.fn(),
     archiveChain: vi.fn(),
@@ -49,15 +51,22 @@ const makeConv = (id: string, slug: string, overrides: Partial<Conversation> = {
   ...overrides,
 });
 
-const makeProject = (id: string, path: string): Project => ({
-  id,
-  canonical_path: path,
-  main_ref: 'main',
-  created_at: '2024-01-01T00:00:00Z',
-  conversation_count: 1,
+const makeProductConversation = (id: string, overrides: Partial<ProductConversationListRow> = {}): ProductConversationListRow => ({
+  product_conversation_id: id,
+  canonical_route: `/product-conversations/${id}`,
+  canonical_root: {
+    transcript_row_id: `root-${id}`,
+    slug: `root-${id}`,
+    title: `Root ${id}`,
+  },
+  ordinary_lifecycle: 'open',
+  latest_transcript_row_id: `latest-${id}`,
+  updated_at: '2024-01-01T00:00:00Z',
+  presentation: { kind: 'state', display_name: `Display ${id}`, presentation_mode: 'idle' },
+  ...overrides,
 });
 
-describe('Sidebar — active conversation project filter', () => {
+describe('Sidebar — ProductConversation navigation', () => {
   let originalScrollDescriptor: PropertyDescriptor | undefined;
 
   beforeEach(() => {
@@ -74,10 +83,12 @@ describe('Sidebar — active conversation project filter', () => {
     });
     apiMock.deploymentInfo.mockResolvedValue({ local_access: true });
     apiMock.getLocalServices.mockResolvedValue({ services: [] });
-    apiMock.getProjects.mockResolvedValue([
-      makeProject('proj-1', '/home/user/one'),
-      makeProject('proj-2', '/home/user/two'),
-    ]);
+    apiMock.listProductConversations.mockResolvedValue({
+      product_conversations: [
+        makeProductConversation('pc-open', { canonical_root: { transcript_row_id: 'root-open', slug: 'root-open', title: 'Open Root' } }),
+        makeProductConversation('pc-archived', { ordinary_lifecycle: 'history', canonical_root: { transcript_row_id: 'root-archived', slug: 'root-archived', title: 'Archived Root' } }),
+      ],
+    });
   });
 
   afterEach(() => {
@@ -90,192 +101,133 @@ describe('Sidebar — active conversation project filter', () => {
     }
   });
 
-  it('clears the project filter when it hides the active conversation', async () => {
-    localStorage.setItem('phoenix:sidebar-project-filter', 'proj-1');
-    const conversations = [
-      makeConv('hidden-active-id', 'hidden-active', { project_id: 'proj-2', cwd: '/home/user/two' }),
-      makeConv('visible-other-id', 'visible-other', { project_id: 'proj-1', cwd: '/home/user/one' }),
-    ];
 
-    const { container } = render(
-      <MemoryRouter initialEntries={['/c/hidden-active']}>
-        <Sidebar
-          collapsed={false}
-          onToggle={vi.fn()}
-          conversations={conversations}
-          archivedConversations={[]}
-          activeSlug="hidden-active"
-          onConversationCreated={vi.fn()}
-        />
-      </MemoryRouter>,
-    );
 
-    await waitFor(() => {
-      expect(localStorage.getItem('phoenix:sidebar-project-filter')).toBeNull();
-    });
-    await waitFor(() => {
-      expect(container.querySelector('[data-id="hidden-active-id"]')).not.toBeNull();
-    });
-    expect(container.querySelector('[data-id="hidden-active-id"]')!.classList.contains('active')).toBe(true);
-  });
-
-  it('preserves a manually selected project tab after the active route has been revealed', async () => {
-    const conversations = [
-      makeConv('active-id', 'active-project-one', { project_id: 'proj-1', cwd: '/home/user/one' }),
-      makeConv('browse-id', 'browse-project-two', { project_id: 'proj-2', cwd: '/home/user/two' }),
-    ];
-
+  it('shows History when the active aggregate product conversation is archived', async () => {
     const { container, getByRole } = render(
-      <MemoryRouter initialEntries={['/c/active-project-one']}>
-        <Sidebar
-          collapsed={false}
-          onToggle={vi.fn()}
-          conversations={conversations}
-          archivedConversations={[]}
-          activeSlug="active-project-one"
-          onConversationCreated={vi.fn()}
-        />
-      </MemoryRouter>,
-    );
-
-    await waitFor(() => {
-      expect(container.querySelector('[data-id="active-id"]')).not.toBeNull();
-    });
-
-    fireEvent.click(getByRole('button', { name: /two/ }));
-
-    await waitFor(() => {
-      expect(localStorage.getItem('phoenix:sidebar-project-filter')).toBe('proj-2');
-    });
-    expect(container.querySelector('[data-id="active-id"]')).toBeNull();
-    expect(container.querySelector('[data-id="browse-id"]')).not.toBeNull();
-  });
-
-  it('shows the archived list when the active conversation is archived', async () => {
-    const archived = makeConv('archived-id', 'archived-active', {
-      archived: true,
-      project_id: 'proj-1',
-    });
-
-    const { container, getByRole } = render(
-      <MemoryRouter initialEntries={['/c/archived-active']}>
+      <MemoryRouter initialEntries={['/product-conversations/pc-archived']}>
         <Sidebar
           collapsed={false}
           onToggle={vi.fn()}
           conversations={[]}
-          archivedConversations={[archived]}
-          activeSlug="archived-active"
+          archivedConversations={[]}
+          activeSlug="pc-archived"
           onConversationCreated={vi.fn()}
         />
       </MemoryRouter>,
     );
 
     await waitFor(() => {
-      expect(container.querySelector('[data-id="archived-id"]')).not.toBeNull();
+      expect(container.querySelector('[data-product-conversation-id="pc-archived"]')).not.toBeNull();
     });
-    expect(container.querySelector('[data-id="archived-id"]')!.classList.contains('active')).toBe(true);
-    const archivedTab = getByRole('button', { name: /Archived 1/ });
+    const archivedTab = getByRole('button', { name: /History 1/ });
     expect(archivedTab.getAttribute('aria-pressed')).toBe('true');
   });
 
-  it('shows project-scoped lifecycle counts', async () => {
-    const conversations = [
-      makeConv('one-active-a', 'one-active-a', { project_id: 'proj-1', cwd: '/home/user/one' }),
-      makeConv('one-active-b', 'one-active-b', { project_id: 'proj-1', cwd: '/home/user/one' }),
-      makeConv('two-active', 'two-active', { project_id: 'proj-2', cwd: '/home/user/two' }),
-    ];
-    const archived = [
-      makeConv('one-archived', 'one-archived', { archived: true, project_id: 'proj-1', cwd: '/home/user/one' }),
-      makeConv('two-archived-a', 'two-archived-a', { archived: true, project_id: 'proj-2', cwd: '/home/user/two' }),
-      makeConv('two-archived-b', 'two-archived-b', { archived: true, project_id: 'proj-2', cwd: '/home/user/two' }),
-    ];
 
-    const { getByRole } = render(
-      <MemoryRouter initialEntries={['/']}>
-        <Sidebar
-          collapsed={false}
-          onToggle={vi.fn()}
-          conversations={conversations}
-          archivedConversations={archived}
-          activeSlug={null}
-          onConversationCreated={vi.fn()}
-        />
-      </MemoryRouter>,
-    );
 
-    await waitFor(() => {
-      expect(getByRole('button', { name: /All 3/ })).not.toBeNull();
-    });
-    expect(getByRole('button', { name: /one 2/ })).not.toBeNull();
-    expect(getByRole('button', { name: /two 1/ })).not.toBeNull();
-    expect(getByRole('button', { name: /Active 3/ })).not.toBeNull();
-    expect(getByRole('button', { name: /Archived 3/ })).not.toBeNull();
-
-    fireEvent.click(getByRole('button', { name: /two 1/ }));
-
-    await waitFor(() => {
-      expect(getByRole('button', { name: /Active 1/ })).not.toBeNull();
-    });
-    expect(getByRole('button', { name: /Archived 2/ })).not.toBeNull();
-  });
-
-  it('names the project and lifecycle in empty states', async () => {
-    const conversations = [
-      makeConv('one-active', 'one-active', { project_id: 'proj-1', cwd: '/home/user/one' }),
-    ];
-
-    const { getByRole, getByText } = render(
-      <MemoryRouter initialEntries={['/']}>
-        <Sidebar
-          collapsed={false}
-          onToggle={vi.fn()}
-          conversations={conversations}
-          archivedConversations={[]}
-          activeSlug={null}
-          onConversationCreated={vi.fn()}
-        />
-      </MemoryRouter>,
-    );
-
-    await waitFor(() => {
-      expect(getByRole('button', { name: /two 0/ })).not.toBeNull();
-    });
-    fireEvent.click(getByRole('button', { name: /two 0/ }));
-
-    expect(getByText('No active conversations in two')).not.toBeNull();
-
-    fireEvent.click(getByRole('button', { name: /Archived 0/ }));
-    expect(getByText('No archived conversations in two')).not.toBeNull();
-  });
-
-  it('limits collapsed sidebar dots and exposes an overflow marker', async () => {
-    const conversations = Array.from({ length: 12 }, (_, index) =>
-      makeConv(`conv-${index}`, `conv-${index}`, { project_id: index % 2 === 0 ? 'proj-1' : 'proj-2' }),
-    );
+  it('marks a collapsed aggregate dot active for its latest-row identity', async () => {
     const onToggle = vi.fn();
 
     const { container, getByRole } = render(
-      <MemoryRouter initialEntries={['/c/conv-11']}>
+      <MemoryRouter initialEntries={['/product-conversations/pc-open']}>
         <Sidebar
           collapsed
           onToggle={onToggle}
-          conversations={conversations}
+          conversations={[]}
           archivedConversations={[]}
-          activeSlug="conv-11"
+          activeSlug="latest-pc-open"
           onConversationCreated={vi.fn()}
         />
       </MemoryRouter>,
     );
 
     await waitFor(() => {
-      expect(apiMock.getProjects).toHaveBeenCalled();
+      expect(container.querySelector('[aria-label="Open Display pc-open"]')).toHaveClass('active');
     });
 
-    expect(container.querySelectorAll('.sidebar-dot-btn')).toHaveLength(9);
-    expect(container.querySelector('[title="conv-11"]')).not.toBeNull();
-
-    fireEvent.click(getByRole('button', { name: /3 more conversations/ }));
+    fireEvent.click(getByRole('button', { name: /Expand sidebar/ }));
     expect(onToggle).toHaveBeenCalledTimes(1);
+  });
+
+  it('falls back to cached member rows and retries a failed aggregate refresh', async () => {
+    apiMock.listProductConversations
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockResolvedValueOnce({ product_conversations: [makeProductConversation('pc-recovered')] });
+    const cached = makeConv('cached-id', 'cached-slug');
+
+    const { container, getByRole } = render(
+      <MemoryRouter initialEntries={['/c/cached-slug']}>
+        <Sidebar
+          collapsed={false}
+          onToggle={vi.fn()}
+          conversations={[cached]}
+          archivedConversations={[]}
+          activeSlug="cached-slug"
+          onConversationCreated={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(getByRole('status')).toHaveTextContent('Showing cached conversations'));
+    expect(container.querySelector('[data-id="cached-id"]')).not.toBeNull();
+    fireEvent.click(getByRole('button', { name: 'Retry' }));
+    await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-recovered"]')).not.toBeNull());
+    expect(apiMock.listProductConversations).toHaveBeenCalledTimes(2);
+  });
+
+  it('coalesces product-list refresh triggers from visibility, focus, and online without request loops', async () => {
+    const { container } = render(
+      <MemoryRouter initialEntries={['/c/cached-slug']}>
+        <Sidebar
+          collapsed={false}
+          onToggle={vi.fn()}
+          conversations={[makeConv('cached-id', 'cached-slug')]}
+          archivedConversations={[]}
+          activeSlug="cached-slug"
+          onConversationCreated={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-open"]')).not.toBeNull());
+    apiMock.listProductConversations.mockResolvedValueOnce({
+      product_conversations: [makeProductConversation('pc-refreshed')],
+    });
+
+    document.dispatchEvent(new Event('visibilitychange'));
+    window.dispatchEvent(new Event('focus'));
+    window.dispatchEvent(new Event('online'));
+
+    await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-refreshed"]')).not.toBeNull());
+    expect(apiMock.listProductConversations).toHaveBeenCalledTimes(2);
+  });
+
+  it('coalesces product-list refresh triggers from conversation store mutations without request loops', async () => {
+    const { container } = render(
+      <MemoryRouter initialEntries={['/c/cached-slug']}>
+        <Sidebar
+          collapsed={false}
+          onToggle={vi.fn()}
+          conversations={[makeConv('cached-id', 'cached-slug')]}
+          archivedConversations={[]}
+          activeSlug="cached-slug"
+          onConversationCreated={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-open"]')).not.toBeNull());
+    apiMock.listProductConversations.mockResolvedValueOnce({
+      product_conversations: [makeProductConversation('pc-updated')],
+    });
+
+    notifyProductConversationListMayHaveChanged();
+    notifyProductConversationListMayHaveChanged();
+    notifyProductConversationListMayHaveChanged();
+
+    await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-updated"]')).not.toBeNull());
+    expect(apiMock.listProductConversations).toHaveBeenCalledTimes(2);
   });
 
   it('labels the global nav entry as Coordinator', async () => {
@@ -300,32 +252,5 @@ describe('Sidebar — active conversation project filter', () => {
     expect(queryByLabelText('Global Recall')).toBeNull();
   });
 
-  it('uses human project labels from canonical paths and replaces generated leaves with repository names', async () => {
-    apiMock.getProjects.mockResolvedValue([
-      makeProject('proj-human', '/Users/scott/phoenix-ide'),
-      makeProject('proj-generated', '/repo/.phoenix/worktrees/9d1b4cc93b7845228e4fdbe566761f44'),
-    ]);
 
-    const { getByRole, queryByRole } = render(
-      <MemoryRouter initialEntries={['/']}>
-        <Sidebar
-          collapsed={false}
-          onToggle={vi.fn()}
-          conversations={[
-            makeConv('c1', 'c1', { project_id: 'proj-human' }),
-            makeConv('c2', 'c2', { project_id: 'proj-generated' }),
-          ]}
-          archivedConversations={[]}
-          activeSlug={null}
-          onConversationCreated={vi.fn()}
-        />
-      </MemoryRouter>,
-    );
-
-    await waitFor(() => {
-      expect(getByRole('button', { name: /phoenix-ide 1/i })).not.toBeNull();
-    });
-    expect(queryByRole('button', { name: /^9d1b4cc93b7845228e4fdbe566761f44 1$/i })).toBeNull();
-    expect(getByRole('button', { name: /^repo 1$/i })).not.toBeNull();
-  });
 });

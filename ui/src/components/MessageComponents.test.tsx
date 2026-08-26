@@ -481,6 +481,42 @@ describe('inline tool timers', () => {
     expect(copyToClipboard).not.toHaveBeenCalledWith(expect.stringContaining('first.md'));
   });
 
+  it('routes grouped context-menu viewer opens by stable message id even when sequence ids collide', async () => {
+    mockDensity = 'compact';
+    const first = agentMessage('agent-context-a', [
+      { type: 'tool_use', id: 'context-read', name: 'read_file', input: { path: 'first.md' } },
+    ], 2);
+    const second = agentMessage('agent-context-b', [
+      { type: 'tool_use', id: 'context-search', name: 'search', input: { pattern: 'second owner' } },
+    ], 2);
+    const events: Array<{ sequenceId: number; messageId?: string }> = [];
+    const handler = (event: Event) => {
+      const detail = (event as CustomEvent<{ sequenceId: number; messageId?: string }>).detail;
+      events.push(detail);
+    };
+    window.addEventListener(OPEN_MESSAGE_VIEWER_EVENT, handler);
+
+    render(
+      <MemoryRouter>
+        <div id="messages">
+          <ToolOnlyAgentTurnGroup members={[
+            { kind: 'agent_turn', key: first.message_id, agent: first, toolResultsByUseId: new Map(), isFirstInTurn: true },
+            { kind: 'agent_turn', key: second.message_id, agent: second, toolResultsByUseId: new Map(), isFirstInTurn: false },
+          ]} />
+          <MessageContextMenu messages={[first, second]} />
+        </div>
+      </MemoryRouter>,
+    );
+
+    fireEvent.contextMenu(screen.getByRole('button', { name: /search:.*expand tool detail/i }), { clientX: 20, clientY: 30 });
+    fireEvent.click(await screen.findByRole('button', { name: 'Copy as Plain Text' }));
+
+    expect(copyToClipboard).toHaveBeenCalledWith(expect.stringContaining('second owner'));
+    expect(copyToClipboard).not.toHaveBeenCalledWith(expect.stringContaining('first.md'));
+    expect(events).toEqual([]);
+    window.removeEventListener(OPEN_MESSAGE_VIEWER_EVENT, handler);
+  });
+
   it('preserves retry audit metadata in a collapsed tool group', () => {
     mockDensity = 'compact';
     const first = agentMessage('agent-retry-a', [
@@ -974,7 +1010,7 @@ describe('message copy affordances', () => {
     const message = agentMessage('agent-open-sidepanel', [
       { type: 'text', text: 'Long **proposal**.' },
     ], 15);
-    const opened: Array<{ sequenceId: number; presentation: string }> = [];
+    const opened: Array<{ sequenceId: number; presentation: string; messageId?: string }> = [];
     const handler = (event: Event) => {
       opened.push((event as CustomEvent<{ sequenceId: number; presentation: string }>).detail);
     };
@@ -997,7 +1033,7 @@ describe('message copy affordances', () => {
       expect(screen.queryByRole('button', { name: 'Open in fullscreen' })).not.toBeInTheDocument();
       fireEvent.click(screen.getByRole('button', { name: 'Open in sidepanel' }));
 
-      expect(opened).toEqual([{ sequenceId: 15, presentation: 'pane' }]);
+      expect(opened).toEqual([{ sequenceId: 15, messageId: 'agent-open-sidepanel', presentation: 'pane' }]);
       expect(screen.queryByRole('button', { name: 'Open in sidepanel' })).not.toBeInTheDocument();
     } finally {
       window.removeEventListener(OPEN_MESSAGE_VIEWER_EVENT, handler);
@@ -1008,7 +1044,7 @@ describe('message copy affordances', () => {
     const message = agentMessage('agent-open-fullscreen', [
       { type: 'text', text: 'Focused **proposal**.' },
     ], 18);
-    const opened: Array<{ sequenceId: number; presentation: string }> = [];
+    const opened: Array<{ sequenceId: number; presentation: string; messageId?: string }> = [];
     const handler = (event: Event) => {
       opened.push((event as CustomEvent<{ sequenceId: number; presentation: string }>).detail);
     };
@@ -1031,7 +1067,7 @@ describe('message copy affordances', () => {
       expect(screen.getByRole('button', { name: 'Open in sidepanel' })).toBeInTheDocument();
       fireEvent.click(screen.getByRole('button', { name: 'Open in fullscreen' }));
 
-      expect(opened).toEqual([{ sequenceId: 18, presentation: 'fullscreen' }]);
+      expect(opened).toEqual([{ sequenceId: 18, messageId: 'agent-open-fullscreen', presentation: 'fullscreen' }]);
       expect(screen.queryByRole('button', { name: 'Open in fullscreen' })).not.toBeInTheDocument();
     } finally {
       window.removeEventListener(OPEN_MESSAGE_VIEWER_EVENT, handler);

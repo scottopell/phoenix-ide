@@ -266,6 +266,26 @@ describe('MessageViewer', () => {
     expect(onPresentationChange).not.toHaveBeenCalled();
   });
 
+  it('selects by stable message id when sequence ids collide', () => {
+    const duplicateA = { ...agentTextMessage(7, 'First duplicate'), message_id: 'dup-a' };
+    const duplicateB = { ...agentTextMessage(7, 'Second duplicate'), message_id: 'dup-b' };
+    render(
+      <ReviewNotesProvider>
+        <MessageViewer
+          sequenceId={7}
+          messageId="dup-b"
+          messages={[duplicateA, duplicateB]}
+          onClose={vi.fn()}
+          onSendNotes={vi.fn()}
+          inline
+        />
+      </ReviewNotesProvider>,
+    );
+
+    expect(screen.getByText('Second duplicate')).toBeInTheDocument();
+    expect(screen.queryByText('First duplicate')).not.toBeInTheDocument();
+  });
+
   it('keeps line refs registered so note jumps can highlight the target line', async () => {
     Element.prototype.scrollIntoView = vi.fn();
     const messages = [agentTextMessage(1, 'First proposal line')];

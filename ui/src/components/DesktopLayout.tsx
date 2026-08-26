@@ -7,7 +7,7 @@ import {
   useWorkScope,
 } from '../conversation';
 import { useResizablePane, useIsDesktop } from '../hooks';
-import { api, type Conversation } from '../api';
+import { api, type Conversation, type ProductConversationListRow, type ProductConversationSnapshotView } from '../api';
 import { Sidebar } from './Sidebar';
 import { FileExplorerPanel, FileExplorerProvider } from './FileExplorer';
 import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
@@ -35,6 +35,7 @@ import {
   notifyCatchUp,
   registerCoordinatorForNotifications,
   useNotificationClickNavigationBridge,
+  setActiveNotificationConversationSlug,
 } from '../notifications';
 
 const subAgentViewerPaneMax = () => Math.max(360, Math.round(window.innerWidth * 0.6));
@@ -137,6 +138,17 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   const { refresh: refreshConversations } = useConversationsRefresh();
   const { active: conversations, archived: archivedConversations } = useConversationsList();
   const [coordinatorForNotifications, setCoordinatorForNotifications] = useState<Conversation | null>(null);
+  const [productConversations, setProductConversations] = useState<ProductConversationListRow[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = () => api.listProductConversations()
+      .then((response) => { if (!cancelled) setProductConversations(response.product_conversations); })
+      .catch(() => {});
+    void refresh();
+    const interval = window.setInterval(refresh, 5_000);
+    return () => { cancelled = true; window.clearInterval(interval); };
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -201,16 +213,51 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
     };
   }, [showInfo]);
 
-  // Extract active slug. `useConversationSnapshot` reads the row directly
-  // from the store — polling and SSE both write through the same atom,
-  // so this is the single source of truth for the active conversation.
-  // Returns null until polling or SSE init has populated the row
-  // (typically one tick after navigation; `if (!conversation)` callers
-  // downstream paint a skeleton during that window).
+  // Extract active route owner. `/c/:slug` reads directly from the store. The
+  // aggregate `/product-conversations/:id` route derives its latest transcript
+  // row from the typed snapshot so desktop work-scope/file panels stay anchored
+  // to the currently-open latest transcript without backend changes.
   const slugMatch = location.pathname.match(/^\/c\/(.+)$/);
-  const activeSlug = slugMatch?.[1] ?? null;
+  const productMatch = location.pathname.match(/^\/product-conversations\/([^/?#]+)/);
+  const routeSlug = slugMatch?.[1] ?? null;
+  const productConversationId = productMatch?.[1] ?? null;
+  const [productSnapshot, setProductSnapshot] = useState<{ ownerId: string; snapshot: ProductConversationSnapshotView } | null>(null);
+  const [productSnapshotRetry, setProductSnapshotRetry] = useState(0);
+  useEffect(() => {
+    if (!productConversationId) {
+      setProductSnapshot(null);
+      return;
+    }
+    let cancelled = false;
+    api.getProductConversationSnapshot(productConversationId, { message_limit: 1 })
+      .then((snapshot) => {
+        if (!cancelled) setProductSnapshot({ ownerId: productConversationId, snapshot });
+      })
+      .catch(() => {
+        if (!cancelled) setProductSnapshot(null);
+      });
+    return () => { cancelled = true; };
+  }, [productConversationId, productSnapshotRetry]);
+  const ownedProductSnapshot = productSnapshot?.ownerId === productConversationId ? productSnapshot.snapshot : null;
+  const activeSlug = routeSlug ?? ownedProductSnapshot?.latest_transcript_row_id ?? null;
+  const sidebarActiveIdentity = productConversationId ?? activeSlug;
   const activeConversation = useConversationSnapshot(activeSlug);
   const activeConversationId = activeConversation?.id;
+  useEffect(() => {
+    if (!productConversationId || ownedProductSnapshot) return;
+    const retry = () => setProductSnapshotRetry((value) => value + 1);
+    const timeout = window.setTimeout(retry, 1_000);
+    window.addEventListener('online', retry);
+    return () => {
+      window.clearTimeout(timeout);
+      window.removeEventListener('online', retry);
+    };
+  }, [ownedProductSnapshot, productConversationId, productSnapshotRetry]);
+
+  useEffect(() => {
+    setActiveNotificationConversationSlug(activeSlug);
+    return () => setActiveNotificationConversationSlug(null);
+  }, [activeSlug]);
   // Live work-scope inventory (SSE-fed) for the active conversation, threaded
   // into FileExplorerPanel's Work scope section + collapsed-rail badge
   // (REQ-WSUI-010). Single-writer atom contract: only the SSE reducer writes
@@ -265,7 +312,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
             onToggle={() => sidebarPane.setCollapsed(!sidebarPane.collapsed)}
             conversations={conversations}
             archivedConversations={archivedConversations}
-            activeSlug={activeSlug}
+            activeSlug={sidebarActiveIdentity}
             onConversationCreated={() => refreshConversations()}
             width={sidebarPane.collapsed ? undefined : sidebarPane.size}
           />
@@ -307,7 +354,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
           {children}
         </div>
         {isDesktop && <SubAgentViewerDock />}
-        {isDesktop && <CommandPalette conversations={conversations} activeConversation={activeConversation} />}
+        {isDesktop && <CommandPalette conversations={conversations} productConversations={productConversations} activeConversation={activeConversation} />}
         <Toast messages={toasts} onDismiss={dismissToast} />
       </div>
      </FileExplorerProvider>

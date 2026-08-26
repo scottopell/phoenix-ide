@@ -1,0 +1,116 @@
+.product-conversation-page {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+  padding: 16px;
+  gap: 16px;
+}
+
+.product-conversation-page__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+}
+
+.product-conversation-page__eyebrow {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+}
+
+.product-conversation-page__route,
+.product-conversation-page__status {
+  color: var(--text-muted);
+  margin: 4px 0 0;
+}
+
+.product-conversation-meta,
+.product-conversation-handoff {
+  border: 1px solid var(--border-subtle);
+  border-radius: 12px;
+  padding: 12px 14px;
+  background: var(--panel-bg);
+}
+
+.product-conversation-meta__row {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+}
+
+.product-conversation-meta__row:first-child {
+  margin-top: 0;
+}
+
+.product-conversation-meta__label,
+.product-conversation-handoff__eyebrow,
+.product-conversation-handoff dt {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.product-conversation-handoff__summary {
+  margin-top: 4px;
+  white-space: pre-wrap;
+}
+
+.product-conversation-handoff__details {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 8px 16px;
+  margin: 12px 0 0;
+}
+
+.product-conversation-handoff__details dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.product-conversation-page__layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.5fr) minmax(320px, 0.9fr) minmax(260px, 0.7fr);
+  gap: 16px;
+  min-height: 0;
+}
+
+.product-conversation-page__history,
+.product-conversation-page__qa,
+.product-conversation-page__dock {
+  min-width: 0;
+  min-height: 0;
+}
+
+.product-conversation-page__history {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.product-conversation-page__qa {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+}
+
+.product-conversation-page__composer,
+.product-conversation-page__composer-placeholder {
+  border: 1px solid var(--border-subtle);
+  border-radius: 12px;
+  background: var(--panel-bg);
+  overflow: hidden;
+}
+
+.product-conversation-page__composer-placeholder {
+  padding: 12px 14px;
+  color: var(--text-muted);
+}
+
+@media (width <= 1400px) {
+  .product-conversation-page__layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

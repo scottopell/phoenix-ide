@@ -2,7 +2,7 @@ import { memo, useState, useEffect, useRef, useMemo, useCallback, useLayoutEffec
 import type { ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { getConvDisplayState } from '../api';
-import type { Conversation, CachedPrSummary } from '../api';
+import type { Conversation, CachedPrSummary, ProductConversationListRow } from '../api';
 import { prReviewState } from './prReviewState';
 import { formatRelativeTime, formatShortDateTime } from '../utils';
 import {
@@ -21,8 +21,11 @@ import './ConversationList.css';
 
 
 interface ConversationListProps {
-  conversations: readonly Conversation[];
-  archivedConversations: readonly Conversation[];
+  conversations?: readonly Conversation[];
+  archivedConversations?: readonly Conversation[];
+  productConversations?: readonly ProductConversationListRow[];
+  archivedProductConversations?: readonly ProductConversationListRow[];
+  productRowsAuthoritative?: boolean;
   showArchived: boolean;
   onToggleArchived: () => void;
   onNewConversation: () => void;
@@ -30,6 +33,7 @@ interface ConversationListProps {
   onDelete: (conv: Conversation) => void;
   onRename: (conv: Conversation) => void;
   onConversationClick?: (conv: Conversation) => void;
+  onProductConversationClick?: (productConversation: ProductConversationListRow) => void;
   activeSlug?: string | null;
   sidebarMode?: boolean;
   listDensity?: 'full' | 'mobile' | 'sidebar';
@@ -164,6 +168,101 @@ function isActionableDisplayState(displayState: ReturnType<typeof getConvDisplay
 }
 
 export const SidebarPrBadge = PrBadge;
+
+function productConversationDisplayTitle(row: ProductConversationListRow): string {
+  return row.canonical_root.title?.trim()
+    || row.presentation.display_name?.trim()
+    || row.canonical_root.slug?.trim()
+    || row.canonical_root.transcript_row_id;
+}
+
+function productConversationStatusLabel(row: ProductConversationListRow): string {
+  if (row.presentation.kind === 'needs_action') return 'Needs action';
+  switch (row.presentation.presentation_mode) {
+    case 'needs_action': return 'Needs action';
+    case 'working': return 'Working';
+    case 'error': return 'Error';
+    case 'done': return 'Completed';
+    default: return row.ordinary_lifecycle === 'history' ? 'History' : 'Open';
+  }
+}
+
+function productConversationStateDotClass(row: ProductConversationListRow): string {
+  if (row.presentation.kind === 'needs_action') return 'awaiting-approval';
+  switch (row.presentation.presentation_mode) {
+    case 'working':
+      return 'working';
+    case 'error':
+      return 'error';
+    case 'done':
+      return 'terminal';
+    default:
+      return row.ordinary_lifecycle === 'history' ? 'terminal' : 'idle';
+  }
+}
+
+const ProductConversationListRowView = memo(function ProductConversationListRowView({
+  row,
+  isActive,
+  isKeyboardSelected,
+  effectiveCwd,
+  listDensity,
+  onClick,
+}: {
+  row: ProductConversationListRow;
+  isActive: boolean;
+  isKeyboardSelected: boolean;
+  effectiveCwd?: string | undefined;
+  listDensity: 'full' | 'mobile' | 'sidebar';
+  onClick: (row: ProductConversationListRow) => void;
+}) {
+  const classes = [
+    'conv-item',
+    isActive ? 'active' : '',
+    isKeyboardSelected ? 'keyboard-selected' : '',
+    'product-conversation-list-row',
+  ].filter(Boolean).join(' ');
+  const displayTitle = productConversationDisplayTitle(row);
+  const presentationLabel = row.presentation.display_name;
+  const statusTitle = productConversationStatusLabel(row);
+  return (
+    <li
+      className={classes}
+      data-id={row.product_conversation_id}
+      data-product-conversation-id={row.product_conversation_id}
+    >
+      <button
+        type="button"
+        className="conv-item-main"
+        onClick={() => onClick(row)}
+        title={`Open product conversation "${displayTitle}"`}
+      >
+        <div className="conv-item-slug">
+          <span className="conv-item-slug-main">
+            <span
+              className={`conv-state-dot ${productConversationStateDotClass(row)}`}
+              title={statusTitle}
+            />
+            <span className="conv-item-title">{displayTitle}</span>
+          </span>
+        </div>
+        <div className="conv-item-meta">
+          <span className="conv-item-context">{presentationLabel}</span>
+          <span className="conv-item-date" title={formatShortDateTime(row.updated_at)}>
+            {formatRelativeTime(row.updated_at)}
+          </span>
+          {effectiveCwd && <span className="conv-item-cwd">{effectiveCwd}</span>}
+        </div>
+      </button>
+      {listDensity !== 'mobile' && (
+        <div className="conv-item-secondary-row">
+          <span className="conv-item-secondary-badge">{row.ordinary_lifecycle === 'history' ? 'Archived' : 'Open'}</span>
+          <span className="conv-item-secondary-context">{statusTitle}</span>
+        </div>
+      )}
+    </li>
+  );
+});
 
 export const ConversationRow = memo(function ConversationRow({
   conv,
@@ -518,8 +617,11 @@ const TerminalGlyph = () => (
 );
 
 export function ConversationList({
-  conversations,
-  archivedConversations,
+  conversations = [],
+  archivedConversations = [],
+  productConversations = [],
+  archivedProductConversations = [],
+  productRowsAuthoritative = false,
   showArchived,
   onToggleArchived,
   onNewConversation,
@@ -527,6 +629,7 @@ export function ConversationList({
   onDelete,
   onRename,
   onConversationClick,
+  onProductConversationClick,
   activeSlug,
   sidebarMode,
   listDensity,
@@ -558,6 +661,8 @@ export function ConversationList({
   }, [expandedId]);
 
   const displayList = showArchived ? archivedConversations : conversations;
+  const displayProductList = showArchived ? archivedProductConversations : productConversations;
+  const usingProductRows = productRowsAuthoritative || displayProductList.length > 0 || productConversations.length > 0 || archivedProductConversations.length > 0;
 
   const groupedItems: SidebarItem[] = useMemo(() => {
     const roots = computeChainRoots(displayList);
@@ -577,6 +682,9 @@ export function ConversationList({
   }, [activeSlug, collapsedChains, effectiveListDensity]);
 
   const keyboardItems = useMemo(() => {
+    if (usingProductRows) {
+      return displayProductList.map((row) => ({ id: row.product_conversation_id }));
+    }
     const out: Conversation[] = [];
     for (const item of groupedItems) {
       if (item.kind === 'single') {
@@ -589,10 +697,19 @@ export function ConversationList({
       }
     }
     return out;
-  }, [effectiveListDensity, groupedItems, isChainCollapsed]);
+  }, [displayProductList, effectiveListDensity, groupedItems, isChainCollapsed, usingProductRows]);
 
   const { selectedId } = useKeyboardNav({
     items: keyboardItems,
+    ...(usingProductRows
+      ? {
+        onSelect: (item: { id: string }) => {
+          const row = displayProductList.find((candidate) => candidate.product_conversation_id === item.id);
+          if (row) onProductConversationClick?.(row);
+          else navigate(`/product-conversations/${item.id}`);
+        },
+      }
+      : {}),
     onNew: onNewConversation,
   });
 
@@ -624,6 +741,19 @@ export function ConversationList({
       return;
     }
     if (lastRevealedActiveSlugRef.current === activeSlug) return;
+    const activeProductRow = displayProductList.find((row) => (
+      row.product_conversation_id === activeSlug
+      || row.latest_transcript_row_id === activeSlug
+      || row.canonical_root.transcript_row_id === activeSlug
+      || row.canonical_root.slug === activeSlug
+    ));
+    if (activeProductRow) {
+      listRootRef.current
+        ?.querySelector<HTMLElement>(`[data-product-conversation-id="${activeProductRow.product_conversation_id}"]`)
+        ?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      lastRevealedActiveSlugRef.current = activeSlug;
+      return;
+    }
 
     for (const item of groupedItems) {
       if (item.kind === 'single') {
@@ -658,11 +788,11 @@ export function ConversationList({
       lastRevealedActiveSlugRef.current = activeSlug;
       return;
     }
-  }, [activeSlug, groupedItems, collapsedChains, effectiveListDensity]);
+  }, [activeSlug, displayProductList, groupedItems, collapsedChains, effectiveListDensity]);
 
   const closeRowMenu = useCallback(() => setExpandedId(null), []);
 
-  const isEmpty = displayList.length === 0;
+  const isEmpty = usingProductRows ? displayProductList.length === 0 : displayList.length === 0;
 
   return (
     <section ref={listRootRef} id="conversation-list" className={`view active ${isSidebarLayout ? 'sidebar-mode' : ''} ${isMobileList ? 'mobile-list-density' : ''}`}>
@@ -692,7 +822,7 @@ export function ConversationList({
                 className={`archive-toggle-text ${showArchived ? 'active' : ''}`}
                 onClick={() => { if (!showArchived) onToggleArchived(); }}
               >
-                Archived {archivedConversations.length}
+                History {usingProductRows ? archivedProductConversations.length : archivedConversations.length}
               </button>
               {authChip && <span className="conversation-list-auth-chip">{authChip}</span>}
             </div>
@@ -734,6 +864,25 @@ export function ConversationList({
           <li className="empty-state">
             <p>{`No ${showArchived ? 'archived' : 'active'} conversations${emptyScopeLabel ? ` in ${emptyScopeLabel}` : ''}`}</p>
           </li>
+        ) : usingProductRows ? (
+          displayProductList.map((row) => (
+            <ProductConversationListRowView
+              key={row.product_conversation_id}
+              row={row}
+              isActive={activeSlug === row.product_conversation_id || activeSlug === row.canonical_root.slug || activeSlug === row.canonical_root.transcript_row_id}
+              isKeyboardSelected={selectedId === row.product_conversation_id}
+              effectiveCwd={[...conversations, ...archivedConversations].find((conversation) => (
+                conversation.id === row.latest_transcript_row_id
+                || conversation.id === row.canonical_root.transcript_row_id
+                || conversation.slug === row.canonical_root.slug
+              ))?.cwd}
+              listDensity={effectiveListDensity}
+              onClick={(productRow) => {
+                if (onProductConversationClick) onProductConversationClick(productRow);
+                else navigate(productRow.canonical_route);
+              }}
+            />
+          ))
         ) : (
           groupedItems.map((item) => {
             if (item.kind === 'single') {

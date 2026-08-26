@@ -34,7 +34,7 @@ export function useGlobalKeyboardShortcuts() {
         // Don't navigate away if an interactive panel is active
         if (hasActiveScope) return;
         // If on conversation page, go back to list
-        if (location.pathname.startsWith('/c/') || location.pathname.startsWith('/conversation/') || location.pathname === '/new') {
+        if (location.pathname.startsWith('/c/') || location.pathname.startsWith('/conversation/') || location.pathname.startsWith('/product-conversations/') || location.pathname === '/new') {
           e.preventDefault();
           navigate('/');
         }
@@ -51,7 +51,7 @@ export function useGlobalKeyboardShortcuts() {
 
       if (e.key === '/') {
         // Focus the message input if on conversation page
-        if (location.pathname.startsWith('/c/') || location.pathname.startsWith('/conversation/')) {
+        if (location.pathname.startsWith('/c/') || location.pathname.startsWith('/conversation/') || location.pathname.startsWith('/product-conversations/')) {
           const input = document.querySelector('#message-input') as HTMLTextAreaElement;
           if (input) {
             e.preventDefault();

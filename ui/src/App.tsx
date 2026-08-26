@@ -1,5 +1,5 @@
 import { lazy, Suspense, useState, useEffect, useCallback } from 'react';
-import { BrowserRouter, Routes, Route, useLocation, useNavigate, useParams } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, useNavigate, useParams, useLocation } from 'react-router-dom';
 import { DesktopLayout } from './components/DesktopLayout';
 import { ShortcutHelpPanel } from './components/ShortcutHelpPanel';
 import { useGlobalKeyboardShortcuts, FocusScopeProvider } from './hooks';
@@ -7,8 +7,8 @@ import { ThemeProvider } from './components/ThemeProvider';
 import { DensityProvider } from './components/DensityProvider';
 import { ConversationProvider } from './conversation';
 import { ChainProvider } from './chain';
-import { ConversationReadinessProvider } from './contexts/ConversationReadinessContext';
 import { api } from './api';
+import { ConversationReadinessProvider } from './contexts/ConversationReadinessContext';
 import './index.css';
 
 // Routes are code-split so the initial bundle only contains what the user
@@ -18,14 +18,14 @@ import './index.css';
 const ConversationListPage = lazy(() =>
   import('./pages/ConversationListPage').then((m) => ({ default: m.ConversationListPage })),
 );
-const ConversationPage = lazy(() =>
-  import('./pages/ConversationPage').then((m) => ({ default: m.ConversationPage })),
+const ProductConversationPage = lazy(() =>
+  import('./pages/ProductConversationPage').then((m) => ({ default: m.ProductConversationPage })),
+);
+const EmbeddedConversationPage = lazy(() =>
+  import('./pages/ConversationPage').then((m) => ({ default: m.EmbeddedConversationPage })),
 );
 const NewConversationPage = lazy(() =>
   import('./pages/NewConversationPage').then((m) => ({ default: m.NewConversationPage })),
-);
-const ChainPage = lazy(() =>
-  import('./pages/ChainPage').then((m) => ({ default: m.ChainPage })),
 );
 const LoginPage = lazy(() =>
   import('./pages/LoginPage').then((m) => ({ default: m.LoginPage })),
@@ -63,15 +63,6 @@ function RouteFallback() {
   return <div style={{ minHeight: '100vh' }} />;
 }
 
-// NOTE: ConversationPage and ChainPage previously sat behind keyed wrapper
-// components (`<ConversationPage key={slug}>` / `<ChainPage key={rootConvId}>`)
-// to force a fresh React tree per slug. That hammer caused the entire content
-// area to flash blank on every conversation→conversation navigation
-// (task 02703). Per-conversation state that the key= was protecting is now
-// reset explicitly inside each page on slug / rootConvId change (see the
-// "reset per-scope state" pattern in ConversationPage / ChainPage and the
-// `scopeKey` prop on the per-conversation context providers).
-
 type AuthState =
   | { status: 'checking' }
   | { status: 'authenticated' }
@@ -107,9 +98,9 @@ function AppRoutes() {
                 <Route path="/" element={<ConversationListPage />} />
                 <Route path="/new" element={<NewConversationPage />} />
                 <Route path="/terminal" element={<TerminalPage />} />
-                <Route path="/c/:slug" element={<ConversationPage />} />
+                <Route path="/c/:slug" element={<ConversationRouteRedirect />} />
                 <Route path="/product-conversations/:productConversationId" element={<ProductConversationPage />} />
-                <Route path="/chains/:rootConvId" element={<ChainPage />} />
+                <Route path="/chains/:rootConvId" element={<ChainRouteRedirect />} />
                 <Route path="/codex/login" element={<CodexLoginPage />} />
                 <Route path="/about" element={<AboutDeploymentPage />} />
                 <Route path="/usage" element={<UsagePage />} />
@@ -126,36 +117,57 @@ function AppRoutes() {
   );
 }
 
-function ProductConversationPage() {
-  const { productConversationId } = useParams<{ productConversationId: string }>();
+function ProductConversationAliasRedirect({ reference }: { reference: string | undefined }) {
   const navigate = useNavigate();
   const location = useLocation();
-  const [error, setError] = useState<string | null>(null);
+  const [fallbackSnapshot, setFallbackSnapshot] = useState<{ reference: string; rowSlug: string } | null>(null);
+  const [retryToken, setRetryToken] = useState(0);
+  const activeFallback = fallbackSnapshot?.reference === reference ? fallbackSnapshot : null;
 
   useEffect(() => {
-    if (!productConversationId) return;
+    if (!reference) {
+      setFallbackSnapshot(null);
+      return;
+    }
     let cancelled = false;
-    setError(null);
-    api.getProductConversationRoute(productConversationId)
-      .then((route) => {
+    api.getProductConversationSnapshot(reference, { message_limit: 1 })
+      .then((snapshot) => {
         if (!cancelled) {
           navigate({
-            pathname: `/c/${route.transcript_row_id}`,
+            pathname: snapshot.canonical_route,
             search: location.search,
             hash: location.hash,
-          }, {
-            replace: true,
-            state: { preserveTranscriptRouteId: true },
-          });
+          }, { replace: true });
         }
       })
       .catch(() => {
-        if (!cancelled) setError('Unable to open this product conversation.');
+        if (!cancelled) {
+          setFallbackSnapshot({ reference, rowSlug: reference });
+        }
       });
     return () => { cancelled = true; };
-  }, [location.hash, location.search, navigate, productConversationId]);
+  }, [location.hash, location.pathname, location.search, navigate, reference, retryToken]);
 
-  return error ? <main role="alert">{error}</main> : <RouteFallback />;
+  if (activeFallback) {
+    return (
+      <main>
+        <EmbeddedConversationPage slug={activeFallback.rowSlug} suppressCanonicalization routePrefix="/c" />
+        <div role="alert">Showing cached conversation while live snapshot is unavailable.</div>
+        <button type="button" onClick={() => { setFallbackSnapshot(null); setRetryToken((n) => n + 1); }}>Retry</button>
+      </main>
+    );
+  }
+  return <RouteFallback />;
+}
+
+function ConversationRouteRedirect() {
+  const { slug } = useParams<{ slug: string }>();
+  return <ProductConversationAliasRedirect reference={slug} />;
+}
+
+function ChainRouteRedirect() {
+  const { rootConvId } = useParams<{ rootConvId: string }>();
+  return <ProductConversationAliasRedirect reference={rootConvId} />;
 }
 
 function App() {
@@ -210,9 +222,9 @@ function App() {
           <FocusScopeProvider>
             <ConversationProvider>
               <ChainProvider>
-                                <ConversationReadinessProvider>
-                    <AppRoutes />
-                  </ConversationReadinessProvider>
+                <ConversationReadinessProvider>
+                  <AppRoutes />
+                </ConversationReadinessProvider>
               </ChainProvider>
             </ConversationProvider>
           </FocusScopeProvider>

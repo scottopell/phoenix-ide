@@ -89,12 +89,14 @@ describe('ViewerSlot — message kind', () => {
     (presentation) => {
       const h = renderSlot('/c/conv-A?viewer=inspect&handle=b-7');
 
-      act(() => { h.get().openMessage(42, presentation); });
+      act(() => { h.get().openMessage(42, presentation, 'msg-42', 'row-1:msg-42'); });
 
-      expect(h.get().slot).toEqual({ kind: 'message', presentation, sequenceId: 42 });
+      expect(h.get().slot).toEqual({ kind: 'message', presentation, sequenceId: 42, messageId: 'msg-42', occurrenceToken: 'row-1:msg-42' });
       expect(h.search()).toContain('viewer=message');
       expect(h.search()).toContain(`presentation=${presentation}`);
       expect(h.search()).toContain('message=42');
+      expect(h.search()).toContain('message_id=msg-42');
+      expect(h.search()).toContain('occurrence=row-1%3Amsg-42');
       expect(h.search()).not.toContain('scope=');
       expect(h.search()).not.toContain('handle=');
     },
