@@ -3067,50 +3067,64 @@ impl RuntimeManager {
             .list_pending_close_obligations()
             .await
             .map_err(|error| error.to_string())?;
-        let mut recovered = 0;
-        for obligation in obligations {
-            if !matches!(
-                obligation.phase(),
-                phoenix_core::domain::close::ClosePhase::SettlingActiveWork
-                    | phoenix_core::domain::close::ClosePhase::CancelRequestedDuringSettlement
-            ) {
-                continue;
+        let manager = Arc::clone(self);
+        self.run_authority_units(obligations, move |obligation| {
+            let manager = Arc::clone(&manager);
+            async move {
+                if !matches!(
+                    obligation.phase(),
+                    phoenix_core::domain::close::ClosePhase::SettlingActiveWork
+                        | phoenix_core::domain::close::ClosePhase::CancelRequestedDuringSettlement
+                ) {
+                    return Ok(false);
+                }
+                let members = manager
+                    .db
+                    .list_close_attempt_members(obligation.attempt_id().as_str())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                for member in &members {
+                    match manager
+                        .db
+                        .cancel_conversation_creation(member.conversation_id.as_str(), Utc::now())
+                        .await
+                    {
+                        Ok(()) | Err(crate::db::DbError::Sqlx(sqlx::Error::RowNotFound)) => {}
+                        Err(error) => return Err(error.to_string()),
+                    }
+                }
+                manager.kick_creation_worker();
+                let event_txs = {
+                    let runtimes = manager.runtimes.read().await;
+                    members
+                        .iter()
+                        .filter_map(|member| {
+                            runtimes
+                                .get(member.conversation_id.as_str())
+                                .map(|handle| handle.event_tx.clone())
+                        })
+                        .collect::<Vec<_>>()
+                };
+                for event_tx in event_txs {
+                    let _ = event_tx
+                        .send(Event::UserCancel {
+                            reason: Some("active Close settlement".to_string()),
+                            cause: crate::state_machine::event::CancelCause::UserRequested,
+                        })
+                        .await;
+                }
+                match manager
+                    .db
+                    .advance_close_settlement_when_quiescent(obligation.attempt_id().as_str())
+                    .await
+                {
+                    Ok(_) => Ok(true),
+                    Err(crate::db::DbError::CloseFoundationPrecondition(_)) => Ok(false),
+                    Err(error) => Err(error.to_string()),
+                }
             }
-            let members = self
-                .db
-                .list_close_attempt_members(obligation.attempt_id().as_str())
-                .await
-                .map_err(|error| error.to_string())?;
-            let event_txs = {
-                let runtimes = self.runtimes.read().await;
-                members
-                    .iter()
-                    .filter_map(|member| {
-                        runtimes
-                            .get(member.conversation_id.as_str())
-                            .map(|handle| handle.event_tx.clone())
-                    })
-                    .collect::<Vec<_>>()
-            };
-            for event_tx in event_txs {
-                let _ = event_tx
-                    .send(Event::UserCancel {
-                        reason: Some("active Close settlement".to_string()),
-                        cause: crate::state_machine::event::CancelCause::UserRequested,
-                    })
-                    .await;
-            }
-            match self
-                .db
-                .advance_close_settlement_when_quiescent(obligation.attempt_id().as_str())
-                .await
-            {
-                Ok(_) => recovered += 1,
-                Err(crate::db::DbError::CloseFoundationPrecondition(_)) => {}
-                Err(error) => return Err(error.to_string()),
-            }
-        }
-        Ok(recovered)
+        })
+        .await
     }
 
     /// Materialize persisted continuation operations so restart recovery does
@@ -5160,6 +5174,9 @@ impl RuntimeManager {
                     conv_id = %conv_id,
                     "Runtime cleanup: entry replaced after eviction, skipping remove"
                 );
+            }
+            if let Err(error) = manager_for_cleanup.resume_pending_close_settlements().await {
+                tracing::error!(%error, conv_id = %conv_id, "failed to re-evaluate Close settlement after runtime exit");
             }
             manager_for_cleanup
                 .propagate_fatal_runtime_exit(disposition, "direct_turn_terminal_evidence");

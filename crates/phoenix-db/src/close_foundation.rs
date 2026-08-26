@@ -1222,6 +1222,11 @@ impl Database {
                      AND turn.owns_conversation = 1 AND turn.terminal_kind IS NULL
                  )
                  OR EXISTS (
+                   SELECT 1 FROM conversation_creation_jobs creation
+                   WHERE creation.conversation_id = member.conversation_id
+                     AND creation.status IN ('accepted', 'claimed', 'retry_scheduled', 'cancelling')
+                 )
+                 OR EXISTS (
                    SELECT 1 FROM wake_bindings binding
                    JOIN workflows workflow ON workflow.workflow_id = binding.workflow_id
                    WHERE binding.conversation_id = member.conversation_id
@@ -3210,6 +3215,54 @@ mod tests {
         .unwrap();
         assert_eq!(
             db.advance_close_settlement_when_quiescent("attempt-busy")
+                .await
+                .unwrap()
+                .phase(),
+            ClosePhase::AwaitingRetirementInspection
+        );
+    }
+
+    #[tokio::test]
+    async fn active_work_settlement_remains_fenced_until_creation_job_is_terminal() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        sqlx::query(
+            "INSERT INTO conversation_creation_jobs (
+                 id, conversation_id, message_id, status, stage, attempt, generation,
+                 intent_json, error, accepted_at, provisioning_started_at, completed_at,
+                 failed_at, cancelled_at, deletion_requested_at, created_at, updated_at
+             ) VALUES (
+                 'creation-job', 'root', NULL, 'accepted', 'validate_intent', 0, 0,
+                 '{}', NULL, '2025-01-01T00:00:00Z', NULL, NULL,
+                 NULL, NULL, NULL, '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z'
+             )",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        db.begin_close_foundation(&product_id("root"), "attempt-creation")
+            .await
+            .unwrap();
+        db.begin_close_active_work_settlement("attempt-creation")
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            db.advance_close_settlement_when_quiescent("attempt-creation")
+                .await
+                .unwrap_err(),
+            DbError::CloseFoundationPrecondition(_)
+        ));
+        sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET status = 'cancelled', cancelled_at = '2025-01-01T00:00:01Z'
+             WHERE id = 'creation-job'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            db.advance_close_settlement_when_quiescent("attempt-creation")
                 .await
                 .unwrap()
                 .phase(),
