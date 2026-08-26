@@ -362,13 +362,6 @@ async fn acquire_handle(
         return None;
     }
 
-    let runtime_resource_instance_id = match scope {
-        ResourceScopeKey::Work(_) => Some(RuntimeResourceInstanceId::new()),
-        ResourceScopeKey::Unattached(_)
-        | ResourceScopeKey::Coordinator
-        | ResourceScopeKey::GlobalTerminal => None,
-    };
-
     // Slow path: spawn a new PTY. Resolve the exec plan first
     // (REQ-TMUX-004 / design.md §"Terminal Attach Path"). `cwd` is
     // forwarded so a fresh tmux server starts its pane in the
@@ -396,9 +389,8 @@ async fn acquire_handle(
 
     let child_pid = handle.child_pid;
     let mut handle = handle;
-    if let (ResourceScopeKey::Work(work_scope), Some(instance_id)) =
-        (scope, runtime_resource_instance_id.clone())
-    {
+    if let ResourceScopeKey::Work(work_scope) = scope {
+        let instance_id = RuntimeResourceInstanceId::new();
         let admission = RuntimeResourceAdmission {
             instance_id: instance_id.clone(),
             scope: work_scope.clone(),
@@ -427,18 +419,6 @@ async fn acquire_handle(
 
     if let Ok(arc_handle) = terminals.publish_admitted(scope.clone(), handle) {
         return acquire_permit(conversation_id, arc_handle).await;
-    }
-    if let Some(instance_id) = runtime_resource_instance_id {
-        if let Err(error) = runtime
-            .db()
-            .set_runtime_resource_instance_state(
-                &instance_id,
-                phoenix_core::runtime_resource::RuntimeResourceInstanceState::Retired,
-            )
-            .await
-        {
-            tracing::error!(%error, %instance_id, "Terminal: failed to retire unpublised durable admission");
-        }
     }
 
     tracing::warn!(conv_id = %conversation_id, scope = %scope, "Terminal: post-spawn race lost, reclaiming winner");

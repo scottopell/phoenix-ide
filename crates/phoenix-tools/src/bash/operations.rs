@@ -589,9 +589,6 @@ async fn run_run(
         }
     };
 
-    let runtime_resource_instance_id =
-        matches!(spawn_context.lifecycle_scope, ResourceScopeKey::Work(_))
-            .then(RuntimeResourceInstanceId::new);
     let ring_bytes_cap = registry.ring_bytes_cap();
     match spawn_child(
         cmd,
@@ -603,11 +600,11 @@ async fn run_run(
         spawn_mode,
     ) {
         Ok((mut handle, spawned)) => {
-            if let (ResourceScopeKey::Work(scope), Some(authority), Some(instance_id)) = (
+            if let (ResourceScopeKey::Work(scope), Some(authority)) = (
                 &spawn_context.lifecycle_scope,
                 ctx.runtime_resource_admission(),
-                runtime_resource_instance_id.clone(),
             ) {
+                let instance_id = RuntimeResourceInstanceId::new();
                 let admission = RuntimeResourceAdmission {
                     instance_id: instance_id.clone(),
                     scope: scope.clone(),

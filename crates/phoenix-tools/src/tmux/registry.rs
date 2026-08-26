@@ -33,10 +33,6 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
-use phoenix_core::runtime_resource::{
-    RuntimeResourceAdmission, RuntimeResourceAdmissionAuthority, RuntimeResourceInstanceId,
-    RuntimeResourceKind,
-};
 use phoenix_core::work_scope::ResourceScopeKey;
 
 use thiserror::Error;
@@ -131,7 +127,6 @@ pub struct TmuxRetirementGeneration(u64);
 pub struct TmuxRetirementPermit {
     pub work_scope: ResourceScopeKey,
     pub instance: TmuxServerInstanceIdentity,
-    pub runtime_resource_instance_id: Option<RuntimeResourceInstanceId>,
     generation: TmuxRetirementGeneration,
     had_entry: bool,
 }
@@ -179,10 +174,7 @@ pub enum ServerStatus {
     /// server yet. Promoted to `Live` on the first successful
     /// `ensure_live` call.
     NotProbed,
-    /// The external server exists but is not visible to callers until its
-    /// exact instance identity has been durably admitted.
-    Admitting,
-    /// `tmux ls` succeeded against the socket and durable admission settled.
+    /// `tmux ls` succeeded against the socket; the server is reachable.
     Live,
     /// The conversation was hard-deleted; the entry is in the process of
     /// being torn down. Entries in this state are dropped from the
@@ -208,7 +200,6 @@ pub struct TmuxServer {
     pub socket_path: PathBuf,
     pub server_token: String,
     pub status: ServerStatus,
-    pub runtime_resource_instance_id: Option<RuntimeResourceInstanceId>,
     retirement_generation: u64,
     retirement_fenced: bool,
 }
@@ -228,16 +219,10 @@ pub struct ObservedWindow {
 impl TmuxServer {
     fn new(work_scope: ResourceScopeKey, socket_path: PathBuf) -> Self {
         Self {
-            work_scope: work_scope.clone(),
+            work_scope,
             socket_path,
             server_token: uuid::Uuid::new_v4().to_string(),
             status: ServerStatus::NotProbed,
-            runtime_resource_instance_id: match work_scope {
-                ResourceScopeKey::Work(_) => Some(RuntimeResourceInstanceId::new()),
-                ResourceScopeKey::Unattached(_)
-                | ResourceScopeKey::Coordinator
-                | ResourceScopeKey::GlobalTerminal => None,
-            },
             retirement_generation: 0,
             retirement_fenced: false,
         }
@@ -326,6 +311,7 @@ pub type TmuxLifecycleSink = tokio::sync::mpsc::UnboundedSender<TmuxLifecycleEve
 
 /// Top-level registry: maps `ResourceScopeKey::stable_key()` → per-scope tmux
 /// server. One registry instance per Phoenix process.
+#[derive(Debug)]
 pub struct TmuxRegistry {
     /// Keyed by `ResourceScopeKey::stable_key()` so Worktree-scoped continuation
     /// members share an entry, and Worktree vs Conversation namespaces
@@ -344,22 +330,7 @@ pub struct TmuxRegistry {
     /// so transitions flow into the work-scope push bridge; `None` for
     /// tool-level tests. Mirrors `BashHandleRegistry::lifecycle_sink`.
     lifecycle_sink: Option<TmuxLifecycleSink>,
-    runtime_resource_admission: Option<RuntimeResourceAdmissionAuthority>,
     contain_test_spawns: bool,
-}
-
-impl std::fmt::Debug for TmuxRegistry {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("TmuxRegistry")
-            .field("socket_dir", &self.socket_dir)
-            .field("binary_available", &self.binary_available)
-            .field(
-                "has_runtime_resource_admission",
-                &self.runtime_resource_admission.is_some(),
-            )
-            .finish_non_exhaustive()
-    }
 }
 
 impl TmuxRegistry {
@@ -385,7 +356,6 @@ impl TmuxRegistry {
             binary_available,
             runtime_assets: OnceCell::new(),
             lifecycle_sink: None,
-            runtime_resource_admission: None,
             contain_test_spawns: false,
         }
     }
@@ -399,16 +369,6 @@ impl TmuxRegistry {
     pub fn with_lifecycle_sink(sink: Option<TmuxLifecycleSink>) -> Self {
         let mut reg = Self::with_socket_dir(default_socket_dir());
         reg.lifecycle_sink = sink;
-        reg
-    }
-
-    #[must_use]
-    pub fn with_lifecycle_sink_and_admission(
-        sink: Option<TmuxLifecycleSink>,
-        runtime_resource_admission: RuntimeResourceAdmissionAuthority,
-    ) -> Self {
-        let mut reg = Self::with_lifecycle_sink(sink);
-        reg.runtime_resource_admission = Some(runtime_resource_admission);
         reg
     }
 
@@ -446,7 +406,6 @@ impl TmuxRegistry {
             binary_available,
             runtime_assets: OnceCell::new(),
             lifecycle_sink: None,
-            runtime_resource_admission: None,
             contain_test_spawns: false,
         }
     }
@@ -468,7 +427,6 @@ impl TmuxRegistry {
             binary_available,
             runtime_assets: OnceCell::new(),
             lifecycle_sink: sink,
-            runtime_resource_admission: None,
             contain_test_spawns: false,
         }
     }
@@ -479,17 +437,11 @@ impl TmuxRegistry {
         self
     }
 
-    async fn spawn_owned_session(
-        &self,
-        socket_path: &Path,
-        cwd: &Path,
-        server_token: &str,
-    ) -> Result<(), TmuxError> {
+    async fn spawn_owned_session(&self, socket_path: &Path, cwd: &Path) -> Result<(), TmuxError> {
         spawn_session_owned(
             socket_path,
             &self.config_path(),
             cwd,
-            server_token,
             self.contain_test_spawns,
         )
         .await
@@ -687,7 +639,6 @@ impl TmuxRegistry {
                 })?;
 
         let mut reused_live = false;
-        let mut spawned_in_this_admission = false;
         match probe_result {
             ProbeResult::Live => {
                 match read_server_token(&server.socket_path).await {
@@ -705,27 +656,15 @@ impl TmuxRegistry {
                         .await;
                     }
                 }
-                server.status = ServerStatus::Admitting;
+                server.status = ServerStatus::Live;
                 reused_live = true;
             }
             ProbeResult::NoSocket => {
-                server.server_token = uuid::Uuid::new_v4().to_string();
-                if matches!(server.work_scope, ResourceScopeKey::Work(_)) {
-                    server.runtime_resource_instance_id = Some(RuntimeResourceInstanceId::new());
-                }
-                let server_token = server.server_token.clone();
-                self.spawn_owned_session(&server.socket_path, cwd, &server_token)
-                    .await?;
-                server.server_token =
-                    read_server_token(&server.socket_path)
-                        .await
-                        .ok_or_else(|| TmuxError::SpawnFailed {
-                            socket_path: server.socket_path.clone(),
-                            reason: "spawned tmux server did not report its launch token"
-                                .to_string(),
-                        })?;
-                server.status = ServerStatus::Admitting;
-                spawned_in_this_admission = true;
+                self.spawn_owned_session(&server.socket_path, cwd).await?;
+                server.server_token = read_server_token(&server.socket_path)
+                    .await
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                server.status = ServerStatus::Live;
             }
             ProbeResult::DeadSocket => {
                 // Post-system-reboot: file present, server gone. Unlink
@@ -736,76 +675,13 @@ impl TmuxRegistry {
                     "tmux: stale socket detected, unlinking and respawning"
                 );
                 let _ = tokio::fs::remove_file(&server.socket_path).await;
-                server.server_token = uuid::Uuid::new_v4().to_string();
-                if matches!(server.work_scope, ResourceScopeKey::Work(_)) {
-                    server.runtime_resource_instance_id = Some(RuntimeResourceInstanceId::new());
-                }
-                let server_token = server.server_token.clone();
-                self.spawn_owned_session(&server.socket_path, cwd, &server_token)
-                    .await?;
-                server.server_token =
-                    read_server_token(&server.socket_path)
-                        .await
-                        .ok_or_else(|| TmuxError::SpawnFailed {
-                            socket_path: server.socket_path.clone(),
-                            reason: "spawned tmux server did not report its launch token"
-                                .to_string(),
-                        })?;
-                server.status = ServerStatus::Admitting;
-                spawned_in_this_admission = true;
+                self.spawn_owned_session(&server.socket_path, cwd).await?;
+                server.server_token = read_server_token(&server.socket_path)
+                    .await
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                server.status = ServerStatus::Live;
             }
         }
-        let socket_path = server.socket_path.clone();
-        let expected_token = server.server_token.clone();
-        let admission = match (&server.work_scope, &self.runtime_resource_admission) {
-            (ResourceScopeKey::Work(scope), Some(authority)) => {
-                let instance_id = server.runtime_resource_instance_id.clone().ok_or_else(|| {
-                    TmuxError::SpawnFailed {
-                        socket_path: socket_path.clone(),
-                        reason: "work-scoped tmux server is missing its preallocated instance id"
-                            .to_string(),
-                    }
-                })?;
-                Some((
-                    authority.clone(),
-                    RuntimeResourceAdmission {
-                        instance_id,
-                        scope: scope.clone(),
-                        kind: RuntimeResourceKind::Tmux,
-                        launch_uuid: server.server_token.clone(),
-                        pid: None,
-                        process_birth: None,
-                        pgid: None,
-                        tmux_socket_path: Some(socket_path.to_string_lossy().into_owned()),
-                        tmux_server_token: Some(server.server_token.clone()),
-                        browser_session_key: None,
-                        browser_audience: None,
-                        browser_profile_path: None,
-                    },
-                ))
-            }
-            _ => None,
-        };
-        if let Some((authority, admission)) = admission {
-            if let Err(error) = authority.admit_runtime_resource(admission).await {
-                if spawned_in_this_admission {
-                    let _ = self
-                        .kill_exact_server(&socket_path, &Some(expected_token))
-                        .await;
-                }
-                server.status = ServerStatus::NotProbed;
-                return Err(TmuxError::SpawnFailed {
-                    socket_path,
-                    reason: format!("durable tmux admission failed: {error}"),
-                });
-            }
-        }
-        if server.retirement_fenced {
-            return Err(TmuxError::RetirementFenced {
-                work_scope: work_scope.clone(),
-            });
-        }
-        server.status = ServerStatus::Live;
         let status_changed = server.status != prev_status;
         let socket_path = server.socket_path.clone();
         drop(server);
@@ -884,35 +760,6 @@ impl TmuxRegistry {
             .await
             .get(&key)
             .map(|entry| entry.server.clone())
-    }
-
-    async fn kill_exact_server(
-        &self,
-        socket_path: &Path,
-        token: &Option<String>,
-    ) -> Result<(), TmuxError> {
-        if token.is_none() || read_server_token(socket_path).await != *token {
-            return Ok(());
-        }
-        if self.binary_available {
-            let socket = socket_path.to_string_lossy().into_owned();
-            let _ = tokio::process::Command::new("tmux")
-                .args([
-                    "-f",
-                    &self.config_path().to_string_lossy(),
-                    "-S",
-                    &socket,
-                    "kill-server",
-                ])
-                .env_remove("TMUX")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .await;
-        }
-        let _ = tokio::fs::remove_file(socket_path).await;
-        Ok(())
     }
 
     async fn exact_identity_state(
@@ -1081,7 +928,6 @@ impl TmuxRegistry {
         TmuxRetirementPermit {
             work_scope: work_scope.clone(),
             instance: server.exact_identity(),
-            runtime_resource_instance_id: server.runtime_resource_instance_id.clone(),
             generation: TmuxRetirementGeneration(server.retirement_generation),
             had_entry,
         }
@@ -1651,7 +1497,7 @@ pub async fn cascade_tmux_on_delete(
 /// the Phoenix process environment, which would leak server secrets (LLM API
 /// keys, gateway config) into every tmux-backed terminal. `build_env_for_tmux`
 /// is the single source for that env (`specs/terminal` REQ-TERM-002).
-fn set_tmux_server_env(cmd: &mut tokio::process::Command, server_token: &str) {
+fn set_tmux_server_env(cmd: &mut tokio::process::Command) {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_owned());
     cmd.env_clear();
     let launch_uuid = uuid::Uuid::new_v4().to_string();
@@ -1662,7 +1508,7 @@ fn set_tmux_server_env(cmd: &mut tokio::process::Command, server_token: &str) {
     // Stamp the companion version so a later reuse can tell a current server
     // (no-op) from a pre-feature/older one that needs a refresh.
     cmd.env(COMPANION_VERSION_VAR, COMPANION_ENV_VERSION);
-    cmd.env(SERVER_TOKEN_VAR, server_token);
+    cmd.env(SERVER_TOKEN_VAR, uuid::Uuid::new_v4().to_string());
 }
 
 /// Run a tmux command against an existing server, discarding output.
@@ -1964,15 +1810,13 @@ pub async fn spawn_session(
     config_path: &Path,
     cwd: &Path,
 ) -> Result<(), TmuxError> {
-    let server_token = uuid::Uuid::new_v4().to_string();
-    spawn_session_owned(socket_path, config_path, cwd, &server_token, false).await
+    spawn_session_owned(socket_path, config_path, cwd, false).await
 }
 
 async fn spawn_session_owned(
     socket_path: &Path,
     config_path: &Path,
     cwd: &Path,
-    server_token: &str,
     contain_test_spawn: bool,
 ) -> Result<(), TmuxError> {
     let tmux_args = [
@@ -1994,7 +1838,7 @@ async fn spawn_session_owned(
     // than inheriting Phoenix's env, which would leak server secrets into every
     // pane and diverge from the direct-shell path. env_clear also drops TMUX, so
     // an outer-tmux invocation does not trip tmux's nesting refusal.
-    set_tmux_server_env(&mut cmd, server_token);
+    set_tmux_server_env(&mut cmd);
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

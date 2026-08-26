@@ -129,7 +129,7 @@ async fn assemble_tmux(
 
 fn project_tmux_status(status: ServerStatus) -> TmuxServerStatus {
     match status {
-        ServerStatus::NotProbed | ServerStatus::Admitting => TmuxServerStatus::NotProbed,
+        ServerStatus::NotProbed => TmuxServerStatus::NotProbed,
         ServerStatus::Live => TmuxServerStatus::Live,
         ServerStatus::Gone => TmuxServerStatus::Gone,
     }
