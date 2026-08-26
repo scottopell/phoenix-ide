@@ -3061,6 +3061,110 @@ impl RuntimeManager {
         Ok(completed)
     }
 
+    async fn settle_close_direct_turn_targets(&self, attempt_id: &str) -> Result<(), String> {
+        let targets = self
+            .db
+            .list_unsettled_close_direct_turn_settlement_targets(attempt_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        for target in targets {
+            let live_runtime = {
+                let runtimes = self.runtimes.read().await;
+                runtimes
+                    .get(&target.conversation_id)
+                    .map(|handle| handle.event_tx.clone())
+            };
+            if let Some(event_tx) = live_runtime {
+                if event_tx
+                    .send(Event::UserCancel {
+                        reason: Some("active Close settlement".to_string()),
+                        cause: crate::state_machine::event::CancelCause::UserRequested,
+                    })
+                    .await
+                    .is_ok()
+                {
+                    continue;
+                }
+            }
+            match self
+                .db
+                .workflow_repository()
+                .terminate_authoritative_turn(phoenix_workflow::TurnCommand::Cancel {
+                    turn_id: phoenix_workflow::TurnAuthorityId(target.turn_id),
+                    expected_generation: target.expected_generation,
+                })
+                .await
+            {
+                Ok(_)
+                | Err(crate::db::DbError::DirectTurnConflict(
+                    phoenix_workflow::TurnConflict::StaleGeneration { .. }
+                    | phoenix_workflow::TurnConflict::AlreadyTerminal,
+                )) => {}
+                Err(error) => return Err(error.to_string()),
+            }
+            self.db
+                .record_close_direct_turn_settlement_if_released(attempt_id, &target)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    pub async fn resume_pending_close_settlements(self: &Arc<Self>) -> Result<usize, String> {
+        let obligations = self
+            .db
+            .list_pending_close_obligations()
+            .await
+            .map_err(|error| error.to_string())?;
+        let manager = Arc::clone(self);
+        self.run_authority_units(obligations, move |obligation| {
+            let manager = Arc::clone(&manager);
+            async move {
+                if !matches!(
+                    obligation.phase(),
+                    phoenix_core::domain::close::ClosePhase::SettlingActiveWork
+                        | phoenix_core::domain::close::ClosePhase::CancelRequestedDuringSettlement
+                ) {
+                    return Ok(false);
+                }
+                let conversation_ids = manager
+                    .db
+                    .list_close_settlement_conversation_ids(obligation.attempt_id().as_str())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                for conversation_id in &conversation_ids {
+                    match manager
+                        .db
+                        .cancel_conversation_creation(conversation_id, Utc::now())
+                        .await
+                    {
+                        Ok(()) | Err(crate::db::DbError::Sqlx(sqlx::Error::RowNotFound)) => {}
+                        Err(error) => return Err(error.to_string()),
+                    }
+                }
+                manager.kick_creation_worker();
+                manager
+                    .db
+                    .cancel_close_settlement_wakes(obligation.attempt_id().as_str())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                manager
+                    .settle_close_direct_turn_targets(obligation.attempt_id().as_str())
+                    .await?;
+                match manager
+                    .db
+                    .advance_close_settlement_when_quiescent(obligation.attempt_id().as_str())
+                    .await
+                {
+                    Ok(_) => Ok(true),
+                    Err(crate::db::DbError::CloseFoundationPrecondition(_)) => Ok(false),
+                    Err(error) => Err(error.to_string()),
+                }
+            }
+        })
+        .await
+    }
+
     /// Materialize persisted continuation operations so restart recovery does
     /// not depend on a browser reconnecting to each conversation.
     pub async fn resume_pending_continuations(self: &Arc<Self>) -> Result<usize, String> {
@@ -3308,14 +3412,36 @@ impl RuntimeManager {
         };
         let manager = Arc::clone(self);
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            Box::pin(crate::runtime::wake::run(manager, rx, ready_tx)).await;
+        let mut worker = tokio::spawn(async move {
+            Box::pin(crate::runtime::wake::run(manager, rx, ready_tx)).await
         });
-        ready_rx.await.map_err(|_| {
-            "wake worker stopped before startup reconciliation completed".to_string()
-        })?;
+        tokio::select! {
+            ready = ready_rx => ready.map_err(|_| "wake worker stopped before startup reconciliation completed".to_string())?,
+            exited = &mut worker => {
+                return Err(format!(
+                    "wake worker stopped before startup reconciliation completed: {}",
+                    Self::describe_wake_worker_exit(exited)
+                ));
+            }
+        };
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            let detail = Self::describe_wake_worker_exit(worker.await);
+            tracing::error!(%detail, "wake worker lost local authority");
+            manager.signal_fatal_local_authority("wake_worker_exit");
+        });
         self.kick_wake_worker();
         Ok(())
+    }
+
+    fn describe_wake_worker_exit(
+        result: Result<Result<(), String>, tokio::task::JoinError>,
+    ) -> String {
+        match result {
+            Ok(Ok(())) => "wake worker exited unexpectedly".to_string(),
+            Ok(Err(error)) => format!("wake worker exited: {error}"),
+            Err(error) => format!("wake worker join failure: {error}"),
+        }
     }
 
     /// Start the background task that handles sub-agent spawn/cancel requests
@@ -5111,6 +5237,11 @@ impl RuntimeManager {
             }
             manager_for_cleanup
                 .propagate_fatal_runtime_exit(disposition, "direct_turn_terminal_evidence");
+            if disposition != executor::RuntimeExitDisposition::FatalLocalAuthorityLoss {
+                if let Err(error) = manager_for_cleanup.resume_pending_close_settlements().await {
+                    tracing::error!(%error, conv_id = %conv_id, "failed to re-evaluate Close settlement after runtime exit");
+                }
+            }
             if removed && disposition == executor::RuntimeExitDisposition::RecreateFromDatabase {
                 manager_for_cleanup.kick_direct_turn_worker();
             }
@@ -7045,6 +7176,77 @@ mod scope_liveness_tests {
             Arc::new(McpClientManager::new()),
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn close_settlement_sends_live_runtime_cancel_without_terminalizing_its_turn() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "live-close-settlement";
+        let conversation = manager
+            .db()
+            .create_conversation(conversation_id, "live", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        sqlx::query(
+            "INSERT INTO workflows (
+                 workflow_id, profile_kind, profile_version, runtime_acceptance_enabled,
+                 external_acceptance_enabled, version, generation, status,
+                 snapshot_codec_family, snapshot_codec_version, snapshot_payload, created_at, updated_at
+             ) VALUES (1, 'direct_turn', 1, 1, 0, 0, 0, 'Active', 'direct_turn', 1, X'00', 1, 1)",
+        )
+        .execute(manager.db().pool())
+        .await
+        .expect("insert workflow");
+        sqlx::query(
+            "INSERT INTO durable_turns (
+                 turn_id, workflow_id, conversation_id, client_turn_key, prepared_fingerprint,
+                 prepared_payload, disposition, generation, terminal_kind, terminal_reason,
+                 owns_conversation, canonical_message_id
+             ) VALUES (1, 1, ?1, 'turn-key', 'prepared', X'00', 'Runtime', 0, NULL, NULL, 1, NULL)",
+        )
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .expect("insert active turn");
+        manager
+            .db()
+            .begin_close_foundation(&conversation.product_conversation_id, "live-attempt")
+            .await
+            .expect("begin close");
+        manager
+            .db()
+            .confirm_close_stop_work("live-attempt")
+            .await
+            .expect("confirm stop work");
+        manager
+            .db()
+            .begin_close_active_work_settlement("live-attempt")
+            .await
+            .expect("begin settlement");
+        let mut events = manager
+            .inject_handle_with_event_capture_for_test(
+                conversation_id,
+                ConvState::LlmRequesting { attempt: 1 },
+            )
+            .await;
+
+        assert_eq!(manager.resume_pending_close_settlements().await.unwrap(), 0);
+        assert!(matches!(
+            events.try_recv(),
+            Ok(Event::UserCancel {
+                reason: Some(reason),
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            }) if reason == "active Close settlement"
+        ));
+        let terminal_kind: Option<String> =
+            sqlx::query_scalar("SELECT terminal_kind FROM durable_turns WHERE turn_id = 1")
+                .fetch_one(manager.db().pool())
+                .await
+                .expect("read live turn");
+        assert!(
+            terminal_kind.is_none(),
+            "Close must leave live runtime terminalization to its executor"
+        );
     }
 
     #[tokio::test]

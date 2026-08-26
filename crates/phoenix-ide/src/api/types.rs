@@ -213,6 +213,7 @@ pub struct ProductConversationListRow {
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct ProductConversationSnapshotView {
     pub product_conversation_id: String,
+    pub close: Option<ProductConversationCloseView>,
     pub canonical_route: String,
     pub requested_transcript_row_id: String,
     pub canonical_root: ProductConversationTranscriptRowView,
@@ -235,6 +236,28 @@ pub struct ProductConversationSnapshotView {
 pub enum OrdinaryProductConversationLifecycleView {
     Open,
     History,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProductConversationCloseView {
+    pub attempt_id: String,
+    pub phase: ProductConversationClosePhaseView,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ProductConversationClosePhaseView {
+    AwaitingBlockerResolution,
+    AwaitingStopWorkConfirmation,
+    SettlingActiveWork,
+    CancelRequestedDuringSettlement,
+    AwaitingRetirementInspection,
+    AwaitingLossConfirmation,
+    RetirementRequested,
+    NeedsRepair,
+    Completed,
 }
 
 #[derive(Debug, Clone, Serialize, TS)]

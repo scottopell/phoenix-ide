@@ -140,6 +140,7 @@ function makeMessage(message_id: string, sequence_id: number, conversation_id = 
 function makeSnapshot(overrides: Partial<ProductConversationSnapshotView> = {}): ProductConversationSnapshotView {
   return {
     product_conversation_id: 'pc-1',
+    close: null,
     canonical_route: '/product-conversations/pc-1',
     requested_transcript_row_id: 'row-2',
     canonical_root: { transcript_row_id: 'row-1', slug: 'root-slug', title: 'Root title' },
