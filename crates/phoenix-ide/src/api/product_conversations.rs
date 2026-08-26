@@ -711,6 +711,12 @@ mod tests {
             .unwrap();
         let successor = create_completed_continuation(&state, &root, "handoff", "opening").await;
 
+        state
+            .db
+            .begin_close_foundation(&root.product_conversation_id, "snapshot-close")
+            .await
+            .unwrap();
+
         let list = create_router(state.clone())
             .oneshot(
                 Request::builder()
@@ -773,6 +779,8 @@ mod tests {
                 |message| message["message_id"] != "handoff" && message["message_id"] != "opening"
             ));
         assert_eq!(snapshot["writable_transcript_row_id"], successor.id);
+        assert_eq!(snapshot["close"]["attempt_id"], "snapshot-close");
+        assert_eq!(snapshot["close"]["phase"], "awaiting_blocker_resolution");
     }
 
     #[tokio::test]
