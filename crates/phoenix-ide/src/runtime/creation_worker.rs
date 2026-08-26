@@ -77,13 +77,9 @@ pub(crate) async fn run_admitted_blocking<R, F>(
 ) -> Result<R, tokio::task::JoinError>
 where
     R: Send + 'static,
-    F: FnOnce() -> R + Send + 'static,
+    F: FnOnce(crate::runtime::AdmittedOperation) -> R + Send + 'static,
 {
-    tokio::task::spawn_blocking(move || {
-        let _admitted = admitted;
-        operation()
-    })
-    .await
+    tokio::task::spawn_blocking(move || operation(admitted)).await
 }
 
 pub(crate) async fn drain_pending_jobs(manager: &Arc<RuntimeManager>) -> Result<(), String> {
@@ -223,7 +219,7 @@ async fn reconcile_creation_cleanup(
         let cleanup_admission = manager.acquire_local_authority_pass().map_err(|()| {
             "creation cleanup mutation rejected after fatal local authority closure".to_string()
         })?;
-        run_admitted_blocking(cleanup_admission, move || -> Result<(), String> {
+        run_admitted_blocking(cleanup_admission, move |_admitted| -> Result<(), String> {
             let _lock = match RepositoryMutationLock::acquire(&repo) {
                 Ok(lock) => Some(lock),
                 Err((_message, _))
@@ -518,7 +514,7 @@ async fn provision_conversation(
     manager: &Arc<RuntimeManager>,
     job: &mut crate::db::ConversationCreationJob,
 ) -> Result<ProvisionOutcome, CreationProvisionError> {
-    let intent = job.intent.clone();
+    let mut intent = job.intent.clone();
     let CreationStatus::Claimed(claim) = job.protocol.status.clone() else {
         return Err((
             "creation provisioning lacks claim authority".to_string(),
@@ -684,7 +680,7 @@ async fn provision_conversation(
                     manager,
                     "branch worktree mutation rejected after fatal local authority closure",
                 )?;
-                let info = run_admitted_blocking(worktree_admission, move || {
+                let info = run_admitted_blocking(worktree_admission, move |_admitted| {
                     let _lock = RepositoryMutationLock::acquire(&repo_for_blocking)?;
                     if reconcile_owned_worktree_path(&repo_for_blocking, &path_for_blocking)? {
                         if approved_task_creation {
@@ -868,7 +864,7 @@ async fn provision_conversation(
                     manager,
                     "managed worktree mutation rejected after fatal local authority closure",
                 )?;
-                let worktree = run_admitted_blocking(worktree_admission, move || {
+                let worktree = run_admitted_blocking(worktree_admission, move |_admitted| {
                     let _lock = RepositoryMutationLock::acquire(&repo_for_blocking)?;
                     if reconcile_owned_worktree_path(&repo_for_blocking, &path_for_blocking)? {
                         Ok(path_for_blocking.to_string_lossy().to_string())
@@ -958,7 +954,25 @@ async fn provision_conversation(
             let start_point = if materialization_started {
                 persisted_start()
             } else {
-                resolve_default_task_start_point(Path::new(&repo_root)).or_else(persisted_start)
+                let repo_for_refresh = repo_root.clone();
+                let refresh_admission = acquire_creation_admission(
+                    manager,
+                    "canonical root refresh rejected after fatal local authority closure",
+                )?;
+                run_admitted_blocking(refresh_admission, move |_admitted| {
+                    let _lock = RepositoryMutationLock::acquire(&repo_for_refresh)?;
+                    Ok::<_, (String, ErrorKind)>(resolve_default_task_start_point(Path::new(
+                        &repo_for_refresh,
+                    )))
+                })
+                .await
+                .map_err(|error| {
+                    (
+                        format!("canonical refresh join failed: {error}"),
+                        ErrorKind::ServerError,
+                    )
+                })??
+                .or_else(persisted_start)
             }
             .ok_or_else(|| {
                 (
@@ -1016,6 +1030,7 @@ async fn provision_conversation(
                         .into());
                 }
                 job.intent = updated_intent;
+                intent = job.intent.clone();
             }
             checkpoint_creation_stage(
                 manager,
@@ -1040,7 +1055,7 @@ async fn provision_conversation(
                 "directory-first product worktree mutation rejected after fatal local authority closure",
             )?;
             let product_conversation_id_for_blocking = product_conversation_id.clone();
-            let worktree = run_admitted_blocking(worktree_admission, move || {
+            let worktree = run_admitted_blocking(worktree_admission, move |_admitted| {
                 let _lock = RepositoryMutationLock::acquire(&repo_for_blocking)?;
                 if reconcile_owned_worktree_path(&repo_for_blocking, &path_for_blocking)? {
                     validate_detached_worktree_at_ref(
@@ -1922,7 +1937,7 @@ mod runtime_bootstrap_settlement_tests {
             .expect("admit blocking worktree operation");
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let awaiting = tokio::spawn(run_admitted_blocking(admitted, move || {
+        let awaiting = tokio::spawn(run_admitted_blocking(admitted, move |_| {
             started_tx.send(()).unwrap();
             release_rx.recv().unwrap();
         }));
@@ -2682,7 +2697,7 @@ fn hidden_repository_attachment_observation(
         .filter(|branch| !branch.trim().is_empty())
         .map(|branch| GitRepositoryDefaultBranchObservation::Resolved {
             branch: branch.to_string(),
-            provenance: "local_checked_out_branch".to_string(),
+            provenance: "remote_head_cache".to_string(),
         })
         .unwrap_or(GitRepositoryDefaultBranchObservation::Unresolved);
     Ok(AttachHiddenGitRepositoryInput {

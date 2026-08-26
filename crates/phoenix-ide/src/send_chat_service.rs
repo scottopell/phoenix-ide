@@ -883,12 +883,12 @@ fn validate_steering_fingerprint(
     receipt: &SteeringAcceptanceFingerprint,
     request_fingerprint: &str,
 ) -> Result<(), SendChatServiceError> {
-    if let SteeringAcceptanceFingerprint::Exact(exact) = receipt {
-        if exact != request_fingerprint {
-            return Err(SendChatServiceError::IdempotencyConflict);
+    match receipt {
+        SteeringAcceptanceFingerprint::Exact(exact) if exact == request_fingerprint => Ok(()),
+        SteeringAcceptanceFingerprint::Exact(_) | SteeringAcceptanceFingerprint::LegacyUnknown => {
+            Err(SendChatServiceError::IdempotencyConflict)
         }
     }
-    Ok(())
 }
 
 fn map_images(images: Vec<ImageAttachment>) -> Vec<ImageData> {
@@ -1386,7 +1386,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_queued_steering_identity_uses_durable_payload_validation() {
+    async fn legacy_queued_steering_identity_conflicts_without_exact_acceptance_fingerprint() {
         let req = request();
         let db = db_with_conversation(&req.conversation_id).await;
         let entry = phoenix_core::domain::sm_event::SteerEntry {
@@ -1401,19 +1401,12 @@ mod tests {
         db.update_steering_queue(&req.conversation_id, &[entry])
             .await
             .unwrap();
-        let mut retry = req;
-        retry.expansion_policy = MessageExpansionPolicy::LiteralText;
 
-        assert_eq!(
-            lookup_durable_steering_replay(
-                &db,
-                &retry,
-                &super::request_fingerprint(&retry).unwrap(),
-            )
-            .await
-            .unwrap(),
-            Some(SendChatOutcome::QueuedAsSteering)
-        );
+        assert!(matches!(
+            lookup_durable_steering_replay(&db, &req, &super::request_fingerprint(&req).unwrap(),)
+                .await,
+            Err(SendChatServiceError::IdempotencyConflict)
+        ));
     }
 
     #[test]

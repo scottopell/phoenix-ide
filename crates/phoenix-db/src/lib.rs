@@ -230,6 +230,7 @@ pub struct ProductRootReservationRecord {
     pub cwd: String,
     pub kind: String,
     pub repo_root: Option<String>,
+    pub repository_id: Option<String>,
     pub exact_checkout_oid: Option<String>,
     pub logical_base: Option<String>,
     pub freshness: Option<String>,
@@ -4485,13 +4486,14 @@ impl Database {
         Self::reclaim_abandoned_product_root_reservations_tx(&mut tx, now).await?;
         sqlx::query(
             "INSERT INTO product_root_reservations
-             (id, cwd, kind, repo_root, exact_checkout_oid, logical_base, freshness, unresolved_reason, status, created_at_unix_micros)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'reserved', ?9)",
+             (id, cwd, kind, repo_root, repository_id, exact_checkout_oid, logical_base, freshness, unresolved_reason, status, created_at_unix_micros)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'reserved', ?10)",
         )
         .bind(&reservation.id)
         .bind(&reservation.cwd)
         .bind(&reservation.kind)
         .bind(&reservation.repo_root)
+        .bind(&reservation.repository_id)
         .bind(&reservation.exact_checkout_oid)
         .bind(&reservation.logical_base)
         .bind(&reservation.freshness)
@@ -4517,7 +4519,7 @@ impl Database {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         Self::reclaim_abandoned_product_root_reservations_tx(&mut tx, now).await?;
         let reservation = sqlx::query(
-            "SELECT id, cwd, kind, repo_root, exact_checkout_oid, logical_base, freshness, unresolved_reason
+            "SELECT id, cwd, kind, repo_root, repository_id, exact_checkout_oid, logical_base, freshness, unresolved_reason
                FROM product_root_reservations
               WHERE id = ?1 AND cwd = ?2",
         )
@@ -4529,6 +4531,7 @@ impl Database {
                 cwd: row.get("cwd"),
                 kind: row.get("kind"),
                 repo_root: row.get("repo_root"),
+                repository_id: row.get("repository_id"),
                 exact_checkout_oid: row.get("exact_checkout_oid"),
                 logical_base: row.get("logical_base"),
                 freshness: row.get("freshness"),
@@ -4758,6 +4761,37 @@ impl Database {
     /// # Errors
     ///
     /// Returns [`DbError`] when the query or timestamp conversion fails.
+    /// Resolve retained hidden-repository identity evidence for a repository management root.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] when the locator lookup fails or the retained repository id is invalid.
+    pub async fn retained_hidden_repository_id_for_management_root(
+        &self,
+        management_root: &str,
+    ) -> DbResult<Option<phoenix_core::git_repository::GitRepositoryId>> {
+        let normalized_management_root = normalize_hidden_git_repository_path(management_root)?;
+        let row = sqlx::query(
+            "SELECT repository_id
+               FROM git_repository_locator_observations
+              WHERE locator_kind = 'management_root'
+                AND status = 'present'
+                AND path = ?1
+              ORDER BY observed_at_unix_micros DESC, repository_id DESC
+              LIMIT 1",
+        )
+        .bind(normalized_management_root)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            phoenix_core::git_repository::GitRepositoryId::parse(
+                row.get::<String, _>("repository_id"),
+            )
+            .map_err(|error| DbError::Serialization(error.to_string()))
+        })
+        .transpose()
+    }
+
     pub async fn list_recent_hidden_repository_management_roots(
         &self,
     ) -> DbResult<Vec<RecentHiddenRepositoryManagementRoot>> {
@@ -7461,7 +7495,7 @@ impl Database {
         conversation_id: &str,
     ) -> DbResult<Option<ApprovedTaskRootReservationInput>> {
         let row = sqlx::query(
-            "SELECT wr.repository_id,
+            "SELECT reservation.repository_id AS repository_id,
                     reservation.repo_root AS repository_root,
                     reservation.logical_base AS logical_base,
                     reservation.exact_checkout_oid AS exact_checkout_oid
@@ -7470,7 +7504,6 @@ impl Database {
                  ON reservation.status = 'consumed'
                 AND reservation.kind = 'exact_committed_tree'
                JOIN conversations c ON c.id = reservation.consumed_by_conversation_id
-               JOIN work_scope_git_repositories wr ON wr.work_scope_id = c.work_scope_id
               WHERE needle.id = ?1
                 AND c.product_conversation_id = needle.product_conversation_id
               ORDER BY c.created_at ASC, c.id ASC
@@ -14316,6 +14349,7 @@ mod tests {
             cwd: "/tmp/unresolved-recent-root".to_string(),
             kind: "unresolved_exact_committed_tree".to_string(),
             repo_root: Some("/repo/unresolved-recent-root".to_string()),
+            repository_id: Some("repo-id-unresolved-recent-root".to_string()),
             exact_checkout_oid: None,
             logical_base: None,
             freshness: Some("unresolved".to_string()),
@@ -14422,6 +14456,7 @@ mod tests {
             cwd: "/tmp/fresh-reservation".to_string(),
             kind: "direct".to_string(),
             repo_root: None,
+            repository_id: None,
             exact_checkout_oid: None,
             logical_base: None,
             freshness: None,
@@ -14446,6 +14481,7 @@ mod tests {
             cwd: "/tmp/reservation-delete".to_string(),
             kind: "direct".to_string(),
             repo_root: None,
+            repository_id: None,
             exact_checkout_oid: None,
             logical_base: None,
             freshness: None,
@@ -14496,6 +14532,7 @@ mod tests {
             cwd: "/tmp/deferred-scope".to_string(),
             kind: "exact_committed_tree".to_string(),
             repo_root: Some("/repo/deferred-scope".to_string()),
+            repository_id: Some("repo-id-deferred-scope".to_string()),
             exact_checkout_oid: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()),
             logical_base: Some("main".to_string()),
             freshness: Some("fresh".to_string()),
@@ -14564,6 +14601,7 @@ mod tests {
             cwd: "/tmp/immutable-root".to_string(),
             kind: "exact_committed_tree".to_string(),
             repo_root: Some("/repo/from-reservation".to_string()),
+            repository_id: Some("repo-id-from-reservation".to_string()),
             exact_checkout_oid: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
             logical_base: Some("main".to_string()),
             freshness: Some("fresh".to_string()),
@@ -14678,6 +14716,7 @@ mod tests {
             cwd: "/tmp/continuation-approval".to_string(),
             kind: "exact_committed_tree".to_string(),
             repo_root: Some("/repo/continuation-approval".to_string()),
+            repository_id: Some("repo-id-continuation-approval".to_string()),
             exact_checkout_oid: Some("cccccccccccccccccccccccccccccccccccccccc".to_string()),
             logical_base: Some("main".to_string()),
             freshness: Some("fresh".to_string()),
@@ -14791,6 +14830,7 @@ mod tests {
             cwd: "/tmp/reservation-rollback".to_string(),
             kind: "direct".to_string(),
             repo_root: None,
+            repository_id: None,
             exact_checkout_oid: None,
             logical_base: None,
             freshness: None,
@@ -14849,6 +14889,7 @@ mod tests {
             cwd: "/tmp/reservation-idempotent".to_string(),
             kind: "direct".to_string(),
             repo_root: None,
+            repository_id: None,
             exact_checkout_oid: None,
             logical_base: None,
             freshness: None,

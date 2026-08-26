@@ -2113,6 +2113,7 @@ CREATE TABLE product_root_reservations (
     cwd TEXT NOT NULL CHECK (typeof(cwd) = 'text' AND cwd <> '' AND instr(cwd, char(0)) = 0),
     kind TEXT NOT NULL CHECK (kind IN ('direct', 'exact_committed_tree', 'unresolved_exact_committed_tree')),
     repo_root TEXT CHECK (repo_root IS NULL OR (typeof(repo_root) = 'text' AND repo_root <> '' AND instr(repo_root, char(0)) = 0)),
+    repository_id TEXT CHECK (repository_id IS NULL OR (typeof(repository_id) = 'text' AND repository_id <> '')),
     exact_checkout_oid TEXT CHECK (exact_checkout_oid IS NULL OR (typeof(exact_checkout_oid) = 'text' AND exact_checkout_oid <> '')),
     logical_base TEXT CHECK (logical_base IS NULL OR (typeof(logical_base) = 'text' AND logical_base <> '')),
     freshness TEXT CHECK (freshness IS NULL OR freshness IN ('fresh', 'stale_cached', 'unresolved')),
@@ -2121,9 +2122,9 @@ CREATE TABLE product_root_reservations (
     consumed_by_conversation_id TEXT,
     created_at_unix_micros INTEGER NOT NULL CHECK (typeof(created_at_unix_micros) = 'integer'),
     consumed_at_unix_micros INTEGER CHECK (consumed_at_unix_micros IS NULL OR typeof(consumed_at_unix_micros) = 'integer'),
-    CHECK ((kind = 'direct' AND repo_root IS NULL AND exact_checkout_oid IS NULL AND logical_base IS NULL AND freshness IS NULL AND unresolved_reason IS NULL)
-        OR (kind = 'exact_committed_tree' AND repo_root IS NOT NULL AND exact_checkout_oid IS NOT NULL AND logical_base IS NOT NULL AND freshness IN ('fresh', 'stale_cached') AND unresolved_reason IS NULL)
-        OR (kind = 'unresolved_exact_committed_tree' AND repo_root IS NOT NULL AND exact_checkout_oid IS NULL AND logical_base IS NULL AND freshness = 'unresolved' AND unresolved_reason IS NOT NULL)),
+    CHECK ((kind = 'direct' AND repo_root IS NULL AND repository_id IS NULL AND exact_checkout_oid IS NULL AND logical_base IS NULL AND freshness IS NULL AND unresolved_reason IS NULL)
+        OR (kind = 'exact_committed_tree' AND repo_root IS NOT NULL AND repository_id IS NOT NULL AND exact_checkout_oid IS NOT NULL AND logical_base IS NOT NULL AND freshness IN ('fresh', 'stale_cached') AND unresolved_reason IS NULL)
+        OR (kind = 'unresolved_exact_committed_tree' AND repo_root IS NOT NULL AND repository_id IS NOT NULL AND exact_checkout_oid IS NULL AND logical_base IS NULL AND freshness = 'unresolved' AND unresolved_reason IS NOT NULL)),
     CHECK ((status = 'reserved' AND consumed_by_conversation_id IS NULL AND consumed_at_unix_micros IS NULL)
         OR (status = 'consumed' AND consumed_by_conversation_id IS NOT NULL AND consumed_at_unix_micros IS NOT NULL))
 );

@@ -87,6 +87,8 @@ pub struct ProductRootReservation {
     pub freshness: Option<ProductRootReservationFreshness>,
     #[serde(default)]
     pub unresolved_reason: Option<String>,
+    #[serde(default)]
+    pub repository_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, TS)]
@@ -1278,6 +1280,11 @@ pub struct ConflictErrorResponse {
     /// the parent has been continued (`error_type = "continuation_exists"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub continuation_id: Option<String>,
+    /// Exact idempotency fingerprint that currently owns the rejected resource,
+    /// when the server can prove it. Used by create endpoints to distinguish an
+    /// exact replay from a divergent duplicate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conflict_fingerprint: Option<String>,
 }
 
 impl ConflictErrorResponse {
@@ -1289,6 +1296,7 @@ impl ConflictErrorResponse {
             can_auto_stash: false,
             conflict_slug: None,
             continuation_id: None,
+            conflict_fingerprint: None,
         }
     }
 
@@ -1299,6 +1307,11 @@ impl ConflictErrorResponse {
 
     pub fn with_continuation_id(mut self, id: impl Into<String>) -> Self {
         self.continuation_id = Some(id.into());
+        self
+    }
+
+    pub fn with_conflict_fingerprint(mut self, fingerprint: impl Into<String>) -> Self {
+        self.conflict_fingerprint = Some(fingerprint.into());
         self
     }
 }

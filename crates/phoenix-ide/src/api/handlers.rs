@@ -73,6 +73,7 @@ use futures::future::BoxFuture;
 use rand::seq::IndexedRandom;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::Digest as _;
 use sqlx::Row;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -1920,6 +1921,7 @@ async fn reserve_product_root(
     let cwd_path = std::path::PathBuf::from(&cwd);
     let persist = |root: &ProductRootReservation| phoenix_db::ProductRootReservationRecord {
         id: root.id.clone(),
+        repository_id: root.repository_id.clone(),
         cwd: root.cwd.clone(),
         kind: root.kind.clone(),
         repo_root: root.repo_root.clone(),
@@ -1942,6 +1944,7 @@ async fn reserve_product_root(
             logical_base: None,
             freshness: None,
             unresolved_reason: None,
+            repository_id: None,
         };
         state
             .db
@@ -1953,6 +1956,12 @@ async fn reserve_product_root(
         }));
     };
     let repo_path = std::path::PathBuf::from(&repo_root);
+    let retained_repository_id = state
+        .db
+        .retained_hidden_repository_id_for_management_root(&repo_root)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+        .map(|id| id.as_str().to_string());
     let cached = crate::git_start::GitStartPoint::cached_default_task_start(&repo_path);
     let (start, freshness) = if let Some(start) = cached {
         (start, ProductRootReservationFreshness::StaleCached)
@@ -1966,6 +1975,7 @@ async fn reserve_product_root(
             logical_base: None,
             freshness: Some(ProductRootReservationFreshness::Unresolved),
             unresolved_reason: Some("canonical_default_unresolved".to_string()),
+            repository_id: retained_repository_id,
         };
         state
             .db
@@ -1992,6 +2002,7 @@ async fn reserve_product_root(
         logical_base: Some(default_branch.clone()),
         freshness: Some(freshness.clone()),
         unresolved_reason: None,
+        repository_id: retained_repository_id,
     };
     state
         .db
@@ -2051,6 +2062,7 @@ async fn create_product_conversation_with_id(
                 _ => ProductRootReservationFreshness::Unresolved,
             });
     req.root_reservation.unresolved_reason = authenticated_reservation.unresolved_reason.clone();
+    req.root_reservation.repository_id = authenticated_reservation.repository_id.clone();
     let response = create_conversation_from_request(
         state.clone(),
         req.into(),
@@ -2093,6 +2105,44 @@ async fn create_conversation_with_id_impl(
     Ok(Json(ConversationResponse {
         conversation: response.conversation,
     }))
+}
+
+#[allow(clippy::too_many_lines)]
+fn create_request_fingerprint(req: &CreateConversationRequest) -> Result<String, AppError> {
+    let canonical = serde_json::to_vec(&serde_json::json!({
+        "cwd": req.cwd,
+        "model": req.model,
+        "effort": req.effort,
+        "text": req.text,
+        "images": req.images.iter().map(|image| serde_json::json!({
+            "data": image.data,
+            "media_type": image.media_type,
+        })).collect::<Vec<_>>(),
+        "files": req.files,
+        "mode": req.mode,
+        "base_branch": req.base_branch,
+        "checkout_ref": req.checkout_ref,
+        "root_reservation": req.root_reservation,
+        "seed_parent_id": req.seed_parent_id,
+        "seed_label": req.seed_label,
+    }))
+    .map_err(|error| AppError::Internal(error.to_string()))?;
+    Ok(sha2::Sha256::digest(canonical).iter().fold(
+        String::with_capacity(64),
+        |mut output, byte| {
+            use std::fmt::Write as _;
+            write!(output, "{byte:02x}").expect("writing to String cannot fail");
+            output
+        },
+    ))
+}
+
+fn conflict_fingerprint_response(
+    req: &CreateConversationRequest,
+    message: &str,
+) -> Result<ConflictErrorResponse, AppError> {
+    Ok(ConflictErrorResponse::new(message, "message_id_conflict")
+        .with_conflict_fingerprint(create_request_fingerprint(req)?))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2178,6 +2228,28 @@ async fn create_conversation_from_request(
         .get_conversation_creation_job_for_message(&req.message_id)
         .await
     {
+        let requested_fingerprint = create_request_fingerprint(&req)?;
+        let existing_fingerprint = serde_json::to_vec(&existing_job.intent)
+            .map(|bytes| {
+                sha2::Sha256::digest(bytes).iter().fold(
+                    String::with_capacity(64),
+                    |mut output, byte| {
+                        use std::fmt::Write as _;
+                        let _ = write!(output, "{byte:02x}");
+                        output
+                    },
+                )
+            })
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+        if existing_fingerprint != requested_fingerprint {
+            return Err(AppError::Conflict(Box::new(
+                ConflictErrorResponse::new(
+                    "message_id was already used for a different create payload",
+                    "message_id_conflict",
+                )
+                .with_conflict_fingerprint(existing_fingerprint),
+            )));
+        }
         if let Ok(conv) = state
             .runtime
             .db()
@@ -2206,18 +2278,16 @@ async fn create_conversation_from_request(
             "Duplicate create request detected, returning existing conversation"
         );
         if let Ok(msg) = state.db.get_message_by_id(&req.message_id).await {
-            if let Ok(conv) = state
+            if let Ok(_conv) = state
                 .runtime
                 .db()
                 .get_conversation(&msg.conversation_id)
                 .await
             {
-                return Ok(InternalCreateConversationAcceptedResponse {
-                    conversation: conversation_to_json(&state, &conv, None),
-                    product_conversation_id: Some(
-                        conv.product_conversation_id.as_str().to_string(),
-                    ),
-                });
+                return Err(AppError::Conflict(Box::new(conflict_fingerprint_response(
+                    &req,
+                    "message_id was already used by an existing transcript message",
+                )?)));
             }
         }
     }
@@ -6329,7 +6399,7 @@ async fn cascade_projects_on_delete(
     };
     let outcome = crate::runtime::creation_worker::run_admitted_blocking(
         cleanup_admission,
-        move || -> Result<(), String> {
+        move |_| -> Result<(), String> {
             let worktree_dir = PathBuf::from(&worktree_path);
 
             if let Some(repo) = repo_root.as_ref() {
@@ -14598,6 +14668,7 @@ mod product_conversation_creation_tests {
                 cwd: temp_dir.path().to_string_lossy().to_string(),
                 id: "test-reservation".to_string(),
                 kind: "direct".to_string(),
+                repository_id: None,
                 repo_root: None,
                 exact_checkout_oid: None,
                 logical_base: None,
@@ -14618,6 +14689,7 @@ mod product_conversation_creation_tests {
             .db
             .insert_product_root_reservation(&phoenix_db::ProductRootReservationRecord {
                 id: "test-reservation".to_string(),
+                repository_id: None,
                 cwd: crate::conversation_cwd::validate_conversation_cwd(
                     temp_dir.path().to_string_lossy(),
                 )
