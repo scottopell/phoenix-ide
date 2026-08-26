@@ -660,6 +660,36 @@ pub struct RecordCloseRetirementEvidenceRequest {
     pub detail: Option<String>,
 }
 
+async fn close_obligation_for_update(
+    tx: &mut Transaction<'_, Sqlite>,
+    attempt_id: &str,
+) -> DbResult<CloseObligation> {
+    sqlx::query(
+        "SELECT attempt_id, product_conversation_id, phase, inspection_generation,
+                inspection_fingerprint, created_at, updated_at, completed_at, close_outcome
+         FROM close_obligations WHERE attempt_id = ?1",
+    )
+    .bind(attempt_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .map(parse_close_obligation_row)
+    .transpose()?
+    .ok_or_else(|| DbError::CloseFoundationNotFound(attempt_id.to_string()))
+}
+
+async fn set_close_phase_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    attempt_id: &str,
+    phase: ClosePhase,
+) -> DbResult<()> {
+    sqlx::query("UPDATE close_obligations SET phase = ?2 WHERE attempt_id = ?1")
+        .bind(attempt_id)
+        .bind(phase.as_str())
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 async fn read_topology_tx(
     tx: &mut Transaction<'_, Sqlite>,
     product_conversation_id: &ProductConversationId,
@@ -1092,6 +1122,97 @@ impl Database {
         .fetch_one(&mut *tx)
         .await?;
         let obligation = parse_close_obligation_row(row)?;
+        tx.commit().await?;
+        Ok(obligation)
+    }
+
+    pub async fn begin_close_active_work_settlement(
+        &self,
+        attempt_id: &str,
+    ) -> DbResult<CloseObligation> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let obligation = close_obligation_for_update(&mut tx, attempt_id).await?;
+        match obligation.phase() {
+            ClosePhase::AwaitingBlockerResolution | ClosePhase::AwaitingStopWorkConfirmation => {
+                set_close_phase_tx(&mut tx, attempt_id, ClosePhase::SettlingActiveWork).await?;
+            }
+            ClosePhase::SettlingActiveWork => {}
+            phase @ (ClosePhase::CancelRequestedDuringSettlement
+            | ClosePhase::AwaitingRetirementInspection
+            | ClosePhase::AwaitingLossConfirmation
+            | ClosePhase::RetirementRequested
+            | ClosePhase::NeedsRepair
+            | ClosePhase::Completed) => {
+                return Err(close_precondition(format!(
+                    "attempt {attempt_id} phase {} does not admit active-work settlement",
+                    phase.as_str()
+                )));
+            }
+        }
+        let obligation = close_obligation_for_update(&mut tx, attempt_id).await?;
+        tx.commit().await?;
+        Ok(obligation)
+    }
+
+    pub async fn advance_close_settlement_when_quiescent(
+        &self,
+        attempt_id: &str,
+    ) -> DbResult<CloseObligation> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let obligation = close_obligation_for_update(&mut tx, attempt_id).await?;
+        match obligation.phase() {
+            ClosePhase::AwaitingRetirementInspection => {
+                tx.commit().await?;
+                return Ok(obligation);
+            }
+            ClosePhase::SettlingActiveWork => {}
+            phase @ (ClosePhase::AwaitingBlockerResolution
+            | ClosePhase::AwaitingStopWorkConfirmation
+            | ClosePhase::CancelRequestedDuringSettlement
+            | ClosePhase::AwaitingLossConfirmation
+            | ClosePhase::RetirementRequested
+            | ClosePhase::NeedsRepair
+            | ClosePhase::Completed) => {
+                return Err(close_precondition(format!(
+                    "attempt {attempt_id} phase {} is not settling active work",
+                    phase.as_str()
+                )));
+            }
+        }
+        let active_members: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)
+             FROM close_attempt_members member
+             WHERE member.attempt_id = ?1
+               AND (
+                 EXISTS (
+                   SELECT 1 FROM durable_turns turn
+                   WHERE turn.conversation_id = member.conversation_id
+                     AND turn.owns_conversation = 1 AND turn.terminal_kind IS NULL
+                 )
+                 OR EXISTS (
+                   SELECT 1 FROM wake_bindings binding
+                   JOIN workflows workflow ON workflow.workflow_id = binding.workflow_id
+                   WHERE binding.conversation_id = member.conversation_id
+                     AND (binding.resolved_at IS NULL
+                       OR workflow.status IN ('Active', 'Cancelling', 'ManualResolution', 'Incompatible', 'DeletionPending'))
+                 )
+               )",
+        )
+        .bind(attempt_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if active_members != 0 {
+            return Err(close_precondition(format!(
+                "attempt {attempt_id} still has {active_members} active durable member obligation(s)"
+            )));
+        }
+        set_close_phase_tx(
+            &mut tx,
+            attempt_id,
+            ClosePhase::AwaitingRetirementInspection,
+        )
+        .await?;
+        let obligation = close_obligation_for_update(&mut tx, attempt_id).await?;
         tx.commit().await?;
         Ok(obligation)
     }
@@ -2948,6 +3069,108 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(members, vec![conversation.id]);
+    }
+
+    #[tokio::test]
+    async fn active_work_settlement_advances_only_once_when_captured_members_are_quiescent() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        create_child(&db, "latest", "root").await;
+        db.begin_close_foundation(&product_id("root"), "attempt-settlement")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.begin_close_active_work_settlement("attempt-settlement")
+                .await
+                .unwrap()
+                .phase(),
+            ClosePhase::SettlingActiveWork
+        );
+        assert_eq!(
+            db.advance_close_settlement_when_quiescent("attempt-settlement")
+                .await
+                .unwrap()
+                .phase(),
+            ClosePhase::AwaitingRetirementInspection
+        );
+        assert_eq!(
+            db.advance_close_settlement_when_quiescent("attempt-settlement")
+                .await
+                .unwrap()
+                .phase(),
+            ClosePhase::AwaitingRetirementInspection
+        );
+        assert!(matches!(
+            db.begin_close_active_work_settlement("attempt-settlement")
+                .await
+                .unwrap_err(),
+            DbError::CloseFoundationPrecondition(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn active_work_settlement_remains_fenced_until_every_captured_turn_is_terminal() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        create_child(&db, "latest", "root").await;
+        sqlx::query(
+            "INSERT INTO workflows (
+                 workflow_id, profile_kind, profile_version, runtime_acceptance_enabled,
+                 external_acceptance_enabled, version, generation, status,
+                 snapshot_codec_family, snapshot_codec_version, snapshot_payload, created_at, updated_at
+             ) VALUES (1, 'direct_turn', 1, 1, 0, 0, 0, 'Active', 'direct_turn', 1, X'00', 1, 1)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO durable_turns (
+                 turn_id, workflow_id, conversation_id, client_turn_key, prepared_fingerprint,
+                 prepared_payload, disposition, generation, terminal_kind, terminal_reason,
+                 owns_conversation, canonical_message_id
+             ) VALUES (1, 1, 'latest', 'turn-key', 'prepared', X'00', 'Runtime', 0, NULL, NULL, 1, NULL)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        db.begin_close_foundation(&product_id("root"), "attempt-busy")
+            .await
+            .unwrap();
+        db.begin_close_active_work_settlement("attempt-busy")
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            db.advance_close_settlement_when_quiescent("attempt-busy")
+                .await
+                .unwrap_err(),
+            DbError::CloseFoundationPrecondition(message)
+                if message.contains("active durable member obligation")
+        ));
+        assert_eq!(
+            db.get_close_obligation("attempt-busy")
+                .await
+                .unwrap()
+                .phase(),
+            ClosePhase::SettlingActiveWork
+        );
+
+        sqlx::query(
+            "UPDATE durable_turns
+             SET terminal_kind = 'Cancelled', owns_conversation = 0
+             WHERE turn_id = 1",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            db.advance_close_settlement_when_quiescent("attempt-busy")
+                .await
+                .unwrap()
+                .phase(),
+            ClosePhase::AwaitingRetirementInspection
+        );
     }
 
     #[tokio::test]
