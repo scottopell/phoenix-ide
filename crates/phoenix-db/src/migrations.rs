@@ -2094,7 +2094,7 @@ CREATE TABLE close_attempt_direct_turn_settlements (
     attempt_id TEXT NOT NULL
         REFERENCES close_attempt_direct_turn_settlement_captures(attempt_id) ON DELETE CASCADE,
     turn_id INTEGER NOT NULL
-        REFERENCES durable_turns(turn_id) ON DELETE RESTRICT,
+        REFERENCES durable_turns(turn_id) ON DELETE CASCADE,
     expected_generation INTEGER NOT NULL
         CHECK (expected_generation >= 0),
     settled_at TEXT,
