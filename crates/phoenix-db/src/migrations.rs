@@ -405,6 +405,21 @@ const MIGRATIONS: &[Migration] = &[
         name: "record_close_retirement_resource_dispatches",
         sql: MIGRATION_077,
     },
+    Migration {
+        version: 78,
+        name: "persist_runtime_resource_instances",
+        sql: MIGRATION_078,
+    },
+    Migration {
+        version: 79,
+        name: "bind_close_resources_to_runtime_instances",
+        sql: MIGRATION_079,
+    },
+    Migration {
+        version: 80,
+        name: "simplify_close_runtime_authority_and_scope_owners",
+        sql: MIGRATION_080,
+    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -7508,6 +7523,168 @@ CREATE INDEX idx_creation_cleanup_due
     ON conversation_creation_jobs(status, cleanup_lease_until, updated_at);
 ";
 
+const MIGRATION_080: &str = r"
+DROP TRIGGER IF EXISTS close_expected_runtime_instance_kind_scope_matches;
+DROP TRIGGER IF EXISTS close_expected_runtime_instance_required;
+ALTER TABLE close_expected_retirement_resources DROP COLUMN runtime_resource_instance_id;
+DROP TRIGGER IF EXISTS runtime_resource_instances_preserve_identity;
+DROP INDEX IF EXISTS runtime_resource_instances_live_exact_identity;
+DROP TABLE runtime_resource_instances;
+
+CREATE TABLE product_conversation_work_scopes (
+    work_scope_id TEXT PRIMARY KEY REFERENCES work_scopes(id) ON DELETE RESTRICT,
+    product_conversation_id TEXT NOT NULL REFERENCES product_conversations(id) ON DELETE RESTRICT,
+    UNIQUE (product_conversation_id, work_scope_id)
+);
+
+INSERT INTO product_conversation_work_scopes (work_scope_id, product_conversation_id)
+SELECT c.work_scope_id, MIN(c.product_conversation_id)
+FROM conversations c
+JOIN product_conversations product ON product.id = c.product_conversation_id
+WHERE c.work_scope_id IS NOT NULL
+  AND c.runtime_role <> 'coordinator'
+  AND product.kind = 'ordinary'
+GROUP BY c.work_scope_id;
+
+CREATE TRIGGER conversations_assign_or_validate_work_scope_owner
+BEFORE INSERT ON conversations
+FOR EACH ROW
+WHEN NEW.work_scope_id IS NOT NULL AND NEW.runtime_role <> 'coordinator'
+BEGIN
+    INSERT OR IGNORE INTO product_conversation_work_scopes (work_scope_id, product_conversation_id)
+    SELECT NEW.work_scope_id, NEW.product_conversation_id
+    WHERE EXISTS (
+        SELECT 1 FROM product_conversations
+        WHERE id = NEW.product_conversation_id AND kind = 'ordinary'
+    );
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1 FROM product_conversation_work_scopes
+        WHERE work_scope_id = NEW.work_scope_id
+          AND product_conversation_id = NEW.product_conversation_id
+    ) THEN RAISE(ABORT, 'work scope belongs to a different ordinary product conversation') END;
+END;
+
+CREATE TRIGGER conversations_validate_work_scope_owner_on_update
+BEFORE UPDATE OF product_conversation_id, work_scope_id, runtime_role ON conversations
+FOR EACH ROW
+WHEN NEW.work_scope_id IS NOT NULL AND NEW.runtime_role <> 'coordinator'
+BEGIN
+    INSERT OR IGNORE INTO product_conversation_work_scopes (work_scope_id, product_conversation_id)
+    SELECT NEW.work_scope_id, NEW.product_conversation_id
+    WHERE EXISTS (
+        SELECT 1 FROM product_conversations
+        WHERE id = NEW.product_conversation_id AND kind = 'ordinary'
+    );
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1 FROM product_conversation_work_scopes
+        WHERE work_scope_id = NEW.work_scope_id
+          AND product_conversation_id = NEW.product_conversation_id
+    ) THEN RAISE(ABORT, 'work scope belongs to a different ordinary product conversation') END;
+END;
+";
+
+const MIGRATION_079: &str = r"
+ALTER TABLE close_expected_retirement_resources
+ADD COLUMN runtime_resource_instance_id TEXT REFERENCES runtime_resource_instances(instance_id) ON DELETE RESTRICT;
+
+CREATE TRIGGER close_expected_runtime_instance_kind_scope_matches
+BEFORE UPDATE OF runtime_resource_instance_id ON close_expected_retirement_resources
+FOR EACH ROW
+WHEN NEW.runtime_resource_instance_id IS NOT NULL
+ AND NOT EXISTS (
+    SELECT 1 FROM runtime_resource_instances instance
+    WHERE instance.instance_id = NEW.runtime_resource_instance_id
+      AND instance.work_scope_id = NEW.scope
+      AND (
+        (NEW.resource_kind = 'bash_process_group' AND instance.resource_kind = 'bash')
+        OR (NEW.resource_kind = 'tmux_server' AND instance.resource_kind = 'tmux')
+        OR (NEW.resource_kind = 'pty_session' AND instance.resource_kind = 'pty')
+        OR (NEW.resource_kind = 'browser_session' AND instance.resource_kind = 'browser')
+      )
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'close expected runtime resource must bind matching scope and kind instance');
+END;
+
+CREATE TRIGGER close_expected_runtime_instance_required
+BEFORE UPDATE OF runtime_resource_instance_id ON close_expected_retirement_resources
+FOR EACH ROW
+WHEN NEW.resource_kind IN ('bash_process_group', 'tmux_server', 'pty_session', 'browser_session')
+ AND NEW.runtime_resource_instance_id IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'close runtime resource instance binding cannot be removed');
+END;
+";
+
+const MIGRATION_078: &str = r"
+CREATE TABLE runtime_resource_instances (
+    instance_id TEXT PRIMARY KEY NOT NULL,
+    work_scope_id TEXT NOT NULL REFERENCES work_scopes(id) ON DELETE RESTRICT,
+    resource_kind TEXT NOT NULL CHECK (resource_kind IN ('bash', 'tmux', 'pty', 'browser')),
+    state TEXT NOT NULL CHECK (state IN ('live', 'retirement_pending', 'retired', 'needs_repair')),
+    launch_uuid TEXT NOT NULL CHECK (length(trim(launch_uuid)) > 0),
+    pid INTEGER,
+    process_birth TEXT,
+    pgid INTEGER,
+    tmux_socket_path TEXT,
+    tmux_server_token TEXT,
+    browser_session_key TEXT,
+    browser_audience TEXT,
+    browser_profile_path TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (
+        (resource_kind = 'bash'
+         AND pid IS NOT NULL AND process_birth IS NOT NULL AND pgid IS NOT NULL
+         AND tmux_socket_path IS NULL AND tmux_server_token IS NULL
+         AND browser_session_key IS NULL AND browser_audience IS NULL AND browser_profile_path IS NULL)
+        OR
+        (resource_kind = 'tmux'
+         AND pid IS NULL AND process_birth IS NULL AND pgid IS NULL
+         AND tmux_socket_path IS NOT NULL AND tmux_server_token IS NOT NULL
+         AND browser_session_key IS NULL AND browser_audience IS NULL AND browser_profile_path IS NULL)
+        OR
+        (resource_kind = 'pty'
+         AND pid IS NOT NULL AND process_birth IS NOT NULL AND pgid IS NULL
+         AND tmux_socket_path IS NULL AND tmux_server_token IS NULL
+         AND browser_session_key IS NULL AND browser_audience IS NULL AND browser_profile_path IS NULL)
+        OR
+        (resource_kind = 'browser'
+         AND pid IS NOT NULL AND process_birth IS NOT NULL AND pgid IS NULL
+         AND tmux_socket_path IS NULL AND tmux_server_token IS NULL
+         AND browser_session_key IS NOT NULL AND browser_audience IS NOT NULL AND browser_profile_path IS NOT NULL)
+    )
+);
+
+CREATE UNIQUE INDEX runtime_resource_instances_live_exact_identity
+ON runtime_resource_instances (
+    work_scope_id, resource_kind, launch_uuid,
+    COALESCE(pid, -1), COALESCE(process_birth, ''), COALESCE(pgid, -1),
+    COALESCE(tmux_socket_path, ''), COALESCE(tmux_server_token, ''),
+    COALESCE(browser_session_key, ''), COALESCE(browser_audience, ''), COALESCE(browser_profile_path, '')
+)
+WHERE state <> 'retired';
+
+CREATE TRIGGER runtime_resource_instances_preserve_identity
+BEFORE UPDATE ON runtime_resource_instances
+FOR EACH ROW
+WHEN NEW.instance_id <> OLD.instance_id
+  OR NEW.work_scope_id <> OLD.work_scope_id
+  OR NEW.resource_kind <> OLD.resource_kind
+  OR NEW.launch_uuid <> OLD.launch_uuid
+  OR NEW.pid IS NOT OLD.pid
+  OR NEW.process_birth IS NOT OLD.process_birth
+  OR NEW.pgid IS NOT OLD.pgid
+  OR NEW.tmux_socket_path IS NOT OLD.tmux_socket_path
+  OR NEW.tmux_server_token IS NOT OLD.tmux_server_token
+  OR NEW.browser_session_key IS NOT OLD.browser_session_key
+  OR NEW.browser_audience IS NOT OLD.browser_audience
+  OR NEW.browser_profile_path IS NOT OLD.browser_profile_path
+BEGIN
+    SELECT RAISE(ABORT, 'runtime resource instance identity is immutable');
+END;
+";
+
 const MIGRATION_077: &str = r"
 CREATE TABLE close_retirement_resource_dispatches (
     attempt_id TEXT NOT NULL,
@@ -7711,6 +7888,20 @@ async fn migration_065_preflight(tx: &mut Transaction<'_, Sqlite>) -> DbResult<(
     })
 }
 
+async fn migration_080_preflight(tx: &mut Transaction<'_, Sqlite>) -> DbResult<()> {
+    let conflict: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT work_scope_id, MIN(product_conversation_id), MAX(product_conversation_id)\n         FROM conversations\n         WHERE work_scope_id IS NOT NULL AND runtime_role <> 'coordinator'\n         GROUP BY work_scope_id\n         HAVING COUNT(DISTINCT product_conversation_id) > 1\n         ORDER BY work_scope_id\n         LIMIT 1",
+    )
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some((scope, first, second)) = conflict {
+        return Err(DbError::Serialization(format!(
+            "migration 80 cannot assign WorkScope {scope} to both ProductConversations {first} and {second}"
+        )));
+    }
+    Ok(())
+}
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -7780,6 +7971,25 @@ pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
 
         if migration.version == 65 {
             migration_065_preflight(&mut tx).await?;
+        }
+
+        if migration.version == 80 {
+            let product_conversation_column_exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(\n                    SELECT 1 FROM pragma_table_info('conversations')\n                    WHERE name = 'product_conversation_id'\n                )",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            if !product_conversation_column_exists {
+                sqlx::query("INSERT INTO _migrations (version, name) VALUES (?, ?)")
+                    .bind(migration.version)
+                    .bind(migration.name)
+                    .execute(&mut *tx)
+                    .await?;
+                tx.commit().await?;
+                applied += 1;
+                continue;
+            }
+            migration_080_preflight(&mut tx).await?;
         }
 
         if migration.version == 59 {
