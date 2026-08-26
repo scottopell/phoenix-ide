@@ -2,4 +2,4 @@
 import type { ProductRootReservation } from "./ProductRootReservation";
 import type { ProductRootReservationFreshness } from "./ProductRootReservationFreshness";
 
-export type ReserveProductRootResponse = { "kind": "direct", root_reservation: ProductRootReservation, } | { "kind": "exact_committed_tree", root_reservation: ProductRootReservation, exact_checkout_oid: string, logical_base: string, freshness: ProductRootReservationFreshness, };
+export type ReserveProductRootResponse = { "kind": "direct", root_reservation: ProductRootReservation, } | { "kind": "exact_committed_tree", root_reservation: ProductRootReservation, exact_checkout_oid: string, logical_base: string, freshness: ProductRootReservationFreshness, } | { "kind": "unresolved_exact_committed_tree", root_reservation: ProductRootReservation, };

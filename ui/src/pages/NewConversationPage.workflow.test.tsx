@@ -87,7 +87,7 @@ describe('/new directory-first product conversation', () => {
     vi.mocked(api.listRecentManagementRootSuggestions).mockResolvedValue({ suggestions: [] });
     vi.mocked(api.reserveProductRoot).mockResolvedValue({
       root_reservation: {
-        cwd: '/repo', kind: 'exact_committed_tree', repo_root: '/repo', exact_checkout_oid: 'abc123',
+        id: 'reservation-git', cwd: '/repo', kind: 'exact_committed_tree', repo_root: '/repo', exact_checkout_oid: 'abc123',
         logical_base: 'main', freshness: 'fresh',
       },
     });
@@ -132,7 +132,7 @@ describe('/new directory-first product conversation', () => {
     vi.mocked(api.validateCwd).mockResolvedValue({ valid: true, is_git: false });
     vi.mocked(api.reserveProductRoot).mockResolvedValue({
       root_reservation: {
-        cwd: '/plain-dir', kind: 'direct', repo_root: null, exact_checkout_oid: null,
+        id: 'reservation-direct', cwd: '/plain-dir', kind: 'direct', repo_root: null, exact_checkout_oid: null,
         logical_base: null, freshness: null,
       },
     });
@@ -152,6 +152,47 @@ describe('/new directory-first product conversation', () => {
       images: [],
     });
     expect(Object.keys(secondRequest).sort()).toEqual(Object.keys(firstRequest).sort());
+  });
+
+  it('creates a missing directory before reserving and submitting its canonical root', async () => {
+    localStorage.setItem('phoenix-last-cwd', '/new-dir');
+    vi.mocked(api.validateCwd).mockImplementation(async (path) => (
+      path === '/new-dir'
+        ? { valid: false } as never
+        : { valid: true, is_git: false }
+    ));
+    vi.mocked(api.reserveProductRoot).mockResolvedValue({
+      root_reservation: {
+        id: 'reservation-created', cwd: '/new-dir', kind: 'direct', repo_root: null,
+        exact_checkout_oid: null, logical_base: null, freshness: null,
+      },
+    });
+    const order: string[] = [];
+    vi.mocked(api.mkdir).mockImplementation(async () => { order.push('mkdir'); return { created: true }; });
+    vi.mocked(api.reserveProductRoot).mockImplementation(async () => {
+      order.push('reserve');
+      return {
+        root_reservation: {
+          id: 'reservation-created', cwd: '/new-dir', kind: 'direct', repo_root: null,
+          exact_checkout_oid: null, logical_base: null, freshness: null,
+        },
+      };
+    });
+    vi.mocked(api.createProductConversation).mockImplementation(async () => {
+      order.push('create');
+      return { product_conversation_id: 'pc-created', canonical_route: '/product-conversations/pc-created' } as never;
+    });
+
+    renderPage();
+    await screen.findAllByPlaceholderText('What would you like to work on?');
+    fireEvent.change(composerTextarea(), { target: { value: 'Create here' } });
+    await waitFor(() => expect(screen.getAllByTitle('Directory will be created').length).toBeGreaterThan(0));
+    fireEvent.click(sendButton());
+
+    await waitFor(() => expect(api.createProductConversation).toHaveBeenCalledTimes(1));
+    expect(order.slice(-3)).toEqual(['mkdir', 'reserve', 'create']);
+    expect(vi.mocked(api.createProductConversation).mock.calls[0]![0].root_reservation.id)
+      .toBe('reservation-created');
   });
 
   it('keeps the draft on failure so retry is truthful', async () => {

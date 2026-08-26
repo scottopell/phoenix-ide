@@ -162,7 +162,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
     && !creating
     && dirStatus !== 'invalid'
     && dirStatus !== 'checking'
-    && rootReservation !== null;
+    && (rootReservation !== null || dirStatus === 'will-create');
 
   const addImages = async (files: File[]) => {
     try {
@@ -230,6 +230,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
     setCreating(true);
 
     try {
+      let acceptedRoot = rootReservation;
       if (dirStatus === 'will-create') {
         const mkdirResult = await api.mkdir(cwd.trim());
         if (!mkdirResult.created) {
@@ -237,7 +238,10 @@ export function useCreateConversation(navigate: (path: string) => void) {
           setCreating(false);
           return;
         }
+        acceptedRoot = (await api.reserveProductRoot(cwd.trim())).root_reservation;
+        setRootReservation(acceptedRoot);
       }
+      if (!acceptedRoot) throw new Error('Creation root is not reserved yet');
 
       const messageId = generateUUID();
       const clientConversationId = generateUUID();
@@ -252,7 +256,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
         return;
       }
       const response = await api.createProductConversation({
-        root_reservation: rootReservation!,
+        root_reservation: acceptedRoot,
         objective: trimmed,
         message_id: messageId,
         conversation_id: clientConversationId,

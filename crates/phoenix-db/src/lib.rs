@@ -214,6 +214,17 @@ pub enum DbError {
 pub type DbResult<T> = Result<T, DbError>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProductRootReservationRecord {
+    pub id: String,
+    pub cwd: String,
+    pub kind: String,
+    pub repo_root: Option<String>,
+    pub exact_checkout_oid: Option<String>,
+    pub logical_base: Option<String>,
+    pub freshness: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecentHiddenRepositoryManagementRoot {
     pub repository_id: phoenix_core::git_repository::GitRepositoryId,
     pub management_root: String,
@@ -233,6 +244,14 @@ pub struct AttachHiddenGitRepositoryInput {
     pub management_root: String,
     pub default_branch: GitRepositoryDefaultBranchObservation,
     pub observed_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovedTaskRootReservationInput {
+    pub repository_id: phoenix_core::git_repository::GitRepositoryId,
+    pub repository_root: String,
+    pub exact_checkout_oid: String,
+    pub logical_base: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4370,6 +4389,66 @@ impl Database {
         .map_err(DbError::Sqlx)
     }
 
+    /// Persist one server-owned pre-creation root reservation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] when persistence fails.
+    pub async fn insert_product_root_reservation(
+        &self,
+        reservation: &ProductRootReservationRecord,
+    ) -> DbResult<()> {
+        sqlx::query(
+            "INSERT INTO product_root_reservations
+             (id, cwd, kind, repo_root, exact_checkout_oid, logical_base, freshness, status, created_at_unix_micros)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'reserved', ?8)",
+        )
+        .bind(&reservation.id)
+        .bind(&reservation.cwd)
+        .bind(&reservation.kind)
+        .bind(&reservation.repo_root)
+        .bind(&reservation.exact_checkout_oid)
+        .bind(&reservation.logical_base)
+        .bind(&reservation.freshness)
+        .bind(Utc::now().timestamp_micros())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Load one server-owned reservation by its opaque identity and canonical cwd.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] when the reservation query fails.
+    pub async fn get_product_root_reservation(
+        &self,
+        reservation_id: &str,
+        cwd: &str,
+    ) -> DbResult<Option<ProductRootReservationRecord>> {
+        sqlx::query(
+            "SELECT id, cwd, kind, repo_root, exact_checkout_oid, logical_base, freshness
+               FROM product_root_reservations
+              WHERE id = ?1 AND cwd = ?2",
+        )
+        .bind(reservation_id)
+        .bind(cwd)
+        .try_map(|row| {
+            Ok(ProductRootReservationRecord {
+                id: row.get("id"),
+                cwd: row.get("cwd"),
+                kind: row.get("kind"),
+                repo_root: row.get("repo_root"),
+                exact_checkout_oid: row.get("exact_checkout_oid"),
+                logical_base: row.get("logical_base"),
+                freshness: row.get("freshness"),
+            })
+        })
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(DbError::Sqlx)
+    }
+
     /// Attach normalized hidden repository authority to an existing conversation `WorkScope`.
     ///
     /// # Errors
@@ -4379,13 +4458,31 @@ impl Database {
     pub async fn attach_hidden_git_repository_to_conversation_work_scope(
         &self,
         input: &AttachHiddenGitRepositoryInput,
-    ) -> DbResult<AttachedHiddenGitRepository> {
+        job_id: &str,
+        claim: &CreationClaim,
+    ) -> DbResult<(CreationCasOutcome, Option<AttachedHiddenGitRepository>)> {
         let normalized_common_dir = normalize_hidden_git_repository_path(&input.common_dir)?;
         let normalized_management_root =
             normalize_hidden_git_repository_path(&input.management_root)?;
         let observed_at_unix_micros = datetime_to_unix_micros(input.observed_at);
         let generation = 1_i64;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let owns_claim: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversation_creation_jobs
+             WHERE id = ?1 AND status = 'claimed' AND generation = ?2
+               AND claim_worker_id = ?3 AND claim_token = ?4 AND lease_until > ?5",
+        )
+        .bind(job_id)
+        .bind(claim_generation_i64(claim)?)
+        .bind(&claim.worker_id.0)
+        .bind(&claim.token.0)
+        .bind(Utc::now().to_rfc3339())
+        .fetch_one(&mut *tx)
+        .await?;
+        if owns_claim == 0 {
+            tx.rollback().await?;
+            return Ok((CreationCasOutcome::ClaimLost, None));
+        }
         let row = sqlx::query(
             "SELECT work_scope_id
                FROM conversations
@@ -4398,22 +4495,18 @@ impl Database {
             .map_err(|error| DbError::Serialization(error.to_string()))?;
 
         let repository_id = if let Some(existing_id) = sqlx::query_scalar::<_, String>(
-            "SELECT repository_id
-               FROM git_repository_locator_observations
-              WHERE locator_kind = 'common_dir' AND path = ?1",
+            "SELECT wr.repository_id
+               FROM conversation_creation_jobs job
+               JOIN conversations c ON c.id = job.conversation_id
+               JOIN work_scope_git_repositories wr ON wr.work_scope_id = c.work_scope_id
+              WHERE job.id = ?1 AND job.status = 'claimed' AND job.generation = ?2
+                AND job.claim_worker_id = ?3 AND job.claim_token = ?4 AND job.lease_until > ?5",
         )
-        .bind(&normalized_common_dir)
-        .fetch_optional(&mut *tx)
-        .await?
-        {
-            phoenix_core::git_repository::GitRepositoryId::parse(existing_id)
-                .map_err(|error| DbError::Serialization(error.to_string()))?
-        } else if let Some(existing_id) = sqlx::query_scalar::<_, String>(
-            "SELECT repository_id
-               FROM git_repository_locator_observations
-              WHERE locator_kind = 'management_root' AND path = ?1",
-        )
-        .bind(&normalized_management_root)
+        .bind(job_id)
+        .bind(claim_generation_i64(claim)?)
+        .bind(&claim.worker_id.0)
+        .bind(&claim.token.0)
+        .bind(Utc::now().to_rfc3339())
         .fetch_optional(&mut *tx)
         .await?
         {
@@ -4489,10 +4582,13 @@ impl Database {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(AttachedHiddenGitRepository {
-            work_scope_id,
-            repository_id,
-        })
+        Ok((
+            CreationCasOutcome::Applied,
+            Some(AttachedHiddenGitRepository {
+                work_scope_id,
+                repository_id,
+            }),
+        ))
     }
 
     /// List one present management-root observation per hidden repository by recency.
@@ -4523,15 +4619,28 @@ impl Database {
                         ON cwa.work_scope_id = wr.work_scope_id
                       JOIN conversations c ON c.id = cwa.conversation_id
                      WHERE wr.repository_id = roots.repository_id
-                       AND c.archived IN (0, 1)
+                       AND EXISTS (
+                           SELECT 1
+                             FROM product_conversations pc
+                            WHERE pc.id = c.product_conversation_id
+                              AND pc.kind = 'ordinary'
+                              AND pc.ordinary_lifecycle IN ('open', 'history')
+                       )
                 )
               ORDER BY (
-                    SELECT COUNT(DISTINCT c2.id)
+                    SELECT COUNT(DISTINCT c2.product_conversation_id)
                       FROM work_scope_git_repositories wr2
                       JOIN conversation_work_scope_attachments cwa2
                         ON cwa2.work_scope_id = wr2.work_scope_id
                       JOIN conversations c2 ON c2.id = cwa2.conversation_id
                      WHERE wr2.repository_id = roots.repository_id
+                       AND EXISTS (
+                           SELECT 1
+                             FROM product_conversations pc2
+                            WHERE pc2.id = c2.product_conversation_id
+                              AND pc2.kind = 'ordinary'
+                              AND pc2.ordinary_lifecycle IN ('open', 'history')
+                       )
                 ) DESC,
                 observed_at_unix_micros DESC, repository_id",
         )
@@ -4698,6 +4807,7 @@ impl Database {
         seed_label: Option<&str>,
         llm_language: phoenix_core::llm_language::LlmLanguage,
         job: &InsertConversationCreationJob,
+        root_reservation_id: Option<&str>,
     ) -> DbResult<Conversation> {
         let now = Utc::now();
         let creation_state = ConvState::Provisioning {
@@ -4710,6 +4820,27 @@ impl Database {
         let intent_json = serde_json::to_string(&job.intent)
             .map_err(|e| DbError::Serialization(e.to_string()))?;
         let mut tx = self.pool.begin().await?;
+        if let Some(reservation_id) = root_reservation_id {
+            let consumed = sqlx::query(
+                "UPDATE product_root_reservations
+                 SET status = 'consumed', consumed_by_conversation_id = ?1,
+                     consumed_at_unix_micros = ?2
+                 WHERE id = ?3
+                   AND (status = 'reserved'
+                        OR (status = 'consumed' AND consumed_by_conversation_id = ?1))",
+            )
+            .bind(id)
+            .bind(now.timestamp_micros())
+            .bind(reservation_id)
+            .execute(&mut *tx)
+            .await?;
+            if consumed.rows_affected() != 1 {
+                return Err(DbError::Serialization(
+                    "product root reservation is missing or belongs to another conversation"
+                        .to_string(),
+                ));
+            }
+        }
         let (created_work_scope_id, authority_kind, environment) =
             Self::new_scope_for_conversation(cwd, &cm);
         let product_conversation_id =
@@ -7007,6 +7138,86 @@ impl Database {
         Ok(())
     }
 
+    /// Return the normalized hidden repository attached to the conversation's current `WorkScope`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] when the attachment query or identity decoding fails.
+    pub async fn current_work_scope_hidden_repository_attachment(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<Option<AttachedHiddenGitRepository>> {
+        let row = sqlx::query(
+            "SELECT c.work_scope_id, wr.repository_id
+               FROM conversations c
+               JOIN work_scope_git_repositories wr ON wr.work_scope_id = c.work_scope_id
+              WHERE c.id = ?1",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let work_scope_id = WorkScopeId::parse(row.get::<String, _>("work_scope_id"))
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let repository_id = phoenix_core::git_repository::GitRepositoryId::parse(
+            row.get::<String, _>("repository_id"),
+        )
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+        Ok(Some(AttachedHiddenGitRepository {
+            work_scope_id,
+            repository_id,
+        }))
+    }
+
+    /// Derive the approved-task immutable root from normalized `WorkScope` repository evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] when repository evidence cannot be queried or decoded.
+    pub async fn root_reservation_for_attached_hidden_repository(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<Option<ApprovedTaskRootReservationInput>> {
+        let row = sqlx::query(
+            "SELECT wr.repository_id,
+                    management.path AS repository_root,
+                    branch.branch AS logical_base,
+                    observed.last_observed_head_oid AS exact_checkout_oid
+               FROM conversations c
+               JOIN work_scope_git_repositories wr ON wr.work_scope_id = c.work_scope_id
+               JOIN git_repository_locator_observations management
+                 ON management.repository_id = wr.repository_id
+                AND management.locator_kind = 'management_root'
+                AND management.status = 'present'
+               JOIN git_repository_default_branch_observations branch
+                 ON branch.repository_id = wr.repository_id
+                AND branch.status = 'resolved'
+               JOIN work_scope_observed_branches observed
+                 ON observed.work_scope_id = c.work_scope_id
+                AND observed.repository_identity = wr.repository_id
+              WHERE c.id = ?1
+              ORDER BY observed.last_observed_at DESC, observed.branch_name DESC
+              LIMIT 1",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        Ok(Some(ApprovedTaskRootReservationInput {
+            repository_id: phoenix_core::git_repository::GitRepositoryId::parse(
+                row.get::<String, _>("repository_id"),
+            )
+            .map_err(|error| DbError::Serialization(error.to_string()))?,
+            repository_root: row.get("repository_root"),
+            exact_checkout_oid: row.get("exact_checkout_oid"),
+            logical_base: row.get("logical_base"),
+        }))
+    }
+
     /// Create a fresh Work conversation and `ProductConversation` for an approved task.
     ///
     /// # Errors
@@ -7031,6 +7242,12 @@ impl Database {
         );
         let parent = self.get_conversation(parent_id).await?;
         let snapshot = phoenix_core::task_handoff::ApprovedTaskSnapshot::from(approval);
+        let attached_hidden_repository = self
+            .current_work_scope_hidden_repository_attachment(parent_id)
+            .await?;
+        let approved_root_reservation = self
+            .root_reservation_for_attached_hidden_repository(parent_id)
+            .await?;
         let new_id = uuid::Uuid::new_v4().to_string();
         let job_id = uuid::Uuid::new_v4().to_string();
         let message_id = uuid::Uuid::new_v4().to_string();
@@ -7056,9 +7273,15 @@ impl Database {
             mode: Some("approved_task".to_string()),
             base_branch: Some(snapshot.base_branch.clone()),
             checkout_ref: Some(snapshot.branch_name.clone()),
-            reserved_checkout_oid: None,
-            reserved_repo_root: None,
-            reserved_root_freshness: None,
+            reserved_checkout_oid: approved_root_reservation
+                .as_ref()
+                .map(|reservation| reservation.exact_checkout_oid.clone()),
+            reserved_repo_root: approved_root_reservation
+                .as_ref()
+                .map(|reservation| reservation.repository_root.clone()),
+            reserved_root_freshness: approved_root_reservation
+                .as_ref()
+                .map(|_| "fresh".to_string()),
             seed_parent_id: None,
             seed_label: Some(snapshot.title.clone()),
             approved_task: Some(snapshot.clone()),
@@ -7118,6 +7341,16 @@ impl Database {
             .await?;
         Self::insert_work_scope_tx(&mut tx, &scope_id, authority_kind, environment, &now_str)
             .await?;
+        if let Some(attached_hidden_repository) = attached_hidden_repository.as_ref() {
+            sqlx::query(
+                "INSERT INTO work_scope_git_repositories (work_scope_id, repository_id)
+                 VALUES (?1, ?2)",
+            )
+            .bind(scope_id.as_str())
+            .bind(attached_hidden_repository.repository_id.as_str())
+            .execute(&mut *tx)
+            .await?;
+        }
         sqlx::query(
             "INSERT INTO product_conversation_sources (
                  target_product_conversation_id, source_product_conversation_id,
@@ -13017,6 +13250,31 @@ mod tests {
         assert_eq!(identity.1.as_deref(), Some("retired-fingerprint"));
     }
 
+    fn test_creation_intent(cwd: &str, message_id: &str) -> ConversationCreationIntent {
+        ConversationCreationIntent {
+            cwd: cwd.to_string(),
+            profile: None,
+            model: None,
+            effort: None,
+            text: "test creation".to_string(),
+            expansion_preflighted: false,
+            llm_text: None,
+            skill_invocation: None,
+            message_id: message_id.to_string(),
+            images: Vec::new(),
+            files: Vec::new(),
+            mode: None,
+            base_branch: None,
+            checkout_ref: None,
+            reserved_checkout_oid: None,
+            reserved_repo_root: None,
+            reserved_root_freshness: None,
+            seed_parent_id: None,
+            seed_label: None,
+            approved_task: None,
+        }
+    }
+
     async fn insert_test_creation_job(db: &Database, job_id: &str, conversation_id: &str) {
         db.create_conversation(conversation_id, conversation_id, "/tmp", true, None, None)
             .await
@@ -13025,28 +13283,7 @@ mod tests {
             id: job_id.to_string(),
             conversation_id: conversation_id.to_string(),
             message_id: Some(format!("message-{job_id}")),
-            intent: ConversationCreationIntent {
-                cwd: "/tmp".to_string(),
-                profile: None,
-                model: None,
-                effort: None,
-                text: "test creation".to_string(),
-                expansion_preflighted: false,
-                llm_text: None,
-                skill_invocation: None,
-                message_id: format!("message-{job_id}"),
-                images: Vec::new(),
-                files: Vec::new(),
-                mode: None,
-                base_branch: None,
-                checkout_ref: None,
-                reserved_checkout_oid: None,
-                reserved_repo_root: None,
-                reserved_root_freshness: None,
-                seed_parent_id: None,
-                seed_label: None,
-                approved_task: None,
-            },
+            intent: test_creation_intent("/tmp", &format!("message-{job_id}")),
         })
         .await
         .unwrap();
@@ -13460,6 +13697,186 @@ mod tests {
                 .state,
             ConvState::Provisioning { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn root_reservation_consumption_rolls_back_when_conversation_insert_fails() {
+        let db = Database::open_in_memory().await.unwrap();
+        let reservation = ProductRootReservationRecord {
+            id: "reservation-rollback".to_string(),
+            cwd: "/tmp/reservation-rollback".to_string(),
+            kind: "direct".to_string(),
+            repo_root: None,
+            exact_checkout_oid: None,
+            logical_base: None,
+            freshness: None,
+        };
+        db.insert_product_root_reservation(&reservation)
+            .await
+            .unwrap();
+        insert_test_creation_job(&db, "job-existing-conv", "existing-conv").await;
+
+        let duplicate = InsertConversationCreationJob {
+            id: "job-duplicate-conversation".to_string(),
+            conversation_id: "existing-conv".to_string(),
+            message_id: Some("message-duplicate-conversation".to_string()),
+            intent: test_creation_intent(
+                "/tmp/reservation-rollback",
+                "message-duplicate-conversation",
+            ),
+        };
+        let error = db
+            .create_conversation_with_creation_job(
+                "existing-conv",
+                "existing-conv",
+                "/tmp/reservation-rollback",
+                true,
+                None,
+                &ConvMode::Direct,
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+                &duplicate,
+                Some(&reservation.id),
+            )
+            .await
+            .expect_err("duplicate conversation id must abort the transaction");
+        assert!(matches!(error, DbError::ConversationAlreadyExists(_)));
+
+        let status: (String, Option<String>) = sqlx::query_as(
+            "SELECT status, consumed_by_conversation_id
+             FROM product_root_reservations WHERE id = ?1",
+        )
+        .bind(&reservation.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(status, ("reserved".to_string(), None));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn root_reservation_accepts_same_conversation_idempotently_but_rejects_another() {
+        let db = Database::open_in_memory().await.unwrap();
+        let reservation = ProductRootReservationRecord {
+            id: "reservation-idempotent".to_string(),
+            cwd: "/tmp/reservation-idempotent".to_string(),
+            kind: "direct".to_string(),
+            repo_root: None,
+            exact_checkout_oid: None,
+            logical_base: None,
+            freshness: None,
+        };
+        db.insert_product_root_reservation(&reservation)
+            .await
+            .unwrap();
+
+        let duplicate_job = InsertConversationCreationJob {
+            id: "job-idempotent".to_string(),
+            conversation_id: "conv-idempotent".to_string(),
+            message_id: Some("message-idempotent".to_string()),
+            intent: test_creation_intent("/tmp/reservation-idempotent", "message-idempotent"),
+        };
+        let duplicate_conversation = db
+            .create_conversation_with_creation_job(
+                "conv-idempotent",
+                "idempotent",
+                "/tmp/reservation-idempotent",
+                true,
+                None,
+                &ConvMode::Direct,
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+                &duplicate_job,
+                Some(&reservation.id),
+            )
+            .await
+            .unwrap();
+        assert_eq!(duplicate_conversation.id, "conv-idempotent");
+
+        let consumed_at_before: Option<i64> = sqlx::query_scalar(
+            "SELECT consumed_at_unix_micros FROM product_root_reservations WHERE id = ?1",
+        )
+        .bind(&reservation.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(consumed_at_before.is_some());
+
+        sqlx::query(
+            "UPDATE product_root_reservations
+             SET consumed_at_unix_micros = 42
+             WHERE id = ?1",
+        )
+        .bind(&reservation.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let duplicate_error = db
+            .create_conversation_with_creation_job(
+                "conv-idempotent",
+                "idempotent",
+                "/tmp/reservation-idempotent",
+                true,
+                None,
+                &ConvMode::Direct,
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+                &duplicate_job,
+                Some(&reservation.id),
+            )
+            .await
+            .expect_err("same conversation id re-create still conflicts after idempotent reservation acceptance");
+        assert!(matches!(
+            duplicate_error,
+            DbError::ConversationAlreadyExists(_)
+        ));
+
+        let consumed_at_after: i64 = sqlx::query_scalar(
+            "SELECT consumed_at_unix_micros FROM product_root_reservations WHERE id = ?1",
+        )
+        .bind(&reservation.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            consumed_at_after, 42,
+            "same-conversation acceptance must not rewrite consumption metadata"
+        );
+
+        let another_job = InsertConversationCreationJob {
+            id: "job-other-conversation".to_string(),
+            conversation_id: "conv-other".to_string(),
+            message_id: Some("message-other".to_string()),
+            intent: test_creation_intent("/tmp/reservation-idempotent", "message-other"),
+        };
+        let another_error = db
+            .create_conversation_with_creation_job(
+                "conv-other",
+                "other",
+                "/tmp/reservation-idempotent",
+                true,
+                None,
+                &ConvMode::Direct,
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+                &another_job,
+                Some(&reservation.id),
+            )
+            .await
+            .expect_err("different conversation must not reuse consumed reservation");
+        let DbError::Serialization(message) = another_error else {
+            panic!("expected reservation ownership error");
+        };
+        assert!(message.contains("belongs to another conversation"));
     }
 
     #[tokio::test]

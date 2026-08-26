@@ -82,19 +82,15 @@ impl ResolutionRoot {
         resolution: &crate::api::ProductCreationResolutionQuery,
     ) -> Self {
         let cwd_path = PathBuf::from(cwd);
-        match resolution {
-            crate::api::ProductCreationResolutionQuery::Direct => Self::WorkingDir(cwd_path),
-            crate::api::ProductCreationResolutionQuery::ExactReservedCommittedTree {
-                root_reservation,
-            } => {
-                if root_reservation.kind == "exact_committed_tree" {
-                    if let (Some(repo_root), Some(exact_checkout_oid)) = (
-                        root_reservation.repo_root.as_deref(),
-                        root_reservation.exact_checkout_oid.as_deref(),
-                    ) {
-                        return Self::git_tree(repo_root, exact_checkout_oid);
-                    }
-                }
+        match resolution.kind {
+            crate::api::ProductCreationResolutionKind::Direct => Self::WorkingDir(cwd_path),
+            crate::api::ProductCreationResolutionKind::ExactReservedCommittedTree => {
+                Self::git_tree(
+                    resolution.repo_root.as_deref().unwrap_or(cwd),
+                    resolution.exact_checkout_oid.as_deref().unwrap_or(cwd),
+                )
+            }
+            crate::api::ProductCreationResolutionKind::UnresolvedExactReservedCommittedTree => {
                 Self::WorkingDir(cwd_path)
             }
         }
@@ -806,7 +802,7 @@ mod tests {
     fn for_create_direct_is_working_dir() {
         let root = ResolutionRoot::for_product_create_query(
             "/tmp/x",
-            &crate::api::ProductCreationResolutionQuery::Direct,
+            &crate::api::ProductCreationResolutionQuery::DIRECT,
         );
         assert!(matches!(root, ResolutionRoot::WorkingDir(_)));
     }
@@ -817,7 +813,7 @@ mod tests {
         // resolvable repo root falls back to the working directory.
         let root = ResolutionRoot::for_product_create_query(
             "/tmp",
-            &crate::api::ProductCreationResolutionQuery::Direct,
+            &crate::api::ProductCreationResolutionQuery::DIRECT,
         );
         assert!(matches!(root, ResolutionRoot::WorkingDir(_)));
     }

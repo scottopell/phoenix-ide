@@ -72,7 +72,9 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
     discoveryReady: inlineReferenceRootReady && conv.rootReservation !== null,
     resolution: conv.rootReservation?.kind === 'exact_committed_tree'
       ? { kind: 'exact_reserved_committed_tree', rootReservation: conv.rootReservation }
-      : { kind: 'direct' },
+      : conv.rootReservation?.kind === 'unresolved_exact_committed_tree'
+        ? { kind: 'unresolved_exact_reserved_committed_tree', rootReservation: conv.rootReservation }
+        : { kind: 'direct' },
     // The new-conversation composer's identity is its directory: switching the
     // chosen directory resets the dropdown / inline error.
     scopeKey: conv.cwd,

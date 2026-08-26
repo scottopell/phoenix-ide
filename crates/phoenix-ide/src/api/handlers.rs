@@ -1905,23 +1905,46 @@ async fn create_conversation(
     create_conversation_with_id(state, req, Vec::new()).await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn reserve_product_root(
+    State(state): State<AppState>,
     Json(req): Json<ReserveProductRootRequest>,
 ) -> Result<Json<ReserveProductRootResponse>, AppError> {
     let canonical_cwd = crate::conversation_cwd::validate_conversation_cwd(&req.cwd)
         .map_err(|error| AppError::BadRequest(error.to_string()))?;
     let cwd = canonical_cwd.raw().to_string();
+    let reservation_id = uuid::Uuid::new_v4().to_string();
     let cwd_path = std::path::PathBuf::from(&cwd);
+    let persist = |root: &ProductRootReservation| phoenix_db::ProductRootReservationRecord {
+        id: root.id.clone(),
+        cwd: root.cwd.clone(),
+        kind: root.kind.clone(),
+        repo_root: root.repo_root.clone(),
+        exact_checkout_oid: root.exact_checkout_oid.clone(),
+        logical_base: root.logical_base.clone(),
+        freshness: root.freshness.as_ref().map(|value| match value {
+            ProductRootReservationFreshness::Fresh => "fresh".to_string(),
+            ProductRootReservationFreshness::StaleCached => "stale_cached".to_string(),
+            ProductRootReservationFreshness::Unresolved => "unresolved".to_string(),
+        }),
+    };
     let Some(repo_root) = phoenix_core::git::detect_git_repo_root(&cwd_path) else {
+        let root = ProductRootReservation {
+            id: reservation_id,
+            cwd,
+            kind: "direct".to_string(),
+            repo_root: None,
+            exact_checkout_oid: None,
+            logical_base: None,
+            freshness: None,
+        };
+        state
+            .db
+            .insert_product_root_reservation(&persist(&root))
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?;
         return Ok(Json(ReserveProductRootResponse::Direct {
-            root_reservation: ProductRootReservation {
-                cwd,
-                kind: "direct".to_string(),
-                repo_root: None,
-                exact_checkout_oid: None,
-                logical_base: None,
-                freshness: None,
-            },
+            root_reservation: root,
         }));
     };
     let repo_path = std::path::PathBuf::from(&repo_root);
@@ -1940,29 +1963,53 @@ async fn reserve_product_root(
     .map_err(AppError::Internal)?;
     let (start, freshness) = match fresh {
         Some(start) => (start, ProductRootReservationFreshness::Fresh),
-        None => (
-            cached.ok_or_else(|| {
-                AppError::BadRequest(
-                    "Could not determine canonical default branch for reserved root".to_string(),
-                )
-            })?,
-            ProductRootReservationFreshness::StaleCached,
-        ),
+        None => {
+            if let Some(cached) = cached {
+                (cached, ProductRootReservationFreshness::StaleCached)
+            } else {
+                let root = ProductRootReservation {
+                    id: reservation_id,
+                    cwd,
+                    kind: "unresolved_exact_committed_tree".to_string(),
+                    repo_root: Some(repo_root),
+                    exact_checkout_oid: None,
+                    logical_base: None,
+                    freshness: Some(ProductRootReservationFreshness::Unresolved),
+                };
+                state
+                    .db
+                    .insert_product_root_reservation(&persist(&root))
+                    .await
+                    .map_err(|error| AppError::Internal(error.to_string()))?;
+                return Ok(Json(
+                    ReserveProductRootResponse::UnresolvedExactCommittedTree {
+                        root_reservation: root,
+                    },
+                ));
+            }
+        }
     };
     let exact_checkout_oid = start
         .reserved_oid()
         .unwrap_or(start.checkout_ref())
         .to_string();
     let default_branch = start.logical_base().to_string();
+    let root = ProductRootReservation {
+        id: reservation_id,
+        cwd,
+        kind: "exact_committed_tree".to_string(),
+        repo_root: Some(repo_root),
+        exact_checkout_oid: Some(exact_checkout_oid.clone()),
+        logical_base: Some(default_branch.clone()),
+        freshness: Some(freshness.clone()),
+    };
+    state
+        .db
+        .insert_product_root_reservation(&persist(&root))
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
     Ok(Json(ReserveProductRootResponse::ExactCommittedTree {
-        root_reservation: ProductRootReservation {
-            cwd,
-            kind: "exact_committed_tree".to_string(),
-            repo_root: Some(repo_root),
-            exact_checkout_oid: Some(exact_checkout_oid.clone()),
-            logical_base: Some(default_branch.clone()),
-            freshness: Some(freshness.clone()),
-        },
+        root_reservation: root,
         exact_checkout_oid,
         logical_base: default_branch,
         freshness,
@@ -1982,16 +2029,43 @@ async fn create_product_conversation_with_id(
     state: AppState,
     req: CreateProductConversationRequest,
 ) -> Result<ProductConversationCreateAcceptedResponse, AppError> {
+    let conversation_id = req
+        .conversation_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let reservation_id = req.root_reservation.id.clone();
+    let mut req = req;
+    req.conversation_id = Some(conversation_id.clone());
     let canonical_cwd =
         crate::conversation_cwd::validate_conversation_cwd(&req.root_reservation.cwd)
             .map_err(|error| AppError::BadRequest(error.to_string()))?;
-    let mut req = req;
     req.root_reservation.cwd = canonical_cwd.raw().to_string();
+    let authenticated_reservation = state
+        .db
+        .get_product_root_reservation(&reservation_id, &req.root_reservation.cwd)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+        .ok_or_else(|| AppError::BadRequest("invalid product root reservation".to_string()))?;
+    req.root_reservation.cwd = authenticated_reservation.cwd.clone();
+    req.root_reservation.kind = authenticated_reservation.kind.clone();
+    req.root_reservation.repo_root = authenticated_reservation.repo_root.clone();
+    req.root_reservation.exact_checkout_oid = authenticated_reservation.exact_checkout_oid.clone();
+    req.root_reservation.logical_base = authenticated_reservation.logical_base.clone();
+    req.root_reservation.freshness =
+        authenticated_reservation
+            .freshness
+            .as_deref()
+            .map(|value| match value {
+                "fresh" => ProductRootReservationFreshness::Fresh,
+                "stale_cached" => ProductRootReservationFreshness::StaleCached,
+                _ => ProductRootReservationFreshness::Unresolved,
+            });
     let response = create_conversation_from_request(
         state.clone(),
         req.into(),
         Vec::new(),
         Some(phoenix_core::domain::db_schema::ConversationCreationProfile::DirectoryFirstProduct),
+        Some(reservation_id),
     )
     .await?;
     let transcript_row_id = response.conversation["id"]
@@ -2014,7 +2088,7 @@ async fn create_conversation_with_id(
     req: CreateConversationRequest,
     raw_files: Vec<RawAttachmentPart>,
 ) -> Result<Json<ConversationResponse>, AppError> {
-    let response = create_conversation_from_request(state, req, raw_files, None).await?;
+    let response = create_conversation_from_request(state, req, raw_files, None, None).await?;
     Ok(Json(ConversationResponse {
         conversation: response.conversation,
     }))
@@ -2026,6 +2100,7 @@ async fn create_conversation_from_request(
     mut req: CreateConversationRequest,
     raw_files: Vec<RawAttachmentPart>,
     profile: Option<phoenix_core::domain::db_schema::ConversationCreationProfile>,
+    root_reservation_id: Option<String>,
 ) -> Result<InternalCreateConversationAcceptedResponse, AppError> {
     let _owner = state.runtime.acquire_local_authority_pass().map_err(|()| {
         AppError::Internal("runtime admission closed after fatal local authority loss".to_string())
@@ -2258,6 +2333,7 @@ async fn create_conversation_from_request(
             .map(|freshness| match freshness {
                 ProductRootReservationFreshness::Fresh => "fresh".to_string(),
                 ProductRootReservationFreshness::StaleCached => "stale_cached".to_string(),
+                ProductRootReservationFreshness::Unresolved => "unresolved".to_string(),
             }),
         reserved_checkout_oid: req
             .root_reservation
@@ -2290,6 +2366,7 @@ async fn create_conversation_from_request(
             req.seed_label.as_deref(),
             default_language,
             &creation_job,
+            root_reservation_id.as_deref(),
         )
         .await
     {
@@ -12512,7 +12589,15 @@ pub(crate) mod hard_delete_cascade_tests {
             cwd: cwd.to_string_lossy().to_string(),
             q: "project".to_string(),
             limit: Some(10),
-            resolution: crate::api::ProductCreationResolutionQuery::Direct,
+            resolution: crate::api::ProductCreationResolutionQuery {
+                kind: crate::api::ProductCreationResolutionKind::Direct,
+                reservation_id: None,
+                cwd: None,
+                repo_root: None,
+                exact_checkout_oid: None,
+                logical_base: None,
+                freshness: None,
+            },
         }))
         .await
         .expect("search");
@@ -12527,7 +12612,15 @@ pub(crate) mod hard_delete_cascade_tests {
             cwd: "/nonexistent/phoenix/test/dir".to_string(),
             q: String::new(),
             limit: None,
-            resolution: crate::api::ProductCreationResolutionQuery::Direct,
+            resolution: crate::api::ProductCreationResolutionQuery {
+                kind: crate::api::ProductCreationResolutionKind::Direct,
+                reservation_id: None,
+                cwd: None,
+                repo_root: None,
+                exact_checkout_oid: None,
+                logical_base: None,
+                freshness: None,
+            },
         }))
         .await
         .expect_err("missing dir rejected");
@@ -14484,6 +14577,7 @@ mod product_conversation_creation_tests {
             conversation_id: Some(conversation_id.clone()),
             root_reservation: ProductRootReservation {
                 cwd: temp_dir.path().to_string_lossy().to_string(),
+                id: "test-reservation".to_string(),
                 kind: "direct".to_string(),
                 repo_root: None,
                 exact_checkout_oid: None,
@@ -14499,6 +14593,24 @@ mod product_conversation_creation_tests {
                 media_type: "image/png".to_string(),
             }],
         };
+
+        state
+            .db
+            .insert_product_root_reservation(&phoenix_db::ProductRootReservationRecord {
+                id: "test-reservation".to_string(),
+                cwd: crate::conversation_cwd::validate_conversation_cwd(
+                    temp_dir.path().to_string_lossy(),
+                )
+                .expect("canonical test cwd")
+                .into_raw(),
+                kind: "direct".to_string(),
+                repo_root: None,
+                exact_checkout_oid: None,
+                logical_base: None,
+                freshness: None,
+            })
+            .await
+            .expect("persist reservation");
 
         let response = Box::pin(create_product_conversation_with_id(state.clone(), request))
             .await

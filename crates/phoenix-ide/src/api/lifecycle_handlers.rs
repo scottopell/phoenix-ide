@@ -89,10 +89,17 @@ pub(crate) async fn approve_task(
         ));
     }
 
-    // 2. Non-project conversations cannot approve tasks (propose_task is project-only)
-    if conv.project_id.is_none() {
+    if state
+        .runtime
+        .db()
+        .root_reservation_for_attached_hidden_repository(&id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+        .is_none()
+    {
         return Err(AppError::BadRequest(
-            "Task approval requires a project-scoped conversation".to_string(),
+            "Task approval requires immutable repository evidence from the attached WorkScope"
+                .to_string(),
         ));
     }
 

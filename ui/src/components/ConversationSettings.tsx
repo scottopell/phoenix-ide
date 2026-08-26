@@ -18,7 +18,7 @@ interface ConversationSettingsProps {
   setShowAllModels: (v: boolean) => void;
   error?: string | null;
   recentPaths?: readonly string[];
-  rootFreshness?: 'fresh' | 'stale_cached' | null;
+  rootFreshness?: 'fresh' | 'stale_cached' | 'unresolved' | null;
 }
 
 export function ConversationSettings({

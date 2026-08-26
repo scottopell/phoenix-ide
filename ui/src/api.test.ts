@@ -413,3 +413,37 @@ describe('canChangeModelInState (task 02713)', () => {
     expect(canChangeModelInState(state)).toBe(expected);
   });
 });
+
+
+describe('directory-first resolution query encoding', () => {
+  beforeEach(() => vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => ({ skills: [], items: [] }) })));
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('encodes reserved roots as scalar form-decodable fields for skills and files', async () => {
+    const rootReservation = {
+      id: 'reservation-1',
+      cwd: '/repo',
+      kind: 'exact_committed_tree' as const,
+      repo_root: '/repo',
+      exact_checkout_oid: 'abc123',
+      logical_base: 'main',
+      freshness: 'fresh' as const,
+    };
+    const resolution = { kind: 'exact_reserved_committed_tree' as const, rootReservation };
+
+    await api.listProjectSkills('/repo', resolution);
+    await api.searchProjectFiles('/repo', 'src', 20, resolution);
+
+    const urls = vi.mocked(fetch).mock.calls.map(([url]) => new URL(String(url), 'http://phoenix.test'));
+    for (const url of urls) {
+      expect(url.searchParams.get('kind')).toBe('exact_reserved_committed_tree');
+      expect(url.searchParams.get('reservation_id')).toBe('reservation-1');
+      expect(url.searchParams.get('cwd')).toBe('/repo');
+      expect(url.searchParams.get('repo_root')).toBe('/repo');
+      expect(url.searchParams.get('exact_checkout_oid')).toBe('abc123');
+      expect(url.searchParams.get('logical_base')).toBe('main');
+      expect(url.searchParams.get('freshness')).toBe('fresh');
+      expect(url.searchParams.has('root_reservation')).toBe(false);
+    }
+  });
+});

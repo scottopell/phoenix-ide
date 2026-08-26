@@ -390,6 +390,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "persist_completed_continuation_handoffs",
         sql: MIGRATION_074,
     },
+    Migration {
+        version: 75,
+        name: "normalize_product_root_reservations",
+        sql: MIGRATION_075,
+    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -2076,6 +2081,29 @@ BEGIN
 END;
 
 CREATE UNIQUE INDEX close_obligations_one_active_per_product ON close_obligations(product_conversation_id) WHERE phase <> 'completed';
+";
+
+const MIGRATION_075: &str = r"
+CREATE TABLE product_root_reservations (
+    id TEXT PRIMARY KEY CHECK (typeof(id) = 'text' AND id <> ''),
+    cwd TEXT NOT NULL CHECK (typeof(cwd) = 'text' AND cwd <> '' AND instr(cwd, char(0)) = 0),
+    kind TEXT NOT NULL CHECK (kind IN ('direct', 'exact_committed_tree', 'unresolved_exact_committed_tree')),
+    repo_root TEXT CHECK (repo_root IS NULL OR (typeof(repo_root) = 'text' AND repo_root <> '' AND instr(repo_root, char(0)) = 0)),
+    exact_checkout_oid TEXT CHECK (exact_checkout_oid IS NULL OR (typeof(exact_checkout_oid) = 'text' AND exact_checkout_oid <> '')),
+    logical_base TEXT CHECK (logical_base IS NULL OR (typeof(logical_base) = 'text' AND logical_base <> '')),
+    freshness TEXT CHECK (freshness IS NULL OR freshness IN ('fresh', 'stale_cached', 'unresolved')),
+    status TEXT NOT NULL CHECK (status IN ('reserved', 'consumed')),
+    consumed_by_conversation_id TEXT,
+    created_at_unix_micros INTEGER NOT NULL CHECK (typeof(created_at_unix_micros) = 'integer'),
+    consumed_at_unix_micros INTEGER CHECK (consumed_at_unix_micros IS NULL OR typeof(consumed_at_unix_micros) = 'integer'),
+    CHECK ((kind = 'direct' AND repo_root IS NULL AND exact_checkout_oid IS NULL AND logical_base IS NULL AND freshness IS NULL)
+        OR (kind = 'exact_committed_tree' AND repo_root IS NOT NULL AND exact_checkout_oid IS NOT NULL AND logical_base IS NOT NULL AND freshness IN ('fresh', 'stale_cached'))
+        OR (kind = 'unresolved_exact_committed_tree' AND repo_root IS NOT NULL AND exact_checkout_oid IS NULL AND logical_base IS NULL AND freshness = 'unresolved')),
+    CHECK ((status = 'reserved' AND consumed_by_conversation_id IS NULL AND consumed_at_unix_micros IS NULL)
+        OR (status = 'consumed' AND consumed_by_conversation_id IS NOT NULL AND consumed_at_unix_micros IS NOT NULL))
+);
+CREATE INDEX product_root_reservations_cwd_created_at
+    ON product_root_reservations(cwd, created_at_unix_micros DESC);
 ";
 
 const MIGRATION_074: &str = r"

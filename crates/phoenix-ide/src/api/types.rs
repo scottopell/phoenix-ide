@@ -67,13 +67,15 @@ pub struct CreateProductConversationRequest {
 pub enum ProductRootReservationFreshness {
     Fresh,
     StaleCached,
+    Unresolved,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct ProductRootReservation {
+    pub id: String,
     pub cwd: String,
-    #[ts(type = "'direct' | 'exact_committed_tree'")]
+    #[ts(type = "'direct' | 'exact_committed_tree' | 'unresolved_exact_committed_tree'")]
     pub kind: String,
     #[serde(default)]
     pub repo_root: Option<String>,
@@ -104,15 +106,47 @@ pub enum ReserveProductRootResponse {
         logical_base: String,
         freshness: ProductRootReservationFreshness,
     },
+    UnresolvedExactCommittedTree {
+        root_reservation: ProductRootReservation,
+    },
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ProductCreationResolutionQuery {
+#[serde(rename_all = "snake_case")]
+pub enum ProductCreationResolutionKind {
     Direct,
-    ExactReservedCommittedTree {
-        root_reservation: ProductRootReservation,
-    },
+    ExactReservedCommittedTree,
+    UnresolvedExactReservedCommittedTree,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+pub struct ProductCreationResolutionQuery {
+    pub kind: ProductCreationResolutionKind,
+    #[serde(default)]
+    pub reservation_id: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub repo_root: Option<String>,
+    #[serde(default)]
+    pub exact_checkout_oid: Option<String>,
+    #[serde(default)]
+    pub logical_base: Option<String>,
+    #[serde(default)]
+    pub freshness: Option<ProductRootReservationFreshness>,
+}
+
+#[cfg(test)]
+impl ProductCreationResolutionQuery {
+    pub const DIRECT: Self = Self {
+        kind: ProductCreationResolutionKind::Direct,
+        reservation_id: None,
+        cwd: None,
+        repo_root: None,
+        exact_checkout_oid: None,
+        logical_base: None,
+        freshness: None,
+    };
 }
 
 impl From<CreateProductConversationRequest> for CreateConversationRequest {
@@ -483,7 +517,7 @@ mod create_product_conversation_request_tests {
                     "objective":"Ship it",
                     "message_id":"msg-1",
                     "images":[],
-                    "root_reservation":{{"cwd":"/tmp/project","kind":"direct"}},
+                    "root_reservation":{{"id":"reservation-test","cwd":"/tmp/project","kind":"direct"}},
                     "{field}":"legacy"
                 }}"#
             );
@@ -504,7 +538,7 @@ mod create_product_conversation_request_tests {
             "objective":"Ship it",
             "message_id":"msg-1",
             "images":[],
-            "root_reservation":{"cwd":"/tmp/project","kind":"direct"},
+            "root_reservation":{"id":"reservation-test","cwd":"/tmp/project","kind":"direct"},
             "settings":{}
         }"#;
         let err = serde_json::from_str::<CreateProductConversationRequest>(payload)
@@ -521,7 +555,18 @@ mod create_product_conversation_request_tests {
             serde_json::json!({ "kind": "direct" }),
         )
         .expect("direct query parses");
-        assert_eq!(resolution, super::ProductCreationResolutionQuery::Direct);
+        assert_eq!(
+            resolution,
+            super::ProductCreationResolutionQuery {
+                kind: super::ProductCreationResolutionKind::Direct,
+                reservation_id: None,
+                cwd: None,
+                repo_root: None,
+                exact_checkout_oid: None,
+                logical_base: None,
+                freshness: None,
+            }
+        );
     }
 
     #[test]
@@ -529,27 +574,46 @@ mod create_product_conversation_request_tests {
         let resolution =
             serde_json::from_value::<super::ProductCreationResolutionQuery>(serde_json::json!({
                 "kind": "exact_reserved_committed_tree",
-                "root_reservation": {
-                    "cwd": "/tmp/project",
-                    "kind": "exact_committed_tree",
-                    "repo_root": "/tmp/project",
-                    "exact_checkout_oid": "abc123",
-                    "logical_base": "main",
-                    "freshness": "fresh"
-                }
+                "cwd": "/tmp/project",
+                "reservation_id": "reservation-1",
+                "repo_root": "/tmp/project",
+                "exact_checkout_oid": "abc123",
+                "logical_base": "main",
+                "freshness": "fresh"
             }))
             .expect("exact reserved committed tree query parses");
         assert_eq!(
             resolution,
-            super::ProductCreationResolutionQuery::ExactReservedCommittedTree {
-                root_reservation: super::ProductRootReservation {
-                    cwd: "/tmp/project".to_string(),
-                    kind: "exact_committed_tree".to_string(),
-                    repo_root: Some("/tmp/project".to_string()),
-                    exact_checkout_oid: Some("abc123".to_string()),
-                    logical_base: Some("main".to_string()),
-                    freshness: Some(super::ProductRootReservationFreshness::Fresh),
-                },
+            super::ProductCreationResolutionQuery {
+                kind: super::ProductCreationResolutionKind::ExactReservedCommittedTree,
+                reservation_id: Some("reservation-1".to_string()),
+                cwd: Some("/tmp/project".to_string()),
+                repo_root: Some("/tmp/project".to_string()),
+                exact_checkout_oid: Some("abc123".to_string()),
+                logical_base: Some("main".to_string()),
+                freshness: Some(super::ProductRootReservationFreshness::Fresh),
+            }
+        );
+    }
+    #[test]
+    fn deserializes_unresolved_exact_reserved_committed_tree_resolution_query() {
+        let resolution =
+            serde_json::from_value::<super::ProductCreationResolutionQuery>(serde_json::json!({
+                "kind": "unresolved_exact_reserved_committed_tree",
+                "cwd": "/tmp/project",
+                "reservation_id": "reservation-2"
+            }))
+            .expect("unresolved reserved committed tree query parses");
+        assert_eq!(
+            resolution,
+            super::ProductCreationResolutionQuery {
+                kind: super::ProductCreationResolutionKind::UnresolvedExactReservedCommittedTree,
+                reservation_id: Some("reservation-2".to_string()),
+                cwd: Some("/tmp/project".to_string()),
+                repo_root: None,
+                exact_checkout_oid: None,
+                logical_base: None,
+                freshness: None,
             }
         );
     }

@@ -1063,11 +1063,22 @@ async fn provision_conversation(
                 Some(canonical_default_branch.as_str()),
             )?;
             attachment.conversation_id = job.conversation_id.clone();
-            manager
+            let (attachment_outcome, _) = manager
                 .db()
-                .attach_hidden_git_repository_to_conversation_work_scope(&attachment)
+                .attach_hidden_git_repository_to_conversation_work_scope(
+                    &attachment,
+                    &job.id,
+                    &claim,
+                )
                 .await
                 .map_err(|error| (error.to_string(), ErrorKind::ServerError))?;
+            if attachment_outcome != crate::db::CreationCasOutcome::Applied {
+                return Err((
+                    "creation claim lost while attaching hidden git repository".to_string(),
+                    ErrorKind::ServerError,
+                )
+                    .into());
+            }
         }
     }
 

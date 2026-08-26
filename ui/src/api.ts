@@ -712,11 +712,12 @@ export interface ImageData {
   media_type: string;
 }
 
-export type ProductRootReservationFreshness = 'fresh' | 'stale_cached';
+export type ProductRootReservationFreshness = 'fresh' | 'stale_cached' | 'unresolved';
 
 export interface ProductRootReservation {
+  id: string;
   cwd: string;
-  kind: 'direct' | 'exact_committed_tree';
+  kind: 'direct' | 'exact_committed_tree' | 'unresolved_exact_committed_tree';
   repo_root: string | null;
   exact_checkout_oid: string | null;
   logical_base: string | null;
@@ -1159,12 +1160,19 @@ export type CodexLoginStatus =
 
 export type ProductCreationResolution =
   | { kind: 'direct' }
-  | { kind: 'exact_reserved_committed_tree'; rootReservation: ProductRootReservation };
+  | { kind: 'exact_reserved_committed_tree'; rootReservation: ProductRootReservation }
+  | { kind: 'unresolved_exact_reserved_committed_tree'; rootReservation: ProductRootReservation };
 
 function applyResolutionOpts(params: URLSearchParams, opts?: ProductCreationResolution): void {
   params.set('kind', opts?.kind ?? 'direct');
-  if (opts?.kind === 'exact_reserved_committed_tree') {
-    params.set('root_reservation', JSON.stringify(opts.rootReservation));
+  if (opts && opts.kind !== 'direct') {
+    const root = opts.rootReservation;
+    params.set('reservation_id', root.id);
+    params.set('cwd', root.cwd);
+    if (root.repo_root) params.set('repo_root', root.repo_root);
+    if (root.exact_checkout_oid) params.set('exact_checkout_oid', root.exact_checkout_oid);
+    if (root.logical_base) params.set('logical_base', root.logical_base);
+    if (root.freshness) params.set('freshness', root.freshness);
   }
 }
 
