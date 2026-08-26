@@ -31,6 +31,13 @@ vi.mock('../components/ConversationNavStack', () => ({
         <button onClick={() => (props['onLoadOlderMessages'] as ((basis?: unknown) => void) | undefined)?.({ kind: 'reader_anchor', messageId: 'm-3', viewportStartOffset: 17 })}>
           load older with anchor
         </button>
+        <button onClick={() => (props['onHistoryScrollCommandHandled'] as ((token: number, result: string, view: unknown) => void) | undefined)?.(
+          ((props['transcriptPositioning'] as { command?: { token?: number } } | undefined)?.command?.token ?? 0),
+          'applied',
+          {},
+        )}>
+          complete positioning
+        </button>
         <div data-testid="message-count">{messages.length}</div>
         <div data-testid="message-order">{messages.map((m) => m.message_id).join(',')}</div>
         <div data-testid="message-types">{messages.map((m) => m.message_type).join(',')}</div>
@@ -81,6 +88,16 @@ vi.mock('../components/Skeleton', () => ({
   MessageListSkeleton: ({ count }: { count: number }) => <div data-testid="skeleton">skeleton {count}</div>,
 }));
 
+vi.mock('../components/TaskApprovalReader', () => ({
+  TaskApprovalReader: (props: Record<string, unknown>) => (
+    <button onClick={() => (props['onApprove'] as ((handoff: string) => void))('continue')}>approve task</button>
+  ),
+}));
+
+vi.mock('../components/FirstTaskWelcome', () => ({
+  FirstTaskWelcome: () => <div data-testid="first-task-welcome">first task welcome</div>,
+}));
+
 const { closeMock, subscribeToChainStreamMock } = vi.hoisted(() => {
   const close = vi.fn();
   return {
@@ -98,6 +115,7 @@ vi.mock('../api', async () => {
       getProductConversationSnapshot: vi.fn(),
       getChain: vi.fn(),
       submitChainQuestion: vi.fn(),
+      approveTask: vi.fn(),
     },
     streamApi: {
       ...actual.streamApi,
@@ -528,6 +546,31 @@ describe('ProductConversationPage', () => {
     expect(new Set(order).size).toBe(order.length);
   });
 
+  it('omits boundary links for unloaded segment messages', async () => {
+    const snapshot = makeSnapshot();
+    snapshot.segments[0] = { ...snapshot.segments[0]!, messages: [] };
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValueOnce(snapshot);
+
+    renderPage();
+    await waitForPageReady();
+
+    expect(screen.getAllByRole('link', { name: 'boundary' })).toHaveLength(1);
+    expect(document.querySelector('a[href$="#message-"]')).not.toBeInTheDocument();
+  });
+
+  it('assigns occurrence identity to newly streamed latest messages', async () => {
+    renderPage();
+    await waitForPageReady();
+    emitLatestProjection({ messages: [makeMessage('new-live', 7, 'conv-latest')] });
+
+    await waitFor(() => {
+      const props = conversationNavStackSpy.mock.lastCall?.[0] as { messages: Array<{ message_id: string; display_data?: { productOccurrenceToken?: string } }> };
+      expect(props.messages.find((message) => message.message_id === 'new-live')?.display_data?.productOccurrenceToken)
+        .toBe('row-2:new-live');
+    });
+  });
+
   it('shows loading then request error state', async () => {
     const { api } = await import('../api');
     vi.mocked(api.getProductConversationSnapshot).mockRejectedValueOnce(new Error('boom'));
@@ -596,6 +639,21 @@ describe('ProductConversationPage', () => {
     expect(chainWorkScopeDockSpy).toHaveBeenLastCalledWith(expect.objectContaining({
       activeConvId: 'row-2',
     }));
+  });
+
+  it('shows first-task onboarding after aggregate approval returns first_task', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.approveTask).mockResolvedValueOnce({ success: true, first_task: true });
+    renderPage();
+    await waitForPageReady();
+
+    emitLatestProjection({
+      convState: { type: 'awaiting_task_approval', title: 'Plan', priority: 'p1', plan: 'Do it' },
+      modelContextWindow: 200_000,
+    });
+    fireEvent.click(await screen.findByRole('button', { name: 'approve task' }));
+
+    expect(await screen.findByTestId('first-task-welcome')).toBeInTheDocument();
   });
 
   it('keeps latest open row mounted even when writable transcript is null', async () => {
@@ -737,6 +795,10 @@ describe('ProductConversationPage', () => {
         viewportStartOffset: 17,
       }),
     }));
+    fireEvent.click(screen.getByRole('button', { name: 'complete positioning' }));
+    await waitFor(() => {
+      expect(conversationNavStackSpy.mock.lastCall?.[0]?.['transcriptPositioning']).toEqual(expect.objectContaining({ kind: 'idle' }));
+    });
   });
 
   it('discards delayed older-page results after a new product route wins', async () => {

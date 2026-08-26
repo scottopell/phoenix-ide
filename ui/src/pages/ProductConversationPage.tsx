@@ -34,6 +34,9 @@ const MessageViewer = lazy(() =>
 const TaskApprovalReader = lazy(() =>
   import('../components/TaskApprovalReader').then((m) => ({ default: m.TaskApprovalReader })),
 );
+const FirstTaskWelcome = lazy(() =>
+  import('../components/FirstTaskWelcome').then((m) => ({ default: m.FirstTaskWelcome })),
+);
 
 
 async function fetchOlderSnapshotWithFreshCursor(
@@ -143,7 +146,7 @@ function flattenHistoricalMessages(snapshot: ProductConversationSnapshotView): M
     });
 }
 
-function mergeMessagesById(snapshotMessages: Message[], liveMessages: Message[]): Message[] {
+function mergeMessagesById(snapshotMessages: Message[], liveMessages: Message[], transcriptRowId: string): Message[] {
   const liveById = new Map(liveMessages.map((message) => [message.message_id, message]));
   const merged = snapshotMessages.map((message) => {
     const live = liveById.get(message.message_id);
@@ -159,7 +162,16 @@ function mergeMessagesById(snapshotMessages: Message[], liveMessages: Message[])
     };
   });
   const snapshotIds = new Set(snapshotMessages.map((message) => message.message_id));
-  return [...merged, ...liveMessages.filter((message) => !snapshotIds.has(message.message_id))];
+  const appended = liveMessages
+    .filter((message) => !snapshotIds.has(message.message_id))
+    .map((message) => ({
+      ...message,
+      display_data: {
+        ...(message.display_data ?? {}),
+        productOccurrenceToken: productOccurrenceToken(transcriptRowId, message.message_id),
+      },
+    }));
+  return [...merged, ...appended];
 }
 
 function makeAggregateMessages(
@@ -184,7 +196,7 @@ function makeAggregateMessages(
   const latestSnapshotMessages = latestSegment?.messages.map((message) => toMessage(message, productOccurrenceToken(latestSegment.transcript_row_id, message.message_id))) ?? [];
   return [
     ...historical,
-    ...mergeMessagesById(latestSnapshotMessages, latestProjection.messages),
+    ...mergeMessagesById(latestSnapshotMessages, latestProjection.messages, snapshot.latest_transcript_row_id),
     ...(latestHandoff ? [latestHandoff] : []),
   ];
 }
@@ -286,10 +298,14 @@ function SegmentLinks({ snapshot }: { snapshot: ProductConversationSnapshotView 
           <span className="product-conversation-meta__label">Segment {segment.segment_ordinal}</span>
           <span>
             <Link to={`/c/${segment.slug ?? segment.transcript_row_id}`}>{segment.title ?? segment.slug ?? segment.transcript_row_id}</Link>
-            {' · '}
-            <Link to={`/product-conversations/${snapshot.product_conversation_id}#message-${encodeURIComponent(segment.messages[0]?.message_id ?? '')}`}>
-              boundary
-            </Link>
+            {segment.messages[0] ? (
+              <>
+                {' · '}
+                <Link to={`/product-conversations/${snapshot.product_conversation_id}#message-${encodeURIComponent(segment.messages[0].message_id)}`}>
+                  boundary
+                </Link>
+              </>
+            ) : null}
             {segment.handoff ? (
               <>
                 {' · '}
@@ -361,6 +377,7 @@ function ProductConversationPageInner() {
   const [latestProjection, setLatestProjection] = useState<EmbeddedConversationProjection | null>(null);
   const [taskApprovalOverlay, setTaskApprovalOverlay] = useState<TaskApprovalOverlayState | null>(null);
   const [approvalContextWindowUsed, setApprovalContextWindowUsed] = useState<number | null>(null);
+  const [showFirstTaskWelcome, setShowFirstTaskWelcome] = useState(false);
   const [historyGeneration, setHistoryGeneration] = useState(0);
   const [restoreCommand, setRestoreCommand] = useState<TranscriptPositioningInput | null>(null);
   const routeGenerationRef = useRef(0);
@@ -753,6 +770,11 @@ function ProductConversationPageInner() {
             loadingOlderMessages={loadingOlder}
             olderHistoryError={olderError}
             transcriptPositioning={transcriptPositioning}
+            onHistoryScrollCommandHandled={(token) => {
+              setRestoreCommand((current) => (
+                current?.kind === 'positioning' && current.command.token === token ? null : current
+              ));
+            }}
             {...(latestWorkScopeKey ? { workScopeKey: latestWorkScopeKey } : {})}
           />
         </section>
@@ -828,10 +850,18 @@ function ProductConversationPageInner() {
               plan={taskApprovalOverlay.plan}
               contextWindowUsed={approvalContextWindowUsed ?? undefined}
               modelContextWindow={latestProjection.modelContextWindow}
-              onApprove={(handoff) => api.approveTask(taskApprovalOverlay.conversationId, handoff).then(() => {}).catch(() => {})}
+              onApprove={(handoff) => api.approveTask(taskApprovalOverlay.conversationId, handoff)
+                .then((result) => { if (result.first_task) setShowFirstTaskWelcome(true); })
+                .catch(() => {})}
               onReject={() => api.rejectTask(taskApprovalOverlay.conversationId).then(() => {}).catch(() => {})}
               onSendFeedback={(annotations) => api.sendTaskFeedback(taskApprovalOverlay.conversationId, annotations).then(() => {}).catch(() => {})}
             />
+          </Suspense>
+        )}
+
+        {showFirstTaskWelcome && (
+          <Suspense fallback={null}>
+            <FirstTaskWelcome visible onClose={() => setShowFirstTaskWelcome(false)} />
           </Suspense>
         )}
 
