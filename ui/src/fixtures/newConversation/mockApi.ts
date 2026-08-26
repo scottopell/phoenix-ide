@@ -17,6 +17,10 @@ export function installNewConversationFixtureApi(scenario: NewConversationScenar
 
   api.getEnv = async () => ({ home_dir: '/Users/alex' });
   api.reserveProductRoot = async (cwd) => ({
+    kind: 'exact_committed_tree' as const,
+    exact_checkout_oid: '1111111111111111111111111111111111111111',
+    logical_base: 'main',
+    freshness: 'fresh' as const,
     root_reservation: {
       id: `fixture-reservation:${cwd}`,
       cwd,

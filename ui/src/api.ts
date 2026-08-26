@@ -13,6 +13,10 @@ import type { FileViewerKind } from './generated/FileViewerKind';
 import type { UsageOverview } from './generated/UsageOverview';
 import type { ConversationUsageDetail } from './generated/ConversationUsageDetail';
 import type { QuotaDetails } from './generated/QuotaDetails';
+import type { ProductRootReservation } from './generated/ProductRootReservation';
+import type { ProductRootReservationFreshness } from './generated/ProductRootReservationFreshness';
+import type { ReserveProductRootResponse } from './generated/ReserveProductRootResponse';
+export type { ProductRootReservation, ProductRootReservationFreshness, ReserveProductRootResponse };
 // Phoenix API Client
 
 export class ApiResponseError extends Error {
@@ -710,25 +714,6 @@ export interface ToolResultContent {
 export interface ImageData {
   data: string;
   media_type: string;
-}
-
-export type ProductRootReservationFreshness = 'fresh' | 'stale_cached' | 'unresolved';
-
-export interface ProductRootReservation {
-  id: string;
-  cwd: string;
-  kind: 'direct' | 'exact_committed_tree' | 'unresolved_exact_committed_tree';
-  repo_root: string | null;
-  exact_checkout_oid: string | null;
-  logical_base: string | null;
-  freshness: ProductRootReservationFreshness | null;
-}
-
-export interface ReserveProductRootResponse {
-  root_reservation: ProductRootReservation;
-  exact_checkout_oid?: string;
-  logical_base?: string;
-  freshness?: ProductRootReservationFreshness;
 }
 
 export interface CreateProductConversationRequest {

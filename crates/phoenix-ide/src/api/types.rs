@@ -166,7 +166,7 @@ impl From<CreateProductConversationRequest> for CreateConversationRequest {
             files: Vec::new(),
             mode: is_git.then_some("managed".to_string()),
             base_branch,
-            checkout_ref: None,
+            checkout_ref: root.exact_checkout_oid.clone(),
             root_reservation: Some(root),
             seed_parent_id: None,
             seed_label: None,

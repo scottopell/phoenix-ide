@@ -86,6 +86,10 @@ describe('/new directory-first product conversation', () => {
     vi.mocked(api.searchProjectFiles).mockResolvedValue({ items: [] });
     vi.mocked(api.listRecentManagementRootSuggestions).mockResolvedValue({ suggestions: [] });
     vi.mocked(api.reserveProductRoot).mockResolvedValue({
+      kind: 'exact_committed_tree',
+      exact_checkout_oid: 'abc123',
+      logical_base: 'main',
+      freshness: 'fresh',
       root_reservation: {
         id: 'reservation-git', cwd: '/repo', kind: 'exact_committed_tree', repo_root: '/repo', exact_checkout_oid: 'abc123',
         logical_base: 'main', freshness: 'fresh',
@@ -131,6 +135,7 @@ describe('/new directory-first product conversation', () => {
     firstPage.unmount();
     vi.mocked(api.validateCwd).mockResolvedValue({ valid: true, is_git: false });
     vi.mocked(api.reserveProductRoot).mockResolvedValue({
+      kind: 'direct',
       root_reservation: {
         id: 'reservation-direct', cwd: '/plain-dir', kind: 'direct', repo_root: null, exact_checkout_oid: null,
         logical_base: null, freshness: null,
@@ -162,6 +167,7 @@ describe('/new directory-first product conversation', () => {
         : { valid: true, is_git: false }
     ));
     vi.mocked(api.reserveProductRoot).mockResolvedValue({
+      kind: 'direct',
       root_reservation: {
         id: 'reservation-created', cwd: '/new-dir', kind: 'direct', repo_root: null,
         exact_checkout_oid: null, logical_base: null, freshness: null,
@@ -172,6 +178,7 @@ describe('/new directory-first product conversation', () => {
     vi.mocked(api.reserveProductRoot).mockImplementation(async () => {
       order.push('reserve');
       return {
+        kind: 'direct',
         root_reservation: {
           id: 'reservation-created', cwd: '/new-dir', kind: 'direct', repo_root: null,
           exact_checkout_oid: null, logical_base: null, freshness: null,

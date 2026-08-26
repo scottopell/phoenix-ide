@@ -4512,6 +4512,29 @@ impl Database {
         {
             phoenix_core::git_repository::GitRepositoryId::parse(existing_id)
                 .map_err(|error| DbError::Serialization(error.to_string()))?
+        } else if let Some(existing_id) = sqlx::query_scalar::<_, String>(
+            "SELECT common.repository_id
+               FROM git_repository_locator_observations common
+               JOIN git_repository_locator_observations management
+                 ON management.repository_id = common.repository_id
+                AND management.locator_kind = 'management_root'
+                AND management.status = 'present'
+                AND management.path = ?2
+              WHERE common.locator_kind = 'common_dir'
+                AND common.status = 'present'
+                AND common.path = ?1
+                AND EXISTS (
+                    SELECT 1 FROM work_scope_git_repositories wr
+                    WHERE wr.repository_id = common.repository_id
+                )",
+        )
+        .bind(&normalized_common_dir)
+        .bind(&normalized_management_root)
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            phoenix_core::git_repository::GitRepositoryId::parse(existing_id)
+                .map_err(|error| DbError::Serialization(error.to_string()))?
         } else {
             let repository_id = phoenix_core::git_repository::GitRepositoryId::parse(
                 uuid::Uuid::new_v4().to_string(),
@@ -7184,7 +7207,7 @@ impl Database {
             "SELECT wr.repository_id,
                     management.path AS repository_root,
                     branch.branch AS logical_base,
-                    observed.last_observed_head_oid AS exact_checkout_oid
+                    reservation.exact_checkout_oid AS exact_checkout_oid
                FROM conversations c
                JOIN work_scope_git_repositories wr ON wr.work_scope_id = c.work_scope_id
                JOIN git_repository_locator_observations management
@@ -7194,11 +7217,11 @@ impl Database {
                JOIN git_repository_default_branch_observations branch
                  ON branch.repository_id = wr.repository_id
                 AND branch.status = 'resolved'
-               JOIN work_scope_observed_branches observed
-                 ON observed.work_scope_id = c.work_scope_id
-                AND observed.repository_identity = wr.repository_id
+               JOIN product_root_reservations reservation
+                 ON reservation.consumed_by_conversation_id = c.id
+                AND reservation.status = 'consumed'
+                AND reservation.kind = 'exact_committed_tree'
               WHERE c.id = ?1
-              ORDER BY observed.last_observed_at DESC, observed.branch_name DESC
               LIMIT 1",
         )
         .bind(conversation_id)
