@@ -29,6 +29,8 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use phoenix_core::work_scope::ResourceScopeKey;
 
@@ -76,6 +78,9 @@ pub enum TmuxError {
     #[error("the tmux binary is not installed on this host")]
     BinaryUnavailable,
 
+    #[error("tmux retirement is in progress for {work_scope}; ensure_live is fenced until repair reopens admission")]
+    RetirementFenced { work_scope: ResourceScopeKey },
+
     #[error("failed to create tmux socket directory at {path}: {source}")]
     SocketDirCreate {
         path: PathBuf,
@@ -95,6 +100,38 @@ pub enum TmuxError {
         #[source]
         source: std::io::Error,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TmuxServerInstanceIdentity {
+    pub socket_path: PathBuf,
+    pub server_token: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TmuxRetirementGeneration(u64);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmuxRetirementPermit {
+    pub work_scope: ResourceScopeKey,
+    pub instance: TmuxServerInstanceIdentity,
+    generation: TmuxRetirementGeneration,
+    had_entry: bool,
+}
+
+impl TmuxRetirementPermit {
+    #[must_use]
+    pub fn generation(&self) -> TmuxRetirementGeneration {
+        self.generation
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "proof_kind", rename_all = "snake_case")]
+pub enum TmuxRetirementOutcome {
+    Retired,
+    AbsenceVerified,
+    Residual { reason: String },
 }
 
 /// Lifecycle state of a per-`ResourceScopeKey` tmux server.
@@ -132,6 +169,13 @@ pub struct TmuxServer {
     pub socket_path: PathBuf,
     pub server_token: String,
     pub status: ServerStatus,
+    retirement_generation: u64,
+    retirement_fenced: bool,
+}
+
+#[derive(Debug)]
+struct TmuxScopeEntry {
+    server: Arc<RwLock<TmuxServer>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,6 +192,23 @@ impl TmuxServer {
             socket_path,
             server_token: uuid::Uuid::new_v4().to_string(),
             status: ServerStatus::NotProbed,
+            retirement_generation: 0,
+            retirement_fenced: false,
+        }
+    }
+
+    fn exact_identity(&self) -> TmuxServerInstanceIdentity {
+        TmuxServerInstanceIdentity {
+            socket_path: self.socket_path.clone(),
+            server_token: self.server_token.clone(),
+        }
+    }
+}
+
+impl TmuxScopeEntry {
+    fn new(server: TmuxServer) -> Self {
+        Self {
+            server: Arc::new(RwLock::new(server)),
         }
     }
 }
@@ -224,7 +285,7 @@ pub struct TmuxRegistry {
     /// Keyed by `ResourceScopeKey::stable_key()` so Worktree-scoped continuation
     /// members share an entry, and Worktree vs Conversation namespaces
     /// stay disjoint.
-    inner: RwLock<HashMap<String, Arc<RwLock<TmuxServer>>>>,
+    inner: RwLock<HashMap<String, Arc<TmuxScopeEntry>>>,
     socket_dir: PathBuf,
     binary_available: bool,
     /// Bootstrap of the socket dir + 0700 perms + Phoenix server config
@@ -473,6 +534,13 @@ impl TmuxRegistry {
         legacy_worktree_path: Option<&Path>,
         legacy_conversation_id: Option<&str>,
     ) -> Result<Arc<RwLock<TmuxServer>>, TmuxError> {
+        if let Some(server) = self.get_existing(work_scope).await {
+            if server.read().await.retirement_fenced {
+                return Err(TmuxError::RetirementFenced {
+                    work_scope: work_scope.clone(),
+                });
+            }
+        }
         if !self.binary_available {
             return Err(TmuxError::BinaryUnavailable);
         }
@@ -513,9 +581,15 @@ impl TmuxRegistry {
             socket_path
         };
 
-        let (server_arc, created) = self.get_or_insert(work_scope, socket_path).await;
+        let (entry, created) = self.get_or_insert(work_scope, socket_path).await;
+        let server_arc = entry.server.clone();
 
         let mut server = server_arc.write().await;
+        if server.retirement_fenced {
+            return Err(TmuxError::RetirementFenced {
+                work_scope: work_scope.clone(),
+            });
+        }
         let prev_status = server.status;
         // Probe under the per-scope entry write lock — the only
         // authoritative point of decision. An earlier outer-lock probe
@@ -617,7 +691,7 @@ impl TmuxRegistry {
         &self,
         work_scope: &ResourceScopeKey,
         socket_path: PathBuf,
-    ) -> (Arc<RwLock<TmuxServer>>, bool) {
+    ) -> (Arc<TmuxScopeEntry>, bool) {
         let key = work_scope.stable_key();
         {
             let map = self.inner.read().await;
@@ -629,7 +703,7 @@ impl TmuxRegistry {
         if let Some(entry) = map.get(&key) {
             return (entry.clone(), false);
         }
-        let entry = Arc::new(RwLock::new(TmuxServer::new(
+        let entry = Arc::new(TmuxScopeEntry::new(TmuxServer::new(
             work_scope.clone(),
             socket_path,
         )));
@@ -649,7 +723,11 @@ impl TmuxRegistry {
         work_scope: &ResourceScopeKey,
     ) -> Option<Arc<RwLock<TmuxServer>>> {
         let key = work_scope.stable_key();
-        self.inner.read().await.get(&key).cloned()
+        self.inner
+            .read()
+            .await
+            .get(&key)
+            .map(|entry| entry.server.clone())
     }
 
     async fn find_socket_for_token(
@@ -781,6 +859,225 @@ impl TmuxRegistry {
         }
     }
 
+    fn build_retirement_permit(
+        &self,
+        work_scope: &ResourceScopeKey,
+        server: &mut TmuxServer,
+        had_entry: bool,
+    ) -> TmuxRetirementPermit {
+        server.retirement_generation = server.retirement_generation.wrapping_add(1);
+        server.retirement_fenced = true;
+        server.status = ServerStatus::Gone;
+        TmuxRetirementPermit {
+            work_scope: work_scope.clone(),
+            instance: server.exact_identity(),
+            generation: TmuxRetirementGeneration(server.retirement_generation),
+            had_entry,
+        }
+    }
+
+    pub async fn begin_retirement(
+        &self,
+        work_scope: &ResourceScopeKey,
+        legacy_worktree_path: Option<&Path>,
+        legacy_conversation_id: Option<&str>,
+    ) -> TmuxRetirementPermit {
+        self.begin_retirement_inner(
+            work_scope,
+            legacy_worktree_path,
+            legacy_conversation_id,
+            true,
+        )
+        .await
+    }
+
+    async fn begin_retirement_inner(
+        &self,
+        work_scope: &ResourceScopeKey,
+        legacy_worktree_path: Option<&Path>,
+        legacy_conversation_id: Option<&str>,
+        emit_lifecycle: bool,
+    ) -> TmuxRetirementPermit {
+        let current = self.derived_socket_path(work_scope);
+        let legacy = legacy_worktree_path
+            .map(|path| socket_path_for_worktree(&self.socket_dir, path))
+            .or_else(|| legacy_conversation_id.map(|id| socket_path_for(&self.socket_dir, id)));
+        let socket_path = if let Some(legacy) = legacy {
+            if legacy != current
+                && matches!(
+                    probe(&current).await,
+                    Ok(ProbeResult::NoSocket | ProbeResult::DeadSocket)
+                )
+                && matches!(probe(&legacy).await, Ok(ProbeResult::Live))
+            {
+                legacy
+            } else {
+                current
+            }
+        } else {
+            current
+        };
+
+        let (entry, created) = self.get_or_insert(work_scope, socket_path).await;
+        let mut server = entry.server.write().await;
+        let permit = self.build_retirement_permit(work_scope, &mut server, !created);
+        drop(server);
+        if !created && emit_lifecycle {
+            self.emit_lifecycle(work_scope);
+        }
+        permit
+    }
+
+    fn matches_exact_instance(server: &TmuxServer, permit: &TmuxRetirementPermit) -> bool {
+        server.retirement_fenced
+            && server.retirement_generation == permit.generation.0
+            && server.socket_path == permit.instance.socket_path
+            && server.server_token == permit.instance.server_token
+    }
+
+    async fn verify_exact_absence(
+        &self,
+        permit: &TmuxRetirementPermit,
+    ) -> Result<TmuxRetirementOutcome, TmuxError> {
+        match probe(&permit.instance.socket_path)
+            .await
+            .map_err(|source| TmuxError::ProbeFailed {
+                socket_path: permit.instance.socket_path.clone(),
+                source,
+            })? {
+            ProbeResult::NoSocket | ProbeResult::DeadSocket => {
+                Ok(TmuxRetirementOutcome::AbsenceVerified)
+            }
+            ProbeResult::Live => {
+                if read_server_token(&permit.instance.socket_path)
+                    .await
+                    .as_deref()
+                    == Some(permit.instance.server_token.as_str())
+                {
+                    Ok(TmuxRetirementOutcome::Residual {
+                        reason: "exact tmux server instance remained live after teardown"
+                            .to_string(),
+                    })
+                } else {
+                    Ok(TmuxRetirementOutcome::AbsenceVerified)
+                }
+            }
+        }
+    }
+
+    pub async fn complete_retirement(
+        &self,
+        permit: &TmuxRetirementPermit,
+    ) -> Result<TmuxRetirementOutcome, TmuxError> {
+        let current_entry = {
+            let map = self.inner.read().await;
+            map.get(&permit.work_scope.stable_key()).cloned()
+        };
+        let Some(entry) = current_entry else {
+            return self.verify_exact_absence(permit).await;
+        };
+
+        let exact_owned = {
+            let server = entry.server.read().await;
+            Self::matches_exact_instance(&server, permit)
+        };
+        if !exact_owned {
+            return self.verify_exact_absence(permit).await;
+        }
+
+        let kill_error = if self.binary_available {
+            match tokio::process::Command::new("tmux")
+                .args([
+                    "-f",
+                    &self.config_path().to_string_lossy(),
+                    "-S",
+                    &permit.instance.socket_path.to_string_lossy(),
+                    "kill-server",
+                ])
+                .env_remove("TMUX")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await
+            {
+                Ok(_) => None,
+                Err(error) => Some(error.to_string()),
+            }
+        } else {
+            None
+        };
+        let unlink_error = match tokio::fs::remove_file(&permit.instance.socket_path).await {
+            Ok(()) => None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => Some(error.to_string()),
+        };
+
+        let verified = self.verify_exact_absence(permit).await?;
+        if let Some(error) = kill_error {
+            return Ok(TmuxRetirementOutcome::Residual {
+                reason: format!("kill-server failed: {error}"),
+            });
+        }
+        if let Some(error) = unlink_error {
+            return Ok(TmuxRetirementOutcome::Residual {
+                reason: format!("socket unlink failed: {error}"),
+            });
+        }
+
+        match verified {
+            TmuxRetirementOutcome::AbsenceVerified => {
+                let current = {
+                    self.inner
+                        .read()
+                        .await
+                        .get(&permit.work_scope.stable_key())
+                        .cloned()
+                };
+                let exact_owned = match current {
+                    Some(current) => {
+                        let server = current.server.read().await;
+                        Self::matches_exact_instance(&server, permit)
+                    }
+                    None => false,
+                };
+                if exact_owned {
+                    let removed = self
+                        .inner
+                        .write()
+                        .await
+                        .remove(&permit.work_scope.stable_key())
+                        .is_some();
+                    if removed && permit.had_entry {
+                        self.emit_lifecycle(&permit.work_scope);
+                    }
+                }
+                Ok(TmuxRetirementOutcome::Retired)
+            }
+            residual => Ok(residual),
+        }
+    }
+
+    pub async fn reopen_after_repair(&self, work_scope: &ResourceScopeKey) {
+        let key = work_scope.stable_key();
+        let Some(entry) = self.inner.read().await.get(&key).cloned() else {
+            return;
+        };
+        let mut server = entry.server.write().await;
+        if server.retirement_fenced {
+            server.retirement_fenced = false;
+            if server.status == ServerStatus::Gone {
+                server.status = ServerStatus::NotProbed;
+            }
+            drop(server);
+            self.emit_lifecycle(work_scope);
+        }
+    }
+
+    /// Best-effort tear-down of a `ResourceScopeKey`'s tmux server, called from
+    /// the unified `run_resource_cleanup_cascade` (REQ-BED-032 —
+    /// archive / abandon / mark-merged / hard-delete all share this
+    /// path).
     /// Best-effort tear-down of a `ResourceScopeKey`'s tmux server, called from
     /// the unified `run_resource_cleanup_cascade` (REQ-BED-032 —
     /// archive / abandon / mark-merged / hard-delete all share this
@@ -845,91 +1142,56 @@ impl TmuxRegistry {
             };
         }
 
-        let key = work_scope.stable_key();
-        let entry = {
-            let mut map = self.inner.write().await;
-            map.remove(&key)
+        let had_entry = self.get_existing(work_scope).await.is_some();
+        let permit = self
+            .begin_retirement_inner(
+                work_scope,
+                legacy_worktree_path,
+                legacy_conversation_id,
+                false,
+            )
+            .await;
+        let outcome = match self.complete_retirement(&permit).await {
+            Ok(outcome) => outcome,
+            Err(error) => TmuxRetirementOutcome::Residual {
+                reason: error.to_string(),
+            },
         };
-        let had_entry = entry.is_some();
 
-        let socket_path = if let Some(arc) = entry {
-            let server = arc.read().await;
-            server.socket_path.clone()
-        } else {
-            let current = self.derived_socket_path(work_scope);
-            let legacy = legacy_worktree_path
-                .map(|path| socket_path_for_worktree(&self.socket_dir, path))
-                .or_else(|| legacy_conversation_id.map(|id| socket_path_for(&self.socket_dir, id)));
-            if let Some(legacy) = legacy {
-                if legacy != current
-                    && matches!(
-                        probe(&current).await,
-                        Ok(ProbeResult::NoSocket | ProbeResult::DeadSocket)
-                    )
-                    && matches!(probe(&legacy).await, Ok(ProbeResult::Live))
-                {
-                    tracing::info!(
-                        scope = %work_scope,
-                        socket = %legacy.display(),
-                        "tmux: cleaning live pre-opaque-scope socket"
-                    );
-                    legacy
-                } else {
-                    current
+        match outcome {
+            TmuxRetirementOutcome::Retired | TmuxRetirementOutcome::AbsenceVerified => {
+                CascadeReport {
+                    socket_path: permit.instance.socket_path,
+                    kill_server_error: None,
+                    unlink_error: None,
                 }
-            } else {
-                current
             }
+            TmuxRetirementOutcome::Residual { reason } => {
+                if !had_entry {
+                    let _ = self.inner.write().await.remove(&work_scope.stable_key());
+                }
+                CascadeReport {
+                    socket_path: permit.instance.socket_path,
+                    kill_server_error: Some(reason),
+                    unlink_error: None,
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    async fn is_retirement_fenced(&self, work_scope: &ResourceScopeKey) -> bool {
+        let Some(entry) = self
+            .inner
+            .read()
+            .await
+            .get(&work_scope.stable_key())
+            .cloned()
+        else {
+            return false;
         };
-
-        let mut report = CascadeReport {
-            socket_path: socket_path.clone(),
-            kill_server_error: None,
-            unlink_error: None,
-        };
-
-        if self.binary_available {
-            // `kill-server` connects to an existing server (which already
-            // has its config loaded), so `-f` is functionally a no-op
-            // here — included for symmetry with other Phoenix tmux
-            // invocations and to harden against an unlikely auto-spawn
-            // path on some tmux versions.
-            let kill = tokio::process::Command::new("tmux")
-                .args([
-                    "-f",
-                    &self.config_path().to_string_lossy(),
-                    "-S",
-                    &socket_path.to_string_lossy(),
-                    "kill-server",
-                ])
-                .env_remove("TMUX")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .await;
-            if let Err(e) = kill {
-                report.kill_server_error = Some(e.to_string());
-            }
-        }
-
-        match tokio::fs::remove_file(&socket_path).await {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                report.unlink_error = Some(e.to_string());
-            }
-        }
-
-        // REMOVAL edge: an entry existed and was torn down, so the server
-        // disappears from the work-scope inventory. Emit only when the
-        // registry actually held an entry — an orphan-socket-only cleanup
-        // (no in-memory entry) does not change the inventory.
-        if had_entry {
-            self.emit_lifecycle(work_scope);
-        }
-
-        report
+        let fenced = entry.server.read().await.retirement_fenced;
+        fenced
     }
 
     /// Number of conversations currently tracked. Test/diagnostic only.
@@ -955,6 +1217,23 @@ pub struct CascadeReport {
     pub socket_path: PathBuf,
     pub kill_server_error: Option<String>,
     pub unlink_error: Option<String>,
+}
+
+impl From<TmuxRetirementOutcome> for CascadeReport {
+    fn from(outcome: TmuxRetirementOutcome) -> Self {
+        match outcome {
+            TmuxRetirementOutcome::Retired | TmuxRetirementOutcome::AbsenceVerified => Self {
+                socket_path: PathBuf::new(),
+                kill_server_error: None,
+                unlink_error: None,
+            },
+            TmuxRetirementOutcome::Residual { reason } => Self {
+                socket_path: PathBuf::new(),
+                kill_server_error: Some(reason),
+                unlink_error: None,
+            },
+        }
+    }
 }
 
 /// Convenience function for the cleanup-cascade orchestrator. Equivalent
@@ -1572,6 +1851,76 @@ mod tests {
             reg.get_existing(&wt).await.is_some(),
             "preserved scope must still resolve to its entry"
         );
+    }
+
+    #[tokio::test]
+    async fn begin_retirement_fences_ensure_live_until_reopened() {
+        let tmp = TempDir::new().unwrap();
+        let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        let work_scope = scope("retirement-fence");
+        let permit = reg.begin_retirement(&work_scope, None, None).await;
+
+        assert_eq!(permit.work_scope, work_scope);
+        assert!(reg.is_retirement_fenced(&work_scope).await);
+        assert!(matches!(
+            reg.ensure_live(&work_scope, tmp.path(), None, None).await,
+            Err(TmuxError::RetirementFenced { work_scope: fenced }) if fenced == work_scope
+        ));
+
+        reg.reopen_after_repair(&work_scope).await;
+        assert!(!reg.is_retirement_fenced(&work_scope).await);
+        assert!(matches!(
+            reg.ensure_live(&work_scope, tmp.path(), None, None).await,
+            Err(TmuxError::BinaryUnavailable)
+        ));
+    }
+
+    #[tokio::test]
+    async fn retirement_absence_verification_does_not_kill_reopened_replacement() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let owner = TestTmuxServerOwner::new();
+        let reg = owner.registry();
+        let work_scope = scope("retirement-absence-replacement");
+
+        let first = reg
+            .ensure_live(&work_scope, owner.path(), None, None)
+            .await
+            .expect("first server");
+        let stale_socket = first.read().await.socket_path.clone();
+        let stale_token = first.read().await.server_token.clone();
+        let permit = reg.begin_retirement(&work_scope, None, None).await;
+        assert_eq!(permit.instance.socket_path, stale_socket);
+        assert_eq!(permit.instance.server_token, stale_token);
+
+        reg.reopen_after_repair(&work_scope).await;
+        kill_socket(&stale_socket).await;
+        let replacement = reg
+            .ensure_live(&work_scope, owner.path(), None, None)
+            .await
+            .expect("replacement server");
+        let replacement_token = replacement.read().await.server_token.clone();
+        assert_ne!(
+            replacement_token, stale_token,
+            "replacement must rotate token"
+        );
+
+        let outcome = reg
+            .complete_retirement(&permit)
+            .await
+            .expect("retirement completion");
+        assert_eq!(outcome, TmuxRetirementOutcome::AbsenceVerified);
+        assert!(reg.get_existing(&work_scope).await.is_some());
+
+        let output = run_tmux_quiet_output(&stale_socket, &["list-sessions"])
+            .await
+            .expect("replacement still reachable");
+        assert!(
+            output.status.success(),
+            "replacement server must survive stale permit retirement"
+        );
+        owner.shutdown();
     }
 
     #[test]
