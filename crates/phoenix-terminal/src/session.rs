@@ -118,6 +118,72 @@ impl std::fmt::Debug for TerminalHandle {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalRetirementGeneration(u64);
+
+impl TerminalRetirementGeneration {
+    #[must_use]
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalInstanceIdentity {
+    handle_addr: usize,
+    pub child_pid: i32,
+}
+
+impl TerminalInstanceIdentity {
+    #[must_use]
+    pub fn from_handle(handle: &Arc<TerminalHandle>) -> Self {
+        Self {
+            handle_addr: Arc::as_ptr(handle) as usize,
+            child_pid: handle.child_pid.as_raw(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalRetirementPermit {
+    pub work_scope: ResourceScopeKey,
+    pub instance: Option<TerminalInstanceIdentity>,
+    generation: TerminalRetirementGeneration,
+    had_entry: bool,
+}
+
+impl TerminalRetirementPermit {
+    #[must_use]
+    pub fn generation(&self) -> TerminalRetirementGeneration {
+        self.generation
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalRetirementOutcome {
+    Retired,
+    AbsenceVerified,
+    Residual { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActiveTerminalInsertError {
+    Occupied,
+    RetirementFenced,
+}
+
+#[derive(Debug, Default)]
+struct ActiveTerminalRegistryState {
+    handles: HashMap<ResourceScopeKey, Arc<TerminalHandle>>,
+    retirements: HashMap<ResourceScopeKey, ScopeRetirementState>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ScopeRetirementState {
+    generation: u64,
+    fenced: bool,
+}
+
 /// Shared registry of active terminal sessions (REQ-TERM-003, REQ-TERM-WS-001).
 ///
 /// Conversation terminals are keyed by durable work-scope identity;
@@ -131,12 +197,21 @@ impl std::fmt::Debug for TerminalHandle {
 /// `Mutex` provides the atomic check-and-insert needed for the race guard
 /// on the fresh-session path.
 #[derive(Clone, Default)]
-pub struct ActiveTerminals(pub Arc<Mutex<HashMap<ResourceScopeKey, Arc<TerminalHandle>>>>);
+pub struct ActiveTerminals(Arc<Mutex<ActiveTerminalRegistryState>>);
 
 impl ActiveTerminals {
+    #[cfg(test)]
+    pub(crate) fn active_count_for_scope(&self, scope: &ResourceScopeKey) -> usize {
+        let map = self.0.lock().expect("terminal registry poisoned");
+        map.handles
+            .iter()
+            .filter(|(candidate, _)| *candidate == scope)
+            .count()
+    }
+
     #[must_use]
     pub fn new() -> Self {
-        Self(Arc::new(Mutex::new(HashMap::new())))
+        Self(Arc::new(Mutex::new(ActiveTerminalRegistryState::default())))
     }
 
     /// # Panics
@@ -144,7 +219,8 @@ impl ActiveTerminals {
     #[must_use]
     pub fn snapshot_shell_session_ids(&self) -> Vec<i32> {
         let map = self.0.lock().expect("terminal registry poisoned");
-        map.values()
+        map.handles
+            .values()
             .filter(|handle| handle.child_kind == TerminalChildKind::Shell)
             .map(|handle| handle.child_pid.as_raw())
             .collect()
@@ -163,12 +239,42 @@ impl ActiveTerminals {
     #[must_use]
     pub fn is_active(&self, scope: &ResourceScopeKey) -> bool {
         let map = self.0.lock().expect("terminal registry poisoned");
-        map.contains_key(scope)
+        map.handles.contains_key(scope)
     }
 
     /// Attempt to register a new terminal for `scope`.
     ///
-    /// Returns `None` if a terminal is already active for the scope.
+    /// Returns a typed error when the scope is already occupied or fenced for
+    /// retirement. The legacy [`Self::try_insert`] wrapper preserves the older
+    /// `Option`-based API by collapsing both rejections to `None`.
+    ///
+    /// # Panics
+    /// Panics if the registry mutex is poisoned.
+    pub fn try_insert_exact(
+        &self,
+        scope: ResourceScopeKey,
+        handle: TerminalHandle,
+    ) -> Result<Arc<TerminalHandle>, ActiveTerminalInsertError> {
+        let mut map = self.0.lock().expect("terminal registry poisoned");
+        if map
+            .retirements
+            .get(&scope)
+            .is_some_and(|retirement| retirement.fenced)
+        {
+            return Err(ActiveTerminalInsertError::RetirementFenced);
+        }
+        if map.handles.contains_key(&scope) {
+            return Err(ActiveTerminalInsertError::Occupied);
+        }
+        let arc = Arc::new(handle);
+        map.handles.insert(scope, Arc::clone(&arc));
+        Ok(arc)
+    }
+
+    /// Attempt to register a new terminal for `scope`.
+    ///
+    /// Returns `None` if a terminal is already active for the scope or if the
+    /// scope is fenced for retirement.
     ///
     /// # Panics
     /// Panics if the registry mutex is poisoned.
@@ -178,22 +284,21 @@ impl ActiveTerminals {
         scope: ResourceScopeKey,
         handle: TerminalHandle,
     ) -> Option<Arc<TerminalHandle>> {
-        let mut map = self.0.lock().expect("terminal registry poisoned");
-        if map.contains_key(&scope) {
-            return None;
-        }
-        let arc = Arc::new(handle);
-        map.insert(scope, Arc::clone(&arc));
-        Some(arc)
+        self.try_insert_exact(scope, handle).ok()
     }
 
     /// Remove the terminal for `scope`, if present.
+    ///
+    /// Legacy removal clears both the live handle and any retirement fence so
+    /// tests and older callers keep the pre-retirement semantics. Exact Close-
+    /// authority teardown uses [`Self::complete_retirement`] instead.
     ///
     /// # Panics
     /// Panics if the registry mutex is poisoned.
     pub fn remove(&self, scope: &ResourceScopeKey) {
         let mut map = self.0.lock().expect("terminal registry poisoned");
-        map.remove(scope);
+        map.handles.remove(scope);
+        map.retirements.remove(scope);
     }
 
     /// Look up an active terminal.
@@ -203,7 +308,160 @@ impl ActiveTerminals {
     #[must_use]
     pub fn get(&self, scope: &ResourceScopeKey) -> Option<Arc<TerminalHandle>> {
         let map = self.0.lock().expect("terminal registry poisoned");
-        map.get(scope).cloned()
+        map.handles.get(scope).cloned()
+    }
+
+    /// Read-only inspection of whether retirement admission is currently fenced.
+    ///
+    /// # Panics
+    /// Panics if the registry mutex is poisoned.
+    #[cfg(test)]
+    #[must_use]
+    pub fn is_retirement_fenced(&self, scope: &ResourceScopeKey) -> bool {
+        let map = self.0.lock().expect("terminal registry poisoned");
+        map.retirements
+            .get(scope)
+            .is_some_and(|retirement| retirement.fenced)
+    }
+
+    fn build_retirement_permit(
+        &self,
+        scope: &ResourceScopeKey,
+        map: &mut ActiveTerminalRegistryState,
+    ) -> TerminalRetirementPermit {
+        let instance = map
+            .handles
+            .get(scope)
+            .map(TerminalInstanceIdentity::from_handle);
+        let had_entry = instance.is_some();
+        let generation = {
+            let retirement = map.retirements.entry(scope.clone()).or_default();
+            retirement.generation = retirement.generation.wrapping_add(1);
+            retirement.fenced = true;
+            retirement.generation
+        };
+        TerminalRetirementPermit {
+            work_scope: scope.clone(),
+            instance,
+            generation: TerminalRetirementGeneration(generation),
+            had_entry,
+        }
+    }
+
+    /// Fence `scope` for exact retirement and return the permit authorizing one
+    /// teardown attempt against the instance that was current at fence time.
+    ///
+    /// Admission stays closed until [`Self::reopen_after_repair`] clears the
+    /// fence, even if `complete_retirement` later verifies exact absence.
+    ///
+    /// # Panics
+    /// Panics if the registry mutex is poisoned.
+    #[must_use]
+    pub fn begin_retirement(&self, scope: &ResourceScopeKey) -> TerminalRetirementPermit {
+        let mut map = self.0.lock().expect("terminal registry poisoned");
+        self.build_retirement_permit(scope, &mut map)
+    }
+
+    fn matches_exact_instance(
+        map: &ActiveTerminalRegistryState,
+        permit: &TerminalRetirementPermit,
+    ) -> bool {
+        let Some(retirement) = map.retirements.get(&permit.work_scope) else {
+            return false;
+        };
+        if !retirement.fenced || retirement.generation != permit.generation.0 {
+            return false;
+        }
+        match (map.handles.get(&permit.work_scope), permit.instance) {
+            (Some(current), Some(expected)) => {
+                TerminalInstanceIdentity::from_handle(current) == expected
+            }
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    fn verify_exact_absence(
+        map: &ActiveTerminalRegistryState,
+        permit: &TerminalRetirementPermit,
+    ) -> TerminalRetirementOutcome {
+        match (map.handles.get(&permit.work_scope), permit.instance) {
+            (None, _) => TerminalRetirementOutcome::AbsenceVerified,
+            (Some(current), Some(expected))
+                if TerminalInstanceIdentity::from_handle(current) != expected =>
+            {
+                TerminalRetirementOutcome::AbsenceVerified
+            }
+            (Some(_), Some(expected)) => TerminalRetirementOutcome::Residual {
+                reason: format!(
+                    "exact terminal instance pid={} remained current after teardown",
+                    expected.child_pid
+                ),
+            },
+            (Some(current), None) => TerminalRetirementOutcome::Residual {
+                reason: format!(
+                    "terminal pid={} appeared after retirement fenced an absent scope",
+                    current.child_pid.as_raw()
+                ),
+            },
+        }
+    }
+
+    /// Retire only the exact terminal instance authorized by `permit`.
+    ///
+    /// A stale permit must not remove a replacement terminal. On an exact match,
+    /// this removes the registry-owned handle, signals relay teardown, and reaps
+    /// the shell when no relay is attached. The scope remains fenced until
+    /// [`Self::reopen_after_repair`] is called.
+    pub async fn complete_retirement(
+        &self,
+        permit: &TerminalRetirementPermit,
+    ) -> TerminalRetirementOutcome {
+        let (handle, relay_attached) = {
+            let mut map = self.0.lock().expect("terminal registry poisoned");
+            if !Self::matches_exact_instance(&map, permit) {
+                return Self::verify_exact_absence(&map, permit);
+            }
+            let handle = map.handles.remove(&permit.work_scope);
+            let relay_attached = handle
+                .as_ref()
+                .is_some_and(|handle| handle.attach_permit.available_permits() == 0);
+            (handle, relay_attached)
+        };
+
+        let Some(handle) = handle else {
+            let map = self.0.lock().expect("terminal registry poisoned");
+            return Self::verify_exact_absence(&map, permit);
+        };
+
+        let child_pid = handle.child_pid;
+        let _ = handle.stop_tx.send(StopReason::TearDown);
+        drop(handle);
+
+        if !relay_attached {
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = nix::sys::wait::waitpid(child_pid, None);
+            })
+            .await;
+        }
+
+        let map = self.0.lock().expect("terminal registry poisoned");
+        match Self::verify_exact_absence(&map, permit) {
+            TerminalRetirementOutcome::AbsenceVerified if permit.had_entry => {
+                TerminalRetirementOutcome::Retired
+            }
+            other => other,
+        }
+    }
+
+    /// Clear a retirement fence after repair authorizes the scope to admit a
+    /// fresh terminal again.
+    ///
+    /// # Panics
+    /// Panics if the registry mutex is poisoned.
+    pub fn reopen_after_repair(&self, scope: &ResourceScopeKey) {
+        let mut map = self.0.lock().expect("terminal registry poisoned");
+        map.retirements.remove(scope);
     }
 
     /// Cascade-cleanup entry for `run_resource_cleanup_cascade`
@@ -237,46 +495,13 @@ impl ActiveTerminals {
             return;
         }
 
-        let handle = {
-            let mut map = self.0.lock().expect("terminal registry poisoned");
-            map.remove(work_scope)
-        };
-        let Some(handle) = handle else {
-            return;
-        };
-
-        let child_pid = handle.child_pid;
-        // attach_permit starts with 1 permit; an attached relay holds it
-        // for its lifetime, so `available_permits() == 0` means a relay is
-        // currently attached.
-        let relay_attached = handle.attach_permit.available_permits() == 0;
-
-        // Signal an attached relay to tear down. The relay's exit branch
-        // runs `full_teardown` which closes the master_fd, reaps the
-        // child, and exits. `send` returns Err if no receivers are alive
-        // (no relay attached) — we ignore.
-        let _ = handle.stop_tx.send(StopReason::TearDown);
-
-        // Drop our registry-owned Arc clone. If a relay is attached, it
-        // still has its own clone + master_fd dup, so master_fd stays
-        // open until the relay's clean-up. If no relay is attached, our
-        // clone was the last reference: Drop fires now, master_fd closes,
-        // SIGHUP delivers to the shell's process group.
-        drop(handle);
-
-        if !relay_attached {
-            // No relay to reap the child for us. Do it here.
-            // spawn_blocking because waitpid is sync; ignore errors —
-            // ECHILD just means someone else already reaped it.
-            let _ = tokio::task::spawn_blocking(move || {
-                let _ = nix::sys::wait::waitpid(child_pid, None);
-            })
-            .await;
-        }
+        let permit = self.begin_retirement(work_scope);
+        let outcome = self.complete_retirement(&permit).await;
+        self.reopen_after_repair(work_scope);
 
         tracing::info!(
             work_scope = %work_scope,
-            relay_attached,
+            outcome = ?outcome,
             "terminal: cascade teardown complete"
         );
     }

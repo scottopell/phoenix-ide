@@ -15,7 +15,7 @@
 
 use proptest::prelude::*;
 
-use super::session::{ActiveTerminals, Dims};
+use super::session::{ActiveTerminalInsertError, ActiveTerminals, Dims, TerminalRetirementOutcome};
 use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -133,6 +133,131 @@ fn remove_allows_reinsertion() {
 
     let third = registry.try_insert(scope.clone(), dummy_handle(dims));
     assert!(third.is_some(), "insert after remove must succeed");
+}
+
+#[test]
+fn begin_retirement_fences_admission_until_reopened() {
+    let registry = ActiveTerminals::new();
+    let scope = scope("retirement-fence");
+    let dims = Dims { cols: 80, rows: 24 };
+
+    registry
+        .try_insert(scope.clone(), dummy_handle(dims))
+        .expect("initial insert");
+
+    let permit = registry.begin_retirement(&scope);
+    assert_eq!(permit.work_scope, scope);
+    assert_eq!(permit.generation().get(), 1);
+    assert!(
+        permit.instance.is_some(),
+        "live terminal should stamp exact identity"
+    );
+    assert!(registry.is_retirement_fenced(&scope));
+    assert!(matches!(
+        registry.try_insert_exact(scope.clone(), dummy_handle(dims)),
+        Err(ActiveTerminalInsertError::RetirementFenced)
+    ));
+
+    registry.reopen_after_repair(&scope);
+    assert!(!registry.is_retirement_fenced(&scope));
+    registry.remove(&scope);
+    assert!(
+        registry
+            .try_insert(scope.clone(), dummy_handle(dims))
+            .is_some(),
+        "repair reopen must restore admission"
+    );
+}
+
+#[tokio::test]
+async fn complete_retirement_requires_exact_instance_and_reopen_for_admission() {
+    let registry = ActiveTerminals::new();
+    let scope = scope("retirement-exact");
+    let dims = Dims { cols: 80, rows: 24 };
+
+    let first = registry
+        .try_insert_exact(scope.clone(), dummy_handle(dims))
+        .expect("first insert");
+    let first_identity = super::session::TerminalInstanceIdentity::from_handle(&first);
+    let permit = registry.begin_retirement(&scope);
+    let second_permit = registry.begin_retirement(&scope);
+    assert_eq!(permit.generation().get(), 1);
+    assert_eq!(second_permit.generation().get(), 2);
+
+    assert_eq!(
+        registry.complete_retirement(&permit).await,
+        TerminalRetirementOutcome::Residual {
+            reason: format!(
+                "exact terminal instance pid={} remained current after teardown",
+                first_identity.child_pid
+            ),
+        },
+        "stale generation must not retire the still-current instance"
+    );
+    assert!(
+        registry.get(&scope).is_some(),
+        "stale permit must leave entry intact"
+    );
+
+    assert_eq!(
+        registry.complete_retirement(&second_permit).await,
+        TerminalRetirementOutcome::Retired,
+        "current permit must retire the exact current instance"
+    );
+    assert!(
+        registry.get(&scope).is_none(),
+        "exact retirement removes live entry"
+    );
+    assert!(
+        registry.is_retirement_fenced(&scope),
+        "scope stays fenced until repair reopen"
+    );
+    assert!(matches!(
+        registry.try_insert_exact(scope.clone(), dummy_handle(dims)),
+        Err(ActiveTerminalInsertError::RetirementFenced)
+    ));
+
+    registry.reopen_after_repair(&scope);
+    assert!(
+        registry
+            .try_insert(scope.clone(), dummy_handle(dims))
+            .is_some(),
+        "reopen_after_repair must permit a fresh terminal after exact teardown"
+    );
+}
+
+#[tokio::test]
+async fn complete_retirement_verifies_absence_without_touching_replacement() {
+    let registry = ActiveTerminals::new();
+    let scope = scope("retirement-replacement");
+    let dims = Dims { cols: 80, rows: 24 };
+
+    registry
+        .try_insert_exact(scope.clone(), dummy_handle(dims))
+        .expect("original insert");
+    let permit = registry.begin_retirement(&scope);
+
+    registry.remove(&scope);
+    let replacement = registry.begin_retirement(&scope);
+    registry.reopen_after_repair(&scope);
+    registry
+        .try_insert_exact(scope.clone(), dummy_handle(dims))
+        .expect("replacement insert after legacy clear");
+
+    assert_eq!(
+        replacement.instance, None,
+        "replacement fence after legacy clear should record absence"
+    );
+
+    assert_eq!(
+        registry.complete_retirement(&permit).await,
+        TerminalRetirementOutcome::AbsenceVerified,
+        "stale permit must verify old instance absence instead of removing replacement"
+    );
+    assert!(
+        registry.get(&scope).is_some(),
+        "replacement must survive stale retirement completion"
+    );
 }
 
 /// `get` returns `Some` for registered scopes, `None` otherwise.
@@ -257,8 +382,7 @@ proptest! {
             }
 
             // Invariant: count per scope must be 0 or 1.
-            let map = registry.0.lock().unwrap();
-            let count = map.iter().filter(|(k, _)| **k == scope).count();
+            let count = registry.active_count_for_scope(&scope);
             prop_assert!(count <= 1,
                 "OneTerminalPerResourceScopeKey violated: {} active for {:?}",
                 count, scope);
