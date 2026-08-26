@@ -7,7 +7,7 @@ import {
   useWorkScope,
 } from '../conversation';
 import { useResizablePane, useIsDesktop } from '../hooks';
-import { api, type Conversation, type ProductConversationSnapshotView } from '../api';
+import { api, type Conversation, type ProductConversationListRow, type ProductConversationSnapshotView } from '../api';
 import { Sidebar } from './Sidebar';
 import { FileExplorerPanel, FileExplorerProvider } from './FileExplorer';
 import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
@@ -35,6 +35,7 @@ import {
   notifyCatchUp,
   registerCoordinatorForNotifications,
   useNotificationClickNavigationBridge,
+  setActiveNotificationConversationSlug,
 } from '../notifications';
 
 const subAgentViewerPaneMax = () => Math.max(360, Math.round(window.innerWidth * 0.6));
@@ -137,6 +138,17 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   const { refresh: refreshConversations } = useConversationsRefresh();
   const { active: conversations, archived: archivedConversations } = useConversationsList();
   const [coordinatorForNotifications, setCoordinatorForNotifications] = useState<Conversation | null>(null);
+  const [productConversations, setProductConversations] = useState<ProductConversationListRow[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = () => api.listProductConversations()
+      .then((response) => { if (!cancelled) setProductConversations(response.product_conversations); })
+      .catch(() => {});
+    void refresh();
+    const interval = window.setInterval(refresh, 5_000);
+    return () => { cancelled = true; window.clearInterval(interval); };
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -234,9 +246,18 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   useEffect(() => {
     if (!productConversationId || ownedProductSnapshot) return;
     const retry = () => setProductSnapshotRetry((value) => value + 1);
+    const timeout = window.setTimeout(retry, 1_000);
     window.addEventListener('online', retry);
-    return () => window.removeEventListener('online', retry);
-  }, [ownedProductSnapshot, productConversationId]);
+    return () => {
+      window.clearTimeout(timeout);
+      window.removeEventListener('online', retry);
+    };
+  }, [ownedProductSnapshot, productConversationId, productSnapshotRetry]);
+
+  useEffect(() => {
+    setActiveNotificationConversationSlug(activeSlug);
+    return () => setActiveNotificationConversationSlug(null);
+  }, [activeSlug]);
   // Live work-scope inventory (SSE-fed) for the active conversation, threaded
   // into FileExplorerPanel's Work scope section + collapsed-rail badge
   // (REQ-WSUI-010). Single-writer atom contract: only the SSE reducer writes
@@ -333,7 +354,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
           {children}
         </div>
         {isDesktop && <SubAgentViewerDock />}
-        {isDesktop && <CommandPalette conversations={conversations} activeConversation={activeConversation} />}
+        {isDesktop && <CommandPalette conversations={conversations} productConversations={productConversations} activeConversation={activeConversation} />}
         <Toast messages={toasts} onDismiss={dismissToast} />
       </div>
      </FileExplorerProvider>

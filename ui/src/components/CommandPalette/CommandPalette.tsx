@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
-import type { Conversation } from '../../api';
+import type { Conversation, ProductConversationListRow } from '../../api';
 import { api } from '../../api';
 import { ConversationSearchWarmingError } from '../../api';
 import './CommandPalette.css';
@@ -23,10 +23,11 @@ const SEARCH_DEBOUNCE_MS = 120;
 
 interface CommandPaletteProps {
   conversations: readonly Conversation[];
+  productConversations?: readonly ProductConversationListRow[];
   activeConversation: Conversation | null;
 }
 
-export function CommandPalette({ conversations, activeConversation }: CommandPaletteProps) {
+export function CommandPalette({ conversations, productConversations = [], activeConversation }: CommandPaletteProps) {
   const [state, setState] = useState<PaletteState>(initialState);
   const isDesktop = useIsDesktop();
   const navigate = useNavigate();
@@ -49,14 +50,23 @@ export function CommandPalette({ conversations, activeConversation }: CommandPal
     () => conversations.map(c => c.id).join(','),
     [conversations],
   );
+  const productConversationIdsKey = useMemo(
+    () => productConversations.map(row => `${row.product_conversation_id}:${row.updated_at}:${row.presentation.display_name}`).join(','),
+    [productConversations],
+  );
 
   // ConversationSource — recomputed only when the conversation set changes (by id key).
   // conversations ref changes every 5s (DesktopLayout poll) but conversationIdsKey is
   // stable across same-content polls; use key as the real dep, capture conversations.
   const conversationSource = useMemo(
-    () => createConversationSource(conversations, (slug) => navigate(`/c/${slug}`)),
+    () => createConversationSource(
+      conversations,
+      (slug) => navigate(`/c/${slug}`),
+      productConversations,
+      (route) => navigate(route),
+    ),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [conversationIdsKey, navigate],
+    [conversationIdsKey, productConversationIdsKey, navigate],
   );
   const conversationContentSource = useMemo(
     () => createConversationContentSource((slug) => navigate(`/c/${slug}`)),

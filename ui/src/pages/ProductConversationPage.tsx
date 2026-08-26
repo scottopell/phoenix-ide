@@ -25,6 +25,7 @@ import { OPEN_MESSAGE_VIEWER_EVENT, type OpenMessageViewerEventDetail } from '..
 import { useViewerSlot } from '../contexts/ViewerSlotContext';
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
 import { EmbeddedConversationPage, type EmbeddedConversationProjection } from './ConversationPage';
+import { useIsDesktop } from '../hooks';
 import './ProductConversationPage.css';
 
 const PAGE_SIZE = 100;
@@ -361,6 +362,7 @@ export function ProductConversationPage() {
 }
 
 function ProductConversationPageInner() {
+  const isDesktop = useIsDesktop();
   const { productConversationId } = useParams<{ productConversationId: string }>();
   const viewerSlot = useViewerSlot();
   const location = useLocation();
@@ -865,7 +867,7 @@ function ProductConversationPageInner() {
           </Suspense>
         )}
 
-        {snapshot.latest_transcript_row_id && aggregateWorkIdentity && (
+        {!isDesktop && snapshot.latest_transcript_row_id && aggregateWorkIdentity && (
           <aside className="product-conversation-page__dock">
             <ChainWorkScopeDock
               activeConvId={snapshot.latest_transcript_row_id}

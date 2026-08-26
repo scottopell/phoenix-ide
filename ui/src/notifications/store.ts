@@ -17,6 +17,11 @@ import {
 } from './policy';
 
 const coordinatorConversationIds = new Set<string>();
+let activeConversationSlugOverride: string | null = null;
+
+export function setActiveNotificationConversationSlug(slug: string | null): void {
+  activeConversationSlugOverride = slug;
+}
 
 export function registerCoordinatorNotificationTarget(conversationId: string): void {
   coordinatorConversationIds.add(conversationId);
@@ -34,6 +39,7 @@ export function getBrowserNotificationPermission(): BrowserPermission {
 }
 
 function currentActiveSlug(): string | null {
+  if (activeConversationSlugOverride) return activeConversationSlugOverride;
   if (typeof window === 'undefined') return null;
   const match = window.location.pathname.match(/^\/(?:c|global)\/([^/?#]+)/);
   return match?.[1] ? decodeURIComponent(match[1]) : null;

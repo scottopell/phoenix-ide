@@ -23,6 +23,7 @@ export {
   DEFAULT_NOTIFICATION_SETTINGS,
   AGENT_FINISHED_THRESHOLD_MS,
 } from './notifications/policy';
+export { setActiveNotificationConversationSlug } from './notifications/store';
 export type { NotificationEventType } from './notifications/policy';
 export { getBrowserNotificationPermission };
 
