@@ -17,6 +17,7 @@ pub mod workflow;
 // …) moved to the phoenix-core domain crate to break the db↔state_machine
 // cycle. Alias the module back as `schema` so the persistence logic in this
 // file and `phoenix_db::*` call sites resolve unchanged.
+use phoenix_core::domain::close::CloseAttemptId;
 use phoenix_core::domain::creation_protocol::{
     CreationClaim, CreationClaimToken, CreationError, CreationKind, CreationProtocolState,
     CreationStage, CreationStatus, CreationWorkerId,
@@ -1816,13 +1817,22 @@ impl Database {
     async fn conversation_retirement_blocker(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         scope_id: &WorkScopeId,
+        close_attempt_id: Option<&CloseAttemptId>,
     ) -> DbResult<Option<WorkScopeRetirementBlocker>> {
         let owners = sqlx::query(
-            "SELECT runtime_role, state, continued_in_conv_id
-             FROM conversations
-             WHERE work_scope_id = ?1 AND archived = 0",
+            "SELECT owner.runtime_role, owner.state, owner.continued_in_conv_id
+             FROM conversations owner
+             WHERE owner.work_scope_id = ?1
+               AND owner.archived = 0
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM close_attempt_members captured
+                   WHERE captured.attempt_id = ?2
+                     AND captured.conversation_id = owner.id
+               )",
         )
         .bind(scope_id.as_str())
+        .bind(close_attempt_id.map(CloseAttemptId::as_str))
         .fetch_all(&mut **tx)
         .await?;
         for owner in owners {
@@ -1861,6 +1871,34 @@ impl Database {
         precondition: WorkScopeRetirementPrecondition,
         reason: &str,
     ) -> DbResult<WorkScopeRetirementOutcome> {
+        self.retire_work_scope_with_close_attempt(precondition, reason, None)
+            .await
+    }
+
+    /// Retire a scope under an exact active Close attempt's captured authority.
+    ///
+    /// The attempt must have sealed its topology and captured the target scope.
+    /// Only conversations captured by that attempt are exempt from the current-user
+    /// and active-subagent ownership blocker; all other retirement safeguards apply.
+    /// # Errors
+    /// Returns a [`DbError`] when the supplied Close attempt is not active and
+    /// topology-sealed for the target scope, or the ordinary retirement operation fails.
+    pub async fn retire_work_scope_for_close_attempt(
+        &self,
+        attempt_id: &CloseAttemptId,
+        precondition: WorkScopeRetirementPrecondition,
+        reason: &str,
+    ) -> DbResult<WorkScopeRetirementOutcome> {
+        self.retire_work_scope_with_close_attempt(precondition, reason, Some(attempt_id))
+            .await
+    }
+
+    async fn retire_work_scope_with_close_attempt(
+        &self,
+        precondition: WorkScopeRetirementPrecondition,
+        reason: &str,
+        close_attempt_id: Option<&CloseAttemptId>,
+    ) -> DbResult<WorkScopeRetirementOutcome> {
         if reason.trim().is_empty() {
             return Err(DbError::Serialization(
                 "work scope retirement reason must not be empty".to_string(),
@@ -1868,6 +1906,29 @@ impl Database {
         }
         let scope_id = precondition.scope_id();
         let mut tx = self.pool.begin().await?;
+        if let Some(attempt_id) = close_attempt_id {
+            let authorized: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                     SELECT 1
+                     FROM close_obligations obligation
+                     JOIN close_attempt_scopes captured
+                       ON captured.attempt_id = obligation.attempt_id
+                     WHERE obligation.attempt_id = ?1
+                       AND obligation.phase <> 'completed'
+                       AND obligation.topology_sealed = 1
+                       AND captured.scope = ?2
+                 )",
+            )
+            .bind(attempt_id.as_str())
+            .bind(scope_id.as_str())
+            .fetch_one(&mut *tx)
+            .await?;
+            if !authorized {
+                return Err(DbError::CloseFoundationPrecondition(format!(
+                    "Close attempt {attempt_id} is not active with a sealed topology capturing work scope {scope_id}"
+                )));
+            }
+        }
         let lifecycle =
             sqlx::query_scalar::<_, String>("SELECT lifecycle FROM work_scopes WHERE id = ?1")
                 .bind(scope_id.as_str())
@@ -1879,7 +1940,9 @@ impl Database {
             return Ok(WorkScopeRetirementOutcome::AlreadyRetired);
         }
 
-        if let Some(blocker) = Self::conversation_retirement_blocker(&mut tx, scope_id).await? {
+        if let Some(blocker) =
+            Self::conversation_retirement_blocker(&mut tx, scope_id, close_attempt_id).await?
+        {
             tx.rollback().await?;
             return Ok(WorkScopeRetirementOutcome::Blocked(blocker));
         }
@@ -22923,6 +22986,155 @@ mod tests {
                 .unwrap(),
             WorkScopeRetirementOutcome::Blocked(WorkScopeRetirementBlocker::CurrentUserOwner)
         );
+    }
+
+    #[tokio::test]
+    async fn close_attempt_retires_its_captured_active_user_owner_scope() {
+        let db = Database::open_in_memory().await.unwrap();
+        let scope =
+            retirement_fixture(&db, "close-owner", RuntimeRole::User, &ConvState::Idle).await;
+        let owner = db.get_conversation("close-owner").await.unwrap();
+        let attempt = CloseAttemptId::parse("close-owner-attempt").unwrap();
+        db.begin_close_foundation(&owner.product_conversation_id, attempt.as_str())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.retire_work_scope_for_close_attempt(
+                &attempt,
+                no_live_resource(scope),
+                "Close retired captured scope",
+            )
+            .await
+            .unwrap(),
+            WorkScopeRetirementOutcome::Retired
+        );
+    }
+
+    #[tokio::test]
+    async fn close_attempt_does_not_exempt_active_owner_absent_from_its_capture() {
+        let db = Database::open_in_memory().await.unwrap();
+        let scope = retirement_fixture(
+            &db,
+            "captured-terminal-owner",
+            RuntimeRole::User,
+            &ConvState::Terminal,
+        )
+        .await;
+        let owner = db
+            .get_conversation("captured-terminal-owner")
+            .await
+            .unwrap();
+        let attempt = CloseAttemptId::parse("captured-owner-attempt").unwrap();
+        db.begin_close_foundation(&owner.product_conversation_id, attempt.as_str())
+            .await
+            .unwrap();
+        db.create_conversation_with_project(
+            "uncaptured-active-child",
+            "uncaptured-active-child",
+            "/tmp/retirement",
+            false,
+            Some("captured-terminal-owner"),
+            None,
+            None,
+            &ConvMode::Direct,
+            None,
+            None,
+            None,
+            phoenix_core::llm_language::LlmLanguage::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.retire_work_scope_for_close_attempt(
+                &attempt,
+                no_live_resource(scope),
+                "Close cannot retire uncaptured owner scope",
+            )
+            .await
+            .unwrap(),
+            WorkScopeRetirementOutcome::Blocked(WorkScopeRetirementBlocker::ActiveSubAgent)
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_close_attempt_cannot_authorize_scope_retirement() {
+        let db = Database::open_in_memory().await.unwrap();
+        let scope =
+            retirement_fixture(&db, "completed-owner", RuntimeRole::User, &ConvState::Idle).await;
+        let owner = db.get_conversation("completed-owner").await.unwrap();
+        let attempt = CloseAttemptId::parse("completed-attempt").unwrap();
+        db.begin_close_foundation(&owner.product_conversation_id, attempt.as_str())
+            .await
+            .unwrap();
+        for phase in [
+            "awaiting_stop_work_confirmation",
+            "settling_active_work",
+            "cancel_requested_during_settlement",
+        ] {
+            sqlx::query("UPDATE close_obligations SET phase = ?2 WHERE attempt_id = ?1")
+                .bind(attempt.as_str())
+                .bind(phase)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "UPDATE close_obligations
+             SET phase = 'completed', close_outcome = 'cancelled', completed_at = ?2
+             WHERE attempt_id = ?1",
+        )
+        .bind(attempt.as_str())
+        .bind(Utc::now().to_rfc3339())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let error = db
+            .retire_work_scope_for_close_attempt(
+                &attempt,
+                no_live_resource(scope),
+                "completed Close cannot retire scope",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DbError::CloseFoundationPrecondition(_)));
+    }
+
+    #[tokio::test]
+    async fn close_attempt_cannot_authorize_uncaptured_scope_retirement() {
+        let db = Database::open_in_memory().await.unwrap();
+        let captured_scope = retirement_fixture(
+            &db,
+            "captured-scope-owner",
+            RuntimeRole::User,
+            &ConvState::Terminal,
+        )
+        .await;
+        let uncaptured_scope = retirement_fixture(
+            &db,
+            "uncaptured-scope-owner",
+            RuntimeRole::User,
+            &ConvState::Idle,
+        )
+        .await;
+        let owner = db.get_conversation("captured-scope-owner").await.unwrap();
+        let attempt = CloseAttemptId::parse("single-scope-attempt").unwrap();
+        db.begin_close_foundation(&owner.product_conversation_id, attempt.as_str())
+            .await
+            .unwrap();
+        assert_ne!(captured_scope, uncaptured_scope);
+
+        let error = db
+            .retire_work_scope_for_close_attempt(
+                &attempt,
+                no_live_resource(uncaptured_scope),
+                "Close cannot retire uncaptured scope",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DbError::CloseFoundationPrecondition(_)));
     }
 
     #[tokio::test]
