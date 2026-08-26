@@ -24,6 +24,7 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use phoenix_core::process_identity::{current_process_identity, ProcessIdentity};
 use phoenix_core::work_scope::{ResourceAuthority, ResourceScopeKey};
 use tokio::sync::watch;
 use tokio::sync::{Mutex, RwLock};
@@ -32,6 +33,26 @@ use super::ring::{RingBuffer, RingLine};
 
 /// Default tombstone tail size (REQ-BASH-006: `TOMBSTONE_TAIL_LINES`).
 pub const TOMBSTONE_TAIL_LINES: usize = 2000;
+
+/// Child-environment marker that binds a spawned bash process to its durable
+/// Phoenix launch identity.
+pub const BASH_LAUNCH_UUID_ENV_VAR: &str = "PHOENIX_BASH_LAUNCH_UUID";
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BashLaunchIdentity {
+    pub process: ProcessIdentity,
+    pub launch_uuid: String,
+}
+
+impl BashLaunchIdentity {
+    #[must_use]
+    pub fn stable_identity(&self) -> String {
+        format!(
+            "pid:{}:start:{}:launch:{}",
+            self.process.pid, self.process.start_time, self.launch_uuid
+        )
+    }
+}
 
 /// Globally unique opaque Bash handle identifier.
 ///
@@ -179,6 +200,7 @@ pub enum ExitState {
 pub struct Handle {
     pub controller_scope: ResourceScopeKey,
     pub handle_id: HandleId,
+    pub launch_identity: BashLaunchIdentity,
     pub creator_conversation_id: String,
     pub authority: ResourceAuthority,
     pub cmd: String,
@@ -208,6 +230,7 @@ impl std::fmt::Debug for Handle {
         f.debug_struct("Handle")
             .field("controller_scope", &self.controller_scope)
             .field("handle_id", &self.handle_id)
+            .field("launch_identity", &self.launch_identity)
             .field("cmd", &self.cmd)
             .field("label", &self.label)
             .field("started_at", &self.started_at)
@@ -286,6 +309,34 @@ impl Handle {
         pid: u32,
         ring_bytes_cap: usize,
     ) -> Arc<Self> {
+        Self::new_live_for_actor_with_owner_and_launch_identity(
+            controller_scope,
+            handle_id,
+            Self::synthetic_launch_identity(pid),
+            creator_conversation_id,
+            authority,
+            cmd,
+            label,
+            pgid,
+            pid,
+            ring_bytes_cap,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::similar_names)]
+    #[must_use]
+    pub fn new_live_for_actor_with_owner_and_launch_identity(
+        controller_scope: ResourceScopeKey,
+        handle_id: HandleId,
+        launch_identity: BashLaunchIdentity,
+        creator_conversation_id: String,
+        authority: ResourceAuthority,
+        cmd: String,
+        label: Option<String>,
+        pgid: i32,
+        pid: u32,
+        ring_bytes_cap: usize,
+    ) -> Arc<Self> {
         let live = LiveData {
             pgid,
             pid,
@@ -295,6 +346,7 @@ impl Handle {
         Arc::new(Self {
             controller_scope,
             handle_id,
+            launch_identity,
             creator_conversation_id,
             authority,
             cmd,
@@ -305,6 +357,14 @@ impl Handle {
             exit_signal: tx,
             exit_observer: rx,
         })
+    }
+
+    fn synthetic_launch_identity(pid: u32) -> BashLaunchIdentity {
+        BashLaunchIdentity {
+            process: current_process_identity(pid)
+                .unwrap_or(ProcessIdentity { pid, start_time: 0 }),
+            launch_uuid: format!("synthetic-{}", uuid::Uuid::new_v4()),
+        }
     }
 
     /// Snapshot the current state. Cloning the `Arc` is cheap; callers
@@ -320,6 +380,15 @@ impl Handle {
     /// [`Self::transition_to_terminal`]).
     pub async fn kill_attempt(&self) -> Option<KillAttempt> {
         *self.kill_attempt.read().await
+    }
+
+    #[must_use]
+    pub fn stable_resource_identity(&self) -> String {
+        format!(
+            "handle:{}:launch:{}",
+            self.handle_id,
+            self.launch_identity.stable_identity()
+        )
     }
 
     /// Receiver for the exit watch. Each `wait`/`run` call clones a fresh

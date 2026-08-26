@@ -17,6 +17,7 @@
 //! concurrent spawns from both observing `count == cap - 1` and racing past
 //! the cap.
 
+use phoenix_core::process_identity::ProcessIdentity;
 use phoenix_core::work_scope::EffectiveResourceAccess;
 use std::collections::HashMap;
 use std::sync::{
@@ -29,7 +30,7 @@ use phoenix_core::work_scope::ResourceScopeKey;
 use thiserror::Error;
 use tokio::sync::{Notify, RwLock};
 
-use super::handle::{Handle, HandleId};
+use super::handle::{BashLaunchIdentity, Handle, HandleId};
 use super::ring::RING_BUFFER_BYTES;
 
 /// Per-`ResourceScopeKey` cap on `running` handles (REQ-BASH-005:
@@ -67,7 +68,19 @@ pub struct LiveHandleProcessGroup {
     pub work_scope: ResourceScopeKey,
     pub control_scope: ResourceScopeKey,
     pub handle_id: HandleId,
+    pub launch_identity: BashLaunchIdentity,
     pub pgid: i32,
+}
+
+impl LiveHandleProcessGroup {
+    #[must_use]
+    pub fn stable_resource_identity(&self) -> String {
+        format!(
+            "handle:{}:launch:{}",
+            self.handle_id,
+            self.launch_identity.stable_identity()
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -109,9 +122,21 @@ impl BashTeardownFence {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BashRetirementTarget {
     pub handle_id: HandleId,
+    pub launch_identity: BashLaunchIdentity,
     pub pgid: i32,
     pub pid: Option<u32>,
     pub kill_pending_kernel: bool,
+}
+
+impl BashRetirementTarget {
+    #[must_use]
+    pub fn stable_resource_identity(&self) -> String {
+        format!(
+            "handle:{}:launch:{}",
+            self.handle_id,
+            self.launch_identity.stable_identity()
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -681,6 +706,7 @@ impl BashHandleRegistry {
                         work_scope: owner.clone(),
                         control_scope: handle.controller_scope.clone(),
                         handle_id: handle.handle_id.clone(),
+                        launch_identity: handle.launch_identity.clone(),
                         pgid,
                     });
                 }
@@ -1077,6 +1103,7 @@ async fn snapshot_retirement_targets(handles: &[Arc<Handle>]) -> Vec<BashRetirem
         };
         targets.push(BashRetirementTarget {
             handle_id: handle.handle_id.clone(),
+            launch_identity: handle.launch_identity.clone(),
             pgid,
             pid: handle.live_pid().await,
             kill_pending_kernel: handle.is_kill_pending_kernel().await,
@@ -1110,6 +1137,38 @@ mod tests {
         )
     }
 
+    fn launch_identity(pid: u32, launch_uuid: &str) -> BashLaunchIdentity {
+        BashLaunchIdentity {
+            process: ProcessIdentity {
+                pid,
+                start_time: u128::from(pid).saturating_mul(100),
+            },
+            launch_uuid: launch_uuid.to_string(),
+        }
+    }
+
+    fn make_handle_with_identity(
+        scope_name: &str,
+        id: &str,
+        launch_uuid: &str,
+        process_group_id: i32,
+        process_id: u32,
+        ring_bytes_cap: usize,
+    ) -> Arc<Handle> {
+        Handle::new_live_for_actor_with_owner_and_launch_identity(
+            scope(scope_name),
+            HandleId::new(id),
+            launch_identity(process_id, launch_uuid),
+            "system".to_string(),
+            phoenix_core::work_scope::ResourceAuthority::Work,
+            format!("cmd for {id}"),
+            None,
+            process_group_id,
+            process_id,
+            ring_bytes_cap,
+        )
+    }
+
     fn make_handle_with_process(
         scope_name: &str,
         id: &str,
@@ -1117,11 +1176,10 @@ mod tests {
         process_id: u32,
         ring_bytes_cap: usize,
     ) -> Arc<Handle> {
-        Handle::new_live(
-            scope(scope_name),
-            HandleId::new(id),
-            format!("cmd for {id}"),
-            None,
+        make_handle_with_identity(
+            scope_name,
+            id,
+            &format!("launch-{id}"),
             process_group_id,
             process_id,
             ring_bytes_cap,
@@ -1570,9 +1628,17 @@ mod tests {
         assert_eq!(permit.work_scope, owner);
         assert_eq!(exact.len(), 2);
         assert_eq!(exact[0].handle_id, HandleId::new("b-1"));
+        assert_eq!(
+            exact[0].launch_identity,
+            launch_identity(2111, "launch-b-1")
+        );
         assert_eq!(exact[0].pgid, 1111);
         assert_eq!(exact[0].pid, Some(2111));
         assert_eq!(exact[1].handle_id, HandleId::new("b-2"));
+        assert_eq!(
+            exact[1].launch_identity,
+            launch_identity(3222, "launch-b-2")
+        );
         assert_eq!(exact[1].pgid, 2222);
         assert_eq!(exact[1].pid, Some(3222));
         assert!(registry.get_by_id(&HandleId::new("b-1")).await.is_none());
@@ -1812,6 +1878,59 @@ mod tests {
         assert_eq!(registry.scope_count().await, 1);
     }
 
+    #[tokio::test]
+    async fn stable_resource_identity_uses_launch_identity_not_handle_pointer_or_pgid() {
+        let a = make_handle_with_identity(
+            "conv-ident",
+            "b-same",
+            "launch-a",
+            777,
+            1234,
+            RING_BUFFER_BYTES,
+        );
+        let b = make_handle_with_identity(
+            "conv-ident",
+            "b-same",
+            "launch-b",
+            777,
+            1234,
+            RING_BUFFER_BYTES,
+        );
+        assert_ne!(a.stable_resource_identity(), b.stable_resource_identity());
+        assert_ne!(a.launch_identity, b.launch_identity);
+    }
+
+    #[tokio::test]
+    async fn snapshot_live_process_groups_carries_launch_identity_and_stable_resource_identity() {
+        let registry = BashHandleRegistry::new();
+        let owner = scope("conv-live-ident");
+        registry
+            .register_existing_handle(
+                &owner,
+                make_handle_with_identity(
+                    "conv-live-ident",
+                    "b-live",
+                    "launch-live",
+                    4444,
+                    5444,
+                    RING_BUFFER_BYTES,
+                ),
+            )
+            .await;
+
+        let groups = registry.snapshot_live_process_groups().await;
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].handle_id, HandleId::new("b-live"));
+        assert_eq!(
+            groups[0].launch_identity,
+            launch_identity(5444, "launch-live")
+        );
+        assert_eq!(
+            groups[0].stable_resource_identity(),
+            "handle:b-live:launch:pid:5444:start:544400:launch:launch-live"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
@@ -1888,13 +2007,21 @@ mod tests {
             .await;
 
         let current = registry.begin_retirement(&owner).await;
+        assert_ne!(
+            stale.exact_process_groups[0].stable_resource_identity(),
+            current.exact_process_groups[0].stable_resource_identity(),
+            "replacement must get a distinct durable identity even if a later process reuses fields"
+        );
         let stale_outcome = registry.complete_retirement(&stale).await;
         assert!(matches!(
             stale_outcome,
             BashRetirementOutcome::AbsenceVerified(_)
         ));
         assert!(
-            stale_child.try_wait().expect("try_wait stale").is_none(),
+            replacement_child
+                .try_wait()
+                .expect("try_wait replacement")
+                .is_none(),
             "stale permit must not kill any process group once a newer fence exists"
         );
         assert!(
