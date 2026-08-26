@@ -9,7 +9,6 @@ mod git_repository_reconciliation;
 mod migrations;
 mod product_conversation_read;
 pub mod retrieval;
-mod runtime_resource_instances;
 mod sqlite_native_statement;
 mod sqlite_telemetry;
 mod sqlite_workload;
@@ -48,7 +47,6 @@ pub use retrieval::{
     Fts5Retriever, MessageRetriever, ReconcileStats, RetrievalError, RetrievalGrouping,
     RetrievalMatchMode, RetrievalRequest, RetrievalScope, RetrievalVisibility, RetrievedChunk,
 };
-pub use runtime_resource_instances::*;
 pub use schema::*;
 pub use sqlite_workload::{
     abandoned_count, approximate_percentiles_from_histogram, operation_count, BucketCategoryTotals,

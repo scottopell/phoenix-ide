@@ -1163,9 +1163,6 @@ pub struct CloseExpectedRetirementResource {
     pub scope: WorkScopeId,
     pub snapshot: CloseRetirementSnapshot,
     pub resource: RetiredResourceIdentity,
-    /// Present only for a normalized runtime resource authority row. Worktree
-    /// and `WorkScope` targets have their own exact identity contracts.
-    pub runtime_resource_instance_id: Option<crate::runtime_resource::RuntimeResourceInstanceId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
