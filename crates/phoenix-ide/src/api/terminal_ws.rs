@@ -572,8 +572,10 @@ mod reclaim_tests {
     use super::{acquire_permit, ATTACH_PERMIT_TIMEOUT};
     use futures::channel::mpsc;
     use futures::StreamExt;
+    use phoenix_core::process_identity::ProcessIdentity;
     use phoenix_terminal::command_tracker::CommandTracker;
     use phoenix_terminal::relay::{run_relay, RelayConfig, RelayExit};
+    use phoenix_terminal::session::TerminalLaunchIdentity;
     use phoenix_terminal::session::{ShellIntegrationStatus, StopReason, TerminalHandle};
     use phoenix_terminal::test_helpers::full_command;
     use std::sync::{Arc, Mutex};
@@ -601,6 +603,13 @@ mod reclaim_tests {
         Arc::new(TerminalHandle {
             master_fd: owned_fd,
             child_pid: nix::unistd::Pid::from_raw(1),
+            launch_identity: TerminalLaunchIdentity {
+                process: ProcessIdentity {
+                    pid: 1,
+                    start_time: 1,
+                },
+                launch_uuid: "reclaim-test-launch".to_string(),
+            },
             child_kind: phoenix_terminal::TerminalChildKind::Shell,
             tracker: Arc::new(Mutex::new(CommandTracker::new("reclaim-test".to_string()))),
             shell_integration_status: Arc::new(Mutex::new(ShellIntegrationStatus::Unknown)),

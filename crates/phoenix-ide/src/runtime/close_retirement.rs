@@ -116,7 +116,7 @@ impl RuntimeManager {
         for target in &bash.exact_process_groups {
             resources.push(opaque_resource(
                 RetiredResourceKind::BashProcessGroup,
-                format!("handle:{}:pgid:{}", target.handle_id, target.pgid),
+                target.stable_resource_identity(),
             ));
         }
         if tmux.had_entry() {
@@ -313,7 +313,7 @@ impl RuntimeManager {
             .map(|target| target.scope.clone())
             .collect::<std::collections::BTreeSet<_>>();
         for scope in scopes {
-            let mut expected = runtime_targets
+            let expected = runtime_targets
                 .iter()
                 .filter(|target| target.scope == scope)
                 .map(|target| target.resource.clone())
