@@ -21,26 +21,16 @@ function pageHasSettled(root: HTMLElement, scenario: NewConversationScenario): b
   const model = root.querySelector<HTMLSelectElement>('.settings-select');
   const draft = root.querySelector<HTMLTextAreaElement>('.new-conv-textarea-mobile');
   const directoryReady = root.querySelector('.status-ok') !== null;
-  const workflowReady = Array.from(root.querySelectorAll('.workflow-card-content strong'))
-    .some((element) => element.textContent === 'Chat in a fresh worktree');
-  const projectSuggestionsReady = root.querySelectorAll('[aria-label="Suggested projects"]').length === 2;
-  const taskAvailabilityReady = Array.from(root.querySelectorAll('.workflow-card-content span'))
-    .some((element) => element.textContent === 'Pick a task file and approve the plan before Work mode.');
-  const branchMetadataReady = Array.from(root.querySelectorAll<HTMLButtonElement>('.new-conv-send'))
-    .every((button) => !button.disabled);
-  const metadataLoading = root.querySelector('.branch-combobox-loading') !== null
-    || Array.from(root.querySelectorAll('.workflow-card-content span'))
-      .some((element) => element.textContent === 'Loading tasks...');
+  const sendButtons = Array.from(root.querySelectorAll<HTMLButtonElement>('.new-conv-send'));
 
   return directory?.value === scenario.cwd
     && model?.value === scenario.models.default
     && draft?.value === scenario.draft
     && directoryReady
-    && workflowReady
-    && projectSuggestionsReady
-    && taskAvailabilityReady
-    && branchMetadataReady
-    && !metadataLoading;
+    && sendButtons.length === 2
+    && sendButtons.every((button) => !button.disabled)
+    && !root.textContent?.includes('Workflow')
+    && !root.textContent?.includes('Chat in a fresh worktree');
 }
 
 function NewConversationFixtureBody({ scenario }: Props) {

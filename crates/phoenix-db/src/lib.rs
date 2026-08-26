@@ -6792,6 +6792,7 @@ impl Database {
         let state_json = serde_json::to_string(&state).unwrap();
         let intent = ConversationCreationIntent {
             cwd: parent.cwd.clone(),
+            profile: None,
             model: parent.model.clone(),
             effort: parent.effort,
             text: snapshot.seed_message(),
@@ -12741,6 +12742,7 @@ mod tests {
             message_id: Some(format!("message-{job_id}")),
             intent: ConversationCreationIntent {
                 cwd: "/tmp".to_string(),
+                profile: None,
                 model: None,
                 effort: None,
                 text: "test creation".to_string(),

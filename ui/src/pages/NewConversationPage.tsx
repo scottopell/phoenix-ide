@@ -61,24 +61,17 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Inline reference autocomplete (@file, ./path, /skill). Discovery resolves
-  // against the same root the first message will expand against: for a
-  // branch/managed workflow that is the chosen branch's committed tree (what
-  // the conversation's fresh worktree will hold), not the current checkout —
-  // so suggestions never point at uncommitted/untracked files that would 422 on
-  // send. `mode`/`baseBranch` come from the same `submission` mapping the create
-  // call uses, so the two cannot drift. The composer renders both a desktop and
-  // a mobile textarea (one hidden by CSS); `inlineRefTextarea` tracks whichever
-  // is focused so trigger detection reads the right caret.
+  // Inline reference autocomplete (@file, ./path, /skill). The composer renders
+  // both a desktop and a mobile textarea (one hidden by CSS);
+  // `inlineRefTextarea` tracks whichever is focused so trigger detection reads
+  // the right caret.
   const inlineRefTextarea = useRef<HTMLTextAreaElement | null>(null);
-  const inlineReferenceRootReady = conv.dirStatus === 'exists'
-    && conv.isGitDir !== null
-    && (conv.submission.mode === 'direct' || conv.submission.baseBranch !== null);
+  const inlineReferenceRootReady = conv.dirStatus === 'exists' && conv.isGitDir !== null;
   const ir = useInlineReferences({
     cwd: conv.cwd,
     discoveryReady: inlineReferenceRootReady,
-    mode: conv.submission.mode,
-    baseBranch: conv.submission.baseBranch,
+    mode: 'direct',
+    baseBranch: null,
     // The new-conversation composer's identity is its directory: switching the
     // chosen directory resets the dropdown / inline error.
     scopeKey: conv.cwd,
@@ -207,20 +200,14 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   const createStatusText = conv.creating
     ? conv.dirStatus === 'will-create'
       ? 'Creating folder…'
-      : conv.submission.mode === 'managed'
-        ? 'Setting up worktree…'
-        : conv.submission.mode === 'branch'
-          ? 'Opening branch conversation…'
-          : 'Creating conversation…'
+      : 'Creating conversation…'
     : null;
   // Until an LLM is configured, the only meaningful action is the sign-in
   // CTA inside ConversationSettings. Hide the message composer + actions so
   // the user isn't tempted to type into a draft that can't be sent.
   const llmReady = conv.models === null || conv.models.llm_configured;
 
-  const inputPlaceholder = conv.workflow.kind === 'planFromTask'
-    ? 'Optional notes for this task…'
-    : 'What would you like to work on?';
+  const inputPlaceholder = 'What would you like to work on?';
 
   return (
     <div
@@ -261,23 +248,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
             models={conv.models}
             showAllModels={conv.showAllModels}
             setShowAllModels={conv.setShowAllModels}
-            projectDirs={conv.projectDirs}
-            isGitDir={conv.isGitDir}
             error={conv.error}
-            workflow={conv.workflow}
-            setWorkflow={conv.setWorkflow}
-            tasks={conv.tasks}
-            taskAvailabilityLoading={conv.taskAvailabilityLoading}
-            taskAvailable={conv.taskAvailable}
-            tasksLoading={conv.tasksLoading}
-            tasksLoaded={conv.tasksLoaded}
-            loadProjectTasks={conv.loadProjectTasks}
-            branches={conv.branches}
-            currentBranch={conv.currentBranch}
-            gitMetadataLoading={conv.gitMetadataLoading}
-            branchSearch={conv.branchSearch}
-            setBranchSearch={conv.setBranchSearch}
-            branchSearchLoading={conv.branchSearchLoading}
           />
 
           {/* Main input — hidden until an LLM is configured */}
@@ -346,23 +317,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
             models={conv.models}
             showAllModels={conv.showAllModels}
             setShowAllModels={conv.setShowAllModels}
-            isGitDir={conv.isGitDir}
-            projectDirs={conv.projectDirs}
             error={conv.error}
-            workflow={conv.workflow}
-            setWorkflow={conv.setWorkflow}
-            tasks={conv.tasks}
-            taskAvailabilityLoading={conv.taskAvailabilityLoading}
-            taskAvailable={conv.taskAvailable}
-            tasksLoading={conv.tasksLoading}
-            tasksLoaded={conv.tasksLoaded}
-            loadProjectTasks={conv.loadProjectTasks}
-            branches={conv.branches}
-            currentBranch={conv.currentBranch}
-            gitMetadataLoading={conv.gitMetadataLoading}
-            branchSearch={conv.branchSearch}
-            setBranchSearch={conv.setBranchSearch}
-            branchSearchLoading={conv.branchSearchLoading}
           />
         </div>
       </main>

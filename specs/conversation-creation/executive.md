@@ -6,7 +6,7 @@ Conversation creation returns a durable shell before filesystem, Git, expansion,
 
 ## Current Reality
 
-The branch includes the shell-first API and UI flow. The durable protocol vocabulary, pure transition function, `CreationClaim`/`CompleteCreation` state-machine hooks, and deterministic operation-sequence tests are present (`crates/phoenix-state-machine/src/creation_protocol.rs`, `transition.rs`). Production persistence and worker orchestration still use the earlier unguarded phase-update model and remain to be migrated before the feature is mergeable. Git-backed creation also still enters through legacy Project/mode fields; hidden `GitRepository` identity, singular `WorkScope.repository` attachment, detached-default creation without a mode/branch picker, and typed unresolved default-branch evidence are normative targets rather than shipped authority.
+The branch includes the shell-first API and UI flow. The durable protocol vocabulary, pure transition function, `CreationClaim`/`CompleteCreation` state-machine hooks, and deterministic operation-sequence tests are present (`crates/phoenix-state-machine/src/creation_protocol.rs`, `transition.rs`). Production persistence and worker orchestration still use the earlier unguarded phase-update model and remain to be migrated before the feature is mergeable. Ordinary web creation enters through a directory-first typed ProductConversation request and provisions Git-backed conversations in detached-default worktrees without Project, mode, or branch inputs. Hidden `GitRepository` identity, singular `WorkScope.repository` attachment, and durable typed unresolved default-branch evidence remain normative targets rather than shipped authority.
 
 ## Verification Coverage
 
@@ -25,7 +25,7 @@ The branch includes the shell-first API and UI flow. The durable protocol vocabu
 
 ## Rehomed Project Requirements
 
-REQ-PROJ-000, REQ-PROJ-001, REQ-PROJ-002, REQ-PROJ-005, REQ-PROJ-005A, REQ-PROJ-017, REQ-PROJ-022, REQ-PROJ-028, and REQ-PROJ-029 retain their immutable IDs in this spec. Their unified Git-backed creation behavior is not fully implemented while legacy Project and mode surfaces remain reader/writer authority.
+REQ-PROJ-000, REQ-PROJ-001, REQ-PROJ-002, REQ-PROJ-005, REQ-PROJ-005A, REQ-PROJ-017, REQ-PROJ-022, REQ-PROJ-028, and REQ-PROJ-029 retain their immutable IDs in this spec. Their unified Git-backed creation behavior is partially implemented by the ordinary web creation path; legacy compatibility creation remains until its separately tracked retirement.
 
 ## Merge Gate
 

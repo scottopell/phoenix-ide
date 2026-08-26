@@ -363,8 +363,16 @@ impl ConversationCreationPhase {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationCreationProfile {
+    DirectoryFirstProduct,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConversationCreationIntent {
     pub cwd: String,
+    #[serde(default)]
+    pub profile: Option<ConversationCreationProfile>,
     #[serde(default)]
     pub model: Option<String>,
     // owned: pre-feature creation jobs had no effort; None correctly follows the model default.

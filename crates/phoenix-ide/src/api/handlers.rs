@@ -31,14 +31,16 @@ use super::types::{
     ConversationMessageRangeResponse, ConversationMessageSliceResponse,
     ConversationMessagesAroundResponse, ConversationResponse, ConversationRouteResponse,
     ConversationSearchQuery, ConversationSearchResponse, ConversationWithMessagesResponse,
-    CreateConversationRequest, CredentialStatusApi, DirectoryEntry, ErrorResponse,
-    ExpansionErrorResponse, FileEntry, FileSearchEntry, FileSearchQuery, FileSearchResponse,
-    FileViewerKind, ListDirectoryResponse, ListFilesResponse, MkdirResponse, ModelsResponse,
-    NotificationSettingsRequest, ProductConversationRouteResponse, ProjectFileSearchQuery,
-    ProjectSkillsQuery, ProjectTasksQuery, ReadFileResponse, ReconcileAcceptedMessagesRequest,
-    ReconcileAcceptedMessagesResponse, RenameRequest, SkillEntry, SkillsResponse, SuccessResponse,
-    SuggestRequest, SuggestResponse, SystemPromptResponse, TaskCountQuery, TaskCountResponse,
-    TaskEntry, TasksResponse, UpgradeModelRequest, ValidateCwdResponse,
+    CreateConversationRequest, CreateProductConversationRequest, CredentialStatusApi,
+    DirectoryEntry, ErrorResponse, ExpansionErrorResponse, FileEntry, FileSearchEntry,
+    FileSearchQuery, FileSearchResponse, FileViewerKind, ListDirectoryResponse, ListFilesResponse,
+    MkdirResponse, ModelsResponse, NotificationSettingsRequest,
+    ProductConversationCreateAcceptedResponse, ProductConversationRouteResponse,
+    ProjectFileSearchQuery, ProjectSkillsQuery, ProjectTasksQuery, ReadFileResponse,
+    ReconcileAcceptedMessagesRequest, ReconcileAcceptedMessagesResponse, RenameRequest, SkillEntry,
+    SkillsResponse, SuccessResponse, SuggestRequest, SuggestResponse, SystemPromptResponse,
+    TaskCountQuery, TaskCountResponse, TaskEntry, TasksResponse, UpgradeModelRequest,
+    ValidateCwdResponse,
 };
 use super::AppState;
 use crate::api::terminal_ws::{terminal_ws_global_handler, terminal_ws_handler};
@@ -138,6 +140,10 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/product-conversations/:reference/route",
             get(get_product_conversation_route),
+        )
+        .route(
+            "/api/product-conversations/new",
+            post(create_product_conversation),
         )
         .route(
             "/api/global/coordinator",
@@ -1888,11 +1894,58 @@ async fn create_conversation(
     create_conversation_with_id(state, req, Vec::new()).await
 }
 
+async fn create_product_conversation(
+    State(state): State<AppState>,
+    Json(req): Json<CreateProductConversationRequest>,
+) -> Result<Json<ProductConversationCreateAcceptedResponse>, AppError> {
+    Ok(Json(create_product_conversation_with_id(state, req).await?))
+}
+
+async fn create_product_conversation_with_id(
+    state: AppState,
+    req: CreateProductConversationRequest,
+) -> Result<ProductConversationCreateAcceptedResponse, AppError> {
+    let Json(response) = create_conversation_from_request(
+        state.clone(),
+        req.into(),
+        Vec::new(),
+        Some(phoenix_core::domain::db_schema::ConversationCreationProfile::DirectoryFirstProduct),
+    )
+    .await?;
+    let transcript_row_id = response.conversation["id"]
+        .as_str()
+        .ok_or_else(|| AppError::Internal("conversation response lacked id".to_string()))?
+        .to_string();
+    let product_conversation_id = state
+        .db
+        .get_conversation(&transcript_row_id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+        .product_conversation_id
+        .as_str()
+        .to_string();
+    Ok(ProductConversationCreateAcceptedResponse {
+        canonical_route: format!("/product-conversations/{product_conversation_id}"),
+        product_conversation_id,
+        transcript_row_id,
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 async fn create_conversation_with_id(
     state: AppState,
+    req: CreateConversationRequest,
+    raw_files: Vec<RawAttachmentPart>,
+) -> Result<Json<ConversationResponse>, AppError> {
+    create_conversation_from_request(state, req, raw_files, None).await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn create_conversation_from_request(
+    state: AppState,
     mut req: CreateConversationRequest,
     raw_files: Vec<RawAttachmentPart>,
+    profile: Option<phoenix_core::domain::db_schema::ConversationCreationProfile>,
 ) -> Result<Json<ConversationResponse>, AppError> {
     let _owner = state.runtime.acquire_local_authority_pass().map_err(|()| {
         AppError::Internal("runtime admission closed after fatal local authority loss".to_string())
@@ -2088,6 +2141,7 @@ async fn create_conversation_with_id(
 
     let intent = crate::db::ConversationCreationIntent {
         cwd: effective_cwd.clone(),
+        profile,
         model: intent_model,
         effort: req.effort,
         text: persisted_prompt_text,
@@ -8479,6 +8533,7 @@ mod conversation_cwd_validation_tests {
                 message_id: Some("msg-existing-shell".to_string()),
                 intent: crate::db::ConversationCreationIntent {
                     cwd: tmp.path().to_string_lossy().to_string(),
+                    profile: None,
                     model: None,
                     effort: None,
                     text: "retry".to_string(),
@@ -8582,6 +8637,7 @@ mod conversation_cwd_validation_tests {
                 message_id: Some("msg-original".to_string()),
                 intent: crate::db::ConversationCreationIntent {
                     cwd: "/tmp".to_string(),
+                    profile: None,
                     model: None,
                     effort: None,
                     text: "original".to_string(),
@@ -14288,6 +14344,54 @@ mod regenerate_conversation_name_tests {
     }
 }
 
+#[cfg(test)]
+mod product_conversation_creation_tests {
+    use super::*;
+    use crate::api::types::{CreateProductConversationRequest, ImageAttachment};
+
+    #[tokio::test]
+    async fn accepted_response_uses_product_route_and_identity() {
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        let temp_dir = tempfile::tempdir().expect("temp directory");
+        let conversation_id = uuid::Uuid::new_v4().to_string();
+        let request = CreateProductConversationRequest {
+            conversation_id: Some(conversation_id.clone()),
+            cwd: temp_dir.path().to_string_lossy().to_string(),
+            model: "claude-sonnet-5".to_string(),
+            effort: None,
+            objective: "Build the feature".to_string(),
+            message_id: "msg-product-1".to_string(),
+            images: vec![ImageAttachment {
+                data: "Zm9v".to_string(),
+                media_type: "image/png".to_string(),
+            }],
+            _settings: serde_json::Map::new(),
+        };
+
+        let response = create_product_conversation_with_id(state.clone(), request)
+            .await
+            .expect("accepted response");
+        assert_eq!(response.transcript_row_id, conversation_id);
+        assert_eq!(
+            response.canonical_route,
+            format!(
+                "/product-conversations/{}",
+                response.product_conversation_id
+            )
+        );
+
+        let persisted = state
+            .db
+            .get_conversation(&response.transcript_row_id)
+            .await
+            .expect("persisted conversation");
+        assert_eq!(
+            response.product_conversation_id,
+            persisted.product_conversation_id.as_str()
+        );
+    }
+}
+
 /// Task 02713: `upgrade_conversation_model` must accept the change from
 /// `Idle` and `Error`, and reject it while an operation is in flight.
 /// Exercises the real axum handler end to end against an in-memory DB.
@@ -15189,6 +15293,7 @@ mod attachment_storage_tests {
         let stored_path = "/tmp/phoenix-creation-job-attachment.txt".to_string();
         let intent = crate::db::ConversationCreationIntent {
             cwd: "/tmp".to_string(),
+            profile: None,
             model: Some("mock".to_string()),
             effort: None,
             text: "with attachment".to_string(),

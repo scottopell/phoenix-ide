@@ -712,6 +712,26 @@ export interface ImageData {
   media_type: string;
 }
 
+export interface ProductConversationCreateSettings {
+  [key: string]: unknown;
+}
+
+export interface CreateProductConversationRequest {
+  cwd: string;
+  objective: string;
+  message_id: string;
+  conversation_id: string;
+  model: string;
+  effort?: ModelEffort | null;
+  images: ImageData[];
+  settings: ProductConversationCreateSettings;
+}
+
+export interface CreateProductConversationResponse {
+  product_conversation_id: string;
+  canonical_route: string;
+}
+
 export interface FileAttachment {
   original_name: string;
   media_type: string;
@@ -1540,6 +1560,24 @@ export const api = {
     const resp = await fetch('/api/conversations');
     if (!resp.ok) throw new Error('Failed to list conversations');
     return (await resp.json()).conversations;
+  },
+
+  async createProductConversation(
+    request: CreateProductConversationRequest,
+  ): Promise<CreateProductConversationResponse> {
+    const resp = await fetch('/api/product-conversations/new', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({})) as { error?: string };
+      if (resp.status === 422) {
+        throw new ExpansionError(err as ExpansionErrorDetail);
+      }
+      throw new Error(err.error || 'Failed to create product conversation');
+    }
+    return resp.json();
   },
 
   async createConversation(

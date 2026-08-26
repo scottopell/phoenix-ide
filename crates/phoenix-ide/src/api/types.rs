@@ -43,6 +43,43 @@ pub struct CreateConversationRequest {
     pub seed_label: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateProductConversationRequest {
+    #[serde(default)]
+    pub conversation_id: Option<String>,
+    pub cwd: String,
+    pub model: String,
+    #[serde(default)]
+    pub effort: Option<phoenix_core::domain::llm_types::ModelEffort>,
+    pub objective: String,
+    pub message_id: String,
+    #[serde(default)]
+    pub images: Vec<ImageAttachment>,
+    #[serde(default, rename = "settings")]
+    pub _settings: serde_json::Map<String, serde_json::Value>,
+}
+
+impl From<CreateProductConversationRequest> for CreateConversationRequest {
+    fn from(value: CreateProductConversationRequest) -> Self {
+        Self {
+            conversation_id: value.conversation_id,
+            cwd: value.cwd,
+            model: value.model,
+            effort: value.effort,
+            text: value.objective,
+            message_id: value.message_id,
+            images: value.images,
+            files: Vec::new(),
+            mode: None,
+            base_branch: None,
+            checkout_ref: None,
+            seed_parent_id: None,
+            seed_label: None,
+        }
+    }
+}
+
 /// Request body for one-shot shell-command suggestion (`POST /api/suggest`).
 /// Stateless: no conversation, no tools, no persistence.
 #[derive(Debug, Deserialize)]
@@ -351,6 +388,48 @@ pub struct ConversationRouteResponse {
 #[derive(Debug, Serialize)]
 pub struct ProductConversationRouteResponse {
     pub transcript_row_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProductConversationCreateAcceptedResponse {
+    pub product_conversation_id: String,
+    pub canonical_route: String,
+    pub transcript_row_id: String,
+}
+
+#[cfg(test)]
+mod create_product_conversation_request_tests {
+    use super::CreateProductConversationRequest;
+
+    #[test]
+    fn rejects_legacy_creation_fields() {
+        for field in [
+            "mode",
+            "base_branch",
+            "checkout_ref",
+            "project_id",
+            "branch_name",
+        ] {
+            let payload = format!(
+                r#"{{
+                    "conversation_id":"11111111-1111-1111-1111-111111111111",
+                    "cwd":"/tmp/project",
+                    "model":"claude-sonnet-4-5",
+                    "objective":"Ship it",
+                    "message_id":"msg-1",
+                    "images":[],
+                    "settings":{{}},
+                    "{field}":"legacy"
+                }}"#
+            );
+            let err = serde_json::from_str::<CreateProductConversationRequest>(&payload)
+                .expect_err("legacy field must be rejected");
+            assert!(
+                err.to_string().contains(field),
+                "missing field name in error: {err}"
+            );
+        }
+    }
 }
 
 /// Response with conversation and messages
