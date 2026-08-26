@@ -15,7 +15,11 @@
 
 use proptest::prelude::*;
 
-use super::session::{ActiveTerminalInsertError, ActiveTerminals, Dims, TerminalRetirementOutcome};
+use super::session::{
+    ActiveTerminalInsertError, ActiveTerminals, Dims, TerminalLaunchIdentity,
+    TerminalRetirementOutcome,
+};
+use phoenix_core::process_identity::ProcessIdentity;
 use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -28,15 +32,30 @@ fn arb_work_scope() -> impl Strategy<Value = ResourceScopeKey> {
     "[a-z0-9]{8}-[a-z0-9]{4}".prop_map(|id| scope(&id))
 }
 
+fn dummy_launch_identity(pid: u32) -> TerminalLaunchIdentity {
+    TerminalLaunchIdentity {
+        process: ProcessIdentity {
+            pid,
+            start_time: u128::from(pid) * 10,
+        },
+        launch_uuid: format!("launch-{pid}"),
+    }
+}
+
 /// Build a minimal `TerminalHandle` for registry tests.
 /// Uses /dev/null as a stand-in fd since these tests never do PTY I/O.
 fn dummy_handle(dims: Dims) -> super::session::TerminalHandle {
-    dummy_handle_kind(dims, super::session::TerminalChildKind::Shell)
+    dummy_handle_with_pid(dims, 1)
+}
+
+fn dummy_handle_with_pid(dims: Dims, pid: i32) -> super::session::TerminalHandle {
+    dummy_handle_kind(dims, super::session::TerminalChildKind::Shell, pid)
 }
 
 fn dummy_handle_kind(
     _dims: Dims,
     child_kind: super::session::TerminalChildKind,
+    pid: i32,
 ) -> super::session::TerminalHandle {
     use crate::command_tracker::CommandTracker;
     use crate::session::{ShellIntegrationStatus, StopReason};
@@ -57,7 +76,8 @@ fn dummy_handle_kind(
 
     super::session::TerminalHandle {
         master_fd: owned_fd,
-        child_pid: nix::unistd::Pid::from_raw(1), // init — never reaped in tests
+        child_pid: nix::unistd::Pid::from_raw(pid), // synthetic test pid — never reaped
+        launch_identity: dummy_launch_identity(pid as u32),
         child_kind,
         tracker: std::sync::Arc::new(std::sync::Mutex::new(CommandTracker::new(
             "test-session".to_string(),
@@ -88,13 +108,13 @@ fn shell_session_snapshot_excludes_tmux_clients() {
     registry
         .try_insert(
             shell_scope,
-            dummy_handle_kind(dims, TerminalChildKind::Shell),
+            dummy_handle_kind(dims, TerminalChildKind::Shell, 1),
         )
         .expect("shell insert");
     registry
         .try_insert(
             tmux_scope,
-            dummy_handle_kind(dims, TerminalChildKind::TmuxClient),
+            dummy_handle_kind(dims, TerminalChildKind::TmuxClient, 1),
         )
         .expect("tmux insert");
 
@@ -188,8 +208,8 @@ async fn complete_retirement_requires_exact_instance_and_reopen_for_admission() 
         registry.complete_retirement(&permit).await,
         TerminalRetirementOutcome::Residual {
             reason: format!(
-                "exact terminal instance pid={} remained current after teardown",
-                first_identity.child_pid
+                "exact terminal instance {} remained current after teardown",
+                first_identity.stable_identity()
             ),
         },
         "stale generation must not retire the still-current instance"
@@ -233,7 +253,7 @@ async fn complete_retirement_verifies_absence_without_touching_replacement() {
     let dims = Dims { cols: 80, rows: 24 };
 
     registry
-        .try_insert_exact(scope.clone(), dummy_handle(dims))
+        .try_insert_exact(scope.clone(), dummy_handle_with_pid(dims, 1))
         .expect("original insert");
     let permit = registry.begin_retirement(&scope);
 
@@ -241,7 +261,7 @@ async fn complete_retirement_verifies_absence_without_touching_replacement() {
     let replacement = registry.begin_retirement(&scope);
     registry.reopen_after_repair(&scope);
     registry
-        .try_insert_exact(scope.clone(), dummy_handle(dims))
+        .try_insert_exact(scope.clone(), dummy_handle_with_pid(dims, 2))
         .expect("replacement insert after legacy clear");
 
     assert_eq!(
@@ -490,7 +510,7 @@ proptest! {
 fn build_env_contains_required_variables() {
     use super::spawn::build_env;
 
-    let env = build_env("/bin/bash");
+    let env = build_env("/bin/bash", "test-launch");
     let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
 
     for required in &["TERM", "COLORTERM", "HOME", "USER", "SHELL", "PATH", "LANG"] {
@@ -504,7 +524,7 @@ fn build_env_contains_required_variables() {
 #[test]
 fn build_env_term_is_xterm_256color() {
     use super::spawn::build_env;
-    let env = build_env("/bin/bash");
+    let env = build_env("/bin/bash", "test-launch");
     let term = env
         .iter()
         .find(|(k, _)| k == "TERM")
@@ -519,7 +539,7 @@ fn build_env_term_is_xterm_256color() {
 #[test]
 fn build_env_colorterm_is_truecolor() {
     use super::spawn::build_env;
-    let env = build_env("/bin/bash");
+    let env = build_env("/bin/bash", "test-launch");
     let ct = env
         .iter()
         .find(|(k, _)| k == "COLORTERM")
@@ -530,7 +550,7 @@ fn build_env_colorterm_is_truecolor() {
 #[test]
 fn build_env_shell_matches_argument() {
     use super::spawn::build_env;
-    let env = build_env("/usr/bin/zsh");
+    let env = build_env("/usr/bin/zsh", "test-launch");
     let shell = env
         .iter()
         .find(|(k, _)| k == "SHELL")
@@ -545,7 +565,7 @@ fn build_env_shell_matches_argument() {
 #[test]
 fn build_env_lang_is_utf8() {
     use super::spawn::build_env;
-    let env = build_env("/bin/bash");
+    let env = build_env("/bin/bash", "test-launch");
     let lang = env
         .iter()
         .find(|(k, _)| k == "LANG")
@@ -556,7 +576,7 @@ fn build_env_lang_is_utf8() {
 #[test]
 fn build_env_no_duplicate_keys() {
     use super::spawn::build_env;
-    let env = build_env("/bin/bash");
+    let env = build_env("/bin/bash", "test-launch");
     let mut keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
     let original_len = keys.len();
     keys.dedup();
@@ -571,6 +591,46 @@ fn build_env_no_duplicate_keys() {
 //
 // These proptests verify REQ-TERM-021 invariants under adversarial byte
 // sequences and arbitrary delivery chunking.
+
+#[test]
+fn terminal_instance_stable_identity_excludes_arc_address_but_exact_match_keeps_it() {
+    let dims = Dims { cols: 80, rows: 24 };
+    let handle = std::sync::Arc::new(dummy_handle(dims));
+    let identity = super::session::TerminalInstanceIdentity::from_handle(&handle);
+
+    let cloned_handle = std::sync::Arc::clone(&handle);
+    assert!(identity.matches_handle(&cloned_handle));
+
+    let same_launch_new_arc = std::sync::Arc::new(dummy_handle(dims));
+    let same_launch_identity =
+        super::session::TerminalInstanceIdentity::from_handle(&same_launch_new_arc);
+    assert_eq!(
+        identity.stable_identity(),
+        same_launch_identity.stable_identity(),
+        "stable identity must come from durable launch identity, not Arc address"
+    );
+    assert!(
+        !identity.matches_handle(&same_launch_new_arc),
+        "exact in-process matching must still distinguish different Arc instances"
+    );
+    assert_eq!(
+        identity.process_identity(),
+        same_launch_identity.process_identity(),
+        "durable process identity should be separable from in-process handle identity"
+    );
+}
+
+#[test]
+fn build_env_carries_terminal_launch_uuid_marker() {
+    use super::spawn::{build_env, TERMINAL_LAUNCH_UUID_ENV_VAR};
+
+    let env = build_env("/bin/bash", "launch-uuid-test");
+    let launch_uuid = env
+        .iter()
+        .find(|(k, _)| k == TERMINAL_LAUNCH_UUID_ENV_VAR)
+        .map(|(_, v)| v.as_str());
+    assert_eq!(launch_uuid, Some("launch-uuid-test"));
+}
 
 #[cfg(test)]
 mod command_tracker_proptest {

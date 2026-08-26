@@ -7,11 +7,15 @@
 //! two paths; only the argv differs.
 
 use super::command_tracker::CommandTracker;
-use super::session::{Dims, ShellIntegrationStatus, StopReason, TerminalChildKind, TerminalHandle};
+use super::session::{
+    Dims, ShellIntegrationStatus, StopReason, TerminalChildKind, TerminalHandle,
+    TerminalLaunchIdentity,
+};
 use nix::{
     pty::openpty,
     unistd::{close, execve, fork, setsid, ForkResult},
 };
+use phoenix_core::process_identity::current_process_identity;
 use std::{
     ffi::CString,
     os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd},
@@ -37,6 +41,8 @@ pub struct PtyEnvInjection {
 }
 
 static ENV_INJECTION: OnceLock<PtyEnvInjection> = OnceLock::new();
+
+pub(crate) const TERMINAL_LAUNCH_UUID_ENV_VAR: &str = "PHOENIX_TERMINAL_LAUNCH_UUID";
 
 /// Install the server-wide PTY env injection. First call wins; later calls are
 /// ignored (startup runs once).
@@ -108,6 +114,7 @@ pub fn spawn_pty(
     plan: PtyExecPlan,
 ) -> Result<TerminalHandle, String> {
     let child_kind = plan.child_kind();
+    let launch_uuid = uuid::Uuid::new_v4().to_string();
 
     // --- PTY creation --------------------------------------------------------
     let pty = openpty(None, None).map_err(|e| format!("openpty: {e}"))?;
@@ -175,8 +182,8 @@ pub fn spawn_pty(
             // tmux's nesting refusal ("sessions should be nested with
             // care"). The shell branch keeps the v1 env unchanged.
             let env_pairs = match &plan {
-                PtyExecPlan::Tmux { .. } => build_env_for_tmux(&shell_path),
-                PtyExecPlan::Shell => build_env(&shell_path),
+                PtyExecPlan::Tmux { .. } => build_env_for_tmux(&shell_path, &launch_uuid),
+                PtyExecPlan::Shell => build_env(&shell_path, &launch_uuid),
             };
             let env_cstrings: Vec<CString> = env_pairs
                 .iter()
@@ -262,16 +269,20 @@ pub fn spawn_pty(
             // Forget the openpty OwnedFd to avoid double-close.
             std::mem::forget(pty.master);
 
-            // Use conversation_id placeholder; ws.rs updates tracker session when
-            // the handle is registered. The conversation_id is not available at spawn
-            // time, so we use the child PID as a unique session identifier.
-            let session_id = child.to_string();
+            let process = current_process_identity(child.as_raw() as u32)
+                .ok_or_else(|| format!("unable to capture process identity for pid {}", child))?;
+            let launch_identity = TerminalLaunchIdentity {
+                process,
+                launch_uuid,
+            };
+            let session_id = launch_identity.stable_identity();
 
             let (stop_tx, _stop_rx) = tokio::sync::watch::channel(StopReason::Running);
 
             Ok(TerminalHandle {
                 master_fd,
                 child_pid: child,
+                launch_identity,
                 child_kind,
                 tracker: Arc::new(Mutex::new(CommandTracker::new(session_id))),
                 shell_integration_status: Arc::new(Mutex::new(ShellIntegrationStatus::Unknown)),
@@ -315,7 +326,7 @@ pub fn set_winsize_raw(fd: RawFd, dims: Dims) -> Result<(), String> {
 /// fixed allowlist of safe interactive session vars copied from the server
 /// process ([`PTY_ENV_ALLOWLIST`]). Secret-bearing vars (LLM API keys, gateway
 /// config, `PHOENIX_*`) are never on that list.
-pub(crate) fn build_env(shell_path: &str) -> Vec<(String, String)> {
+pub(crate) fn build_env(shell_path: &str, launch_uuid: &str) -> Vec<(String, String)> {
     let home = phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()
         .home()
         .to_string_lossy()
@@ -351,6 +362,7 @@ pub(crate) fn build_env(shell_path: &str) -> Vec<(String, String)> {
         // detect the host terminal by name rather than by env-var sniffing.
         ("ITERM_SHELL_INTEGRATION_INSTALLED".into(), "Yes".into()),
         ("TERM_PROGRAM".into(), "phoenix-ide".into()),
+        (TERMINAL_LAUNCH_UUID_ENV_VAR.into(), launch_uuid.to_owned()),
     ];
 
     if let Some(inj) = injection {
@@ -388,12 +400,12 @@ const PTY_ENV_ALLOWLIST: &[&str] = &[
 /// ("sessions should be nested with care"). REQ-TMUX-004 / spec
 /// design.md §"TMUX env handling".
 #[must_use]
-pub fn build_env_for_tmux(shell_path: &str) -> Vec<(String, String)> {
+pub fn build_env_for_tmux(shell_path: &str, launch_uuid: &str) -> Vec<(String, String)> {
     // build_env() never includes TMUX in the first place — its caller
     // populates the env from a fixed list. We re-use it verbatim and
     // belt-and-braces drop any TMUX-prefixed key just in case the list
     // grows in the future.
-    build_env(shell_path)
+    build_env(shell_path, launch_uuid)
         .into_iter()
         .filter(|(k, _)| k != "TMUX" && k != "TMUX_PANE")
         .collect()
@@ -456,7 +468,7 @@ mod tests {
 
     #[test]
     fn build_env_for_tmux_omits_tmux_keys() {
-        let env = build_env_for_tmux("/bin/bash");
+        let env = build_env_for_tmux("/bin/bash", "launch-uuid");
         for (k, _) in &env {
             assert_ne!(k, "TMUX", "TMUX env var must be stripped on tmux path");
             assert_ne!(k, "TMUX_PANE", "TMUX_PANE env var must be stripped");

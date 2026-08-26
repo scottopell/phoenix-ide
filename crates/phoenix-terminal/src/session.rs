@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{watch, Semaphore};
 
 use super::command_tracker::CommandTracker;
-use phoenix_core::work_scope::ResourceScopeKey;
+use phoenix_core::{process_identity::ProcessIdentity, work_scope::ResourceScopeKey};
 
 /// Why the current relay should stop.
 ///
@@ -76,6 +76,22 @@ pub enum TerminalChildKind {
     TmuxClient,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalLaunchIdentity {
+    pub process: ProcessIdentity,
+    pub launch_uuid: String,
+}
+
+impl TerminalLaunchIdentity {
+    #[must_use]
+    pub fn stable_identity(&self) -> String {
+        format!(
+            "pid:{}:start:{}:launch:{}",
+            self.process.pid, self.process.start_time, self.launch_uuid
+        )
+    }
+}
+
 /// Owns the PTY master fd and child process.
 ///
 /// `Drop` closes `master_fd`, which causes the kernel to deliver `SIGHUP`
@@ -85,6 +101,8 @@ pub struct TerminalHandle {
     pub master_fd: OwnedFd,
     /// Child shell PID.  Reaped by the reader task on EIO.
     pub child_pid: Pid,
+    /// Durable launch identity captured at spawn time.
+    pub launch_identity: TerminalLaunchIdentity,
     pub child_kind: TerminalChildKind,
     /// Command tracker — fed with every PTY output byte (REQ-TERM-010, REQ-TERM-021).
     pub tracker: Arc<Mutex<CommandTracker>>,
@@ -128,24 +146,34 @@ impl TerminalRetirementGeneration {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalInstanceIdentity {
+    durable: TerminalLaunchIdentity,
     handle_addr: usize,
-    pub child_pid: i32,
 }
 
 impl TerminalInstanceIdentity {
     #[must_use]
     pub fn from_handle(handle: &Arc<TerminalHandle>) -> Self {
         Self {
+            durable: handle.launch_identity.clone(),
             handle_addr: Arc::as_ptr(handle) as usize,
-            child_pid: handle.child_pid.as_raw(),
         }
     }
 
     #[must_use]
     pub fn stable_identity(&self) -> String {
-        format!("pid:{}:handle:{}", self.child_pid, self.handle_addr)
+        self.durable.stable_identity()
+    }
+
+    #[must_use]
+    pub fn process_identity(&self) -> ProcessIdentity {
+        self.durable.process
+    }
+
+    #[must_use]
+    pub fn matches_handle(&self, handle: &Arc<TerminalHandle>) -> bool {
+        self.handle_addr == Arc::as_ptr(handle) as usize && self.durable == handle.launch_identity
     }
 }
 
@@ -379,10 +407,11 @@ impl ActiveTerminals {
         if !retirement.fenced || retirement.generation != permit.generation.0 {
             return false;
         }
-        match (map.handles.get(&permit.work_scope), permit.instance) {
-            (Some(current), Some(expected)) => {
-                TerminalInstanceIdentity::from_handle(current) == expected
-            }
+        match (
+            map.handles.get(&permit.work_scope),
+            permit.instance.as_ref(),
+        ) {
+            (Some(current), Some(expected)) => expected.matches_handle(current),
             (None, None) => true,
             _ => false,
         }
@@ -392,23 +421,24 @@ impl ActiveTerminals {
         map: &ActiveTerminalRegistryState,
         permit: &TerminalRetirementPermit,
     ) -> TerminalRetirementOutcome {
-        match (map.handles.get(&permit.work_scope), permit.instance) {
+        match (
+            map.handles.get(&permit.work_scope),
+            permit.instance.as_ref(),
+        ) {
             (None, _) => TerminalRetirementOutcome::AbsenceVerified,
-            (Some(current), Some(expected))
-                if TerminalInstanceIdentity::from_handle(current) != expected =>
-            {
+            (Some(current), Some(expected)) if !expected.matches_handle(current) => {
                 TerminalRetirementOutcome::AbsenceVerified
             }
             (Some(_), Some(expected)) => TerminalRetirementOutcome::Residual {
                 reason: format!(
-                    "exact terminal instance pid={} remained current after teardown",
-                    expected.child_pid
+                    "exact terminal instance {} remained current after teardown",
+                    expected.stable_identity()
                 ),
             },
             (Some(current), None) => TerminalRetirementOutcome::Residual {
                 reason: format!(
-                    "terminal pid={} appeared after retirement fenced an absent scope",
-                    current.child_pid.as_raw()
+                    "terminal {} appeared after retirement fenced an absent scope",
+                    current.launch_identity.stable_identity()
                 ),
             },
         }
