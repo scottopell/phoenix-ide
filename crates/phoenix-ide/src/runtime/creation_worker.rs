@@ -168,15 +168,15 @@ thread_local! {
         std::cell::RefCell::new(None);
 }
 
+#[cfg(not(test))]
+fn resolve_default_task_start_point(repo_root: &Path) -> Option<crate::git_start::GitStartPoint> {
+    crate::git_start::GitStartPoint::for_default_task_start(repo_root)
+}
+
 #[cfg(test)]
 fn resolve_default_task_start_point(repo_root: &Path) -> Option<crate::git_start::GitStartPoint> {
-    #[cfg(test)]
-    {
-        if let Some(start) =
-            TEST_DEFAULT_START_RESOLVER.with(|slot| slot.borrow().as_ref().copied())
-        {
-            return start(repo_root);
-        }
+    if let Some(start) = TEST_DEFAULT_START_RESOLVER.with(|slot| slot.borrow().as_ref().copied()) {
+        return start(repo_root);
     }
     crate::git_start::GitStartPoint::for_default_task_start(repo_root)
 }
@@ -191,6 +191,7 @@ fn with_test_default_start_resolver<R>(resolver: StartPointResolver, f: impl FnO
     })
 }
 
+#[cfg(test)]
 fn reserved_checkout_ref(
     intent: &ConversationCreationIntent,
     start_point: &crate::git_start::GitStartPoint,
@@ -936,32 +937,41 @@ async fn provision_conversation(
         (directory_first_product, product_conversation_id.as_ref())
     {
         if let Some(repo_root) = repo_root.clone() {
-            let start_point = if let (Some(oid), Some(logical_base)) = (
-                job.intent.reserved_checkout_oid.as_deref(),
-                job.intent.base_branch.as_deref(),
-            ) {
-                crate::git_start::GitStartPoint::with_reserved_oid(
-                    logical_base.to_string(),
-                    oid.to_string(),
-                    oid.to_string(),
-                    oid.to_string(),
-                )
-            } else {
-                return Err((
-                    job.intent.reserved_root_failure.clone().unwrap_or_else(|| {
-                        "Directory-first Git creation requires a reserved canonical root"
-                            .to_string()
-                    }),
-                    ErrorKind::InvalidRequest,
-                )
-                    .into());
-            };
+            let start_point = resolve_default_task_start_point(Path::new(&repo_root))
+                .or_else(|| {
+                    let (oid, logical_base) = (
+                        job.intent.reserved_checkout_oid.as_deref()?,
+                        job.intent.base_branch.as_deref()?,
+                    );
+                    Some(crate::git_start::GitStartPoint::with_reserved_oid(
+                        logical_base.to_string(),
+                        oid.to_string(),
+                        oid.to_string(),
+                        oid.to_string(),
+                    ))
+                })
+                .ok_or_else(|| {
+                    (
+                        job.intent.reserved_root_failure.clone().unwrap_or_else(|| {
+                            "Directory-first Git creation requires a refreshed or cached canonical root"
+                                .to_string()
+                        }),
+                        ErrorKind::InvalidRequest,
+                    )
+                })?;
             let existing_path =
                 deterministic_worktree_path_checked(&repo_root, product_conversation_id)
                     .map_err(|error| (error, ErrorKind::ServerError))?;
-            let canonical_default_ref = reserved_checkout_ref(&job.intent, &start_point);
+            let canonical_default_ref = start_point
+                .reserved_oid()
+                .unwrap_or_else(|| start_point.checkout_ref())
+                .to_string();
             let canonical_default_branch = start_point.logical_base().to_string();
-            if job.intent.reserved_checkout_oid.is_none() {
+            if job.intent.reserved_checkout_oid.as_deref() != start_point.reserved_oid()
+                || job.intent.base_branch.as_deref() != Some(start_point.logical_base())
+                || job.intent.reserved_root_freshness.as_deref() != Some("fresh")
+                || job.intent.reserved_root_failure.is_some()
+            {
                 let reserved_oid = start_point.reserved_oid().ok_or_else(|| {
                     (
                         "Could not resolve canonical default commit OID for directory-first ProductConversation"
@@ -975,6 +985,9 @@ async fn provision_conversation(
                 )?;
                 let updated_intent = ConversationCreationIntent {
                     reserved_checkout_oid: Some(reserved_oid.to_string()),
+                    base_branch: Some(start_point.logical_base().to_string()),
+                    reserved_root_freshness: Some("fresh".to_string()),
+                    reserved_root_failure: None,
                     ..job.intent.clone()
                 };
                 let outcome = manager

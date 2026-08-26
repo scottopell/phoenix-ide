@@ -18,8 +18,13 @@ type PendingCreateIdentity = {
   messageId: string;
 };
 
-function pendingCreateScope(cwd: string, objective: string, reservationId: string): string {
-  return JSON.stringify([cwd.trim(), objective, reservationId]);
+function pendingCreateScope(
+  cwd: string,
+  objective: string,
+  model: string | null,
+  effort: ModelEffort | null,
+): string {
+  return JSON.stringify([cwd.trim(), objective, model, effort]);
 }
 
 function getOrCreatePendingIdentity(scope: string): PendingCreateIdentity {
@@ -272,7 +277,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
       if (!acceptedRoot) throw new Error('Creation root is not reserved yet');
 
       const pendingIdentity = getOrCreatePendingIdentity(
-        pendingCreateScope(cwd, trimmed, acceptedRoot.id),
+        pendingCreateScope(cwd, trimmed, selectedModel, selectedEffort),
       );
       if (files.length > 0) {
         setError('File attachments are not available for this conversation flow yet.');
