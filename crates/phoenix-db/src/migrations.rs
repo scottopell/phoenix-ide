@@ -395,6 +395,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "capture_close_direct_turn_settlements",
         sql: MIGRATION_075,
     },
+    Migration {
+        version: 76,
+        name: "add_work_scope_close_retirement_resource_kind",
+        sql: MIGRATION_076,
+    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -7498,6 +7503,110 @@ CREATE INDEX idx_creation_cleanup_due
     ON conversation_creation_jobs(status, cleanup_lease_until, updated_at);
 ";
 
+const MIGRATION_076: &str = "SELECT 1;";
+
+async fn migration_076_extend_close_retirement_resource_kinds(
+    tx: &mut Transaction<'_, Sqlite>,
+) -> DbResult<()> {
+    const TABLES: [&str; 3] = [
+        "close_expected_retirement_resources",
+        "close_retirement_resources",
+        "close_retirement_resource_history",
+    ];
+    const RESOURCE_KIND_TAIL: &str =
+        "'browser_session',\n        'equivalent_live_resource'\n    ))";
+    const EXTENDED_RESOURCE_KIND_TAIL: &str =
+        "'browser_session',\n        'equivalent_live_resource',\n        'work_scope'\n    ))";
+    const HISTORY_FOREIGN_KEY: &str = "    FOREIGN KEY (\n        attempt_id, scope, inspection_generation, inspection_fingerprint,";
+    const HISTORY_CONSTRAINTS: &str = "    CHECK (resource_kind IN (\n        'worktree',\n        'bash_process_group',\n        'tmux_server',\n        'pty_session',\n        'browser_session',\n        'equivalent_live_resource',\n        'work_scope'\n    )),\n    CHECK (\n        (resource_kind = 'worktree' AND identity_kind = 'worktree')\n        OR (resource_kind <> 'worktree' AND identity_kind = 'opaque')\n    ),\n";
+
+    let mut table_sql = Vec::with_capacity(TABLES.len());
+    for table in TABLES {
+        let sql: String =
+            sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1")
+                .bind(table)
+                .fetch_optional(&mut **tx)
+                .await?
+                .ok_or_else(|| {
+                    DbError::Serialization(format!("missing {table} for migration 76"))
+                })?;
+        table_sql.push((table, sql));
+    }
+
+    let objects: Vec<(String, String)> = sqlx::query_as(
+        "SELECT name, sql FROM sqlite_master\n         WHERE sql IS NOT NULL\n           AND (\n             (type = 'index' AND tbl_name IN (\n                 'close_expected_retirement_resources',\n                 'close_retirement_resources',\n                 'close_retirement_resource_history'\n             ))\n             OR (type = 'trigger' AND (\n                 tbl_name IN (\n                     'close_expected_retirement_resources',\n                     'close_retirement_resources',\n                     'close_retirement_resource_history'\n                 )\n                 OR sql LIKE '%close_expected_retirement_resources%'\n                 OR sql LIKE '%close_retirement_resources%'\n                 OR sql LIKE '%close_retirement_resource_history%'\n             ))\n           )\n         ORDER BY CASE type WHEN 'index' THEN 0 ELSE 1 END, name",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    for (name, _) in &objects {
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP INDEX IF EXISTS {name};")))
+            .execute(&mut **tx)
+            .await?;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP TRIGGER IF EXISTS {name};"
+        )))
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    for table in TABLES.iter().rev() {
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "ALTER TABLE {table} RENAME TO {table}_migration_076_old;"
+        )))
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    for (table, sql) in &table_sql {
+        let sql = if *table == "close_retirement_resource_history" {
+            sql.replacen(
+                HISTORY_FOREIGN_KEY,
+                &(HISTORY_CONSTRAINTS.to_string() + HISTORY_FOREIGN_KEY),
+                1,
+            )
+        } else {
+            sql.replacen(RESOURCE_KIND_TAIL, EXTENDED_RESOURCE_KIND_TAIL, 1)
+        };
+        if sql
+            == *table_sql
+                .iter()
+                .find_map(|(candidate, original)| (*candidate == *table).then_some(original))
+                .expect("captured table SQL must contain the current table")
+        {
+            return Err(DbError::Serialization(format!(
+                "unexpected {table} definition for migration 76"
+            )));
+        }
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+            .execute(&mut **tx)
+            .await?;
+    }
+
+    for table in TABLES {
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO {table} SELECT * FROM {table}_migration_076_old;"
+        )))
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    for table in TABLES.iter().rev() {
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP TABLE {table}_migration_076_old;"
+        )))
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    for (_, sql) in objects {
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+            .execute(&mut **tx)
+            .await?;
+    }
+
+    Ok(())
+}
+
 async fn migration_065_preflight(tx: &mut Transaction<'_, Sqlite>) -> DbResult<()> {
     let work_scope_id: Option<String> = sqlx::query_scalar(
         "SELECT work_scope_id
@@ -7605,6 +7714,10 @@ pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
         // applied but unrecorded migration would fail to re-run (missing/duplicate
         // column) and abort startup.
         let mut tx = pool.begin().await?;
+
+        if migration.version == 76 {
+            migration_076_extend_close_retirement_resource_kinds(&mut tx).await?;
+        }
 
         if migration.version == 65 {
             migration_065_preflight(&mut tx).await?;

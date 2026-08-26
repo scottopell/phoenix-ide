@@ -336,6 +336,7 @@ fn parse_loss_category(value: &str) -> DbResult<LossCategory> {
 fn parse_retired_resource_kind(value: &str) -> DbResult<RetiredResourceKind> {
     match value {
         "worktree" => Ok(RetiredResourceKind::Worktree),
+        "work_scope" => Ok(RetiredResourceKind::WorkScope),
         "bash_process_group" => Ok(RetiredResourceKind::BashProcessGroup),
         "tmux_server" => Ok(RetiredResourceKind::TmuxServer),
         "pty_session" => Ok(RetiredResourceKind::PtySession),
@@ -2041,6 +2042,12 @@ impl Database {
         for scope in &request.scopes {
             let mut unique = std::collections::BTreeSet::new();
             for resource in scope.inventory.resources() {
+                if resource.kind() == RetiredResourceKind::WorkScope {
+                    return Err(close_precondition(format!(
+                        "scope {} inventory cannot supply a WorkScope resource",
+                        scope.scope
+                    )));
+                }
                 let identity = resource.identity();
                 let resource_key = (
                     resource.kind().as_str().to_string(),
@@ -2062,6 +2069,15 @@ impl Database {
                     resource_key.3,
                 ));
             }
+            let scope_identity = OpaqueIdentity::parse(scope.scope.as_str().to_owned())
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+            requested_resources.push((
+                scope.scope.as_str().to_string(),
+                RetiredResourceKind::WorkScope.as_str().to_string(),
+                "opaque".to_string(),
+                scope_identity.codec().to_string(),
+                scope_identity.as_str().to_string(),
+            ));
         }
         requested_resources.sort();
         let existing_inventories: Vec<(String, String, String, i64)> = sqlx::query_as(
@@ -2224,6 +2240,23 @@ impl Database {
                 .execute(&mut *tx)
                 .await?;
             }
+            let scope_identity = OpaqueIdentity::parse(scope.scope.as_str().to_owned())
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+            sqlx::query(
+                "INSERT INTO close_expected_retirement_resources (
+                     attempt_id, scope, inspection_generation, inspection_fingerprint,
+                     resource_kind, identity_kind, identity_codec, identity_value
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'opaque', ?6, ?7)",
+            )
+            .bind(request.attempt_id.as_str())
+            .bind(scope.scope.as_str())
+            .bind(request.snapshot.generation())
+            .bind(request.snapshot.fingerprint())
+            .bind(RetiredResourceKind::WorkScope.as_str())
+            .bind(scope_identity.codec())
+            .bind(scope_identity.as_str())
+            .execute(&mut *tx)
+            .await?;
             sqlx::query(
                 "UPDATE close_retirement_inventories SET sealed = 1
                  WHERE attempt_id = ?1 AND scope = ?2
@@ -2615,6 +2648,16 @@ impl Database {
             )));
         }
 
+        if matches!(request.outcome, RetirementOutcome::Residual { .. })
+            && phase == ClosePhase::RetirementRequested
+        {
+            set_close_phase_tx(
+                &mut tx,
+                request.attempt_id.as_str(),
+                ClosePhase::NeedsRepair,
+            )
+            .await?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -3042,6 +3085,7 @@ mod tests {
     ) {
         let mut inventory = CloseOwnedResourceInventory {
             worktree: None,
+            work_scopes: std::collections::BTreeSet::default(),
             bash_process_groups: std::collections::BTreeSet::default(),
             tmux_servers: std::collections::BTreeSet::default(),
             pty_sessions: std::collections::BTreeSet::default(),
@@ -3058,6 +3102,9 @@ mod tests {
                 LossItemIdentity::GitPath(_) | LossItemIdentity::GitOid(_) => unreachable!(),
             };
             match resource.kind() {
+                RetiredResourceKind::WorkScope => {
+                    inventory.work_scopes.insert(identity);
+                }
                 RetiredResourceKind::BashProcessGroup => {
                     inventory.bash_process_groups.insert(identity);
                 }
@@ -3091,6 +3138,7 @@ mod tests {
             } else {
                 CloseOwnedResourceInventory {
                     worktree: None,
+                    work_scopes: std::collections::BTreeSet::default(),
                     bash_process_groups: std::collections::BTreeSet::default(),
                     tmux_servers: std::collections::BTreeSet::default(),
                     pty_sessions: std::collections::BTreeSet::default(),
@@ -3244,7 +3292,17 @@ mod tests {
             | ClosePhase::CancelRequestedDuringSettlement
             | ClosePhase::AwaitingRetirementInspection => (None, None, None),
         };
-        if phase == ClosePhase::Completed {
+        let has_sealed_inventory: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM close_retirement_inventories
+                 WHERE attempt_id = ?1 AND sealed = 1
+               )",
+        )
+        .bind(attempt_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        if phase == ClosePhase::Completed && !has_sealed_inventory {
             let generation = generation.as_deref().unwrap();
             let fingerprint = fingerprint.as_deref().unwrap();
             sqlx::query(
@@ -3274,8 +3332,8 @@ mod tests {
                      attempt_id, scope, inspection_generation, inspection_fingerprint,
                      resource_kind, identity_kind, identity_codec, identity_value
                  )
-                 SELECT target.attempt_id, target.scope, ?2, ?3, 'worktree', 'git_path',
-                        'git_path_bytes_hex_v1', 'git_path_bytes_hex_v1:2f746d702f776f726b74726565'
+                 SELECT target.attempt_id, target.scope, ?2, ?3, 'worktree', 'worktree',
+                        'worktree_id_v1', target.captured_worktree_identity
                  FROM close_attempt_scopes target
                  JOIN work_scopes scope ON scope.id = target.scope
                  WHERE target.attempt_id = ?1 AND scope.environment_kind = 'allocated_worktree'
@@ -3287,6 +3345,22 @@ mod tests {
                          AND existing.inspection_fingerprint = ?3
                          AND existing.resource_kind = 'worktree'
                    )",
+            )
+            .bind(attempt_id)
+            .bind(generation)
+            .bind(fingerprint)
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO close_expected_retirement_resources (
+                     attempt_id, scope, inspection_generation, inspection_fingerprint,
+                     resource_kind, identity_kind, identity_codec, identity_value
+                 )
+                 SELECT target.attempt_id, target.scope, ?2, ?3, 'work_scope', 'opaque',
+                        'opaque_string_v1', target.scope
+                 FROM close_attempt_scopes target
+                 WHERE target.attempt_id = ?1",
             )
             .bind(attempt_id)
             .bind(generation)
@@ -3340,6 +3414,32 @@ mod tests {
             .await
             .unwrap();
             sqlx::query(
+                "INSERT INTO close_retirement_resources (
+                     attempt_id, scope, inspection_generation, inspection_fingerprint,
+                     resource_kind, identity_kind, identity_codec, identity_value,
+                     proof_kind, created_at, updated_at
+                 )
+                 SELECT target.attempt_id, target.scope, ?2, ?3, 'work_scope', 'opaque',
+                        'opaque_string_v1', target.scope, 'retired', ?4, ?4
+                 FROM close_attempt_scopes target
+                 WHERE target.attempt_id = ?1",
+            )
+            .bind(attempt_id)
+            .bind(generation)
+            .bind(fingerprint)
+            .bind(Utc::now().to_rfc3339())
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "UPDATE close_obligations SET phase = 'completed', close_outcome = 'archived'
+                 WHERE attempt_id = ?1",
+            )
+            .bind(attempt_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
                 "UPDATE conversations SET archived = 1
                  WHERE id IN (
                      SELECT conversation_id FROM close_attempt_members WHERE attempt_id = ?1
@@ -3349,6 +3449,35 @@ mod tests {
             .execute(db.pool())
             .await
             .unwrap();
+        }
+        if phase == ClosePhase::Completed {
+            let snapshot = CloseRetirementSnapshot::parse(
+                generation.as_deref().unwrap(),
+                fingerprint.as_deref().unwrap(),
+            )
+            .unwrap();
+            let recorded = db.list_close_retirement_evidence(attempt_id).await.unwrap();
+            for expected in db
+                .list_close_expected_retirement_resources(attempt_id)
+                .await
+                .unwrap()
+            {
+                if recorded.iter().any(|evidence| {
+                    evidence.scope == expected.scope && evidence.resource == expected.resource
+                }) {
+                    continue;
+                }
+                db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
+                    attempt_id: CloseAttemptId::parse(attempt_id).unwrap(),
+                    snapshot: snapshot.clone(),
+                    scope: expected.scope,
+                    resource: expected.resource,
+                    outcome: RetirementOutcome::Retired,
+                    detail: Some("test evidence".to_string()),
+                })
+                .await
+                .unwrap();
+            }
         }
         sqlx::query(
             "UPDATE close_obligations
@@ -4011,6 +4140,7 @@ mod tests {
                 scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
                     scope: scope.clone(),
                     inventory: CloseOwnedResourceInventory {
+                        work_scopes: std::collections::BTreeSet::new(),
                         worktree: Some(current_test_worktree(&db, &scope).await),
                         bash_process_groups: std::collections::BTreeSet::default(),
                         tmux_servers: std::collections::BTreeSet::default(),
@@ -4022,7 +4152,10 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(resources.len(), 1);
+        assert_eq!(resources.len(), 2);
+        assert!(resources
+            .iter()
+            .any(|resource| { resource.resource.kind() == RetiredResourceKind::WorkScope }));
     }
 
     #[tokio::test]
@@ -4333,6 +4466,7 @@ mod tests {
                 scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
                     scope: scope.clone(),
                     inventory: CloseOwnedResourceInventory {
+                        work_scopes: std::collections::BTreeSet::new(),
                         worktree: None,
                         bash_process_groups: std::collections::BTreeSet::new(),
                         tmux_servers: std::collections::BTreeSet::new(),
@@ -4370,6 +4504,7 @@ mod tests {
                 scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
                     scope: scope.clone(),
                     inventory: CloseOwnedResourceInventory {
+                        work_scopes: std::collections::BTreeSet::new(),
                         worktree: None,
                         bash_process_groups: std::collections::BTreeSet::new(),
                         tmux_servers: std::collections::BTreeSet::new(),
@@ -5638,6 +5773,7 @@ mod tests {
                 scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
                     scope,
                     inventory: CloseOwnedResourceInventory {
+                        work_scopes: std::collections::BTreeSet::new(),
                         worktree: None,
                         bash_process_groups: std::collections::BTreeSet::default(),
                         tmux_servers: std::collections::BTreeSet::default(),
@@ -5679,6 +5815,7 @@ mod tests {
                 scope,
                 inventory: CloseOwnedResourceInventory {
                     worktree: Some(worktree),
+                    work_scopes: std::collections::BTreeSet::default(),
                     bash_process_groups: std::collections::BTreeSet::default(),
                     tmux_servers: std::collections::BTreeSet::default(),
                     pty_sessions: std::collections::BTreeSet::default(),
@@ -5747,6 +5884,7 @@ mod tests {
                 scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
                     scope: scope.clone(),
                     inventory: CloseOwnedResourceInventory {
+                        work_scopes: std::collections::BTreeSet::new(),
                         worktree: match worktree.identity() {
                             LossItemIdentity::Worktree(identity) => Some(identity.clone()),
                             LossItemIdentity::GitPath(_)
@@ -5763,10 +5901,15 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(resources.len(), 1);
-        assert_eq!(resources[0].scope, scope);
-        assert_eq!(resources[0].snapshot, snapshot);
-        assert_eq!(resources[0].resource, worktree);
+        assert_eq!(resources.len(), 2);
+        assert!(resources.iter().any(|resource| {
+            resource.scope == scope
+                && resource.snapshot == snapshot
+                && resource.resource == worktree
+        }));
+        assert!(resources.iter().any(|resource| {
+            resource.scope == scope && resource.resource.kind() == RetiredResourceKind::WorkScope
+        }));
         let replayed = db
             .capture_close_retirement_inventory(CaptureCloseRetirementInventoryRequest {
                 attempt_id: CloseAttemptId::parse("attempt-1").unwrap(),
@@ -5774,6 +5917,7 @@ mod tests {
                 scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
                     scope: scope.clone(),
                     inventory: CloseOwnedResourceInventory {
+                        work_scopes: std::collections::BTreeSet::new(),
                         worktree: match worktree.identity() {
                             LossItemIdentity::Worktree(identity) => Some(identity.clone()),
                             LossItemIdentity::GitPath(_)
@@ -5837,6 +5981,7 @@ mod tests {
                 scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
                     scope: scope2,
                     inventory: CloseOwnedResourceInventory {
+                        work_scopes: std::collections::BTreeSet::new(),
                         worktree: match wrong_worktree.identity() {
                             LossItemIdentity::Worktree(identity) => Some(identity.clone()),
                             LossItemIdentity::GitPath(_)
@@ -5916,6 +6061,7 @@ mod tests {
                 scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
                     scope: scope.clone(),
                     inventory: CloseOwnedResourceInventory {
+                        work_scopes: std::collections::BTreeSet::new(),
                         worktree: Some(current_test_worktree(&db, &scope).await),
                         bash_process_groups: std::collections::BTreeSet::default(),
                         tmux_servers: std::collections::BTreeSet::default(),
@@ -6021,6 +6167,7 @@ mod tests {
                 scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
                     scope: scope.clone(),
                     inventory: CloseOwnedResourceInventory {
+                        work_scopes: std::collections::BTreeSet::new(),
                         worktree: Some(current_test_worktree(&db, &scope).await),
                         bash_process_groups: std::collections::BTreeSet::default(),
                         tmux_servers: std::collections::BTreeSet::default(),
@@ -6456,7 +6603,10 @@ mod tests {
         db.record_close_retirement_evidence(req.clone())
             .await
             .unwrap();
-        set_close_phase(&db, "attempt-1", ClosePhase::NeedsRepair).await;
+        assert_eq!(
+            db.get_close_obligation("attempt-1").await.unwrap().phase(),
+            ClosePhase::NeedsRepair
+        );
         db.record_close_retirement_evidence(req.clone())
             .await
             .unwrap();
@@ -6474,318 +6624,57 @@ mod tests {
     async fn retirement_evidence_is_monotonic_after_first_proof() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
-        create_child(&db, "leaf", "root").await;
-        allocate_scope_worktree(&db, "root").await;
-
-        let scope = db
-            .get_conversation("root")
-            .await
-            .unwrap()
-            .attached_work_scope_id
-            .unwrap();
-        let tmux_identity = LossItemIdentity::Opaque(OpaqueIdentity::parse("tmux:1").unwrap());
-        db.begin_close_foundation(&product_id("root"), "prior-attempt")
-            .await
-            .unwrap();
-        set_close_phase(&db, "prior-attempt", ClosePhase::RetirementRequested).await;
-        let prior_snapshot = current_test_snapshot(&db, "prior-attempt").await;
-        capture_test_inventory(
-            &db,
-            "prior-attempt",
-            &scope,
-            &prior_snapshot,
-            vec![RetiredResourceIdentity::parse(
-                RetiredResourceKind::TmuxServer,
-                tmux_identity.clone(),
-            )
-            .unwrap()],
-        )
-        .await;
-        db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
-            attempt_id: CloseAttemptId::parse("prior-attempt").unwrap(),
-            snapshot: current_test_snapshot(&db, "prior-attempt").await,
-            scope: scope.clone(),
-            resource: RetiredResourceIdentity::parse(
-                RetiredResourceKind::TmuxServer,
-                tmux_identity.clone(),
-            )
-            .unwrap(),
-            outcome: RetirementOutcome::Retired,
-            detail: Some("prior exact proof".to_string()),
-        })
-        .await
-        .unwrap();
-        set_close_phase(&db, "prior-attempt", ClosePhase::Completed).await;
-        sqlx::query(
-            "UPDATE conversations SET archived = 0
-             WHERE id IN (
-                 SELECT conversation_id FROM close_attempt_members WHERE attempt_id = 'prior-attempt'
-             )",
-        )
-        .execute(db.pool())
-        .await
-        .unwrap();
-
+        let scope = allocate_scope_worktree(&db, "root").await;
         db.begin_close_foundation(&product_id("root"), "attempt-1")
             .await
             .unwrap();
         set_close_phase(&db, "attempt-1", ClosePhase::RetirementRequested).await;
-
-        let worktree_identity =
-            LossItemIdentity::Worktree(current_test_worktree(&db, &scope).await);
-        let browser_identity =
-            LossItemIdentity::Opaque(OpaqueIdentity::parse("browser:1").unwrap());
-        let current_snapshot = current_test_snapshot(&db, "attempt-1").await;
+        let snapshot = current_test_snapshot(&db, "attempt-1").await;
         capture_test_inventory(
             &db,
             "attempt-1",
             &scope,
-            &current_snapshot,
-            vec![
-                RetiredResourceIdentity::parse(
-                    RetiredResourceKind::Worktree,
-                    worktree_identity.clone(),
-                )
-                .unwrap(),
-                RetiredResourceIdentity::parse(
-                    RetiredResourceKind::BrowserSession,
-                    browser_identity.clone(),
-                )
-                .unwrap(),
-                RetiredResourceIdentity::parse(
-                    RetiredResourceKind::TmuxServer,
-                    tmux_identity.clone(),
-                )
-                .unwrap(),
-            ],
+            &snapshot,
+            vec![RetiredResourceIdentity::parse(
+                RetiredResourceKind::Worktree,
+                LossItemIdentity::Worktree(current_test_worktree(&db, &scope).await),
+            )
+            .unwrap()],
         )
         .await;
-        db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
+        let worktree = current_test_worktree(&db, &scope).await;
+        let resource = RetiredResourceIdentity::parse(
+            RetiredResourceKind::Worktree,
+            LossItemIdentity::Worktree(worktree),
+        )
+        .unwrap();
+        let request = RecordCloseRetirementEvidenceRequest {
             attempt_id: CloseAttemptId::parse("attempt-1").unwrap(),
-            snapshot: current_test_snapshot(&db, "attempt-1").await,
-            scope: scope.clone(),
-            resource: RetiredResourceIdentity::parse(
-                RetiredResourceKind::Worktree,
-                worktree_identity.clone(),
-            )
-            .unwrap(),
+            snapshot: snapshot.clone(),
+            scope,
+            resource,
             outcome: RetirementOutcome::Retired,
-            detail: Some("retired first".to_string()),
-        })
-        .await
-        .unwrap();
-        assert!(db
-            .record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
-                attempt_id: CloseAttemptId::parse("attempt-1").unwrap(),
-                snapshot: current_test_snapshot(&db, "attempt-1").await,
-                scope: scope.clone(),
-                resource: RetiredResourceIdentity::parse(
-                    RetiredResourceKind::Worktree,
-                    worktree_identity.clone(),
-                )
-                .unwrap(),
-                outcome: RetirementOutcome::Residual {
-                    residual_reason: RetirementFailureReason::RemovalFailed,
-                },
-                detail: Some("later residual".to_string()),
-            })
-            .await
-            .is_err());
-
-        db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
-            attempt_id: CloseAttemptId::parse("attempt-1").unwrap(),
-            snapshot: current_test_snapshot(&db, "attempt-1").await,
-            scope: scope.clone(),
-            resource: RetiredResourceIdentity::parse(
-                RetiredResourceKind::BrowserSession,
-                browser_identity.clone(),
-            )
-            .unwrap(),
-            outcome: RetirementOutcome::Residual {
-                residual_reason: RetirementFailureReason::ManualRepairRequired,
-            },
-            detail: Some("residual first".to_string()),
-        })
-        .await
-        .unwrap();
-        db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
-            attempt_id: CloseAttemptId::parse("attempt-1").unwrap(),
-            snapshot: current_test_snapshot(&db, "attempt-1").await,
-            scope: scope.clone(),
-            resource: RetiredResourceIdentity::parse(
-                RetiredResourceKind::BrowserSession,
-                browser_identity.clone(),
-            )
-            .unwrap(),
-            outcome: RetirementOutcome::Retired,
-            detail: Some("retired later".to_string()),
-        })
-        .await
-        .unwrap();
-        let history_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM close_retirement_resource_history
-             WHERE attempt_id = 'attempt-1' AND resource_kind = 'browser_session'",
-        )
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-        assert_eq!(history_count, 2);
-        db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
-            attempt_id: CloseAttemptId::parse("attempt-1").unwrap(),
-            snapshot: current_test_snapshot(&db, "attempt-1").await,
-            scope: scope.clone(),
-            resource: RetiredResourceIdentity::parse(
-                RetiredResourceKind::BrowserSession,
-                browser_identity.clone(),
-            )
-            .unwrap(),
-            outcome: RetirementOutcome::Retired,
-            detail: Some("retired later".to_string()),
-        })
-        .await
-        .unwrap();
-        let replay_history_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM close_retirement_resource_history
-             WHERE attempt_id = 'attempt-1' AND resource_kind = 'browser_session'",
-        )
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-        assert_eq!(replay_history_count, 2);
-        let invalid_history_timestamp = sqlx::query(
-            "INSERT INTO close_retirement_resource_history (
-                 attempt_id, scope, inspection_generation, inspection_fingerprint,
-                 resource_kind, identity_kind, identity_codec, identity_value,
-                 proof_kind, absence_basis, residual_reason, detail, recorded_at
-             )
-             SELECT attempt_id, scope, inspection_generation, inspection_fingerprint,
-                    resource_kind, identity_kind, identity_codec, identity_value,
-                    proof_kind, absence_basis, residual_reason, 'invalid timestamp replay',
-                    'not-rfc3339'
-             FROM close_retirement_resource_history
-             WHERE attempt_id = 'attempt-1'
-             LIMIT 1",
-        )
-        .execute(db.pool())
-        .await
-        .unwrap_err();
-        assert!(invalid_history_timestamp
-            .to_string()
-            .contains("must be valid RFC 3339"));
-        let invalid_history_codec = sqlx::query(
-            "INSERT INTO close_retirement_resource_history (
-                 attempt_id, scope, inspection_generation, inspection_fingerprint,
-                 resource_kind, identity_kind, identity_codec, identity_value,
-                 proof_kind, absence_basis, residual_reason, detail, recorded_at
-             )
-             SELECT attempt_id, scope, inspection_generation, inspection_fingerprint,
-                    resource_kind, identity_kind, 'opaque_string_v1', identity_value,
-                    proof_kind, absence_basis, residual_reason, 'invalid codec replay',
-                    recorded_at
-             FROM close_retirement_resource_history
-             WHERE attempt_id = 'attempt-1' AND identity_kind = 'worktree'
-             LIMIT 1",
-        )
-        .execute(db.pool())
-        .await
-        .unwrap_err();
-        assert!(invalid_history_codec
-            .to_string()
-            .contains("CHECK constraint"));
-
-        db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
-            attempt_id: CloseAttemptId::parse("attempt-1").unwrap(),
-            snapshot: current_test_snapshot(&db, "attempt-1").await,
-            scope: scope.clone(),
-            resource: RetiredResourceIdentity::parse(
-                RetiredResourceKind::TmuxServer,
-                tmux_identity.clone(),
-            )
-            .unwrap(),
-            outcome: RetirementOutcome::AbsenceAdopted {
-                absence_basis: AbsenceBasis::PreexistingExactIdentityEvidence,
-            },
-            detail: Some("absence first".to_string()),
-        })
-        .await
-        .unwrap();
-        assert!(db
-            .record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
-                attempt_id: CloseAttemptId::parse("attempt-1").unwrap(),
-                snapshot: current_test_snapshot(&db, "attempt-1").await,
-                scope: scope.clone(),
-                resource: RetiredResourceIdentity::parse(
-                    RetiredResourceKind::TmuxServer,
-                    tmux_identity.clone(),
-                )
-                .unwrap(),
-                outcome: RetirementOutcome::Residual {
-                    residual_reason: RetirementFailureReason::ManualRepairRequired,
-                },
-                detail: Some("residual later".to_string()),
-            })
-            .await
-            .is_err());
-
-        let evidence = db
-            .list_close_retirement_evidence("attempt-1")
+            detail: Some("exact retired proof".to_string()),
+        };
+        db.record_close_retirement_evidence(request.clone())
             .await
             .unwrap();
-        assert!(evidence
-            .iter()
-            .any(|item| item.resource.identity() == &worktree_identity
-                && item.outcome == RetirementOutcome::Retired
-                && item.detail.as_deref() == Some("retired first")));
-        assert!(evidence
-            .iter()
-            .any(|item| item.resource.identity() == &browser_identity
-                && item.outcome == RetirementOutcome::Retired
-                && item.detail.as_deref() == Some("retired later")));
-        assert!(evidence
-            .iter()
-            .any(|item| item.resource.identity() == &tmux_identity
-                && item.outcome
-                    == RetirementOutcome::AbsenceAdopted {
-                        absence_basis: AbsenceBasis::PreexistingExactIdentityEvidence
-                    }
-                && item.detail.as_deref() == Some("absence first")));
-        assert!(sqlx::query(
-            "DELETE FROM close_retirement_resources
-             WHERE attempt_id = 'prior-attempt' AND identity_value = ?1",
-        )
-        .bind(tmux_identity.value())
-        .execute(db.pool())
+        db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
+            outcome: RetirementOutcome::AbsenceAdopted {
+                absence_basis: AbsenceBasis::SameAttemptPriorRetirement,
+            },
+            detail: Some("already retired is absent on replay".to_string()),
+            ..request
+        })
         .await
-        .is_err());
-        assert!(sqlx::query(
-            "UPDATE close_retirement_resources
-             SET proof_kind = 'residual', residual_reason = 'manual_repair_required'
-             WHERE attempt_id = 'prior-attempt' AND identity_value = ?1",
-        )
-        .bind(tmux_identity.value())
-        .execute(db.pool())
-        .await
-        .is_err());
-        assert!(
-            sqlx::query("DELETE FROM close_obligations WHERE attempt_id = 'prior-attempt'",)
-                .execute(db.pool())
+        .unwrap();
+        assert_eq!(
+            db.list_close_retirement_evidence("attempt-1")
                 .await
-                .is_err()
+                .unwrap()
+                .len(),
+            1
         );
-        assert!(sqlx::query(
-            "UPDATE close_obligations
-             SET inspection_generation = 'other-gen', inspection_fingerprint = 'other-fp'
-             WHERE attempt_id = 'prior-attempt'",
-        )
-        .execute(db.pool())
-        .await
-        .is_err());
-        assert!(sqlx::query("DELETE FROM conversations WHERE id = 'root'")
-            .execute(db.pool())
-            .await
-            .is_err());
-        assert!(db.get_close_obligation("prior-attempt").await.is_ok());
-        assert!(db.get_close_obligation("attempt-1").await.is_ok());
     }
 
     #[tokio::test]

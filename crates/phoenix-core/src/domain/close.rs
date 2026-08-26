@@ -228,6 +228,7 @@ impl LossCategory {
 #[serde(rename_all = "snake_case")]
 pub enum RetiredResourceKind {
     Worktree,
+    WorkScope,
     BashProcessGroup,
     TmuxServer,
     PtySession,
@@ -240,7 +241,8 @@ impl RetiredResourceKind {
     pub fn admits_identity_kind(self, identity: &LossItemIdentity) -> bool {
         match self {
             Self::Worktree => matches!(identity, LossItemIdentity::Worktree(_)),
-            Self::BashProcessGroup
+            Self::WorkScope
+            | Self::BashProcessGroup
             | Self::TmuxServer
             | Self::PtySession
             | Self::BrowserSession
@@ -254,6 +256,7 @@ impl RetiredResourceKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Worktree => "worktree",
+            Self::WorkScope => "work_scope",
             Self::BashProcessGroup => "bash_process_group",
             Self::TmuxServer => "tmux_server",
             Self::PtySession => "pty_session",
@@ -1084,6 +1087,7 @@ impl std::error::Error for RetiredResourceIdentityError {}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloseOwnedResourceInventory {
     pub worktree: Option<WorktreeIdentity>,
+    pub work_scopes: std::collections::BTreeSet<OpaqueIdentity>,
     pub bash_process_groups: std::collections::BTreeSet<OpaqueIdentity>,
     pub tmux_servers: std::collections::BTreeSet<OpaqueIdentity>,
     pub pty_sessions: std::collections::BTreeSet<OpaqueIdentity>,
@@ -1111,6 +1115,12 @@ impl CloseOwnedResourceInventory {
                 )
                 .expect("worktree identity pairing is structural")
             })
+            .chain(
+                self.work_scopes
+                    .iter()
+                    .cloned()
+                    .map(|identity| Self::opaque(RetiredResourceKind::WorkScope, identity)),
+            )
             .chain(
                 self.bash_process_groups
                     .iter()
@@ -1322,6 +1332,7 @@ mod tests {
         );
 
         assert_eq!(RetiredResourceKind::Worktree.as_str(), "worktree");
+        assert_eq!(RetiredResourceKind::WorkScope.as_str(), "work_scope");
         assert_eq!(
             RetiredResourceKind::BashProcessGroup.as_str(),
             "bash_process_group"
@@ -1509,6 +1520,10 @@ mod tests {
         assert!(!RetiredResourceKind::Worktree.admits_identity_kind(&git_path));
         assert!(!RetiredResourceKind::Worktree.admits_identity_kind(&opaque));
         assert!(!RetiredResourceKind::Worktree.admits_identity_kind(&git_oid));
+        assert!(RetiredResourceKind::WorkScope.admits_identity_kind(&opaque));
+        assert!(!RetiredResourceKind::WorkScope.admits_identity_kind(&worktree));
+        assert!(!RetiredResourceKind::WorkScope.admits_identity_kind(&git_path));
+        assert!(!RetiredResourceKind::WorkScope.admits_identity_kind(&git_oid));
         assert!(RetiredResourceKind::BrowserSession.admits_identity_kind(&opaque));
         assert!(!RetiredResourceKind::BrowserSession.admits_identity_kind(&git_path));
         assert!(!RetiredResourceKind::BrowserSession.admits_identity_kind(&worktree));
