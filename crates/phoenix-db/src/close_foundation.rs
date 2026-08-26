@@ -676,6 +676,15 @@ pub struct RecordCloseRetirementDispatchRequest {
     pub resource: RetiredResourceIdentity,
 }
 
+#[derive(Debug, Clone)]
+pub struct BindCloseRuntimeResourceInstanceRequest {
+    pub attempt_id: CloseAttemptId,
+    pub scope: WorkScopeId,
+    pub snapshot: CloseRetirementSnapshot,
+    pub resource: RetiredResourceIdentity,
+    pub instance_id: phoenix_core::runtime_resource::RuntimeResourceInstanceId,
+}
+
 async fn close_obligation_for_update(
     tx: &mut Transaction<'_, Sqlite>,
     attempt_id: &str,
@@ -2360,7 +2369,7 @@ async fn list_close_expected_retirement_resources_tx(
             "SELECT expected.attempt_id, expected.scope, expected.inspection_generation,
                     expected.inspection_fingerprint, expected.resource_kind,
                     expected.identity_kind, expected.identity_codec, expected.identity_value,
-                    captured.captured_worktree_fingerprint,
+                    expected.runtime_resource_instance_id, captured.captured_worktree_fingerprint,
                     captured.captured_worktree_locator
              FROM close_expected_retirement_resources expected
              JOIN close_obligations obligation ON obligation.attempt_id = expected.attempt_id
@@ -2401,12 +2410,129 @@ async fn list_close_expected_retirement_resources_tx(
                     )?,
                 )
                 .map_err(|error| DbError::Serialization(error.to_string()))?,
+                runtime_resource_instance_id: row
+                    .try_get::<Option<String>, _>("runtime_resource_instance_id")?
+                    .map(phoenix_core::runtime_resource::RuntimeResourceInstanceId::parse)
+                    .transpose()
+                    .map_err(|error| DbError::Serialization(error.to_string()))?,
             })
         })
         .collect()
 }
 
 impl Database {
+    /// Binds a sealed runtime retirement target to its normalized durable
+    /// instance authority. The `SQLite` trigger enforces matching scope and kind.
+    ///
+    /// # Errors
+    /// Returns an error unless the expected target belongs to the exact sealed
+    /// snapshot and the instance has the matching normalized authority shape.
+    pub async fn bind_close_runtime_resource_instance(
+        &self,
+        request: BindCloseRuntimeResourceInstanceRequest,
+    ) -> DbResult<()> {
+        let kind = request.resource.kind();
+        if !matches!(
+            kind,
+            RetiredResourceKind::BashProcessGroup
+                | RetiredResourceKind::TmuxServer
+                | RetiredResourceKind::PtySession
+                | RetiredResourceKind::BrowserSession
+        ) {
+            return Err(close_precondition(
+                "only runtime resources bind runtime instances",
+            ));
+        }
+        let identity = request.resource.identity();
+        let updated = sqlx::query(
+            "UPDATE close_expected_retirement_resources
+             SET runtime_resource_instance_id = ?1
+             WHERE attempt_id = ?2 AND scope = ?3
+               AND inspection_generation = ?4 AND inspection_fingerprint = ?5
+               AND resource_kind = ?6 AND identity_kind = ?7
+               AND identity_codec = ?8 AND identity_value = ?9
+               AND runtime_resource_instance_id IS NULL",
+        )
+        .bind(request.instance_id.as_str())
+        .bind(request.attempt_id.as_str())
+        .bind(request.scope.as_str())
+        .bind(request.snapshot.generation())
+        .bind(request.snapshot.fingerprint())
+        .bind(kind.as_str())
+        .bind(identity.identity_kind())
+        .bind(identity.codec())
+        .bind(identity.value())
+        .execute(&self.pool)
+        .await?;
+        if updated.rows_affected() == 1 {
+            return Ok(());
+        }
+        let bound: Option<String> = sqlx::query_scalar(
+            "SELECT runtime_resource_instance_id
+             FROM close_expected_retirement_resources
+             WHERE attempt_id = ?1 AND scope = ?2
+               AND inspection_generation = ?3 AND inspection_fingerprint = ?4
+               AND resource_kind = ?5 AND identity_kind = ?6
+               AND identity_codec = ?7 AND identity_value = ?8",
+        )
+        .bind(request.attempt_id.as_str())
+        .bind(request.scope.as_str())
+        .bind(request.snapshot.generation())
+        .bind(request.snapshot.fingerprint())
+        .bind(kind.as_str())
+        .bind(identity.identity_kind())
+        .bind(identity.codec())
+        .bind(identity.value())
+        .fetch_optional(&self.pool)
+        .await?;
+        if bound.as_deref() == Some(request.instance_id.as_str()) {
+            return Ok(());
+        }
+        Err(close_precondition(format!(
+            "Close runtime resource binding for {} is absent or conflicts with another instance",
+            request.instance_id
+        )))
+    }
+
+    /// Reads the normalized instance key previously sealed for an exact runtime
+    /// target. Consumers use the row, not the opaque resource display identity,
+    /// for restart verification.
+    ///
+    /// # Errors
+    /// Returns an error when the expected target cannot be read or its stored
+    /// instance identifier is invalid.
+    pub async fn close_runtime_resource_instance_id(
+        &self,
+        attempt_id: &CloseAttemptId,
+        scope: &WorkScopeId,
+        snapshot: &CloseRetirementSnapshot,
+        resource: &RetiredResourceIdentity,
+    ) -> DbResult<Option<phoenix_core::runtime_resource::RuntimeResourceInstanceId>> {
+        let identity = resource.identity();
+        let value: Option<String> = sqlx::query_scalar(
+            "SELECT runtime_resource_instance_id
+             FROM close_expected_retirement_resources
+             WHERE attempt_id = ?1 AND scope = ?2
+               AND inspection_generation = ?3 AND inspection_fingerprint = ?4
+               AND resource_kind = ?5 AND identity_kind = ?6
+               AND identity_codec = ?7 AND identity_value = ?8",
+        )
+        .bind(attempt_id.as_str())
+        .bind(scope.as_str())
+        .bind(snapshot.generation())
+        .bind(snapshot.fingerprint())
+        .bind(resource.kind().as_str())
+        .bind(identity.identity_kind())
+        .bind(identity.codec())
+        .bind(identity.value())
+        .fetch_optional(&self.pool)
+        .await?;
+        value
+            .map(phoenix_core::runtime_resource::RuntimeResourceInstanceId::parse)
+            .transpose()
+            .map_err(|error| DbError::Serialization(error.to_string()))
+    }
+
     /// Durably records intent to remove one exact sealed resource before external
     /// teardown begins. A restart can adopt absence only from this same-attempt
     /// dispatch record, never from a path or scope-wide guess.

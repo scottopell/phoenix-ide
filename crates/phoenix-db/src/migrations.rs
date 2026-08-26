@@ -410,6 +410,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "persist_runtime_resource_instances",
         sql: MIGRATION_078,
     },
+    Migration {
+        version: 79,
+        name: "bind_close_resources_to_runtime_instances",
+        sql: MIGRATION_079,
+    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -7511,6 +7516,39 @@ ALTER TABLE conversation_creation_jobs ADD COLUMN cleanup_lease_until TEXT;
 
 CREATE INDEX idx_creation_cleanup_due
     ON conversation_creation_jobs(status, cleanup_lease_until, updated_at);
+";
+
+const MIGRATION_079: &str = r"
+ALTER TABLE close_expected_retirement_resources
+ADD COLUMN runtime_resource_instance_id TEXT REFERENCES runtime_resource_instances(instance_id) ON DELETE RESTRICT;
+
+CREATE TRIGGER close_expected_runtime_instance_kind_scope_matches
+BEFORE UPDATE OF runtime_resource_instance_id ON close_expected_retirement_resources
+FOR EACH ROW
+WHEN NEW.runtime_resource_instance_id IS NOT NULL
+ AND NOT EXISTS (
+    SELECT 1 FROM runtime_resource_instances instance
+    WHERE instance.instance_id = NEW.runtime_resource_instance_id
+      AND instance.work_scope_id = NEW.scope
+      AND (
+        (NEW.resource_kind = 'bash_process_group' AND instance.resource_kind = 'bash')
+        OR (NEW.resource_kind = 'tmux_server' AND instance.resource_kind = 'tmux')
+        OR (NEW.resource_kind = 'pty_session' AND instance.resource_kind = 'pty')
+        OR (NEW.resource_kind = 'browser_session' AND instance.resource_kind = 'browser')
+      )
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'close expected runtime resource must bind matching scope and kind instance');
+END;
+
+CREATE TRIGGER close_expected_runtime_instance_required
+BEFORE UPDATE OF runtime_resource_instance_id ON close_expected_retirement_resources
+FOR EACH ROW
+WHEN NEW.resource_kind IN ('bash_process_group', 'tmux_server', 'pty_session', 'browser_session')
+ AND NEW.runtime_resource_instance_id IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'close runtime resource instance binding cannot be removed');
+END;
 ";
 
 const MIGRATION_078: &str = r"
