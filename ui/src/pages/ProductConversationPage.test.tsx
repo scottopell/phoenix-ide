@@ -556,7 +556,7 @@ describe('ProductConversationPage', () => {
     });
     const chain = chainQaColumnSpy.mock.lastCall?.[0]?.['chain'] as ChainView;
     expect(chain.current_member_count).toBe(2);
-    expect(chain.current_total_messages).toBe(8);
+    expect(chain.current_total_messages).toBe(6);
   });
 
   it('surfaces pagination failure through aggregated status', async () => {

@@ -590,12 +590,15 @@ function ProductConversationPageInner() {
     if (!snapshot) return null;
     const fallback = chainFromSnapshot(snapshot, []);
     if (!chain) return fallback;
+    const realMessageCount = messages.filter((message) => (
+      !(message.display_data as { productHistoricalHandoff?: unknown } | null | undefined)?.productHistoricalHandoff
+    )).length;
     return {
       ...chain,
       current_member_count: Math.max(chain.current_member_count, snapshot.segments.length),
-      current_total_messages: Math.max(chain.current_total_messages, messages.length, countSnapshotMessages(snapshot)),
+      current_total_messages: Math.max(chain.current_total_messages, realMessageCount, countSnapshotMessages(snapshot)),
     };
-  }, [chain, messages.length, snapshot]);
+  }, [chain, messages, snapshot]);
 
   const renderableQas = useMemo(() => {
     const persisted: ChainQaRow[] = chain?.qa_history.slice() ?? [];
@@ -771,7 +774,7 @@ function ProductConversationPageInner() {
                 setDraft={setDraft}
                 submitting={submitting}
                 sseLost={sseLost}
-                onSubmit={loadError ? () => {} : handleSubmit}
+                {...(!loadError ? { onSubmit: handleSubmit } : {})}
                 onReask={handleReask}
                 activeTextareaRef={activeTextareaRef}
                 onRetryConnection={() => {

@@ -465,6 +465,7 @@ export function Sidebar({
           archivedConversations={archivedConversations}
           productConversations={openProductConversations}
           archivedProductConversations={archivedProductConversations}
+          productRowsAuthoritative={!productConversationsError}
           showArchived={showArchived}
           onToggleArchived={handleToggleArchived}
           onNewConversation={handleNewClick}

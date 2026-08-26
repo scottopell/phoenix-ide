@@ -396,6 +396,7 @@ export function ConversationListPage() {
               archivedConversations={archivedConversations}
               productConversations={openProductConversations}
               archivedProductConversations={archivedProductConversations}
+              productRowsAuthoritative={!productListError}
               showArchived={showArchived}
               onToggleArchived={handleToggleArchived}
               onNewConversation={handleNewConversation}

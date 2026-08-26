@@ -25,6 +25,7 @@ interface ConversationListProps {
   archivedConversations?: readonly Conversation[];
   productConversations?: readonly ProductConversationListRow[];
   archivedProductConversations?: readonly ProductConversationListRow[];
+  productRowsAuthoritative?: boolean;
   showArchived: boolean;
   onToggleArchived: () => void;
   onNewConversation: () => void;
@@ -620,6 +621,7 @@ export function ConversationList({
   archivedConversations = [],
   productConversations = [],
   archivedProductConversations = [],
+  productRowsAuthoritative = false,
   showArchived,
   onToggleArchived,
   onNewConversation,
@@ -660,7 +662,7 @@ export function ConversationList({
 
   const displayList = showArchived ? archivedConversations : conversations;
   const displayProductList = showArchived ? archivedProductConversations : productConversations;
-  const usingProductRows = displayProductList.length > 0 || productConversations.length > 0 || archivedProductConversations.length > 0;
+  const usingProductRows = productRowsAuthoritative || displayProductList.length > 0 || productConversations.length > 0 || archivedProductConversations.length > 0;
 
   const groupedItems: SidebarItem[] = useMemo(() => {
     const roots = computeChainRoots(displayList);
@@ -739,6 +741,19 @@ export function ConversationList({
       return;
     }
     if (lastRevealedActiveSlugRef.current === activeSlug) return;
+    const activeProductRow = displayProductList.find((row) => (
+      row.product_conversation_id === activeSlug
+      || row.latest_transcript_row_id === activeSlug
+      || row.canonical_root.transcript_row_id === activeSlug
+      || row.canonical_root.slug === activeSlug
+    ));
+    if (activeProductRow) {
+      listRootRef.current
+        ?.querySelector<HTMLElement>(`[data-product-conversation-id="${activeProductRow.product_conversation_id}"]`)
+        ?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      lastRevealedActiveSlugRef.current = activeSlug;
+      return;
+    }
 
     for (const item of groupedItems) {
       if (item.kind === 'single') {
@@ -773,7 +788,7 @@ export function ConversationList({
       lastRevealedActiveSlugRef.current = activeSlug;
       return;
     }
-  }, [activeSlug, groupedItems, collapsedChains, effectiveListDensity]);
+  }, [activeSlug, displayProductList, groupedItems, collapsedChains, effectiveListDensity]);
 
   const closeRowMenu = useCallback(() => setExpandedId(null), []);
 
