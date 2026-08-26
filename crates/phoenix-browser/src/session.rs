@@ -1002,6 +1002,24 @@ pub struct BrowserSessionInstanceIdentity {
     user_data_key: String,
 }
 
+impl BrowserSessionInstanceIdentity {
+    #[must_use]
+    pub fn stable_identity(&self) -> String {
+        format!(
+            "session:{}:audience:{:?}:pid:{:?}:profile:{}:addr:{}",
+            self.session_key, self.audience, self.chrome_pid, self.user_data_key, self.session_addr
+        )
+    }
+}
+
+type BrowserRetirementSession = (
+    String,
+    Arc<RwLock<BrowserSession>>,
+    String,
+    BrowserSessionAudience,
+);
+type BrowserActorRetirementSession = (Arc<RwLock<BrowserSession>>, String, BrowserSessionAudience);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrowserRetirementPermit {
     pub work_scope: ResourceScopeKey,
@@ -1737,15 +1755,7 @@ impl BrowserSessionManager {
     }
 
     pub async fn begin_retirement(&self, work_scope: &ResourceScopeKey) -> BrowserRetirementPermit {
-        let (generation, current): (
-            BrowserRetirementGeneration,
-            Vec<(
-                String,
-                Arc<RwLock<BrowserSession>>,
-                String,
-                BrowserSessionAudience,
-            )>,
-        ) = {
+        let (generation, current): (BrowserRetirementGeneration, Vec<BrowserRetirementSession>) = {
             let mut state = self.state.write().await;
             let generation = Self::mark_retirement_fenced(
                 &mut state,
@@ -1794,7 +1804,7 @@ impl BrowserSessionManager {
         let actor_key = session_key(work_scope, actor);
         let (generation, current): (
             BrowserRetirementGeneration,
-            Option<(Arc<RwLock<BrowserSession>>, String, BrowserSessionAudience)>,
+            Option<BrowserActorRetirementSession>,
         ) = {
             let mut state = self.state.write().await;
             let generation = Self::mark_retirement_fenced(
@@ -2124,7 +2134,9 @@ impl BrowserSessionManager {
             BrowserRetirementOutcome::AbsenceVerified if permit.had_entries => {
                 BrowserRetirementOutcome::Retired
             }
-            other => other,
+            outcome @ (BrowserRetirementOutcome::Retired
+            | BrowserRetirementOutcome::AbsenceVerified
+            | BrowserRetirementOutcome::Residual { .. }) => outcome,
         }
     }
 
@@ -2319,7 +2331,7 @@ impl BrowserSessionManager {
         // Find idle sessions
         {
             let state = self.state.read().await;
-            for (key, entry) in state.sessions.iter() {
+            for (key, entry) in &state.sessions {
                 if let Ok(guard) = entry.session.try_read() {
                     if now.duration_since(guard.last_activity) > IDLE_TIMEOUT {
                         let restricted_creator =

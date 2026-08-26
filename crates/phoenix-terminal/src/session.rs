@@ -142,6 +142,11 @@ impl TerminalInstanceIdentity {
             child_pid: handle.child_pid.as_raw(),
         }
     }
+
+    #[must_use]
+    pub fn stable_identity(&self) -> String {
+        format!("pid:{}:handle:{}", self.child_pid, self.handle_addr)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -248,6 +253,9 @@ impl ActiveTerminals {
     /// retirement. The legacy [`Self::try_insert`] wrapper preserves the older
     /// `Option`-based API by collapsing both rejections to `None`.
     ///
+    /// # Errors
+    /// Returns [`ActiveTerminalInsertError`] when the scope is occupied or fenced.
+    ///
     /// # Panics
     /// Panics if the registry mutex is poisoned.
     pub fn try_insert_exact(
@@ -325,7 +333,6 @@ impl ActiveTerminals {
     }
 
     fn build_retirement_permit(
-        &self,
         scope: &ResourceScopeKey,
         map: &mut ActiveTerminalRegistryState,
     ) -> TerminalRetirementPermit {
@@ -359,7 +366,7 @@ impl ActiveTerminals {
     #[must_use]
     pub fn begin_retirement(&self, scope: &ResourceScopeKey) -> TerminalRetirementPermit {
         let mut map = self.0.lock().expect("terminal registry poisoned");
-        self.build_retirement_permit(scope, &mut map)
+        Self::build_retirement_permit(scope, &mut map)
     }
 
     fn matches_exact_instance(
@@ -413,6 +420,9 @@ impl ActiveTerminals {
     /// this removes the registry-owned handle, signals relay teardown, and reaps
     /// the shell when no relay is attached. The scope remains fenced until
     /// [`Self::reopen_after_repair`] is called.
+    ///
+    /// # Panics
+    /// Panics if the registry mutex is poisoned.
     pub async fn complete_retirement(
         &self,
         permit: &TerminalRetirementPermit,
@@ -450,7 +460,9 @@ impl ActiveTerminals {
             TerminalRetirementOutcome::AbsenceVerified if permit.had_entry => {
                 TerminalRetirementOutcome::Retired
             }
-            other => other,
+            outcome @ (TerminalRetirementOutcome::Retired
+            | TerminalRetirementOutcome::AbsenceVerified
+            | TerminalRetirementOutcome::Residual { .. }) => outcome,
         }
     }
 

@@ -490,6 +490,15 @@ pub struct SuccessResponse {
     pub success: bool,
 }
 
+/// Exact server-observed inspection snapshot required to confirm destructive
+/// loss retirement. The request intentionally carries no filesystem path.
+#[derive(Debug, Deserialize)]
+pub struct ConfirmCloseLossRetirementRequest {
+    pub attempt_id: String,
+    pub inspection_generation: String,
+    pub inspection_fingerprint: String,
+}
+
 /// Opening handoff submitted while creating a context continuation.
 #[derive(Debug, Deserialize)]
 pub struct ContinueConversationRequest {

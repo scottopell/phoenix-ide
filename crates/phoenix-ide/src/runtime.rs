@@ -9,6 +9,7 @@
 //! REQ-BED-008: Sub-Agent Spawning
 //! REQ-BED-009: Sub-Agent Isolation
 
+pub(crate) mod close_retirement;
 pub(crate) mod creation_worker;
 pub mod deny_gate;
 pub(crate) mod direct_turn_worker;
@@ -481,6 +482,8 @@ pub struct RuntimeManager {
     mcp_manager: Arc<crate::tools::mcp::McpClientManager>,
     /// Active PTY terminal sessions — threaded into `ToolContext` for `read_terminal`.
     pub terminals: crate::terminal::ActiveTerminals,
+    pub(crate) close_retirement_leases:
+        AsyncMutex<HashMap<(String, WorkScopeId), close_retirement::CloseResourceLease>>,
     runtimes: RwLock<HashMap<String, ConversationHandle>>,
     /// Per-conversation single-flight results for slow runtime materialization.
     /// The mutex protects only map admission/removal; unrelated conversations
@@ -2122,6 +2125,7 @@ impl RuntimeManager {
             tmux_registry: Arc::new(TmuxRegistry::with_lifecycle_sink(Some(tmux_lifecycle_tx))),
             mcp_manager,
             terminals: crate::terminal::ActiveTerminals::new(),
+            close_retirement_leases: AsyncMutex::new(HashMap::new()),
             runtimes: RwLock::new(HashMap::new()),
             runtime_creations: AsyncMutex::new(HashMap::new()),
             conversation_admissions: AsyncMutex::new(HashMap::new()),
@@ -3108,6 +3112,77 @@ impl RuntimeManager {
                 .map_err(|error| error.to_string())?;
         }
         Ok(())
+    }
+
+    /// Rebuilds persisted server-owned loss inspection. Inspection is recovery
+    /// only: it never confirms loss or begins destructive retirement.
+    pub async fn resume_pending_close_inspections(self: &Arc<Self>) -> Result<usize, String> {
+        let obligations = self
+            .db
+            .list_pending_close_obligations()
+            .await
+            .map_err(|error| error.to_string())?;
+        let manager = Arc::clone(self);
+        self.run_authority_units(obligations, move |obligation| {
+            let manager = Arc::clone(&manager);
+            async move {
+                if !matches!(
+                    obligation.phase(),
+                    phoenix_core::domain::close::ClosePhase::AwaitingRetirementInspection
+                ) {
+                    return Ok(false);
+                }
+                match manager
+                    .inspect_close_retirement(obligation.attempt_id().clone())
+                    .await
+                {
+                    Ok(_) => Ok(true),
+                    Err(error) => {
+                        tracing::warn!(attempt_id = %obligation.attempt_id(), %error,
+                            "Close retirement inspection could not be rebuilt");
+                        Ok(false)
+                    }
+                }
+            }
+        })
+        .await
+    }
+
+    /// Replays exact runtime-resource permits for sealed Close retirements. It
+    /// never finalizes product lifecycle or unblocks History.
+    pub async fn resume_pending_close_runtime_retirements(
+        self: &Arc<Self>,
+    ) -> Result<usize, String> {
+        let obligations = self
+            .db
+            .list_pending_close_obligations()
+            .await
+            .map_err(|error| error.to_string())?;
+        let manager = Arc::clone(self);
+        self.run_authority_units(obligations, move |obligation| {
+            let manager = Arc::clone(&manager);
+            async move {
+                if !matches!(
+                    obligation.phase(),
+                    phoenix_core::domain::close::ClosePhase::RetirementRequested
+                        | phoenix_core::domain::close::ClosePhase::NeedsRepair
+                ) {
+                    return Ok(false);
+                }
+                match manager
+                    .retire_close_runtime_resources(obligation.attempt_id().clone())
+                    .await
+                {
+                    Ok(()) => Ok(true),
+                    Err(error) => {
+                        tracing::warn!(attempt_id = %obligation.attempt_id(), %error,
+                            "Close runtime-resource retirement remains in repair state");
+                        Ok(false)
+                    }
+                }
+            }
+        })
+        .await
     }
 
     pub async fn resume_pending_close_settlements(self: &Arc<Self>) -> Result<usize, String> {

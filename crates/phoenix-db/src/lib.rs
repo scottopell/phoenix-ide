@@ -1893,6 +1893,7 @@ impl Database {
             .await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn retire_work_scope_with_close_attempt(
         &self,
         precondition: WorkScopeRetirementPrecondition,
@@ -1926,6 +1927,36 @@ impl Database {
             if !authorized {
                 return Err(DbError::CloseFoundationPrecondition(format!(
                     "Close attempt {attempt_id} is not active with a sealed topology capturing work scope {scope_id}"
+                )));
+            }
+            let resources_retired: bool = sqlx::query_scalar(
+                "SELECT NOT EXISTS(
+                     SELECT 1
+                     FROM close_expected_retirement_resources expected
+                     WHERE expected.attempt_id = ?1
+                       AND expected.scope = ?2
+                       AND expected.resource_kind <> 'work_scope'
+                       AND NOT EXISTS (
+                           SELECT 1
+                           FROM close_retirement_resources receipt
+                           WHERE receipt.attempt_id = expected.attempt_id
+                             AND receipt.scope = expected.scope
+                             AND receipt.inspection_generation = expected.inspection_generation
+                             AND receipt.inspection_fingerprint = expected.inspection_fingerprint
+                             AND receipt.resource_kind = expected.resource_kind
+                             AND receipt.identity_kind = expected.identity_kind
+                             AND receipt.identity_value = expected.identity_value
+                             AND receipt.proof_kind IN ('retired', 'absence_adopted')
+                       )
+                 )",
+            )
+            .bind(attempt_id.as_str())
+            .bind(scope_id.as_str())
+            .fetch_one(&mut *tx)
+            .await?;
+            if !resources_retired {
+                return Err(DbError::CloseFoundationPrecondition(format!(
+                    "Close attempt {attempt_id} has unresolved exact retirement resources for work scope {scope_id}"
                 )));
             }
         }

@@ -668,6 +668,14 @@ pub struct RecordCloseRetirementEvidenceRequest {
     pub detail: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct RecordCloseRetirementDispatchRequest {
+    pub attempt_id: CloseAttemptId,
+    pub scope: WorkScopeId,
+    pub snapshot: CloseRetirementSnapshot,
+    pub resource: RetiredResourceIdentity,
+}
+
 async fn close_obligation_for_update(
     tx: &mut Transaction<'_, Sqlite>,
     attempt_id: &str,
@@ -2399,6 +2407,113 @@ async fn list_close_expected_retirement_resources_tx(
 }
 
 impl Database {
+    /// Durably records intent to remove one exact sealed resource before external
+    /// teardown begins. A restart can adopt absence only from this same-attempt
+    /// dispatch record, never from a path or scope-wide guess.
+    ///
+    /// # Errors
+    /// Returns a database error unless the request names one sealed resource in
+    /// the exact active Close snapshot.
+    pub async fn record_close_retirement_dispatch(
+        &self,
+        request: RecordCloseRetirementDispatchRequest,
+    ) -> DbResult<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let current = close_obligation_for_update(&mut tx, request.attempt_id.as_str()).await?;
+        if !matches!(
+            current.phase(),
+            ClosePhase::RetirementRequested | ClosePhase::NeedsRepair
+        ) || current.snapshot() != Some(&request.snapshot)
+        {
+            return Err(close_precondition(format!(
+                "attempt {} dispatch lacks the exact active retirement authority",
+                request.attempt_id
+            )));
+        }
+        let identity = request.resource.identity();
+        let inserted = sqlx::query(
+            "INSERT OR IGNORE INTO close_retirement_resource_dispatches (
+                 attempt_id, scope, inspection_generation, inspection_fingerprint,
+                 resource_kind, identity_kind, identity_codec, identity_value, dispatched_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )
+        .bind(request.attempt_id.as_str())
+        .bind(request.scope.as_str())
+        .bind(request.snapshot.generation())
+        .bind(request.snapshot.fingerprint())
+        .bind(request.resource.kind().as_str())
+        .bind(identity.identity_kind())
+        .bind(identity.codec())
+        .bind(identity.value())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *tx)
+        .await?;
+        if inserted.rows_affected() == 0 {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                     SELECT 1 FROM close_retirement_resource_dispatches
+                     WHERE attempt_id = ?1 AND scope = ?2
+                       AND inspection_generation = ?3 AND inspection_fingerprint = ?4
+                       AND resource_kind = ?5 AND identity_kind = ?6
+                       AND identity_codec = ?7 AND identity_value = ?8
+                 )",
+            )
+            .bind(request.attempt_id.as_str())
+            .bind(request.scope.as_str())
+            .bind(request.snapshot.generation())
+            .bind(request.snapshot.fingerprint())
+            .bind(request.resource.kind().as_str())
+            .bind(identity.identity_kind())
+            .bind(identity.codec())
+            .bind(identity.value())
+            .fetch_one(&mut *tx)
+            .await?;
+            if !exists {
+                return Err(close_precondition(format!(
+                    "attempt {} dispatch resource is not in the exact sealed inventory",
+                    request.attempt_id
+                )));
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Returns whether the current exact attempt dispatched this resource before
+    /// process-local teardown. This is deliberately narrower than prior evidence.
+    ///
+    /// # Errors
+    /// Returns a database error when dispatch evidence cannot be read.
+    pub async fn close_retirement_resource_was_dispatched(
+        &self,
+        attempt_id: &CloseAttemptId,
+        scope: &WorkScopeId,
+        snapshot: &CloseRetirementSnapshot,
+        resource: &RetiredResourceIdentity,
+    ) -> DbResult<bool> {
+        let identity = resource.identity();
+        sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM close_retirement_resource_dispatches
+                 WHERE attempt_id = ?1 AND scope = ?2
+                   AND inspection_generation = ?3 AND inspection_fingerprint = ?4
+                   AND resource_kind = ?5 AND identity_kind = ?6
+                   AND identity_codec = ?7 AND identity_value = ?8
+             )",
+        )
+        .bind(attempt_id.as_str())
+        .bind(scope.as_str())
+        .bind(snapshot.generation())
+        .bind(snapshot.fingerprint())
+        .bind(resource.kind().as_str())
+        .bind(identity.identity_kind())
+        .bind(identity.codec())
+        .bind(identity.value())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Records one exact resource-retirement outcome for an authorized Close snapshot.
     ///
     /// # Errors
@@ -3076,6 +3191,7 @@ mod tests {
         )
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn capture_test_inventory(
         db: &Database,
         attempt_id: &str,

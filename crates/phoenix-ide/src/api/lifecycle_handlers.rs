@@ -5,9 +5,10 @@ use super::handlers::{
     reopen_bash_after_failed_lifecycle_mutation, run_resource_cleanup_cascade, AppError,
 };
 use super::types::{
-    ConflictErrorResponse, ForkDismissResponse, ForkPromoteResponse, ForkProposalListResponse,
-    ForkProposalSummary, ForkSpawnResponse, RequestChangesRequest, SuccessResponse,
-    TaskApprovalRequest, TaskApprovalResponse, TaskFeedbackRequest,
+    ConfirmCloseLossRetirementRequest, ConflictErrorResponse, ForkDismissResponse,
+    ForkPromoteResponse, ForkProposalListResponse, ForkProposalSummary, ForkSpawnResponse,
+    RequestChangesRequest, SuccessResponse, TaskApprovalRequest, TaskApprovalResponse,
+    TaskFeedbackRequest,
 };
 use super::AppState;
 use crate::db::{ConvMode, Conversation, MessageContent};
@@ -308,6 +309,69 @@ pub(crate) async fn list_fork_proposals(
 /// Abandon a Work or Branch conversation: delete worktree, optionally delete branch,
 /// capture diff snapshot, transition to Terminal.
 /// Single-phase endpoint -- the frontend confirms via a dialog before calling this.
+#[allow(clippy::too_many_lines)]
+/// Confirms destructive loss retirement against one exact persisted server
+/// inspection. This contract deliberately accepts no client path or inventory.
+pub(crate) async fn confirm_close_loss_retirement(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<ConfirmCloseLossRetirementRequest>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    let attempt_id = phoenix_core::domain::close::CloseAttemptId::parse(request.attempt_id)
+        .map_err(|error| AppError::TypedBadRequest {
+            message: error.to_string(),
+            error_type: "invalid_close_attempt".to_string(),
+        })?;
+    let snapshot = phoenix_core::domain::close::CloseRetirementSnapshot::parse(
+        request.inspection_generation,
+        request.inspection_fingerprint,
+    )
+    .map_err(|error| AppError::TypedBadRequest {
+        message: error.to_string(),
+        error_type: "invalid_close_snapshot".to_string(),
+    })?;
+    let attempt = state
+        .db
+        .get_close_obligation(attempt_id.as_str())
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    let topology = state
+        .db
+        .close_foundation_topology(attempt.product_conversation_id())
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    if !topology
+        .member_ids()
+        .into_iter()
+        .any(|candidate| candidate == id)
+    {
+        return Err(AppError::NotFound(
+            "Close attempt does not own this conversation".to_string(),
+        ));
+    }
+    state
+        .db
+        .confirm_close_loss_retirement(&attempt_id, &snapshot)
+        .await
+        .map_err(|error| {
+            AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                error.to_string(),
+                "stale_close_inspection",
+            )))
+        })?;
+    state
+        .runtime
+        .retire_close_runtime_resources(attempt_id)
+        .await
+        .map_err(|error| {
+            AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                error,
+                "close_retirement_needs_repair",
+            )))
+        })?;
+    Ok(Json(SuccessResponse { success: true }))
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn abandon_task(
     State(state): State<AppState>,

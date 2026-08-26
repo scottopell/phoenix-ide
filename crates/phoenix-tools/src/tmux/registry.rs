@@ -108,6 +108,17 @@ pub struct TmuxServerInstanceIdentity {
     pub server_token: String,
 }
 
+impl TmuxServerInstanceIdentity {
+    #[must_use]
+    pub fn stable_identity(&self) -> String {
+        format!(
+            "socket:{}:token:{}",
+            self.socket_path.display(),
+            self.server_token
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TmuxRetirementGeneration(u64);
 
@@ -123,6 +134,11 @@ impl TmuxRetirementPermit {
     #[must_use]
     pub fn generation(&self) -> TmuxRetirementGeneration {
         self.generation
+    }
+
+    #[must_use]
+    pub fn had_entry(&self) -> bool {
+        self.had_entry
     }
 }
 
@@ -527,6 +543,7 @@ impl TmuxRegistry {
     ///   registry init.
     /// - Other [`TmuxError`] variants when the probe / unlink / spawn / mkdir
     ///   steps fail.
+    #[allow(clippy::too_many_lines)]
     pub async fn ensure_live(
         &self,
         work_scope: &ResourceScopeKey,
@@ -860,7 +877,6 @@ impl TmuxRegistry {
     }
 
     fn build_retirement_permit(
-        &self,
         work_scope: &ResourceScopeKey,
         server: &mut TmuxServer,
         had_entry: bool,
@@ -920,7 +936,7 @@ impl TmuxRegistry {
 
         let (entry, created) = self.get_or_insert(work_scope, socket_path).await;
         let mut server = entry.server.write().await;
-        let permit = self.build_retirement_permit(work_scope, &mut server, !created);
+        let permit = Self::build_retirement_permit(work_scope, &mut server, !created);
         drop(server);
         if !created && emit_lifecycle {
             self.emit_lifecycle(work_scope);
@@ -965,6 +981,8 @@ impl TmuxRegistry {
         }
     }
 
+    /// # Errors
+    /// Returns [`TmuxError`] when exact-instance absence cannot be verified.
     pub async fn complete_retirement(
         &self,
         permit: &TmuxRetirementPermit,
@@ -1054,7 +1072,10 @@ impl TmuxRegistry {
                 }
                 Ok(TmuxRetirementOutcome::Retired)
             }
-            residual => Ok(residual),
+            residual
+            @ (TmuxRetirementOutcome::Retired | TmuxRetirementOutcome::Residual { .. }) => {
+                Ok(residual)
+            }
         }
     }
 

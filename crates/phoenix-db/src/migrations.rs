@@ -400,6 +400,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_work_scope_close_retirement_resource_kind",
         sql: MIGRATION_076,
     },
+    Migration {
+        version: 77,
+        name: "record_close_retirement_resource_dispatches",
+        sql: MIGRATION_077,
+    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -7501,6 +7506,60 @@ ALTER TABLE conversation_creation_jobs ADD COLUMN cleanup_lease_until TEXT;
 
 CREATE INDEX idx_creation_cleanup_due
     ON conversation_creation_jobs(status, cleanup_lease_until, updated_at);
+";
+
+const MIGRATION_077: &str = r"
+CREATE TABLE close_retirement_resource_dispatches (
+    attempt_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    inspection_generation TEXT NOT NULL,
+    inspection_fingerprint TEXT NOT NULL,
+    resource_kind TEXT NOT NULL,
+    identity_kind TEXT NOT NULL,
+    identity_codec TEXT NOT NULL,
+    identity_value TEXT NOT NULL,
+    dispatched_at TEXT NOT NULL,
+    PRIMARY KEY (
+        attempt_id, scope, inspection_generation, inspection_fingerprint,
+        resource_kind, identity_kind, identity_value
+    ),
+    FOREIGN KEY (
+        attempt_id, scope, inspection_generation, inspection_fingerprint,
+        resource_kind, identity_kind, identity_value
+    ) REFERENCES close_expected_retirement_resources (
+        attempt_id, scope, inspection_generation, inspection_fingerprint,
+        resource_kind, identity_kind, identity_value
+    ) ON DELETE RESTRICT,
+    CHECK (resource_kind IN (
+        'worktree', 'work_scope', 'bash_process_group', 'tmux_server',
+        'pty_session', 'browser_session', 'equivalent_live_resource'
+    )),
+    CHECK (
+        (resource_kind = 'worktree' AND identity_kind = 'worktree')
+        OR (resource_kind <> 'worktree' AND identity_kind = 'opaque')
+    )
+);
+
+CREATE TRIGGER close_retirement_resource_dispatches_require_authority
+BEFORE INSERT ON close_retirement_resource_dispatches
+FOR EACH ROW
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM close_obligations obligation
+    JOIN close_retirement_inventories inventory
+      ON inventory.attempt_id = obligation.attempt_id
+    WHERE obligation.attempt_id = NEW.attempt_id
+      AND obligation.phase IN ('retirement_requested', 'needs_repair')
+      AND obligation.inspection_generation = NEW.inspection_generation
+      AND obligation.inspection_fingerprint = NEW.inspection_fingerprint
+      AND inventory.scope = NEW.scope
+      AND inventory.inspection_generation = NEW.inspection_generation
+      AND inventory.inspection_fingerprint = NEW.inspection_fingerprint
+      AND inventory.sealed = 1
+)
+BEGIN
+    SELECT RAISE(ABORT, 'close retirement dispatch lacks exact active authority');
+END;
 ";
 
 const MIGRATION_076: &str = "SELECT 1;";

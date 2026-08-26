@@ -781,6 +781,43 @@ impl BashHandleRegistry {
         }
     }
 
+    /// Releases an uncommitted exact retirement permit and restores its handles.
+    ///
+    /// This is only valid before a retirement outcome is durably recorded. It is
+    /// used when Close cannot atomically seal the inventory after fencing
+    /// admission, so a failed persistence attempt does not silently strand a
+    /// still-live process group outside the registry.
+    pub async fn cancel_retirement(&self, permit: BashRetirementPermit) {
+        let BashRetirementPermit {
+            work_scope,
+            generation,
+            entry,
+            removed_handles,
+            ..
+        } = permit;
+        let restored = {
+            let mut table = entry.write().await;
+            if !table.teardown_started || table.teardown_generation != generation.0 {
+                return;
+            }
+            table.teardown_started = false;
+            for handle in &removed_handles {
+                table.insert(Arc::clone(handle));
+            }
+            removed_handles
+        };
+        let mut by_id = self.handles_by_id.write().await;
+        for handle in restored {
+            by_id.insert(
+                handle.handle_id.clone(),
+                RegisteredHandle {
+                    owner: work_scope.clone(),
+                    handle,
+                },
+            );
+        }
+    }
+
     pub async fn complete_retirement(
         &self,
         permit: &BashRetirementPermit,
@@ -1056,8 +1093,8 @@ mod tests {
     fn make_handle_with_process(
         scope_name: &str,
         id: &str,
-        pgid: i32,
-        pid: u32,
+        process_group_id: i32,
+        process_id: u32,
         ring_bytes_cap: usize,
     ) -> Arc<Handle> {
         Handle::new_live(
@@ -1065,8 +1102,8 @@ mod tests {
             HandleId::new(id),
             format!("cmd for {id}"),
             None,
-            pgid,
-            pid,
+            process_group_id,
+            process_id,
             ring_bytes_cap,
         )
     }
@@ -1757,6 +1794,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     #[allow(clippy::similar_names)]
     async fn stale_retirement_permit_does_not_kill_replacement_process_group() {
         use std::os::unix::process::CommandExt as _;
