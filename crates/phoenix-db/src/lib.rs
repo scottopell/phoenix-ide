@@ -5609,8 +5609,8 @@ impl Database {
         ) {
             sqlx::query(
                 "UPDATE product_root_reservations
-                 SET exact_checkout_oid = ?1, logical_base = ?2, freshness = 'fresh',
-                     unresolved_reason = NULL, consumed_at_unix_micros = ?3
+                 SET kind = 'exact_committed_tree', exact_checkout_oid = ?1,
+                     logical_base = ?2, freshness = 'fresh', unresolved_reason = NULL, consumed_at_unix_micros = ?3
                  WHERE consumed_by_conversation_id = (
                      SELECT conversation_id FROM conversation_creation_jobs WHERE id = ?4
                  ) AND status = 'consumed'",

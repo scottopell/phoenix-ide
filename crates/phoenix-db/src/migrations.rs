@@ -2123,8 +2123,8 @@ CREATE TABLE product_root_reservations (
     created_at_unix_micros INTEGER NOT NULL CHECK (typeof(created_at_unix_micros) = 'integer'),
     consumed_at_unix_micros INTEGER CHECK (consumed_at_unix_micros IS NULL OR typeof(consumed_at_unix_micros) = 'integer'),
     CHECK ((kind = 'direct' AND repo_root IS NULL AND repository_id IS NULL AND exact_checkout_oid IS NULL AND logical_base IS NULL AND freshness IS NULL AND unresolved_reason IS NULL)
-        OR (kind = 'exact_committed_tree' AND repo_root IS NOT NULL AND repository_id IS NOT NULL AND exact_checkout_oid IS NOT NULL AND logical_base IS NOT NULL AND freshness IN ('fresh', 'stale_cached') AND unresolved_reason IS NULL)
-        OR (kind = 'unresolved_exact_committed_tree' AND repo_root IS NOT NULL AND repository_id IS NOT NULL AND exact_checkout_oid IS NULL AND logical_base IS NULL AND freshness = 'unresolved' AND unresolved_reason IS NOT NULL)),
+        OR (kind = 'exact_committed_tree' AND repo_root IS NOT NULL AND exact_checkout_oid IS NOT NULL AND logical_base IS NOT NULL AND freshness IN ('fresh', 'stale_cached') AND unresolved_reason IS NULL)
+        OR (kind = 'unresolved_exact_committed_tree' AND repo_root IS NOT NULL AND exact_checkout_oid IS NULL AND logical_base IS NULL AND freshness = 'unresolved' AND unresolved_reason IS NOT NULL)),
     CHECK ((status = 'reserved' AND consumed_by_conversation_id IS NULL AND consumed_at_unix_micros IS NULL)
         OR (status = 'consumed' AND consumed_by_conversation_id IS NOT NULL AND consumed_at_unix_micros IS NOT NULL))
 );

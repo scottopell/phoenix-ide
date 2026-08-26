@@ -91,7 +91,7 @@ describe('/new directory-first product conversation', () => {
       logical_base: 'main',
       freshness: 'fresh',
       root_reservation: {
-        id: 'reservation-git', cwd: '/repo', kind: 'exact_committed_tree', repo_root: '/repo', exact_checkout_oid: 'abc123',
+        repository_id: null, id: 'reservation-git', cwd: '/repo', kind: 'exact_committed_tree', repo_root: '/repo', exact_checkout_oid: 'abc123',
         logical_base: 'main', freshness: 'fresh', unresolved_reason: null,
       },
     });
@@ -137,7 +137,7 @@ describe('/new directory-first product conversation', () => {
     vi.mocked(api.reserveProductRoot).mockResolvedValue({
       kind: 'direct',
       root_reservation: {
-        id: 'reservation-direct', cwd: '/plain-dir', kind: 'direct', repo_root: null, exact_checkout_oid: null,
+        repository_id: null, id: 'reservation-direct', cwd: '/plain-dir', kind: 'direct', repo_root: null, exact_checkout_oid: null,
         logical_base: null, freshness: null, unresolved_reason: null,
       },
     });
@@ -169,7 +169,7 @@ describe('/new directory-first product conversation', () => {
     vi.mocked(api.reserveProductRoot).mockResolvedValue({
       kind: 'direct',
       root_reservation: {
-        id: 'reservation-created', cwd: '/new-dir', kind: 'direct', repo_root: null,
+        repository_id: null, id: 'reservation-created', cwd: '/new-dir', kind: 'direct', repo_root: null,
         exact_checkout_oid: null, logical_base: null, freshness: null, unresolved_reason: null,
       },
     });
@@ -180,7 +180,7 @@ describe('/new directory-first product conversation', () => {
       return {
         kind: 'direct',
         root_reservation: {
-          id: 'reservation-created', cwd: '/new-dir', kind: 'direct', repo_root: null,
+          repository_id: null, id: 'reservation-created', cwd: '/new-dir', kind: 'direct', repo_root: null,
           exact_checkout_oid: null, logical_base: null, freshness: null, unresolved_reason: null,
         },
       };
@@ -210,14 +210,14 @@ describe('/new directory-first product conversation', () => {
       .mockResolvedValueOnce({
         kind: 'exact_committed_tree', exact_checkout_oid: 'abc123', logical_base: 'main', freshness: 'fresh',
         root_reservation: {
-          id: 'reservation-expired', cwd: '/repo', kind: 'exact_committed_tree', repo_root: '/repo',
+          repository_id: null, id: 'reservation-expired', cwd: '/repo', kind: 'exact_committed_tree', repo_root: '/repo',
           exact_checkout_oid: 'abc123', logical_base: 'main', freshness: 'fresh', unresolved_reason: null,
         },
       })
       .mockResolvedValueOnce({
         kind: 'exact_committed_tree', exact_checkout_oid: 'def456', logical_base: 'main', freshness: 'fresh',
         root_reservation: {
-          id: 'reservation-refreshed', cwd: '/repo', kind: 'exact_committed_tree', repo_root: '/repo',
+          repository_id: null, id: 'reservation-refreshed', cwd: '/repo', kind: 'exact_committed_tree', repo_root: '/repo',
           exact_checkout_oid: 'def456', logical_base: 'main', freshness: 'fresh', unresolved_reason: null,
         },
       });

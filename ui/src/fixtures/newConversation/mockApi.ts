@@ -22,7 +22,7 @@ export function installNewConversationFixtureApi(scenario: NewConversationScenar
     logical_base: 'main',
     freshness: 'fresh' as const,
     root_reservation: {
-      id: `fixture-reservation:${cwd}`,
+      repository_id: null, id: `fixture-reservation:${cwd}`,
       cwd,
       kind: 'exact_committed_tree',
       repo_root: cwd,

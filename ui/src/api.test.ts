@@ -421,7 +421,7 @@ describe('directory-first resolution query encoding', () => {
 
   it('encodes reserved roots as scalar form-decodable fields for skills and files', async () => {
     const rootReservation = {
-      id: 'reservation-1',
+      repository_id: null, id: 'reservation-1',
       cwd: '/repo',
       kind: 'exact_committed_tree' as const,
       repo_root: '/repo',

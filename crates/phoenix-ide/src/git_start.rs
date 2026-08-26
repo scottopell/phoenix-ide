@@ -227,9 +227,26 @@ struct RefreshedDefaultTaskStart {
     reserved_oid: String,
 }
 
+fn discover_remote_head_branch(repo_root: &Path) -> Option<String> {
+    let output = phoenix_core::git::command()
+        .current_dir(repo_root)
+        .args(["ls-remote", "--symref", "origin", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("ref: refs/heads/"))
+        .and_then(|line| line.split_whitespace().next())
+        .map(str::to_string)
+}
+
 fn refreshed_default_task_start(repo_root: &Path) -> Option<RefreshedDefaultTaskStart> {
     if has_remote_named_origin(repo_root) {
-        let default_branch = origin_head_branch(repo_root)?;
+        let default_branch =
+            origin_head_branch(repo_root).or_else(|| discover_remote_head_branch(repo_root))?;
         run_git(
             repo_root,
             &[
