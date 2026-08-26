@@ -18,9 +18,6 @@ use axum::{
 use futures::{SinkExt, StreamExt};
 use nix::sys::wait::waitpid;
 use phoenix_core::domain::db_schema::ConvMode;
-use phoenix_core::runtime_resource::{
-    RuntimeResourceAdmission, RuntimeResourceInstanceId, RuntimeResourceKind,
-};
 use phoenix_core::work_scope::ResourceScopeKey;
 use phoenix_terminal::relay::{run_relay, PtyMasterIo, RelayConfig, RelayExit};
 use phoenix_terminal::session::{ActiveTerminals, Dims, StopReason, TerminalHandle};
@@ -350,18 +347,6 @@ async fn acquire_handle(
         return reclaim(conversation_id, existing).await;
     }
 
-    if terminals.reserve_admission(scope).is_err() {
-        if let Some(existing) = terminals.get(scope) {
-            return reclaim(conversation_id, existing).await;
-        }
-        let _ = ws_sender
-            .send(Message::Text(
-                "error: terminal admission unavailable".to_string(),
-            ))
-            .await;
-        return None;
-    }
-
     // Slow path: spawn a new PTY. Resolve the exec plan first
     // (REQ-TMUX-004 / design.md §"Terminal Attach Path"). `cwd` is
     // forwarded so a fresh tmux server starts its pane in the
@@ -376,48 +361,22 @@ async fn acquire_handle(
     {
         Ok(Ok(h)) => h,
         Ok(Err(e)) => {
-            terminals.cancel_admission(scope);
             tracing::error!(conv_id = %conversation_id, error = %e, "Terminal: PTY spawn failed");
             return None;
         }
         Err(e) => {
-            terminals.cancel_admission(scope);
             tracing::error!(conv_id = %conversation_id, error = %e, "Terminal: spawn_blocking panicked");
             return None;
         }
     };
 
     let child_pid = handle.child_pid;
-    let mut handle = handle;
-    if let ResourceScopeKey::Work(work_scope) = scope {
-        let instance_id = RuntimeResourceInstanceId::new();
-        let admission = RuntimeResourceAdmission {
-            instance_id: instance_id.clone(),
-            scope: work_scope.clone(),
-            kind: RuntimeResourceKind::Pty,
-            launch_uuid: handle.launch_identity.launch_uuid.clone(),
-            pid: Some(handle.launch_identity.process.pid),
-            process_birth: Some(handle.launch_identity.process.start_time),
-            pgid: None,
-            tmux_socket_path: None,
-            tmux_server_token: None,
-            browser_session_key: None,
-            browser_audience: None,
-            browser_profile_path: None,
-        };
-        if let Err(error) = runtime
-            .db()
-            .admit_runtime_resource_instance(admission)
-            .await
-        {
-            terminals.cancel_admission(scope);
-            tracing::error!(conv_id = %conversation_id, %error, "Terminal: durable PTY admission failed");
-            return None;
-        }
-        handle.runtime_resource_instance_id = Some(instance_id);
-    }
 
-    if let Ok(arc_handle) = terminals.publish_admitted(scope.clone(), handle) {
+    // Atomic check-and-insert. If we lose the race, the handle we just spawned
+    // is dropped (closing master_fd → SIGHUP), and we fall back to reclaiming
+    // the winner so the caller still gets an attached session.
+    if let Some(arc_handle) = terminals.try_insert(scope.clone(), handle) {
+        // Fresh handle — permit is available immediately (initialized with 1).
         return acquire_permit(conversation_id, arc_handle).await;
     }
 

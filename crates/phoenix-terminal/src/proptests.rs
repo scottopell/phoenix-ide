@@ -78,7 +78,6 @@ fn dummy_handle_kind(
         master_fd: owned_fd,
         child_pid: nix::unistd::Pid::from_raw(pid), // synthetic test pid — never reaped
         launch_identity: dummy_launch_identity(pid.cast_unsigned()),
-        runtime_resource_instance_id: None,
         child_kind,
         tracker: std::sync::Arc::new(std::sync::Mutex::new(CommandTracker::new(
             "test-session".to_string(),
