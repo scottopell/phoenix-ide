@@ -103,6 +103,9 @@ pub struct TerminalHandle {
     pub child_pid: Pid,
     /// Durable launch identity captured at spawn time.
     pub launch_identity: TerminalLaunchIdentity,
+    /// Durable database authority row assigned before publication.
+    pub runtime_resource_instance_id:
+        Option<phoenix_core::runtime_resource::RuntimeResourceInstanceId>,
     pub child_kind: TerminalChildKind,
     /// Command tracker — fed with every PTY output byte (REQ-TERM-010, REQ-TERM-021).
     pub tracker: Arc<Mutex<CommandTracker>>,
@@ -208,6 +211,7 @@ pub enum ActiveTerminalInsertError {
 #[derive(Debug, Default)]
 struct ActiveTerminalRegistryState {
     handles: HashMap<ResourceScopeKey, Arc<TerminalHandle>>,
+    pending_admissions: std::collections::HashSet<ResourceScopeKey>,
     retirements: HashMap<ResourceScopeKey, ScopeRetirementState>,
 }
 
@@ -299,12 +303,64 @@ impl ActiveTerminals {
         {
             return Err(ActiveTerminalInsertError::RetirementFenced);
         }
-        if map.handles.contains_key(&scope) {
+        if map.handles.contains_key(&scope) || map.pending_admissions.contains(&scope) {
             return Err(ActiveTerminalInsertError::Occupied);
         }
         let arc = Arc::new(handle);
         map.handles.insert(scope, Arc::clone(&arc));
         Ok(arc)
+    }
+
+    /// Reserves `scope` before durable admission; the handle stays invisible
+    /// until [`Self::publish_admitted`] consumes the reservation.
+    pub fn reserve_admission(
+        &self,
+        scope: &ResourceScopeKey,
+    ) -> Result<(), ActiveTerminalInsertError> {
+        let mut map = self.0.lock().expect("terminal registry poisoned");
+        if map
+            .retirements
+            .get(scope)
+            .is_some_and(|retirement| retirement.fenced)
+        {
+            return Err(ActiveTerminalInsertError::RetirementFenced);
+        }
+        if map.handles.contains_key(scope) || !map.pending_admissions.insert(scope.clone()) {
+            return Err(ActiveTerminalInsertError::Occupied);
+        }
+        Ok(())
+    }
+
+    /// Publishes an exact handle after durable admission succeeds.
+    pub fn publish_admitted(
+        &self,
+        scope: ResourceScopeKey,
+        handle: TerminalHandle,
+    ) -> Result<Arc<TerminalHandle>, ActiveTerminalInsertError> {
+        let mut map = self.0.lock().expect("terminal registry poisoned");
+        if !map.pending_admissions.remove(&scope) {
+            return Err(ActiveTerminalInsertError::Occupied);
+        }
+        if map
+            .retirements
+            .get(&scope)
+            .is_some_and(|retirement| retirement.fenced)
+            || map.handles.contains_key(&scope)
+        {
+            return Err(ActiveTerminalInsertError::RetirementFenced);
+        }
+        let handle = Arc::new(handle);
+        map.handles.insert(scope, Arc::clone(&handle));
+        Ok(handle)
+    }
+
+    /// Cancels a failed admission without publishing a handle.
+    pub fn cancel_admission(&self, scope: &ResourceScopeKey) {
+        self.0
+            .lock()
+            .expect("terminal registry poisoned")
+            .pending_admissions
+            .remove(scope);
     }
 
     /// Attempt to register a new terminal for `scope`.

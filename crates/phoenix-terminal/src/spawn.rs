@@ -283,6 +283,7 @@ pub fn spawn_pty(
                 master_fd,
                 child_pid: child,
                 launch_identity,
+                runtime_resource_instance_id: None,
                 child_kind,
                 tracker: Arc::new(Mutex::new(CommandTracker::new(session_id))),
                 shell_integration_status: Arc::new(Mutex::new(ShellIntegrationStatus::Unknown)),
