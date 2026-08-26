@@ -1,1 +1,0 @@
-Add exact per-WorkScope retirement admission fences, instance inventory, teardown outcomes, and absence verification for tmux, terminal/PTY, and browser registries. Close retirement will consume these authorities; no Close/history/UI behavior belongs here.
