@@ -10,6 +10,34 @@ import { generateUUID } from '../utils/uuid';
 const LAST_CWD_KEY = 'phoenix-last-cwd';
 const LAST_MODEL_KEY = 'phoenix-last-model';
 const NEW_CONVERSATION_DRAFT_KEY = 'phoenix-new-conversation-draft';
+const PENDING_CREATE_IDENTITY_KEY = 'phoenix-pending-product-create-identity';
+
+type PendingCreateIdentity = {
+  scope: string;
+  conversationId: string;
+  messageId: string;
+};
+
+function pendingCreateScope(cwd: string, objective: string, reservationId: string): string {
+  return JSON.stringify([cwd.trim(), objective, reservationId]);
+}
+
+function getOrCreatePendingIdentity(scope: string): PendingCreateIdentity {
+  try {
+    const raw = localStorage.getItem(PENDING_CREATE_IDENTITY_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as PendingCreateIdentity;
+      if (parsed.scope === scope && parsed.conversationId && parsed.messageId) return parsed;
+    }
+  } catch { /* replace malformed/unavailable state below */ }
+  const identity = { scope, conversationId: generateUUID(), messageId: generateUUID() };
+  try { localStorage.setItem(PENDING_CREATE_IDENTITY_KEY, JSON.stringify(identity)); } catch { /* retry remains stable in-memory only */ }
+  return identity;
+}
+
+function clearPendingCreateIdentity(): void {
+  try { localStorage.removeItem(PENDING_CREATE_IDENTITY_KEY); } catch { /* best effort after success */ }
+}
 
 function effortSupportedByModel(models: ModelsResponse | null, modelId: string | null, effort: ModelEffort | null): boolean {
   if (!effort) return true;
@@ -243,8 +271,9 @@ export function useCreateConversation(navigate: (path: string) => void) {
       }
       if (!acceptedRoot) throw new Error('Creation root is not reserved yet');
 
-      const messageId = generateUUID();
-      const clientConversationId = generateUUID();
+      const pendingIdentity = getOrCreatePendingIdentity(
+        pendingCreateScope(cwd, trimmed, acceptedRoot.id),
+      );
       if (files.length > 0) {
         setError('File attachments are not available for this conversation flow yet.');
         setCreating(false);
@@ -258,8 +287,8 @@ export function useCreateConversation(navigate: (path: string) => void) {
       const response = await api.createProductConversation({
         root_reservation: acceptedRoot,
         objective: trimmed,
-        message_id: messageId,
-        conversation_id: clientConversationId,
+        message_id: pendingIdentity.messageId,
+        conversation_id: pendingIdentity.conversationId,
         model: selectedModel,
         effort: selectedEffort,
         images,
@@ -268,6 +297,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
       setImages([]);
       setFiles([]);
       clearNewConversationDraft();
+      clearPendingCreateIdentity();
       navigate(response.canonical_route);
     } catch (err) {
       setCreating(false);

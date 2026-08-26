@@ -6152,6 +6152,39 @@ impl Database {
                 tx.rollback().await?;
                 return Err(DbError::ConversationNotFound(job_id.to_string()));
             }
+            let cleanup_required: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM conversation_creation_resource_reservations
+                 WHERE job_id = ?1 AND status = 'cleanup_required'",
+            )
+            .bind(job_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if cleanup_required > 0 {
+                let stale_scope_id: Option<String> = sqlx::query_scalar(
+                    "SELECT work_scope_id FROM conversations WHERE id = (
+                         SELECT conversation_id FROM conversation_creation_jobs WHERE id = ?1
+                     )",
+                )
+                .bind(job_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .flatten();
+                sqlx::query(
+                    "UPDATE conversations
+                     SET work_scope_id = NULL, cm_kind = 'direct', cm_task_id = NULL,
+                         cm_task_title = NULL, cm_next_taskmd_id_hint = NULL
+                     WHERE id = (SELECT conversation_id FROM conversation_creation_jobs WHERE id = ?1)",
+                )
+                .bind(job_id)
+                .execute(&mut *tx)
+                .await?;
+                if let Some(scope_id) = stale_scope_id {
+                    sqlx::query("DELETE FROM work_scopes WHERE id = ?1")
+                        .bind(scope_id)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+            }
             tx.commit().await?;
             Ok(CreationCasOutcome::Applied)
         } else {

@@ -928,8 +928,8 @@ fn phoenix_is_already_ignored(dir: &Path) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-/// Ensure `.phoenix/` is ignored in the given directory, appending + staging the
-/// tracked `.gitignore` only when it is NOT already ignored by some other
+/// Ensure `.phoenix/` is ignored in the given directory, appending to the
+/// tracked `.gitignore` without modifying the index when it is not already ignored by another
 /// mechanism. Creates `.gitignore` if it doesn't exist.
 ///
 /// No-op when `git check-ignore` already reports `.phoenix/` ignored — e.g. a
@@ -970,8 +970,10 @@ pub(crate) fn ensure_gitignore_has_phoenix(dir: &Path) -> Result<(), String> {
             writeln!(f).map_err(|e| format!("Failed to write .gitignore: {e}"))?;
         }
         writeln!(f, ".phoenix/").map_err(|e| format!("Failed to write .gitignore: {e}"))?;
-        run_git(dir, &["add", ".gitignore"])?;
-        tracing::info!(dir = %dir.display(), "Added .phoenix/ to .gitignore");
+        // Keep creation observational with respect to the user's index. The
+        // working-tree rule is sufficient while provisioning; later owned
+        // commits may stage it together with their own metadata.
+        tracing::info!(dir = %dir.display(), "Added .phoenix/ to working-tree .gitignore without staging");
     }
 
     Ok(())
@@ -1693,11 +1695,8 @@ mod tests {
         );
     }
 
-    /// Bug 2 complement: when `.phoenix/` is NOT yet ignored (a plain
-    /// Explore/Branch worktree), `ensure_gitignore_has_phoenix` keeps its
-    /// append + stage behaviour.
     #[test]
-    fn ensure_gitignore_appends_and_stages_when_not_yet_ignored() {
+    fn ensure_gitignore_appends_without_mutating_index() {
         let tmp = TempDir::new().unwrap();
         init_repo(tmp.path());
 
@@ -1709,10 +1708,9 @@ mod tests {
             "`.phoenix/` must be appended: {content:?}"
         );
         let staged = run_git(tmp.path(), &["diff", "--cached", "--name-only"]).unwrap();
-        assert_eq!(
-            staged.trim(),
-            ".gitignore",
-            "the new `.gitignore` must be staged: {staged:?}"
+        assert!(
+            staged.trim().is_empty(),
+            "creation must preserve the user's index exactly: {staged:?}"
         );
     }
 

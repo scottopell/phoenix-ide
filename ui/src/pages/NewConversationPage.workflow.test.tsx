@@ -202,6 +202,25 @@ describe('/new directory-first product conversation', () => {
       .toBe('reservation-created');
   });
 
+  it('reuses create identities after an uncertain response', async () => {
+    vi.mocked(api.createProductConversation)
+      .mockRejectedValueOnce(new Error('network response lost'))
+      .mockResolvedValueOnce({ product_conversation_id: 'pc-reused', canonical_route: '/product-conversations/pc-reused' } as never);
+
+    renderPage();
+    await screen.findAllByPlaceholderText('What would you like to work on?');
+    fireEvent.change(composerTextarea(), { target: { value: 'Retry safely' } });
+    fireEvent.click(sendButton());
+    await waitFor(() => expect(api.createProductConversation).toHaveBeenCalledTimes(1));
+    fireEvent.click(sendButton());
+    await waitFor(() => expect(api.createProductConversation).toHaveBeenCalledTimes(2));
+
+    const first = vi.mocked(api.createProductConversation).mock.calls[0]![0];
+    const second = vi.mocked(api.createProductConversation).mock.calls[1]![0];
+    expect(second.conversation_id).toBe(first.conversation_id);
+    expect(second.message_id).toBe(first.message_id);
+  });
+
   it('keeps the draft on failure so retry is truthful', async () => {
     vi.mocked(api.createProductConversation)
       .mockRejectedValueOnce(new Error('boom'))
