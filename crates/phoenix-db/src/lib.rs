@@ -1522,8 +1522,7 @@ impl Database {
 
         let marker = std::path::Path::new(worktree_path).join(".git");
         let metadata = std::fs::symlink_metadata(&marker).ok()?;
-        let marker_is_file = metadata.is_file();
-        let marker_bytes = if marker_is_file {
+        let marker_bytes = if metadata.is_file() {
             if metadata.len() > MAX_GIT_POINTER_BYTES {
                 return None;
             }
@@ -1560,10 +1559,7 @@ impl Database {
             .ok()
             .and_then(|created| created.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|duration| duration.as_nanos().to_string());
-        if created_nanos.is_none() && !marker_is_file {
-            return None;
-        }
-        let created_nanos = created_nanos.unwrap_or_else(|| "unavailable".to_string());
+        let created_nanos = created_nanos?;
         Some(format!(
             "git_admin_incarnation_v1:{}:{}:{created_nanos}:{encoded}",
             metadata.dev(),

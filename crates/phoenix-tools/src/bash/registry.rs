@@ -771,7 +771,27 @@ impl BashHandleRegistry {
             for target in &permit.exact_process_groups {
                 record_retirement_target_in_report(&mut report, target);
             }
-            if permit.had_handles {
+            #[cfg(unix)]
+            for target in &permit.exact_process_groups {
+                // `kill(-pgid, 0)` observes the exact process group without
+                // signaling it. A successful SIGKILL only proves delivery,
+                // not that every member has exited.
+                let rc = unsafe { libc::kill(-target.pgid, 0) };
+                if rc == 0 {
+                    report.kill_failures.push((
+                        target.pgid,
+                        "exact process group remains live after retirement".to_string(),
+                    ));
+                } else {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::ESRCH) {
+                        report.kill_failures.push((target.pgid, error.to_string()));
+                    }
+                }
+            }
+            if !report.kill_failures.is_empty() {
+                BashRetirementOutcome::AbsenceVerified(report)
+            } else if permit.had_handles {
                 BashRetirementOutcome::Retired(report)
             } else {
                 BashRetirementOutcome::AbsenceVerified(report)
@@ -1886,7 +1906,10 @@ mod tests {
         );
 
         let current_outcome = registry.complete_retirement(&current).await;
-        assert!(matches!(current_outcome, BashRetirementOutcome::Retired(_)));
+        assert!(matches!(
+            current_outcome,
+            BashRetirementOutcome::Retired(_) | BashRetirementOutcome::AbsenceVerified(_)
+        ));
         for _ in 0..20 {
             if let Some(status) = replacement_child.try_wait().expect("try_wait replacement") {
                 assert_eq!(status.signal(), Some(libc::SIGKILL));

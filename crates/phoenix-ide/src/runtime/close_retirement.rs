@@ -331,48 +331,14 @@ impl RuntimeManager {
                     .iter()
                     .map(resource_key)
                     .collect::<std::collections::BTreeSet<_>>();
-                let absent_after_dispatch = expected
-                    .iter()
-                    .filter(|resource| !observed_keys.contains(&resource_key(resource)))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                for resource in absent_after_dispatch {
-                    let dispatched = self
-                        .db()
-                        .close_retirement_resource_was_dispatched(
-                            &attempt_id,
-                            &scope,
-                            &snapshot,
-                            &resource,
-                        )
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    if !dispatched {
-                        return self
-                            .record_close_residual(
-                                &attempt_id,
-                                &snapshot,
-                                &scope,
-                                resource,
-                                RetirementFailureReason::IdentityNotProven,
-                                "restart observed an absent runtime resource without an exact prior dispatch",
-                            )
-                            .await;
-                    }
-                    self.record_close_retired(
-                        &attempt_id,
-                        &snapshot,
-                        &scope,
-                        resource.clone(),
-                        "exact prior dispatch and restart absence verification",
-                    )
-                    .await?;
-                    expected.retain(|candidate| candidate != &resource);
-                }
                 let expected_keys = expected
                     .iter()
                     .map(resource_key)
                     .collect::<std::collections::BTreeSet<_>>();
+                // Registry entries are process-local observations, not durable
+                // proof that a prior process or browser has exited. After a
+                // restart, empty registry state must route to repair rather
+                // than turning a same-attempt dispatch into a false receipt.
                 if observed_keys != expected_keys {
                     let resource = expected
                         .first()
@@ -853,8 +819,7 @@ fn observe_worktree_fingerprint(path: &Path) -> Option<String> {
     const MAX_GIT_POINTER_BYTES: u64 = 16 * 1024;
     let marker = path.join(".git");
     let metadata = std::fs::symlink_metadata(&marker).ok()?;
-    let marker_is_file = metadata.is_file();
-    let marker_bytes = if marker_is_file {
+    let marker_bytes = if metadata.is_file() {
         if metadata.len() > MAX_GIT_POINTER_BYTES {
             return None;
         }
@@ -893,14 +858,12 @@ fn observe_worktree_fingerprint(path: &Path) -> Option<String> {
             .ok()
             .and_then(|created| created.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|duration| duration.as_nanos().to_string());
-        if created_nanos.is_none() && !marker_is_file {
-            return None;
-        }
+        let created_nanos = created_nanos?;
         Some(format!(
             "git_admin_incarnation_v1:{}:{}:{}:{encoded}",
             metadata.dev(),
             metadata.ino(),
-            created_nanos.unwrap_or_else(|| "unavailable".to_string())
+            created_nanos
         ))
     }
     #[cfg(not(unix))]
