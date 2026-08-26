@@ -213,6 +213,34 @@ pub enum DbError {
 
 pub type DbResult<T> = Result<T, DbError>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentHiddenRepositoryManagementRoot {
+    pub repository_id: phoenix_core::git_repository::GitRepositoryId,
+    pub management_root: String,
+    pub observed_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitRepositoryDefaultBranchObservation {
+    Resolved { branch: String, provenance: String },
+    Unresolved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachHiddenGitRepositoryInput {
+    pub conversation_id: String,
+    pub common_dir: String,
+    pub management_root: String,
+    pub default_branch: GitRepositoryDefaultBranchObservation,
+    pub observed_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachedHiddenGitRepository {
+    pub work_scope_id: WorkScopeId,
+    pub repository_id: phoenix_core::git_repository::GitRepositoryId,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SteeringDrainMessageStatus {
     Inserted,
@@ -4342,6 +4370,193 @@ impl Database {
         .map_err(DbError::Sqlx)
     }
 
+    /// Attach normalized hidden repository authority to an existing conversation `WorkScope`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] when attachment validation or the transaction fails.
+    #[allow(clippy::too_many_lines)]
+    pub async fn attach_hidden_git_repository_to_conversation_work_scope(
+        &self,
+        input: &AttachHiddenGitRepositoryInput,
+    ) -> DbResult<AttachedHiddenGitRepository> {
+        let normalized_common_dir = normalize_hidden_git_repository_path(&input.common_dir)?;
+        let normalized_management_root =
+            normalize_hidden_git_repository_path(&input.management_root)?;
+        let observed_at_unix_micros = datetime_to_unix_micros(input.observed_at);
+        let generation = 1_i64;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let row = sqlx::query(
+            "SELECT work_scope_id
+               FROM conversations
+              WHERE id = ?1",
+        )
+        .bind(&input.conversation_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let work_scope_id = WorkScopeId::parse(row.get::<String, _>("work_scope_id"))
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+
+        let repository_id = if let Some(existing_id) = sqlx::query_scalar::<_, String>(
+            "SELECT repository_id
+               FROM git_repository_locator_observations
+              WHERE locator_kind = 'common_dir' AND path = ?1",
+        )
+        .bind(&normalized_common_dir)
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            phoenix_core::git_repository::GitRepositoryId::parse(existing_id)
+                .map_err(|error| DbError::Serialization(error.to_string()))?
+        } else if let Some(existing_id) = sqlx::query_scalar::<_, String>(
+            "SELECT repository_id
+               FROM git_repository_locator_observations
+              WHERE locator_kind = 'management_root' AND path = ?1",
+        )
+        .bind(&normalized_management_root)
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            phoenix_core::git_repository::GitRepositoryId::parse(existing_id)
+                .map_err(|error| DbError::Serialization(error.to_string()))?
+        } else {
+            let repository_id = phoenix_core::git_repository::GitRepositoryId::parse(
+                uuid::Uuid::new_v4().to_string(),
+            )
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+            sqlx::query("INSERT INTO git_repositories (id) VALUES (?1)")
+                .bind(repository_id.as_str())
+                .execute(&mut *tx)
+                .await?;
+            repository_id
+        };
+
+        for (locator_kind, path) in [
+            ("common_dir", normalized_common_dir.as_str()),
+            ("management_root", normalized_management_root.as_str()),
+        ] {
+            sqlx::query(
+                "INSERT INTO git_repository_locator_observations (
+                    repository_id, locator_kind, status, path, observed_at_unix_micros
+                 ) VALUES (?1, ?2, 'present', ?3, ?4)
+                 ON CONFLICT(repository_id, locator_kind)
+                 DO UPDATE SET status = excluded.status,
+                               path = excluded.path,
+                               observed_at_unix_micros = excluded.observed_at_unix_micros",
+            )
+            .bind(repository_id.as_str())
+            .bind(locator_kind)
+            .bind(path)
+            .bind(observed_at_unix_micros)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        let (status, branch, provenance) = match &input.default_branch {
+            GitRepositoryDefaultBranchObservation::Resolved { branch, provenance } => {
+                ("resolved", Some(branch.as_str()), Some(provenance.as_str()))
+            }
+            GitRepositoryDefaultBranchObservation::Unresolved => ("unresolved", None, None),
+        };
+        sqlx::query(
+            "INSERT INTO git_repository_default_branch_observations (
+                repository_id, generation, status, branch, provenance, observed_at_unix_micros
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(repository_id)
+             DO UPDATE SET generation = excluded.generation,
+                           status = excluded.status,
+                           branch = excluded.branch,
+                           provenance = excluded.provenance,
+                           observed_at_unix_micros = excluded.observed_at_unix_micros",
+        )
+        .bind(repository_id.as_str())
+        .bind(generation)
+        .bind(status)
+        .bind(branch)
+        .bind(provenance)
+        .bind(observed_at_unix_micros)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO work_scope_git_repositories (work_scope_id, repository_id)
+             VALUES (?1, ?2)
+             ON CONFLICT(work_scope_id)
+             DO UPDATE SET repository_id = excluded.repository_id",
+        )
+        .bind(work_scope_id.as_str())
+        .bind(repository_id.as_str())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(AttachedHiddenGitRepository {
+            work_scope_id,
+            repository_id,
+        })
+    }
+
+    /// List one present management-root observation per hidden repository by recency.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] when the query or timestamp conversion fails.
+    pub async fn list_recent_hidden_repository_management_roots(
+        &self,
+    ) -> DbResult<Vec<RecentHiddenRepositoryManagementRoot>> {
+        let rows = sqlx::query(
+            "WITH latest_management_root AS (
+                 SELECT repository_id, path, observed_at_unix_micros,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY repository_id
+                            ORDER BY observed_at_unix_micros DESC, path DESC
+                        ) AS row_num
+                   FROM git_repository_locator_observations
+                  WHERE locator_kind = 'management_root' AND status = 'present'
+             )
+             SELECT repository_id, path, observed_at_unix_micros
+               FROM latest_management_root roots
+              WHERE row_num = 1
+                AND EXISTS (
+                    SELECT 1
+                      FROM work_scope_git_repositories wr
+                      JOIN conversation_work_scope_attachments cwa
+                        ON cwa.work_scope_id = wr.work_scope_id
+                      JOIN conversations c ON c.id = cwa.conversation_id
+                     WHERE wr.repository_id = roots.repository_id
+                       AND c.archived IN (0, 1)
+                )
+              ORDER BY (
+                    SELECT COUNT(DISTINCT c2.id)
+                      FROM work_scope_git_repositories wr2
+                      JOIN conversation_work_scope_attachments cwa2
+                        ON cwa2.work_scope_id = wr2.work_scope_id
+                      JOIN conversations c2 ON c2.id = cwa2.conversation_id
+                     WHERE wr2.repository_id = roots.repository_id
+                ) DESC,
+                observed_at_unix_micros DESC, repository_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let repository_id = phoenix_core::git_repository::GitRepositoryId::parse(
+                    row.get::<String, _>("repository_id"),
+                )
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+                let management_root = row.get::<String, _>("path");
+                let observed_at = unix_micros_to_datetime(
+                    row.get::<i64, _>("observed_at_unix_micros"),
+                    "observed_at_unix_micros",
+                )?;
+                Ok(RecentHiddenRepositoryManagementRoot {
+                    repository_id,
+                    management_root,
+                    observed_at,
+                })
+            })
+            .collect()
+    }
+
     /// Conversations with persisted Phoenix-created worktree paths, including
     /// archived and terminal rows for disk disposition.
     ///
@@ -6842,6 +7057,8 @@ impl Database {
             base_branch: Some(snapshot.base_branch.clone()),
             checkout_ref: Some(snapshot.branch_name.clone()),
             reserved_checkout_oid: None,
+            reserved_repo_root: None,
+            reserved_root_freshness: None,
             seed_parent_id: None,
             seed_label: Some(snapshot.title.clone()),
             approved_task: Some(snapshot.clone()),
@@ -11396,6 +11613,36 @@ fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
     })
 }
 
+fn normalize_hidden_git_repository_path(raw: &str) -> DbResult<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(DbError::Serialization(
+            "hidden git repository path must not be empty".to_string(),
+        ));
+    }
+    let path = std::path::Path::new(trimmed);
+    if !path.is_absolute() {
+        return Err(DbError::Serialization(format!(
+            "hidden git repository path must be absolute: {trimmed}"
+        )));
+    }
+    let normalized = if trimmed == "/" {
+        "/".to_string()
+    } else {
+        trimmed.trim_end_matches('/').to_string()
+    };
+    Ok(normalized)
+}
+
+fn datetime_to_unix_micros(value: chrono::DateTime<Utc>) -> i64 {
+    value.timestamp_micros()
+}
+
+fn unix_micros_to_datetime(value: i64, field: &str) -> DbResult<chrono::DateTime<Utc>> {
+    chrono::DateTime::<Utc>::from_timestamp_micros(value)
+        .ok_or_else(|| DbError::Serialization(format!("invalid {field}: {value}")))
+}
+
 fn claim_generation_i64(claim: &CreationClaim) -> DbResult<i64> {
     i64::try_from(claim.generation).map_err(|_| {
         DbError::Serialization("creation generation exceeds SQLite integer".to_string())
@@ -12794,6 +13041,8 @@ mod tests {
                 base_branch: None,
                 checkout_ref: None,
                 reserved_checkout_oid: None,
+                reserved_repo_root: None,
+                reserved_root_freshness: None,
                 seed_parent_id: None,
                 seed_label: None,
                 approved_task: None,

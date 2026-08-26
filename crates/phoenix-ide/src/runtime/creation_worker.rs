@@ -5,7 +5,8 @@ use crate::api::handlers::{
     BranchWorktreeInfo, ManagedWorktreeError,
 };
 use crate::db::{
-    ConvMode, ConversationCreationMetadataUpdate, CreationClaimOutcome, ErrorKind, NonEmptyString,
+    AttachHiddenGitRepositoryInput, ConvMode, ConversationCreationMetadataUpdate,
+    CreationClaimOutcome, ErrorKind, GitRepositoryDefaultBranchObservation, NonEmptyString,
 };
 use crate::runtime::{ConversationMetadataUpdate, EvictionReason, RuntimeManager, SseEvent};
 use crate::state_machine::{ConvState, Event};
@@ -167,6 +168,7 @@ thread_local! {
         std::cell::RefCell::new(None);
 }
 
+#[cfg(test)]
 fn resolve_default_task_start_point(repo_root: &Path) -> Option<crate::git_start::GitStartPoint> {
     #[cfg(test)]
     {
@@ -524,6 +526,44 @@ async fn provision_conversation(
     };
     let valid_cwd = crate::conversation_cwd::validate_conversation_cwd(&intent.cwd)
         .map_err(|e| (e.to_string(), ErrorKind::InvalidRequest))?;
+    let initial_cwd = valid_cwd.into_raw();
+    if let (Some(repo_root), Some(reserved_oid)) = (
+        intent.reserved_repo_root.as_deref(),
+        intent.reserved_checkout_oid.as_deref(),
+    ) {
+        let detected = phoenix_core::git::detect_git_repo_root(std::path::Path::new(&initial_cwd))
+            .ok_or_else(|| {
+                (
+                    "Reserved root requires a git repository".to_string(),
+                    ErrorKind::InvalidRequest,
+                )
+            })?;
+        if detected != repo_root {
+            return Err((
+                "Reserved root does not belong to the detected repository".to_string(),
+                ErrorKind::InvalidRequest,
+            )
+                .into());
+        }
+        let head = crate::git_start::resolve_commit_oid_for_reservation(
+            std::path::Path::new(repo_root),
+            reserved_oid,
+        )
+        .ok_or_else(|| {
+            (
+                "Reserved checkout OID is no longer available".to_string(),
+                ErrorKind::InvalidRequest,
+            )
+        })?;
+        if head != reserved_oid {
+            return Err((
+                "Reserved checkout OID does not resolve exactly".to_string(),
+                ErrorKind::InvalidRequest,
+            )
+                .into());
+        }
+    }
+
     checkpoint_creation_stage(
         manager,
         job,
@@ -531,7 +571,6 @@ async fn provision_conversation(
         phoenix_core::domain::creation_protocol::CreationStage::ResolveRepository,
     )
     .await?;
-    let initial_cwd = valid_cwd.into_raw();
     let repo_root = phoenix_core::git::detect_git_repo_root(Path::new(&initial_cwd));
     let requested_mode = intent.mode.as_deref().unwrap_or("direct");
     let approved_task_creation = requested_mode == "approved_task";
@@ -890,30 +929,26 @@ async fn provision_conversation(
         (directory_first_product, product_conversation_id.as_ref())
     {
         if let Some(repo_root) = repo_root.clone() {
-            let repo_for_resolution = repo_root.clone();
-            let resolution_admission = acquire_creation_admission(
-                manager,
-                "default branch resolution rejected after fatal local authority closure",
-            )?;
-            let start_point = run_admitted_blocking(resolution_admission, move || {
-                let _lock = RepositoryMutationLock::acquire(&repo_for_resolution).ok()?;
-                resolve_default_task_start_point(Path::new(&repo_for_resolution))
-            })
-            .await
-            .map_err(|e| {
-                (
-                    format!("spawn_blocking failed: {e}"),
-                    ErrorKind::ServerError,
+            let start_point = if let (Some(oid), Some(logical_base)) = (
+                job.intent.reserved_checkout_oid.as_deref(),
+                job.intent.base_branch.as_deref(),
+            ) {
+                crate::git_start::GitStartPoint::with_reserved_oid(
+                    logical_base.to_string(),
+                    oid.to_string(),
+                    oid.to_string(),
+                    oid.to_string(),
                 )
-            })?
-            .ok_or_else(|| {
-                (
-                    "Could not determine canonical default branch for directory-first ProductConversation"
-                        .to_string(),
+            } else {
+                return Err((
+                    "Directory-first Git creation requires a reserved canonical root".to_string(),
                     ErrorKind::InvalidRequest,
                 )
-            })?;
-            let existing_path = deterministic_worktree_path(&repo_root, product_conversation_id);
+                    .into());
+            };
+            let existing_path =
+                deterministic_worktree_path_checked(&repo_root, product_conversation_id)
+                    .map_err(|error| (error, ErrorKind::ServerError))?;
             let canonical_default_ref = reserved_checkout_ref(&job.intent, &start_point);
             let canonical_default_branch = start_point.logical_base().to_string();
             if job.intent.reserved_checkout_oid.is_none() {
@@ -1022,6 +1057,17 @@ async fn provision_conversation(
                 "managed",
                 true,
             );
+
+            let mut attachment = hidden_repository_attachment_observation(
+                &repo_root,
+                Some(canonical_default_branch.as_str()),
+            )?;
+            attachment.conversation_id = job.conversation_id.clone();
+            manager
+                .db()
+                .attach_hidden_git_repository_to_conversation_work_scope(&attachment)
+                .await
+                .map_err(|error| (error.to_string(), ErrorKind::ServerError))?;
         }
     }
 
@@ -1110,8 +1156,14 @@ async fn provision_conversation(
                 intent.skill_invocation.clone(),
             )
         } else {
-            let resolution_root =
-                crate::resolution_root::ResolutionRoot::working_dir(&effective_cwd);
+            let resolution_root = if let (Some(repo_root), Some(reserved_oid)) = (
+                intent.reserved_repo_root.as_deref(),
+                intent.reserved_checkout_oid.as_deref(),
+            ) {
+                crate::resolution_root::ResolutionRoot::git_tree(repo_root, reserved_oid)
+            } else {
+                crate::resolution_root::ResolutionRoot::working_dir(&effective_cwd)
+            };
             let expanded = crate::message_expander::expand(&intent.text, &resolution_root)
                 .map_err(|e| {
                     (
@@ -1327,12 +1379,16 @@ async fn provision_conversation(
     Ok(ProvisionOutcome::InitialMessageSubmitted)
 }
 
-struct RepositoryMutationLock {
+pub(crate) struct RepositoryMutationLock {
     file: std::fs::File,
 }
 
 impl RepositoryMutationLock {
-    fn acquire(repo_root: &str) -> Result<Self, (String, ErrorKind)> {
+    pub(crate) fn acquire_for_api(repo_root: &str) -> Result<Self, String> {
+        Self::acquire(repo_root).map_err(|(message, _)| message)
+    }
+
+    pub(crate) fn acquire(repo_root: &str) -> Result<Self, (String, ErrorKind)> {
         let (file, lock_path) = Self::open_file(repo_root)?;
         file.lock_exclusive().map_err(|error| {
             (
@@ -1599,6 +1655,8 @@ mod temporary_creation_branch_tests {
                 base_branch: None,
                 checkout_ref: None,
                 reserved_checkout_oid: None,
+                reserved_repo_root: None,
+                reserved_root_freshness: None,
                 seed_parent_id: None,
                 seed_label: None,
                 approved_task: None,
@@ -2162,6 +2220,8 @@ mod default_branch_reservation_tests {
             base_branch: None,
             checkout_ref: None,
             reserved_checkout_oid: Some("deadbeef".repeat(5)),
+            reserved_repo_root: None,
+            reserved_root_freshness: None,
             seed_parent_id: None,
             seed_label: None,
             approved_task: None,
@@ -2212,7 +2272,7 @@ mod default_branch_reservation_tests {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod repository_lock_tests {
-    use super::RepositoryMutationLock;
+    use super::{deterministic_worktree_path, RepositoryMutationLock};
     use fs2::FileExt;
 
     #[test]
@@ -2232,6 +2292,61 @@ mod repository_lock_tests {
         drop(first);
         second.try_lock_exclusive().unwrap();
         second.unlock().unwrap();
+    }
+
+    #[test]
+    fn deterministic_worktree_path_uses_management_root_for_linked_worktrees() {
+        let repo = tempfile::tempdir().unwrap();
+        let status = phoenix_core::git::command()
+            .args(["init", "--quiet", "-b", "main"])
+            .current_dir(repo.path())
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::write(repo.path().join("README.md"), "one").unwrap();
+        let add = phoenix_core::git::command()
+            .args(["add", "."])
+            .current_dir(repo.path())
+            .status()
+            .unwrap();
+        assert!(add.success());
+        let commit = phoenix_core::git::command()
+            .args(["commit", "-qm", "initial"])
+            .current_dir(repo.path())
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .status()
+            .unwrap();
+        assert!(commit.success());
+
+        let linked_parent = tempfile::tempdir().unwrap();
+        let linked_path = linked_parent.path().join("linked");
+        let worktree_add = phoenix_core::git::command()
+            .args([
+                "worktree",
+                "add",
+                "--detach",
+                linked_path.to_str().unwrap(),
+                "main",
+            ])
+            .current_dir(repo.path())
+            .status()
+            .unwrap();
+        assert!(worktree_add.success());
+
+        let path = deterministic_worktree_path(linked_path.to_str().unwrap(), "conv-123");
+        assert_eq!(
+            std::fs::canonicalize(path.parent().unwrap().parent().unwrap().parent().unwrap())
+                .unwrap(),
+            std::fs::canonicalize(repo.path()).unwrap(),
+        );
+        assert!(path.ends_with(".phoenix/worktrees/conv-123"));
     }
 }
 
@@ -2494,11 +2609,60 @@ fn validate_existing_worktree(path: &Path) -> Result<(), (String, ErrorKind)> {
     Ok(())
 }
 
+fn deterministic_worktree_path_checked(repo_root: &str, conv_id: &str) -> Result<PathBuf, String> {
+    Ok(worktree_management_root(repo_root)?
+        .join(".phoenix")
+        .join("worktrees")
+        .join(conv_id))
+}
+
 fn deterministic_worktree_path(repo_root: &str, conv_id: &str) -> std::path::PathBuf {
-    Path::new(repo_root)
+    worktree_management_root(repo_root)
+        .unwrap_or_else(|_| Path::new(repo_root).to_path_buf())
         .join(".phoenix")
         .join("worktrees")
         .join(conv_id)
+}
+
+fn hidden_repository_attachment_observation(
+    repo_root: &str,
+    desired_base_branch: Option<&str>,
+) -> Result<AttachHiddenGitRepositoryInput, (String, ErrorKind)> {
+    let repo_path = Path::new(repo_root);
+    let common_dir = crate::git_ops::run_git(
+        repo_path,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .map_err(|error| (error, ErrorKind::ServerError))?;
+    let common_dir = common_dir.trim().to_string();
+    let management_root =
+        worktree_management_root(repo_root).map_err(|error| (error, ErrorKind::ServerError))?;
+    let default_branch = desired_base_branch
+        .filter(|branch| !branch.trim().is_empty())
+        .map(|branch| GitRepositoryDefaultBranchObservation::Resolved {
+            branch: branch.to_string(),
+            provenance: "remote_head_cache".to_string(),
+        })
+        .unwrap_or(GitRepositoryDefaultBranchObservation::Unresolved);
+    Ok(AttachHiddenGitRepositoryInput {
+        conversation_id: String::new(),
+        common_dir,
+        management_root: management_root.to_string_lossy().to_string(),
+        default_branch,
+        observed_at: chrono::Utc::now(),
+    })
+}
+
+fn worktree_management_root(repo_root: &str) -> Result<PathBuf, String> {
+    let common_dir = crate::git_ops::run_git(
+        Path::new(repo_root),
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let common_dir = PathBuf::from(common_dir.trim());
+    common_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| format!("git common dir {} has no parent", common_dir.display()))
 }
 
 fn creation_error_is_retryable(kind: &ErrorKind) -> bool {

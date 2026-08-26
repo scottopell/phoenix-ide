@@ -93,13 +93,12 @@ export function useInlineReferences({
   value,
   setValue,
 }: UseInlineReferencesParams): InlineReferences {
-  const resolutionKind = resolution?.kind ?? 'direct';
-  const resolutionBaseBranch = resolution?.kind === 'default_committed_tree' ? resolution.baseBranch : undefined;
+  const reservedRoot = resolution?.kind === 'exact_reserved_committed_tree' ? resolution.rootReservation : undefined;
   const discoveryOpts = useMemo<ProductCreationResolution>(
-    () => resolutionKind === 'default_committed_tree'
-      ? { kind: 'default_committed_tree', ...(resolutionBaseBranch ? { baseBranch: resolutionBaseBranch } : {}) }
+    () => reservedRoot
+      ? { kind: 'exact_reserved_committed_tree', rootReservation: reservedRoot }
       : { kind: 'direct' },
-    [resolutionKind, resolutionBaseBranch],
+    [reservedRoot],
   );
   const discoveryKey = cwd ? JSON.stringify([cwd, discoveryOpts]) : undefined;
   // Transient UI state is keyed on the composer identity (`scopeKey`) so it

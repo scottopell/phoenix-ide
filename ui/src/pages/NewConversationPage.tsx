@@ -69,9 +69,9 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   const inlineReferenceRootReady = conv.dirStatus === 'exists' && conv.isGitDir !== null;
   const ir = useInlineReferences({
     cwd: conv.cwd,
-    discoveryReady: inlineReferenceRootReady,
-    resolution: conv.isGitDir
-      ? { kind: 'default_committed_tree' }
+    discoveryReady: inlineReferenceRootReady && conv.rootReservation !== null,
+    resolution: conv.rootReservation?.kind === 'exact_committed_tree'
+      ? { kind: 'exact_reserved_committed_tree', rootReservation: conv.rootReservation }
       : { kind: 'direct' },
     // The new-conversation composer's identity is its directory: switching the
     // chosen directory resets the dropdown / inline error.
@@ -250,6 +250,8 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
             showAllModels={conv.showAllModels}
             setShowAllModels={conv.setShowAllModels}
             error={conv.error}
+            recentPaths={conv.recentManagementRootSuggestions.map((suggestion) => suggestion.path)}
+            rootFreshness={conv.rootReservation?.freshness ?? null}
           />
 
           {/* Main input — hidden until an LLM is configured */}
@@ -319,6 +321,8 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
             showAllModels={conv.showAllModels}
             setShowAllModels={conv.setShowAllModels}
             error={conv.error}
+            recentPaths={conv.recentManagementRootSuggestions.map((suggestion) => suggestion.path)}
+            rootFreshness={conv.rootReservation?.freshness ?? null}
           />
         </div>
       </main>

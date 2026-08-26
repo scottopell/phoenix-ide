@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { api, ExpansionError } from '../api';
 import { subscribeModels } from '../modelsPoller';
-import type { ImageData, ModelEffort, ModelsResponse } from '../api';
+import type { ImageData, ModelEffort, ModelsResponse, ProductRootReservation, RecentManagementRootSuggestion } from '../api';
 import type { DirStatus } from '../components/SettingsFields';
 import { SUPPORTED_IMAGE_TYPES, processImageFiles } from '../utils/images';
 import { isWebSpeechSupported } from '../components/VoiceInput/VoiceRecorder';
@@ -81,6 +81,9 @@ export function useCreateConversation(navigate: (path: string) => void) {
   const [isDragOver, setIsDragOver] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  const [recentManagementRootSuggestions, setRecentManagementRootSuggestions] = useState<RecentManagementRootSuggestion[]>([]);
+  const [rootReservation, setRootReservation] = useState<ProductRootReservation | null>(null);
+  const reservationGenerationRef = useRef(0);
 
   const voiceSupported = isWebSpeechSupported();
   const [interimText, setInterimText] = useState('');
@@ -120,8 +123,29 @@ export function useCreateConversation(navigate: (path: string) => void) {
         setCwd(env.home_dir);
       }
     }).catch(console.error);
+    api.listRecentManagementRootSuggestions()
+      .then((response) => setRecentManagementRootSuggestions(response.suggestions))
+      .catch(console.error);
     return () => { unsub(); };
   }, [selectEffort, selectModel]);
+
+  useEffect(() => {
+    const trimmedCwd = cwd.trim();
+    const generation = ++reservationGenerationRef.current;
+    setRootReservation(null);
+    if (dirStatus !== 'exists' || !trimmedCwd) return;
+    api.reserveProductRoot(trimmedCwd)
+      .then((response) => {
+        if (reservationGenerationRef.current === generation && cwd.trim() === trimmedCwd) {
+          setRootReservation(response.root_reservation);
+        }
+      })
+      .catch((reservationError) => {
+        if (reservationGenerationRef.current === generation) {
+          setError(reservationError instanceof Error ? reservationError.message : 'Failed to reserve creation root');
+        }
+      });
+  }, [cwd, dirStatus]);
 
   useEffect(() => { localStorage.setItem(LAST_CWD_KEY, cwd); }, [cwd]);
   useEffect(() => { if (selectedModel) localStorage.setItem(LAST_MODEL_KEY, selectedModel); }, [selectedModel]);
@@ -137,7 +161,8 @@ export function useCreateConversation(navigate: (path: string) => void) {
   const canSend = hasMessageContent
     && !creating
     && dirStatus !== 'invalid'
-    && dirStatus !== 'checking';
+    && dirStatus !== 'checking'
+    && rootReservation !== null;
 
   const addImages = async (files: File[]) => {
     try {
@@ -216,7 +241,6 @@ export function useCreateConversation(navigate: (path: string) => void) {
 
       const messageId = generateUUID();
       const clientConversationId = generateUUID();
-      const trimmedCwd = cwd.trim();
       if (files.length > 0) {
         setError('File attachments are not available for this conversation flow yet.');
         setCreating(false);
@@ -228,7 +252,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
         return;
       }
       const response = await api.createProductConversation({
-        cwd: trimmedCwd,
+        root_reservation: rootReservation!,
         objective: trimmed,
         message_id: messageId,
         conversation_id: clientConversationId,
@@ -273,6 +297,8 @@ export function useCreateConversation(navigate: (path: string) => void) {
     setIsDragOver,
     error,
     creating,
+    recentManagementRootSuggestions,
+    rootReservation,
     canSend,
     genericFilesEnabled,
     addImages,

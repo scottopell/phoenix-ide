@@ -401,6 +401,10 @@ pub struct ConversationCreationIntent {
     pub base_branch: Option<String>,
     #[serde(default)]
     pub checkout_ref: Option<String>,
+    #[serde(default)]
+    pub reserved_repo_root: Option<String>,
+    #[serde(default)]
+    pub reserved_root_freshness: Option<String>,
     // owned: pre-reservation rows had no durable reserved checkout OID; None correctly re-resolves.
     #[serde(default)]
     pub reserved_checkout_oid: Option<String>,

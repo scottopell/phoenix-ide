@@ -84,26 +84,15 @@ impl ResolutionRoot {
         let cwd_path = PathBuf::from(cwd);
         match resolution {
             crate::api::ProductCreationResolutionQuery::Direct => Self::WorkingDir(cwd_path),
-            crate::api::ProductCreationResolutionQuery::DefaultCommittedTree { base_branch } => {
-                let start = base_branch
-                    .as_deref()
-                    .and_then(|branch| {
-                        crate::git_start::GitStartPoint::for_inline_discovery(
-                            &cwd_path,
-                            "managed",
-                            Some(branch),
-                        )
-                    })
-                    .or_else(|| {
-                        phoenix_core::git::detect_git_repo_root(&cwd_path).and_then(|repo| {
-                            crate::git_start::GitStartPoint::for_default_task_start(Path::new(
-                                &repo,
-                            ))
-                        })
-                    });
-                if let Some(start) = start {
-                    if let Some(repo_root) = phoenix_core::git::detect_git_repo_root(&cwd_path) {
-                        return Self::from_start_point(repo_root, &start);
+            crate::api::ProductCreationResolutionQuery::ExactReservedCommittedTree {
+                root_reservation,
+            } => {
+                if root_reservation.kind == "exact_committed_tree" {
+                    if let (Some(repo_root), Some(exact_checkout_oid)) = (
+                        root_reservation.repo_root.as_deref(),
+                        root_reservation.exact_checkout_oid.as_deref(),
+                    ) {
+                        return Self::git_tree(repo_root, exact_checkout_oid);
                     }
                 }
                 Self::WorkingDir(cwd_path)
@@ -828,9 +817,7 @@ mod tests {
         // resolvable repo root falls back to the working directory.
         let root = ResolutionRoot::for_product_create_query(
             "/tmp",
-            &crate::api::ProductCreationResolutionQuery::DefaultCommittedTree {
-                base_branch: Some("main".to_string()),
-            },
+            &crate::api::ProductCreationResolutionQuery::Direct,
         );
         assert!(matches!(root, ResolutionRoot::WorkingDir(_)));
     }

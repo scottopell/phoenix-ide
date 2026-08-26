@@ -17,6 +17,8 @@ interface ConversationSettingsProps {
   showAllModels: boolean;
   setShowAllModels: (v: boolean) => void;
   error?: string | null;
+  recentPaths?: readonly string[];
+  rootFreshness?: 'fresh' | 'stale_cached' | null;
 }
 
 export function ConversationSettings({
@@ -32,6 +34,8 @@ export function ConversationSettings({
   showAllModels,
   setShowAllModels,
   error,
+  recentPaths = [],
+  rootFreshness = null,
 }: ConversationSettingsProps) {
   if (models && !models.llm_configured) {
     return <LlmStatusBanner models={models} />;
@@ -41,6 +45,9 @@ export function ConversationSettings({
     <>
       <LlmStatusBanner models={models} />
       {error && <div className="new-conv-error">{error}</div>}
+      {rootFreshness === 'stale_cached' && (
+        <div className="new-conversation-status">Using cached default branch while the remote is unavailable.</div>
+      )}
       <SettingsFields
         cwd={cwd}
         setCwd={setCwd}
@@ -53,6 +60,7 @@ export function ConversationSettings({
         models={models}
         showAllModels={showAllModels}
         setShowAllModels={setShowAllModels}
+        recentPaths={recentPaths}
       />
     </>
   );

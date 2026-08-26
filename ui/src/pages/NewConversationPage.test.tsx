@@ -21,6 +21,8 @@ vi.mock('../api', () => ({
   api: {
     listModels: vi.fn().mockResolvedValue({ models: [{ id: 'claude-3-5-sonnet' }], default: 'claude-3-5-sonnet' }),
     getEnv: vi.fn().mockResolvedValue({ home_dir: '/home/user' }),
+    reserveProductRoot: vi.fn().mockResolvedValue({ root_reservation: { cwd: '/home/user/projects', kind: 'direct', repo_root: null, exact_checkout_oid: null, logical_base: null, freshness: null } }),
+    listRecentManagementRootSuggestions: vi.fn().mockResolvedValue({ suggestions: [] }),
     getProjects: vi.fn().mockResolvedValue([]),
     validateCwd: vi.fn().mockResolvedValue({ valid: true }),
     listDirectory: vi.fn().mockResolvedValue({ entries: [] }),

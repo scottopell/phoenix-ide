@@ -25,6 +25,8 @@ vi.mock('../api', () => {
       listProjectSkills: vi.fn(),
       searchProjectFiles: vi.fn(),
       createProductConversation: vi.fn(),
+      reserveProductRoot: vi.fn(),
+      listRecentManagementRootSuggestions: vi.fn(),
       mkdir: vi.fn(),
       listConversations: vi.fn().mockResolvedValue([]),
       listArchivedConversations: vi.fn().mockResolvedValue([]),
@@ -82,6 +84,13 @@ describe('/new directory-first product conversation', () => {
     vi.mocked(api.listDirectory).mockResolvedValue({ entries: [] });
     vi.mocked(api.listProjectSkills).mockResolvedValue({ skills: [] });
     vi.mocked(api.searchProjectFiles).mockResolvedValue({ items: [] });
+    vi.mocked(api.listRecentManagementRootSuggestions).mockResolvedValue({ suggestions: [] });
+    vi.mocked(api.reserveProductRoot).mockResolvedValue({
+      root_reservation: {
+        cwd: '/repo', kind: 'exact_committed_tree', repo_root: '/repo', exact_checkout_oid: 'abc123',
+        logical_base: 'main', freshness: 'fresh',
+      },
+    });
     vi.mocked(api.mkdir).mockResolvedValue({ created: true });
     vi.mocked(api.createProductConversation).mockResolvedValue({
       product_conversation_id: 'pc-1',
@@ -103,7 +112,7 @@ describe('/new directory-first product conversation', () => {
     await waitFor(() => expect(api.createProductConversation).toHaveBeenCalledTimes(1));
     const firstRequest = vi.mocked(api.createProductConversation).mock.calls[0]![0];
     expect(firstRequest).toMatchObject({
-      cwd: '/repo',
+      root_reservation: expect.objectContaining({ cwd: '/repo', exact_checkout_oid: 'abc123' }),
       objective: 'Ship it',
       model: 'claude-3-5-sonnet',
       images: [],
@@ -121,6 +130,12 @@ describe('/new directory-first product conversation', () => {
     vi.mocked(api.createProductConversation).mockClear();
     firstPage.unmount();
     vi.mocked(api.validateCwd).mockResolvedValue({ valid: true, is_git: false });
+    vi.mocked(api.reserveProductRoot).mockResolvedValue({
+      root_reservation: {
+        cwd: '/plain-dir', kind: 'direct', repo_root: null, exact_checkout_oid: null,
+        logical_base: null, freshness: null,
+      },
+    });
     localStorage.setItem('phoenix-last-cwd', '/plain-dir');
     renderPage();
 
@@ -131,7 +146,7 @@ describe('/new directory-first product conversation', () => {
     await waitFor(() => expect(api.createProductConversation).toHaveBeenCalledTimes(1));
     const secondRequest = vi.mocked(api.createProductConversation).mock.calls[0]![0];
     expect(secondRequest).toMatchObject({
-      cwd: '/plain-dir',
+      root_reservation: expect.objectContaining({ cwd: '/plain-dir', kind: 'direct' }),
       objective: 'Ship it',
       model: 'claude-3-5-sonnet',
       images: [],

@@ -37,11 +37,13 @@ use super::types::{
     InternalCreateConversationAcceptedResponse, ListDirectoryResponse, ListFilesResponse,
     MkdirResponse, ModelsResponse, NotificationSettingsRequest,
     ProductConversationCreateAcceptedResponse, ProductConversationRouteResponse,
-    ProjectFileSearchQuery, ProjectSkillsQuery, ProjectTasksQuery, ReadFileResponse,
-    ReconcileAcceptedMessagesRequest, ReconcileAcceptedMessagesResponse, RenameRequest, SkillEntry,
-    SkillsResponse, SuccessResponse, SuggestRequest, SuggestResponse, SystemPromptResponse,
-    TaskCountQuery, TaskCountResponse, TaskEntry, TasksResponse, UpgradeModelRequest,
-    ValidateCwdResponse,
+    ProductRootReservation, ProductRootReservationFreshness, ProjectFileSearchQuery,
+    ProjectSkillsQuery, ProjectTasksQuery, ReadFileResponse, RecentManagementRootSuggestion,
+    RecentManagementRootSuggestionsResponse, ReconcileAcceptedMessagesRequest,
+    ReconcileAcceptedMessagesResponse, RenameRequest, ReserveProductRootRequest,
+    ReserveProductRootResponse, SkillEntry, SkillsResponse, SuccessResponse, SuggestRequest,
+    SuggestResponse, SystemPromptResponse, TaskCountQuery, TaskCountResponse, TaskEntry,
+    TasksResponse, UpgradeModelRequest, ValidateCwdResponse,
 };
 use super::AppState;
 use crate::api::terminal_ws::{terminal_ws_global_handler, terminal_ws_handler};
@@ -145,6 +147,10 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/product-conversations/new",
             post(create_product_conversation),
+        )
+        .route(
+            "/api/product-conversations/reserve-root",
+            post(reserve_product_root),
         )
         .route(
             "/api/global/coordinator",
@@ -333,6 +339,10 @@ pub fn create_router(state: AppState) -> Router {
         // Directory browser (REQ-API-008)
         .route("/api/validate-cwd", get(validate_cwd))
         .route("/api/list-directory", get(list_directory))
+        .route(
+            "/api/recent-management-root-suggestions",
+            get(list_recent_management_root_suggestions),
+        )
         .route("/api/mkdir", post(mkdir))
         // File browser API (REQ-PF-001 through REQ-PF-004)
         .route("/api/files/list", get(list_files))
@@ -1895,21 +1905,88 @@ async fn create_conversation(
     create_conversation_with_id(state, req, Vec::new()).await
 }
 
+async fn reserve_product_root(
+    Json(req): Json<ReserveProductRootRequest>,
+) -> Result<Json<ReserveProductRootResponse>, AppError> {
+    let canonical_cwd = crate::conversation_cwd::validate_conversation_cwd(&req.cwd)
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    let cwd = canonical_cwd.raw().to_string();
+    let cwd_path = std::path::PathBuf::from(&cwd);
+    let Some(repo_root) = phoenix_core::git::detect_git_repo_root(&cwd_path) else {
+        return Ok(Json(ReserveProductRootResponse::Direct {
+            root_reservation: ProductRootReservation {
+                cwd,
+                kind: "direct".to_string(),
+                repo_root: None,
+                exact_checkout_oid: None,
+                logical_base: None,
+                freshness: None,
+            },
+        }));
+    };
+    let repo_path = std::path::PathBuf::from(&repo_root);
+    let cached = crate::git_start::GitStartPoint::cached_default_task_start(&repo_path);
+    let repo_for_refresh = repo_root.clone();
+    let fresh = tokio::task::spawn_blocking(move || {
+        let _lock = crate::runtime::creation_worker::RepositoryMutationLock::acquire_for_api(
+            &repo_for_refresh,
+        )?;
+        Ok::<_, String>(crate::git_start::GitStartPoint::for_default_task_start(
+            std::path::Path::new(&repo_for_refresh),
+        ))
+    })
+    .await
+    .map_err(|error| AppError::Internal(format!("default root reservation task failed: {error}")))?
+    .map_err(AppError::Internal)?;
+    let (start, freshness) = match fresh {
+        Some(start) => (start, ProductRootReservationFreshness::Fresh),
+        None => (
+            cached.ok_or_else(|| {
+                AppError::BadRequest(
+                    "Could not determine canonical default branch for reserved root".to_string(),
+                )
+            })?,
+            ProductRootReservationFreshness::StaleCached,
+        ),
+    };
+    let exact_checkout_oid = start
+        .reserved_oid()
+        .unwrap_or(start.checkout_ref())
+        .to_string();
+    let default_branch = start.logical_base().to_string();
+    Ok(Json(ReserveProductRootResponse::ExactCommittedTree {
+        root_reservation: ProductRootReservation {
+            cwd,
+            kind: "exact_committed_tree".to_string(),
+            repo_root: Some(repo_root),
+            exact_checkout_oid: Some(exact_checkout_oid.clone()),
+            logical_base: Some(default_branch.clone()),
+            freshness: Some(freshness.clone()),
+        },
+        exact_checkout_oid,
+        logical_base: default_branch,
+        freshness,
+    }))
+}
+
 async fn create_product_conversation(
     State(state): State<AppState>,
     Json(req): Json<CreateProductConversationRequest>,
 ) -> Result<Json<ProductConversationCreateAcceptedResponse>, AppError> {
-    Ok(Json(create_product_conversation_with_id(state, req).await?))
+    Ok(Json(
+        Box::pin(create_product_conversation_with_id(state, req)).await?,
+    ))
 }
 
 async fn create_product_conversation_with_id(
     state: AppState,
     req: CreateProductConversationRequest,
 ) -> Result<ProductConversationCreateAcceptedResponse, AppError> {
-    let canonical_cwd = crate::conversation_cwd::validate_conversation_cwd(&req.cwd)
-        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    let canonical_cwd =
+        crate::conversation_cwd::validate_conversation_cwd(&req.root_reservation.cwd)
+            .map_err(|error| AppError::BadRequest(error.to_string()))?;
     let mut req = req;
-    req.cwd = canonical_cwd.raw().to_string();
+    req.root_reservation.cwd = canonical_cwd.raw().to_string();
     let response = create_conversation_from_request(
         state.clone(),
         req.into(),
@@ -2170,7 +2247,22 @@ async fn create_conversation_from_request(
         mode: resolved_mode_for_intent,
         base_branch: req.base_branch.clone(),
         checkout_ref: req.checkout_ref.clone(),
-        reserved_checkout_oid: None,
+        reserved_repo_root: req
+            .root_reservation
+            .as_ref()
+            .and_then(|reservation| reservation.repo_root.clone()),
+        reserved_root_freshness: req
+            .root_reservation
+            .as_ref()
+            .and_then(|reservation| reservation.freshness.as_ref())
+            .map(|freshness| match freshness {
+                ProductRootReservationFreshness::Fresh => "fresh".to_string(),
+                ProductRootReservationFreshness::StaleCached => "stale_cached".to_string(),
+            }),
+        reserved_checkout_oid: req
+            .root_reservation
+            .as_ref()
+            .and_then(|reservation| reservation.exact_checkout_oid.clone()),
         seed_parent_id: req.seed_parent_id.clone(),
         seed_label: req.seed_label.clone(),
         approved_task: None,
@@ -6503,6 +6595,28 @@ async fn validate_cwd(Query(query): Query<PathQuery>) -> Json<ValidateCwdRespons
     }
 }
 
+async fn list_recent_management_root_suggestions(
+    State(state): State<AppState>,
+) -> Result<Json<RecentManagementRootSuggestionsResponse>, AppError> {
+    let suggestions = state
+        .runtime
+        .db()
+        .list_recent_hidden_repository_management_roots()
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+        .into_iter()
+        .filter_map(|entry| {
+            let path = PathBuf::from(&entry.management_root);
+            path.is_dir().then_some(RecentManagementRootSuggestion {
+                path: entry.management_root,
+            })
+        })
+        .collect();
+    Ok(Json(RecentManagementRootSuggestionsResponse {
+        suggestions,
+    }))
+}
+
 async fn list_directory(
     Query(query): Query<PathQuery>,
 ) -> Result<Json<ListDirectoryResponse>, AppError> {
@@ -8351,6 +8465,7 @@ mod conversation_cwd_validation_tests {
             base_branch: None,
             seed_parent_id: None,
             checkout_ref: None,
+            root_reservation: None,
             seed_label: None,
         }
     }
@@ -8554,6 +8669,8 @@ mod conversation_cwd_validation_tests {
                     base_branch: Some("does-not-exist".to_string()),
                     checkout_ref: None,
                     reserved_checkout_oid: None,
+                    reserved_repo_root: None,
+                    reserved_root_freshness: None,
                     seed_parent_id: None,
                     seed_label: None,
                     approved_task: None,
@@ -8659,6 +8776,8 @@ mod conversation_cwd_validation_tests {
                     base_branch: None,
                     checkout_ref: None,
                     reserved_checkout_oid: None,
+                    reserved_repo_root: None,
+                    reserved_root_freshness: None,
                     seed_parent_id: None,
                     seed_label: None,
                     approved_task: None,
@@ -14363,7 +14482,14 @@ mod product_conversation_creation_tests {
         let conversation_id = uuid::Uuid::new_v4().to_string();
         let request = CreateProductConversationRequest {
             conversation_id: Some(conversation_id.clone()),
-            cwd: temp_dir.path().to_string_lossy().to_string(),
+            root_reservation: ProductRootReservation {
+                cwd: temp_dir.path().to_string_lossy().to_string(),
+                kind: "direct".to_string(),
+                repo_root: None,
+                exact_checkout_oid: None,
+                logical_base: None,
+                freshness: None,
+            },
             model: "claude-sonnet-5".to_string(),
             effort: None,
             objective: "Build the feature".to_string(),
@@ -14374,7 +14500,7 @@ mod product_conversation_creation_tests {
             }],
         };
 
-        let response = create_product_conversation_with_id(state.clone(), request)
+        let response = Box::pin(create_product_conversation_with_id(state.clone(), request))
             .await
             .expect("accepted response");
         assert_eq!(response.transcript_row_id, conversation_id);
@@ -15318,6 +15444,8 @@ mod attachment_storage_tests {
             base_branch: None,
             checkout_ref: None,
             reserved_checkout_oid: None,
+            reserved_repo_root: None,
+            reserved_root_freshness: None,
             seed_parent_id: None,
             seed_label: None,
             approved_task: None,

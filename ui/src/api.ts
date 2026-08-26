@@ -712,8 +712,26 @@ export interface ImageData {
   media_type: string;
 }
 
-export interface CreateProductConversationRequest {
+export type ProductRootReservationFreshness = 'fresh' | 'stale_cached';
+
+export interface ProductRootReservation {
   cwd: string;
+  kind: 'direct' | 'exact_committed_tree';
+  repo_root: string | null;
+  exact_checkout_oid: string | null;
+  logical_base: string | null;
+  freshness: ProductRootReservationFreshness | null;
+}
+
+export interface ReserveProductRootResponse {
+  root_reservation: ProductRootReservation;
+  exact_checkout_oid?: string;
+  logical_base?: string;
+  freshness?: ProductRootReservationFreshness;
+}
+
+export interface CreateProductConversationRequest {
+  root_reservation: ProductRootReservation;
   objective: string;
   message_id: string;
   conversation_id: string;
@@ -725,6 +743,14 @@ export interface CreateProductConversationRequest {
 export interface CreateProductConversationResponse {
   product_conversation_id: string;
   canonical_route: string;
+}
+
+export interface RecentManagementRootSuggestion {
+  path: string;
+}
+
+export interface RecentManagementRootSuggestionsResponse {
+  suggestions: RecentManagementRootSuggestion[];
 }
 
 export interface FileAttachment {
@@ -1133,12 +1159,12 @@ export type CodexLoginStatus =
 
 export type ProductCreationResolution =
   | { kind: 'direct' }
-  | { kind: 'default_committed_tree'; baseBranch?: string | null };
+  | { kind: 'exact_reserved_committed_tree'; rootReservation: ProductRootReservation };
 
 function applyResolutionOpts(params: URLSearchParams, opts?: ProductCreationResolution): void {
   params.set('kind', opts?.kind ?? 'direct');
-  if (opts?.kind === 'default_committed_tree' && opts.baseBranch) {
-    params.set('base_branch', opts.baseBranch);
+  if (opts?.kind === 'exact_reserved_committed_tree') {
+    params.set('root_reservation', JSON.stringify(opts.rootReservation));
   }
 }
 
@@ -1542,10 +1568,26 @@ export const api = {
     return resp.json();
   },
 
+  async listRecentManagementRootSuggestions(): Promise<RecentManagementRootSuggestionsResponse> {
+    const resp = await fetch('/api/recent-management-root-suggestions');
+    if (!resp.ok) throw new Error('Failed to list recent management root suggestions');
+    return resp.json();
+  },
+
   async listConversations(): Promise<Conversation[]> {
     const resp = await fetch('/api/conversations');
     if (!resp.ok) throw new Error('Failed to list conversations');
     return (await resp.json()).conversations;
+  },
+
+  async reserveProductRoot(cwd: string): Promise<ReserveProductRootResponse> {
+    const resp = await fetch('/api/product-conversations/reserve-root', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cwd }),
+    });
+    if (!resp.ok) throw new Error('Failed to reserve product conversation root');
+    return resp.json();
   },
 
   async createProductConversation(

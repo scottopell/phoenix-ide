@@ -35,7 +35,7 @@ export const DIR_STATUS_CONFIG = {
 export function SettingsFields({
   cwd, setCwd, onDirStatusChange, onGitStatusChange,
   selectedModel, setSelectedModel, selectedEffort, setSelectedEffort, models,
-  showAllModels, setShowAllModels
+  showAllModels, setShowAllModels, recentPaths = []
 }: {
   cwd: string;
   setCwd: (v: string) => void;
@@ -48,6 +48,7 @@ export function SettingsFields({
   models: ModelsResponse | null;
   showAllModels: boolean;
   setShowAllModels: (v: boolean) => void;
+  recentPaths?: readonly string[];
 }) {
   // Filter and group models
   const filteredModels = models?.models.filter(m => showAllModels || m.recommended) || [];
@@ -78,6 +79,7 @@ export function SettingsFields({
           onChange={setCwd}
           onStatusChange={onDirStatusChange}
           onGitStatusChange={onGitStatusChange}
+          recentPaths={recentPaths}
           className="settings-input"
         />
       </label>
