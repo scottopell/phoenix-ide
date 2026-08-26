@@ -540,9 +540,11 @@ async fn provision_conversation(
                     ErrorKind::InvalidRequest,
                 )
             })?;
-        if detected != repo_root {
+        let detected_common = crate::git_ops::git_common_dir_path(std::path::Path::new(&detected));
+        let reserved_common = crate::git_ops::git_common_dir_path(std::path::Path::new(repo_root));
+        if detected_common.is_none() || detected_common != reserved_common {
             return Err((
-                "Reserved root does not belong to the detected repository".to_string(),
+                "Reserved root does not belong to the detected repository authority".to_string(),
                 ErrorKind::InvalidRequest,
             )
                 .into());
@@ -937,31 +939,36 @@ async fn provision_conversation(
         (directory_first_product, product_conversation_id.as_ref())
     {
         if let Some(repo_root) = repo_root.clone() {
-            let start_point = resolve_default_task_start_point(Path::new(&repo_root))
-                .or_else(|| {
-                    let (oid, logical_base) = (
-                        job.intent.reserved_checkout_oid.as_deref()?,
-                        job.intent.base_branch.as_deref()?,
-                    );
-                    Some(crate::git_start::GitStartPoint::with_reserved_oid(
-                        logical_base.to_string(),
-                        oid.to_string(),
-                        oid.to_string(),
-                        oid.to_string(),
-                    ))
-                })
-                .ok_or_else(|| {
-                    (
-                        job.intent.reserved_root_failure.clone().unwrap_or_else(|| {
-                            "Directory-first Git creation requires a refreshed or cached canonical root"
-                                .to_string()
-                        }),
-                        ErrorKind::InvalidRequest,
-                    )
-                })?;
             let existing_path =
                 deterministic_worktree_path_checked(&repo_root, product_conversation_id)
                     .map_err(|error| (error, ErrorKind::ServerError))?;
+            let materialization_started = Path::new(&existing_path).exists();
+            let persisted_start = || {
+                let (oid, logical_base) = (
+                    job.intent.reserved_checkout_oid.as_deref()?,
+                    job.intent.base_branch.as_deref()?,
+                );
+                Some(crate::git_start::GitStartPoint::with_reserved_oid(
+                    logical_base.to_string(),
+                    oid.to_string(),
+                    oid.to_string(),
+                    oid.to_string(),
+                ))
+            };
+            let start_point = if materialization_started {
+                persisted_start()
+            } else {
+                resolve_default_task_start_point(Path::new(&repo_root)).or_else(persisted_start)
+            }
+            .ok_or_else(|| {
+                (
+                    job.intent.reserved_root_failure.clone().unwrap_or_else(|| {
+                        "Directory-first Git creation requires a refreshed or cached canonical root"
+                            .to_string()
+                    }),
+                    ErrorKind::InvalidRequest,
+                )
+            })?;
             let canonical_default_ref = start_point
                 .reserved_oid()
                 .unwrap_or_else(|| start_point.checkout_ref())

@@ -6,6 +6,18 @@
 
 use std::path::Path;
 
+pub(crate) fn git_common_dir_path(path: &Path) -> Option<std::path::PathBuf> {
+    let output = phoenix_core::git::command()
+        .current_dir(path)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()))
+}
+
 /// Walks back from `end` until the byte slice `bytes[..end]` is on a
 /// valid UTF-8 character boundary. Used by `run_git_capped` so the
 /// truncated buffer is always parseable as UTF-8 (any incomplete

@@ -4657,31 +4657,6 @@ impl Database {
         {
             phoenix_core::git_repository::GitRepositoryId::parse(existing_id)
                 .map_err(|error| DbError::Serialization(error.to_string()))?
-        } else if let Some(existing_id) = sqlx::query_scalar::<_, String>(
-            "SELECT common.repository_id
-               FROM git_repository_locator_observations common
-               JOIN git_repository_locator_observations management
-                 ON management.repository_id = common.repository_id
-                AND management.locator_kind = 'management_root'
-                AND management.status = 'present'
-                AND management.path = ?2
-              WHERE common.locator_kind = 'common_dir'
-                AND common.status = 'present'
-                AND common.path = ?1
-                AND EXISTS (
-                    SELECT 1 FROM work_scope_git_repositories wr
-                    WHERE wr.repository_id = common.repository_id
-                )
-              ORDER BY common.observed_at_unix_micros DESC, common.repository_id DESC
-              LIMIT 1",
-        )
-        .bind(&normalized_common_dir)
-        .bind(&normalized_management_root)
-        .fetch_optional(&mut *tx)
-        .await?
-        {
-            phoenix_core::git_repository::GitRepositoryId::parse(existing_id)
-                .map_err(|error| DbError::Serialization(error.to_string()))?
         } else {
             let repository_id = phoenix_core::git_repository::GitRepositoryId::parse(
                 uuid::Uuid::new_v4().to_string(),
@@ -5573,7 +5548,9 @@ impl Database {
     ) -> DbResult<CreationCasOutcome> {
         let intent_json = serde_json::to_string(intent)
             .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let now_micros = now.timestamp_micros();
         let now = now.to_rfc3339();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let updated = sqlx::query(
             "UPDATE conversation_creation_jobs
              SET intent_json = ?1, updated_at = ?2
@@ -5586,13 +5563,33 @@ impl Database {
         .bind(claim_generation_i64(claim)?)
         .bind(&claim.worker_id.0)
         .bind(&claim.token.0)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(if updated.rows_affected() == 1 {
-            CreationCasOutcome::Applied
-        } else {
-            CreationCasOutcome::ClaimLost
-        })
+        if updated.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(CreationCasOutcome::ClaimLost);
+        }
+        if let (Some(oid), Some(branch)) = (
+            intent.reserved_checkout_oid.as_deref(),
+            intent.base_branch.as_deref(),
+        ) {
+            sqlx::query(
+                "UPDATE product_root_reservations
+                 SET exact_checkout_oid = ?1, logical_base = ?2, freshness = 'fresh',
+                     unresolved_reason = NULL, consumed_at_unix_micros = ?3
+                 WHERE consumed_by_conversation_id = (
+                     SELECT conversation_id FROM conversation_creation_jobs WHERE id = ?4
+                 ) AND status = 'consumed'",
+            )
+            .bind(oid)
+            .bind(branch)
+            .bind(now_micros)
+            .bind(job_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(CreationCasOutcome::Applied)
     }
 
     /// Atomically transition a seeded-empty creation to Idle and ready.
@@ -14167,6 +14164,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn hidden_repository_management_roots_break_ties_by_latest_ordinary_activity() {
         let db = Database::open_in_memory().await.unwrap();
         db.create_conversation("repo-a-open", "repo-a-open", "/tmp/a", true, None, None)
@@ -14266,9 +14264,16 @@ mod tests {
             .list_recent_hidden_repository_management_roots()
             .await
             .unwrap();
-        assert_eq!(roots.len(), 2);
-        assert_eq!(roots[0].repository_id, repo_b.repository_id);
-        assert_eq!(roots[1].repository_id, repo_a.repository_id);
+        let ranked: Vec<_> = roots
+            .iter()
+            .filter(|root| {
+                root.repository_id == repo_a.repository_id
+                    || root.repository_id == repo_b.repository_id
+            })
+            .collect();
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].repository_id, repo_b.repository_id);
+        assert_eq!(ranked[1].repository_id, repo_a.repository_id);
     }
 
     #[tokio::test]

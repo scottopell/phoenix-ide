@@ -2095,7 +2095,7 @@ CREATE TRIGGER conversations_role_scope_insert
 BEFORE INSERT ON conversations
 WHEN NEW.runtime_role NOT IN ('user', 'sub_agent', 'coordinator')
   OR (NEW.runtime_role = 'coordinator' AND NEW.work_scope_id IS NOT NULL)
-  OR (NEW.runtime_role = 'user' AND NEW.work_scope_id IS NULL AND NEW.state_kind NOT IN ('provisioning', 'creation_failed'))
+  OR (NEW.runtime_role = 'user' AND NEW.work_scope_id IS NULL AND NEW.state_kind NOT IN ('provisioning', 'creation_failed', 'creation_cancelled'))
 BEGIN
     SELECT RAISE(ABORT, 'invalid conversation runtime role/work scope');
 END;
@@ -2103,7 +2103,7 @@ CREATE TRIGGER conversations_role_scope_update
 BEFORE UPDATE OF runtime_role, work_scope_id, state_kind ON conversations
 WHEN NEW.runtime_role NOT IN ('user', 'sub_agent', 'coordinator')
   OR (NEW.runtime_role = 'coordinator' AND NEW.work_scope_id IS NOT NULL)
-  OR (NEW.runtime_role = 'user' AND NEW.work_scope_id IS NULL AND NEW.state_kind NOT IN ('provisioning', 'creation_failed'))
+  OR (NEW.runtime_role = 'user' AND NEW.work_scope_id IS NULL AND NEW.state_kind NOT IN ('provisioning', 'creation_failed', 'creation_cancelled'))
 BEGIN
     SELECT RAISE(ABORT, 'invalid conversation runtime role/work scope');
 END;
