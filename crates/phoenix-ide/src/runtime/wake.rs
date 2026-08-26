@@ -127,7 +127,7 @@ pub(crate) async fn run(
     manager: Arc<RuntimeManager>,
     kick_rx: watch::Receiver<u64>,
     ready_tx: tokio::sync::oneshot::Sender<()>,
-) {
+) -> Result<(), String> {
     let worker = WakeWorker::new(
         manager.db().wake_repository(),
         Arc::new(RuntimeRegistryInspector::new(
@@ -137,9 +137,7 @@ pub(crate) async fn run(
         Arc::new(SystemClock),
         fresh_process_incarnation(),
     );
-    if let Err(error) = Box::pin(worker.run_loop_with_manager(kick_rx, manager, ready_tx)).await {
-        tracing::warn!(error = %error, "wake worker stopped after DB/inspection error");
-    }
+    Box::pin(worker.run_loop_with_manager(kick_rx, manager, ready_tx)).await
 }
 
 #[derive(Clone)]
@@ -478,6 +476,7 @@ async fn deliver_pending(
                 cursor = Some(next_cursor);
                 continue;
             }
+            let close_settlement_conversation_id = current.conversation_id.clone();
             let rendered = render_terminal_result(&current);
             let display_data = Some(serde_json::json!({
                 "type": "wake_result",
@@ -582,7 +581,45 @@ async fn deliver_pending(
                         .map_err(|error| error.to_string())?;
                 }
             }
+            let close_cancellation_delivery = matches!(
+                current.receipt.terminal,
+                phoenix_workflow::wake_profile::WakeTerminalPayload::Cancelled {
+                    reason: phoenix_workflow::wake_profile::WakeCancellationReason::ExplicitCancel,
+                    ..
+                }
+            );
             drop(sequence_guard);
+            let should_recheck_close = close_cancellation_delivery && match manager
+                .db()
+                .get_conversation(&close_settlement_conversation_id)
+                .await
+            {
+                Ok(conversation) => match manager
+                    .db()
+                    .get_active_close_obligation_for_product(&conversation.product_conversation_id)
+                    .await
+                {
+                    Ok(Some(obligation)) => matches!(
+                        obligation.phase(),
+                        phoenix_core::domain::close::ClosePhase::SettlingActiveWork
+                            | phoenix_core::domain::close::ClosePhase::CancelRequestedDuringSettlement
+                    ),
+                    Ok(None) => false,
+                    Err(error) => {
+                        tracing::error!(%error, conversation_id = %close_settlement_conversation_id, "failed to classify Close settlement after wake delivery");
+                        false
+                    }
+                },
+                Err(error) => {
+                    tracing::error!(%error, conversation_id = %close_settlement_conversation_id, "failed to read wake conversation after delivery");
+                    false
+                }
+            };
+            if should_recheck_close {
+                if let Err(error) = manager.resume_pending_close_settlements().await {
+                    tracing::error!(%error, conversation_id = %close_settlement_conversation_id, "failed to re-evaluate Close settlement after wake delivery");
+                }
+            }
             cursor = Some(next_cursor);
         }
         if page_len < OBSERVATION_BATCH_LIMIT {

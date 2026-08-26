@@ -593,6 +593,9 @@ impl TerminalObligationDispatcher for ProductionDirectTurnDispatcher {
         self.manager
             .complete_database_terminal_recovery(conversation_id, recovery)
             .await;
+        if let Err(error) = self.manager.resume_pending_close_settlements().await {
+            tracing::error!(%error, %conversation_id, "failed to re-evaluate Close settlement after direct-turn terminal recovery");
+        }
         Ok(outcome)
     }
 }
