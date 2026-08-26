@@ -2132,10 +2132,29 @@ BEGIN
     SELECT RAISE(ABORT, 'close direct-turn settlement target must be latest active authority');
 END;
 
+DROP TRIGGER close_obligations_transition_graph;
+
 UPDATE close_obligations
 SET phase = 'awaiting_stop_work_confirmation',
-    updated_at = datetime('now')
+    updated_at = STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now')
 WHERE phase IN ('settling_active_work', 'cancel_requested_during_settlement');
+
+CREATE TRIGGER close_obligations_transition_graph
+BEFORE UPDATE OF phase ON close_obligations
+FOR EACH ROW
+WHEN NOT (
+    (OLD.phase = 'awaiting_blocker_resolution' AND NEW.phase IN ('awaiting_stop_work_confirmation', 'settling_active_work', 'completed'))
+    OR (OLD.phase = 'awaiting_stop_work_confirmation' AND NEW.phase IN ('settling_active_work', 'completed'))
+    OR (OLD.phase = 'settling_active_work' AND NEW.phase IN ('cancel_requested_during_settlement', 'awaiting_retirement_inspection'))
+    OR (OLD.phase = 'cancel_requested_during_settlement' AND NEW.phase = 'completed')
+    OR (OLD.phase = 'awaiting_retirement_inspection' AND NEW.phase IN ('awaiting_loss_confirmation', 'retirement_requested', 'completed'))
+    OR (OLD.phase = 'awaiting_loss_confirmation' AND NEW.phase IN ('awaiting_retirement_inspection', 'retirement_requested', 'completed'))
+    OR (OLD.phase = 'retirement_requested' AND NEW.phase IN ('needs_repair', 'completed'))
+    OR (OLD.phase = 'needs_repair' AND NEW.phase IN ('retirement_requested', 'completed'))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid close obligation phase transition');
+END;
 
 CREATE TRIGGER close_attempt_direct_turn_settlements_immutable_identity
 BEFORE UPDATE OF attempt_id, turn_id, expected_generation
