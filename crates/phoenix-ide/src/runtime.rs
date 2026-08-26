@@ -3124,8 +3124,8 @@ impl RuntimeManager {
                         })
                         .await
                     {
-                        Ok(_) => {}
-                        Err(crate::db::DbError::DirectTurnConflict(
+                        Ok(_)
+                        | Err(crate::db::DbError::DirectTurnConflict(
                             phoenix_workflow::TurnConflict::StaleGeneration { .. }
                             | phoenix_workflow::TurnConflict::AlreadyTerminal,
                         )) => {}
