@@ -242,6 +242,11 @@ Repository locator and default-branch observations are current per repository an
 THE SYSTEM SHALL keep legacy `Project` as the sole writable repository authority while no product capability requires hidden `GitRepository` authority
 AND SHALL NOT activate hidden `GitRepository` authority merely because its dormant Foundation data is available
 
+WHEN a destructive Close capability resumes after interruption
+THE SYSTEM SHALL reobserve the exact attached WorkScope worktree before removal
+AND SHALL require current inspection/confirmation evidence to match the retained worktree identity
+AND SHALL route missing, inaccessible, registration, or fingerprint ambiguity to typed repair rather than removing a path
+
 WHEN an owning normative requirement for a ProductConversation or destructive Close capability explicitly requires hidden `GitRepository` authority generation `2` for its correctness contract
 THE SYSTEM SHALL require an activation mandate that identifies that exact consumer capability and owning normative requirement
 AND SHALL make that mandate an exact input to the one activation operation

@@ -839,8 +839,8 @@ invariant CleanupAuthorityComesFromCommittedCloseOperation {
 }
 
 invariant WorkScopeHasOneOrdinaryProductConversationOwner {
-    for all scope: WorkScope:
-        exists exactly one AttachedWorkScope{scope: scope}
+    for attachment in AttachedWorkScope:
+        product_conversation_owner_for_scope(attachment.scope) = attachment.product_conversation
 }
 
 invariant NoAutomaticRecoveryArtifactFromRetirement {

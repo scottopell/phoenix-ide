@@ -7530,6 +7530,8 @@ ALTER TABLE close_expected_retirement_resources DROP COLUMN runtime_resource_ins
 DROP TRIGGER IF EXISTS runtime_resource_instances_preserve_identity;
 DROP INDEX IF EXISTS runtime_resource_instances_live_exact_identity;
 DROP TABLE runtime_resource_instances;
+DELETE FROM close_expected_retirement_resources
+WHERE resource_kind IN ('bash_process_group', 'pty_session', 'browser_session');
 
 CREATE TABLE product_conversation_work_scopes (
     work_scope_id TEXT PRIMARY KEY REFERENCES work_scopes(id) ON DELETE RESTRICT,

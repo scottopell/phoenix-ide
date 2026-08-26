@@ -21,7 +21,10 @@ use phoenix_terminal::session::{TerminalRetirementOutcome, TerminalRetirementPer
 use phoenix_tools::{
     bash::registry::{BashRetirementOutcome, BashRetirementPermit},
     browser::session::{BrowserRetirementOutcome, BrowserRetirementPermit},
-    tmux::registry::{TmuxRetirementOutcome, TmuxRetirementPermit},
+    tmux::registry::{
+        TmuxRetirementOutcome, TmuxRetirementPermit, TmuxRetirementRehydration,
+        TmuxServerInstanceIdentity,
+    },
 };
 
 use super::RuntimeManager;
@@ -203,23 +206,19 @@ impl RuntimeManager {
                 equivalent_live_resources: BTreeSet::default(),
             };
             for resource in resources {
+                if resource.kind() != RetiredResourceKind::TmuxServer {
+                    continue;
+                }
                 let LossItemIdentity::Opaque(identity) = resource.identity() else {
                     return Err("registry resource identity was not opaque".to_string());
                 };
                 match resource.kind() {
-                    RetiredResourceKind::BashProcessGroup => {
-                        inventory.bash_process_groups.insert(identity.clone());
-                    }
                     RetiredResourceKind::TmuxServer => {
                         inventory.tmux_servers.insert(identity.clone());
                     }
-                    RetiredResourceKind::PtySession => {
-                        inventory.pty_sessions.insert(identity.clone());
+                    kind => {
+                        return Err(format!("unexpected durable permit resource kind {kind:?}"))
                     }
-                    RetiredResourceKind::BrowserSession => {
-                        inventory.browser_sessions.insert(identity.clone());
-                    }
-                    kind => return Err(format!("unexpected permit resource kind {kind:?}")),
                 }
             }
             requests.push(CaptureCloseRetirementInventoryScopeRequest {
@@ -324,40 +323,100 @@ impl RuntimeManager {
                 .await
                 .contains_key(&(attempt_id.as_str().to_string(), scope.clone()));
             if !has_lease {
-                let observed = self
-                    .acquire_close_resource_lease(&attempt_id, scope.clone())
-                    .await;
-                let observed_keys = observed
-                    .iter()
-                    .map(resource_key)
-                    .collect::<std::collections::BTreeSet<_>>();
-                let expected_keys = expected
-                    .iter()
-                    .map(resource_key)
-                    .collect::<std::collections::BTreeSet<_>>();
-                // Registry entries are process-local observations, not durable
-                // proof that a prior process or browser has exited. After a
-                // restart, empty registry state must route to repair rather
-                // than turning a same-attempt dispatch into a false receipt.
-                if observed_keys != expected_keys {
-                    let resource = expected
-                        .first()
-                        .cloned()
-                        .or_else(|| observed.first().cloned())
-                        .ok_or_else(|| {
-                            "runtime target comparison lost its exact identity".to_string()
-                        })?;
-                    return self
-                        .record_close_residual(
-                            &attempt_id,
-                            &snapshot,
-                            &scope,
-                            resource,
-                            RetirementFailureReason::IdentityNotProven,
-                            "restart observed a different runtime-resource instance set than the sealed Close inventory",
-                        )
-                        .await;
+                for resource in &expected {
+                    let LossItemIdentity::Opaque(identity) = resource.identity() else {
+                        return self
+                            .record_close_residual(
+                                &attempt_id,
+                                &snapshot,
+                                &scope,
+                                resource.clone(),
+                                RetirementFailureReason::IdentityNotProven,
+                                "sealed durable tmux identity was not opaque",
+                            )
+                            .await;
+                    };
+                    let Some(instance) =
+                        TmuxServerInstanceIdentity::parse_stable_identity(identity.as_str())
+                    else {
+                        return self
+                            .record_close_residual(
+                                &attempt_id,
+                                &snapshot,
+                                &scope,
+                                resource.clone(),
+                                RetirementFailureReason::IdentityNotProven,
+                                "sealed durable tmux identity was malformed",
+                            )
+                            .await;
+                    };
+                    self.db()
+                        .record_close_retirement_dispatch(RecordCloseRetirementDispatchRequest {
+                            attempt_id: attempt_id.clone(),
+                            scope: scope.clone(),
+                            snapshot: snapshot.clone(),
+                            resource: resource.clone(),
+                        })
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    match self
+                        .tmux_registry()
+                        .rehydrate_retirement(&ResourceScopeKey::Work(scope.clone()), &instance)
+                        .await
+                    {
+                        Ok(TmuxRetirementRehydration::Permit(permit)) => {
+                            require_tmux_absent(
+                                self.tmux_registry()
+                                    .complete_retirement(&permit)
+                                    .await
+                                    .map_err(|error| error.to_string())?,
+                            )?;
+                            self.record_close_retired(
+                                &attempt_id,
+                                &snapshot,
+                                &scope,
+                                resource.clone(),
+                                "exact durable tmux rehydration",
+                            )
+                            .await?;
+                        }
+                        Ok(TmuxRetirementRehydration::AbsenceVerified) => {
+                            self.record_close_retired(
+                                &attempt_id,
+                                &snapshot,
+                                &scope,
+                                resource.clone(),
+                                "exact durable tmux absence",
+                            )
+                            .await?;
+                        }
+                        Ok(TmuxRetirementRehydration::Residual { reason }) => {
+                            return self
+                                .record_close_residual(
+                                    &attempt_id,
+                                    &snapshot,
+                                    &scope,
+                                    resource.clone(),
+                                    RetirementFailureReason::IdentityNotProven,
+                                    &reason,
+                                )
+                                .await;
+                        }
+                        Err(error) => {
+                            return self
+                                .record_close_residual(
+                                    &attempt_id,
+                                    &snapshot,
+                                    &scope,
+                                    resource.clone(),
+                                    RetirementFailureReason::IdentityNotProven,
+                                    &format!("durable tmux rehydration failed: {error}"),
+                                )
+                                .await;
+                        }
+                    }
                 }
+                continue;
             }
             if expected.is_empty() {
                 self.cancel_close_resource_lease(&attempt_id, &scope).await;
@@ -396,6 +455,10 @@ impl RuntimeManager {
                 .iter()
                 .map(resource_key)
                 .collect::<std::collections::BTreeSet<_>>();
+            let resources = resources
+                .into_iter()
+                .filter(|resource| expected_keys.contains(&resource_key(resource)))
+                .collect::<Vec<_>>();
             let retired_keys = resources
                 .iter()
                 .map(resource_key)
