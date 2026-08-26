@@ -1351,11 +1351,6 @@ impl Database {
              JOIN close_obligations obligation
                ON obligation.product_conversation_id = participant.product_conversation_id
              WHERE binding.workflow_id = ?1
-               AND EXISTS (
-                 SELECT 1 FROM workflow_deliveries delivery
-                 WHERE delivery.workflow_id = binding.workflow_id
-                   AND (delivery.status = 'Pending' OR delivery.runtime_acceptance_status = 'Owed')
-               )
              ORDER BY obligation.created_at DESC
              LIMIT 1",
         )

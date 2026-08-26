@@ -515,7 +515,7 @@ async fn deliver_pending(
             let (sequence_guard, sequence_ids) =
                 handle.broadcast_tx.reserve_next_persisted_message_range(1);
             let sequence_id = sequence_ids[0];
-            let materialized_for_close = match repo
+            let adopted_for_close = match repo
                 .materialize_pending_delivery_message(&MaterializePendingDeliveryMessageInput {
                     workflow_id: current.workflow_id,
                     delivery_id: current.canonical_delivery.delivery_id,
@@ -548,12 +548,12 @@ async fn deliver_pending(
                                     .await
                                     .map_err(|error| error.to_string())?;
                             }
+                            true
                         }
                         WakeAdoptMaterializedPendingOutcome::Busy(_)
                         | WakeAdoptMaterializedPendingOutcome::NothingPending
-                        | WakeAdoptMaterializedPendingOutcome::NotFullyMaterialized { .. } => {}
+                        | WakeAdoptMaterializedPendingOutcome::NotFullyMaterialized { .. } => false,
                     }
-                    true
                 }
                 MaterializePendingDeliveryMessageOutcome::AlreadyMaterialized(_) => {
                     let conversation_id = current.conversation_id;
@@ -570,12 +570,12 @@ async fn deliver_pending(
                                     .await
                                     .map_err(|error| error.to_string())?;
                             }
+                            true
                         }
                         WakeAdoptMaterializedPendingOutcome::Busy(_)
                         | WakeAdoptMaterializedPendingOutcome::NothingPending
-                        | WakeAdoptMaterializedPendingOutcome::NotFullyMaterialized { .. } => {}
+                        | WakeAdoptMaterializedPendingOutcome::NotFullyMaterialized { .. } => false,
                     }
-                    false
                 }
                 MaterializePendingDeliveryMessageOutcome::WrongOwnerOrIneligible => {
                     repo.suppress_pending_for_archived_conversation(&current, now)
@@ -585,7 +585,7 @@ async fn deliver_pending(
                 }
             };
             drop(sequence_guard);
-            if materialized_for_close {
+            if adopted_for_close {
                 match manager
                     .db()
                     .wake_delivery_requires_close_settlement_recheck(close_settlement_workflow_id)
@@ -1662,6 +1662,12 @@ mod tests {
         assert!(matches!(
             materialized,
             MaterializePendingDeliveryMessageOutcome::Materialized(_)
+        ));
+        assert!(matches!(
+            repo.adopt_materialized_pending_for_conversation("conv", Timestamp(20))
+                .await
+                .unwrap(),
+            WakeAdoptMaterializedPendingOutcome::Adopted(_)
         ));
 
         let manager = Arc::new(crate::runtime::RuntimeManager::new(
