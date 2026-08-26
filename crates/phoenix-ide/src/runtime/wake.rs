@@ -476,7 +476,7 @@ async fn deliver_pending(
                 cursor = Some(next_cursor);
                 continue;
             }
-            let close_settlement_conversation_id = current.conversation_id.clone();
+            let close_settlement_workflow_id = current.workflow_id;
             let rendered = render_terminal_result(&current);
             let display_data = Some(serde_json::json!({
                 "type": "wake_result",
@@ -515,7 +515,7 @@ async fn deliver_pending(
             let (sequence_guard, sequence_ids) =
                 handle.broadcast_tx.reserve_next_persisted_message_range(1);
             let sequence_id = sequence_ids[0];
-            match repo
+            let materialized_for_close = match repo
                 .materialize_pending_delivery_message(&MaterializePendingDeliveryMessageInput {
                     workflow_id: current.workflow_id,
                     delivery_id: current.canonical_delivery.delivery_id,
@@ -553,6 +553,7 @@ async fn deliver_pending(
                         | WakeAdoptMaterializedPendingOutcome::NothingPending
                         | WakeAdoptMaterializedPendingOutcome::NotFullyMaterialized { .. } => {}
                     }
+                    true
                 }
                 MaterializePendingDeliveryMessageOutcome::AlreadyMaterialized(_) => {
                     let conversation_id = current.conversation_id;
@@ -574,50 +575,31 @@ async fn deliver_pending(
                         | WakeAdoptMaterializedPendingOutcome::NothingPending
                         | WakeAdoptMaterializedPendingOutcome::NotFullyMaterialized { .. } => {}
                     }
+                    false
                 }
                 MaterializePendingDeliveryMessageOutcome::WrongOwnerOrIneligible => {
                     repo.suppress_pending_for_archived_conversation(&current, now)
                         .await
                         .map_err(|error| error.to_string())?;
-                }
-            }
-            let close_cancellation_delivery = matches!(
-                current.receipt.terminal,
-                phoenix_workflow::wake_profile::WakeTerminalPayload::Cancelled {
-                    reason: phoenix_workflow::wake_profile::WakeCancellationReason::ExplicitCancel,
-                    ..
-                }
-            );
-            drop(sequence_guard);
-            let should_recheck_close = close_cancellation_delivery && match manager
-                .db()
-                .get_conversation(&close_settlement_conversation_id)
-                .await
-            {
-                Ok(conversation) => match manager
-                    .db()
-                    .get_active_close_obligation_for_product(&conversation.product_conversation_id)
-                    .await
-                {
-                    Ok(Some(obligation)) => matches!(
-                        obligation.phase(),
-                        phoenix_core::domain::close::ClosePhase::SettlingActiveWork
-                            | phoenix_core::domain::close::ClosePhase::CancelRequestedDuringSettlement
-                    ),
-                    Ok(None) => false,
-                    Err(error) => {
-                        tracing::error!(%error, conversation_id = %close_settlement_conversation_id, "failed to classify Close settlement after wake delivery");
-                        false
-                    }
-                },
-                Err(error) => {
-                    tracing::error!(%error, conversation_id = %close_settlement_conversation_id, "failed to read wake conversation after delivery");
                     false
                 }
             };
-            if should_recheck_close {
-                if let Err(error) = manager.resume_pending_close_settlements().await {
-                    tracing::error!(%error, conversation_id = %close_settlement_conversation_id, "failed to re-evaluate Close settlement after wake delivery");
+            drop(sequence_guard);
+            if materialized_for_close {
+                match manager
+                    .db()
+                    .wake_delivery_requires_close_settlement_recheck(close_settlement_workflow_id)
+                    .await
+                {
+                    Ok(true) => {
+                        if let Err(error) = manager.resume_pending_close_settlements().await {
+                            tracing::error!(%error, workflow_id = close_settlement_workflow_id.0, "failed to re-evaluate Close settlement after wake delivery");
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::error!(%error, workflow_id = close_settlement_workflow_id.0, "failed to classify Close settlement wake delivery");
+                    }
                 }
             }
             cursor = Some(next_cursor);

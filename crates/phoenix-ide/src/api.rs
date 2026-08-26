@@ -101,12 +101,6 @@ pub struct AppState {
     pub resource_monitor: Arc<resource_monitor::ResourceMonitor>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct AgentFacingWakeRegistrationAvailable(bool);
-
-const AGENT_FACING_WAKE_REGISTRATION: AgentFacingWakeRegistrationAvailable =
-    AgentFacingWakeRegistrationAvailable(false);
-
 async fn reconcile_startup_continuations(
     runtime: &Arc<RuntimeManager>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -185,13 +179,11 @@ impl AppState {
             .await;
         runtime.start_direct_turn_worker().await?;
         runtime.require_startup_local_authority()?;
-        if AGENT_FACING_WAKE_REGISTRATION.0 {
-            runtime
-                .start_wake_worker()
-                .await
-                .map_err(std::io::Error::other)?;
-            runtime.require_startup_local_authority()?;
-        }
+        runtime
+            .start_wake_worker()
+            .await
+            .map_err(std::io::Error::other)?;
+        runtime.require_startup_local_authority()?;
         runtime.require_startup_local_authority()?;
         tokio::spawn(crate::runtime::pr_status_poll::run(runtime.clone()));
         runtime.start_creation_worker().await?;

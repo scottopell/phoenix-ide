@@ -3401,6 +3401,7 @@ impl RuntimeManager {
         };
         let manager = Arc::clone(self);
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let result = Box::pin(crate::runtime::wake::run(
                 Arc::clone(&manager),
@@ -3408,6 +3409,9 @@ impl RuntimeManager {
                 ready_tx,
             ))
             .await;
+            if startup_tx.send(()).is_ok() {
+                return;
+            }
             let detail = match result {
                 Ok(()) => "wake worker exited unexpectedly".to_string(),
                 Err(error) => format!("wake worker exited: {error}"),
@@ -3415,9 +3419,10 @@ impl RuntimeManager {
             tracing::error!(%detail, "wake worker lost local authority");
             manager.signal_fatal_local_authority("wake_worker_exit");
         });
-        ready_rx.await.map_err(|_| {
-            "wake worker stopped before startup reconciliation completed".to_string()
-        })?;
+        tokio::select! {
+            ready = ready_rx => ready.map_err(|_| "wake worker stopped before startup reconciliation completed".to_string())?,
+            _ = startup_rx => return Err("wake worker stopped before startup reconciliation completed".to_string()),
+        };
         self.kick_wake_worker();
         Ok(())
     }

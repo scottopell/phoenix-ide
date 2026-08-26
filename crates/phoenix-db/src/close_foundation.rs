@@ -1340,6 +1340,36 @@ impl Database {
         Ok(rows)
     }
 
+    pub async fn wake_delivery_requires_close_settlement_recheck(
+        &self,
+        workflow_id: phoenix_workflow::WorkflowId,
+    ) -> DbResult<bool> {
+        let phase: Option<String> = sqlx::query_scalar(
+            "SELECT obligation.phase
+             FROM wake_bindings binding
+             JOIN conversations participant ON participant.id = binding.conversation_id
+             JOIN close_obligations obligation
+               ON obligation.product_conversation_id = participant.product_conversation_id
+             WHERE binding.workflow_id = ?1
+               AND EXISTS (
+                 SELECT 1 FROM workflow_deliveries delivery
+                 WHERE delivery.workflow_id = binding.workflow_id
+                   AND (delivery.status = 'Pending' OR delivery.runtime_acceptance_status = 'Owed')
+               )
+             ORDER BY obligation.created_at DESC
+             LIMIT 1",
+        )
+        .bind(i64::try_from(workflow_id.0).map_err(|_| {
+            DbError::Serialization("wake workflow id exceeds SQLite range".to_string())
+        })?)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(matches!(
+            phase.as_deref(),
+            Some("settling_active_work" | "cancel_requested_during_settlement")
+        ))
+    }
+
     pub async fn cancel_close_settlement_wakes(&self, attempt_id: &str) -> DbResult<usize> {
         let wake_repo = crate::workflow::wake::WakeRepository::new(self.pool.clone());
         let rows: Vec<(i64, String, String)> = sqlx::query_as(
