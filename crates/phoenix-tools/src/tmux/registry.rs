@@ -150,6 +150,20 @@ pub enum TmuxRetirementOutcome {
     Residual { reason: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TmuxRetirementRehydration {
+    Permit(TmuxRetirementPermit),
+    AbsenceVerified,
+    Residual { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExactTmuxIdentityState {
+    Live,
+    Absent,
+    Ambiguous { reason: String },
+}
+
 /// Lifecycle state of a per-`ResourceScopeKey` tmux server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)] // `Gone` is the terminal-transition target; cascade
@@ -747,6 +761,32 @@ impl TmuxRegistry {
             .map(|entry| entry.server.clone())
     }
 
+    async fn exact_identity_state(
+        &self,
+        identity: &TmuxServerInstanceIdentity,
+    ) -> Result<ExactTmuxIdentityState, TmuxError> {
+        match probe(&identity.socket_path)
+            .await
+            .map_err(|source| TmuxError::ProbeFailed {
+                socket_path: identity.socket_path.clone(),
+                source,
+            })? {
+            ProbeResult::NoSocket | ProbeResult::DeadSocket => Ok(ExactTmuxIdentityState::Absent),
+            ProbeResult::Live => match read_server_token(&identity.socket_path).await {
+                Some(token) if token == identity.server_token => Ok(ExactTmuxIdentityState::Live),
+                Some(_) => Ok(ExactTmuxIdentityState::Absent),
+                None => Ok(ExactTmuxIdentityState::Ambiguous {
+                    reason: format!(
+                        "live tmux server at {} did not report {}; cannot prove whether {} is still current",
+                        identity.socket_path.display(),
+                        SERVER_TOKEN_VAR,
+                        identity.stable_identity()
+                    ),
+                }),
+            },
+        }
+    }
+
     async fn find_socket_for_token(
         &self,
         expected_server_token: &str,
@@ -905,6 +945,167 @@ impl TmuxRegistry {
             true,
         )
         .await
+    }
+
+    /// Rehydrate exact retirement authority for a persisted tmux server identity
+    /// after a Phoenix restart.
+    ///
+    /// The persisted identity is authoritative only when the same live server is
+    /// still reachable at the same socket path and reports the same
+    /// `PHOENIX_TMUX_SERVER_TOKEN`. A missing socket or replacement token proves
+    /// exact absence. Any scope conflict or live server without a token remains a
+    /// residual ambiguity so callers do not take destructive action on path or
+    /// token evidence alone.
+    ///
+    /// # Errors
+    /// Returns [`TmuxError`] when probing the persisted socket path fails.
+    pub async fn rehydrate_retirement(
+        &self,
+        work_scope: &ResourceScopeKey,
+        persisted: &TmuxServerInstanceIdentity,
+    ) -> Result<TmuxRetirementRehydration, TmuxError> {
+        let current_entry = self.get_existing(work_scope).await;
+        if let Some(entry) = current_entry {
+            let current = entry.read().await;
+            let exact_current = current.socket_path == persisted.socket_path
+                && current.server_token == persisted.server_token;
+            let current_socket_matches = current.socket_path == persisted.socket_path;
+            let current_identity = current.exact_identity();
+            let current_fenced = current.retirement_fenced;
+            drop(current);
+
+            if exact_current {
+                return match self.exact_identity_state(persisted).await? {
+                    ExactTmuxIdentityState::Absent => Ok(TmuxRetirementRehydration::AbsenceVerified),
+                    ExactTmuxIdentityState::Ambiguous { reason } => {
+                        Ok(TmuxRetirementRehydration::Residual { reason })
+                    }
+                    ExactTmuxIdentityState::Live => {
+                        let mut current = entry.write().await;
+                        if current.retirement_fenced {
+                            return Ok(TmuxRetirementRehydration::Residual {
+                                reason: format!(
+                                    "tmux retirement already fenced for {} at {}",
+                                    work_scope,
+                                    persisted.stable_identity()
+                                ),
+                            });
+                        }
+                        current.status = ServerStatus::Live;
+                        let permit = Self::build_retirement_permit(work_scope, &mut current, true);
+                        drop(current);
+                        self.emit_lifecycle(work_scope);
+                        Ok(TmuxRetirementRehydration::Permit(permit))
+                    }
+                };
+            }
+
+            if current_socket_matches {
+                return Ok(TmuxRetirementRehydration::AbsenceVerified);
+            }
+
+            return match self.exact_identity_state(persisted).await? {
+                ExactTmuxIdentityState::Absent => Ok(TmuxRetirementRehydration::AbsenceVerified),
+                ExactTmuxIdentityState::Live => Ok(TmuxRetirementRehydration::Residual {
+                    reason: format!(
+                        "work scope {} is already materialized as {}; persisted server {} also remains live",
+                        work_scope,
+                        current_identity.stable_identity(),
+                        persisted.stable_identity()
+                    ),
+                }),
+                ExactTmuxIdentityState::Ambiguous { reason: ambiguity } => {
+                    let mut reason = format!(
+                        "work scope {} is already materialized as {}",
+                        work_scope,
+                        current_identity.stable_identity()
+                    );
+                    if current_fenced {
+                        reason.push_str(" with retirement already fenced");
+                    }
+                    reason.push_str(&format!("; {ambiguity}"));
+                    Ok(TmuxRetirementRehydration::Residual { reason })
+                }
+            };
+        }
+
+        match self.exact_identity_state(persisted).await? {
+            ExactTmuxIdentityState::Absent => Ok(TmuxRetirementRehydration::AbsenceVerified),
+            ExactTmuxIdentityState::Ambiguous { reason } => {
+                Ok(TmuxRetirementRehydration::Residual { reason })
+            }
+            ExactTmuxIdentityState::Live => {
+                let key = work_scope.stable_key();
+                let entry = {
+                    let mut map = self.inner.write().await;
+                    if let Some(entry) = map.get(&key) {
+                        entry.clone()
+                    } else {
+                        let mut server = TmuxServer::new(
+                            work_scope.clone(),
+                            persisted.socket_path.clone(),
+                        );
+                        server.server_token = persisted.server_token.clone();
+                        server.status = ServerStatus::Live;
+                        let entry = Arc::new(TmuxScopeEntry::new(server));
+                        map.insert(key, entry.clone());
+                        entry
+                    }
+                };
+
+                let current_identity = {
+                    let server = entry.server.read().await;
+                    if server.socket_path != persisted.socket_path {
+                        Some(server.exact_identity())
+                    } else {
+                        None
+                    }
+                };
+                if let Some(current_identity) = current_identity {
+                    return Ok(TmuxRetirementRehydration::Residual {
+                        reason: format!(
+                            "work scope {} raced to a different tmux server {}; refusing to rehydrate persisted {}",
+                            work_scope,
+                            current_identity.stable_identity(),
+                            persisted.stable_identity()
+                        ),
+                    });
+                }
+                match self.exact_identity_state(persisted).await? {
+                    ExactTmuxIdentityState::Absent => Ok(TmuxRetirementRehydration::AbsenceVerified),
+                    ExactTmuxIdentityState::Ambiguous { reason } => {
+                        Ok(TmuxRetirementRehydration::Residual { reason })
+                    }
+                    ExactTmuxIdentityState::Live => {
+                        let mut server = entry.server.write().await;
+                        if server.retirement_fenced {
+                            return Ok(TmuxRetirementRehydration::Residual {
+                                reason: format!(
+                                    "tmux retirement already fenced for {} at {}",
+                                    work_scope,
+                                    persisted.stable_identity()
+                                ),
+                            });
+                        }
+                        if server.socket_path != persisted.socket_path {
+                            let current_identity = server.exact_identity();
+                            return Ok(TmuxRetirementRehydration::Residual {
+                                reason: format!(
+                                    "work scope {} raced to a different tmux server {}; refusing to rehydrate persisted {}",
+                                    work_scope,
+                                    current_identity.stable_identity(),
+                                    persisted.stable_identity()
+                                ),
+                            });
+                        }
+                        server.server_token = persisted.server_token.clone();
+                        server.status = ServerStatus::Live;
+                        let permit = Self::build_retirement_permit(work_scope, &mut server, true);
+                        Ok(TmuxRetirementRehydration::Permit(permit))
+                    }
+                }
+            }
+        }
     }
 
     async fn begin_retirement_inner(
@@ -1288,7 +1489,11 @@ pub async fn cascade_tmux_on_delete(
 fn set_tmux_server_env(cmd: &mut tokio::process::Command) {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_owned());
     cmd.env_clear();
-    cmd.envs(phoenix_terminal::spawn::build_env_for_tmux(&shell));
+    let launch_uuid = uuid::Uuid::new_v4().to_string();
+    cmd.envs(phoenix_terminal::spawn::build_env_for_tmux(
+        &shell,
+        &launch_uuid,
+    ));
     // Stamp the companion version so a later reuse can tell a current server
     // (no-op) from a pre-feature/older one that needs a refresh.
     cmd.env(COMPANION_VERSION_VAR, COMPANION_ENV_VERSION);
@@ -1408,7 +1613,8 @@ async fn refresh_companion_if_stale(socket_path: &Path) {
     // The suggest token and API URL DO propagate to new panes via the global
     // environment (unlike PATH), so set them there.
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_owned());
-    for (k, v) in phoenix_terminal::spawn::build_env_for_tmux(&shell) {
+    let launch_uuid = uuid::Uuid::new_v4().to_string();
+    for (k, v) in phoenix_terminal::spawn::build_env_for_tmux(&shell, &launch_uuid) {
         if k == "PHOENIX_API_URL" || k == "PHOENIX_SUGGEST_TOKEN" {
             run_tmux_quiet(
                 socket_path,
@@ -1894,6 +2100,114 @@ mod tests {
             reg.ensure_live(&work_scope, tmp.path(), None, None).await,
             Err(TmuxError::BinaryUnavailable)
         ));
+    }
+
+    #[tokio::test]
+    async fn rehydrate_retirement_fresh_registry_reclaims_same_live_server() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let owner = TestTmuxServerOwner::new();
+        let scope = scope("rehydrate-same-server");
+        let bootstrap = owner.registry();
+        let live = bootstrap
+            .ensure_live(&scope, owner.path(), None, None)
+            .await
+            .expect("bootstrap live server");
+        let persisted = {
+            let live = live.read().await;
+            TmuxServerInstanceIdentity {
+                socket_path: live.socket_path.clone(),
+                server_token: live.server_token.clone(),
+            }
+        };
+
+        let restarted = owner.registry();
+        let permit = match restarted.rehydrate_retirement(&scope, &persisted).await.unwrap() {
+            TmuxRetirementRehydration::Permit(permit) => permit,
+            other => panic!("expected exact rehydrated permit, got {other:?}"),
+        };
+        let outcome = restarted
+            .complete_retirement(&permit)
+            .await
+            .expect("complete exact rehydrated retirement");
+        assert_eq!(outcome, TmuxRetirementOutcome::Retired);
+        assert!(matches!(probe(&persisted.socket_path).await.unwrap(), ProbeResult::NoSocket));
+        owner.shutdown();
+    }
+
+    #[tokio::test]
+    async fn rehydrate_retirement_replacement_server_is_left_untouched() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let owner = TestTmuxServerOwner::new();
+        let scope = scope("rehydrate-replacement");
+        let bootstrap = owner.registry();
+        let first = bootstrap
+            .ensure_live(&scope, owner.path(), None, None)
+            .await
+            .expect("bootstrap live server");
+        let persisted = {
+            let first = first.read().await;
+            TmuxServerInstanceIdentity {
+                socket_path: first.socket_path.clone(),
+                server_token: first.server_token.clone(),
+            }
+        };
+        kill_socket(&persisted.socket_path).await;
+
+        let replacement_registry = owner.registry();
+        let replacement = replacement_registry
+            .ensure_live(&scope, owner.path(), None, None)
+            .await
+            .expect("replacement live server");
+        let replacement_token = replacement.read().await.server_token.clone();
+        assert_ne!(replacement_token, persisted.server_token);
+
+        let restarted = owner.registry();
+        assert_eq!(
+            restarted.rehydrate_retirement(&scope, &persisted).await.unwrap(),
+            TmuxRetirementRehydration::AbsenceVerified
+        );
+        let output = run_tmux_quiet_output(&persisted.socket_path, &["list-sessions"])
+            .await
+            .expect("replacement should still be reachable");
+        assert!(
+            output.status.success(),
+            "replacement server must survive stale rehydration"
+        );
+        owner.shutdown();
+    }
+
+    #[tokio::test]
+    async fn rehydrate_retirement_missing_server_proves_exact_absence() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let owner = TestTmuxServerOwner::new();
+        let scope = scope("rehydrate-missing");
+        let bootstrap = owner.registry();
+        let live = bootstrap
+            .ensure_live(&scope, owner.path(), None, None)
+            .await
+            .expect("bootstrap live server");
+        let persisted = {
+            let live = live.read().await;
+            TmuxServerInstanceIdentity {
+                socket_path: live.socket_path.clone(),
+                server_token: live.server_token.clone(),
+            }
+        };
+        kill_socket(&persisted.socket_path).await;
+
+        let restarted = owner.registry();
+        assert_eq!(
+            restarted.rehydrate_retirement(&scope, &persisted).await.unwrap(),
+            TmuxRetirementRehydration::AbsenceVerified
+        );
+        let _ = std::fs::remove_file(&persisted.socket_path);
+        owner.shutdown();
     }
 
     #[tokio::test]
