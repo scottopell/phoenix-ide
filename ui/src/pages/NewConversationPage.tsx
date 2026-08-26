@@ -69,7 +69,9 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   const inlineReferenceRootReady = conv.dirStatus === 'exists' && conv.isGitDir !== null;
   const ir = useInlineReferences({
     cwd: conv.cwd,
-    discoveryReady: inlineReferenceRootReady && conv.rootReservation !== null,
+    discoveryReady: inlineReferenceRootReady
+      && conv.rootReservation !== null
+      && conv.rootReservation.kind !== 'unresolved_exact_committed_tree',
     resolution: conv.rootReservation?.kind === 'exact_committed_tree'
       ? { kind: 'exact_reserved_committed_tree', rootReservation: conv.rootReservation }
       : conv.rootReservation?.kind === 'unresolved_exact_committed_tree'

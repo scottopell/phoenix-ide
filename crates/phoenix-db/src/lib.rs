@@ -7479,8 +7479,40 @@ impl Database {
         .bind(conversation_id)
         .fetch_optional(&self.pool)
         .await?;
-        let Some(row) = row else {
-            return Ok(None);
+        let row = if let Some(row) = row {
+            row
+        } else {
+            let retained = sqlx::query(
+                "SELECT wr.repository_id,
+                        management.path AS repository_root,
+                        branch.branch AS logical_base,
+                        observed.last_observed_head_oid AS exact_checkout_oid
+                   FROM conversations needle
+                   JOIN conversations c
+                     ON c.product_conversation_id = needle.product_conversation_id
+                   JOIN work_scope_git_repositories wr ON wr.work_scope_id = c.work_scope_id
+                   JOIN git_repository_locator_observations management
+                     ON management.repository_id = wr.repository_id
+                    AND management.locator_kind = 'management_root'
+                    AND management.status = 'present'
+                   JOIN git_repository_default_branch_observations branch
+                     ON branch.repository_id = wr.repository_id
+                    AND branch.status = 'resolved'
+                   JOIN work_scope_observed_branches observed
+                     ON observed.work_scope_id = c.work_scope_id
+                    AND observed.repository_identity = wr.repository_id
+                    AND observed.branch_name = branch.branch
+                  WHERE needle.id = ?1
+                  ORDER BY observed.last_observed_at DESC, c.created_at ASC
+                  LIMIT 1",
+            )
+            .bind(conversation_id)
+            .fetch_optional(&self.pool)
+            .await?;
+            let Some(retained) = retained else {
+                return Ok(None);
+            };
+            retained
         };
         Ok(Some(ApprovedTaskRootReservationInput {
             repository_id: phoenix_core::git_repository::GitRepositoryId::parse(
