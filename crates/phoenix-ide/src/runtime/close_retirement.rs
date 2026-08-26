@@ -129,10 +129,14 @@ impl RuntimeManager {
             resources.push(resource);
         }
         if tmux.had_entry() {
-            resources.push(opaque_resource(
+            let resource = opaque_resource(
                 RetiredResourceKind::TmuxServer,
                 tmux.instance.stable_identity(),
-            ));
+            );
+            if let Some(instance_id) = tmux.runtime_resource_instance_id.clone() {
+                runtime_instance_bindings.push((resource.clone(), instance_id));
+            }
+            resources.push(resource);
         }
         if let Some(instance) = &terminal.instance {
             let resource =
@@ -143,10 +147,14 @@ impl RuntimeManager {
             resources.push(resource);
         }
         for instance in &browser.instances {
-            resources.push(opaque_resource(
+            let resource = opaque_resource(
                 RetiredResourceKind::BrowserSession,
                 instance.stable_identity(),
-            ));
+            );
+            if let Some(instance_id) = instance.runtime_resource_instance_id.clone() {
+                runtime_instance_bindings.push((resource.clone(), instance_id));
+            }
+            resources.push(resource);
         }
         leases.insert(
             (attempt_id.as_str().to_string(), scope),

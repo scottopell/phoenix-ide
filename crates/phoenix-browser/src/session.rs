@@ -27,6 +27,10 @@ use phoenix_core::process_identity::{
     current_process_identity, process_identity_matches, ProcessIdentity,
 };
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
+use phoenix_core::runtime_resource::{
+    RuntimeResourceAdmission, RuntimeResourceAdmissionAuthority, RuntimeResourceInstanceId,
+    RuntimeResourceKind,
+};
 use phoenix_core::work_scope::{EffectiveResourceAccess, ResourceAuthority, ResourceScopeKey};
 
 /// Derive a Chrome user data dir from a browser session key.
@@ -1316,6 +1320,7 @@ pub struct BrowserSessionInstanceIdentity {
     durable: BrowserLaunchIdentity,
     session_addr: usize,
     user_data_key: String,
+    pub runtime_resource_instance_id: Option<RuntimeResourceInstanceId>,
 }
 
 impl BrowserSessionInstanceIdentity {
@@ -1349,8 +1354,14 @@ type BrowserRetirementSession = (
     Arc<RwLock<BrowserSession>>,
     String,
     BrowserSessionAudience,
+    Option<RuntimeResourceInstanceId>,
 );
-type BrowserActorRetirementSession = (Arc<RwLock<BrowserSession>>, String, BrowserSessionAudience);
+type BrowserActorRetirementSession = (
+    Arc<RwLock<BrowserSession>>,
+    String,
+    BrowserSessionAudience,
+    Option<RuntimeResourceInstanceId>,
+);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrowserRetirementPermit {
@@ -1452,6 +1463,7 @@ struct ScopedSession {
     authority: ResourceAuthority,
     session: Arc<RwLock<BrowserSession>>,
     user_data_key: String,
+    runtime_resource_instance_id: Option<RuntimeResourceInstanceId>,
     current_kill: std::sync::Mutex<Option<Arc<KillAttempt>>>,
     teardown_failed: Arc<AtomicBool>,
 }
@@ -1503,6 +1515,7 @@ pub struct BrowserSessionManager {
     scope_liveness_hook: std::sync::OnceLock<ScopeLivenessHook>,
     shutting_down: AtomicBool,
     tmp_root: PathBuf,
+    runtime_resource_admission: Option<RuntimeResourceAdmissionAuthority>,
 }
 
 impl BrowserSessionManager {
@@ -1534,6 +1547,7 @@ impl BrowserSessionManager {
             scope_liveness_hook: std::sync::OnceLock::new(),
             shutting_down: AtomicBool::new(false),
             tmp_root: runtime_env.tmp_root().to_path_buf(),
+            runtime_resource_admission: None,
         });
 
         // Start background cleanup task with weak reference to avoid reference cycle
@@ -1551,6 +1565,19 @@ impl BrowserSessionManager {
             }
         });
 
+        manager
+    }
+
+    #[must_use]
+    pub fn with_lifecycle_sink_runtime_env_and_admission(
+        sink: Option<BrowserSessionLifecycleSink>,
+        runtime_env: &PhoenixRuntimeEnvironment,
+        runtime_resource_admission: RuntimeResourceAdmissionAuthority,
+    ) -> Arc<Self> {
+        let mut manager = Self::with_lifecycle_sink_and_runtime_env(sink, runtime_env);
+        Arc::get_mut(&mut manager)
+            .expect("new browser manager has one strong reference")
+            .runtime_resource_admission = Some(runtime_resource_admission);
         manager
     }
 
@@ -1814,6 +1841,34 @@ impl BrowserSessionManager {
         }
     }
 
+    async fn discard_unpublished_session(
+        &self,
+        session: Arc<RwLock<BrowserSession>>,
+        session_key: &str,
+    ) -> Result<(), BrowserError> {
+        let (launch_identity, profile_path) = {
+            let mut session = session.write().await;
+            let launch_identity = session.launch_identity().clone();
+            session
+                .terminate()
+                .await
+                .map_err(|error| BrowserError::OperationFailed(error.to_string()))?;
+            (
+                launch_identity,
+                user_data_dir_for_key(&self.tmp_root, session_key),
+            )
+        };
+        let session_key = session_key.to_string();
+        tokio::task::spawn_blocking(move || {
+            delete_profile_if_owned_and_stopped(&profile_path, &session_key, &launch_identity)
+        })
+        .await
+        .map_err(|error| {
+            BrowserError::OperationFailed(format!("browser profile cleanup task failed: {error}"))
+        })?
+        .map_err(|error| BrowserError::OperationFailed(error.to_string()))
+    }
+
     async fn get_session_with_creator(
         &self,
         work_scope: &ResourceScopeKey,
@@ -1892,10 +1947,55 @@ impl BrowserSessionManager {
         };
 
         tracing::info!(work_scope = %work_scope, "Creating new browser session");
+        let instance_id =
+            matches!(work_scope, ResourceScopeKey::Work(_)).then(RuntimeResourceInstanceId::new);
         let session = BrowserSession::new(&self.tmp_root, &key).await?;
         let session_arc = Arc::new(RwLock::new(session));
 
         Self::setup_session_listeners(session_arc.clone()).await;
+        if let (ResourceScopeKey::Work(scope), Some(authority), Some(instance_id)) = (
+            work_scope,
+            self.runtime_resource_admission.as_ref(),
+            instance_id.clone(),
+        ) {
+            let session = session_arc.read().await;
+            let Some(process) = session.chrome_process() else {
+                drop(session);
+                let cleanup = self.discard_unpublished_session(session_arc, &key).await;
+                return Err(cleanup.err().unwrap_or_else(|| {
+                    BrowserError::OperationFailed(
+                        "browser launch lacks an exact process identity".to_string(),
+                    )
+                }));
+            };
+            let admission = RuntimeResourceAdmission {
+                instance_id,
+                scope: scope.clone(),
+                kind: RuntimeResourceKind::Browser,
+                launch_uuid: session.launch_identity().launch_uuid.clone(),
+                pid: Some(process.pid),
+                process_birth: Some(process.start_time),
+                pgid: None,
+                tmux_socket_path: None,
+                tmux_server_token: None,
+                browser_session_key: Some(key.clone()),
+                browser_audience: Some(format!("{:?}", actor.authority())),
+                browser_profile_path: Some(
+                    user_data_dir_for_key(&self.tmp_root, &key)
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            };
+            drop(session);
+            if let Err(error) = authority.admit_runtime_resource(admission).await {
+                if let Err(cleanup) = self.discard_unpublished_session(session_arc, &key).await {
+                    return Err(cleanup);
+                }
+                return Err(BrowserError::OperationFailed(format!(
+                    "durable browser admission failed: {error}"
+                )));
+            }
+        }
 
         state.sessions.insert(
             key.clone(),
@@ -1905,6 +2005,7 @@ impl BrowserSessionManager {
                 authority: actor.authority(),
                 session: session_arc.clone(),
                 user_data_key: key.clone(),
+                runtime_resource_instance_id: instance_id,
                 current_kill: std::sync::Mutex::new(None),
                 teardown_failed: Arc::new(AtomicBool::new(false)),
             },
@@ -2102,13 +2203,15 @@ impl BrowserSessionManager {
                         entry.session.clone(),
                         entry.user_data_key.clone(),
                         entry.audience(),
+                        entry.runtime_resource_instance_id.clone(),
                     )
                 })
                 .collect();
             (generation, current)
         };
         let mut instances = Vec::with_capacity(current.len());
-        for (session_key, session, user_data_key, audience) in current {
+        for (session_key, session, user_data_key, audience, runtime_resource_instance_id) in current
+        {
             let guard = session.read().await;
             let chrome_pid = guard.chrome_pid;
             let durable = guard.launch_identity().clone();
@@ -2120,6 +2223,7 @@ impl BrowserSessionManager {
                 durable,
                 session_addr: Arc::as_ptr(&session) as usize,
                 user_data_key,
+                runtime_resource_instance_id,
             });
         }
         BrowserRetirementPermit {
@@ -2151,12 +2255,13 @@ impl BrowserSessionManager {
                     entry.session.clone(),
                     entry.user_data_key.clone(),
                     entry.audience(),
+                    entry.runtime_resource_instance_id.clone(),
                 )
             });
             (generation, current)
         };
         let instances = match current {
-            Some((session, user_data_key, audience)) => {
+            Some((session, user_data_key, audience, runtime_resource_instance_id)) => {
                 let guard = session.read().await;
                 let chrome_pid = guard.chrome_pid;
                 let durable = guard.launch_identity().clone();
@@ -2168,6 +2273,7 @@ impl BrowserSessionManager {
                     durable,
                     session_addr: Arc::as_ptr(&session) as usize,
                     user_data_key,
+                    runtime_resource_instance_id,
                 }]
             }
             None => Vec::new(),
@@ -2787,6 +2893,7 @@ impl Default for BrowserSessionManager {
             scope_liveness_hook: std::sync::OnceLock::new(),
             shutting_down: AtomicBool::new(false),
             tmp_root: PhoenixRuntimeEnvironment::detect().tmp_root().to_path_buf(),
+            runtime_resource_admission: None,
         }
     }
 }

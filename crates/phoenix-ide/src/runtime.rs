@@ -2112,18 +2112,26 @@ impl RuntimeManager {
                 wake_kick_tx.clone(),
             ));
         Self {
-            db,
+            db: db.clone(),
             llm_registry,
             message_retriever,
             platform,
-            browser_sessions: BrowserSessionManager::with_lifecycle_sink_and_runtime_env(
+            browser_sessions: BrowserSessionManager::with_lifecycle_sink_runtime_env_and_admission(
                 Some(browser_lifecycle_tx),
                 runtime_env,
+                Arc::new(resource_admission::DatabaseRuntimeResourceAdmission::new(
+                    db.clone(),
+                )),
             ),
             bash_handles: Arc::new(BashHandleRegistry::with_lifecycle_sink(Some(
                 bash_lifecycle_tx,
             ))),
-            tmux_registry: Arc::new(TmuxRegistry::with_lifecycle_sink(Some(tmux_lifecycle_tx))),
+            tmux_registry: Arc::new(TmuxRegistry::with_lifecycle_sink_and_admission(
+                Some(tmux_lifecycle_tx),
+                Arc::new(resource_admission::DatabaseRuntimeResourceAdmission::new(
+                    db.clone(),
+                )),
+            )),
             mcp_manager,
             terminals: crate::terminal::ActiveTerminals::new(),
             close_retirement_leases: AsyncMutex::new(HashMap::new()),
