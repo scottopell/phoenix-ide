@@ -988,10 +988,13 @@ async fn provision_conversation(
                 .unwrap_or_else(|| start_point.checkout_ref())
                 .to_string();
             let canonical_default_branch = start_point.logical_base().to_string();
-            if job.intent.reserved_checkout_oid.as_deref() != start_point.reserved_oid()
-                || job.intent.base_branch.as_deref() != Some(start_point.logical_base())
-                || job.intent.reserved_root_freshness.as_deref() != Some("fresh")
+            let refreshed = start_point.reserved_oid()
+                != job.intent.reserved_checkout_oid.as_deref()
+                || start_point.logical_base()
+                    != job.intent.base_branch.as_deref().unwrap_or_default();
+            if refreshed
                 || job.intent.reserved_root_failure.is_some()
+                || job.intent.reserved_root_freshness.is_none()
             {
                 let reserved_oid = start_point.reserved_oid().ok_or_else(|| {
                     (
@@ -1007,7 +1010,14 @@ async fn provision_conversation(
                 let updated_intent = ConversationCreationIntent {
                     reserved_checkout_oid: Some(reserved_oid.to_string()),
                     base_branch: Some(start_point.logical_base().to_string()),
-                    reserved_root_freshness: Some("fresh".to_string()),
+                    reserved_root_freshness: Some(if refreshed {
+                        "fresh".to_string()
+                    } else {
+                        job.intent
+                            .reserved_root_freshness
+                            .clone()
+                            .unwrap_or_else(|| "stale_cached".to_string())
+                    }),
                     reserved_root_failure: None,
                     ..job.intent.clone()
                 };

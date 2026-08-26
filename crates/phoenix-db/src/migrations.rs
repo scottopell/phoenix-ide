@@ -2120,8 +2120,8 @@ CREATE TABLE product_root_reservations (
     unresolved_reason TEXT CHECK (unresolved_reason IS NULL OR (typeof(unresolved_reason) = 'text' AND unresolved_reason <> '')),
     status TEXT NOT NULL CHECK (status IN ('reserved', 'consumed')),
     consumed_by_conversation_id TEXT,
-    created_at_unix_micros INTEGER NOT NULL CHECK (typeof(created_at_unix_micros) = 'integer'),
-    consumed_at_unix_micros INTEGER CHECK (consumed_at_unix_micros IS NULL OR typeof(consumed_at_unix_micros) = 'integer'),
+    created_at_unix_micros INTEGER NOT NULL CHECK (typeof(created_at_unix_micros) = 'integer' AND created_at_unix_micros >= 0),
+    consumed_at_unix_micros INTEGER CHECK (consumed_at_unix_micros IS NULL OR (typeof(consumed_at_unix_micros) = 'integer' AND consumed_at_unix_micros >= 0)),
     CHECK ((kind = 'direct' AND repo_root IS NULL AND repository_id IS NULL AND exact_checkout_oid IS NULL AND logical_base IS NULL AND freshness IS NULL AND unresolved_reason IS NULL)
         OR (kind = 'exact_committed_tree' AND repo_root IS NOT NULL AND exact_checkout_oid IS NOT NULL AND logical_base IS NOT NULL AND freshness IN ('fresh', 'stale_cached') AND unresolved_reason IS NULL)
         OR (kind = 'unresolved_exact_committed_tree' AND repo_root IS NOT NULL AND exact_checkout_oid IS NULL AND logical_base IS NULL AND freshness = 'unresolved' AND unresolved_reason IS NOT NULL)),

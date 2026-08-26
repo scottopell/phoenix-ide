@@ -246,7 +246,7 @@ fn discover_remote_head_branch(repo_root: &Path) -> Option<String> {
 fn refreshed_default_task_start(repo_root: &Path) -> Option<RefreshedDefaultTaskStart> {
     if has_remote_named_origin(repo_root) {
         let default_branch =
-            origin_head_branch(repo_root).or_else(|| discover_remote_head_branch(repo_root))?;
+            discover_remote_head_branch(repo_root).or_else(|| origin_head_branch(repo_root))?;
         run_git(
             repo_root,
             &[

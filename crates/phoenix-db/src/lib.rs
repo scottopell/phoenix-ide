@@ -4756,11 +4756,6 @@ impl Database {
         ))
     }
 
-    /// List one present management-root observation per hidden repository by recency.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DbError`] when the query or timestamp conversion fails.
     /// Resolve retained hidden-repository identity evidence for a repository management root.
     ///
     /// # Errors
@@ -4792,6 +4787,11 @@ impl Database {
         .transpose()
     }
 
+    /// List one present management-root observation per hidden repository by recency.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] when the query or timestamp conversion fails.
     pub async fn list_recent_hidden_repository_management_roots(
         &self,
     ) -> DbResult<Vec<RecentHiddenRepositoryManagementRoot>> {
@@ -5610,13 +5610,14 @@ impl Database {
             sqlx::query(
                 "UPDATE product_root_reservations
                  SET kind = 'exact_committed_tree', exact_checkout_oid = ?1,
-                     logical_base = ?2, freshness = 'fresh', unresolved_reason = NULL, consumed_at_unix_micros = ?3
+                     logical_base = ?2, freshness = ?3, unresolved_reason = NULL, consumed_at_unix_micros = ?4
                  WHERE consumed_by_conversation_id = (
-                     SELECT conversation_id FROM conversation_creation_jobs WHERE id = ?4
+                     SELECT conversation_id FROM conversation_creation_jobs WHERE id = ?5
                  ) AND status = 'consumed'",
             )
             .bind(oid)
             .bind(branch)
+            .bind(intent.reserved_root_freshness.as_deref().unwrap_or("stale_cached"))
             .bind(now_micros)
             .bind(job_id)
             .execute(&mut *tx)
@@ -14699,7 +14700,7 @@ mod tests {
             .await
             .unwrap()
             .expect("consumed reservation evidence");
-        assert_eq!(root.repository_id, attachment.repository_id);
+        assert_eq!(root.repository_id.as_str(), "repo-id-from-reservation");
         assert_eq!(root.repository_root, "/repo/from-reservation");
         assert_eq!(root.logical_base, "main");
         assert_eq!(
