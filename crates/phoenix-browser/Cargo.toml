@@ -21,6 +21,7 @@ tokio = { version = "1", features = ["full"] }
 # Serialization (console entries, profiling state, screencast events).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
 
 # CDP event-stream combinators (StreamExt) and BoxFuture for the liveness hook.
 futures = "0.3"

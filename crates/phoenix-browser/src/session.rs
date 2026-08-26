@@ -23,6 +23,9 @@ use thiserror::Error;
 use tokio::sync::{Notify, RwLock};
 use tokio::task::JoinHandle;
 
+use phoenix_core::process_identity::{
+    current_process_identity, process_identity_matches, ProcessIdentity,
+};
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use phoenix_core::work_scope::{EffectiveResourceAccess, ResourceAuthority, ResourceScopeKey};
 
@@ -51,23 +54,238 @@ fn legacy_user_data_dir_for_key(scope_key: &str) -> PathBuf {
     user_data_dir_for_key(Path::new("/tmp"), scope_key)
 }
 
-fn legacy_profile_has_live_owner(profile: &Path) -> bool {
-    let lock = profile.join("SingletonLock");
-    let Ok(target) = std::fs::read_link(lock) else {
-        return false;
-    };
-    let Some(pid) = target
-        .to_string_lossy()
-        .rsplit('-')
-        .next()
-        .and_then(|value| value.parse::<i32>().ok())
-    else {
-        return true;
-    };
-    if unsafe { libc::kill(pid, 0) } == 0 {
-        return true;
+fn profile_marker_path(profile: &Path) -> PathBuf {
+    profile.join(PROFILE_MARKER_FILENAME)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExactProcessState {
+    Live,
+    DeadOrReused,
+    Unproven,
+}
+
+fn exact_process_state(expected: ProcessIdentity) -> ExactProcessState {
+    if process_identity_matches(expected) {
+        return ExactProcessState::Live;
     }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    if current_process_identity(expected.pid).is_some() {
+        return ExactProcessState::DeadOrReused;
+    }
+    let Ok(pid) = i32::try_from(expected.pid) else {
+        return ExactProcessState::Unproven;
+    };
+    match unsafe { libc::kill(pid, 0) } {
+        0 => ExactProcessState::Unproven,
+        _ => match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => ExactProcessState::DeadOrReused,
+            Some(libc::EPERM) => ExactProcessState::Unproven,
+            _ => ExactProcessState::Unproven,
+        },
+    }
+}
+
+fn read_profile_marker(profile: &Path) -> Result<Option<BrowserProfileMarker>, BrowserError> {
+    let marker_path = profile_marker_path(profile);
+    match std::fs::read_to_string(&marker_path) {
+        Ok(contents) => serde_json::from_str::<BrowserProfileMarker>(&contents)
+            .map(Some)
+            .map_err(|error| {
+                BrowserError::ProfileReuseRefused(format!(
+                    "browser profile {} has malformed marker {}: {error}",
+                    profile.display(),
+                    marker_path.display()
+                ))
+            }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(BrowserError::ProfileReuseRefused(format!(
+            "failed to read browser profile marker {}: {error}",
+            marker_path.display()
+        ))),
+    }
+}
+
+fn write_profile_marker_atomic(
+    profile: &Path,
+    marker: &BrowserProfileMarker,
+) -> Result<(), BrowserError> {
+    let marker_path = profile_marker_path(profile);
+    let temp_path = profile.join(format!(
+        ".{}.{}.tmp",
+        PROFILE_MARKER_FILENAME,
+        uuid::Uuid::new_v4()
+    ));
+    let bytes = serde_json::to_vec(marker).map_err(|error| {
+        BrowserError::LaunchFailed(format!(
+            "failed to serialize browser profile marker {}: {error}",
+            marker_path.display()
+        ))
+    })?;
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp_path)
+            .map_err(|error| {
+                BrowserError::LaunchFailed(format!(
+                    "failed to create browser profile marker temp file {}: {error}",
+                    temp_path.display()
+                ))
+            })?;
+        file.write_all(&bytes).map_err(|error| {
+            BrowserError::LaunchFailed(format!(
+                "failed to write browser profile marker temp file {}: {error}",
+                temp_path.display()
+            ))
+        })?;
+        file.sync_all().map_err(|error| {
+            BrowserError::LaunchFailed(format!(
+                "failed to sync browser profile marker temp file {}: {error}",
+                temp_path.display()
+            ))
+        })?;
+    }
+    std::fs::rename(&temp_path, &marker_path).map_err(|error| {
+        let _ = std::fs::remove_file(&temp_path);
+        BrowserError::LaunchFailed(format!(
+            "failed to publish browser profile marker {}: {error}",
+            marker_path.display()
+        ))
+    })
+}
+
+fn prepare_profile_dir_for_launch(
+    tmp_root: &Path,
+    session_key: &str,
+) -> Result<PathBuf, BrowserError> {
+    let profile = user_data_dir_for_key(tmp_root, session_key);
+    let legacy_profile = legacy_user_data_dir_for_key(session_key);
+    if legacy_profile != profile && legacy_profile.exists() {
+        tracing::debug!(
+            legacy_profile = %legacy_profile.display(),
+            "preserving legacy browser profile path without reuse"
+        );
+    }
+    match std::fs::metadata(&profile) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(&profile).map_err(|create_error| {
+                BrowserError::LaunchFailed(format!(
+                    "failed to create browser profile {}: {create_error}",
+                    profile.display()
+                ))
+            })?;
+            return Ok(profile);
+        }
+        Err(error) => {
+            return Err(BrowserError::ProfileReuseRefused(format!(
+                "failed to inspect browser profile {}: {error}",
+                profile.display()
+            )));
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(BrowserError::ProfileReuseRefused(format!(
+                "browser profile path {} exists but is not a directory",
+                profile.display()
+            )));
+        }
+        Ok(_) => {}
+    }
+    let Some(marker) = read_profile_marker(&profile)? else {
+        return Err(BrowserError::ProfileReuseRefused(format!(
+            "browser profile {} is unmarked; refusing reuse or deletion",
+            profile.display()
+        )));
+    };
+    if marker.version != PROFILE_MARKER_VERSION {
+        return Err(BrowserError::ProfileReuseRefused(format!(
+            "browser profile {} marker version {} does not match expected {}",
+            profile.display(),
+            marker.version,
+            PROFILE_MARKER_VERSION
+        )));
+    }
+    if marker.session_key != session_key {
+        return Err(BrowserError::ProfileReuseRefused(format!(
+            "browser profile {} belongs to session key {} not {}",
+            profile.display(),
+            marker.session_key,
+            session_key
+        )));
+    }
+    match exact_process_state(marker.chrome_process_identity()) {
+        ExactProcessState::Live => Err(BrowserError::ProfileReuseRefused(format!(
+            "browser profile {} is still owned by live Chrome {}",
+            profile.display(),
+            marker.chrome_process.pid
+        ))),
+        ExactProcessState::Unproven => Err(BrowserError::ProfileReuseRefused(format!(
+            "browser profile {} owner {} could not be proven dead or replaced",
+            profile.display(),
+            marker.chrome_process.pid
+        ))),
+        ExactProcessState::DeadOrReused => {
+            std::fs::remove_dir_all(&profile).map_err(|error| {
+                BrowserError::ProfileReuseRefused(format!(
+                    "failed to reclaim browser profile {}: {error}",
+                    profile.display()
+                ))
+            })?;
+            std::fs::create_dir_all(&profile).map_err(|error| {
+                BrowserError::LaunchFailed(format!(
+                    "failed to recreate reclaimed browser profile {}: {error}",
+                    profile.display()
+                ))
+            })?;
+            Ok(profile)
+        }
+    }
+}
+
+fn delete_profile_if_owned_and_stopped(
+    profile: &Path,
+    session_key: &str,
+    expected: &BrowserLaunchIdentity,
+) -> Result<(), BrowserError> {
+    let Some(expected_marker) = BrowserProfileMarker::from_launch(session_key, expected) else {
+        return Err(BrowserError::OperationFailed(format!(
+            "browser profile {} cannot be authoritatively deleted without exact Chrome process identity",
+            profile.display()
+        )));
+    };
+    let Some(actual_marker) = read_profile_marker(profile)? else {
+        return Err(BrowserError::OperationFailed(format!(
+            "browser profile {} has no ownership marker; preserving residual profile",
+            profile.display()
+        )));
+    };
+    if actual_marker != expected_marker {
+        return Err(BrowserError::OperationFailed(format!(
+            "browser profile {} marker no longer matches session launch identity {}; preserving residual profile",
+            profile.display(),
+            expected.stable_identity()
+        )));
+    }
+    match exact_process_state(actual_marker.chrome_process_identity()) {
+        ExactProcessState::Live => Err(BrowserError::OperationFailed(format!(
+            "browser profile {} still belongs to live Chrome {}; preserving residual profile",
+            profile.display(),
+            actual_marker.chrome_process.pid
+        ))),
+        ExactProcessState::Unproven => Err(BrowserError::OperationFailed(format!(
+            "browser profile {} Chrome {} exit could not be proven; preserving residual profile",
+            profile.display(),
+            actual_marker.chrome_process.pid
+        ))),
+        ExactProcessState::DeadOrReused => match std::fs::remove_dir_all(profile) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(BrowserError::OperationFailed(format!(
+                "failed to remove browser profile {}: {error}",
+                profile.display()
+            ))),
+        },
+    }
 }
 
 /// Filesystem prefix shared by every per-scope Chrome user-data directory.
@@ -104,8 +322,14 @@ const SESSION_INIT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_VIEWPORT_WIDTH: u32 = 1024;
 const DEFAULT_VIEWPORT_HEIGHT: u32 = 768;
 
+const PROFILE_MARKER_VERSION: u32 = 1;
+const PROFILE_MARKER_FILENAME: &str = "phoenix-profile-owner.json";
+
 #[derive(Debug, Error)]
 pub enum BrowserError {
+    #[error("browser profile reuse refused: {0}")]
+    ProfileReuseRefused(String),
+
     #[error("Failed to launch browser: {0}")]
     LaunchFailed(String),
 
@@ -263,11 +487,79 @@ pub struct ProfilingState {
     pub trace_events: Vec<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+struct BrowserProfileProcessIdentity {
+    pid: u32,
+    start_time: u128,
+}
+
+impl From<ProcessIdentity> for BrowserProfileProcessIdentity {
+    fn from(value: ProcessIdentity) -> Self {
+        Self {
+            pid: value.pid,
+            start_time: value.start_time,
+        }
+    }
+}
+
+impl From<BrowserProfileProcessIdentity> for ProcessIdentity {
+    fn from(value: BrowserProfileProcessIdentity) -> Self {
+        Self {
+            pid: value.pid,
+            start_time: value.start_time,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+struct BrowserProfileMarker {
+    version: u32,
+    session_key: String,
+    launch_uuid: String,
+    chrome_process: BrowserProfileProcessIdentity,
+}
+
+impl BrowserProfileMarker {
+    fn from_launch(session_key: &str, launch_identity: &BrowserLaunchIdentity) -> Option<Self> {
+        Some(Self {
+            version: PROFILE_MARKER_VERSION,
+            session_key: session_key.to_string(),
+            launch_uuid: launch_identity.launch_uuid.clone(),
+            chrome_process: launch_identity.chrome_process?.into(),
+        })
+    }
+
+    fn chrome_process_identity(&self) -> ProcessIdentity {
+        self.chrome_process.into()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserLaunchIdentity {
+    pub launch_uuid: String,
+    pub chrome_process: Option<ProcessIdentity>,
+}
+
+impl BrowserLaunchIdentity {
+    #[must_use]
+    pub fn stable_identity(&self) -> String {
+        match self.chrome_process {
+            Some(process) => format!(
+                "uuid:{}:pid:{}:start:{}",
+                self.launch_uuid, process.pid, process.start_time
+            ),
+            None => format!("uuid:{}:pid:none:start:none", self.launch_uuid),
+        }
+    }
+}
+
 /// Per-conversation browser instance
 pub struct BrowserSession {
     #[allow(dead_code)] // Browser must stay alive
     browser: Browser,
     chrome_pid: Option<u32>,
+    chrome_process: Option<ProcessIdentity>,
+    launch_identity: BrowserLaunchIdentity,
     #[allow(dead_code)] // Task must stay alive
     handler_task: JoinHandle<()>,
     #[allow(dead_code)] // Task must stay alive
@@ -428,22 +720,9 @@ impl BrowserSession {
     /// Build a `BrowserConfig` with optional explicit Chrome executable path.
     /// The Chrome user data dir is derived from the browser session key.
     fn browser_config(
-        tmp_root: &Path,
-        session_key: &str,
+        user_data_dir: &Path,
         executable: Option<&Path>,
     ) -> Result<BrowserConfig, BrowserError> {
-        let user_data_dir = user_data_dir_for_key(tmp_root, session_key);
-
-        // Remove stale user data directory to avoid Chrome SingletonLock conflicts
-        // (e.g. from a previous crash or test run that didn't clean up)
-        let _ = std::fs::remove_dir_all(&user_data_dir);
-        let legacy_user_data_dir = legacy_user_data_dir_for_key(session_key);
-        if legacy_user_data_dir != user_data_dir
-            && !legacy_profile_has_live_owner(&legacy_user_data_dir)
-        {
-            let _ = std::fs::remove_dir_all(legacy_user_data_dir);
-        }
-
         let mut builder = BrowserConfig::builder()
             .new_headless_mode()
             .no_sandbox()
@@ -472,9 +751,11 @@ impl BrowserSession {
     async fn launch_and_init(
         tmp_root: &Path,
         scope_key: &str,
+        launch_uuid: &str,
         executable: Option<&Path>,
     ) -> Result<Self, BrowserError> {
-        let config = Self::browser_config(tmp_root, scope_key, executable)?;
+        let user_data_dir = prepare_profile_dir_for_launch(tmp_root, scope_key)?;
+        let config = Self::browser_config(&user_data_dir, executable)?;
 
         // Browser::launch can hang on a wedged chromium subprocess. Bound it.
         // If launch itself times out there is no browser handle to clean up.
@@ -487,6 +768,14 @@ impl BrowserSession {
         let chrome_pid = browser
             .get_mut_child()
             .and_then(|child| child.as_mut_inner().id());
+        let chrome_process = chrome_pid.and_then(current_process_identity);
+        let launch_identity = BrowserLaunchIdentity {
+            launch_uuid: launch_uuid.to_string(),
+            chrome_process,
+        };
+        if let Some(marker) = BrowserProfileMarker::from_launch(scope_key, &launch_identity) {
+            write_profile_marker_atomic(&user_data_dir, &marker)?;
+        }
 
         let handler_task = tokio::spawn(async move {
             while let Some(event) = handler.next().await {
@@ -533,6 +822,8 @@ impl BrowserSession {
         Ok(Self {
             browser,
             chrome_pid,
+            chrome_process,
+            launch_identity,
             handler_task,
             console_task: None,
             profiling_tasks: Vec::new(),
@@ -558,6 +849,8 @@ impl BrowserSession {
     ///      install paths).
     ///   3. `BrowserFetcher` downloads a compatible Chromium and caches it.
     async fn new(tmp_root: &Path, scope_key: &str) -> Result<Self, BrowserError> {
+        let launch_uuid = uuid::Uuid::new_v4().to_string();
+
         // 1. Explicit env-var override — used by the test harness in
         //    sandboxes where Chrome lives at a non-standard path that
         //    chromiumoxide's lookup doesn't probe.
@@ -568,7 +861,9 @@ impl BrowserSession {
                     "Using PHOENIX_CHROME_EXECUTABLE={}",
                     explicit_path.display()
                 );
-                match Self::launch_and_init(tmp_root, scope_key, Some(&explicit_path)).await {
+                match Self::launch_and_init(tmp_root, scope_key, &launch_uuid, Some(&explicit_path))
+                    .await
+                {
                     Ok(session) => return Ok(session),
                     Err(e) => {
                         tracing::warn!(
@@ -585,7 +880,7 @@ impl BrowserSession {
         }
 
         // 2. System Chrome (no explicit executable — chromiumoxide finds it)
-        match Self::launch_and_init(tmp_root, scope_key, None).await {
+        match Self::launch_and_init(tmp_root, scope_key, &launch_uuid, None).await {
             Ok(session) => return Ok(session),
             Err(e) => {
                 tracing::info!("System Chrome not available ({e}), trying fetcher...");
@@ -617,7 +912,28 @@ impl BrowserSession {
 
         tracing::info!("Using Chrome at {:?}", info.executable_path);
 
-        Self::launch_and_init(tmp_root, scope_key, Some(&info.executable_path)).await
+        Self::launch_and_init(
+            tmp_root,
+            scope_key,
+            &launch_uuid,
+            Some(&info.executable_path),
+        )
+        .await
+    }
+
+    #[must_use]
+    pub fn launch_identity(&self) -> &BrowserLaunchIdentity {
+        &self.launch_identity
+    }
+
+    #[must_use]
+    pub fn chrome_process(&self) -> Option<ProcessIdentity> {
+        self.chrome_process
+    }
+
+    #[must_use]
+    pub fn exact_instance_matches(&self, identity: &BrowserSessionInstanceIdentity) -> bool {
+        self.launch_identity == identity.durable
     }
 
     /// Attach a new live-view viewer (REQ-BT-018).
@@ -998,6 +1314,7 @@ pub struct BrowserSessionInstanceIdentity {
     pub session_key: String,
     pub audience: BrowserSessionAudience,
     pub chrome_pid: Option<u32>,
+    durable: BrowserLaunchIdentity,
     session_addr: usize,
     user_data_key: String,
 }
@@ -1006,9 +1323,25 @@ impl BrowserSessionInstanceIdentity {
     #[must_use]
     pub fn stable_identity(&self) -> String {
         format!(
-            "session:{}:audience:{:?}:pid:{:?}:profile:{}:addr:{}",
-            self.session_key, self.audience, self.chrome_pid, self.user_data_key, self.session_addr
+            "session:{}:audience:{:?}:{}:profile:{}",
+            self.session_key,
+            self.audience,
+            self.durable.stable_identity(),
+            self.user_data_key
         )
+    }
+
+    #[must_use]
+    pub fn process_identity(&self) -> Option<ProcessIdentity> {
+        self.durable.chrome_process
+    }
+
+    #[must_use]
+    pub fn matches_session(&self, session: &Arc<RwLock<BrowserSession>>) -> bool {
+        self.session_addr == Arc::as_ptr(session) as usize
+            && session
+                .try_read()
+                .is_ok_and(|guard| guard.exact_instance_matches(self))
     }
 }
 
@@ -1341,8 +1674,7 @@ impl BrowserSessionManager {
         entry: &ScopedSession,
         expected: &BrowserSessionInstanceIdentity,
     ) -> bool {
-        entry.user_data_key == expected.user_data_key
-            && Arc::as_ptr(&entry.session) as usize == expected.session_addr
+        entry.user_data_key == expected.user_data_key && expected.matches_session(&entry.session)
     }
 
     #[cfg(test)]
@@ -1778,11 +2110,15 @@ impl BrowserSessionManager {
         };
         let mut instances = Vec::with_capacity(current.len());
         for (session_key, session, user_data_key, audience) in current {
-            let chrome_pid = session.read().await.chrome_pid;
+            let guard = session.read().await;
+            let chrome_pid = guard.chrome_pid;
+            let durable = guard.launch_identity().clone();
+            drop(guard);
             instances.push(BrowserSessionInstanceIdentity {
                 session_key,
                 audience,
                 chrome_pid,
+                durable,
                 session_addr: Arc::as_ptr(&session) as usize,
                 user_data_key,
             });
@@ -1821,13 +2157,20 @@ impl BrowserSessionManager {
             (generation, current)
         };
         let instances = match current {
-            Some((session, user_data_key, audience)) => vec![BrowserSessionInstanceIdentity {
-                session_key: actor_key.clone(),
-                audience,
-                chrome_pid: session.read().await.chrome_pid,
-                session_addr: Arc::as_ptr(&session) as usize,
-                user_data_key,
-            }],
+            Some((session, user_data_key, audience)) => {
+                let guard = session.read().await;
+                let chrome_pid = guard.chrome_pid;
+                let durable = guard.launch_identity().clone();
+                drop(guard);
+                vec![BrowserSessionInstanceIdentity {
+                    session_key: actor_key.clone(),
+                    audience,
+                    chrome_pid,
+                    durable,
+                    session_addr: Arc::as_ptr(&session) as usize,
+                    user_data_key,
+                }]
+            }
             None => Vec::new(),
         };
         BrowserRetirementPermit {
@@ -1889,21 +2232,22 @@ impl BrowserSessionManager {
         key: &str,
         attempt: &Arc<KillAttempt>,
         user_data_dir: &Path,
+        session_key: &str,
+        expected: &BrowserLaunchIdentity,
     ) -> Result<(), BrowserError> {
-        let failure = match tokio::time::timeout(
-            SESSION_INIT_TIMEOUT,
-            tokio::fs::remove_dir_all(user_data_dir),
-        )
+        let user_data_dir = user_data_dir.to_path_buf();
+        let profile_for_delete = user_data_dir.clone();
+        let session_key = session_key.to_string();
+        let expected = expected.clone();
+        let failure = match tokio::task::spawn_blocking(move || {
+            delete_profile_if_owned_and_stopped(&profile_for_delete, &session_key, &expected)
+        })
         .await
         {
             Ok(Ok(())) => return Ok(()),
-            Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Ok(Err(error)) => format!(
-                "failed to remove browser profile {}: {error}",
-                user_data_dir.display()
-            ),
-            Err(_) => format!(
-                "timed out removing browser profile {}",
+            Ok(Err(error)) => error.to_string(),
+            Err(error) => format!(
+                "browser profile deletion task failed for {}: {error}",
                 user_data_dir.display()
             ),
         };
@@ -2010,10 +2354,15 @@ impl BrowserSessionManager {
                     return Err(BrowserError::OperationFailed(error.to_string()));
                 }
 
-                let Some(user_data_key) = ({
+                let Some((user_data_key, launch_identity)) = ({
                     let state = manager.state.read().await;
                     state.sessions.get(&key).and_then(|entry| {
-                        Arc::ptr_eq(&entry.session, &session).then(|| entry.user_data_key.clone())
+                        if !Arc::ptr_eq(&entry.session, &session) {
+                            return None;
+                        }
+                        entry.session.try_read().ok().map(|guard| {
+                            (entry.user_data_key.clone(), guard.launch_identity().clone())
+                        })
                     })
                 }) else {
                     tracing::debug!(work_scope = %requested_scope, "browser kill completed after session was removed or replaced");
@@ -2023,7 +2372,13 @@ impl BrowserSessionManager {
 
                 let user_data_dir = user_data_dir_for_key(&manager.tmp_root, &user_data_key);
                 manager
-                    .remove_profile_for_attempt(&key, &task_attempt, &user_data_dir)
+                    .remove_profile_for_attempt(
+                        &key,
+                        &task_attempt,
+                        &user_data_dir,
+                        &user_data_key,
+                        &launch_identity,
+                    )
                     .await?;
 
                 let removed = manager.remove_session_if_current(&key, &session).await;
@@ -2433,6 +2788,143 @@ impl Default for BrowserSessionManager {
             shutting_down: AtomicBool::new(false),
             tmp_root: PhoenixRuntimeEnvironment::detect().tmp_root().to_path_buf(),
         }
+    }
+}
+
+#[cfg(test)]
+mod profile_marker_tests {
+    use super::{
+        delete_profile_if_owned_and_stopped, prepare_profile_dir_for_launch, profile_marker_path,
+        read_profile_marker, write_profile_marker_atomic, BrowserLaunchIdentity,
+        BrowserProfileMarker, PROFILE_MARKER_VERSION,
+    };
+    use phoenix_core::process_identity::ProcessIdentity;
+
+    fn identity(pid: u32, start_time: u128) -> ProcessIdentity {
+        ProcessIdentity { pid, start_time }
+    }
+
+    fn launch_identity(pid: u32, start_time: u128, uuid: &str) -> BrowserLaunchIdentity {
+        BrowserLaunchIdentity {
+            launch_uuid: uuid.to_string(),
+            chrome_process: Some(identity(pid, start_time)),
+        }
+    }
+
+    fn marker(session_key: &str, identity: &BrowserLaunchIdentity) -> BrowserProfileMarker {
+        BrowserProfileMarker::from_launch(session_key, identity).expect("marker")
+    }
+
+    #[test]
+    fn clean_profile_gets_no_reclaim_barrier() {
+        let root = tempfile::tempdir().expect("temp root");
+        let profile = prepare_profile_dir_for_launch(root.path(), "scope-key").expect("prepare");
+        assert!(profile.exists());
+        assert_eq!(
+            read_profile_marker(&profile).expect("read marker"),
+            None,
+            "fresh profile dir starts unmarked until launch stamps ownership"
+        );
+    }
+
+    #[test]
+    fn unmarked_foreign_and_live_marked_profiles_are_refused() {
+        let root = tempfile::tempdir().expect("temp root");
+        let session_key = "scope-key";
+        let profile = super::user_data_dir_for_key(root.path(), session_key);
+
+        std::fs::create_dir_all(&profile).expect("create profile");
+        let err =
+            prepare_profile_dir_for_launch(root.path(), session_key).expect_err("unmarked refused");
+        assert!(err.to_string().contains("unmarked"));
+
+        std::fs::remove_dir_all(&profile).expect("remove unmarked");
+        std::fs::create_dir_all(&profile).expect("recreate profile");
+        let foreign = launch_identity(4242, 7, "foreign-uuid");
+        write_profile_marker_atomic(&profile, &marker("other-key", &foreign))
+            .expect("write foreign marker");
+        let err =
+            prepare_profile_dir_for_launch(root.path(), session_key).expect_err("foreign refused");
+        assert!(err.to_string().contains("belongs to session key other-key"));
+
+        std::fs::remove_dir_all(&profile).expect("remove foreign");
+        std::fs::create_dir_all(&profile).expect("recreate profile");
+        let live = BrowserLaunchIdentity {
+            launch_uuid: "live-uuid".to_string(),
+            chrome_process: phoenix_core::process_identity::current_process_identity(
+                std::process::id(),
+            ),
+        };
+        if let Some(live_marker) = BrowserProfileMarker::from_launch(session_key, &live) {
+            write_profile_marker_atomic(&profile, &live_marker).expect("write live marker");
+            let err =
+                prepare_profile_dir_for_launch(root.path(), session_key).expect_err("live refused");
+            assert!(err.to_string().contains("still owned by live Chrome"));
+        }
+    }
+
+    #[test]
+    fn dead_identity_reclaims_matching_profile() {
+        let root = tempfile::tempdir().expect("temp root");
+        let session_key = "scope-key";
+        let profile = super::user_data_dir_for_key(root.path(), session_key);
+        std::fs::create_dir_all(&profile).expect("create profile");
+        std::fs::write(profile.join("stale.txt"), "stale").expect("write stale file");
+        write_profile_marker_atomic(
+            &profile,
+            &marker(session_key, &launch_identity(999_999, 1, "dead-uuid")),
+        )
+        .expect("write dead marker");
+
+        let prepared =
+            prepare_profile_dir_for_launch(root.path(), session_key).expect("reclaim dead");
+        assert_eq!(prepared, profile);
+        assert!(
+            !prepared.join("stale.txt").exists(),
+            "reclaimed profile must replace old contents"
+        );
+        assert!(read_profile_marker(&prepared)
+            .expect("read marker after reclaim")
+            .is_none());
+    }
+
+    #[test]
+    fn deletion_requires_exact_marker_and_dead_identity() {
+        let root = tempfile::tempdir().expect("temp root");
+        let session_key = "scope-key";
+        let profile = super::user_data_dir_for_key(root.path(), session_key);
+        let launched = launch_identity(999_998, 2, "launch-uuid");
+
+        std::fs::create_dir_all(&profile).expect("create profile");
+        write_profile_marker_atomic(&profile, &marker(session_key, &launched))
+            .expect("write marker");
+        delete_profile_if_owned_and_stopped(&profile, session_key, &launched)
+            .expect("delete exact dead profile");
+        assert!(!profile.exists());
+
+        std::fs::create_dir_all(&profile).expect("recreate profile");
+        write_profile_marker_atomic(&profile, &marker(session_key, &launched))
+            .expect("write marker again");
+        let replacement = launch_identity(999_997, 3, "replacement-uuid");
+        let err = delete_profile_if_owned_and_stopped(&profile, session_key, &replacement)
+            .expect_err("mismatched replacement refused");
+        assert!(err.to_string().contains("marker no longer matches"));
+        assert!(profile.exists(), "mismatched delete must preserve profile");
+    }
+
+    #[test]
+    fn malformed_marker_is_refused_and_preserved() {
+        let root = tempfile::tempdir().expect("temp root");
+        let session_key = "scope-key";
+        let profile = super::user_data_dir_for_key(root.path(), session_key);
+        std::fs::create_dir_all(&profile).expect("create profile");
+        std::fs::write(profile_marker_path(&profile), "{not json").expect("write malformed marker");
+
+        let err = prepare_profile_dir_for_launch(root.path(), session_key)
+            .expect_err("malformed refused");
+        assert!(err.to_string().contains("malformed marker"));
+        assert_eq!(PROFILE_MARKER_VERSION, 1);
+        assert!(profile.exists(), "malformed profile must be preserved");
     }
 }
 
