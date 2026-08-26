@@ -79,7 +79,6 @@ fn exact_process_state(expected: ProcessIdentity) -> ExactProcessState {
         0 => ExactProcessState::Unproven,
         _ => match std::io::Error::last_os_error().raw_os_error() {
             Some(libc::ESRCH) => ExactProcessState::DeadOrReused,
-            Some(libc::EPERM) => ExactProcessState::Unproven,
             _ => ExactProcessState::Unproven,
         },
     }
@@ -728,7 +727,7 @@ impl BrowserSession {
             .no_sandbox()
             .arg("--disable-gpu")
             .arg("--disable-software-rasterizer")
-            .user_data_dir(&user_data_dir)
+            .user_data_dir(user_data_dir)
             .viewport(chromiumoxide::handler::viewport::Viewport {
                 width: DEFAULT_VIEWPORT_WIDTH,
                 height: DEFAULT_VIEWPORT_HEIGHT,
@@ -2286,6 +2285,7 @@ impl BrowserSessionManager {
     /// lock-free so concurrent `get_session` / `get_existing` /
     /// `is_active` calls on unrelated scopes are not blocked for the
     /// duration of fs deletion + Chrome shutdown.
+    #[allow(clippy::too_many_lines)]
     async fn spawn_kill_session_by_key(
         self: &Arc<Self>,
         key: String,

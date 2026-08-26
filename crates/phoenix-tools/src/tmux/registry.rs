@@ -24,6 +24,7 @@
 //! the second caller observes `Live` after the first one finishes.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -1025,12 +1026,20 @@ impl TmuxRegistry {
                     if current_fenced {
                         reason.push_str(" with retirement already fenced");
                     }
-                    reason.push_str(&format!("; {ambiguity}"));
+                    write!(&mut reason, "; {ambiguity}").expect("writing into String cannot fail");
                     Ok(TmuxRetirementRehydration::Residual { reason })
                 }
             };
         }
 
+        self.rehydrate_missing_entry(work_scope, persisted).await
+    }
+
+    async fn rehydrate_missing_entry(
+        &self,
+        work_scope: &ResourceScopeKey,
+        persisted: &TmuxServerInstanceIdentity,
+    ) -> Result<TmuxRetirementRehydration, TmuxError> {
         match self.exact_identity_state(persisted).await? {
             ExactTmuxIdentityState::Absent => Ok(TmuxRetirementRehydration::AbsenceVerified),
             ExactTmuxIdentityState::Ambiguous { reason } => {
@@ -1045,7 +1054,7 @@ impl TmuxRegistry {
                     } else {
                         let mut server =
                             TmuxServer::new(work_scope.clone(), persisted.socket_path.clone());
-                        server.server_token = persisted.server_token.clone();
+                        server.server_token.clone_from(&persisted.server_token);
                         server.status = ServerStatus::Live;
                         let entry = Arc::new(TmuxScopeEntry::new(server));
                         map.insert(key, entry.clone());
@@ -1055,10 +1064,10 @@ impl TmuxRegistry {
 
                 let current_identity = {
                     let server = entry.server.read().await;
-                    if server.socket_path != persisted.socket_path {
-                        Some(server.exact_identity())
-                    } else {
+                    if server.socket_path == persisted.socket_path {
                         None
+                    } else {
+                        Some(server.exact_identity())
                     }
                 };
                 if let Some(current_identity) = current_identity {
@@ -1100,7 +1109,7 @@ impl TmuxRegistry {
                                 ),
                             });
                         }
-                        server.server_token = persisted.server_token.clone();
+                        server.server_token.clone_from(&persisted.server_token);
                         server.status = ServerStatus::Live;
                         let permit = Self::build_retirement_permit(work_scope, &mut server, true);
                         Ok(TmuxRetirementRehydration::Permit(permit))
@@ -2131,7 +2140,10 @@ mod tests {
             .unwrap()
         {
             TmuxRetirementRehydration::Permit(permit) => permit,
-            other => panic!("expected exact rehydrated permit, got {other:?}"),
+            other @ (TmuxRetirementRehydration::AbsenceVerified
+            | TmuxRetirementRehydration::Residual { .. }) => {
+                panic!("expected exact rehydrated permit, got {other:?}")
+            }
         };
         let outcome = restarted
             .complete_retirement(&permit)

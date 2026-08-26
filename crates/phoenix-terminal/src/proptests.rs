@@ -77,7 +77,7 @@ fn dummy_handle_kind(
     super::session::TerminalHandle {
         master_fd: owned_fd,
         child_pid: nix::unistd::Pid::from_raw(pid), // synthetic test pid — never reaped
-        launch_identity: dummy_launch_identity(pid as u32),
+        launch_identity: dummy_launch_identity(pid.cast_unsigned()),
         child_kind,
         tracker: std::sync::Arc::new(std::sync::Mutex::new(CommandTracker::new(
             "test-session".to_string(),

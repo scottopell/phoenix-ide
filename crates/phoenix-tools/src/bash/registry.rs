@@ -1115,6 +1115,7 @@ async fn snapshot_retirement_targets(handles: &[Arc<Handle>]) -> Vec<BashRetirem
 mod tests {
     use super::*;
     use crate::bash::handle::{FinalCause, Handle};
+    use phoenix_core::process_identity::ProcessIdentity;
 
     fn scope(name: &str) -> ResourceScopeKey {
         ResourceScopeKey::Work(phoenix_core::work_scope::WorkScopeId::parse(name).unwrap())
@@ -2046,6 +2047,7 @@ mod tests {
                 assert_eq!(stale_status.signal(), Some(libc::SIGKILL));
                 return;
             }
+            // test-timing-allow: OS child exit is asynchronous; `try_wait` is the causal signal.
             sleep(Duration::from_millis(50)).await;
         }
         unsafe {

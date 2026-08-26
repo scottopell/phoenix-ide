@@ -269,8 +269,8 @@ pub fn spawn_pty(
             // Forget the openpty OwnedFd to avoid double-close.
             std::mem::forget(pty.master);
 
-            let process = current_process_identity(child.as_raw() as u32)
-                .ok_or_else(|| format!("unable to capture process identity for pid {}", child))?;
+            let process = current_process_identity(child.as_raw().cast_unsigned())
+                .ok_or_else(|| format!("unable to capture process identity for pid {child}"))?;
             let launch_identity = TerminalLaunchIdentity {
                 process,
                 launch_uuid,
