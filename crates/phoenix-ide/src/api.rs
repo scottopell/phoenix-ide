@@ -184,11 +184,10 @@ impl AppState {
             .await
             .map_err(std::io::Error::other)?;
         runtime.require_startup_local_authority()?;
+        reconcile_startup_continuations(&runtime).await?;
         runtime.require_startup_local_authority()?;
         tokio::spawn(crate::runtime::pr_status_poll::run(runtime.clone()));
         runtime.start_creation_worker().await?;
-        runtime.require_startup_local_authority()?;
-        reconcile_startup_continuations(&runtime).await?;
         runtime.require_startup_local_authority()?;
         handlers::start_attachment_cleanup_task(db.clone(), Arc::clone(&runtime));
         let terminals = runtime.terminals.clone();

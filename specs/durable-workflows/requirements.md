@@ -555,6 +555,26 @@ machinery. A stale-generation or stale-identity settlement attempt SHALL NOT mut
 current accepted turn, and successful settlement SHALL release runtime ownership without
 creating a duplicate transcript event or a second lifecycle-specific cancellation state.
 
+WHEN a Close attempt enters active-work settlement
+THE SYSTEM SHALL atomically capture a finite attempt-scoped receipt target for each
+nonterminal latest-row accepted turn, including its accepted-turn identity and generation
+AND SHALL advance Close only after each captured target has a durable receipt proving that
+same authority released ownership at its next generation
+AND recovery SHALL retry those captured targets rather than discover or substitute later
+accepted turns.
+
+WHEN a captured Close settlement target is hosted by a live runtime
+THE SYSTEM SHALL send the runtime's normal cancellation event before any repository
+terminal command
+AND SHALL allow that runtime to commit an already-derived terminal outcome through its
+normal terminal-obligation path
+AND the Close attempt SHALL record its receipt only after that exact durable release.
+
+WHEN a captured Close settlement target has no live runtime
+THE SYSTEM SHALL use the profile's existing typed cancellation command for its exact
+accepted-turn identity and generation
+AND SHALL record the same attempt-scoped receipt only after its durable release.
+
 Once ownership release for that exact accepted turn has begun, a user-visible cancel of
 Close MAY stop further retirement progression but SHALL NOT require or invent a second
 settlement cancellation path; the original settlement completion remains the release

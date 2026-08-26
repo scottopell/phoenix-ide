@@ -390,6 +390,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "persist_completed_continuation_handoffs",
         sql: MIGRATION_074,
     },
+    Migration {
+        version: 75,
+        name: "capture_close_direct_turn_settlements",
+        sql: MIGRATION_075,
+    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -2076,6 +2081,88 @@ BEGIN
 END;
 
 CREATE UNIQUE INDEX close_obligations_one_active_per_product ON close_obligations(product_conversation_id) WHERE phase <> 'completed';
+";
+
+const MIGRATION_075: &str = r"
+CREATE TABLE close_attempt_direct_turn_settlement_captures (
+    attempt_id TEXT PRIMARY KEY
+        REFERENCES close_obligations(attempt_id) ON DELETE CASCADE,
+    captured_at TEXT NOT NULL
+);
+
+CREATE TABLE close_attempt_direct_turn_settlements (
+    attempt_id TEXT NOT NULL
+        REFERENCES close_attempt_direct_turn_settlement_captures(attempt_id) ON DELETE CASCADE,
+    turn_id INTEGER NOT NULL
+        REFERENCES durable_turns(turn_id) ON DELETE RESTRICT,
+    expected_generation INTEGER NOT NULL
+        CHECK (expected_generation >= 0),
+    settled_at TEXT,
+    PRIMARY KEY (attempt_id, turn_id)
+);
+
+CREATE INDEX idx_close_attempt_direct_turn_settlements_pending
+    ON close_attempt_direct_turn_settlements(attempt_id, settled_at);
+
+CREATE TRIGGER close_attempt_direct_turn_settlement_capture_requires_settlement_phase
+BEFORE INSERT ON close_attempt_direct_turn_settlement_captures
+WHEN NOT EXISTS (
+    SELECT 1 FROM close_obligations obligation
+    WHERE obligation.attempt_id = NEW.attempt_id
+      AND obligation.phase IN ('settling_active_work', 'cancel_requested_during_settlement')
+)
+BEGIN
+    SELECT RAISE(ABORT, 'close direct-turn settlement capture requires settlement phase');
+END;
+
+CREATE TRIGGER close_attempt_direct_turn_settlement_target_requires_latest_member
+BEFORE INSERT ON close_attempt_direct_turn_settlements
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM durable_turns turn
+    JOIN close_attempt_members member ON member.conversation_id = turn.conversation_id
+    WHERE member.attempt_id = NEW.attempt_id
+      AND member.member_role IN ('latest', 'root_latest')
+      AND turn.turn_id = NEW.turn_id
+      AND turn.generation = NEW.expected_generation
+      AND turn.owns_conversation = 1
+      AND turn.terminal_kind IS NULL
+)
+BEGIN
+    SELECT RAISE(ABORT, 'close direct-turn settlement target must be latest active authority');
+END;
+
+INSERT INTO close_attempt_direct_turn_settlement_captures (attempt_id, captured_at)
+SELECT attempt_id, updated_at
+FROM close_obligations
+WHERE phase IN ('settling_active_work', 'cancel_requested_during_settlement');
+
+INSERT INTO close_attempt_direct_turn_settlements (
+    attempt_id, turn_id, expected_generation
+)
+SELECT obligation.attempt_id, turn.turn_id, turn.generation
+FROM close_obligations obligation
+JOIN close_attempt_members member ON member.attempt_id = obligation.attempt_id
+JOIN durable_turns turn ON turn.conversation_id = member.conversation_id
+WHERE obligation.phase IN ('settling_active_work', 'cancel_requested_during_settlement')
+  AND member.member_role IN ('latest', 'root_latest')
+  AND turn.owns_conversation = 1
+  AND turn.terminal_kind IS NULL;
+
+CREATE TRIGGER close_attempt_direct_turn_settlements_immutable_identity
+BEFORE UPDATE OF attempt_id, turn_id, expected_generation
+ON close_attempt_direct_turn_settlements
+BEGIN
+    SELECT RAISE(ABORT, 'close direct-turn settlement target identity is immutable');
+END;
+
+CREATE TRIGGER close_attempt_direct_turn_settlements_settle_once
+BEFORE UPDATE OF settled_at
+ON close_attempt_direct_turn_settlements
+WHEN OLD.settled_at IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'close direct-turn settlement receipt is immutable');
+END;
 ";
 
 const MIGRATION_074: &str = r"
