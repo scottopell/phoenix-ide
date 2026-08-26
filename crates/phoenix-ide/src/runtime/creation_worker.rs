@@ -1893,6 +1893,12 @@ mod directory_first_product_worktree_tests {
         let repo = root.path().join("clone");
         let repo_str = repo.to_string_lossy().to_string();
 
+        let local_branches_before = crate::git_ops::run_git(
+            &repo,
+            &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+        )
+        .expect("list local branches before creation");
+
         let first =
             create_directory_first_product_worktree_blocking(&repo_str, "prod-1", "origin/main")
                 .expect("first worktree");
@@ -1913,7 +1919,7 @@ mod directory_first_product_worktree_tests {
             &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
         )
         .expect("list local branches");
-        assert_eq!(local_branches.lines().collect::<Vec<_>>(), vec!["main"]);
+        assert_eq!(local_branches, local_branches_before);
     }
 
     #[test]

@@ -117,7 +117,7 @@ describe('/new directory-first product conversation', () => {
     expect(firstRequest).not.toHaveProperty('checkout_ref');
     expect(firstRequest).not.toHaveProperty('project_id');
     expect(firstRequest).not.toHaveProperty('task');
-    expect(screen.getByTestId('location-path')).toHaveTextContent('/product-conversations/pc-1');
+    await waitFor(() => expect(screen.getByTestId('location-path')).toHaveTextContent('/product-conversations/pc-1'));
 
     vi.mocked(api.createProductConversation).mockClear();
     firstPage.unmount();
@@ -156,7 +156,7 @@ describe('/new directory-first product conversation', () => {
 
     fireEvent.click(sendButton());
     await waitFor(() => expect(api.createProductConversation).toHaveBeenCalledTimes(2));
-    expect(screen.getByTestId('location-path')).toHaveTextContent('/product-conversations/pc-1');
+    await waitFor(() => expect(screen.getByTestId('location-path')).toHaveTextContent('/product-conversations/pc-1'));
   });
 
   it('does not request project, branch, or task metadata', async () => {
