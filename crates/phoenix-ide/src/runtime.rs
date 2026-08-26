@@ -3401,30 +3401,36 @@ impl RuntimeManager {
         };
         let manager = Arc::clone(self);
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let result = Box::pin(crate::runtime::wake::run(
-                Arc::clone(&manager),
-                rx,
-                ready_tx,
-            ))
-            .await;
-            if startup_tx.send(()).is_ok() {
-                return;
-            }
-            let detail = match result {
-                Ok(()) => "wake worker exited unexpectedly".to_string(),
-                Err(error) => format!("wake worker exited: {error}"),
-            };
-            tracing::error!(%detail, "wake worker lost local authority");
-            manager.signal_fatal_local_authority("wake_worker_exit");
+        let mut worker = tokio::spawn(async move {
+            Box::pin(crate::runtime::wake::run(manager, rx, ready_tx)).await
         });
         tokio::select! {
             ready = ready_rx => ready.map_err(|_| "wake worker stopped before startup reconciliation completed".to_string())?,
-            _ = startup_rx => return Err("wake worker stopped before startup reconciliation completed".to_string()),
+            exited = &mut worker => {
+                return Err(format!(
+                    "wake worker stopped before startup reconciliation completed: {}",
+                    Self::describe_wake_worker_exit(exited)
+                ));
+            }
         };
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            let detail = Self::describe_wake_worker_exit(worker.await);
+            tracing::error!(%detail, "wake worker lost local authority");
+            manager.signal_fatal_local_authority("wake_worker_exit");
+        });
         self.kick_wake_worker();
         Ok(())
+    }
+
+    fn describe_wake_worker_exit(
+        result: Result<Result<(), String>, tokio::task::JoinError>,
+    ) -> String {
+        match result {
+            Ok(Ok(())) => "wake worker exited unexpectedly".to_string(),
+            Ok(Err(error)) => format!("wake worker exited: {error}"),
+            Err(error) => format!("wake worker join failure: {error}"),
+        }
     }
 
     /// Start the background task that handles sub-agent spawn/cancel requests

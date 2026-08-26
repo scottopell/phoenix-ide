@@ -1245,10 +1245,9 @@ impl Database {
         }
         let active_members: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)
-             FROM conversations participant
-             JOIN close_obligations obligation
-               ON obligation.product_conversation_id = participant.product_conversation_id
-             WHERE obligation.attempt_id = ?1
+             FROM close_attempt_members member
+             JOIN conversations participant ON participant.id = member.conversation_id
+             WHERE member.attempt_id = ?1
                AND (
                  EXISTS (
                    SELECT 1 FROM durable_turns turn
@@ -1324,12 +1323,10 @@ impl Database {
         attempt_id: &str,
     ) -> DbResult<Vec<String>> {
         let rows = sqlx::query_scalar(
-            "SELECT participant.id
-             FROM conversations participant
-             JOIN close_obligations obligation
-               ON obligation.product_conversation_id = participant.product_conversation_id
-             WHERE obligation.attempt_id = ?1
-             ORDER BY participant.id",
+            "SELECT member.conversation_id
+             FROM close_attempt_members member
+             WHERE member.attempt_id = ?1
+             ORDER BY member.conversation_id",
         )
         .bind(attempt_id)
         .fetch_all(&self.pool)
@@ -1347,9 +1344,9 @@ impl Database {
         let phase: Option<String> = sqlx::query_scalar(
             "SELECT obligation.phase
              FROM wake_bindings binding
-             JOIN conversations participant ON participant.id = binding.conversation_id
-             JOIN close_obligations obligation
-               ON obligation.product_conversation_id = participant.product_conversation_id
+             JOIN close_attempt_members member
+               ON member.conversation_id = binding.conversation_id
+             JOIN close_obligations obligation ON obligation.attempt_id = member.attempt_id
              WHERE binding.workflow_id = ?1
              ORDER BY obligation.created_at DESC
              LIMIT 1",
@@ -1371,10 +1368,9 @@ impl Database {
             "SELECT binding.workflow_id, binding.conversation_id, binding.contract_id
              FROM wake_bindings binding
              JOIN workflows workflow ON workflow.workflow_id = binding.workflow_id
-             JOIN conversations participant ON participant.id = binding.conversation_id
-             JOIN close_obligations obligation
-               ON obligation.product_conversation_id = participant.product_conversation_id
-             WHERE obligation.attempt_id = ?1
+             JOIN close_attempt_members member
+               ON member.conversation_id = binding.conversation_id
+             WHERE member.attempt_id = ?1
                AND binding.resolved_at IS NULL
                AND workflow.status IN ('Active', 'Cancelling', 'ManualResolution', 'Incompatible', 'DeletionPending')
              ORDER BY binding.workflow_id",
@@ -1419,10 +1415,9 @@ impl Database {
         let rows: Vec<(i64, i64)> = sqlx::query_as(
             "SELECT turn.turn_id, turn.generation
              FROM durable_turns turn
-             JOIN conversations participant ON participant.id = turn.conversation_id
-             JOIN close_obligations obligation
-               ON obligation.product_conversation_id = participant.product_conversation_id
-             WHERE obligation.attempt_id = ?1
+             JOIN close_attempt_members member
+               ON member.conversation_id = turn.conversation_id
+             WHERE member.attempt_id = ?1
                AND turn.owns_conversation = 1 AND turn.terminal_kind IS NULL
              ORDER BY turn.turn_id",
         )
