@@ -2073,10 +2073,12 @@ mod directory_first_product_worktree_tests {
         )
         .unwrap();
         crate::git_ops::run_git(&remote_checkout, &["config", "user.name", "Test User"]).unwrap();
+        crate::git_ops::run_git(&remote_checkout, &["checkout", "-B", "main", "origin/main"])
+            .unwrap();
         std::fs::write(remote_checkout.join("README.md"), "advanced\n").unwrap();
         crate::git_ops::run_git(&remote_checkout, &["add", "README.md"]).unwrap();
         crate::git_ops::run_git(&remote_checkout, &["commit", "-m", "advance"]).unwrap();
-        crate::git_ops::run_git(&remote_checkout, &["push", "origin", "HEAD:main"]).unwrap();
+        crate::git_ops::run_git(&remote_checkout, &["push", "origin", "main"]).unwrap();
         crate::git_ops::run_git(&repo, &["fetch", "origin", "main"]).unwrap();
 
         let worktree =
