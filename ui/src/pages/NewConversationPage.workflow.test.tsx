@@ -92,7 +92,7 @@ describe('/new directory-first product conversation', () => {
       freshness: 'fresh',
       root_reservation: {
         id: 'reservation-git', cwd: '/repo', kind: 'exact_committed_tree', repo_root: '/repo', exact_checkout_oid: 'abc123',
-        logical_base: 'main', freshness: 'fresh',
+        logical_base: 'main', freshness: 'fresh', unresolved_reason: null,
       },
     });
     vi.mocked(api.mkdir).mockResolvedValue({ created: true });
@@ -138,7 +138,7 @@ describe('/new directory-first product conversation', () => {
       kind: 'direct',
       root_reservation: {
         id: 'reservation-direct', cwd: '/plain-dir', kind: 'direct', repo_root: null, exact_checkout_oid: null,
-        logical_base: null, freshness: null,
+        logical_base: null, freshness: null, unresolved_reason: null,
       },
     });
     localStorage.setItem('phoenix-last-cwd', '/plain-dir');
@@ -170,7 +170,7 @@ describe('/new directory-first product conversation', () => {
       kind: 'direct',
       root_reservation: {
         id: 'reservation-created', cwd: '/new-dir', kind: 'direct', repo_root: null,
-        exact_checkout_oid: null, logical_base: null, freshness: null,
+        exact_checkout_oid: null, logical_base: null, freshness: null, unresolved_reason: null,
       },
     });
     const order: string[] = [];
@@ -181,7 +181,7 @@ describe('/new directory-first product conversation', () => {
         kind: 'direct',
         root_reservation: {
           id: 'reservation-created', cwd: '/new-dir', kind: 'direct', repo_root: null,
-          exact_checkout_oid: null, logical_base: null, freshness: null,
+          exact_checkout_oid: null, logical_base: null, freshness: null, unresolved_reason: null,
         },
       };
     });

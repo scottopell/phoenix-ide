@@ -1927,6 +1927,7 @@ async fn reserve_product_root(
             ProductRootReservationFreshness::StaleCached => "stale_cached".to_string(),
             ProductRootReservationFreshness::Unresolved => "unresolved".to_string(),
         }),
+        unresolved_reason: root.unresolved_reason.clone(),
     };
     let Some(repo_root) = phoenix_core::git::detect_git_repo_root(&cwd_path) else {
         let root = ProductRootReservation {
@@ -1937,6 +1938,7 @@ async fn reserve_product_root(
             exact_checkout_oid: None,
             logical_base: None,
             freshness: None,
+            unresolved_reason: None,
         };
         state
             .db
@@ -1975,6 +1977,7 @@ async fn reserve_product_root(
                     exact_checkout_oid: None,
                     logical_base: None,
                     freshness: Some(ProductRootReservationFreshness::Unresolved),
+                    unresolved_reason: Some("canonical_default_unresolved".to_string()),
                 };
                 state
                     .db
@@ -2002,6 +2005,7 @@ async fn reserve_product_root(
         exact_checkout_oid: Some(exact_checkout_oid.clone()),
         logical_base: Some(default_branch.clone()),
         freshness: Some(freshness.clone()),
+        unresolved_reason: None,
     };
     state
         .db
@@ -2060,6 +2064,7 @@ async fn create_product_conversation_with_id(
                 "stale_cached" => ProductRootReservationFreshness::StaleCached,
                 _ => ProductRootReservationFreshness::Unresolved,
             });
+    req.root_reservation.unresolved_reason = authenticated_reservation.unresolved_reason.clone();
     let response = create_conversation_from_request(
         state.clone(),
         req.into(),
@@ -2082,8 +2087,18 @@ async fn create_product_conversation_with_id(
     })
 }
 
+fn create_conversation_with_id(
+    state: AppState,
+    req: CreateConversationRequest,
+    raw_files: Vec<RawAttachmentPart>,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Json<ConversationResponse>, AppError>> + Send>,
+> {
+    Box::pin(create_conversation_with_id_impl(state, req, raw_files))
+}
+
 #[allow(clippy::too_many_lines)]
-async fn create_conversation_with_id(
+async fn create_conversation_with_id_impl(
     state: AppState,
     req: CreateConversationRequest,
     raw_files: Vec<RawAttachmentPart>,
@@ -2335,6 +2350,10 @@ async fn create_conversation_from_request(
                 ProductRootReservationFreshness::StaleCached => "stale_cached".to_string(),
                 ProductRootReservationFreshness::Unresolved => "unresolved".to_string(),
             }),
+        reserved_root_failure: req
+            .root_reservation
+            .as_ref()
+            .and_then(|reservation| reservation.unresolved_reason.clone()),
         reserved_checkout_oid: req
             .root_reservation
             .as_ref()
@@ -8760,6 +8779,7 @@ mod conversation_cwd_validation_tests {
                     reserved_checkout_oid: None,
                     reserved_repo_root: None,
                     reserved_root_freshness: None,
+                    reserved_root_failure: None,
                     seed_parent_id: None,
                     seed_label: None,
                     approved_task: None,
@@ -8867,6 +8887,7 @@ mod conversation_cwd_validation_tests {
                     reserved_checkout_oid: None,
                     reserved_repo_root: None,
                     reserved_root_freshness: None,
+                    reserved_root_failure: None,
                     seed_parent_id: None,
                     seed_label: None,
                     approved_task: None,
@@ -14595,6 +14616,7 @@ mod product_conversation_creation_tests {
                 exact_checkout_oid: None,
                 logical_base: None,
                 freshness: None,
+                unresolved_reason: None,
             },
             model: "claude-sonnet-5".to_string(),
             effort: None,
@@ -14620,6 +14642,7 @@ mod product_conversation_creation_tests {
                 exact_checkout_oid: None,
                 logical_base: None,
                 freshness: None,
+                unresolved_reason: None,
             })
             .await
             .expect("persist reservation");
@@ -15570,6 +15593,7 @@ mod attachment_storage_tests {
             reserved_checkout_oid: None,
             reserved_repo_root: None,
             reserved_root_freshness: None,
+            reserved_root_failure: None,
             seed_parent_id: None,
             seed_label: None,
             approved_task: None,

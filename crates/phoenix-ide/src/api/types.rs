@@ -85,6 +85,8 @@ pub struct ProductRootReservation {
     pub logical_base: Option<String>,
     #[serde(default)]
     pub freshness: Option<ProductRootReservationFreshness>,
+    #[serde(default)]
+    pub unresolved_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, TS)]

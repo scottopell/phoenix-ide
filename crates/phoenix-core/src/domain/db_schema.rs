@@ -405,6 +405,9 @@ pub struct ConversationCreationIntent {
     pub reserved_repo_root: Option<String>,
     #[serde(default)]
     pub reserved_root_freshness: Option<String>,
+    // owned: pre-unresolved-reservation rows had no canonical failure; None is correct.
+    #[serde(default)]
+    pub reserved_root_failure: Option<String>,
     // owned: pre-reservation rows had no durable reserved checkout OID; None correctly re-resolves.
     #[serde(default)]
     pub reserved_checkout_oid: Option<String>,

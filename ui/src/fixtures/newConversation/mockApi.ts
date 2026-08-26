@@ -28,7 +28,7 @@ export function installNewConversationFixtureApi(scenario: NewConversationScenar
       repo_root: cwd,
       exact_checkout_oid: 'fixture-oid',
       logical_base: 'main',
-      freshness: 'fresh',
+      freshness: 'fresh', unresolved_reason: null,
     },
   });
   api.listRecentManagementRootSuggestions = async () => ({ suggestions: [] });

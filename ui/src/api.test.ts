@@ -428,6 +428,7 @@ describe('directory-first resolution query encoding', () => {
       exact_checkout_oid: 'abc123',
       logical_base: 'main',
       freshness: 'fresh' as const,
+      unresolved_reason: null,
     };
     const resolution = { kind: 'exact_reserved_committed_tree' as const, rootReservation };
 

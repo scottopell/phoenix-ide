@@ -233,6 +233,7 @@ pub struct ProductRootReservationRecord {
     pub exact_checkout_oid: Option<String>,
     pub logical_base: Option<String>,
     pub freshness: Option<String>,
+    pub unresolved_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -264,6 +265,8 @@ pub struct ApprovedTaskRootReservationInput {
     pub exact_checkout_oid: String,
     pub logical_base: String,
 }
+
+const PRODUCT_ROOT_RESERVATION_RECLAIM_AFTER: chrono::Duration = chrono::Duration::days(7);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachedHiddenGitRepository {
@@ -1208,6 +1211,10 @@ fn row_work_scope_id(row: &SqliteRow) -> phoenix_core::work_scope::WorkScopeId {
     let raw: String = row.get("work_scope_id");
     phoenix_core::work_scope::WorkScopeId::parse(raw)
         .expect("database CHECK enforces non-empty work_scope_id")
+}
+
+fn product_root_reservation_reclaim_before(now: chrono::DateTime<Utc>) -> i64 {
+    (now - PRODUCT_ROOT_RESERVATION_RECLAIM_AFTER).timestamp_micros()
 }
 
 /// Thread-safe database handle
@@ -4448,6 +4455,21 @@ impl Database {
         .map_err(DbError::Sqlx)
     }
 
+    async fn reclaim_abandoned_product_root_reservations_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        now: chrono::DateTime<Utc>,
+    ) -> DbResult<()> {
+        sqlx::query(
+            "DELETE FROM product_root_reservations
+             WHERE status = 'reserved'
+               AND created_at_unix_micros < ?1",
+        )
+        .bind(product_root_reservation_reclaim_before(now))
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
     /// Persist one server-owned pre-creation root reservation.
     ///
     /// # Errors
@@ -4457,10 +4479,13 @@ impl Database {
         &self,
         reservation: &ProductRootReservationRecord,
     ) -> DbResult<()> {
+        let now = Utc::now();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        Self::reclaim_abandoned_product_root_reservations_tx(&mut tx, now).await?;
         sqlx::query(
             "INSERT INTO product_root_reservations
-             (id, cwd, kind, repo_root, exact_checkout_oid, logical_base, freshness, status, created_at_unix_micros)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'reserved', ?8)",
+             (id, cwd, kind, repo_root, exact_checkout_oid, logical_base, freshness, unresolved_reason, status, created_at_unix_micros)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'reserved', ?9)",
         )
         .bind(&reservation.id)
         .bind(&reservation.cwd)
@@ -4469,9 +4494,11 @@ impl Database {
         .bind(&reservation.exact_checkout_oid)
         .bind(&reservation.logical_base)
         .bind(&reservation.freshness)
-        .bind(Utc::now().timestamp_micros())
-        .execute(&self.pool)
+        .bind(&reservation.unresolved_reason)
+        .bind(now.timestamp_micros())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -4485,8 +4512,11 @@ impl Database {
         reservation_id: &str,
         cwd: &str,
     ) -> DbResult<Option<ProductRootReservationRecord>> {
-        sqlx::query(
-            "SELECT id, cwd, kind, repo_root, exact_checkout_oid, logical_base, freshness
+        let now = Utc::now();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        Self::reclaim_abandoned_product_root_reservations_tx(&mut tx, now).await?;
+        let reservation = sqlx::query(
+            "SELECT id, cwd, kind, repo_root, exact_checkout_oid, logical_base, freshness, unresolved_reason
                FROM product_root_reservations
               WHERE id = ?1 AND cwd = ?2",
         )
@@ -4501,11 +4531,13 @@ impl Database {
                 exact_checkout_oid: row.get("exact_checkout_oid"),
                 logical_base: row.get("logical_base"),
                 freshness: row.get("freshness"),
+                unresolved_reason: row.get("unresolved_reason"),
             })
         })
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(DbError::Sqlx)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(reservation)
     }
 
     /// Attach normalized hidden repository authority to an existing conversation `WorkScope`.
@@ -4524,7 +4556,6 @@ impl Database {
         let normalized_management_root =
             normalize_hidden_git_repository_path(&input.management_root)?;
         let observed_at_unix_micros = datetime_to_unix_micros(input.observed_at);
-        let generation = 1_i64;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let owns_claim: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM conversation_creation_jobs
@@ -4585,7 +4616,9 @@ impl Database {
                 AND EXISTS (
                     SELECT 1 FROM work_scope_git_repositories wr
                     WHERE wr.repository_id = common.repository_id
-                )",
+                )
+              ORDER BY common.observed_at_unix_micros DESC, common.repository_id DESC
+              LIMIT 1",
         )
         .bind(&normalized_common_dir)
         .bind(&normalized_management_root)
@@ -4627,6 +4660,16 @@ impl Database {
             .await?;
         }
 
+        let next_default_branch_generation: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(generation, 0) + 1
+               FROM git_repository_default_branch_observations
+              WHERE repository_id = ?1",
+        )
+        .bind(repository_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await?
+        .unwrap_or(1);
+
         let (status, branch, provenance) = match &input.default_branch {
             GitRepositoryDefaultBranchObservation::Resolved { branch, provenance } => {
                 ("resolved", Some(branch.as_str()), Some(provenance.as_str()))
@@ -4642,10 +4685,17 @@ impl Database {
                            status = excluded.status,
                            branch = excluded.branch,
                            provenance = excluded.provenance,
-                           observed_at_unix_micros = excluded.observed_at_unix_micros",
+                           observed_at_unix_micros = excluded.observed_at_unix_micros
+                   WHERE excluded.observed_at_unix_micros > git_repository_default_branch_observations.observed_at_unix_micros
+                      OR (
+                          excluded.observed_at_unix_micros = git_repository_default_branch_observations.observed_at_unix_micros
+                          AND excluded.status = git_repository_default_branch_observations.status
+                          AND excluded.branch IS git_repository_default_branch_observations.branch
+                          AND excluded.provenance IS git_repository_default_branch_observations.provenance
+                      )",
         )
         .bind(repository_id.as_str())
-        .bind(generation)
+        .bind(next_default_branch_generation)
         .bind(status)
         .bind(branch)
         .bind(provenance)
@@ -4715,14 +4765,21 @@ impl Database {
                       JOIN conversation_work_scope_attachments cwa2
                         ON cwa2.work_scope_id = wr2.work_scope_id
                       JOIN conversations c2 ON c2.id = cwa2.conversation_id
+                      JOIN product_conversations pc2 ON pc2.id = c2.product_conversation_id
                      WHERE wr2.repository_id = roots.repository_id
-                       AND EXISTS (
-                           SELECT 1
-                             FROM product_conversations pc2
-                            WHERE pc2.id = c2.product_conversation_id
-                              AND pc2.kind = 'ordinary'
-                              AND pc2.ordinary_lifecycle IN ('open', 'history')
-                       )
+                       AND pc2.kind = 'ordinary'
+                       AND pc2.ordinary_lifecycle IN ('open', 'history')
+                ) DESC,
+                (
+                    SELECT MAX(MAX(c2.updated_at, c2.state_updated_at))
+                      FROM work_scope_git_repositories wr2
+                      JOIN conversation_work_scope_attachments cwa2
+                        ON cwa2.work_scope_id = wr2.work_scope_id
+                      JOIN conversations c2 ON c2.id = cwa2.conversation_id
+                      JOIN product_conversations pc2 ON pc2.id = c2.product_conversation_id
+                     WHERE wr2.repository_id = roots.repository_id
+                       AND pc2.kind = 'ordinary'
+                       AND pc2.ordinary_lifecycle IN ('open', 'history')
                 ) DESC,
                 observed_at_unix_micros DESC, repository_id",
         )
@@ -7299,18 +7356,11 @@ impl Database {
     ) -> DbResult<Option<ApprovedTaskRootReservationInput>> {
         let row = sqlx::query(
             "SELECT wr.repository_id,
-                    management.path AS repository_root,
-                    branch.branch AS logical_base,
+                    reservation.repo_root AS repository_root,
+                    reservation.logical_base AS logical_base,
                     reservation.exact_checkout_oid AS exact_checkout_oid
                FROM conversations c
                JOIN work_scope_git_repositories wr ON wr.work_scope_id = c.work_scope_id
-               JOIN git_repository_locator_observations management
-                 ON management.repository_id = wr.repository_id
-                AND management.locator_kind = 'management_root'
-                AND management.status = 'present'
-               JOIN git_repository_default_branch_observations branch
-                 ON branch.repository_id = wr.repository_id
-                AND branch.status = 'resolved'
                JOIN product_root_reservations reservation
                  ON reservation.consumed_by_conversation_id = c.id
                 AND reservation.status = 'consumed'
@@ -7399,6 +7449,7 @@ impl Database {
             reserved_root_freshness: approved_root_reservation
                 .as_ref()
                 .map(|_| "fresh".to_string()),
+            reserved_root_failure: None,
             seed_parent_id: None,
             seed_label: Some(snapshot.title.clone()),
             approved_task: Some(snapshot.clone()),
@@ -9254,6 +9305,13 @@ impl Database {
             conversation_id,
             observer,
         )
+        .await?;
+        sqlx::query(
+            "DELETE FROM product_root_reservations
+             WHERE consumed_by_conversation_id = ?1",
+        )
+        .bind(conversation_id)
+        .execute(&mut *connection)
         .await?;
         Self::delete_product_conversation_if_empty(connection, &product_conversation_id).await?;
         Ok(true)
@@ -13387,9 +13445,86 @@ mod tests {
             reserved_repo_root: None,
             reserved_root_freshness: None,
             seed_parent_id: None,
+            reserved_root_failure: None,
             seed_label: None,
             approved_task: None,
         }
+    }
+
+    async fn attach_hidden_repository_for_test(
+        db: &Database,
+        conversation_id: &str,
+        common_dir: &str,
+        management_root: &str,
+        default_branch: GitRepositoryDefaultBranchObservation,
+        observed_at: chrono::DateTime<Utc>,
+    ) -> AttachedHiddenGitRepository {
+        let message_id = format!(
+            "message-{conversation_id}-{}",
+            observed_at.timestamp_micros()
+        );
+        let existing_job = db
+            .get_conversation_creation_job_for_conversation(conversation_id)
+            .await
+            .unwrap();
+        let job_id = if let Some(job) = existing_job {
+            sqlx::query(
+                "UPDATE conversation_creation_jobs
+                    SET status = 'accepted', stage = 'validate_intent', claim_worker_id = NULL,
+                        claim_token = NULL, lease_until = NULL, next_attempt_at = NULL,
+                        updated_at = ?2, intent_json = ?3, message_id = ?4
+                  WHERE id = ?1",
+            )
+            .bind(&job.id)
+            .bind(Utc::now().to_rfc3339())
+            .bind(
+                serde_json::to_string(&test_creation_intent(management_root, &message_id)).unwrap(),
+            )
+            .bind(&message_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+            job.id
+        } else {
+            let job = InsertConversationCreationJob {
+                id: format!("job-{conversation_id}"),
+                conversation_id: conversation_id.to_string(),
+                message_id: Some(message_id.clone()),
+                intent: test_creation_intent(management_root, &message_id),
+            };
+            db.insert_conversation_creation_job(&job).await.unwrap();
+            job.id
+        };
+        let claim = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker".into()),
+                &CreationClaimToken("token".into()),
+                Utc::now(),
+                chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(claimed_job) = claim else {
+            panic!("creation claim");
+        };
+        let CreationStatus::Claimed(claim) = claimed_job.protocol.status else {
+            panic!("creation claim authority");
+        };
+        let (_, attachment) = db
+            .attach_hidden_git_repository_to_conversation_work_scope(
+                &AttachHiddenGitRepositoryInput {
+                    conversation_id: conversation_id.to_string(),
+                    common_dir: common_dir.to_string(),
+                    management_root: management_root.to_string(),
+                    default_branch,
+                    observed_at,
+                },
+                &job_id,
+                &claim,
+            )
+            .await
+            .unwrap();
+        attachment.expect("hidden repository attached")
     }
 
     async fn insert_test_creation_job(db: &Database, job_id: &str, conversation_id: &str) {
@@ -13817,6 +13952,396 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hidden_repository_default_branch_observation_fences_stale_updates_and_bumps_generation(
+    ) {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation(
+            "conv-branch-fence",
+            "conv-branch-fence",
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let first_observed = Utc::now() - chrono::Duration::minutes(5);
+        let attachment = attach_hidden_repository_for_test(
+            &db,
+            "conv-branch-fence",
+            "/tmp/.git/worktrees/fence",
+            "/tmp/.git/worktrees/fence",
+            GitRepositoryDefaultBranchObservation::Resolved {
+                branch: "main".to_string(),
+                provenance: "remote_head_cache".to_string(),
+            },
+            first_observed,
+        )
+        .await;
+        let initial: (i64, String, i64) = sqlx::query_as(
+            "SELECT generation, branch, observed_at_unix_micros
+             FROM git_repository_default_branch_observations WHERE repository_id = ?1",
+        )
+        .bind(attachment.repository_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(initial.0, 1);
+        assert_eq!(initial.1, "main");
+
+        let stale = attach_hidden_repository_for_test(
+            &db,
+            "conv-branch-fence",
+            "/tmp/.git/worktrees/fence",
+            "/tmp/.git/worktrees/fence",
+            GitRepositoryDefaultBranchObservation::Resolved {
+                branch: "stale-branch".to_string(),
+                provenance: "user_selected".to_string(),
+            },
+            first_observed - chrono::Duration::minutes(1),
+        )
+        .await;
+        assert_eq!(stale.repository_id, attachment.repository_id);
+        let after_stale: (i64, String, String, i64) = sqlx::query_as(
+            "SELECT generation, branch, provenance, observed_at_unix_micros
+             FROM git_repository_default_branch_observations WHERE repository_id = ?1",
+        )
+        .bind(attachment.repository_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(after_stale.0, 1);
+        assert_eq!(after_stale.1, "main");
+        assert_eq!(after_stale.2, "remote_head_cache");
+        assert_eq!(after_stale.3, initial.2);
+
+        attach_hidden_repository_for_test(
+            &db,
+            "conv-branch-fence",
+            "/tmp/.git/worktrees/fence",
+            "/tmp/.git/worktrees/fence",
+            GitRepositoryDefaultBranchObservation::Resolved {
+                branch: "develop".to_string(),
+                provenance: "user_selected".to_string(),
+            },
+            first_observed + chrono::Duration::minutes(1),
+        )
+        .await;
+        let updated: (i64, String, String, i64) = sqlx::query_as(
+            "SELECT generation, branch, provenance, observed_at_unix_micros
+             FROM git_repository_default_branch_observations WHERE repository_id = ?1",
+        )
+        .bind(attachment.repository_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(updated.0, 2);
+        assert_eq!(updated.1, "develop");
+        assert_eq!(updated.2, "user_selected");
+        assert!(updated.3 > initial.2);
+    }
+
+    #[tokio::test]
+    async fn hidden_repository_management_roots_break_ties_by_latest_ordinary_activity() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("repo-a-open", "repo-a-open", "/tmp/a", true, None, None)
+            .await
+            .unwrap();
+        db.create_conversation(
+            "repo-a-history",
+            "repo-a-history",
+            "/tmp/a2",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_conversation("repo-b-open", "repo-b-open", "/tmp/b", true, None, None)
+            .await
+            .unwrap();
+        db.create_conversation(
+            "repo-b-history",
+            "repo-b-history",
+            "/tmp/b2",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        attach_hidden_repository_for_test(
+            &db,
+            "repo-a-open",
+            "/tmp/.git/worktrees/repo-a",
+            "/tmp/.git/worktrees/repo-a",
+            GitRepositoryDefaultBranchObservation::Resolved {
+                branch: "main".to_string(),
+                provenance: "remote_head_cache".to_string(),
+            },
+            Utc::now() - chrono::Duration::minutes(10),
+        )
+        .await;
+        let repo_a = attach_hidden_repository_for_test(
+            &db,
+            "repo-a-history",
+            "/tmp/.git/worktrees/repo-a",
+            "/tmp/.git/worktrees/repo-a",
+            GitRepositoryDefaultBranchObservation::Resolved {
+                branch: "main".to_string(),
+                provenance: "remote_head_cache".to_string(),
+            },
+            Utc::now() - chrono::Duration::minutes(10),
+        )
+        .await;
+        attach_hidden_repository_for_test(
+            &db,
+            "repo-b-open",
+            "/tmp/.git/worktrees/repo-b",
+            "/tmp/.git/worktrees/repo-b",
+            GitRepositoryDefaultBranchObservation::Resolved {
+                branch: "main".to_string(),
+                provenance: "remote_head_cache".to_string(),
+            },
+            Utc::now() - chrono::Duration::minutes(10),
+        )
+        .await;
+        let repo_b = attach_hidden_repository_for_test(
+            &db,
+            "repo-b-history",
+            "/tmp/.git/worktrees/repo-b",
+            "/tmp/.git/worktrees/repo-b",
+            GitRepositoryDefaultBranchObservation::Resolved {
+                branch: "main".to_string(),
+                provenance: "remote_head_cache".to_string(),
+            },
+            Utc::now() - chrono::Duration::minutes(10),
+        )
+        .await;
+        assert_ne!(repo_a.repository_id, repo_b.repository_id);
+
+        sqlx::query("UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = (SELECT product_conversation_id FROM conversations WHERE id = 'repo-a-history')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = (SELECT product_conversation_id FROM conversations WHERE id = 'repo-b-history')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE conversations SET updated_at = '2026-01-01T00:00:00Z', state_updated_at = '2026-01-01T00:00:00Z' WHERE id IN ('repo-a-open', 'repo-a-history')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE conversations SET updated_at = '2026-02-01T00:00:00Z', state_updated_at = '2026-02-01T00:00:00Z' WHERE id IN ('repo-b-open', 'repo-b-history')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let roots = db
+            .list_recent_hidden_repository_management_roots()
+            .await
+            .unwrap();
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0].repository_id, repo_b.repository_id);
+        assert_eq!(roots[1].repository_id, repo_a.repository_id);
+    }
+
+    #[tokio::test]
+    async fn product_root_reservation_reclaims_abandoned_reserved_rows_on_read_and_write() {
+        let db = Database::open_in_memory().await.unwrap();
+        let reclaim_before = product_root_reservation_reclaim_before(Utc::now()) - 1;
+        sqlx::query(
+            "INSERT INTO product_root_reservations (
+                id, cwd, kind, repo_root, exact_checkout_oid, logical_base, freshness, status,
+                consumed_by_conversation_id, created_at_unix_micros, consumed_at_unix_micros
+             ) VALUES (?1, ?2, 'direct', NULL, NULL, NULL, NULL, 'reserved', NULL, ?3, NULL)",
+        )
+        .bind("stale-reservation")
+        .bind("/tmp/stale-reservation")
+        .bind(reclaim_before)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert!(db
+            .get_product_root_reservation("stale-reservation", "/tmp/stale-reservation")
+            .await
+            .unwrap()
+            .is_none());
+        let count_after_read: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM product_root_reservations WHERE id = 'stale-reservation'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(count_after_read, 0);
+
+        sqlx::query(
+            "INSERT INTO product_root_reservations (
+                id, cwd, kind, repo_root, exact_checkout_oid, logical_base, freshness, status,
+                consumed_by_conversation_id, created_at_unix_micros, consumed_at_unix_micros
+             ) VALUES (?1, ?2, 'direct', NULL, NULL, NULL, NULL, 'reserved', NULL, ?3, NULL)",
+        )
+        .bind("stale-reservation-write")
+        .bind("/tmp/stale-reservation-write")
+        .bind(reclaim_before)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        db.insert_product_root_reservation(&ProductRootReservationRecord {
+            id: "fresh-reservation".to_string(),
+            cwd: "/tmp/fresh-reservation".to_string(),
+            kind: "direct".to_string(),
+            repo_root: None,
+            exact_checkout_oid: None,
+            logical_base: None,
+            freshness: None,
+            unresolved_reason: None,
+        })
+        .await
+        .unwrap();
+        let count_after_write: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM product_root_reservations WHERE id = 'stale-reservation-write'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(count_after_write, 0);
+    }
+
+    #[tokio::test]
+    async fn consumed_product_root_reservation_is_deleted_with_hard_deleted_conversation() {
+        let db = Database::open_in_memory().await.unwrap();
+        let reservation = ProductRootReservationRecord {
+            id: "reservation-delete".to_string(),
+            cwd: "/tmp/reservation-delete".to_string(),
+            kind: "direct".to_string(),
+            repo_root: None,
+            exact_checkout_oid: None,
+            logical_base: None,
+            freshness: None,
+            unresolved_reason: None,
+        };
+        db.insert_product_root_reservation(&reservation)
+            .await
+            .unwrap();
+        let job = InsertConversationCreationJob {
+            id: "job-reservation-delete".to_string(),
+            conversation_id: "conv-reservation-delete".to_string(),
+            message_id: Some("message-reservation-delete".to_string()),
+            intent: test_creation_intent("/tmp/reservation-delete", "message-reservation-delete"),
+        };
+        db.create_conversation_with_creation_job(
+            "conv-reservation-delete",
+            "conv-reservation-delete",
+            "/tmp/reservation-delete",
+            true,
+            None,
+            &ConvMode::Direct,
+            None,
+            None,
+            None,
+            phoenix_core::llm_language::LlmLanguage::default(),
+            &job,
+            Some(&reservation.id),
+        )
+        .await
+        .unwrap();
+        db.delete_conversation("conv-reservation-delete")
+            .await
+            .unwrap();
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM product_root_reservations WHERE id = ?1")
+                .bind(&reservation.id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[tokio::test]
+    async fn approval_handoff_uses_consumed_reservation_as_immutable_root_evidence() {
+        let db = Database::open_in_memory().await.unwrap();
+        let reservation = ProductRootReservationRecord {
+            id: "reservation-immutable-root".to_string(),
+            cwd: "/tmp/immutable-root".to_string(),
+            kind: "exact_committed_tree".to_string(),
+            repo_root: Some("/repo/from-reservation".to_string()),
+            exact_checkout_oid: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
+            logical_base: Some("main".to_string()),
+            freshness: Some("fresh".to_string()),
+            unresolved_reason: None,
+        };
+        db.insert_product_root_reservation(&reservation)
+            .await
+            .unwrap();
+        let job = InsertConversationCreationJob {
+            id: "job-immutable-root".to_string(),
+            conversation_id: "conv-immutable-root".to_string(),
+            message_id: Some("message-immutable-root".to_string()),
+            intent: test_creation_intent("/tmp/immutable-root", "message-immutable-root"),
+        };
+        db.create_conversation_with_creation_job(
+            "conv-immutable-root",
+            "conv-immutable-root",
+            "/tmp/immutable-root",
+            true,
+            None,
+            &ConvMode::Direct,
+            None,
+            None,
+            None,
+            phoenix_core::llm_language::LlmLanguage::default(),
+            &job,
+            Some(&reservation.id),
+        )
+        .await
+        .unwrap();
+        let attachment = attach_hidden_repository_for_test(
+            &db,
+            "conv-immutable-root",
+            "/tmp/.git/worktrees/immutable",
+            "/repo/current-management-root",
+            GitRepositoryDefaultBranchObservation::Resolved {
+                branch: "main".to_string(),
+                provenance: "remote_head_cache".to_string(),
+            },
+            Utc::now() - chrono::Duration::minutes(1),
+        )
+        .await;
+        sqlx::query(
+            "UPDATE git_repository_default_branch_observations
+                SET branch = 'drifted-base', provenance = 'user_selected'
+              WHERE repository_id = ?1",
+        )
+        .bind(attachment.repository_id.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE git_repository_locator_observations
+                SET path = '/repo/drifted-management-root'
+              WHERE repository_id = ?1 AND locator_kind = 'management_root'",
+        )
+        .bind(attachment.repository_id.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let root = db
+            .root_reservation_for_attached_hidden_repository("conv-immutable-root")
+            .await
+            .unwrap()
+            .expect("consumed reservation evidence");
+        assert_eq!(root.repository_id, attachment.repository_id);
+        assert_eq!(root.repository_root, "/repo/from-reservation");
+        assert_eq!(root.logical_base, "main");
+        assert_eq!(
+            root.exact_checkout_oid,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+    }
+
+    #[tokio::test]
     async fn root_reservation_consumption_rolls_back_when_conversation_insert_fails() {
         let db = Database::open_in_memory().await.unwrap();
         let reservation = ProductRootReservationRecord {
@@ -13827,6 +14352,7 @@ mod tests {
             exact_checkout_oid: None,
             logical_base: None,
             freshness: None,
+            unresolved_reason: None,
         };
         db.insert_product_root_reservation(&reservation)
             .await
@@ -13884,6 +14410,7 @@ mod tests {
             exact_checkout_oid: None,
             logical_base: None,
             freshness: None,
+            unresolved_reason: None,
         };
         db.insert_product_root_reservation(&reservation)
             .await

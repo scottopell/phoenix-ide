@@ -942,7 +942,10 @@ async fn provision_conversation(
                 )
             } else {
                 return Err((
-                    "Directory-first Git creation requires a reserved canonical root".to_string(),
+                    job.intent.reserved_root_failure.clone().unwrap_or_else(|| {
+                        "Directory-first Git creation requires a reserved canonical root"
+                            .to_string()
+                    }),
                     ErrorKind::InvalidRequest,
                 )
                     .into());
@@ -1669,6 +1672,7 @@ mod temporary_creation_branch_tests {
                 reserved_checkout_oid: None,
                 reserved_repo_root: None,
                 reserved_root_freshness: None,
+                reserved_root_failure: None,
                 seed_parent_id: None,
                 seed_label: None,
                 approved_task: None,
@@ -2234,6 +2238,7 @@ mod default_branch_reservation_tests {
             reserved_checkout_oid: Some("deadbeef".repeat(5)),
             reserved_repo_root: None,
             reserved_root_freshness: None,
+            reserved_root_failure: None,
             seed_parent_id: None,
             seed_label: None,
             approved_task: None,
@@ -2653,7 +2658,7 @@ fn hidden_repository_attachment_observation(
         .filter(|branch| !branch.trim().is_empty())
         .map(|branch| GitRepositoryDefaultBranchObservation::Resolved {
             branch: branch.to_string(),
-            provenance: "remote_head_cache".to_string(),
+            provenance: "local_checked_out_branch".to_string(),
         })
         .unwrap_or(GitRepositoryDefaultBranchObservation::Unresolved);
     Ok(AttachHiddenGitRepositoryInput {
