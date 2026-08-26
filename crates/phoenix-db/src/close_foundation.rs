@@ -1832,6 +1832,57 @@ impl Database {
         Ok(())
     }
 
+    /// Confirms the exact loss snapshot before admitting resource retirement.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] when the attempt is not awaiting loss confirmation,
+    /// the supplied snapshot is stale, or no persisted loss remains to confirm.
+    pub async fn confirm_close_loss_retirement(
+        &self,
+        attempt_id: &CloseAttemptId,
+        snapshot: &CloseRetirementSnapshot,
+    ) -> DbResult<CloseObligation> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let obligation = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
+        if obligation.phase() != ClosePhase::AwaitingLossConfirmation {
+            return Err(close_precondition(format!(
+                "attempt {attempt_id} is not awaiting loss confirmation"
+            )));
+        }
+        if obligation.snapshot() != Some(snapshot) {
+            return Err(close_precondition(format!(
+                "attempt {attempt_id} loss confirmation snapshot is stale"
+            )));
+        }
+        let has_loss: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM close_retirement_losses loss
+                 JOIN close_retirement_inspections inspection
+                   ON inspection.attempt_id = loss.attempt_id
+                  AND inspection.scope = loss.scope
+                  AND inspection.generation = loss.generation
+                 WHERE loss.attempt_id = ?1
+               )",
+        )
+        .bind(attempt_id.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+        if !has_loss {
+            return Err(close_precondition(format!(
+                "attempt {attempt_id} has no exact loss evidence to confirm"
+            )));
+        }
+        set_close_phase_tx(
+            &mut tx,
+            attempt_id.as_str(),
+            ClosePhase::RetirementRequested,
+        )
+        .await?;
+        let confirmed = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
+        tx.commit().await?;
+        Ok(confirmed)
+    }
+
     pub async fn list_close_retirement_inspections(
         &self,
         attempt_id: &str,
@@ -6852,6 +6903,58 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn loss_confirmation_requires_the_exact_persisted_snapshot() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let scope = allocate_scope_worktree(&db, "root").await;
+        db.begin_close_foundation(&product_id("root"), "attempt-confirm-loss")
+            .await
+            .unwrap();
+        set_close_phase(
+            &db,
+            "attempt-confirm-loss",
+            ClosePhase::AwaitingRetirementInspection,
+        )
+        .await;
+        let scope_snapshot = CloseRetirementSnapshot::parse("scope-gen", "scope-fp").unwrap();
+        db.replace_close_inspection(ReplaceCloseInspectionRequest {
+            attempt_id: CloseAttemptId::parse("attempt-confirm-loss").unwrap(),
+            scopes: vec![ReplaceCloseInspectionScopeRequest {
+                scope,
+                snapshot: scope_snapshot,
+                losses: vec![CloseLossItem::UntrackedNonIgnoredPath(
+                    GitPathIdentity::from_bytes(b"new.txt".to_vec()),
+                )],
+            }],
+        })
+        .await
+        .unwrap();
+        let obligation = db
+            .get_close_obligation("attempt-confirm-loss")
+            .await
+            .unwrap();
+        let stale =
+            CloseRetirementSnapshot::parse("stale", obligation.snapshot().unwrap().fingerprint())
+                .unwrap();
+        assert!(matches!(
+            db.confirm_close_loss_retirement(
+                &CloseAttemptId::parse("attempt-confirm-loss").unwrap(),
+                &stale,
+            )
+            .await,
+            Err(DbError::CloseFoundationPrecondition(message)) if message.contains("snapshot is stale")
+        ));
+        let confirmed = db
+            .confirm_close_loss_retirement(
+                &CloseAttemptId::parse("attempt-confirm-loss").unwrap(),
+                obligation.snapshot().unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(confirmed.phase(), ClosePhase::RetirementRequested);
     }
 
     #[tokio::test]
