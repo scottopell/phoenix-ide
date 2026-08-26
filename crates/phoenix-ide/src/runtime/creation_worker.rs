@@ -2076,7 +2076,7 @@ mod directory_first_product_worktree_tests {
         std::fs::write(remote_checkout.join("README.md"), "advanced\n").unwrap();
         crate::git_ops::run_git(&remote_checkout, &["add", "README.md"]).unwrap();
         crate::git_ops::run_git(&remote_checkout, &["commit", "-m", "advance"]).unwrap();
-        crate::git_ops::run_git(&remote_checkout, &["push", "origin", "main"]).unwrap();
+        crate::git_ops::run_git(&remote_checkout, &["push", "origin", "HEAD:main"]).unwrap();
         crate::git_ops::run_git(&repo, &["fetch", "origin", "main"]).unwrap();
 
         let worktree =
@@ -2179,7 +2179,7 @@ mod default_branch_reservation_tests {
                     with_test_default_start_resolver(
                         |_| {
                             // test-timing-allow: deliberate long blocking resolver proves claim heartbeat runs on the async lane.
-                            std::thread::sleep(std::time::Duration::from_secs(30));
+                            std::thread::sleep(std::time::Duration::from_secs(2));
                             Some(crate::git_start::GitStartPoint::new("main", "main", "main"))
                         },
                         || resolve_default_task_start_point(Path::new("/tmp")),
