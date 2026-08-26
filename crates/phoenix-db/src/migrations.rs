@@ -2089,6 +2089,25 @@ CREATE UNIQUE INDEX close_obligations_one_active_per_product ON close_obligation
 ";
 
 const MIGRATION_076: &str = r"
+DROP TRIGGER conversations_role_scope_insert;
+DROP TRIGGER conversations_role_scope_update;
+CREATE TRIGGER conversations_role_scope_insert
+BEFORE INSERT ON conversations
+WHEN NEW.runtime_role NOT IN ('user', 'sub_agent', 'coordinator')
+  OR (NEW.runtime_role = 'coordinator' AND NEW.work_scope_id IS NOT NULL)
+  OR (NEW.runtime_role = 'user' AND NEW.work_scope_id IS NULL AND NEW.state_kind <> 'provisioning')
+BEGIN
+    SELECT RAISE(ABORT, 'invalid conversation runtime role/work scope');
+END;
+CREATE TRIGGER conversations_role_scope_update
+BEFORE UPDATE OF runtime_role, work_scope_id, state_kind ON conversations
+WHEN NEW.runtime_role NOT IN ('user', 'sub_agent', 'coordinator')
+  OR (NEW.runtime_role = 'coordinator' AND NEW.work_scope_id IS NOT NULL)
+  OR (NEW.runtime_role = 'user' AND NEW.work_scope_id IS NULL AND NEW.state_kind <> 'provisioning')
+BEGIN
+    SELECT RAISE(ABORT, 'invalid conversation runtime role/work scope');
+END;
+
 CREATE TABLE product_root_reservations (
     id TEXT PRIMARY KEY CHECK (typeof(id) = 'text' AND id <> ''),
     cwd TEXT NOT NULL CHECK (typeof(cwd) = 'text' AND cwd <> '' AND instr(cwd, char(0)) = 0),

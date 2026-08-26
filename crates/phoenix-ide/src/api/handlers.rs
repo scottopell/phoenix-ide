@@ -838,6 +838,9 @@ fn conversation_resource_scope(
         None if conv.runtime_role == crate::work_scope::RuntimeRole::SubAgent => {
             crate::work_scope::ResourceScopeKey::Unattached(conv.id.clone())
         }
+        None if matches!(conv.state, ConvState::Provisioning { .. }) => {
+            crate::work_scope::ResourceScopeKey::Unattached(conv.id.clone())
+        }
         None => panic!("ordinary persisted conversation is missing its work scope"),
     }
 }

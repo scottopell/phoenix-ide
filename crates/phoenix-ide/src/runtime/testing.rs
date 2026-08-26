@@ -1827,6 +1827,10 @@ impl StateStore for InMemoryStorage {
             .unwrap_or_default())
     }
 
+    async fn get_product_conversation_id(&self, conv_id: &str) -> Result<String, String> {
+        Ok(conv_id.to_string())
+    }
+
     async fn update_conversation_cwd_recovery_only(
         &self,
         _conv_id: &str,

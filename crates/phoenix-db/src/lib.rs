@@ -4980,8 +4980,8 @@ impl Database {
                 ));
             }
         }
-        let (created_work_scope_id, authority_kind, environment) =
-            Self::new_scope_for_conversation(cwd, &cm);
+        let deferred_scope = root_reservation_id.is_some();
+        let scope = (!deferred_scope).then(|| Self::new_scope_for_conversation(cwd, &cm));
         let product_conversation_id =
             phoenix_core::domain::product_conversation::ProductConversationId::new();
         sqlx::query(
@@ -4991,14 +4991,16 @@ impl Database {
         .bind(product_conversation_id.as_str())
         .execute(&mut *tx)
         .await?;
-        Self::insert_work_scope_tx(
-            &mut tx,
-            &created_work_scope_id,
-            authority_kind,
-            environment,
-            &now_str,
-        )
-        .await?;
+        if let Some((scope_id, authority_kind, environment)) = scope.as_ref() {
+            Self::insert_work_scope_tx(
+                &mut tx,
+                scope_id,
+                *authority_kind,
+                environment.clone(),
+                &now_str,
+            )
+            .await?;
+        }
 
         let mut actual_slug = slug.to_string();
         let mut attempts = 0u8;
@@ -5025,7 +5027,7 @@ impl Database {
             .bind(cm.task_id)
             .bind(cm.task_title)
             .bind(cm.next_taskmd_id_hint)
-            .bind(created_work_scope_id.as_str())
+            .bind(scope.as_ref().map(|(scope_id, _, _)| scope_id.as_str()))
             .bind(product_conversation_id.as_str())
             .execute(&mut *tx)
             .await;
@@ -5091,7 +5093,7 @@ impl Database {
             runtime_role: RuntimeRole::User,
             effort: job.intent.effort,
             service_tier: ServiceTier::Standard,
-            attached_work_scope_id: Some(created_work_scope_id),
+            attached_work_scope_id: scope.map(|(scope_id, _, _)| scope_id),
             desired_base_branch: desired_base_branch.map(String::from),
             message_count: 0,
             seed_parent_id: seed_parent_id.map(String::from),
@@ -7409,9 +7411,6 @@ impl Database {
         );
         let parent = self.get_conversation(parent_id).await?;
         let snapshot = phoenix_core::task_handoff::ApprovedTaskSnapshot::from(approval);
-        let attached_hidden_repository = self
-            .current_work_scope_hidden_repository_attachment(parent_id)
-            .await?;
         let approved_root_reservation = self
             .root_reservation_for_attached_hidden_repository(parent_id)
             .await?;
@@ -7464,9 +7463,6 @@ impl Database {
                 slug
             }
         };
-        let (scope_id, authority_kind, environment) =
-            Self::new_scope_for_conversation(&parent.cwd, &conv_mode_columns(&ConvMode::Direct));
-
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let existing: Option<(String, String)> = sqlx::query_as(
             "SELECT target.id, job.intent_json
@@ -7507,18 +7503,6 @@ impl Database {
             .bind(product_id.as_str())
             .execute(&mut *tx)
             .await?;
-        Self::insert_work_scope_tx(&mut tx, &scope_id, authority_kind, environment, &now_str)
-            .await?;
-        if let Some(attached_hidden_repository) = attached_hidden_repository.as_ref() {
-            sqlx::query(
-                "INSERT INTO work_scope_git_repositories (work_scope_id, repository_id)
-                 VALUES (?1, ?2)",
-            )
-            .bind(scope_id.as_str())
-            .bind(attached_hidden_repository.repository_id.as_str())
-            .execute(&mut *tx)
-            .await?;
-        }
         sqlx::query(
             "INSERT INTO product_conversation_sources (
                  target_product_conversation_id, source_product_conversation_id,
@@ -7543,7 +7527,8 @@ impl Database {
                      archived, model, effort, project_id, desired_base_branch, seed_parent_id,
                      seed_label, llm_language, cm_kind, runtime_role, work_scope_id, service_tier
                  ) VALUES (?1, ?2, ?3, ?4, NULL, 1, ?5, ?6, ?7, ?7, ?7, 0, ?8, ?9, ?10, ?11,
-                           NULL, ?12, ?13, 'direct', 'user', ?14, ?15)",
+                           NULL, ?12, ?13, 'direct', 'user', NULL, ?14)
+",
             )
             .bind(&new_id)
             .bind(product_id.as_str())
@@ -7558,7 +7543,6 @@ impl Database {
             .bind(&snapshot.base_branch)
             .bind(&snapshot.title)
             .bind(parent.llm_language.as_str())
-            .bind(scope_id.as_str())
             .bind(parent.service_tier.as_wire_name())
             .execute(&mut *tx)
             .await
@@ -9017,28 +9001,59 @@ impl Database {
                         tx.rollback().await?;
                         return Ok(CreationCasOutcome::ClaimLost);
                     }
-                    let environment_row = sqlx::query(
-                        "SELECT e.cwd, c.work_scope_id
+                    let conversation_row = sqlx::query(
+                        "SELECT c.work_scope_id
                          FROM conversations c
-                         JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id
                          WHERE c.id = ?1",
                     )
                     .bind(id)
                     .fetch_one(&mut *tx)
                     .await?;
-                    let persisted_environment_cwd: String = environment_row.get("cwd");
-                    let environment_cwd =
-                        update.cwd.as_deref().unwrap_or(&persisted_environment_cwd);
-                    let environment_scope =
-                        WorkScopeId::parse(environment_row.get::<String, _>("work_scope_id"))
+                    let environment_scope = if let Some(raw_scope_id) =
+                        conversation_row.get::<Option<String>, _>("work_scope_id")
+                    {
+                        let environment_scope = WorkScopeId::parse(raw_scope_id)
                             .map_err(|error| DbError::Serialization(error.to_string()))?;
-                    Self::update_work_scope_environment_tx(
-                        &mut tx,
-                        &environment_scope,
-                        Self::environment_for_mode(environment_cwd, &cm),
-                        &now,
-                    )
-                    .await?;
+                        let environment_row = sqlx::query(
+                            "SELECT cwd FROM work_scope_environments WHERE work_scope_id = ?1",
+                        )
+                        .bind(environment_scope.as_str())
+                        .fetch_one(&mut *tx)
+                        .await?;
+                        let persisted_environment_cwd: String = environment_row.get("cwd");
+                        let environment_cwd =
+                            update.cwd.as_deref().unwrap_or(&persisted_environment_cwd);
+                        Self::update_work_scope_environment_tx(
+                            &mut tx,
+                            &environment_scope,
+                            Self::environment_for_mode(environment_cwd, &cm),
+                            &now,
+                        )
+                        .await?;
+                        environment_scope
+                    } else {
+                        let environment_cwd = update.cwd.as_deref().ok_or_else(|| {
+                            DbError::Serialization(
+                                "cannot allocate work scope without a persisted cwd".to_string(),
+                            )
+                        })?;
+                        let (scope_id, authority_kind, environment) =
+                            Self::new_scope_for_conversation(environment_cwd, &cm);
+                        Self::insert_work_scope_tx(
+                            &mut tx,
+                            &scope_id,
+                            authority_kind,
+                            environment,
+                            &now,
+                        )
+                        .await?;
+                        sqlx::query("UPDATE conversations SET work_scope_id = ?1 WHERE id = ?2")
+                            .bind(scope_id.as_str())
+                            .bind(id)
+                            .execute(&mut *tx)
+                            .await?;
+                        scope_id
+                    };
 
                     let authority = match mode {
                         ConvMode::Explore { .. } => AuthorityKind::RestrictedExplore,
@@ -14259,6 +14274,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn approval_handoff_uses_consumed_reservation_as_immutable_root_evidence() {
         let db = Database::open_in_memory().await.unwrap();
         let reservation = ProductRootReservationRecord {
@@ -14296,6 +14312,37 @@ mod tests {
         )
         .await
         .unwrap();
+        let claimed = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-immutable-root".into()),
+                &CreationClaimToken("token-immutable-root".into()),
+                Utc::now(),
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(claimed_job) = claimed else {
+            panic!("claim immutable-root job");
+        };
+        let CreationStatus::Claimed(claim) = claimed_job.protocol.status else {
+            panic!("creation claim authority");
+        };
+        db.update_conversation_creation_metadata_and_mode(
+            &job.id,
+            &claim,
+            "conv-immutable-root",
+            &ConversationCreationMetadataUpdate {
+                cwd: Some("/tmp/immutable-root".to_string()),
+                ..Default::default()
+            },
+            &ConvMode::Direct,
+            "test-model",
+            CreationStage::ValidateIntent,
+            CreationStage::ResolveRepository,
+        )
+        .await
+        .unwrap();
+
         let attachment = attach_hidden_repository_for_test(
             &db,
             "conv-immutable-root",
@@ -21854,10 +21901,10 @@ mod tests {
             .create_task_approval_handoff_creation_job("handoff-parent", &approval)
             .await
             .unwrap();
-        let successor_scope = successor.attached_work_scope_id.clone().unwrap();
-        assert_ne!(successor_scope, parent.attached_work_scope_id.unwrap());
         assert!(matches!(successor.state, ConvState::Provisioning { .. }));
         assert_eq!(successor.conv_mode, ConvMode::Direct);
+        assert_eq!(successor.attached_work_scope_id, None);
+        assert!(parent.attached_work_scope_id.is_some());
         let job = db
             .get_conversation_creation_job_for_conversation(&successor.id)
             .await

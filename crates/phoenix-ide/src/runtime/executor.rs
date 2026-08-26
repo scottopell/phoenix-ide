@@ -8119,7 +8119,11 @@ where
         // pre-REQ-PROJ-028 Managed conversations cwd IS already the repo root.
         let repo_root =
             crate::git_ops::repo_root_from_phoenix_worktree(&cwd).unwrap_or_else(|| cwd.clone());
-        let conv_id = self.context.conversation_id.clone();
+        let worktree_identity = self
+            .storage
+            .get_product_conversation_id(&self.context.conversation_id)
+            .await
+            .map_err(|error| format!("Failed to load ProductConversation identity: {error}"))?;
         let desired_base_branch = self.context.desired_base_branch.clone();
         let tasks_dir_name = self.context.tasks_dir_name.clone();
         let storage = self.storage.clone();
@@ -8137,7 +8141,7 @@ where
                 execute_approve_task_blocking(
                     &cwd,
                     &repo_root,
-                    &conv_id,
+                    &worktree_identity,
                     &tasks_dir_name,
                     &task_file,
                     &title,
@@ -10008,6 +10012,13 @@ fn open_early_worktree_and_rename_branch(
             "Task approval retry found worktree already on approval branch; skipping rename"
         );
         return Ok((worktree_path, temp_branch));
+    }
+    if temp_branch == "HEAD" {
+        let target_branch = unique_task_approval_branch(repo_root, task_branch, "HEAD");
+        run_git(&worktree_path, &["switch", "-c", &target_branch]).map_err(|error| {
+            format!("Failed to attach detached approval worktree to '{target_branch}': {error}")
+        })?;
+        return Ok((worktree_path, target_branch));
     }
     if !temp_branch.starts_with("task-pending-") {
         return Err(format!(
@@ -14497,12 +14508,81 @@ mod approve_task_failure_effect_tests {
     use super::test_git_helpers::{add_explore_worktree, init_repo};
     use super::*;
     use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
+    use crate::runtime::TaskApprovalHandoffResponse;
     use crate::state_machine::state::{TaskApprovalHandoff, TaskApprovalOutcome};
     use crate::state_machine::{ConvContext, ConvState, Event};
     use crate::tools::BrowserSessionManager;
     use phoenix_llm::ModelRegistry;
     use std::sync::Arc;
     use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn fresh_handoff_approval_sends_parent_conversation_id_to_handoff_worker() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "fresh-handoff-parent";
+        let base_branch = "main";
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, base_branch);
+        let tasks_dir = explore_wt.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        let task_filename = "12345-p2-ready--fresh-handoff.md";
+        std::fs::write(tasks_dir.join(task_filename), "# Fix\n").unwrap();
+
+        let mut context = ConvContext::new(conv_id, explore_wt.clone(), "test-model", 200_000);
+        context.desired_base_branch = Some(base_branch.to_string());
+        let (_event_tx, event_rx) = mpsc::channel(32);
+        let event_tx_dup = mpsc::channel::<Event>(1).0;
+        let llm = Arc::new(MockLlmClient::new("test-model"));
+        let (handoff_tx, mut handoff_rx) = mpsc::channel(1);
+        let mut rt = ConversationRuntime::new(
+            context,
+            ConvState::AwaitingTaskApproval {
+                task_file: format!("tasks/{task_filename}"),
+                title: "Fresh handoff".to_string(),
+                priority: crate::task_source::Priority::P2,
+                plan: "Plan".to_string(),
+            },
+            Arc::new(InMemoryStorage::new()),
+            llm,
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx_dup,
+            SseBroadcaster::new(128, 0),
+        )
+        .with_fatal_local_authority_fence(crate::runtime::FatalLocalAuthorityFence::new())
+        .with_task_handoff_channel(handoff_tx);
+
+        let waiter = tokio::spawn(async move {
+            let request =
+                tokio::time::timeout(std::time::Duration::from_secs(5), handoff_rx.recv())
+                    .await
+                    .expect("handoff request timeout")
+                    .expect("handoff request");
+            let observed_parent_id = request.parent_conversation_id.clone();
+            request
+                .response_tx
+                .send(Ok(TaskApprovalHandoffResponse {
+                    successor_conv_id: "successor-1".to_string(),
+                    state_updated_at: chrono::Utc::now(),
+                }))
+                .expect("reply to runtime");
+            observed_parent_id
+        });
+
+        rt.process_event(Event::TaskApprovalDecided {
+            outcome: TaskApprovalOutcome::Approved {
+                handoff: TaskApprovalHandoff::StartFreshWorkConversation,
+            },
+        })
+        .await
+        .expect("fresh handoff approval should succeed");
+
+        assert_eq!(waiter.await.unwrap(), conv_id);
+    }
 
     #[tokio::test]
     async fn approval_failure_does_not_dispatch_llm() {

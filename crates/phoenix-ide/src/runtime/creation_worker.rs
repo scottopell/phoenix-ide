@@ -727,19 +727,25 @@ async fn provision_conversation(
                             base_branch,
                         })
                     } else if approved_task_creation {
-                        let worktree_path = create_detached_task_worktree_blocking(
+                        let approved_oid = approved_task_snapshot
+                            .as_ref()
+                            .expect("approved_task mode has reviewed snapshot")
+                            .approved_commit_oid
+                            .as_str();
+                        let detached_worktree_path = create_detached_task_worktree_blocking(
                             &repo_for_blocking,
                             &path_for_blocking,
-                            approved_task_snapshot
-                                .as_ref()
-                                .expect("approved_task mode has reviewed snapshot")
-                                .approved_commit_oid
-                                .as_str(),
+                            approved_oid,
                         )
                         .map_err(branch_worktree_error_to_kind)?;
+                        crate::git_ops::run_git(
+                            Path::new(&detached_worktree_path),
+                            &["switch", "-c", &branch_name],
+                        )
+                        .map_err(|error| (error, ErrorKind::ServerError))?;
                         Ok(BranchWorktreeInfo {
                             branch_name,
-                            worktree_path,
+                            worktree_path: detached_worktree_path,
                             base_branch: base_branch_for_blocking,
                         })
                     } else {
