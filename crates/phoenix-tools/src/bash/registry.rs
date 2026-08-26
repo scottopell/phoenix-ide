@@ -106,6 +106,57 @@ impl BashTeardownFence {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BashRetirementTarget {
+    pub handle_id: HandleId,
+    pub pgid: i32,
+    pub pid: Option<u32>,
+    pub kill_pending_kernel: bool,
+}
+
+#[derive(Debug)]
+pub struct BashRetirementPermit {
+    pub work_scope: ResourceScopeKey,
+    pub exact_process_groups: Vec<BashRetirementTarget>,
+    generation: BashTeardownGeneration,
+    had_handles: bool,
+    entry: Arc<RwLock<ResourceScopeKeyHandles>>,
+    removed_handles: Vec<Arc<Handle>>,
+}
+
+impl BashRetirementPermit {
+    #[must_use]
+    pub fn generation(&self) -> BashTeardownGeneration {
+        self.generation
+    }
+
+    fn into_removed_handles(self) -> Vec<Arc<Handle>> {
+        self.removed_handles
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BashRetirementOutcome {
+    Retired(CascadeBashReport),
+    AbsenceVerified(CascadeBashReport),
+}
+
+impl BashRetirementOutcome {
+    #[must_use]
+    pub fn report(&self) -> &CascadeBashReport {
+        match self {
+            Self::Retired(report) | Self::AbsenceVerified(report) => report,
+        }
+    }
+
+    #[must_use]
+    pub fn into_report(self) -> CascadeBashReport {
+        match self {
+            Self::Retired(report) | Self::AbsenceVerified(report) => report,
+        }
+    }
+}
+
 impl SpawnReservation {
     #[must_use]
     pub fn handle_id(&self) -> &HandleId {
@@ -690,14 +741,102 @@ impl BashHandleRegistry {
         }
     }
 
-    async fn drain_owner(
+    pub async fn begin_retirement(&self, work_scope: &ResourceScopeKey) -> BashRetirementPermit {
+        let Some(fence) = self.begin_teardown(work_scope).await else {
+            unreachable!("begin_teardown always installs or reuses a fenced owner table")
+        };
+        let removed_handles = {
+            let mut table = fence.entry.write().await;
+            table.take_all()
+        };
+        self.remove_from_global_index(&removed_handles).await;
+        let exact_process_groups = snapshot_retirement_targets(&removed_handles).await;
+        BashRetirementPermit {
+            work_scope: work_scope.clone(),
+            exact_process_groups,
+            generation: fence.generation(),
+            had_handles: !removed_handles.is_empty(),
+            entry: fence.entry,
+            removed_handles,
+        }
+    }
+
+    async fn verify_exact_absence(&self, permit: &BashRetirementPermit) -> BashRetirementOutcome {
+        let mut report = CascadeBashReport {
+            teardown_generation: Some(permit.generation()),
+            ..CascadeBashReport::default()
+        };
+        let table = permit.entry.read().await;
+        if table.teardown_started && table.teardown_generation == permit.generation().0 {
+            for target in &permit.exact_process_groups {
+                record_retirement_target_in_report(&mut report, target);
+            }
+            if permit.had_handles {
+                BashRetirementOutcome::Retired(report)
+            } else {
+                BashRetirementOutcome::AbsenceVerified(report)
+            }
+        } else {
+            BashRetirementOutcome::AbsenceVerified(report)
+        }
+    }
+
+    pub async fn complete_retirement(
+        &self,
+        permit: &BashRetirementPermit,
+    ) -> BashRetirementOutcome {
+        let mut report = CascadeBashReport {
+            teardown_generation: Some(permit.generation()),
+            ..CascadeBashReport::default()
+        };
+        {
+            let table = permit.entry.write().await;
+            if !table.teardown_started || table.teardown_generation != permit.generation().0 {
+                return BashRetirementOutcome::AbsenceVerified(report);
+            }
+            for target in &permit.exact_process_groups {
+                record_retirement_target_in_report(&mut report, target);
+                #[cfg(unix)]
+                {
+                    // SAFETY: kill(2) with negative pid signals the process group;
+                    // no memory implications. ESRCH (group already gone) is expected.
+                    let rc = unsafe { libc::kill(-target.pgid, libc::SIGKILL) };
+                    if rc != 0 {
+                        let err = std::io::Error::last_os_error();
+                        if err.raw_os_error() != Some(libc::ESRCH) {
+                            report.kill_failures.push((target.pgid, err.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+
+        let verified = self.verify_exact_absence(permit).await;
+        if permit.had_handles {
+            self.emit_lifecycle(
+                &permit.work_scope,
+                None,
+                BashLifecyclePhase::Terminal,
+                None,
+                Some(BashTerminalEffect::InventoryOnly),
+            );
+        }
+        match verified {
+            BashRetirementOutcome::Retired(_) => BashRetirementOutcome::Retired(report),
+            BashRetirementOutcome::AbsenceVerified(_) => {
+                BashRetirementOutcome::AbsenceVerified(report)
+            }
+        }
+    }
+
+    pub async fn remove(
         &self,
         work_scope: &ResourceScopeKey,
-    ) -> Option<(Arc<RwLock<ResourceScopeKeyHandles>>, BashTeardownGeneration)> {
-        let fence = self.begin_teardown(work_scope).await?;
-        let removed_handles = fence.entry.write().await.take_all();
-        self.remove_from_global_index(&removed_handles).await;
-
+    ) -> Option<Arc<RwLock<ResourceScopeKeyHandles>>> {
+        let removed_handles = self
+            .begin_retirement(work_scope)
+            .await
+            .into_removed_handles();
         let removed = Arc::new(RwLock::new(ResourceScopeKeyHandles::new()));
         {
             let mut table = removed.write().await;
@@ -705,16 +844,7 @@ impl BashHandleRegistry {
                 table.insert(handle);
             }
         }
-        Some((removed, fence.generation()))
-    }
-
-    pub async fn remove(
-        &self,
-        work_scope: &ResourceScopeKey,
-    ) -> Option<Arc<RwLock<ResourceScopeKeyHandles>>> {
-        self.drain_owner(work_scope)
-            .await
-            .map(|(removed, _)| removed)
+        Some(removed)
     }
 
     async fn remove_from_global_index(&self, handles: &[Arc<Handle>]) {
@@ -736,7 +866,7 @@ impl BashHandleRegistry {
 /// orchestrator logs at WARN; nothing here is fatal — the conversation
 /// row is removed regardless. The orchestrator already knows the
 /// `ResourceScopeKey` (it's an argument), so it is not duplicated here.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CascadeBashReport {
     /// pids that were live at snapshot time (informational; kills target
     /// the pgid). One per live handle.
@@ -810,46 +940,8 @@ pub async fn teardown_bash_owner(
     registry: &Arc<BashHandleRegistry>,
     work_scope: &ResourceScopeKey,
 ) -> CascadeBashReport {
-    let mut report = CascadeBashReport::default();
-    let Some((removed, generation)) = registry.drain_owner(work_scope).await else {
-        return report;
-    };
-    report.teardown_generation = Some(generation);
-    let handles: Vec<_> = removed.read().await.all().cloned().collect();
-
-    for h in &handles {
-        let Some(group_id) = h.live_pgid().await else {
-            continue;
-        };
-        let process_id = h.live_pid().await;
-        let kill_pending = h.is_kill_pending_kernel().await;
-        record_handle_in_report(&mut report, group_id, process_id, kill_pending);
-
-        #[cfg(unix)]
-        {
-            // SAFETY: kill(2) with negative pid signals the process group;
-            // no memory implications. ESRCH (group already gone) is expected.
-            let rc = unsafe { libc::kill(-group_id, libc::SIGKILL) };
-            if rc != 0 {
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() != Some(libc::ESRCH) {
-                    report.kill_failures.push((group_id, err.to_string()));
-                }
-            }
-        }
-    }
-
-    if !handles.is_empty() {
-        registry.emit_lifecycle(
-            work_scope,
-            None,
-            BashLifecyclePhase::Terminal,
-            None,
-            Some(BashTerminalEffect::InventoryOnly),
-        );
-    }
-
-    report
+    let permit = registry.begin_retirement(work_scope).await;
+    registry.complete_retirement(&permit).await.into_report()
 }
 
 async fn kill_selected_handles(
@@ -913,6 +1005,29 @@ fn record_handle_in_report(
     }
 }
 
+fn record_retirement_target_in_report(
+    report: &mut CascadeBashReport,
+    target: &BashRetirementTarget,
+) {
+    record_handle_in_report(report, target.pgid, target.pid, target.kill_pending_kernel);
+}
+
+async fn snapshot_retirement_targets(handles: &[Arc<Handle>]) -> Vec<BashRetirementTarget> {
+    let mut targets = Vec::new();
+    for handle in handles {
+        let Some(pgid) = handle.live_pgid().await else {
+            continue;
+        };
+        targets.push(BashRetirementTarget {
+            handle_id: handle.handle_id.clone(),
+            pgid,
+            pid: handle.live_pid().await,
+            kill_pending_kernel: handle.is_kill_pending_kernel().await,
+        });
+    }
+    targets
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -934,6 +1049,24 @@ mod tests {
             None,
             12345,
             12345,
+            ring_bytes_cap,
+        )
+    }
+
+    fn make_handle_with_process(
+        scope_name: &str,
+        id: &str,
+        pgid: i32,
+        pid: u32,
+        ring_bytes_cap: usize,
+    ) -> Arc<Handle> {
+        Handle::new_live(
+            scope(scope_name),
+            HandleId::new(id),
+            format!("cmd for {id}"),
+            None,
+            pgid,
+            pid,
             ring_bytes_cap,
         )
     }
@@ -1352,6 +1485,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn begin_retirement_snapshots_exact_handle_ids_and_pgids() {
+        let registry = BashHandleRegistry::new();
+        let owner = scope("conv-retire-snapshot");
+        let handles = registry.get_or_create(&owner).await;
+        {
+            let mut table = handles.write().await;
+            table.insert(make_handle_with_process(
+                "conv-retire-snapshot",
+                "b-1",
+                1111,
+                2111,
+                RING_BUFFER_BYTES,
+            ));
+            table.insert(make_handle_with_process(
+                "conv-retire-snapshot",
+                "b-2",
+                2222,
+                3222,
+                RING_BUFFER_BYTES,
+            ));
+        }
+
+        let permit = registry.begin_retirement(&owner).await;
+        let mut exact = permit.exact_process_groups.clone();
+        exact.sort_by(|a, b| a.handle_id.cmp(&b.handle_id));
+        assert_eq!(permit.work_scope, owner);
+        assert_eq!(exact.len(), 2);
+        assert_eq!(exact[0].handle_id, HandleId::new("b-1"));
+        assert_eq!(exact[0].pgid, 1111);
+        assert_eq!(exact[0].pid, Some(2111));
+        assert_eq!(exact[1].handle_id, HandleId::new("b-2"));
+        assert_eq!(exact[1].pgid, 2222);
+        assert_eq!(exact[1].pid, Some(3222));
+        assert!(registry.get_by_id(&HandleId::new("b-1")).await.is_none());
+        assert!(registry.get_by_id(&HandleId::new("b-2")).await.is_none());
+        assert!(matches!(
+            registry.reserve_spawn(&owner).await,
+            Err(BashHandleError::SpawnFenced)
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_retirement_permit_does_not_clear_newer_fence() {
+        let registry = BashHandleRegistry::new();
+        let owner = scope("conv-stale-retire");
+        let stale = registry.begin_retirement(&owner).await;
+        let current = registry.begin_retirement(&owner).await;
+
+        assert!(matches!(
+            registry.complete_retirement(&stale).await,
+            BashRetirementOutcome::AbsenceVerified(_)
+        ));
+        assert!(matches!(
+            registry.reserve_spawn(&owner).await,
+            Err(BashHandleError::SpawnFenced)
+        ));
+        assert!(matches!(
+            registry.complete_retirement(&current).await,
+            BashRetirementOutcome::AbsenceVerified(_)
+        ));
+    }
+
+    #[tokio::test]
     async fn work_scope_teardown_removes_coordinator_controlled_handle() {
         let registry = Arc::new(BashHandleRegistry::new());
         let lifecycle_scope = scope("inspected-work");
@@ -1557,6 +1753,121 @@ mod tests {
         assert!(report.live_handle_pgids.iter().all(|&p| p == 12345));
         assert!(report.kill_failures.is_empty(), "ESRCH must be swallowed");
         assert_eq!(registry.scope_count().await, 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::similar_names)]
+    async fn stale_retirement_permit_does_not_kill_replacement_process_group() {
+        use std::os::unix::process::CommandExt as _;
+        use std::os::unix::process::ExitStatusExt as _;
+        use std::process::Stdio;
+        use tokio::time::{sleep, Duration};
+
+        fn spawn_sleep() -> std::process::Child {
+            let mut cmd = std::process::Command::new("sleep");
+            cmd.arg("60");
+            cmd.stdin(Stdio::null());
+            cmd.stdout(Stdio::null());
+            cmd.stderr(Stdio::null());
+            unsafe {
+                cmd.pre_exec(|| {
+                    if libc::setpgid(0, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            cmd.spawn().expect("spawn sleep")
+        }
+
+        let registry = Arc::new(BashHandleRegistry::new());
+        let owner = scope("conv-replacement");
+
+        let mut stale_child = spawn_sleep();
+        #[allow(clippy::cast_possible_wrap)]
+        let stale_pgid = stale_child.id() as i32;
+        let stale_pid = stale_child.id();
+        registry
+            .register_existing_handle(
+                &owner,
+                Handle::new_live(
+                    owner.clone(),
+                    HandleId::new("b-stale"),
+                    "sleep 60".to_string(),
+                    None,
+                    stale_pgid,
+                    stale_pid,
+                    RING_BUFFER_BYTES,
+                ),
+            )
+            .await;
+
+        let stale = registry.begin_retirement(&owner).await;
+        assert!(
+            registry
+                .reopen_spawn_admission(&owner, stale.generation())
+                .await
+        );
+
+        let mut replacement_child = spawn_sleep();
+        #[allow(clippy::cast_possible_wrap)]
+        let replacement_pgid = replacement_child.id() as i32;
+        let replacement_pid = replacement_child.id();
+        registry
+            .register_existing_handle(
+                &owner,
+                Handle::new_live(
+                    owner.clone(),
+                    HandleId::new("b-replacement"),
+                    "sleep 60".to_string(),
+                    None,
+                    replacement_pgid,
+                    replacement_pid,
+                    RING_BUFFER_BYTES,
+                ),
+            )
+            .await;
+
+        let current = registry.begin_retirement(&owner).await;
+        let stale_outcome = registry.complete_retirement(&stale).await;
+        assert!(matches!(
+            stale_outcome,
+            BashRetirementOutcome::AbsenceVerified(_)
+        ));
+        assert!(
+            stale_child.try_wait().expect("try_wait stale").is_none(),
+            "stale permit must not kill any process group once a newer fence exists"
+        );
+        assert!(
+            replacement_child
+                .try_wait()
+                .expect("try_wait replacement")
+                .is_none(),
+            "stale permit must not kill replacement process group"
+        );
+
+        let current_outcome = registry.complete_retirement(&current).await;
+        assert!(matches!(current_outcome, BashRetirementOutcome::Retired(_)));
+        for _ in 0..20 {
+            if let Some(status) = replacement_child.try_wait().expect("try_wait replacement") {
+                assert_eq!(status.signal(), Some(libc::SIGKILL));
+                unsafe {
+                    let _ = libc::kill(stale_pgid, libc::SIGKILL);
+                }
+                let stale_status = stale_child.wait().expect("wait stale cleanup");
+                assert_eq!(stale_status.signal(), Some(libc::SIGKILL));
+                return;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        unsafe {
+            let _ = libc::kill(replacement_pgid, libc::SIGKILL);
+            let _ = libc::kill(stale_pgid, libc::SIGKILL);
+        }
+        let _ = replacement_child.wait();
+        let _ = stale_child.wait();
+        panic!("replacement subprocess survived current retirement SIGKILL within 1s");
     }
 
     #[cfg(unix)]
