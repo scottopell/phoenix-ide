@@ -41,6 +41,9 @@ use phoenix_core::domain::tool_wire::{
     BashStillRunningPayload, BashTombstonedPayload, BashWaiterPanickedPayload,
 };
 use phoenix_core::process_identity::current_process_identity;
+use phoenix_core::runtime_resource::{
+    RuntimeResourceAdmission, RuntimeResourceInstanceId, RuntimeResourceKind,
+};
 
 // ---------------------------------------------------------------------------
 // Configuration constants (REQ-BASH config)
@@ -596,7 +599,34 @@ async fn run_run(
         ring_bytes_cap,
         spawn_mode,
     ) {
-        Ok((handle, spawned)) => {
+        Ok((mut handle, spawned)) => {
+            if let (ResourceScopeKey::Work(scope), Some(authority)) = (
+                &spawn_context.lifecycle_scope,
+                ctx.runtime_resource_admission(),
+            ) {
+                let instance_id = RuntimeResourceInstanceId::new();
+                let admission = RuntimeResourceAdmission {
+                    instance_id: instance_id.clone(),
+                    scope: scope.clone(),
+                    kind: RuntimeResourceKind::Bash,
+                    launch_uuid: handle.launch_identity.launch_uuid.clone(),
+                    pid: Some(handle.launch_identity.process.pid),
+                    process_birth: Some(handle.launch_identity.process.start_time),
+                    pgid: handle.live_pgid().await,
+                    tmux_socket_path: None,
+                    tmux_server_token: None,
+                    browser_session_key: None,
+                    browser_audience: None,
+                    browser_profile_path: None,
+                };
+                if let Err(error) = authority.admit_runtime_resource(admission).await {
+                    return BashError::SpawnFailed {
+                        error_message: format!("durable bash admission failed: {error}"),
+                    }
+                    .into_tool_output();
+                }
+                handle = handle.with_runtime_resource_instance_id(instance_id);
+            }
             let inserted = match registry
                 .commit_spawn(&mut reservation, handle.clone())
                 .await

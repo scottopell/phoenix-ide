@@ -17,6 +17,7 @@ pub(crate) mod executor;
 pub(crate) mod fork_resolve;
 pub mod pr_status_poll;
 mod recovery;
+pub(crate) mod resource_admission;
 pub mod traits;
 pub mod usage_limit_sweep;
 pub mod user_facing_error;
@@ -5132,6 +5133,9 @@ impl RuntimeManager {
         };
         let runtime = runtime
             .with_wake_registrar(self.wake_registrar())
+            .with_runtime_resource_admission(Arc::new(
+                resource_admission::DatabaseRuntimeResourceAdmission::new(self.db.clone()),
+            ))
             .with_state_updated_at(initial_state_updated_at)
             .with_active_direct_turn(active_direct_turn)
             .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone())

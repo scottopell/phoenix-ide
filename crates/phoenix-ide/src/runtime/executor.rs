@@ -1574,6 +1574,8 @@ where
     /// LLM registry for `ToolContext`
     llm_registry: Arc<ModelRegistry>,
     wake_registrar: Option<Arc<dyn crate::tools::WakeRegistrar>>,
+    runtime_resource_admission:
+        Option<phoenix_core::runtime_resource::RuntimeResourceAdmissionAuthority>,
     /// Active PTY terminal sessions — passed to `ToolContext` for `read_terminal` tool.
     terminals: crate::terminal::ActiveTerminals,
     event_rx: mpsc::Receiver<Event>,
@@ -1859,6 +1861,7 @@ where
             tmux_registry,
             llm_registry,
             wake_registrar: None,
+            runtime_resource_admission: None,
             terminals,
             event_rx,
             event_tx,
@@ -1930,6 +1933,14 @@ where
         wake_registrar: Option<Arc<dyn crate::tools::WakeRegistrar>>,
     ) -> Self {
         self.wake_registrar = wake_registrar;
+        self
+    }
+
+    pub fn with_runtime_resource_admission(
+        mut self,
+        authority: phoenix_core::runtime_resource::RuntimeResourceAdmissionAuthority,
+    ) -> Self {
+        self.runtime_resource_admission = Some(authority);
         self
     }
 
@@ -7165,6 +7176,7 @@ where
         .with_root_conversation_id(self.context.root_conversation_id.clone())
         .with_tool_use_id(tool.id.clone())
         .with_wake_registrar(self.wake_registrar.clone())
+        .with_optional_runtime_resource_admission(self.runtime_resource_admission.clone())
         .with_llm_metrics_tx(llm_metrics_tx);
 
         let conv_id = self.context.conversation_id.clone();

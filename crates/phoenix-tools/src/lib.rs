@@ -417,6 +417,8 @@ pub struct ToolContext {
     bash_progress_sink: Option<Arc<dyn BashProgressSink>>,
     tool_use_id: Option<String>,
     wake_registrar: Option<Arc<dyn WakeRegistrar>>,
+    runtime_resource_admission:
+        Option<phoenix_core::runtime_resource::RuntimeResourceAdmissionAuthority>,
 }
 
 impl ToolContext {
@@ -508,6 +510,7 @@ impl ToolContext {
             bash_progress_sink: None,
             tool_use_id: None,
             wake_registrar: None,
+            runtime_resource_admission: None,
             llm_metrics_tx: None,
         }
     }
@@ -563,6 +566,7 @@ impl ToolContext {
             bash_progress_sink: None,
             tool_use_id: None,
             wake_registrar: None,
+            runtime_resource_admission: None,
         }
     }
 
@@ -588,6 +592,31 @@ impl ToolContext {
     pub fn with_wake_registrar(mut self, wake_registrar: Option<Arc<dyn WakeRegistrar>>) -> Self {
         self.wake_registrar = wake_registrar;
         self
+    }
+
+    #[must_use]
+    pub fn with_runtime_resource_admission(
+        mut self,
+        authority: phoenix_core::runtime_resource::RuntimeResourceAdmissionAuthority,
+    ) -> Self {
+        self.runtime_resource_admission = Some(authority);
+        self
+    }
+
+    #[must_use]
+    pub fn with_optional_runtime_resource_admission(
+        mut self,
+        authority: Option<phoenix_core::runtime_resource::RuntimeResourceAdmissionAuthority>,
+    ) -> Self {
+        self.runtime_resource_admission = authority;
+        self
+    }
+
+    #[must_use]
+    pub fn runtime_resource_admission(
+        &self,
+    ) -> Option<&phoenix_core::runtime_resource::RuntimeResourceAdmissionAuthority> {
+        self.runtime_resource_admission.as_ref()
     }
 
     #[must_use]
