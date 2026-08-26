@@ -598,6 +598,49 @@ pub(crate) enum PhoenixIgnoreStrategy {
     LocalExclude,
 }
 
+fn install_phoenix_ignore(cwd: &Path, ignore_strategy: PhoenixIgnoreStrategy) {
+    let result = match ignore_strategy {
+        PhoenixIgnoreStrategy::StageGitignore => ensure_gitignore_has_phoenix(cwd),
+        PhoenixIgnoreStrategy::LocalExclude => ensure_local_exclude_has_phoenix(cwd),
+    };
+    if let Err(e) = result {
+        tracing::warn!(error = %e, ?ignore_strategy, "Failed to ignore .phoenix/ (non-fatal)");
+    }
+}
+
+pub(crate) fn create_detached_worktree(
+    cwd: &Path,
+    target_path: &Path,
+    checkout_ref: &str,
+    ignore_strategy: PhoenixIgnoreStrategy,
+) -> Result<String, GitOpError> {
+    install_phoenix_ignore(cwd, ignore_strategy);
+    let parent = target_path.parent().ok_or_else(|| {
+        GitOpError::Io("detached worktree target has no parent directory".to_string())
+    })?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| GitOpError::Io(format!("Failed to create worktree parent: {error}")))?;
+    run_git(
+        cwd,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            target_path.to_string_lossy().as_ref(),
+            checkout_ref,
+        ],
+    )
+    .map_err(|e| {
+        cleanup_failed_worktree(cwd, target_path, None);
+        GitOpError::Git(format!(
+            "Failed to create detached worktree from '{checkout_ref}': {e}"
+        ))
+    })?;
+    prewarm_new_worktree(cwd, target_path);
+    Ok(target_path.to_string_lossy().to_string())
+}
+
+/// Create a git worktree at `.phoenix/worktrees/{conv_id}`.
 /// Create a git worktree at `.phoenix/worktrees/{conv_id}`.
 ///
 /// If `create_branch` is `Some((new_branch, start_point))`, creates a new branch
@@ -622,9 +665,7 @@ pub(crate) fn create_worktree(
     // below (staging a tracked file before the worktree exists has no benefit and
     // would dirty the index on a failed add).
     if ignore_strategy == PhoenixIgnoreStrategy::LocalExclude {
-        if let Err(e) = ensure_local_exclude_has_phoenix(cwd) {
-            tracing::warn!(error = %e, "Failed to ignore .phoenix/ via local exclude before worktree add (non-fatal)");
-        }
+        install_phoenix_ignore(cwd, ignore_strategy);
     }
 
     // 1. Create .phoenix/worktrees/ directory
@@ -681,9 +722,7 @@ pub(crate) fn create_worktree(
     //    LocalExclude already wrote its exclude entry BEFORE the add (above), so
     //    `.phoenix/` is ignored even if the add failed; nothing to do here.
     if ignore_strategy == PhoenixIgnoreStrategy::StageGitignore {
-        if let Err(e) = ensure_gitignore_has_phoenix(cwd) {
-            tracing::warn!(error = %e, "Failed to ignore .phoenix/ (non-fatal)");
-        }
+        install_phoenix_ignore(cwd, ignore_strategy);
     }
 
     Ok(worktree_path_str)

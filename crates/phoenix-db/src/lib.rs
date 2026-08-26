@@ -4998,6 +4998,42 @@ impl Database {
         Ok(())
     }
 
+    /// Persist a claimed creation's resolved intent before external materialization.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if serialization or the update fails.
+    pub async fn update_conversation_creation_job_intent(
+        &self,
+        job_id: &str,
+        claim: &CreationClaim,
+        intent: &ConversationCreationIntent,
+        now: DateTime<Utc>,
+    ) -> DbResult<CreationCasOutcome> {
+        let intent_json = serde_json::to_string(intent)
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let now = now.to_rfc3339();
+        let updated = sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET intent_json = ?1, updated_at = ?2
+             WHERE id = ?3 AND status = 'claimed' AND generation = ?4
+               AND claim_worker_id = ?5 AND claim_token = ?6 AND lease_until > ?2",
+        )
+        .bind(intent_json)
+        .bind(&now)
+        .bind(job_id)
+        .bind(claim_generation_i64(claim)?)
+        .bind(&claim.worker_id.0)
+        .bind(&claim.token.0)
+        .execute(&self.pool)
+        .await?;
+        Ok(if updated.rows_affected() == 1 {
+            CreationCasOutcome::Applied
+        } else {
+            CreationCasOutcome::ClaimLost
+        })
+    }
+
     /// Atomically transition a seeded-empty creation to Idle and ready.
     ///
     /// # Errors
@@ -6805,6 +6841,7 @@ impl Database {
             mode: Some("approved_task".to_string()),
             base_branch: Some(snapshot.base_branch.clone()),
             checkout_ref: Some(snapshot.branch_name.clone()),
+            reserved_checkout_oid: None,
             seed_parent_id: None,
             seed_label: Some(snapshot.title.clone()),
             approved_task: Some(snapshot.clone()),
@@ -12277,6 +12314,7 @@ fn cleared_creation_intent_json() -> String {
         "mode": null,
         "base_branch": null,
         "checkout_ref": null,
+        "reserved_checkout_oid": null,
         "seed_parent_id": null,
         "seed_label": null
     })
@@ -12755,6 +12793,7 @@ mod tests {
                 mode: None,
                 base_branch: None,
                 checkout_ref: None,
+                reserved_checkout_oid: None,
                 seed_parent_id: None,
                 seed_label: None,
                 approved_task: None,

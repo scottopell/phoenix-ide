@@ -70,8 +70,9 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   const ir = useInlineReferences({
     cwd: conv.cwd,
     discoveryReady: inlineReferenceRootReady,
-    mode: 'direct',
-    baseBranch: null,
+    resolution: conv.isGitDir
+      ? { kind: 'default_committed_tree' }
+      : { kind: 'direct' },
     // The new-conversation composer's identity is its directory: switching the
     // chosen directory resets the dropdown / inline error.
     scopeKey: conv.cwd,

@@ -107,7 +107,6 @@ describe('/new directory-first product conversation', () => {
       objective: 'Ship it',
       model: 'claude-3-5-sonnet',
       images: [],
-      settings: {},
     });
     expect(firstRequest).toHaveProperty('message_id');
     expect(firstRequest).toHaveProperty('conversation_id');
@@ -136,7 +135,6 @@ describe('/new directory-first product conversation', () => {
       objective: 'Ship it',
       model: 'claude-3-5-sonnet',
       images: [],
-      settings: {},
     });
     expect(Object.keys(secondRequest).sort()).toEqual(Object.keys(firstRequest).sort());
   });

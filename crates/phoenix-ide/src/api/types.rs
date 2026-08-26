@@ -56,8 +56,16 @@ pub struct CreateProductConversationRequest {
     pub message_id: String,
     #[serde(default)]
     pub images: Vec<ImageAttachment>,
-    #[serde(default, rename = "settings")]
-    pub _settings: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProductCreationResolutionQuery {
+    Direct,
+    DefaultCommittedTree {
+        #[serde(default)]
+        base_branch: Option<String>,
+    },
 }
 
 impl From<CreateProductConversationRequest> for CreateConversationRequest {
@@ -397,6 +405,12 @@ pub struct ProductConversationCreateAcceptedResponse {
     pub transcript_row_id: String,
 }
 
+#[derive(Debug)]
+pub(crate) struct InternalCreateConversationAcceptedResponse {
+    pub conversation: serde_json::Value,
+    pub product_conversation_id: Option<String>,
+}
+
 #[cfg(test)]
 mod create_product_conversation_request_tests {
     use super::CreateProductConversationRequest;
@@ -418,7 +432,6 @@ mod create_product_conversation_request_tests {
                     "objective":"Ship it",
                     "message_id":"msg-1",
                     "images":[],
-                    "settings":{{}},
                     "{field}":"legacy"
                 }}"#
             );
@@ -429,6 +442,48 @@ mod create_product_conversation_request_tests {
                 "missing field name in error: {err}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_unsupported_settings_field() {
+        let payload = r#"{
+            "conversation_id":"11111111-1111-1111-1111-111111111111",
+            "cwd":"/tmp/project",
+            "model":"claude-sonnet-4-5",
+            "objective":"Ship it",
+            "message_id":"msg-1",
+            "images":[],
+            "settings":{}
+        }"#;
+        let err = serde_json::from_str::<CreateProductConversationRequest>(payload)
+            .expect_err("settings field must be rejected");
+        assert!(
+            err.to_string().contains("settings"),
+            "missing field name in error: {err}"
+        );
+    }
+
+    #[test]
+    fn deserializes_direct_resolution_query() {
+        let resolution = serde_json::from_value::<super::ProductCreationResolutionQuery>(
+            serde_json::json!({ "kind": "direct" }),
+        )
+        .expect("direct query parses");
+        assert_eq!(resolution, super::ProductCreationResolutionQuery::Direct);
+    }
+
+    #[test]
+    fn deserializes_default_committed_tree_resolution_query() {
+        let resolution = serde_json::from_value::<super::ProductCreationResolutionQuery>(
+            serde_json::json!({ "kind": "default_committed_tree", "base_branch": "main" }),
+        )
+        .expect("default committed tree query parses");
+        assert_eq!(
+            resolution,
+            super::ProductCreationResolutionQuery::DefaultCommittedTree {
+                base_branch: Some("main".to_string()),
+            }
+        );
     }
 }
 
@@ -813,14 +868,8 @@ pub struct ProjectFileSearchQuery {
     pub q: String,
     /// Maximum number of results (default 50)
     pub limit: Option<usize>,
-    /// Resolved creation mode (`direct`/`managed`/`branch`). Together with
-    /// `base_branch` this selects the resolution root: branch/managed modes
-    /// search the chosen branch's committed tree (what the conversation's fresh
-    /// worktree will hold), so suggestions match create-time expansion.
-    /// Absent ⇒ Direct (search `cwd`).
-    pub mode: Option<String>,
-    /// Branch the conversation will be created on, for branch/managed modes.
-    pub base_branch: Option<String>,
+    #[serde(flatten)]
+    pub resolution: ProductCreationResolutionQuery,
 }
 
 /// A single code content search result.
@@ -883,13 +932,8 @@ pub struct SkillsResponse {
 pub struct ProjectSkillsQuery {
     /// Working directory to discover skills from.
     pub cwd: String,
-    /// Resolved creation mode (`direct`/`managed`/`branch`). With `base_branch`,
-    /// branch/managed modes discover skills from the chosen branch's committed
-    /// `.claude/skills` / `.agents/skills` (plus global + built-in), matching
-    /// what the conversation's worktree will expose. Absent ⇒ Direct (`cwd`).
-    pub mode: Option<String>,
-    /// Branch the conversation will be created on, for branch/managed modes.
-    pub base_branch: Option<String>,
+    #[serde(flatten)]
+    pub resolution: ProductCreationResolutionQuery,
 }
 
 /// A task file entry returned by the tasks list endpoint.

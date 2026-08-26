@@ -13,7 +13,7 @@ use fs2::FileExt;
 use phoenix_core::domain::creation_protocol::{
     CreationClaimToken, CreationStatus, CreationWorkerId,
 };
-use phoenix_core::domain::db_schema::ConversationCreationProfile;
+use phoenix_core::domain::db_schema::{ConversationCreationIntent, ConversationCreationProfile};
 use phoenix_llm::ModelRegistry;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -156,6 +156,48 @@ pub(crate) async fn drain_pending_jobs(manager: &Arc<RuntimeManager>) -> Result<
         },
     )
     .await
+}
+
+#[cfg(test)]
+type StartPointResolver = fn(&Path) -> Option<crate::git_start::GitStartPoint>;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_DEFAULT_START_RESOLVER: std::cell::RefCell<Option<StartPointResolver>> =
+        std::cell::RefCell::new(None);
+}
+
+fn resolve_default_task_start_point(repo_root: &Path) -> Option<crate::git_start::GitStartPoint> {
+    #[cfg(test)]
+    {
+        if let Some(start) =
+            TEST_DEFAULT_START_RESOLVER.with(|slot| slot.borrow().as_ref().copied())
+        {
+            return start(repo_root);
+        }
+    }
+    crate::git_start::GitStartPoint::for_default_task_start(repo_root)
+}
+
+#[cfg(test)]
+fn with_test_default_start_resolver<R>(resolver: StartPointResolver, f: impl FnOnce() -> R) -> R {
+    TEST_DEFAULT_START_RESOLVER.with(|slot| {
+        let previous = slot.replace(Some(resolver));
+        let result = f();
+        slot.replace(previous);
+        result
+    })
+}
+
+fn reserved_checkout_ref(
+    intent: &ConversationCreationIntent,
+    start_point: &crate::git_start::GitStartPoint,
+) -> String {
+    intent
+        .reserved_checkout_oid
+        .clone()
+        .or_else(|| start_point.reserved_oid().map(ToOwned::to_owned))
+        .unwrap_or_else(|| start_point.checkout_ref().to_string())
 }
 
 fn missing_repository_and_resource(repo: &Path, resource: &Path) -> bool {
@@ -848,9 +890,22 @@ async fn provision_conversation(
         (directory_first_product, product_conversation_id.as_ref())
     {
         if let Some(repo_root) = repo_root.clone() {
-            let start_point = crate::git_start::GitStartPoint::for_default_task_start(Path::new(
-                &repo_root,
-            ))
+            let repo_for_resolution = repo_root.clone();
+            let resolution_admission = acquire_creation_admission(
+                manager,
+                "default branch resolution rejected after fatal local authority closure",
+            )?;
+            let start_point = run_admitted_blocking(resolution_admission, move || {
+                let _lock = RepositoryMutationLock::acquire(&repo_for_resolution).ok()?;
+                resolve_default_task_start_point(Path::new(&repo_for_resolution))
+            })
+            .await
+            .map_err(|e| {
+                (
+                    format!("spawn_blocking failed: {e}"),
+                    ErrorKind::ServerError,
+                )
+            })?
             .ok_or_else(|| {
                 (
                     "Could not determine canonical default branch for directory-first ProductConversation"
@@ -859,8 +914,44 @@ async fn provision_conversation(
                 )
             })?;
             let existing_path = deterministic_worktree_path(&repo_root, product_conversation_id);
-            let canonical_default_ref = start_point.checkout_ref().to_string();
+            let canonical_default_ref = reserved_checkout_ref(&job.intent, &start_point);
             let canonical_default_branch = start_point.logical_base().to_string();
+            if job.intent.reserved_checkout_oid.is_none() {
+                let reserved_oid = start_point.reserved_oid().ok_or_else(|| {
+                    (
+                        "Could not resolve canonical default commit OID for directory-first ProductConversation"
+                            .to_string(),
+                        ErrorKind::ServerError,
+                    )
+                })?;
+                let _admitted = acquire_creation_admission(
+                    manager,
+                    "reserved checkout OID persistence rejected after fatal local authority closure",
+                )?;
+                let updated_intent = ConversationCreationIntent {
+                    reserved_checkout_oid: Some(reserved_oid.to_string()),
+                    ..job.intent.clone()
+                };
+                let outcome = manager
+                    .db()
+                    .update_conversation_creation_job_intent(
+                        &job.id,
+                        &claim,
+                        &updated_intent,
+                        chrono::Utc::now(),
+                    )
+                    .await
+                    .map_err(|error| (error.to_string(), ErrorKind::ServerError))?;
+                if matches!(outcome, crate::db::CreationCasOutcome::ClaimLost) {
+                    return Err((
+                        "creation claim was lost before reserved checkout OID persistence"
+                            .to_string(),
+                        ErrorKind::Cancelled,
+                    )
+                        .into());
+                }
+                job.intent = updated_intent;
+            }
             checkpoint_creation_stage(
                 manager,
                 job,
@@ -1507,6 +1598,7 @@ mod temporary_creation_branch_tests {
                 mode: None,
                 base_branch: None,
                 checkout_ref: None,
+                reserved_checkout_oid: None,
                 seed_parent_id: None,
                 seed_label: None,
                 approved_task: None,
@@ -1954,6 +2046,45 @@ mod directory_first_product_worktree_tests {
             .expect_err("branched worktree must be rejected");
         assert_eq!(error.1, ErrorKind::InvalidRequest);
     }
+
+    #[test]
+    fn replay_accepts_reserved_oid_after_remote_branch_advances() {
+        let root = init_repo_with_origin_default();
+        let repo = root.path().join("clone");
+        let repo_str = repo.to_string_lossy().to_string();
+        let reserved_oid = crate::git_ops::run_git(&repo, &["rev-parse", "origin/main"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let remote_checkout = root.path().join("advance");
+        crate::git_ops::run_git(
+            root.path(),
+            &[
+                "clone",
+                root.path().join("remote.git").to_str().unwrap(),
+                remote_checkout.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        crate::git_ops::run_git(
+            &remote_checkout,
+            &["config", "user.email", "test@example.com"],
+        )
+        .unwrap();
+        crate::git_ops::run_git(&remote_checkout, &["config", "user.name", "Test User"]).unwrap();
+        std::fs::write(remote_checkout.join("README.md"), "advanced\n").unwrap();
+        crate::git_ops::run_git(&remote_checkout, &["add", "README.md"]).unwrap();
+        crate::git_ops::run_git(&remote_checkout, &["commit", "-m", "advance"]).unwrap();
+        crate::git_ops::run_git(&remote_checkout, &["push", "origin", "main"]).unwrap();
+        crate::git_ops::run_git(&repo, &["fetch", "origin", "main"]).unwrap();
+
+        let worktree =
+            create_directory_first_product_worktree_blocking(&repo_str, "prod-oid", &reserved_oid)
+                .expect("worktree pinned to reserved oid");
+        validate_detached_worktree_at_ref(Path::new(&worktree), &reserved_oid)
+            .expect("matching detached reserved oid");
+    }
 }
 
 #[cfg(test)]
@@ -1980,6 +2111,99 @@ mod existing_message_recovery_tests {
         assert!(creation_state_allows_existing_message_completion(
             &ConvState::Idle
         ));
+    }
+}
+
+#[cfg(test)]
+mod default_branch_reservation_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn directory_first_product_worktree_installs_ignore_before_detach_add() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::git_ops::run_git(repo.path(), &["init", "--quiet", "--initial-branch=main"])
+            .unwrap();
+        crate::git_ops::run_git(repo.path(), &["config", "user.email", "probe@test"]).unwrap();
+        crate::git_ops::run_git(repo.path(), &["config", "user.name", "probe"]).unwrap();
+        std::fs::write(repo.path().join("README.md"), "one").unwrap();
+        crate::git_ops::run_git(repo.path(), &["add", "."]).unwrap();
+        crate::git_ops::run_git(repo.path(), &["commit", "-q", "-m", "init"]).unwrap();
+
+        let repo_str = repo.path().to_string_lossy().to_string();
+        let wt =
+            create_directory_first_product_worktree_blocking(&repo_str, "prod-ig", "main").unwrap();
+        let status = crate::git_ops::run_git(repo.path(), &["status", "--short"]).unwrap();
+        assert!(
+            !status.contains(".phoenix"),
+            ".phoenix should be ignored: {status:?}"
+        );
+        assert!(std::path::Path::new(&wt).exists());
+    }
+
+    #[test]
+    fn reserved_checkout_ref_prefers_persisted_oid_for_replay() {
+        let start = crate::git_start::GitStartPoint::new("main", "origin/main", "origin/main");
+        let intent = ConversationCreationIntent {
+            cwd: "/tmp".to_string(),
+            profile: Some(ConversationCreationProfile::DirectoryFirstProduct),
+            model: None,
+            effort: None,
+            text: String::new(),
+            expansion_preflighted: false,
+            llm_text: None,
+            skill_invocation: None,
+            message_id: String::new(),
+            images: vec![],
+            files: vec![],
+            mode: None,
+            base_branch: None,
+            checkout_ref: None,
+            reserved_checkout_oid: Some("deadbeef".repeat(5)),
+            seed_parent_id: None,
+            seed_label: None,
+            approved_task: None,
+        };
+        assert_eq!(reserved_checkout_ref(&intent, &start), "deadbeef".repeat(5));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn default_start_resolution_runs_in_blocking_lane_without_stalling_heartbeat() {
+        let renewals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_renewals = Arc::clone(&renewals);
+        let (close_tx, close_rx) = tokio::sync::oneshot::channel();
+
+        let worker = tokio::spawn(process_claimed_job_until_closed(
+            || async move {
+                let _ = tokio::task::spawn_blocking(|| {
+                    with_test_default_start_resolver(
+                        |_| {
+                            // test-timing-allow: deliberate long blocking resolver proves claim heartbeat runs on the async lane.
+                            std::thread::sleep(std::time::Duration::from_secs(30));
+                            Some(crate::git_start::GitStartPoint::new("main", "main", "main"))
+                        },
+                        || resolve_default_task_start_point(Path::new("/tmp")),
+                    )
+                })
+                .await
+                .unwrap();
+                Ok(CreationDrainControl::Continue)
+            },
+            move || {
+                observed_renewals.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                async { Ok(crate::db::CreationCasOutcome::Applied) }
+            },
+            || async move {
+                close_rx.await.unwrap();
+            },
+        ));
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(11)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(renewals.load(std::sync::atomic::Ordering::Acquire), 1);
+        close_tx.send(()).unwrap();
+        let _ = worker.await.unwrap();
     }
 }
 
@@ -2016,15 +2240,11 @@ fn create_directory_first_product_worktree_blocking(
 ) -> Result<String, (String, ErrorKind)> {
     let repo = Path::new(repo_root);
     let worktree_path = deterministic_worktree_path(repo_root, product_conversation_id);
-    crate::git_ops::run_git(
+    crate::git_ops::create_detached_worktree(
         repo,
-        &[
-            "worktree",
-            "add",
-            "--detach",
-            &worktree_path.to_string_lossy(),
-            checkout_ref,
-        ],
+        &worktree_path,
+        checkout_ref,
+        crate::git_ops::PhoenixIgnoreStrategy::StageGitignore,
     )
     .map_err(|error| {
         (
@@ -2033,8 +2253,7 @@ fn create_directory_first_product_worktree_blocking(
             ),
             ErrorKind::ServerError,
         )
-    })?;
-    Ok(worktree_path.to_string_lossy().to_string())
+    })
 }
 
 fn validate_detached_worktree_at_ref(

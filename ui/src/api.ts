@@ -712,10 +712,6 @@ export interface ImageData {
   media_type: string;
 }
 
-export interface ProductConversationCreateSettings {
-  [key: string]: unknown;
-}
-
 export interface CreateProductConversationRequest {
   cwd: string;
   objective: string;
@@ -724,7 +720,6 @@ export interface CreateProductConversationRequest {
   model: string;
   effort?: ModelEffort | null;
   images: ImageData[];
-  settings: ProductConversationCreateSettings;
 }
 
 export interface CreateProductConversationResponse {
@@ -1136,24 +1131,15 @@ export type CodexLoginStatus =
   | { kind: 'success'; account_id: string | null; auth_path: string }
   | { kind: 'error'; message: string };
 
-/**
- * Selects the root that directory-scoped discovery (`@file` / `/skill`)
- * resolves against, for the new-conversation composer. `mode`/`baseBranch`
- * mirror the create-time submission: a branch/managed workflow discovers
- * against the chosen branch's committed tree (what its worktree will hold),
- * so suggestions match what create-time expansion can resolve. Omitted ⇒
- * Direct (the working directory).
- */
-export interface ProjectResolutionOpts {
-  // Explicit `| undefined` so a caller can pass `{ mode: undefined }` under
-  // exactOptionalPropertyTypes (the in-conversation composer leaves these unset).
-  mode?: 'direct' | 'managed' | 'branch' | undefined;
-  baseBranch?: string | null | undefined;
-}
+export type ProductCreationResolution =
+  | { kind: 'direct' }
+  | { kind: 'default_committed_tree'; baseBranch?: string | null };
 
-function applyResolutionOpts(params: URLSearchParams, opts?: ProjectResolutionOpts): void {
-  if (opts?.mode) params.set('mode', opts.mode);
-  if (opts?.baseBranch) params.set('base_branch', opts.baseBranch);
+function applyResolutionOpts(params: URLSearchParams, opts?: ProductCreationResolution): void {
+  params.set('kind', opts?.kind ?? 'direct');
+  if (opts?.kind === 'default_committed_tree' && opts.baseBranch) {
+    params.set('base_branch', opts.baseBranch);
+  }
 }
 
 export type ServiceStatus = 'healthy' | 'stale';
@@ -2113,7 +2099,7 @@ export const api = {
    */
   async listProjectSkills(
     cwd: string,
-    opts?: ProjectResolutionOpts,
+    opts?: ProductCreationResolution,
     signal?: AbortSignal,
   ): Promise<{ skills: SkillEntry[] }> {
     const params = new URLSearchParams({ cwd });
@@ -2201,7 +2187,7 @@ export const api = {
     cwd: string,
     query: string,
     limit = 50,
-    opts?: ProjectResolutionOpts,
+    opts?: ProductCreationResolution,
     signal?: AbortSignal,
   ): Promise<{ items: FileSearchEntry[] }> {
     const params = new URLSearchParams({ cwd, q: query, limit: String(limit) });

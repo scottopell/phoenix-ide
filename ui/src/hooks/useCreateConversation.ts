@@ -235,7 +235,6 @@ export function useCreateConversation(navigate: (path: string) => void) {
         model: selectedModel,
         effort: selectedEffort,
         images,
-        settings: {},
       });
       setDraft('');
       setImages([]);
