@@ -41,10 +41,6 @@ pub struct CloseAdmissionFence {
     pub phase: ClosePhase,
 }
 
-/// The only admission decision a product-aggregate operation may observe.
-///
-/// Callers must make this decision inside their owning write transaction; an
-/// observation made before that transaction is not an admission capability.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProductConversationAdmission {
     Accepted {
@@ -85,12 +81,25 @@ pub(crate) async fn admit_product_conversation_operation_tx(
         product_conversation_id,
         "conversations.product_conversation_id",
     )?;
-    let lifecycle: Option<String> =
-        sqlx::query_scalar("SELECT ordinary_lifecycle FROM product_conversations WHERE id = ?1")
+    let aggregate =
+        sqlx::query("SELECT kind, ordinary_lifecycle FROM product_conversations WHERE id = ?1")
             .bind(product_conversation_id.as_str())
             .fetch_optional(&mut **tx)
-            .await?;
-    if lifecycle.as_deref() == Some("history") {
+            .await?
+            .ok_or_else(|| {
+                DbError::Serialization(format!(
+                    "missing product conversation {}",
+                    product_conversation_id.as_str()
+                ))
+            })?;
+    let kind: String = aggregate.try_get("kind")?;
+    if kind == "coordinator" {
+        return Ok(ProductConversationAdmission::Accepted {
+            product_conversation_id,
+        });
+    }
+    let lifecycle: String = aggregate.try_get("ordinary_lifecycle")?;
+    if lifecycle == "history" {
         return Ok(ProductConversationAdmission::History(
             product_conversation_id,
         ));
@@ -893,10 +902,6 @@ fn encode_aggregate_snapshot_component<'a>(
 // close-foundation precondition/not-found errors enforced by this module.
 #[allow(clippy::missing_errors_doc)]
 impl Database {
-    /// Resolve an aggregate's current fence for diagnostics and recovery.
-    ///
-    /// This read does not grant admission. Mutating callers must instead call
-    /// [`admit_product_conversation_operation_tx`] in their own write transaction.
     pub async fn product_conversation_admission(
         &self,
         conversation_id: &str,
@@ -2953,6 +2958,21 @@ mod tests {
             db.product_conversation_admission("root").await.unwrap(),
             ProductConversationAdmission::Accepted { product_conversation_id }
                 if product_conversation_id == product_id("root")
+        ));
+    }
+
+    #[tokio::test]
+    async fn product_conversation_admission_accepts_coordinator_without_ordinary_lifecycle() {
+        let db = Database::open_in_memory().await.unwrap();
+        let coordinator = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            db.product_conversation_admission(&coordinator.id).await.unwrap(),
+            ProductConversationAdmission::Accepted { product_conversation_id }
+                if product_conversation_id == coordinator.product_conversation_id
         ));
     }
 
