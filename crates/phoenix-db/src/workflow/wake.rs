@@ -3546,7 +3546,10 @@ async fn exact_replay_is_live_tx(
 ) -> DbResult<bool> {
     sqlx::query_scalar(
         "SELECT c.archived = 0
-         AND c.state_kind NOT IN ('terminal', 'completed', 'failed', 'creation_failed', 'creation_cancelled')
+         AND c.state_kind NOT IN (
+             'terminal', 'completed', 'failed', 'creation_failed', 'creation_cancelled',
+             'context_exhausted', 'handed_off'
+         )
          AND w.status = 'Active'
          AND NOT EXISTS (
              SELECT 1 FROM wake_terminal_receipts terminal
@@ -6463,30 +6466,42 @@ mod tests {
 
     #[tokio::test]
     async fn close_fence_refuses_exact_replay_after_conversation_registration_fence_closes() {
-        let (_dir, repo, _) = open_repo_pair().await;
-        let db =
-            crate::Database::from_pool_for_tests(repo.workflow_repo.pool.clone(), String::new());
-        let input = intent();
-        assert!(matches!(
-            repo.register(&input, "exact", Timestamp(10)).await.unwrap(),
-            WakeRegistrationOutcome::Registered { .. }
-        ));
-        let product_conversation_id = db
-            .get_conversation("conv-1")
-            .await
-            .unwrap()
-            .product_conversation_id;
-        db.begin_close_foundation(&product_conversation_id, "wake-registration-fence")
-            .await
-            .unwrap();
-        db.update_conversation_state("conv-1", &crate::ConvState::Terminal)
-            .await
-            .unwrap();
+        for state in [
+            crate::ConvState::ContextExhausted {
+                summary: "exhausted".to_string(),
+            },
+            crate::ConvState::HandedOff {
+                successor_conv_id: "successor".to_string(),
+            },
+            crate::ConvState::Terminal,
+        ] {
+            let (_dir, repo, _) = open_repo_pair().await;
+            let db = crate::Database::from_pool_for_tests(
+                repo.workflow_repo.pool.clone(),
+                String::new(),
+            );
+            let input = intent();
+            assert!(matches!(
+                repo.register(&input, "exact", Timestamp(10)).await.unwrap(),
+                WakeRegistrationOutcome::Registered { .. }
+            ));
+            let product_conversation_id = db
+                .get_conversation("conv-1")
+                .await
+                .unwrap()
+                .product_conversation_id;
+            db.begin_close_foundation(&product_conversation_id, "wake-registration-fence")
+                .await
+                .unwrap();
+            db.update_conversation_state("conv-1", &state)
+                .await
+                .unwrap();
 
-        assert!(matches!(
-            repo.register(&input, "exact", Timestamp(10)).await.unwrap_err(),
-            DbError::ProductConversationUnavailable(id) if id == product_conversation_id
-        ));
+            assert!(matches!(
+                repo.register(&input, "exact", Timestamp(10)).await.unwrap_err(),
+                DbError::ProductConversationUnavailable(id) if id == product_conversation_id
+            ));
+        }
     }
 
     #[tokio::test]
