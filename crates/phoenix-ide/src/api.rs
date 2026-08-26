@@ -101,12 +101,6 @@ pub struct AppState {
     pub resource_monitor: Arc<resource_monitor::ResourceMonitor>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct AgentFacingWakeRegistrationAvailable(bool);
-
-const AGENT_FACING_WAKE_REGISTRATION: AgentFacingWakeRegistrationAvailable =
-    AgentFacingWakeRegistrationAvailable(false);
-
 async fn reconcile_startup_continuations(
     runtime: &Arc<RuntimeManager>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -123,6 +117,13 @@ async fn reconcile_startup_continuations(
         .map_err(std::io::Error::other)?;
     if resumed > 0 {
         tracing::info!(resumed, "resumed persisted continuation operations");
+    }
+    let settled = runtime
+        .resume_pending_close_settlements()
+        .await
+        .map_err(std::io::Error::other)?;
+    if settled > 0 {
+        tracing::info!(settled, "recovered pending Close active-work settlements");
     }
     Ok(())
 }
@@ -178,18 +179,15 @@ impl AppState {
             .await;
         runtime.start_direct_turn_worker().await?;
         runtime.require_startup_local_authority()?;
-        if AGENT_FACING_WAKE_REGISTRATION.0 {
-            runtime
-                .start_wake_worker()
-                .await
-                .map_err(std::io::Error::other)?;
-            runtime.require_startup_local_authority()?;
-        }
+        runtime
+            .start_wake_worker()
+            .await
+            .map_err(std::io::Error::other)?;
+        runtime.require_startup_local_authority()?;
+        reconcile_startup_continuations(&runtime).await?;
         runtime.require_startup_local_authority()?;
         tokio::spawn(crate::runtime::pr_status_poll::run(runtime.clone()));
         runtime.start_creation_worker().await?;
-        runtime.require_startup_local_authority()?;
-        reconcile_startup_continuations(&runtime).await?;
         runtime.require_startup_local_authority()?;
         handlers::start_attachment_cleanup_task(db.clone(), Arc::clone(&runtime));
         let terminals = runtime.terminals.clone();

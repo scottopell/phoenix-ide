@@ -1607,6 +1607,13 @@ rule CloseObligationUserConfirmsStopWork {
     ensures: CloseSettlementRequested(product_conversation, attempt_id)
 }
 
+rule CloseSettlementCapturesExactDirectTurnTargets {
+    when: CloseSettlementRequested(product_conversation, attempt_id)
+    requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = settling_active_work
+    ensures: CloseDirectTurnSettlementTargetsCaptured(product_conversation, attempt_id)
+    ensures: not AdditionalCloseDirectTurnSettlementTargetMayBeCaptured(product_conversation, attempt_id)
+}
+
 rule CloseObligationCanBeCancelledBeforeSettlementStarts {
     when: UserCancelsClose(product_conversation, attempt_id)
     requires: CloseObligation.exists(product_conversation: product_conversation, attempt_id: attempt_id)
@@ -1653,6 +1660,15 @@ rule CloseObligationBeginsSettlementWithoutBusyWork {
 rule CloseObligationWaitsForSettlement {
     when: CloseSettlementProgressed(product_conversation, attempt_id)
     requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in { settling_active_work, cancel_requested_during_settlement }
+    requires: exists UnreceivedCloseDirectTurnSettlementTarget(product_conversation, attempt_id)
+    ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase
+}
+
+rule CloseObligationWaitsForOtherSettlementAuthority {
+    when: CloseSettlementProgressed(product_conversation, attempt_id)
+    requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = settling_active_work
+    requires: CloseDirectTurnSettlementTargetsCaptured(product_conversation, attempt_id)
+    requires: not exists UnreceivedCloseDirectTurnSettlementTarget(product_conversation, attempt_id)
     requires: not all_close_owned_authorities_released(product_conversation)
     ensures: CloseSettlementStillOwed(product_conversation)
 
@@ -1666,6 +1682,8 @@ rule CloseObligationWaitsForSettlement {
 rule CloseObligationRequestsRetirementInspectionAfterSettlement {
     when: CloseSettlementProgressed(product_conversation, attempt_id)
     requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = settling_active_work
+    requires: CloseDirectTurnSettlementTargetsCaptured(product_conversation, attempt_id)
+    requires: not exists UnreceivedCloseDirectTurnSettlementTarget(product_conversation, attempt_id)
     requires: all_close_owned_authorities_released(product_conversation)
     ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_retirement_inspection
     ensures: RetirementInspectionRequested(product_conversation, attempt_id)
@@ -1674,6 +1692,8 @@ rule CloseObligationRequestsRetirementInspectionAfterSettlement {
 rule CloseSettlementCancellationCompletesAfterBusyOwnershipReleased {
     when: CloseSettlementProgressed(product_conversation, attempt_id)
     requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = cancel_requested_during_settlement
+    requires: CloseDirectTurnSettlementTargetsCaptured(product_conversation, attempt_id)
+    requires: not exists UnreceivedCloseDirectTurnSettlementTarget(product_conversation, attempt_id)
     requires: all_close_owned_authorities_released(product_conversation)
     ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = completed
     ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.outcome = cancelled

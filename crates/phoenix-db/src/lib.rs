@@ -55,6 +55,9 @@ pub use sqlite_workload::{
 };
 pub use workflow::*;
 
+/// Maximum pending steering entries permitted per conversation.
+pub const MAX_STEERING_QUEUE_DEPTH: usize = 5;
+
 use chrono::{DateTime, Utc};
 use phoenix_core::domain::llm_types::{
     EffectiveEffort, EffortSource, LlmAttemptMetrics, LlmAttemptOutcome, LlmTransport, ModelEffort,
@@ -177,6 +180,14 @@ pub enum DbError {
     ContinuationPrecondition(String),
     #[error("Close foundation conflict: {0}")]
     CloseFoundationConflict(String),
+    #[error("new aggregate work is fenced by Close attempt {0:?}")]
+    CloseAdmissionFenced(CloseAdmissionFence),
+    #[error("ProductConversation {0} is unavailable because it is in History")]
+    ProductConversationUnavailable(
+        phoenix_core::domain::product_conversation::ProductConversationId,
+    ),
+    #[error("steering queue is full")]
+    SteeringQueueFull,
     #[error("Close foundation precondition failed: {0}")]
     CloseFoundationPrecondition(String),
     #[error("Close foundation repair required: {0:?}")]
@@ -1247,6 +1258,42 @@ impl SubAgentCreationTestLatch {
     }
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct CloseFoundationTestLatch {
+    pub transaction_entered: tokio::sync::Notify,
+    pub release_transaction: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl CloseFoundationTestLatch {
+    pub(crate) fn new() -> Self {
+        Self {
+            transaction_entered: tokio::sync::Notify::new(),
+            release_transaction: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct SteeringBeginTestLatch {
+    before_begin: tokio::sync::Notify,
+    allow_begin: tokio::sync::Notify,
+    begin_called: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl SteeringBeginTestLatch {
+    fn new() -> Self {
+        Self {
+            before_begin: tokio::sync::Notify::new(),
+            allow_begin: tokio::sync::Notify::new(),
+            begin_called: tokio::sync::Notify::new(),
+        }
+    }
+}
+
 pub struct Database {
     pool: SqlitePool,
     sqlite_workload_collector: SqliteWorkloadCollector,
@@ -1257,6 +1304,10 @@ pub struct Database {
         std::sync::Arc<git_repository_reconciliation::DormantGitRepositoryCatchupAuthorityState>,
     #[cfg(test)]
     sub_agent_creation_test_latch: Option<std::sync::Arc<SubAgentCreationTestLatch>>,
+    #[cfg(test)]
+    pub(crate) close_foundation_test_latch: Option<std::sync::Arc<CloseFoundationTestLatch>>,
+    #[cfg(test)]
+    steering_begin_test_latch: Option<std::sync::Arc<SteeringBeginTestLatch>>,
 }
 
 impl Clone for Database {
@@ -1270,6 +1321,10 @@ impl Clone for Database {
                 .clone(),
             #[cfg(test)]
             sub_agent_creation_test_latch: self.sub_agent_creation_test_latch.clone(),
+            #[cfg(test)]
+            close_foundation_test_latch: self.close_foundation_test_latch.clone(),
+            #[cfg(test)]
+            steering_begin_test_latch: self.steering_begin_test_latch.clone(),
         }
     }
 }
@@ -1480,6 +1535,10 @@ impl Database {
             ),
             #[cfg(test)]
             sub_agent_creation_test_latch: None,
+            #[cfg(test)]
+            close_foundation_test_latch: None,
+            #[cfg(test)]
+            steering_begin_test_latch: None,
         }
     }
 
@@ -6476,7 +6535,12 @@ impl Database {
         queue: &[phoenix_core::domain::sm_event::SteerEntry],
     ) -> DbResult<()> {
         let now = Utc::now();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        require_product_conversation_admission_tx(&mut tx, id).await?;
+        if queue.len() > MAX_STEERING_QUEUE_DEPTH {
+            tx.rollback().await?;
+            return Err(DbError::SteeringQueueFull);
+        }
 
         let exists = sqlx::query("SELECT 1 FROM conversations WHERE id = ?1")
             .bind(id)
@@ -6518,6 +6582,22 @@ impl Database {
         Ok(())
     }
 
+    /// Return the current steering queue depth.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the queue cannot be read or its count cannot be
+    /// represented as `usize`.
+    pub async fn steering_queue_depth(&self, id: &str) -> DbResult<usize> {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM steering_messages WHERE conversation_id = ?1")
+                .bind(id)
+                .fetch_one(&self.pool)
+                .await?;
+        usize::try_from(count)
+            .map_err(|_| DbError::Serialization("steering queue depth overflow".to_string()))
+    }
+
     /// Append one steering entry atomically and return its committed zero-based
     /// queue position. Existing rows are never rewritten, so a concurrent drain
     /// cannot be resurrected by a stale read-modify-write snapshot.
@@ -6533,7 +6613,14 @@ impl Database {
         request_fingerprint: &str,
     ) -> DbResult<usize> {
         let now = Utc::now();
-        let mut tx = self.pool.begin().await?;
+        #[cfg(test)]
+        if let Some(latch) = &self.steering_begin_test_latch {
+            latch.before_begin.notify_waiters();
+            latch.allow_begin.notified().await;
+            latch.begin_called.notify_waiters();
+        }
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        require_product_conversation_admission_tx(&mut tx, id).await?;
 
         let (queue_position, ordinal): (i64, i64) = sqlx::query_as(
             "SELECT COUNT(*), COALESCE(MAX(ordinal), -1) + 1
@@ -6543,6 +6630,13 @@ impl Database {
         .bind(id)
         .fetch_one(&mut *tx)
         .await?;
+
+        let queue_depth = usize::try_from(queue_position)
+            .map_err(|_| DbError::Serialization("steering queue depth overflow".to_string()))?;
+        if queue_depth >= MAX_STEERING_QUEUE_DEPTH {
+            tx.rollback().await?;
+            return Err(DbError::SteeringQueueFull);
+        }
 
         sqlx::query(
             "INSERT INTO steering_acceptance_receipts
@@ -17936,6 +18030,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn close_admission_fence_serializes_concurrent_steering_admission() {
+        use phoenix_core::domain::sm_event::SteerEntry;
+
+        let (_dir, mut close_db, mut steering_db) = open_test_db_pair().await;
+        let close_latch = std::sync::Arc::new(CloseFoundationTestLatch::new());
+        let steering_latch = std::sync::Arc::new(SteeringBeginTestLatch::new());
+        close_db.close_foundation_test_latch = Some(close_latch.clone());
+        steering_db.steering_begin_test_latch = Some(steering_latch.clone());
+        close_db
+            .create_conversation("close-steering", "close steering", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let product_conversation_id = close_db
+            .get_conversation("close-steering")
+            .await
+            .unwrap()
+            .product_conversation_id;
+        let entry = SteerEntry {
+            text: "refused".to_string(),
+            llm_text: None,
+            images: Vec::new(),
+            files: Vec::new(),
+            message_id: "refused-steering".to_string(),
+            user_agent: None,
+            skill_invocation: None,
+        };
+
+        let transaction_entered = close_latch.transaction_entered.notified();
+        let close_writer = close_db.clone();
+        let close = tokio::spawn(async move {
+            close_writer
+                .begin_close_foundation(&product_conversation_id, "close-vs-steering")
+                .await
+        });
+        transaction_entered.await;
+        let steering_before_begin = steering_latch.before_begin.notified();
+        let steering_begin_called = steering_latch.begin_called.notified();
+        let steering = tokio::spawn(async move {
+            steering_db
+                .append_steering_entry("close-steering", &entry, "refused-fingerprint")
+                .await
+        });
+        steering_before_begin.await;
+        steering_latch.allow_begin.notify_waiters();
+        steering_begin_called.await;
+        close_latch.release_transaction.notify_waiters();
+        close.await.unwrap().unwrap();
+        assert!(matches!(
+            steering.await.unwrap(),
+            Err(DbError::CloseAdmissionFenced(_))
+        ));
+        assert!(close_db
+            .get_steering_queue("close-steering")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
     async fn steering_append_returns_committed_fifo_position_without_resurrecting_drains() {
         use phoenix_core::domain::sm_event::SteerEntry;
 
@@ -17991,6 +18144,68 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["b", "c"]
         );
+    }
+
+    #[tokio::test]
+    async fn steering_append_refuses_entry_beyond_capacity_in_its_write_transaction() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("capacity", "capacity", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        for index in 0..MAX_STEERING_QUEUE_DEPTH {
+            db.append_steering_entry(
+                "capacity",
+                &steering_entry(&format!("entry-{index}")),
+                &format!("fingerprint-{index}"),
+            )
+            .await
+            .unwrap();
+        }
+
+        assert!(matches!(
+            db.append_steering_entry("capacity", &steering_entry("overflow"), "overflow")
+                .await
+                .unwrap_err(),
+            DbError::SteeringQueueFull
+        ));
+        assert_eq!(
+            db.get_steering_queue("capacity").await.unwrap().len(),
+            MAX_STEERING_QUEUE_DEPTH
+        );
+    }
+    #[tokio::test]
+    async fn steering_queue_mutators_share_exported_capacity() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation(
+            "capacity-update",
+            "capacity-update",
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let queue = (0..MAX_STEERING_QUEUE_DEPTH)
+            .map(|index| steering_entry(&format!("entry-{index}")))
+            .collect::<Vec<_>>();
+        db.update_steering_queue("capacity-update", &queue)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.steering_queue_depth("capacity-update").await.unwrap(),
+            MAX_STEERING_QUEUE_DEPTH
+        );
+        assert!(matches!(
+            db.update_steering_queue(
+                "capacity-update",
+                &[queue.clone(), vec![steering_entry("overflow")]].concat(),
+            )
+            .await
+            .unwrap_err(),
+            DbError::SteeringQueueFull
+        ));
     }
 
     #[tokio::test]

@@ -76,11 +76,20 @@ impl WakeRegistrar for ProductionWakeRegistrar {
         );
         let prepared_fingerprint = input.prepared_fingerprint.clone();
         let intent = input.into_intent(now);
-        let outcome = self
+        let outcome = match self
             .repo
             .register(&intent, &prepared_fingerprint, now)
             .await
-            .map_err(|e| e.to_string())?;
+        {
+            Ok(outcome) => outcome,
+            Err(
+                phoenix_db::DbError::CloseAdmissionFenced(_)
+                | phoenix_db::DbError::ProductConversationUnavailable(_),
+            ) => {
+                return Ok(RegisteredWake::Unavailable);
+            }
+            Err(error) => return Err(error.to_string()),
+        };
         self.kick();
         Ok(match outcome {
             WakeRegistrationOutcome::Registered { workflow_id, .. } => {
@@ -118,7 +127,7 @@ pub(crate) async fn run(
     manager: Arc<RuntimeManager>,
     kick_rx: watch::Receiver<u64>,
     ready_tx: tokio::sync::oneshot::Sender<()>,
-) {
+) -> Result<(), String> {
     let worker = WakeWorker::new(
         manager.db().wake_repository(),
         Arc::new(RuntimeRegistryInspector::new(
@@ -128,9 +137,7 @@ pub(crate) async fn run(
         Arc::new(SystemClock),
         fresh_process_incarnation(),
     );
-    if let Err(error) = Box::pin(worker.run_loop_with_manager(kick_rx, manager, ready_tx)).await {
-        tracing::warn!(error = %error, "wake worker stopped after DB/inspection error");
-    }
+    Box::pin(worker.run_loop_with_manager(kick_rx, manager, ready_tx)).await
 }
 
 #[derive(Clone)]
@@ -469,6 +476,7 @@ async fn deliver_pending(
                 cursor = Some(next_cursor);
                 continue;
             }
+            let close_settlement_workflow_id = current.workflow_id;
             let rendered = render_terminal_result(&current);
             let display_data = Some(serde_json::json!({
                 "type": "wake_result",
@@ -507,7 +515,7 @@ async fn deliver_pending(
             let (sequence_guard, sequence_ids) =
                 handle.broadcast_tx.reserve_next_persisted_message_range(1);
             let sequence_id = sequence_ids[0];
-            match repo
+            let adopted_for_close = match repo
                 .materialize_pending_delivery_message(&MaterializePendingDeliveryMessageInput {
                     workflow_id: current.workflow_id,
                     delivery_id: current.canonical_delivery.delivery_id,
@@ -540,10 +548,11 @@ async fn deliver_pending(
                                     .await
                                     .map_err(|error| error.to_string())?;
                             }
+                            true
                         }
                         WakeAdoptMaterializedPendingOutcome::Busy(_)
                         | WakeAdoptMaterializedPendingOutcome::NothingPending
-                        | WakeAdoptMaterializedPendingOutcome::NotFullyMaterialized { .. } => {}
+                        | WakeAdoptMaterializedPendingOutcome::NotFullyMaterialized { .. } => false,
                     }
                 }
                 MaterializePendingDeliveryMessageOutcome::AlreadyMaterialized(_) => {
@@ -561,19 +570,38 @@ async fn deliver_pending(
                                     .await
                                     .map_err(|error| error.to_string())?;
                             }
+                            true
                         }
                         WakeAdoptMaterializedPendingOutcome::Busy(_)
                         | WakeAdoptMaterializedPendingOutcome::NothingPending
-                        | WakeAdoptMaterializedPendingOutcome::NotFullyMaterialized { .. } => {}
+                        | WakeAdoptMaterializedPendingOutcome::NotFullyMaterialized { .. } => false,
                     }
                 }
                 MaterializePendingDeliveryMessageOutcome::WrongOwnerOrIneligible => {
                     repo.suppress_pending_for_archived_conversation(&current, now)
                         .await
                         .map_err(|error| error.to_string())?;
+                    false
+                }
+            };
+            drop(sequence_guard);
+            if adopted_for_close {
+                match manager
+                    .db()
+                    .wake_delivery_requires_close_settlement_recheck(close_settlement_workflow_id)
+                    .await
+                {
+                    Ok(true) => {
+                        if let Err(error) = manager.resume_pending_close_settlements().await {
+                            tracing::error!(%error, workflow_id = close_settlement_workflow_id.0, "failed to re-evaluate Close settlement after wake delivery");
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::error!(%error, workflow_id = close_settlement_workflow_id.0, "failed to classify Close settlement wake delivery");
+                    }
                 }
             }
-            drop(sequence_guard);
             cursor = Some(next_cursor);
         }
         if page_len < OBSERVATION_BATCH_LIMIT {
@@ -1318,6 +1346,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn production_registrar_refuses_exact_replay_for_history() {
+        let (db, repo, scope) = open_repo().await;
+        let (kick_tx, mut kick_rx) = watch::channel(0u64);
+        let registrar = ProductionWakeRegistrar::new(repo, kick_tx);
+        let input = register_input(&scope, "b-history", "fp-history", 50);
+        assert!(matches!(
+            registrar.register(input.clone()).await.unwrap(),
+            RegisteredWake::Registered { .. }
+        ));
+        let product_conversation_id = db
+            .get_conversation("conv")
+            .await
+            .unwrap()
+            .product_conversation_id;
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1",
+        )
+        .bind(product_conversation_id.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        assert_eq!(
+            registrar.register(input).await.unwrap(),
+            RegisteredWake::Unavailable
+        );
+        assert_eq!(*kick_rx.borrow_and_update(), 1);
+    }
+
+    #[tokio::test]
+    async fn production_registrar_returns_typed_unavailable_for_close_fence() {
+        let (db, repo, scope) = open_repo().await;
+        let (kick_tx, mut kick_rx) = watch::channel(0u64);
+        let registrar = ProductionWakeRegistrar::new(repo, kick_tx);
+        let product_conversation_id = db
+            .get_conversation("conv")
+            .await
+            .unwrap()
+            .product_conversation_id;
+        db.begin_close_foundation(&product_conversation_id, "wake-production-fence")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            registrar
+                .register(register_input(&scope, "b-1", "fp-1", 50))
+                .await
+                .unwrap(),
+            RegisteredWake::Unavailable
+        );
+        assert_eq!(*kick_rx.borrow_and_update(), 0);
+    }
+
+    #[tokio::test]
     async fn production_registrar_replays_and_conflicts_exactly() {
         let (_db, repo, scope) = open_repo().await;
         let (kick_tx, kick_rx) = watch::channel(0u64);
@@ -1580,6 +1662,12 @@ mod tests {
         assert!(matches!(
             materialized,
             MaterializePendingDeliveryMessageOutcome::Materialized(_)
+        ));
+        assert!(matches!(
+            repo.adopt_materialized_pending_for_conversation("conv", Timestamp(20))
+                .await
+                .unwrap(),
+            WakeAdoptMaterializedPendingOutcome::Adopted(_)
         ));
 
         let manager = Arc::new(crate::runtime::RuntimeManager::new(

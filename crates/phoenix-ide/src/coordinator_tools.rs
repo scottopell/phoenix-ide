@@ -411,6 +411,8 @@ fn service_error_code(error: &SendChatServiceError) -> &'static str {
         SendChatServiceError::Dispatch(_) => "dispatch_failed",
         SendChatServiceError::IdempotencyConflict => "idempotency_conflict",
         SendChatServiceError::Busy => "conversation_busy",
+        SendChatServiceError::CloseAdmissionFenced => "close_admission_fenced",
+        SendChatServiceError::HistoryUnavailable => "target_unavailable",
     }
 }
 

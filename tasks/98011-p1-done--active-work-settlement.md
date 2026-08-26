@@ -1,0 +1,1 @@
+Implement the dormant ProductConversation Close settlement boundary: release current aggregate authority, collect fresh authoritative workspace/Git loss evidence, seal WorkScope resource creation through retirement, and durably recover retryable retirement progress. This child excludes final History outcome, FTS/permanent deletion, and Close UI activation.

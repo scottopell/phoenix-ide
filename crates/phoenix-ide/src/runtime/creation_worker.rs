@@ -272,6 +272,7 @@ async fn reconcile_creation_cleanup(
         .finish_conversation_creation_cleanup(cleanup, chrono::Utc::now())
         .await
         .map_err(|error| error.to_string())?;
+    manager.resume_pending_close_settlements().await?;
     Ok(())
 }
 
