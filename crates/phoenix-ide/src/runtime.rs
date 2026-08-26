@@ -3069,7 +3069,11 @@ impl RuntimeManager {
             .map_err(|error| error.to_string())?;
         let mut recovered = 0;
         for obligation in obligations {
-            if obligation.phase() != phoenix_core::domain::close::ClosePhase::SettlingActiveWork {
+            if !matches!(
+                obligation.phase(),
+                phoenix_core::domain::close::ClosePhase::SettlingActiveWork
+                    | phoenix_core::domain::close::ClosePhase::CancelRequestedDuringSettlement
+            ) {
                 continue;
             }
             let members = self
