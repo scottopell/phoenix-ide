@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use super::handlers::AppError;
 use super::types::{
     OrdinaryProductConversationLifecycleView, ProductConversationChainQaCompatibilityView,
+    ProductConversationClosePhaseView, ProductConversationCloseView,
     ProductConversationHandoffView, ProductConversationListResponse, ProductConversationListRow,
     ProductConversationPresentationView, ProductConversationSegmentView,
     ProductConversationSnapshotView, ProductConversationSourceRelationView,
@@ -172,6 +173,12 @@ async fn snapshot_view(
             .conversation
             .archived,
     );
+    let close = state
+        .db
+        .get_active_close_obligation_for_product(aggregate.product_conversation.id())
+        .await
+        .map_err(db_to_app)?
+        .map(close_view);
     let generation = aggregate_generation(&aggregate);
     let segment_ceilings = cursor.as_ref().map_or_else(
         || aggregate_segment_ceilings(&aggregate),
@@ -200,6 +207,8 @@ async fn snapshot_view(
     Ok(ProductConversationSnapshotView {
         product_conversation_id: aggregate.product_conversation.id().to_string(),
         canonical_route: canonical_route(&aggregate),
+        close,
+
         requested_transcript_row_id,
         canonical_root: transcript_row_view(&aggregate.root),
         ordinary_lifecycle: lifecycle_view(lifecycle),
@@ -523,6 +532,38 @@ fn validate_cursor(
         ));
     }
     Ok(())
+}
+
+fn close_view(
+    obligation: phoenix_core::domain::close::CloseObligation,
+) -> ProductConversationCloseView {
+    use phoenix_core::domain::close::ClosePhase;
+
+    let phase = match obligation.phase() {
+        ClosePhase::AwaitingBlockerResolution => {
+            ProductConversationClosePhaseView::AwaitingBlockerResolution
+        }
+        ClosePhase::AwaitingStopWorkConfirmation => {
+            ProductConversationClosePhaseView::AwaitingStopWorkConfirmation
+        }
+        ClosePhase::SettlingActiveWork => ProductConversationClosePhaseView::SettlingActiveWork,
+        ClosePhase::CancelRequestedDuringSettlement => {
+            ProductConversationClosePhaseView::CancelRequestedDuringSettlement
+        }
+        ClosePhase::AwaitingRetirementInspection => {
+            ProductConversationClosePhaseView::AwaitingRetirementInspection
+        }
+        ClosePhase::AwaitingLossConfirmation => {
+            ProductConversationClosePhaseView::AwaitingLossConfirmation
+        }
+        ClosePhase::RetirementRequested => ProductConversationClosePhaseView::RetirementRequested,
+        ClosePhase::NeedsRepair => ProductConversationClosePhaseView::NeedsRepair,
+        ClosePhase::Completed => ProductConversationClosePhaseView::Completed,
+    };
+    ProductConversationCloseView {
+        attempt_id: obligation.attempt_id().to_string(),
+        phase,
+    }
 }
 
 fn lifecycle_view(

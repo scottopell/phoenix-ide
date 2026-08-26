@@ -3061,6 +3061,54 @@ impl RuntimeManager {
         Ok(completed)
     }
 
+    pub async fn resume_pending_close_settlements(self: &Arc<Self>) -> Result<usize, String> {
+        let obligations = self
+            .db
+            .list_pending_close_obligations()
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut recovered = 0;
+        for obligation in obligations {
+            if obligation.phase() != phoenix_core::domain::close::ClosePhase::SettlingActiveWork {
+                continue;
+            }
+            let members = self
+                .db
+                .list_close_attempt_members(obligation.attempt_id().as_str())
+                .await
+                .map_err(|error| error.to_string())?;
+            let event_txs = {
+                let runtimes = self.runtimes.read().await;
+                members
+                    .iter()
+                    .filter_map(|member| {
+                        runtimes
+                            .get(member.conversation_id.as_str())
+                            .map(|handle| handle.event_tx.clone())
+                    })
+                    .collect::<Vec<_>>()
+            };
+            for event_tx in event_txs {
+                let _ = event_tx
+                    .send(Event::UserCancel {
+                        reason: Some("active Close settlement".to_string()),
+                        cause: crate::state_machine::event::CancelCause::UserRequested,
+                    })
+                    .await;
+            }
+            match self
+                .db
+                .advance_close_settlement_when_quiescent(obligation.attempt_id().as_str())
+                .await
+            {
+                Ok(_) => recovered += 1,
+                Err(crate::db::DbError::CloseFoundationPrecondition(_)) => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Ok(recovered)
+    }
+
     /// Materialize persisted continuation operations so restart recovery does
     /// not depend on a browser reconnecting to each conversation.
     pub async fn resume_pending_continuations(self: &Arc<Self>) -> Result<usize, String> {

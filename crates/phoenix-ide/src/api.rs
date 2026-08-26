@@ -124,6 +124,13 @@ async fn reconcile_startup_continuations(
     if resumed > 0 {
         tracing::info!(resumed, "resumed persisted continuation operations");
     }
+    let settled = runtime
+        .resume_pending_close_settlements()
+        .await
+        .map_err(std::io::Error::other)?;
+    if settled > 0 {
+        tracing::info!(settled, "recovered pending Close active-work settlements");
+    }
     Ok(())
 }
 
