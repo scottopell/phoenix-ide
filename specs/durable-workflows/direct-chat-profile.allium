@@ -467,6 +467,21 @@ rule ActiveCloseObligationAllowsExactDirectTurnReplay {
     ensures: replay_of(committed_outcome_for(same_key_existing_acceptance(turn_key)))
 }
 
+rule ActiveCloseObligationPreservesExactPendingDirectTurnRecovery {
+    when: DirectChatRequested(client, request)
+    requires: rejection_reason_for(request) = null
+
+    let resolved_target = resolved_target_for(request)
+    let turn_key = target_bound_key(resolved_target, request.client_message_id)
+
+    requires: active_close_obligation(resolved_target.product_conversation)
+    requires: same_key_existing_acceptance(turn_key) != null
+    requires: request_matches_existing_acceptance(request, same_key_existing_acceptance(turn_key))
+    requires: same_key_existing_acceptance(turn_key).committed_outcome = null
+
+    ensures: retryable_unaccepted_outcome(turn_key)
+}
+
 rule CloseSettlementBridgesToLatestAcceptedDirectTurn {
     when: bedrock_close_settlement_request(product_conversation, attempt_id)
     let latest_parent = bedrock/Parent{product_conversation: product_conversation, is_latest_row: true}
