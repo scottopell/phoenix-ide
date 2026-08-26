@@ -137,11 +137,13 @@ impl GitStartPoint {
     }
 
     pub(crate) fn for_default_task_start(repo_root: &Path) -> Option<Self> {
-        let default_branch = refresh_and_resolve_default_branch(repo_root)?;
-        let checkout_ref = preferred_default_checkout_ref(repo_root, &default_branch)?;
-        let reserved_oid = resolve_commit_oid(repo_root, &checkout_ref)?;
-        let mut start = Self::new(default_branch, checkout_ref.clone(), checkout_ref);
-        start.reserved_oid = Some(reserved_oid);
+        let resolved = refreshed_default_task_start(repo_root)?;
+        let mut start = Self::new(
+            resolved.default_branch.clone(),
+            resolved.checkout_ref.clone(),
+            resolved.checkout_ref,
+        );
+        start.reserved_oid = Some(resolved.reserved_oid);
         Some(start)
     }
 
@@ -218,30 +220,48 @@ pub(crate) fn refresh_and_resolve_default_branch_for_reservation(
     refresh_and_resolve_default_branch(repo_root)
 }
 
-fn refresh_and_resolve_default_branch(repo_root: &Path) -> Option<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RefreshedDefaultTaskStart {
+    default_branch: String,
+    checkout_ref: String,
+    reserved_oid: String,
+}
+
+fn refreshed_default_task_start(repo_root: &Path) -> Option<RefreshedDefaultTaskStart> {
     if has_remote_named_origin(repo_root) {
-        let _ = run_git(repo_root, &["remote", "set-head", "origin", "--auto"]).inspect_err(
-            |e| tracing::debug!(error = %e, "project task refresh origin HEAD update failed"),
-        );
-        if let Some(default_branch) = origin_head_branch(repo_root) {
-            run_git(
-                repo_root,
-                &[
-                    "fetch",
-                    "origin",
-                    "--no-tags",
-                    &format!("+refs/heads/{default_branch}:refs/remotes/origin/{default_branch}"),
-                ],
-            )
-            .inspect_err(|e| tracing::debug!(error = %e, branch = %default_branch, "project task targeted default fetch failed"))
-            .ok()?;
-            let _ = run_git(repo_root, &["remote", "set-head", "origin", "--auto"]).inspect_err(
-                |e| tracing::debug!(error = %e, "project task refresh origin HEAD update failed after fetch"),
-            );
-            return origin_head_branch(repo_root).or(Some(default_branch));
-        }
+        let default_branch = origin_head_branch(repo_root)?;
+        run_git(
+            repo_root,
+            &[
+                "fetch",
+                "origin",
+                "--no-tags",
+                &format!("+refs/heads/{default_branch}:refs/remotes/origin/{default_branch}"),
+            ],
+        )
+        .inspect_err(|e| tracing::debug!(error = %e, branch = %default_branch, "project task targeted default fetch failed"))
+        .ok()?;
+        let checkout_ref = preferred_default_checkout_ref(repo_root, &default_branch)?;
+        let reserved_oid = resolve_commit_oid(repo_root, &checkout_ref)?;
+        return Some(RefreshedDefaultTaskStart {
+            default_branch,
+            checkout_ref,
+            reserved_oid,
+        });
     }
-    resolve_local_only_default_branch(repo_root)
+
+    let default_branch = resolve_local_only_default_branch(repo_root)?;
+    let checkout_ref = preferred_default_checkout_ref(repo_root, &default_branch)?;
+    let reserved_oid = resolve_commit_oid(repo_root, &checkout_ref)?;
+    Some(RefreshedDefaultTaskStart {
+        default_branch,
+        checkout_ref,
+        reserved_oid,
+    })
+}
+
+fn refresh_and_resolve_default_branch(repo_root: &Path) -> Option<String> {
+    refreshed_default_task_start(repo_root).map(|resolved| resolved.default_branch)
 }
 
 fn resolve_local_only_default_branch(repo_root: &Path) -> Option<String> {

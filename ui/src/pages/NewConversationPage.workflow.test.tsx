@@ -202,6 +202,38 @@ describe('/new directory-first product conversation', () => {
       .toBe('reservation-created');
   });
 
+  it('reacquires an expired reservation while preserving create identities', async () => {
+    vi.mocked(api.createProductConversation)
+      .mockRejectedValueOnce(new Error('invalid product root reservation'))
+      .mockResolvedValueOnce({ product_conversation_id: 'pc-refreshed', canonical_route: '/product-conversations/pc-refreshed' } as never);
+    vi.mocked(api.reserveProductRoot)
+      .mockResolvedValueOnce({
+        kind: 'exact_committed_tree', exact_checkout_oid: 'abc123', logical_base: 'main', freshness: 'fresh',
+        root_reservation: {
+          id: 'reservation-expired', cwd: '/repo', kind: 'exact_committed_tree', repo_root: '/repo',
+          exact_checkout_oid: 'abc123', logical_base: 'main', freshness: 'fresh', unresolved_reason: null,
+        },
+      })
+      .mockResolvedValueOnce({
+        kind: 'exact_committed_tree', exact_checkout_oid: 'def456', logical_base: 'main', freshness: 'fresh',
+        root_reservation: {
+          id: 'reservation-refreshed', cwd: '/repo', kind: 'exact_committed_tree', repo_root: '/repo',
+          exact_checkout_oid: 'def456', logical_base: 'main', freshness: 'fresh', unresolved_reason: null,
+        },
+      });
+
+    renderPage();
+    await screen.findAllByPlaceholderText('What would you like to work on?');
+    fireEvent.change(composerTextarea(), { target: { value: 'Retry expired root' } });
+    fireEvent.click(sendButton());
+    await waitFor(() => expect(api.createProductConversation).toHaveBeenCalledTimes(2));
+    const first = vi.mocked(api.createProductConversation).mock.calls[0]![0];
+    const second = vi.mocked(api.createProductConversation).mock.calls[1]![0];
+    expect(second.root_reservation.id).toBe('reservation-refreshed');
+    expect(second.conversation_id).toBe(first.conversation_id);
+    expect(second.message_id).toBe(first.message_id);
+  });
+
   it('reuses create identities after an uncertain response', async () => {
     vi.mocked(api.createProductConversation)
       .mockRejectedValueOnce(new Error('network response lost'))

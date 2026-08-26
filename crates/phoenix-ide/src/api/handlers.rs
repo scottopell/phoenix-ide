@@ -1954,46 +1954,29 @@ async fn reserve_product_root(
     };
     let repo_path = std::path::PathBuf::from(&repo_root);
     let cached = crate::git_start::GitStartPoint::cached_default_task_start(&repo_path);
-    let repo_for_refresh = repo_root.clone();
-    let fresh = tokio::task::spawn_blocking(move || {
-        let _lock = crate::runtime::creation_worker::RepositoryMutationLock::acquire_for_api(
-            &repo_for_refresh,
-        )?;
-        Ok::<_, String>(crate::git_start::GitStartPoint::for_default_task_start(
-            std::path::Path::new(&repo_for_refresh),
-        ))
-    })
-    .await
-    .map_err(|error| AppError::Internal(format!("default root reservation task failed: {error}")))?
-    .map_err(AppError::Internal)?;
-    let (start, freshness) = match fresh {
-        Some(start) => (start, ProductRootReservationFreshness::Fresh),
-        None => {
-            if let Some(cached) = cached {
-                (cached, ProductRootReservationFreshness::StaleCached)
-            } else {
-                let root = ProductRootReservation {
-                    id: reservation_id,
-                    cwd,
-                    kind: "unresolved_exact_committed_tree".to_string(),
-                    repo_root: Some(repo_root),
-                    exact_checkout_oid: None,
-                    logical_base: None,
-                    freshness: Some(ProductRootReservationFreshness::Unresolved),
-                    unresolved_reason: Some("canonical_default_unresolved".to_string()),
-                };
-                state
-                    .db
-                    .insert_product_root_reservation(&persist(&root))
-                    .await
-                    .map_err(|error| AppError::Internal(error.to_string()))?;
-                return Ok(Json(
-                    ReserveProductRootResponse::UnresolvedExactCommittedTree {
-                        root_reservation: root,
-                    },
-                ));
-            }
-        }
+    let (start, freshness) = if let Some(start) = cached {
+        (start, ProductRootReservationFreshness::StaleCached)
+    } else {
+        let root = ProductRootReservation {
+            id: reservation_id,
+            cwd,
+            kind: "unresolved_exact_committed_tree".to_string(),
+            repo_root: Some(repo_root),
+            exact_checkout_oid: None,
+            logical_base: None,
+            freshness: Some(ProductRootReservationFreshness::Unresolved),
+            unresolved_reason: Some("canonical_default_unresolved".to_string()),
+        };
+        state
+            .db
+            .insert_product_root_reservation(&persist(&root))
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+        return Ok(Json(
+            ReserveProductRootResponse::UnresolvedExactCommittedTree {
+                root_reservation: root,
+            },
+        ));
     };
     let exact_checkout_oid = start
         .reserved_oid()

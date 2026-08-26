@@ -284,8 +284,8 @@ export function useCreateConversation(navigate: (path: string) => void) {
         setCreating(false);
         return;
       }
-      const response = await api.createProductConversation({
-        root_reservation: acceptedRoot,
+      const createRequest = (root: ProductRootReservation) => ({
+        root_reservation: root,
         objective: trimmed,
         message_id: pendingIdentity.messageId,
         conversation_id: pendingIdentity.conversationId,
@@ -293,6 +293,15 @@ export function useCreateConversation(navigate: (path: string) => void) {
         effort: selectedEffort,
         images,
       });
+      let response;
+      try {
+        response = await api.createProductConversation(createRequest(acceptedRoot));
+      } catch (error) {
+        if (!(error instanceof Error) || !error.message.includes('invalid product root reservation')) throw error;
+        acceptedRoot = (await api.reserveProductRoot(cwd.trim())).root_reservation;
+        setRootReservation(acceptedRoot);
+        response = await api.createProductConversation(createRequest(acceptedRoot));
+      }
       setDraft('');
       setImages([]);
       setFiles([]);

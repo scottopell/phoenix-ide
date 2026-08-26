@@ -8320,7 +8320,11 @@ where
         let cwd = self.context.filesystem_root().to_path_buf();
         let repo_root =
             crate::git_ops::repo_root_from_phoenix_worktree(&cwd).unwrap_or_else(|| cwd.clone());
-        let conv_id = self.context.conversation_id.clone();
+        let worktree_identity = self
+            .storage
+            .get_product_conversation_id(&self.context.conversation_id)
+            .await
+            .map_err(|error| format!("Failed to load ProductConversation identity: {error}"))?;
         let desired_base_branch = self.context.desired_base_branch.clone();
         let tasks_dir_name = self.context.tasks_dir_name.clone();
 
@@ -8336,7 +8340,7 @@ where
                 execute_approve_task_blocking(
                     &cwd,
                     &repo_root,
-                    &conv_id,
+                    &worktree_identity,
                     &tasks_dir_name,
                     &task_file,
                     &title,
@@ -10014,11 +10018,7 @@ fn open_early_worktree_and_rename_branch(
         return Ok((worktree_path, temp_branch));
     }
     if temp_branch == "HEAD" {
-        let target_branch = unique_task_approval_branch(repo_root, task_branch, "HEAD");
-        run_git(&worktree_path, &["switch", "-c", &target_branch]).map_err(|error| {
-            format!("Failed to attach detached approval worktree to '{target_branch}': {error}")
-        })?;
-        return Ok((worktree_path, target_branch));
+        return Ok((worktree_path, temp_branch));
     }
     if !temp_branch.starts_with("task-pending-") {
         return Err(format!(

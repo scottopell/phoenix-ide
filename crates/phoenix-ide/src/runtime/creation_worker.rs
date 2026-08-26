@@ -1070,6 +1070,7 @@ async fn provision_conversation(
 
             let mut attachment = hidden_repository_attachment_observation(
                 &repo_root,
+                &effective_cwd,
                 Some(canonical_default_branch.as_str()),
             )?;
             attachment.conversation_id = job.conversation_id.clone();
@@ -1405,10 +1406,6 @@ pub(crate) struct RepositoryMutationLock {
 }
 
 impl RepositoryMutationLock {
-    pub(crate) fn acquire_for_api(repo_root: &str) -> Result<Self, String> {
-        Self::acquire(repo_root).map_err(|(message, _)| message)
-    }
-
     pub(crate) fn acquire(repo_root: &str) -> Result<Self, (String, ErrorKind)> {
         let (file, lock_path) = Self::open_file(repo_root)?;
         file.lock_exclusive().map_err(|error| {
@@ -2384,7 +2381,7 @@ fn create_directory_first_product_worktree_blocking(
         repo,
         &worktree_path,
         checkout_ref,
-        crate::git_ops::PhoenixIgnoreStrategy::StageGitignore,
+        crate::git_ops::PhoenixIgnoreStrategy::LocalExclude,
     )
     .map_err(|error| {
         (
@@ -2649,6 +2646,7 @@ fn deterministic_worktree_path(repo_root: &str, conv_id: &str) -> std::path::Pat
 
 fn hidden_repository_attachment_observation(
     repo_root: &str,
+    materialized_worktree: &str,
     desired_base_branch: Option<&str>,
 ) -> Result<AttachHiddenGitRepositoryInput, (String, ErrorKind)> {
     let repo_path = Path::new(repo_root);
@@ -2671,6 +2669,7 @@ fn hidden_repository_attachment_observation(
         conversation_id: String::new(),
         common_dir,
         management_root: management_root.to_string_lossy().to_string(),
+        materialized_worktree: materialized_worktree.to_string(),
         default_branch,
         observed_at: chrono::Utc::now(),
     })

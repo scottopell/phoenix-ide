@@ -254,6 +254,7 @@ pub struct AttachHiddenGitRepositoryInput {
     pub conversation_id: String,
     pub common_dir: String,
     pub management_root: String,
+    pub materialized_worktree: String,
     pub default_branch: GitRepositoryDefaultBranchObservation,
     pub observed_at: chrono::DateTime<Utc>,
 }
@@ -4574,15 +4575,69 @@ impl Database {
             return Ok((CreationCasOutcome::ClaimLost, None));
         }
         let row = sqlx::query(
-            "SELECT work_scope_id
-               FROM conversations
-              WHERE id = ?1",
+            "SELECT c.cm_kind, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
+                    c.work_scope_id,
+                    e.branch_name AS env_branch_name,
+                    e.worktree_path AS env_worktree_path,
+                    e.base_branch AS env_base_branch
+               FROM conversations c
+               LEFT JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id
+              WHERE c.id = ?1",
         )
         .bind(&input.conversation_id)
         .fetch_one(&mut *tx)
         .await?;
-        let work_scope_id = WorkScopeId::parse(row.get::<String, _>("work_scope_id"))
-            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let work_scope_id =
+            if let Some(existing_scope_id) = row.get::<Option<String>, _>("work_scope_id") {
+                WorkScopeId::parse(existing_scope_id)
+                    .map_err(|error| DbError::Serialization(error.to_string()))?
+            } else {
+                let cm_kind = row.get::<String, _>("cm_kind");
+                let cm_task_id = row.get::<Option<String>, _>("cm_task_id");
+                let cm_task_title = row.get::<Option<String>, _>("cm_task_title");
+                let cm_next_hint = row
+                    .get::<Option<i64>, _>("cm_next_taskmd_id_hint")
+                    .map(|value| value.to_string());
+                let env_worktree_path = row.get::<Option<String>, _>("env_worktree_path");
+                let env_branch_name = row.get::<Option<String>, _>("env_branch_name");
+                let env_base_branch = row.get::<Option<String>, _>("env_base_branch");
+                let cm = ConvModeCols {
+                    kind: match cm_kind.as_str() {
+                        "direct" => "direct",
+                        "work" => "work",
+                        "explore" => "explore",
+                        other => {
+                            return Err(DbError::Serialization(format!(
+                                "invalid deferred scope mode {other}"
+                            )))
+                        }
+                    },
+                    task_id: cm_task_id.as_deref(),
+                    task_title: cm_task_title.as_deref(),
+                    next_taskmd_id_hint: cm_next_hint.as_deref(),
+                    worktree_path: env_worktree_path.as_deref(),
+                    branch_name: env_branch_name.as_deref(),
+                    base_branch: env_base_branch.as_deref(),
+                };
+                let (scope_id, authority_kind, environment) =
+                    Self::new_scope_for_conversation(&input.materialized_worktree, &cm);
+                let now = Utc::now().to_rfc3339();
+                Self::insert_work_scope_tx(&mut tx, &scope_id, authority_kind, environment, &now)
+                    .await?;
+                sqlx::query(
+                    "UPDATE conversations
+                    SET work_scope_id = ?1,
+                        updated_at = ?3
+                  WHERE id = ?2
+                    AND work_scope_id IS NULL",
+                )
+                .bind(scope_id.as_str())
+                .bind(&input.conversation_id)
+                .bind(&now)
+                .execute(&mut *tx)
+                .await?;
+                scope_id
+            };
 
         let repository_id = if let Some(existing_id) = sqlx::query_scalar::<_, String>(
             "SELECT wr.repository_id
@@ -4740,46 +4795,65 @@ impl Database {
                         ) AS row_num
                    FROM git_repository_locator_observations
                   WHERE locator_kind = 'management_root' AND status = 'present'
+             ),
+             active_repository_evidence AS (
+                 SELECT DISTINCT wr.repository_id,
+                        c.product_conversation_id,
+                        MAX(MAX(c.updated_at, c.state_updated_at)) AS updated_at
+                   FROM work_scope_git_repositories wr
+                   JOIN conversation_work_scope_attachments cwa
+                     ON cwa.work_scope_id = wr.work_scope_id
+                   JOIN conversations c ON c.id = cwa.conversation_id
+                   JOIN product_conversations pc ON pc.id = c.product_conversation_id
+                  WHERE pc.kind = 'ordinary'
+                    AND pc.ordinary_lifecycle IN ('open', 'history')
+                  GROUP BY wr.repository_id, c.product_conversation_id
+                 UNION
+                 SELECT DISTINCT wr.repository_id,
+                        c.product_conversation_id,
+                        MAX(MAX(c.updated_at, c.state_updated_at)) AS updated_at
+                   FROM work_scope_git_repositories wr
+                   JOIN conversations c ON c.id = (
+                        SELECT reservation.consumed_by_conversation_id
+                          FROM product_root_reservations reservation
+                         WHERE reservation.status = 'consumed'
+                           AND reservation.unresolved_reason IS NOT NULL
+                           AND reservation.repo_root IS NOT NULL
+                           AND reservation.repo_root = (
+                               SELECT management.path
+                                 FROM git_repository_locator_observations management
+                                WHERE management.repository_id = wr.repository_id
+                                  AND management.locator_kind = 'management_root'
+                                  AND management.status = 'present'
+                                ORDER BY management.observed_at_unix_micros DESC, management.path DESC
+                                LIMIT 1
+                           )
+                         ORDER BY reservation.consumed_at_unix_micros DESC, reservation.id DESC
+                         LIMIT 1
+                   )
+                   JOIN product_conversations pc ON pc.id = c.product_conversation_id
+                  WHERE pc.kind = 'ordinary'
+                    AND pc.ordinary_lifecycle IN ('open', 'history')
+                  GROUP BY wr.repository_id, c.product_conversation_id
+
              )
              SELECT repository_id, path, observed_at_unix_micros
                FROM latest_management_root roots
               WHERE row_num = 1
                 AND EXISTS (
                     SELECT 1
-                      FROM work_scope_git_repositories wr
-                      JOIN conversation_work_scope_attachments cwa
-                        ON cwa.work_scope_id = wr.work_scope_id
-                      JOIN conversations c ON c.id = cwa.conversation_id
-                     WHERE wr.repository_id = roots.repository_id
-                       AND EXISTS (
-                           SELECT 1
-                             FROM product_conversations pc
-                            WHERE pc.id = c.product_conversation_id
-                              AND pc.kind = 'ordinary'
-                              AND pc.ordinary_lifecycle IN ('open', 'history')
-                       )
+                      FROM active_repository_evidence evidence
+                     WHERE evidence.repository_id = roots.repository_id
                 )
               ORDER BY (
-                    SELECT COUNT(DISTINCT c2.product_conversation_id)
-                      FROM work_scope_git_repositories wr2
-                      JOIN conversation_work_scope_attachments cwa2
-                        ON cwa2.work_scope_id = wr2.work_scope_id
-                      JOIN conversations c2 ON c2.id = cwa2.conversation_id
-                      JOIN product_conversations pc2 ON pc2.id = c2.product_conversation_id
-                     WHERE wr2.repository_id = roots.repository_id
-                       AND pc2.kind = 'ordinary'
-                       AND pc2.ordinary_lifecycle IN ('open', 'history')
+                    SELECT COUNT(*)
+                      FROM active_repository_evidence evidence
+                     WHERE evidence.repository_id = roots.repository_id
                 ) DESC,
                 (
-                    SELECT MAX(MAX(c2.updated_at, c2.state_updated_at))
-                      FROM work_scope_git_repositories wr2
-                      JOIN conversation_work_scope_attachments cwa2
-                        ON cwa2.work_scope_id = wr2.work_scope_id
-                      JOIN conversations c2 ON c2.id = cwa2.conversation_id
-                      JOIN product_conversations pc2 ON pc2.id = c2.product_conversation_id
-                     WHERE wr2.repository_id = roots.repository_id
-                       AND pc2.kind = 'ordinary'
-                       AND pc2.ordinary_lifecycle IN ('open', 'history')
+                    SELECT MAX(evidence.updated_at)
+                      FROM active_repository_evidence evidence
+                     WHERE evidence.repository_id = roots.repository_id
                 ) DESC,
                 observed_at_unix_micros DESC, repository_id",
         )
@@ -7394,13 +7468,15 @@ impl Database {
                     reservation.repo_root AS repository_root,
                     reservation.logical_base AS logical_base,
                     reservation.exact_checkout_oid AS exact_checkout_oid
-               FROM conversations c
-               JOIN work_scope_git_repositories wr ON wr.work_scope_id = c.work_scope_id
+               FROM conversations needle
                JOIN product_root_reservations reservation
-                 ON reservation.consumed_by_conversation_id = c.id
-                AND reservation.status = 'consumed'
+                 ON reservation.status = 'consumed'
                 AND reservation.kind = 'exact_committed_tree'
-              WHERE c.id = ?1
+               JOIN conversations c ON c.id = reservation.consumed_by_conversation_id
+               JOIN work_scope_git_repositories wr ON wr.work_scope_id = c.work_scope_id
+              WHERE needle.id = ?1
+                AND c.product_conversation_id = needle.product_conversation_id
+              ORDER BY c.created_at ASC, c.id ASC
               LIMIT 1",
         )
         .bind(conversation_id)
@@ -13564,6 +13640,7 @@ mod tests {
                     conversation_id: conversation_id.to_string(),
                     common_dir: common_dir.to_string(),
                     management_root: management_root.to_string(),
+                    materialized_worktree: management_root.to_string(),
                     default_branch,
                     observed_at,
                 },
@@ -14195,6 +14272,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recent_hidden_repository_roots_include_unresolved_consumed_pre_scope_reservations() {
+        let db = Database::open_in_memory().await.unwrap();
+        let reservation = ProductRootReservationRecord {
+            id: "reservation-unresolved-recent-root".to_string(),
+            cwd: "/tmp/unresolved-recent-root".to_string(),
+            kind: "unresolved_exact_committed_tree".to_string(),
+            repo_root: Some("/repo/unresolved-recent-root".to_string()),
+            exact_checkout_oid: None,
+            logical_base: None,
+            freshness: Some("unresolved".to_string()),
+            unresolved_reason: Some("no_merge_base".to_string()),
+        };
+        db.insert_product_root_reservation(&reservation)
+            .await
+            .unwrap();
+        let job = InsertConversationCreationJob {
+            id: "job-unresolved-recent-root".to_string(),
+            conversation_id: "conv-unresolved-recent-root".to_string(),
+            message_id: Some("message-unresolved-recent-root".to_string()),
+            intent: test_creation_intent(
+                "/tmp/unresolved-recent-root",
+                "message-unresolved-recent-root",
+            ),
+        };
+        db.create_conversation_with_creation_job(
+            "conv-unresolved-recent-root",
+            "conv-unresolved-recent-root",
+            "/tmp/unresolved-recent-root",
+            true,
+            None,
+            &ConvMode::Direct,
+            None,
+            None,
+            None,
+            phoenix_core::llm_language::LlmLanguage::default(),
+            &job,
+            Some(&reservation.id),
+        )
+        .await
+        .unwrap();
+        let repo = attach_hidden_repository_for_test(
+            &db,
+            "conv-unresolved-recent-root",
+            "/tmp/.git/worktrees/unresolved-recent-root",
+            "/repo/unresolved-recent-root",
+            GitRepositoryDefaultBranchObservation::Resolved {
+                branch: "main".to_string(),
+                provenance: "remote_head_cache".to_string(),
+            },
+            Utc::now(),
+        )
+        .await;
+        sqlx::query("UPDATE conversations SET work_scope_id = NULL, updated_at = '2026-03-01T00:00:00Z', state_updated_at = '2026-03-01T00:00:00Z' WHERE id = 'conv-unresolved-recent-root'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let roots = db
+            .list_recent_hidden_repository_management_roots()
+            .await
+            .unwrap();
+        assert!(roots
+            .iter()
+            .any(|root| root.repository_id == repo.repository_id
+                && root.management_root == "/repo/unresolved-recent-root"));
+    }
+
+    #[tokio::test]
     async fn product_root_reservation_reclaims_abandoned_reserved_rows_on_read_and_write() {
         let db = Database::open_in_memory().await.unwrap();
         let reclaim_before = product_root_reservation_reclaim_before(Utc::now()) - 1;
@@ -14304,6 +14449,73 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(remaining, 0);
+    }
+
+    #[tokio::test]
+    async fn attach_hidden_repository_allocates_deferred_work_scope_atomically() {
+        let db = Database::open_in_memory().await.unwrap();
+        let reservation = ProductRootReservationRecord {
+            id: "reservation-deferred-scope".to_string(),
+            cwd: "/tmp/deferred-scope".to_string(),
+            kind: "exact_committed_tree".to_string(),
+            repo_root: Some("/repo/deferred-scope".to_string()),
+            exact_checkout_oid: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()),
+            logical_base: Some("main".to_string()),
+            freshness: Some("fresh".to_string()),
+            unresolved_reason: None,
+        };
+        db.insert_product_root_reservation(&reservation)
+            .await
+            .unwrap();
+        let job = InsertConversationCreationJob {
+            id: "job-deferred-scope".to_string(),
+            conversation_id: "conv-deferred-scope".to_string(),
+            message_id: Some("message-deferred-scope".to_string()),
+            intent: test_creation_intent("/tmp/deferred-scope", "message-deferred-scope"),
+        };
+        let created = db
+            .create_conversation_with_creation_job(
+                "conv-deferred-scope",
+                "conv-deferred-scope",
+                "/tmp/deferred-scope",
+                true,
+                None,
+                &ConvMode::Direct,
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+                &job,
+                Some(&reservation.id),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.attached_work_scope_id, None);
+
+        let attachment = attach_hidden_repository_for_test(
+            &db,
+            "conv-deferred-scope",
+            "/tmp/.git/worktrees/deferred-scope",
+            "/repo/deferred-scope",
+            GitRepositoryDefaultBranchObservation::Resolved {
+                branch: "main".to_string(),
+                provenance: "remote_head_cache".to_string(),
+            },
+            Utc::now(),
+        )
+        .await;
+        let conversation = db.get_conversation("conv-deferred-scope").await.unwrap();
+        let scope_id = conversation
+            .attached_work_scope_id
+            .clone()
+            .expect("scope allocated at attachment time");
+        assert_eq!(scope_id, attachment.work_scope_id);
+        let attachments = db
+            .conversation_work_scope_attachments(&scope_id)
+            .await
+            .unwrap();
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].id, "conv-deferred-scope");
     }
 
     #[tokio::test]
@@ -14418,6 +14630,119 @@ mod tests {
         assert_eq!(
             root.exact_checkout_oid,
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+    }
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn approval_handoff_from_continuation_transcript_uses_shared_product_evidence() {
+        let db = Database::open_in_memory().await.unwrap();
+        let reservation = ProductRootReservationRecord {
+            id: "reservation-continuation-approval".to_string(),
+            cwd: "/tmp/continuation-approval".to_string(),
+            kind: "exact_committed_tree".to_string(),
+            repo_root: Some("/repo/continuation-approval".to_string()),
+            exact_checkout_oid: Some("cccccccccccccccccccccccccccccccccccccccc".to_string()),
+            logical_base: Some("main".to_string()),
+            freshness: Some("fresh".to_string()),
+            unresolved_reason: None,
+        };
+        db.insert_product_root_reservation(&reservation)
+            .await
+            .unwrap();
+        let job = InsertConversationCreationJob {
+            id: "job-continuation-approval".to_string(),
+            conversation_id: "conv-continuation-root".to_string(),
+            message_id: Some("message-continuation-approval".to_string()),
+            intent: test_creation_intent(
+                "/tmp/continuation-approval",
+                "message-continuation-approval",
+            ),
+        };
+        db.create_conversation_with_creation_job(
+            "conv-continuation-root",
+            "conv-continuation-root",
+            "/tmp/continuation-approval",
+            true,
+            None,
+            &ConvMode::Direct,
+            None,
+            None,
+            None,
+            phoenix_core::llm_language::LlmLanguage::default(),
+            &job,
+            Some(&reservation.id),
+        )
+        .await
+        .unwrap();
+        attach_hidden_repository_for_test(
+            &db,
+            "conv-continuation-root",
+            "/tmp/.git/worktrees/continuation-approval",
+            "/repo/continuation-approval",
+            GitRepositoryDefaultBranchObservation::Resolved {
+                branch: "main".to_string(),
+                provenance: "remote_head_cache".to_string(),
+            },
+            Utc::now(),
+        )
+        .await;
+
+        db.update_conversation_state(
+            "conv-continuation-root",
+            &ConvState::ContextExhausted {
+                summary: "continued approval evidence".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let (outcome, _) = db
+            .continue_conversation_with_intent(
+                "conv-continuation-root",
+                NewContinuationDispatchIntent {
+                    message_id: "message-continuation-successor".to_string(),
+                    handoff: "continued approval".to_string(),
+                    user_agent: Some("test-agent".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+        let ContinueOutcome::Created(successor) = outcome else {
+            panic!("expected created continuation");
+        };
+        let approval = phoenix_core::task_handoff::TaskApprovalHandoffData {
+            task_id: "27099".to_string(),
+            task_title: "Continued Approval".to_string(),
+            branch_name: "task-27099-continued-approval".to_string(),
+            approved_commit_oid: "cccccccccccccccccccccccccccccccccccccccc".to_string(),
+            worktree_path: "/ignored".to_string(),
+            base_branch: "main".to_string(),
+            title: "Continued Approval".to_string(),
+            priority: phoenix_core::task_source::Priority::P1,
+            plan: "reviewed plan from continuation".to_string(),
+            task_file: "tasks/27099-p1-ready--continued-approval.md".to_string(),
+        };
+
+        let handoff = db
+            .create_task_approval_handoff_creation_job(&successor.id, &approval)
+            .await
+            .unwrap();
+        let job = db
+            .get_conversation_creation_job_for_conversation(&handoff.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            job.intent.reserved_repo_root.as_deref(),
+            Some("/repo/continuation-approval")
+        );
+        assert_eq!(
+            job.intent.reserved_checkout_oid.as_deref(),
+            Some("cccccccccccccccccccccccccccccccccccccccc")
+        );
+        assert_eq!(
+            job.intent.approved_task.as_ref().map(|s| s.plan.as_str()),
+            Some("reviewed plan from continuation")
         );
     }
 
