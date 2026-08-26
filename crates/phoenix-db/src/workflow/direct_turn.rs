@@ -1,6 +1,6 @@
 use super::WorkflowRepository;
 use crate::sqlite_telemetry::{SqliteOperation, SqlitePhase};
-use crate::{DbError, DbResult};
+use crate::{require_product_conversation_admission_tx, DbError, DbResult};
 use chrono::{DateTime, Utc};
 use phoenix_core::domain::db_schema::{
     ConvState, FileAttachment, ImageData, Message, MessageContent,
@@ -327,6 +327,13 @@ impl WorkflowRepository {
                 owed_effects: Vec::new(),
             });
         }
+        if let Err(error) =
+            require_product_conversation_admission_tx(&mut tx.tx, &input.conversation().0).await
+        {
+            tx.rollback().await?;
+            return Err(error);
+        }
+
         let submitted_message_id =
             PreparedDirectTurnPayload::from_exact_bytes(input.prepared.payload())
                 .map_err(|_| {
@@ -3762,6 +3769,42 @@ mod tests {
             TerminalEvidenceProbe::Established {
                 transcript_generation: None
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn close_admission_fence_preserves_admitted_turn_and_refuses_the_next_one() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-fenced", "Fenced", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let repo = WorkflowRepository::new(db.pool().clone());
+        repo.accept_authoritative_turn(&input("conv-fenced", "admitted", 1))
+            .await
+            .unwrap();
+
+        let product_conversation_id = db
+            .get_conversation("conv-fenced")
+            .await
+            .unwrap()
+            .product_conversation_id;
+        db.begin_close_foundation(&product_conversation_id, "direct-turn-fence")
+            .await
+            .unwrap();
+
+        let error = repo
+            .accept_authoritative_turn(&input("conv-fenced", "refused", 2))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DbError::CloseAdmissionFenced(_)));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM durable_turns WHERE conversation_id = 'conv-fenced'",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+            1
         );
     }
 

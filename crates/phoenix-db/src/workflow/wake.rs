@@ -9,6 +9,7 @@ use super::{
     WorkflowSequenceName, WorkflowTx,
 };
 use crate::sqlite_telemetry::SqliteOperation;
+use crate::{admit_product_conversation_operation_tx, ProductConversationAdmission};
 use chrono::{DateTime, Utc};
 use phoenix_core::domain::{
     db_schema::{Message, MessageContent, UserContent},
@@ -585,16 +586,61 @@ impl WakeRepository {
         prepared_fingerprint: &str,
         now: Timestamp,
     ) -> DbResult<WakeRegistrationOutcome> {
-        let mut tx = self.workflow_repo.begin_tx().await?;
+        let mut tx = self.begin_authoritative_tx().await?;
         let existing = fetch_existing_binding_tx(&mut tx, input).await?;
         if let Some(existing) = existing {
-            let exact_replay = existing.prepared_fingerprint == prepared_fingerprint;
+            let exact_replay = existing.prepared_fingerprint == prepared_fingerprint
+                && existing.expires_at == input.expires_at
+                && existing.registration_scope == input.registration_scope
+                && existing.conversation_id == input.conversation_id
+                && existing.resource == input.resource
+                && existing.registering_tool_use_id == input.registering_tool_use_id;
+            if exact_replay {
+                let admission =
+                    admit_product_conversation_operation_tx(&mut tx.tx, &input.conversation_id)
+                        .await?;
+                let product_conversation_id = match admission {
+                    ProductConversationAdmission::Accepted {
+                        product_conversation_id,
+                    } => product_conversation_id,
+                    ProductConversationAdmission::Refused(fence) => fence.product_conversation_id,
+                    ProductConversationAdmission::History(product_conversation_id) => {
+                        tx.rollback().await?;
+                        return Err(DbError::ProductConversationUnavailable(
+                            product_conversation_id,
+                        ));
+                    }
+                };
+                if !exact_replay_is_live_tx(&mut tx, &existing).await? {
+                    tx.rollback().await?;
+                    return Err(DbError::ProductConversationUnavailable(
+                        product_conversation_id,
+                    ));
+                }
+                tx.commit().await?;
+                return Ok(WakeRegistrationOutcome::Replayed {
+                    workflow_id: existing.workflow_id,
+                    receipt: replay_receipt(&existing),
+                });
+            }
             let migrated_replay = existing.fingerprint_needs_scope_upgrade
+                && existing.expires_at == input.expires_at
                 && existing.registration_scope == input.registration_scope
                 && existing.conversation_id == input.conversation_id
                 && existing.resource == input.resource
                 && input.root_conversation_id == input.conversation_id
                 && existing.registering_tool_use_id == input.registering_tool_use_id;
+            if migrated_replay {
+                if let Err(error) = crate::require_product_conversation_admission_tx(
+                    &mut tx.tx,
+                    &input.conversation_id,
+                )
+                .await
+                {
+                    tx.rollback().await?;
+                    return Err(error);
+                }
+            }
             if migrated_replay {
                 sqlx::query(
                     "UPDATE wake_bindings
@@ -614,15 +660,30 @@ impl WakeRepository {
                 .execute(&mut *tx.tx)
                 .await?;
             }
-            tx.commit().await?;
-            return Ok(if exact_replay || migrated_replay {
-                WakeRegistrationOutcome::Replayed {
+            if migrated_replay {
+                tx.commit().await?;
+                return Ok(WakeRegistrationOutcome::Replayed {
                     workflow_id: existing.workflow_id,
                     receipt: replay_receipt(&existing),
-                }
-            } else {
-                WakeRegistrationOutcome::Conflict
-            });
+                });
+            }
+            if let Err(error) =
+                crate::require_product_conversation_admission_tx(&mut tx.tx, &input.conversation_id)
+                    .await
+            {
+                tx.rollback().await?;
+                return Err(error);
+            }
+            tx.commit().await?;
+            return Ok(WakeRegistrationOutcome::Conflict);
+        }
+
+        if let Err(error) =
+            crate::require_product_conversation_admission_tx(&mut tx.tx, &input.conversation_id)
+                .await
+        {
+            tx.rollback().await?;
+            return Err(error);
         }
 
         let workflow_id = match allocated_workflow_id {
@@ -3479,6 +3540,37 @@ fn replay_receipt(existing: &WakeBindingRecord) -> WakeRegistrationReceipt {
     }
 }
 
+async fn exact_replay_is_live_tx(
+    tx: &mut WorkflowTx<'_>,
+    binding: &WakeBindingRecord,
+) -> DbResult<bool> {
+    sqlx::query_scalar(
+        "SELECT c.archived = 0
+         AND c.state_kind NOT IN (
+             'terminal', 'completed', 'failed', 'creation_failed', 'creation_cancelled',
+             'context_exhausted', 'handed_off'
+         )
+         AND w.status = 'Active'
+         AND NOT EXISTS (
+             SELECT 1 FROM wake_terminal_receipts terminal
+             WHERE terminal.workflow_id = b.workflow_id
+         )
+         FROM wake_bindings b
+         JOIN conversations c ON c.id = b.conversation_id
+         JOIN workflows w ON w.workflow_id = b.workflow_id
+         WHERE b.workflow_id = ?1",
+    )
+    .bind(to_i64(binding.workflow_id.0, "workflow_id")?)
+    .fetch_optional(&mut *tx.tx)
+    .await?
+    .ok_or_else(|| {
+        DbError::Serialization(format!(
+            "missing wake replay binding {}",
+            binding.workflow_id.0
+        ))
+    })
+}
+
 async fn fetch_existing_binding_tx(
     tx: &mut WorkflowTx<'_>,
     input: &WakeRegistrationIntent,
@@ -4912,6 +5004,41 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn close_admission_fence_refuses_new_wake_registration_without_creating_binding() {
+        let db = crate::Database::open_in_memory().await.unwrap();
+        db.create_conversation("wake-fenced", "Wake fenced", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let product_conversation_id = db
+            .get_conversation("wake-fenced")
+            .await
+            .unwrap()
+            .product_conversation_id;
+        db.begin_close_foundation(&product_conversation_id, "wake-fence")
+            .await
+            .unwrap();
+        let repo = WakeRepository::new(db.pool().clone());
+        let mut input = intent();
+        input.conversation_id = "wake-fenced".into();
+        input.root_conversation_id = "wake-fenced".into();
+
+        let error = repo
+            .register(&input, "wake-fence-fingerprint", Timestamp(10))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DbError::CloseAdmissionFenced(_)));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM wake_bindings WHERE conversation_id = 'wake-fenced'",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+            0
+        );
+    }
+
     fn resolve_input(
         workflow_id: WorkflowId,
         expected_version: Version,
@@ -6234,6 +6361,147 @@ mod tests {
             repo.register(&input, "fp-2", Timestamp(10)).await.unwrap(),
             WakeRegistrationOutcome::Conflict
         );
+    }
+
+    #[tokio::test]
+    async fn close_fence_preserves_exact_wake_replay_and_refuses_nonexact_binding() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let db =
+            crate::Database::from_pool_for_tests(repo.workflow_repo.pool.clone(), String::new());
+        let input = intent();
+        assert!(matches!(
+            repo.register(&input, "exact", Timestamp(10)).await.unwrap(),
+            WakeRegistrationOutcome::Registered { .. }
+        ));
+        let product_conversation_id = db
+            .get_conversation("conv-1")
+            .await
+            .unwrap()
+            .product_conversation_id;
+        db.begin_close_foundation(&product_conversation_id, "wake-existing-fence")
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            repo.register(&input, "exact", Timestamp(10)).await.unwrap(),
+            WakeRegistrationOutcome::Replayed { .. }
+        ));
+        assert!(matches!(
+            repo.register(&input, "changed", Timestamp(10))
+                .await
+                .unwrap_err(),
+            DbError::CloseAdmissionFenced(_)
+        ));
+        let mut changed_expiry = input;
+        changed_expiry.expires_at = Timestamp(11);
+        assert!(matches!(
+            repo.register(&changed_expiry, "exact", Timestamp(10))
+                .await
+                .unwrap_err(),
+            DbError::CloseAdmissionFenced(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn history_refuses_exact_wake_replay() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let db =
+            crate::Database::from_pool_for_tests(repo.workflow_repo.pool.clone(), String::new());
+        let input = intent();
+        assert!(matches!(
+            repo.register(&input, "exact", Timestamp(10)).await.unwrap(),
+            WakeRegistrationOutcome::Registered { .. }
+        ));
+        let product_conversation_id = db
+            .get_conversation("conv-1")
+            .await
+            .unwrap()
+            .product_conversation_id;
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1",
+        )
+        .bind(product_conversation_id.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            repo.register(&input, "exact", Timestamp(10)).await.unwrap_err(),
+            DbError::ProductConversationUnavailable(id) if id == product_conversation_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn close_fence_refuses_exact_replay_after_wake_becomes_terminal() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let db =
+            crate::Database::from_pool_for_tests(repo.workflow_repo.pool.clone(), String::new());
+        let input = intent();
+        let workflow_id = match repo.register(&input, "exact", Timestamp(10)).await.unwrap() {
+            WakeRegistrationOutcome::Registered { workflow_id, .. } => workflow_id,
+            outcome @ (WakeRegistrationOutcome::Replayed { .. }
+            | WakeRegistrationOutcome::Conflict) => {
+                panic!("expected registration, got {outcome:?}");
+            }
+        };
+        let product_conversation_id = db
+            .get_conversation("conv-1")
+            .await
+            .unwrap()
+            .product_conversation_id;
+        db.begin_close_foundation(&product_conversation_id, "wake-terminal-fence")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE workflows SET status = 'Completed' WHERE workflow_id = ?1")
+            .bind(to_i64(workflow_id.0, "workflow_id").unwrap())
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            repo.register(&input, "exact", Timestamp(10)).await.unwrap_err(),
+            DbError::ProductConversationUnavailable(id) if id == product_conversation_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn close_fence_refuses_exact_replay_after_conversation_registration_fence_closes() {
+        for state in [
+            crate::ConvState::ContextExhausted {
+                summary: "exhausted".to_string(),
+            },
+            crate::ConvState::HandedOff {
+                successor_conv_id: "successor".to_string(),
+            },
+            crate::ConvState::Terminal,
+        ] {
+            let (_dir, repo, _) = open_repo_pair().await;
+            let db = crate::Database::from_pool_for_tests(
+                repo.workflow_repo.pool.clone(),
+                String::new(),
+            );
+            let input = intent();
+            assert!(matches!(
+                repo.register(&input, "exact", Timestamp(10)).await.unwrap(),
+                WakeRegistrationOutcome::Registered { .. }
+            ));
+            let product_conversation_id = db
+                .get_conversation("conv-1")
+                .await
+                .unwrap()
+                .product_conversation_id;
+            db.begin_close_foundation(&product_conversation_id, "wake-registration-fence")
+                .await
+                .unwrap();
+            db.update_conversation_state("conv-1", &state)
+                .await
+                .unwrap();
+
+            assert!(matches!(
+                repo.register(&input, "exact", Timestamp(10)).await.unwrap_err(),
+                DbError::ProductConversationUnavailable(id) if id == product_conversation_id
+            ));
+        }
     }
 
     #[tokio::test]

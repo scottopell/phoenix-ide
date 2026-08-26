@@ -65,6 +65,10 @@ pub(crate) enum SendChatServiceError {
     IdempotencyConflict,
     #[error("conversation is busy accepting another direct turn")]
     Busy,
+    #[error("conversation is fenced by an active Close attempt")]
+    CloseAdmissionFenced,
+    #[error("conversation is permanently unavailable in History")]
+    HistoryUnavailable,
 }
 
 #[derive(Clone)]
@@ -72,8 +76,6 @@ pub(crate) struct SendChatApplicationService {
     db: crate::db::Database,
     runtime: Arc<RuntimeManager>,
 }
-
-const MAX_STEER_QUEUE_DEPTH: usize = 5;
 
 impl SendChatApplicationService {
     pub(crate) fn new(db: crate::db::Database, runtime: Arc<RuntimeManager>) -> Self {
@@ -177,6 +179,22 @@ impl SendChatApplicationService {
                 });
             }
         }
+        match self
+            .runtime
+            .db()
+            .product_conversation_admission(&conversation.id)
+            .await
+            .map_err(map_conversation_load_error)?
+        {
+            crate::db::ProductConversationAdmission::Accepted { .. } => {}
+            crate::db::ProductConversationAdmission::Refused(_) => {
+                return Ok(close_admission_fenced_outcome());
+            }
+            crate::db::ProductConversationAdmission::History(_) => {
+                return Ok(history_unavailable_outcome());
+            }
+        }
+
         let steering_queue = self
             .runtime
             .db()
@@ -193,13 +211,22 @@ impl SendChatApplicationService {
             || pending_queue_fences_direct_acceptance(&acceptance_state, !steering_queue.is_empty())
             || active_turn_fences_direct_acceptance(&acceptance_state, active_direct_turn.is_some())
         {
-            if steering_queue.len() >= MAX_STEER_QUEUE_DEPTH {
-                return Ok(SendChatOutcome::Rejected {
-                    message: "Steering queue is full; try again once a queued message has been delivered."
-                        .to_string(),
-                    code: "steering_queue_full",
-                });
+            match self
+                .runtime
+                .db()
+                .product_conversation_admission(&conversation.id)
+                .await
+                .map_err(map_conversation_load_error)?
+            {
+                crate::db::ProductConversationAdmission::Accepted { .. } => {}
+                crate::db::ProductConversationAdmission::Refused(_) => {
+                    return Ok(close_admission_fenced_outcome());
+                }
+                crate::db::ProductConversationAdmission::History(_) => {
+                    return Ok(history_unavailable_outcome());
+                }
             }
+
             let event = Event::SteerMessage {
                 text: expanded.display_text.clone(),
                 llm_text: expanded.llm_text,
@@ -209,10 +236,26 @@ impl SendChatApplicationService {
                 user_agent: req.user_agent.clone(),
                 skill_invocation: expanded.skill_invocation,
             };
-            self.runtime
+            if let Err(error) = self
+                .runtime
                 .enqueue_steer_message(&conversation.id, event, &request_fingerprint)
                 .await
-                .map_err(SendChatServiceError::Dispatch)?;
+            {
+                return match error {
+                    crate::runtime::SteeringAdmissionError::CloseAdmissionFenced => {
+                        Ok(close_admission_fenced_outcome())
+                    }
+                    crate::runtime::SteeringAdmissionError::HistoryUnavailable => {
+                        Ok(history_unavailable_outcome())
+                    }
+                    crate::runtime::SteeringAdmissionError::QueueFull => {
+                        Ok(steering_queue_full_outcome())
+                    }
+                    crate::runtime::SteeringAdmissionError::Internal(error) => {
+                        Err(SendChatServiceError::Dispatch(error))
+                    }
+                };
+            }
             drop(acceptance_guard);
             if let Err(error) = record_pr_auto_fix_context_baseline(
                 self.runtime.db(),
@@ -301,6 +344,12 @@ impl SendChatApplicationService {
                         return Err(map_db_internal_error(&error));
                     }
                 }
+            }
+            Err(crate::db::DbError::CloseAdmissionFenced(_)) => {
+                return Ok(close_admission_fenced_outcome());
+            }
+            Err(crate::db::DbError::ProductConversationUnavailable(_)) => {
+                return Ok(history_unavailable_outcome());
             }
             Err(error) => return Err(map_direct_turn_accept_error(error)),
         };
@@ -532,8 +581,35 @@ fn now_timestamp() -> Timestamp {
     Timestamp(u64::try_from(now).unwrap_or_default())
 }
 
+fn steering_queue_full_outcome() -> SendChatOutcome {
+    SendChatOutcome::Rejected {
+        message: "Steering queue is full; try again once a queued message has been delivered."
+            .to_string(),
+        code: "steering_queue_full",
+    }
+}
+
+fn history_unavailable_outcome() -> SendChatOutcome {
+    SendChatOutcome::Rejected {
+        message: "Conversation is archived and unavailable for messaging.".to_string(),
+        code: "target_unavailable",
+    }
+}
+
+fn close_admission_fenced_outcome() -> SendChatOutcome {
+    SendChatOutcome::Rejected {
+        message: "Conversation is closing and cannot accept new work.".to_string(),
+        code: "close_admission_fenced",
+    }
+}
+
 fn map_conversation_load_error(error: crate::db::DbError) -> SendChatServiceError {
     match error {
+        crate::db::DbError::CloseAdmissionFenced(_) => SendChatServiceError::CloseAdmissionFenced,
+        crate::db::DbError::ProductConversationUnavailable(_) => {
+            SendChatServiceError::HistoryUnavailable
+        }
+        crate::db::DbError::SteeringQueueFull => SendChatServiceError::Busy,
         crate::db::DbError::ConversationNotFound(message) => {
             SendChatServiceError::NotFound(message)
         }
@@ -566,10 +642,15 @@ fn map_conversation_load_error(error: crate::db::DbError) -> SendChatServiceErro
 
 fn map_direct_turn_accept_error(error: crate::db::DbError) -> SendChatServiceError {
     match error {
+        crate::db::DbError::CloseAdmissionFenced(_) => SendChatServiceError::CloseAdmissionFenced,
+        crate::db::DbError::ProductConversationUnavailable(_) => {
+            SendChatServiceError::HistoryUnavailable
+        }
         crate::db::DbError::DirectTurnConflict(TurnConflict::PreparedSemanticsChanged {
             ..
         }) => SendChatServiceError::IdempotencyConflict,
-        crate::db::DbError::DirectTurnConflict(TurnConflict::ConversationAlreadyOwned {
+        crate::db::DbError::SteeringQueueFull
+        | crate::db::DbError::DirectTurnConflict(TurnConflict::ConversationAlreadyOwned {
             ..
         }) => SendChatServiceError::Busy,
         crate::db::DbError::DirectTurnConflict(
@@ -836,11 +917,12 @@ fn transition_code(err: &TransitionError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        active_turn_fences_direct_acceptance, lookup_durable_replay,
-        lookup_durable_steering_replay, map_conversation_load_error, map_direct_turn_accept_error,
-        pending_queue_fences_direct_acceptance, persisted_skill_matches, queued_retry_matches,
-        should_enqueue_steering, submitted_identity_from_request, DurableReplayOutcome,
-        MessageExpansionPolicy, SendChatOutcome, SendChatRequest, SendChatServiceError,
+        active_turn_fences_direct_acceptance, close_admission_fenced_outcome,
+        lookup_durable_replay, lookup_durable_steering_replay, map_conversation_load_error,
+        map_direct_turn_accept_error, pending_queue_fences_direct_acceptance,
+        persisted_skill_matches, queued_retry_matches, should_enqueue_steering,
+        submitted_identity_from_request, DurableReplayOutcome, MessageExpansionPolicy,
+        SendChatOutcome, SendChatRequest, SendChatServiceError,
     };
     use crate::api::{FileAttachment, ImageAttachment};
     use phoenix_core::domain::db_schema::SkillContent;
@@ -866,6 +948,17 @@ mod tests {
             user_agent: None,
             expansion_policy: MessageExpansionPolicy::ExpandReferences,
         }
+    }
+
+    #[test]
+    fn close_admission_fence_is_a_typed_client_rejection() {
+        assert_eq!(
+            close_admission_fenced_outcome(),
+            SendChatOutcome::Rejected {
+                message: "Conversation is closing and cannot accept new work.".to_string(),
+                code: "close_admission_fenced",
+            }
+        );
     }
 
     #[test]

@@ -1,0 +1,1 @@
+Implement the dormant aggregate Close admission fence: persist/derive typed ProductConversation admission from active Close obligations, enforce it at direct-turn and wake-registration transaction boundaries, and recover pending fences in the runtime without exposing a user Close command or History transition.

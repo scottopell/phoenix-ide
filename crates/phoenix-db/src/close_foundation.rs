@@ -33,6 +33,30 @@ pub struct CloseFoundationTopology {
     pub members: Vec<CloseFoundationTopologyMember>,
 }
 
+/// Exact durable Close attempt that currently fences aggregate work admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseAdmissionFence {
+    pub product_conversation_id: ProductConversationId,
+    pub attempt_id: CloseAttemptId,
+    pub phase: ClosePhase,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProductConversationAdmission {
+    Accepted {
+        product_conversation_id: ProductConversationId,
+    },
+    Refused(CloseAdmissionFence),
+    History(ProductConversationId),
+}
+
+impl ProductConversationAdmission {
+    #[must_use]
+    pub fn is_accepted(&self) -> bool {
+        matches!(self, Self::Accepted { .. })
+    }
+}
+
 impl CloseFoundationTopology {
     #[must_use]
     pub fn member_ids(&self) -> Vec<&str> {
@@ -40,6 +64,84 @@ impl CloseFoundationTopology {
             .iter()
             .map(|member| member.conversation.id.as_str())
             .collect()
+    }
+}
+
+pub(crate) async fn admit_product_conversation_operation_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    conversation_id: &str,
+) -> DbResult<ProductConversationAdmission> {
+    let product_conversation_id: String =
+        sqlx::query_scalar("SELECT product_conversation_id FROM conversations WHERE id = ?1")
+            .bind(conversation_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .ok_or_else(|| DbError::ConversationNotFound(conversation_id.to_string()))?;
+    let product_conversation_id = parse_product_conversation_id(
+        product_conversation_id,
+        "conversations.product_conversation_id",
+    )?;
+    let aggregate =
+        sqlx::query("SELECT kind, ordinary_lifecycle FROM product_conversations WHERE id = ?1")
+            .bind(product_conversation_id.as_str())
+            .fetch_optional(&mut **tx)
+            .await?
+            .ok_or_else(|| {
+                DbError::Serialization(format!(
+                    "missing product conversation {}",
+                    product_conversation_id.as_str()
+                ))
+            })?;
+    let kind: String = aggregate.try_get("kind")?;
+    if kind == "coordinator" {
+        return Ok(ProductConversationAdmission::Accepted {
+            product_conversation_id,
+        });
+    }
+    let lifecycle: String = aggregate.try_get("ordinary_lifecycle")?;
+    if lifecycle == "history" {
+        return Ok(ProductConversationAdmission::History(
+            product_conversation_id,
+        ));
+    }
+    let obligation = sqlx::query(
+        "SELECT attempt_id, phase FROM close_obligations
+         WHERE product_conversation_id = ?1 AND phase <> 'completed'",
+    )
+    .bind(product_conversation_id.as_str())
+    .fetch_optional(&mut **tx)
+    .await?;
+    match obligation {
+        None => Ok(ProductConversationAdmission::Accepted {
+            product_conversation_id,
+        }),
+        Some(row) => {
+            let attempt_id = parse_close_attempt_id(row.try_get("attempt_id")?)?;
+            let phase_raw: String = row.try_get("phase")?;
+            let phase = ClosePhase::from_db_str(&phase_raw).ok_or_else(|| {
+                DbError::Serialization(format!("unknown close phase {phase_raw}"))
+            })?;
+            Ok(ProductConversationAdmission::Refused(CloseAdmissionFence {
+                product_conversation_id,
+                attempt_id,
+                phase,
+            }))
+        }
+    }
+}
+
+pub(crate) async fn require_product_conversation_admission_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    conversation_id: &str,
+) -> DbResult<ProductConversationId> {
+    match admit_product_conversation_operation_tx(tx, conversation_id).await? {
+        ProductConversationAdmission::Accepted {
+            product_conversation_id,
+        } => Ok(product_conversation_id),
+        ProductConversationAdmission::Refused(fence) => Err(DbError::CloseAdmissionFenced(fence)),
+        ProductConversationAdmission::History(product_conversation_id) => Err(
+            DbError::ProductConversationUnavailable(product_conversation_id),
+        ),
     }
 }
 
@@ -800,6 +902,16 @@ fn encode_aggregate_snapshot_component<'a>(
 // close-foundation precondition/not-found errors enforced by this module.
 #[allow(clippy::missing_errors_doc)]
 impl Database {
+    pub async fn product_conversation_admission(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<ProductConversationAdmission> {
+        let mut tx = self.pool.begin().await?;
+        let admission = admit_product_conversation_operation_tx(&mut tx, conversation_id).await?;
+        tx.commit().await?;
+        Ok(admission)
+    }
+
     pub async fn close_foundation_topology(
         &self,
         product_conversation_id: &ProductConversationId,
@@ -820,6 +932,11 @@ impl Database {
     ) -> DbResult<CloseObligation> {
         let mut conn = self.pool.acquire().await?;
         let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
+        #[cfg(test)]
+        if let Some(latch) = &self.close_foundation_test_latch {
+            latch.transaction_entered.notify_waiters();
+            latch.release_transaction.notified().await;
+        }
         if let Some(row) = sqlx::query(
             "SELECT attempt_id, product_conversation_id, phase, inspection_generation,
                     inspection_fingerprint, created_at, updated_at, completed_at, close_outcome,
@@ -2831,6 +2948,72 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(members, vec![conversation.id]);
+    }
+
+    #[tokio::test]
+    async fn product_conversation_admission_is_open_without_a_close_attempt() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        assert!(matches!(
+            db.product_conversation_admission("root").await.unwrap(),
+            ProductConversationAdmission::Accepted { product_conversation_id }
+                if product_conversation_id == product_id("root")
+        ));
+    }
+
+    #[tokio::test]
+    async fn product_conversation_admission_accepts_coordinator_without_ordinary_lifecycle() {
+        let db = Database::open_in_memory().await.unwrap();
+        let coordinator = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            db.product_conversation_admission(&coordinator.id).await.unwrap(),
+            ProductConversationAdmission::Accepted { product_conversation_id }
+                if product_conversation_id == coordinator.product_conversation_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn product_conversation_admission_refuses_history_after_close_completes() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let product_conversation_id = product_id("root");
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1",
+        )
+        .bind(product_conversation_id.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            db.product_conversation_admission("root").await.unwrap(),
+            ProductConversationAdmission::History(id) if id == product_conversation_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn product_conversation_admission_refuses_every_captured_member_after_close_begins() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        create_child(&db, "latest", "root").await;
+        db.begin_close_foundation(&product_id("root"), "admission-fence")
+            .await
+            .unwrap();
+
+        for conversation_id in ["root", "latest"] {
+            assert!(matches!(
+                db.product_conversation_admission(conversation_id)
+                    .await
+                    .unwrap(),
+                ProductConversationAdmission::Refused(CloseAdmissionFence { attempt_id, phase, .. })
+                    if attempt_id.as_str() == "admission-fence"
+                        && phase == ClosePhase::AwaitingBlockerResolution
+            ));
+        }
     }
 
     #[tokio::test]

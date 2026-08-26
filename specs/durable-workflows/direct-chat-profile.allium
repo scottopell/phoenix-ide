@@ -34,6 +34,7 @@ enum DirectChatRejectReason {
     malformed_request
     | target_unavailable
     | capability_closed
+    | close_admission_fenced
 }
 
 enum PayloadSourceKind { inline_text | inline_file_reference | skill_invocation }
@@ -54,6 +55,7 @@ enum DirectChatOutcomeKind {
 
 value ResolvedTarget {
     conversation_id: String
+    product_conversation: bedrock/ProductConversation
     successor_conversation_id: String?
 }
 
@@ -169,7 +171,8 @@ entity DirectChatConsumerCursor {
 -- rejection_reason_for(request), prepared_parts_for(request), parts_are_fully_resolved(parts)
 -- prepared_payload_for(request, resolved_target), prepared_fingerprint_for(resolved_target, payload)
 -- immutable_after_acceptance(payload), immutable_after_acceptance(fingerprint)
--- same_key_existing_acceptance(turn_key), fingerprints_match(left, right)
+-- same_key_existing_acceptance(turn_key), fingerprints_match(left, right), prepared_event_emitted_for(turn_key)
+-- request_matches_existing_acceptance(request, acceptance)
 -- conflicting_fingerprint(existing_acceptance), runtime_slot_for(resolved_target), slot_is_available(slot)
 -- canonical_delivery_for(acceptance), runtime_acceptance_for(delivery), runtime_identity_matches_acceptance(acceptance, runtime_acceptance)
 -- committed_outcome_for(acceptance), replay_of(outcome), steering_target_matches_successor(acceptance)
@@ -190,7 +193,7 @@ entity DirectChatConsumerCursor {
 -- replay_runtime_accepted_outcome(accepted_turn), replay_queued_steering_outcome(accepted_turn)
 -- independent_prepared_events_emitted(request, targets)
 -- replay_preserves_prepared_payload(acceptance, prepared_payload), acceptance_created_once(turn_key)
--- direct_chat_close_settlement_request(product_conversation, attempt_id)
+-- direct_chat_close_settlement_request(product_conversation, attempt_id), active_close_obligation(product_conversation)
 -- observer_semantic_state_is_committed(acceptance), routing_semantic_state_is_committed(acceptance)
 -- admission_semantic_state_is_committed(acceptance), no_semantic_state_established(acceptance)
 
@@ -283,6 +286,8 @@ rule ResolveTargetAndPrepareImmutablePayloadBeforeAcceptance {
     let prepared_payload = prepared_payload_for(request, resolved_target)
     let prepared_fingerprint = prepared_fingerprint_for(resolved_target, prepared_payload)
     let turn_key = target_bound_key(resolved_target, prepared_payload.user_message_id)
+    requires: not active_close_obligation(resolved_target.product_conversation)
+        or same_key_existing_acceptance(turn_key) != null
 
     ensures: parts_are_fully_resolved(prepared_payload.parts)
     ensures: prepared_fingerprint.resolved_target_key = resolved_target_key(resolved_target)
@@ -423,6 +428,58 @@ rule SecondaryConsumersAreMonotonicViewsOfAcceptedTurns {
 
     ensures: consumer_cursor_for(acceptance, consumer_kind)
     ensures: acceptance.accepted_turn = acceptance.accepted_turn
+}
+
+rule ActiveCloseObligationFencesNewDirectTurnAdmission {
+    when: DirectChatRequested(client, request)
+    requires: rejection_reason_for(request) = null
+
+    let resolved_target = resolved_target_for(request)
+    let turn_key = target_bound_key(resolved_target, request.client_message_id)
+
+    requires: active_close_obligation(resolved_target.product_conversation)
+    requires: same_key_existing_acceptance(turn_key) = null
+
+    ensures: DirectChatOutcome.created(
+        kind: TerminalRejected,
+        terminal_rejected: close_admission_fenced
+    )
+    ensures: not prepared_event_emitted_for(turn_key)
+
+    @guidance
+        -- The close-attempt admission and new direct-turn acceptance share one
+        -- serialized durable decision boundary. Existing exact-key acceptance is
+        -- replay, not new work, and remains available for recovery.
+}
+
+rule ActiveCloseObligationAllowsExactDirectTurnReplay {
+    when: DirectChatRequested(client, request)
+    requires: rejection_reason_for(request) = null
+
+    let resolved_target = resolved_target_for(request)
+    let turn_key = target_bound_key(resolved_target, request.client_message_id)
+
+    requires: active_close_obligation(resolved_target.product_conversation)
+    requires: same_key_existing_acceptance(turn_key) != null
+    requires: request_matches_existing_acceptance(request, same_key_existing_acceptance(turn_key))
+    requires: same_key_existing_acceptance(turn_key).committed_outcome != null
+
+    ensures: replay_of(committed_outcome_for(same_key_existing_acceptance(turn_key)))
+}
+
+rule ActiveCloseObligationPreservesExactPendingDirectTurnRecovery {
+    when: DirectChatRequested(client, request)
+    requires: rejection_reason_for(request) = null
+
+    let resolved_target = resolved_target_for(request)
+    let turn_key = target_bound_key(resolved_target, request.client_message_id)
+
+    requires: active_close_obligation(resolved_target.product_conversation)
+    requires: same_key_existing_acceptance(turn_key) != null
+    requires: request_matches_existing_acceptance(request, same_key_existing_acceptance(turn_key))
+    requires: same_key_existing_acceptance(turn_key).committed_outcome = null
+
+    ensures: retryable_unaccepted_outcome(turn_key)
 }
 
 rule CloseSettlementBridgesToLatestAcceptedDirectTurn {
