@@ -113,43 +113,46 @@ THE SYSTEM SHALL treat it as a typed inspection-mismatch path that returns the C
 
 ---
 
-### REQ-WL-002b: Retirement Retires Owned Resources Stepwise, Idempotently, and Without Automatic Recovery Artifacts
+### REQ-WL-002b: Retirement Seals One WorkScope Gate and Retires Its Owned Resources Without Automatic Recovery Artifacts
 
 WHEN bedrock requests resource retirement for one exact Close attempt
 THE SYSTEM SHALL retire the owned worktree and WorkScope-scoped resources for every attached `WorkScope` targeted by that ProductConversation operation, including each worktree itself, bash/process-group resources, tmux resources, PTY/terminal resources, browser resources, and equivalent live execution resources owned by that exact WorkScope
 
-THE SYSTEM SHALL treat the attached `WorkScope` as the owner of the retireable resources
+THE SYSTEM SHALL seal one admission gate for each exact attached `WorkScope` before retiring its currently owned resources
 AND SHALL derive cleanup authority only from the exact ProductConversation's committed Close retirement operation targeting that attached `WorkScope`
+AND SHALL reject new resource admission through that sealed gate until the attempt either completes or enters typed repair
 
 THE SYSTEM SHALL treat transcript rows and subordinate execution conversations within the same ordinary Open ProductConversation as participants in that one aggregate rather than as independent WorkScope owners
 AND SHALL NOT let those subordinate participants independently own, veto, or delay destructive retirement of the ProductConversation's attached `WorkScope`
 
-THE SYSTEM SHALL distinguish those same-aggregate participants from a genuinely separate ordinary Open ProductConversation that also resolves to the same `WorkScope`, or from unresolved ProductConversation-identity evidence that prevents Phoenix from proving whether another Open product aggregate exists
-AND SHALL block destructive teardown only for that distinct-open-aggregate or unresolved-identity-conflict case
+THE SYSTEM SHALL structurally assign each `WorkScope` to exactly one ordinary `ProductConversation`
+AND SHALL permit continuation rows and subordinate execution conversations only as members of that same owning aggregate
+AND SHALL reject a distinct ordinary `ProductConversation` attachment to that `WorkScope`
+AND SHALL treat legacy conflicting ownership evidence as typed repair rather than electing an owner or beginning destructive teardown
 
-THE SYSTEM SHALL perform retirement as a stepwise idempotent operation that records per-owned-resource completion or residual-error evidence as each step is attempted so retries can safely continue from the exact prior state
+THE SYSTEM SHALL stop resources held by the sealed gate's live process epoch through their in-memory ownership permits
+AND SHALL treat bash/process groups, PTY sessions, browser sessions, and equivalent ordinary live execution resources as process-epoch resources rather than durable restart resources
 
-WHEN retirement attempts one owned resource
-THE SYSTEM SHALL record typed evidence for that exact retirement attempt before any all-retired completion is emitted
-AND SHALL classify the attempted resource as one of: worktree, bash/process-group, tmux, PTY/terminal, browser, or equivalent live execution resource
-AND SHALL carry a stable concrete `resource_identity` alongside `resource_kind` so multiple same-kind owned resources remain distinguishable across retries and restarts
-
-WHEN a retirement step succeeds for one owned resource
-THE SYSTEM SHALL record `RetiredResource` evidence for that resource bound to the exact retirement attempt, attached `WorkScope`, `resource_kind`, and stable `resource_identity`
-AND SHALL treat a later retry that encounters the same resource already retired as an idempotent no-op rather than as a failure or a second completion
+WHEN retirement cannot confidently identify a resource as the resource owned by the sealed gate
+THE SYSTEM SHALL leave that resource untouched
+AND SHALL report typed repair information rather than silently succeeding
 
 WHEN retirement succeeds overall
-THE SYSTEM SHALL emit success only after every owned resource of every attached owned `WorkScope` has either produced `RetiredResource` evidence for that exact attempt and exact scope or been accepted as an idempotent already-retired no-op for that exact attempt and scope
+THE SYSTEM SHALL emit success only after the sealed gate has stopped its currently owned process-epoch resources and the required durable tmux and worktree outcomes are recorded
 
-WHEN retirement cannot retire every owned resource
+WHEN retirement cannot retire a required durable resource or worktree
 THE SYSTEM SHALL report typed residual cleanup state and repair information rather than silently succeeding
-AND SHALL bind every residual cleanup item to the exact retirement attempt, attached `WorkScope`, `resource_kind`, and stable `resource_identity`
-AND SHALL preserve the previously recorded per-resource retirement evidence so the remaining residual set is explicit
 
 WHEN the worktree is already absent
-THE SYSTEM SHALL bind that absence evidence to the exact retirement attempt, attached `WorkScope`, `resource_kind`, and stable `resource_identity`
-AND SHALL accept the absence only when retained identity and evidence show that the same requested retirement already removed it or is adopting that exact absence
+THE SYSTEM SHALL bind that absence evidence to the exact retirement attempt and attached `WorkScope`
+AND SHALL accept the absence only when retained worktree identity and same-attempt evidence show that the requested retirement removed it or is adopting that exact absence
 AND SHALL otherwise report typed residual evidence rather than silently treating the absence as success
+
+WHEN Phoenix resumes an interrupted Close attempt
+THE SYSTEM SHALL reseal its exact WorkScope gate and reinspect the current worktree before destructive worktree removal
+AND SHALL safely retire a tmux server only when its sealed socket path and Phoenix-controlled server token identify the same server
+AND SHALL leave process-epoch resources that have no live in-memory permit untouched
+AND SHALL route an ambiguous tmux server, worktree, or ownership record to `NeedsRepair`
 
 WHEN the attached `WorkScope` also owns attachments or other work-affine retained resources that are shared across transcript rows of the same open product conversation
 THE SYSTEM SHALL retire or preserve those resources according to that same WorkScope ownership boundary rather than according to individual transcript-row ownership
@@ -163,29 +166,23 @@ AND SHALL NOT create, rename, move, fast-forward, merge, delete, push, close, or
 
 ---
 
-### REQ-WL-002d: Durable Runtime Resource Instance Authority
+### REQ-WL-002d: Durable Tmux Instance Authority
 
-WHEN Phoenix admits a Phoenix-owned bash/process group, tmux server, PTY session, browser session, or equivalent live execution resource
-THE SYSTEM SHALL allocate one durable random launch identity before the external process or server is created
-AND SHALL persist one normalized resource-instance row bound to its owning `WorkScope`, resource kind, and launch identity
-AND SHALL retain the resource's Phoenix-controlled marker or stable server/profile authority together with the leader or server OS instance evidence sufficient to distinguish a reused PID, PGID, socket, or profile locator from the originally admitted instance
-AND SHALL treat a leader that is absent while an owned process group has surviving or escaped descendants as unresolved identity rather than as automatic cleanup authority
+WHEN Phoenix creates a tmux server for a `WorkScope`
+THE SYSTEM SHALL allocate a Phoenix-controlled server token before server creation
+AND SHALL seal the server's socket path and token as the durable tmux identity for a Close attempt
 
 WHEN Phoenix resumes retirement after a restart
-THE SYSTEM SHALL verify the sealed resource identity against its Phoenix-controlled marker or stable server/profile authority and its retained OS process-birth evidence before signaling, removing, or receiving retirement completion for that resource
-AND SHALL treat a PID, PGID, socket path, browser profile path, or filesystem path alone as insufficient authority
+THE SYSTEM SHALL retire a tmux server only when its sealed socket path and Phoenix-controlled server token prove the same server remains live
+AND SHALL treat a socket path alone as insufficient authority
 
-WHEN the retained durable identity proves the same Phoenix-owned resource instance remains live
-THE SYSTEM SHALL fence admission for its exact owning `WorkScope` and retire only that exact instance
+WHEN the sealed tmux identity proves that the requested server is absent and a distinct replacement owns the reused socket path
+THE SYSTEM SHALL leave the replacement untouched and record the requested server's exact-attempt absence outcome
 
-WHEN the retained durable identity proves that the requested instance is absent and a distinct replacement owns a reused locator
-THE SYSTEM SHALL leave the replacement untouched and record exact-attempt absence evidence only for the requested instance
+WHEN Phoenix cannot prove the sealed tmux identity
+THE SYSTEM SHALL preserve the server and route the Close attempt to `NeedsRepair`
 
-WHEN Phoenix cannot prove the requested resource identity, marker authority, process-birth evidence, or descendant containment
-THE SYSTEM SHALL preserve the resource and its replacement, if any
-AND SHALL record typed residual cleanup evidence and route the Close attempt to `NeedsRepair`
-
-**Rationale:** Runtime registries and PID-like locators are process-local or reusable. Durable marker and birth evidence make restart recovery safe without turning registry amnesia into a destructive authority.
+**Rationale:** tmux is intentionally process-persistent. Ordinary execution resources belong to one Phoenix process epoch and Close does not retain universal per-resource restart identity for them.
 
 ---
 
@@ -209,9 +206,9 @@ AND SHALL otherwise route conflicts to typed repair rather than silently succeed
 
 ---
 
-### REQ-PROJ-WS-001: WorkScope as Resource Owner
+### REQ-PROJ-WS-001: WorkScope Has One Ordinary ProductConversation Owner
 
-Work-affine resources SHOULD be owned by the opaque persisted `work_scope_id`. Resource ownership MUST NOT be derived from ProductConversation ids, transcript-row ids, sub-agent ids, working directories, or worktree paths. ProductConversations, transcript rows, and subordinate execution conversations MAY have a `WorkScope` attached, but attachment is not ownership. THE SYSTEM SHALL expose ProductConversation-to-WorkScope attachments through exactly one authoritative writable representation and SHALL treat every other attachment representation as a read-only derivation rather than a parallel writable authority. When continuation creates a new execution row within the same ProductConversation, the ProductConversation keeps the same attached `WorkScope`; Phoenix SHALL NOT describe that step as transferring WorkScope ownership from one row to another or as electing a latest row owner. Attachments and other work-affine execution resources share that same WorkScope ownership model. Distinct ProductConversations remain isolated by distinct WorkScope identities even when their environments use the same path.
+Each persisted `WorkScope` SHALL have exactly one ordinary `ProductConversation` owner through one authoritative writable representation. Work-affine resource ownership SHALL derive from that opaque persisted `work_scope_id`, not from transcript-row IDs, sub-agent IDs, working directories, or worktree paths. Continuation rows and subordinate execution conversations MAY refer to their owning aggregate's `WorkScope`, but SHALL NOT create a separate ownership relation. A distinct ordinary `ProductConversation` SHALL NOT share that `WorkScope`, even when an environment path happens to match. Legacy records that imply multiple or no ordinary owners SHALL be retained as repair input and SHALL NOT confer destructive authority.
 
 
 ---
