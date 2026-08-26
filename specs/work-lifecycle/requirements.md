@@ -163,6 +163,32 @@ AND SHALL NOT create, rename, move, fast-forward, merge, delete, push, close, or
 
 ---
 
+### REQ-WL-002d: Durable Runtime Resource Instance Authority
+
+WHEN Phoenix admits a Phoenix-owned bash/process group, tmux server, PTY session, browser session, or equivalent live execution resource
+THE SYSTEM SHALL allocate one durable random launch identity before the external process or server is created
+AND SHALL persist one normalized resource-instance row bound to its owning `WorkScope`, resource kind, and launch identity
+AND SHALL retain the resource's Phoenix-controlled marker or stable server/profile authority together with the leader or server OS instance evidence sufficient to distinguish a reused PID, PGID, socket, or profile locator from the originally admitted instance
+AND SHALL treat a leader that is absent while an owned process group has surviving or escaped descendants as unresolved identity rather than as automatic cleanup authority
+
+WHEN Phoenix resumes retirement after a restart
+THE SYSTEM SHALL verify the sealed resource identity against its Phoenix-controlled marker or stable server/profile authority and its retained OS process-birth evidence before signaling, removing, or receiving retirement completion for that resource
+AND SHALL treat a PID, PGID, socket path, browser profile path, or filesystem path alone as insufficient authority
+
+WHEN the retained durable identity proves the same Phoenix-owned resource instance remains live
+THE SYSTEM SHALL fence admission for its exact owning `WorkScope` and retire only that exact instance
+
+WHEN the retained durable identity proves that the requested instance is absent and a distinct replacement owns a reused locator
+THE SYSTEM SHALL leave the replacement untouched and record exact-attempt absence evidence only for the requested instance
+
+WHEN Phoenix cannot prove the requested resource identity, marker authority, process-birth evidence, or descendant containment
+THE SYSTEM SHALL preserve the resource and its replacement, if any
+AND SHALL record typed residual cleanup evidence and route the Close attempt to `NeedsRepair`
+
+**Rationale:** Runtime registries and PID-like locators are process-local or reusable. Durable marker and birth evidence make restart recovery safe without turning registry amnesia into a destructive authority.
+
+---
+
 ### REQ-PROJ-028a: Restart Reconciles a Missing Registered Worktree as Open Repair Evidence
 
 WHEN Phoenix restarts and the latest Open row of a Git-backed `ProductConversation` still has a registered attached `WorkScope`/worktree tuple but that registered worktree path is missing on disk

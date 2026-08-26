@@ -532,6 +532,45 @@ rule ResourceRetirementFailureProducesResidualRepairState {
         -- so partial completion remains visible across retries.
 }
 
+rule RestartRetirementRequiresDurableRuntimeInstanceProof {
+    when: ResourceRetirementRequested(product_conversation, attempt_id)
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
+        retirement_requested,
+        needs_repair
+    }
+    requires: runtime_resource_pending_retirement(product_conversation, attempt_id)
+    requires: not durable_runtime_instance_proof_matches_pending_resource(product_conversation, attempt_id)
+    ensures: ResourceRetirementFailed(product_conversation, attempt_id)
+
+    @guidance
+        -- A restart may retire a runtime resource only after its durable Phoenix marker
+        -- or stable server/profile authority and retained process-birth identity prove
+        -- the sealed instance. PID, PGID, socket, and profile locators alone never
+        -- authorize signaling or removal; an unproven identity remains typed repair.
+}
+
+rule RestartRetirementLeavesVerifiedReplacementUntouched {
+    when: ResourceRetirementRequested(product_conversation, attempt_id)
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
+        retirement_requested,
+        needs_repair
+    }
+    requires: pending_runtime_resource_is_absent_with_verified_replacement(product_conversation, attempt_id)
+    ensures: RetirementAbsenceEvidence.created(
+        attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: pending_runtime_resource_scope(product_conversation, attempt_id)},
+        product_conversation: product_conversation,
+        scope: pending_runtime_resource_scope(product_conversation, attempt_id),
+        resource_kind: pending_runtime_resource_kind(product_conversation, attempt_id),
+        resource_identity: pending_runtime_resource_identity(product_conversation, attempt_id)
+    )
+    ensures: ResourceRetirementProgressRecorded(product_conversation, attempt_id)
+
+    @guidance
+        -- A replacement at a reused locator proves the old marked instance is absent;
+        -- it never inherits retirement authority. Phoenix records absence for the sealed
+        -- instance and does not signal, remove, or otherwise mutate the replacement.
+}
+
 rule ExactAttemptAdoptsRestartRepairAbsenceEvidence {
     when: ResourceRetirementRequested(product_conversation, attempt_id)
     let scope_binding = pending_worktree_retirement_scope(product_conversation, attempt_id)

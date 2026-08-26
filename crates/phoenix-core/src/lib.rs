@@ -12,6 +12,7 @@ pub mod git_repository;
 pub mod llm_language;
 pub mod llm_service;
 pub mod platform;
+pub mod process_identity;
 pub mod runtime_env;
 pub mod task_handoff;
 pub mod task_source;
