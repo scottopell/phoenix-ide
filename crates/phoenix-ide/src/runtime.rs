@@ -3094,6 +3094,11 @@ impl RuntimeManager {
                     }
                 }
                 manager.kick_creation_worker();
+                manager
+                    .db
+                    .cancel_close_settlement_wakes(obligation.attempt_id().as_str())
+                    .await
+                    .map_err(|error| error.to_string())?;
                 let active_turns = manager
                     .db
                     .list_close_settlement_active_turns(obligation.attempt_id().as_str())
@@ -3110,7 +3115,7 @@ impl RuntimeManager {
                     .collect::<Vec<_>>();
                 drop(runtimes);
                 for (turn_id, generation) in active_turns {
-                    manager
+                    match manager
                         .db
                         .workflow_repository()
                         .terminate_authoritative_turn(phoenix_workflow::TurnCommand::Cancel {
@@ -3118,7 +3123,14 @@ impl RuntimeManager {
                             expected_generation: generation,
                         })
                         .await
-                        .map_err(|error| error.to_string())?;
+                    {
+                        Ok(_) => {}
+                        Err(crate::db::DbError::DirectTurnConflict(
+                            phoenix_workflow::TurnConflict::StaleGeneration { .. }
+                            | phoenix_workflow::TurnConflict::AlreadyTerminal,
+                        )) => {}
+                        Err(error) => return Err(error.to_string()),
+                    }
                 }
                 for event_tx in event_txs {
                     let _ = event_tx

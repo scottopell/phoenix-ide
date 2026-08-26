@@ -1327,6 +1327,53 @@ impl Database {
         Ok(rows)
     }
 
+    pub async fn cancel_close_settlement_wakes(&self, attempt_id: &str) -> DbResult<usize> {
+        let wake_repo = crate::workflow::wake::WakeRepository::new(self.pool.clone());
+        let rows: Vec<(i64, String, String)> = sqlx::query_as(
+            "SELECT binding.workflow_id, binding.conversation_id, binding.contract_id
+             FROM wake_bindings binding
+             JOIN workflows workflow ON workflow.workflow_id = binding.workflow_id
+             JOIN conversations participant ON participant.id = binding.conversation_id
+             JOIN close_obligations obligation
+               ON obligation.product_conversation_id = participant.product_conversation_id
+             WHERE obligation.attempt_id = ?1
+               AND binding.resolved_at IS NULL
+               AND workflow.status IN ('Active', 'Cancelling', 'ManualResolution', 'Incompatible', 'DeletionPending')
+             ORDER BY binding.workflow_id",
+        )
+        .bind(attempt_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut cancelled = 0;
+        for (workflow_id, conversation_id, contract_id) in rows {
+            let workflow_id =
+                phoenix_workflow::WorkflowId(u64::try_from(workflow_id).map_err(|_| {
+                    DbError::Serialization("negative wake workflow id".to_string())
+                })?);
+            match wake_repo
+                .cancel_allocated(&crate::workflow::wake::WakeCancelIfUnresolvedInput {
+                    workflow_id,
+                    expected_conversation_id: Some(conversation_id),
+                    expected_contract_id: Some(contract_id),
+                    timestamp: phoenix_workflow::Timestamp(
+                        u64::try_from(Utc::now().timestamp()).map_err(|_| {
+                            DbError::Serialization(
+                                "negative wake cancellation timestamp".to_string(),
+                            )
+                        })?,
+                    ),
+                    reason: phoenix_workflow::wake_profile::WakeCancellationReason::ExplicitCancel,
+                })
+                .await?
+            {
+                crate::workflow::wake::WakeCancellationOutcome::Cancelled { .. }
+                | crate::workflow::wake::WakeCancellationOutcome::Replayed { .. } => cancelled += 1,
+                crate::workflow::wake::WakeCancellationOutcome::Stale => {}
+            }
+        }
+        Ok(cancelled)
+    }
+
     pub async fn list_close_settlement_active_turns(
         &self,
         attempt_id: &str,
