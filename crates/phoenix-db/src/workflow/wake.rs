@@ -586,7 +586,7 @@ impl WakeRepository {
         prepared_fingerprint: &str,
         now: Timestamp,
     ) -> DbResult<WakeRegistrationOutcome> {
-        let mut tx = self.workflow_repo.begin_tx().await?;
+        let mut tx = self.begin_authoritative_tx().await?;
         let existing = fetch_existing_binding_tx(&mut tx, input).await?;
         if let Some(existing) = existing {
             let exact_replay = existing.prepared_fingerprint == prepared_fingerprint
