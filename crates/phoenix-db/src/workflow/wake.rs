@@ -6436,7 +6436,10 @@ mod tests {
         let input = intent();
         let workflow_id = match repo.register(&input, "exact", Timestamp(10)).await.unwrap() {
             WakeRegistrationOutcome::Registered { workflow_id, .. } => workflow_id,
-            outcome => panic!("expected registration, got {outcome:?}"),
+            outcome @ (WakeRegistrationOutcome::Replayed { .. }
+            | WakeRegistrationOutcome::Conflict) => {
+                panic!("expected registration, got {outcome:?}");
+            }
         };
         let product_conversation_id = db
             .get_conversation("conv-1")
