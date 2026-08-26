@@ -5202,11 +5202,13 @@ impl RuntimeManager {
                     "Runtime cleanup: entry replaced after eviction, skipping remove"
                 );
             }
-            if let Err(error) = manager_for_cleanup.resume_pending_close_settlements().await {
-                tracing::error!(%error, conv_id = %conv_id, "failed to re-evaluate Close settlement after runtime exit");
-            }
             manager_for_cleanup
                 .propagate_fatal_runtime_exit(disposition, "direct_turn_terminal_evidence");
+            if disposition != executor::RuntimeExitDisposition::FatalLocalAuthorityLoss {
+                if let Err(error) = manager_for_cleanup.resume_pending_close_settlements().await {
+                    tracing::error!(%error, conv_id = %conv_id, "failed to re-evaluate Close settlement after runtime exit");
+                }
+            }
             if removed && disposition == executor::RuntimeExitDisposition::RecreateFromDatabase {
                 manager_for_cleanup.kick_direct_turn_worker();
             }

@@ -1253,7 +1253,13 @@ impl Database {
                  EXISTS (
                    SELECT 1 FROM durable_turns turn
                    WHERE turn.conversation_id = participant.id
-                     AND turn.owns_conversation = 1 AND turn.terminal_kind IS NULL
+                     AND (
+                       (turn.owns_conversation = 1 AND turn.terminal_kind IS NULL)
+                       OR EXISTS (
+                         SELECT 1 FROM direct_turn_terminal_obligations terminal
+                         WHERE terminal.turn_id = turn.turn_id
+                       )
+                     )
                  )
                  OR EXISTS (
                    SELECT 1 FROM conversation_creation_jobs creation
@@ -1270,8 +1276,15 @@ impl Database {
                    SELECT 1 FROM wake_bindings binding
                    JOIN workflows workflow ON workflow.workflow_id = binding.workflow_id
                    WHERE binding.conversation_id = participant.id
-                     AND (binding.resolved_at IS NULL
-                       OR workflow.status IN ('Active', 'Cancelling', 'ManualResolution', 'Incompatible', 'DeletionPending'))
+                     AND (
+                       binding.resolved_at IS NULL
+                       OR workflow.status IN ('Active', 'Cancelling', 'ManualResolution', 'Incompatible', 'DeletionPending')
+                       OR EXISTS (
+                         SELECT 1 FROM workflow_deliveries delivery
+                         WHERE delivery.workflow_id = binding.workflow_id
+                           AND (delivery.status = 'Pending' OR delivery.runtime_acceptance_status = 'Owed')
+                       )
+                     )
                  )
                )",
         )
