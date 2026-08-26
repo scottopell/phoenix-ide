@@ -184,8 +184,6 @@ impl TerminalInstanceIdentity {
 pub struct TerminalRetirementPermit {
     pub work_scope: ResourceScopeKey,
     pub instance: Option<TerminalInstanceIdentity>,
-    pub runtime_resource_instance_id:
-        Option<phoenix_core::runtime_resource::RuntimeResourceInstanceId>,
     generation: TerminalRetirementGeneration,
     had_entry: bool,
 }
@@ -426,10 +424,6 @@ impl ActiveTerminals {
             .handles
             .get(scope)
             .map(TerminalInstanceIdentity::from_handle);
-        let runtime_resource_instance_id = map
-            .handles
-            .get(scope)
-            .and_then(|handle| handle.runtime_resource_instance_id.clone());
         let had_entry = instance.is_some();
         let generation = {
             let retirement = map.retirements.entry(scope.clone()).or_default();
@@ -440,7 +434,6 @@ impl ActiveTerminals {
         TerminalRetirementPermit {
             work_scope: scope.clone(),
             instance,
-            runtime_resource_instance_id,
             generation: TerminalRetirementGeneration(generation),
             had_entry,
         }

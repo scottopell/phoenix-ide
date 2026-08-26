@@ -135,12 +135,10 @@ impl RuntimeManager {
             ));
         }
         if let Some(instance) = &terminal.instance {
-            let resource =
-                opaque_resource(RetiredResourceKind::PtySession, instance.stable_identity());
-            if let Some(instance_id) = terminal.runtime_resource_instance_id.clone() {
-                runtime_instance_bindings.push((resource.clone(), instance_id));
-            }
-            resources.push(resource);
+            resources.push(opaque_resource(
+                RetiredResourceKind::PtySession,
+                instance.stable_identity(),
+            ));
         }
         for instance in &browser.instances {
             resources.push(opaque_resource(

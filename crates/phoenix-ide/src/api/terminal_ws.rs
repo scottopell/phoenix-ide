@@ -651,7 +651,6 @@ mod reclaim_tests {
                 },
                 launch_uuid: "reclaim-test-launch".to_string(),
             },
-            runtime_resource_instance_id: None,
             child_kind: phoenix_terminal::TerminalChildKind::Shell,
             tracker: Arc::new(Mutex::new(CommandTracker::new("reclaim-test".to_string()))),
             shell_integration_status: Arc::new(Mutex::new(ShellIntegrationStatus::Unknown)),
