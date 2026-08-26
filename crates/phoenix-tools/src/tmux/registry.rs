@@ -976,7 +976,9 @@ impl TmuxRegistry {
 
             if exact_current {
                 return match self.exact_identity_state(persisted).await? {
-                    ExactTmuxIdentityState::Absent => Ok(TmuxRetirementRehydration::AbsenceVerified),
+                    ExactTmuxIdentityState::Absent => {
+                        Ok(TmuxRetirementRehydration::AbsenceVerified)
+                    }
                     ExactTmuxIdentityState::Ambiguous { reason } => {
                         Ok(TmuxRetirementRehydration::Residual { reason })
                     }
@@ -1041,10 +1043,8 @@ impl TmuxRegistry {
                     if let Some(entry) = map.get(&key) {
                         entry.clone()
                     } else {
-                        let mut server = TmuxServer::new(
-                            work_scope.clone(),
-                            persisted.socket_path.clone(),
-                        );
+                        let mut server =
+                            TmuxServer::new(work_scope.clone(), persisted.socket_path.clone());
                         server.server_token = persisted.server_token.clone();
                         server.status = ServerStatus::Live;
                         let entry = Arc::new(TmuxScopeEntry::new(server));
@@ -1072,7 +1072,9 @@ impl TmuxRegistry {
                     });
                 }
                 match self.exact_identity_state(persisted).await? {
-                    ExactTmuxIdentityState::Absent => Ok(TmuxRetirementRehydration::AbsenceVerified),
+                    ExactTmuxIdentityState::Absent => {
+                        Ok(TmuxRetirementRehydration::AbsenceVerified)
+                    }
                     ExactTmuxIdentityState::Ambiguous { reason } => {
                         Ok(TmuxRetirementRehydration::Residual { reason })
                     }
@@ -2123,7 +2125,11 @@ mod tests {
         };
 
         let restarted = owner.registry();
-        let permit = match restarted.rehydrate_retirement(&scope, &persisted).await.unwrap() {
+        let permit = match restarted
+            .rehydrate_retirement(&scope, &persisted)
+            .await
+            .unwrap()
+        {
             TmuxRetirementRehydration::Permit(permit) => permit,
             other => panic!("expected exact rehydrated permit, got {other:?}"),
         };
@@ -2132,7 +2138,10 @@ mod tests {
             .await
             .expect("complete exact rehydrated retirement");
         assert_eq!(outcome, TmuxRetirementOutcome::Retired);
-        assert!(matches!(probe(&persisted.socket_path).await.unwrap(), ProbeResult::NoSocket));
+        assert!(matches!(
+            probe(&persisted.socket_path).await.unwrap(),
+            ProbeResult::NoSocket
+        ));
         owner.shutdown();
     }
 
@@ -2167,7 +2176,10 @@ mod tests {
 
         let restarted = owner.registry();
         assert_eq!(
-            restarted.rehydrate_retirement(&scope, &persisted).await.unwrap(),
+            restarted
+                .rehydrate_retirement(&scope, &persisted)
+                .await
+                .unwrap(),
             TmuxRetirementRehydration::AbsenceVerified
         );
         let output = run_tmux_quiet_output(&persisted.socket_path, &["list-sessions"])
@@ -2203,7 +2215,10 @@ mod tests {
 
         let restarted = owner.registry();
         assert_eq!(
-            restarted.rehydrate_retirement(&scope, &persisted).await.unwrap(),
+            restarted
+                .rehydrate_retirement(&scope, &persisted)
+                .await
+                .unwrap(),
             TmuxRetirementRehydration::AbsenceVerified
         );
         let _ = std::fs::remove_file(&persisted.socket_path);

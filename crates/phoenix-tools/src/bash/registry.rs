@@ -17,7 +17,6 @@
 //! concurrent spawns from both observing `count == cap - 1` and racing past
 //! the cap.
 
-use phoenix_core::process_identity::ProcessIdentity;
 use phoenix_core::work_scope::EffectiveResourceAccess;
 use std::collections::HashMap;
 use std::sync::{
