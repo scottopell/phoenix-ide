@@ -5223,16 +5223,41 @@ mod tests {
     }
 
     async fn insert_conversation(pool: &sqlx::SqlitePool, id: &str) {
-        let product_conversation_id = format!("product-{id}");
         sqlx::query(
-            "INSERT OR IGNORE INTO product_conversations (id, kind, ordinary_lifecycle)
-             VALUES (?1, 'ordinary', 'open')",
+            "INSERT OR IGNORE INTO conversations
+             (id, product_conversation_id, slug, title, parent_conversation_id,
+              user_initiated, state_updated_at, created_at, updated_at, runtime_role, work_scope_id)
+             SELECT ?1, product_conversation_id, ?1, ?1, 'conv-1',
+                    0, '2025-01-01', '2025-01-01', '2025-01-01', 'sub_agent', work_scope_id
+             FROM conversations
+             WHERE id = 'conv-1'",
         )
-        .bind(&product_conversation_id)
+        .bind(id)
         .execute(pool)
         .await
         .unwrap();
-        insert_conversation_in_product(pool, id, &product_conversation_id, None).await;
+    }
+
+    #[tokio::test]
+    async fn wake_discovery_fixture_participant_is_same_aggregate_subagent() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        insert_conversation(&repo.workflow_repo.pool, "wake-subagent").await;
+        let (product, role, scope): (String, String, String) = sqlx::query_as(
+            "SELECT product_conversation_id, runtime_role, work_scope_id
+             FROM conversations WHERE id = 'wake-subagent'",
+        )
+        .fetch_one(&repo.workflow_repo.pool)
+        .await
+        .unwrap();
+        let owner_product: String = sqlx::query_scalar(
+            "SELECT product_conversation_id FROM conversations WHERE id = 'conv-1'",
+        )
+        .fetch_one(&repo.workflow_repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(product, owner_product);
+        assert_eq!(role, "sub_agent");
+        assert_eq!(scope, "conv-1");
     }
 
     async fn external_acceptance_identity(
