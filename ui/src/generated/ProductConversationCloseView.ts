@@ -3,4 +3,4 @@ import type { ProductConversationCloseInspectionView } from "./ProductConversati
 import type { ProductConversationCloseLossView } from "./ProductConversationCloseLossView";
 import type { ProductConversationClosePhaseView } from "./ProductConversationClosePhaseView";
 
-export type ProductConversationCloseView = { attempt_id: string, phase: ProductConversationClosePhaseView, inspections: Array<ProductConversationCloseInspectionView>, losses: Array<ProductConversationCloseLossView>, };
+export type ProductConversationCloseView = { attempt_id: string, phase: ProductConversationClosePhaseView, confirmation_snapshot: ProductConversationCloseInspectionView | null, inspections: Array<ProductConversationCloseInspectionView>, losses: Array<ProductConversationCloseLossView>, };
