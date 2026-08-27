@@ -49,10 +49,6 @@ export class ConversationOpenMeasurement {
     this.startedAt = startedAt ?? clock();
   }
 
-  isCompleted(): boolean {
-    return this.completed;
-  }
-
   documentHidden(): void {
     this.remainedVisible = false;
   }

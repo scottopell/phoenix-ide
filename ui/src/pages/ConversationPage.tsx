@@ -715,6 +715,9 @@ function ConversationPageContent({
   } | null>(null);
   const expectedCanonicalSlugRef = useRef<string | null>(null);
   const routeRetryAttemptRef = useRef(0);
+  const routeResolutionFailedRef = useRef(false);
+  const routeResolvedRef = useRef(false);
+  const routeRetryActiveRef = useRef(false);
   if (initialOpenJourneyRef.current?.slug !== slug) {
     if (expectedCanonicalSlugRef.current === slug && initialOpenJourneyRef.current) {
       initialOpenJourneyRef.current.slug = slug;
@@ -724,6 +727,10 @@ function ConversationPageContent({
         slug,
         measurement: new ConversationOpenMeasurement(generateUUID(), 0, undefined, routeRenderStartedAt),
       };
+      routeRetryAttemptRef.current = 0;
+      routeResolutionFailedRef.current = false;
+      routeResolvedRef.current = false;
+      routeRetryActiveRef.current = false;
     }
   }
   const initialOpenMeasurement = initialOpenJourneyRef.current.measurement;
@@ -740,6 +747,7 @@ function ConversationPageContent({
     const handleVisibilityChange = () => {
       if (document.visibilityState !== 'visible') currentRouteMeasurement()?.documentHidden();
     };
+    handleVisibilityChange();
     window.addEventListener('pagehide', reportRouteOwnedCancellation);
     document.addEventListener('visibilitychange', handleVisibilityChange);
     return () => {
@@ -971,11 +979,13 @@ function ConversationPageContent({
     let cancelled = false;
 
     const resolveAuthoritativeRoute = async (
-      measurement = initialOpenMeasurement,
+      measurement: ConversationOpenMeasurement | null,
     ) => {
       const route = await resolveConversationRoute(slug);
       if (cancelled) return;
-      measurement.routeResolved();
+      routeResolutionFailedRef.current = false;
+      routeResolvedRef.current = true;
+      measurement?.routeResolved();
       setResolvedRouteConversationId(route.id);
       const preserveTranscriptRouteId = (
         locationRef.current.state as { preserveTranscriptRouteId?: boolean } | null
@@ -1003,36 +1013,36 @@ function ConversationPageContent({
         }
         return;
       }
+      routeRetryActiveRef.current = true;
       try {
-        await resolveAuthoritativeRoute();
+        await resolveAuthoritativeRoute(initialOpenMeasurement);
+        routeRetryActiveRef.current = false;
       } catch (err) {
-        if (!cancelled) {
-          console.error('Failed to resolve conversation route:', err);
-          const telemetry = initialOpenMeasurement.error();
-          if (telemetry) reportConversationOpen(telemetry);
-          if (!atomRef.current.conversationId) {
-            setError(err instanceof Error ? err.message : 'Failed to resolve conversation route');
-          }
+        if (cancelled) return;
+        routeRetryActiveRef.current = false;
+        console.error('Failed to resolve conversation route:', err);
+        routeResolutionFailedRef.current = true;
+        const telemetry = initialOpenMeasurement.error();
+        if (telemetry) reportConversationOpen(telemetry);
+        if (!atomRef.current.conversationId) {
+          setError(err instanceof Error ? err.message : 'Failed to resolve conversation route');
         }
       }
     };
 
     const handleOnline = () => {
-      const currentMeasurement = initialOpenJourneyRef.current?.measurement
-        ?? initialOpenMeasurement;
-      const retryMeasurement = currentMeasurement.isCompleted()
-        ? new ConversationOpenMeasurement(generateUUID(), ++routeRetryAttemptRef.current)
-        : currentMeasurement;
-      initialOpenJourneyRef.current = { slug, measurement: retryMeasurement };
-      setResolvedRouteConversationId(null);
-      setArchiveStatusConfirmedConversationId(null);
-      setError(null);
-      const retryRouteResolution = async (measurement: ConversationOpenMeasurement) => {
+      if (routeRetryActiveRef.current) return;
+      routeRetryActiveRef.current = true;
+      const retryRouteResolution = async (
+        measurement: ConversationOpenMeasurement | null,
+      ): Promise<void> => {
         try {
           await resolveAuthoritativeRoute(measurement);
+          routeRetryActiveRef.current = false;
         } catch (err) {
           if (cancelled) return;
-          const telemetry = measurement.error();
+          routeResolutionFailedRef.current = true;
+          const telemetry = measurement?.error();
           if (telemetry) reportConversationOpen(telemetry);
           console.warn('Failed to resolve conversation route after reconnect; retrying', err);
           window.setTimeout(() => {
@@ -1046,13 +1056,29 @@ function ConversationPageContent({
           }, 1_000);
         }
       };
-      void retryRouteResolution(retryMeasurement);
+
+      let measurement: ConversationOpenMeasurement | null = null;
+      if (routeResolutionFailedRef.current) {
+        measurement = new ConversationOpenMeasurement(
+          generateUUID(),
+          ++routeRetryAttemptRef.current,
+        );
+        initialOpenJourneyRef.current = { slug, measurement };
+      } else if (!routeResolvedRef.current) {
+        measurement = initialOpenJourneyRef.current?.measurement
+          ?? initialOpenMeasurement;
+      }
+      setResolvedRouteConversationId(null);
+      setArchiveStatusConfirmedConversationId(null);
+      setError(null);
+      void retryRouteResolution(measurement);
     };
     window.addEventListener('online', handleOnline);
     void loadConversation();
 
     return () => {
       cancelled = true;
+      routeRetryActiveRef.current = false;
       const timeout = window.setTimeout(() => {
         if (initialOpenCancellationRef.current?.timeout === timeout) {
           initialOpenCancellationRef.current = null;

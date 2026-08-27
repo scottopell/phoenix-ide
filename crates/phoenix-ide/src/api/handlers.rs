@@ -2543,6 +2543,11 @@ impl ConversationOpenTelemetry {
             .copied()
             .try_fold(0.0, |previous, value| (value >= previous).then_some(value))
             .is_some();
+        let causal_prefix = (self.native_open_ms.is_none()
+            || self.event_source_created_ms.is_some())
+            && (self.init_received_ms.is_none() || self.event_source_created_ms.is_some())
+            && (self.init_handled_ms.is_none() || self.init_received_ms.is_some())
+            && (self.first_paint_ms.is_none() || self.init_handled_ms.is_some());
         let connected_complete = match self.outcome {
             ConversationOpenOutcome::Connected => {
                 self.event_source_created_ms.is_some()
@@ -2556,6 +2561,7 @@ impl ConversationOpenTelemetry {
         };
         milestones_valid
             && ordered
+            && causal_prefix
             && valid_duration(self.total_ms)
             && self.retry_attempt <= MAX_RETRY_ATTEMPT
             && connected_complete
@@ -2615,6 +2621,24 @@ mod conversation_open_telemetry_tests {
         assert!(!serde_json::from_value::<ConversationOpenTelemetry>(report)
             .unwrap()
             .has_valid_bounds());
+    }
+
+    #[test]
+    fn rejects_impossible_unfinished_milestone_prefixes() {
+        for (missing, present) in [
+            ("event_source_created_ms", "native_open_ms"),
+            ("event_source_created_ms", "init_received_ms"),
+            ("init_received_ms", "init_handled_ms"),
+        ] {
+            let mut report = valid_report();
+            report["outcome"] = serde_json::json!("error");
+            report["first_paint_ms"] = serde_json::Value::Null;
+            report[missing] = serde_json::Value::Null;
+            report[present] = serde_json::json!(5.0);
+            assert!(!serde_json::from_value::<ConversationOpenTelemetry>(report)
+                .unwrap()
+                .has_valid_bounds());
+        }
     }
 
     #[test]

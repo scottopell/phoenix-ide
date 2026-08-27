@@ -1495,6 +1495,23 @@ describe('ConversationPage archived read-only rendering', () => {
     expect(openMeasurements.at(-1)).toBe(openMeasurements[0]);
   });
 
+  it('does not overlap an in-flight initial route request on online events', async () => {
+    let resolveRoute: ((value: { id: string; slug: string }) => void) | undefined;
+    vi.mocked(api.getConversationRouteBySlug).mockReturnValueOnce(new Promise((resolve) => {
+      resolveRoute = resolve;
+    }));
+    const conversation = makeConversation();
+
+    renderPage(conversation);
+    await waitFor(() => expect(api.getConversationRouteBySlug).toHaveBeenCalledTimes(1));
+    act(() => {
+      window.dispatchEvent(new Event('online'));
+      window.dispatchEvent(new Event('online'));
+    });
+    expect(api.getConversationRouteBySlug).toHaveBeenCalledTimes(1);
+    resolveRoute?.({ id: conversation.id, slug: conversation.slug });
+  });
+
   it('rotates a completed route measurement when an online retry succeeds', async () => {
     const firstRouteRequest = Promise.reject(new Error('temporary route failure'));
     vi.mocked(api.getConversationRouteBySlug)
@@ -1511,6 +1528,22 @@ describe('ConversationPage archived read-only rendering', () => {
     act(() => window.dispatchEvent(new Event('online')));
     await waitFor(() => expect(api.getConversationRouteBySlug).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(openMeasurements.at(-1)).not.toBe(openMeasurements[0]));
+  });
+
+  it('keeps ordinary online stream reconnects route-free', async () => {
+    const conversation = makeConversation();
+    const openMeasurements: ConversationOpenMeasurement[] = [];
+    hooksMockState.useConnection.mockImplementation((options: ConnectionOptions) => {
+      if (options.initialOpenMeasurement) openMeasurements.push(options.initialOpenMeasurement);
+      return useConnectedConnection(options);
+    });
+
+    renderPage(conversation);
+    await waitFor(() => expect(api.getConversationRouteBySlug).toHaveBeenCalledTimes(1));
+    const initialMeasurement = openMeasurements.at(-1);
+    act(() => window.dispatchEvent(new Event('online')));
+    await waitFor(() => expect(api.getConversationRouteBySlug).toHaveBeenCalledTimes(2));
+    expect(openMeasurements.at(-1)).toBe(initialMeasurement);
   });
 
   it('flushes a route-owned measurement synchronously on pagehide', async () => {
