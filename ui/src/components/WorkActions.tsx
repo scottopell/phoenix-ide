@@ -407,7 +407,7 @@ export function WorkControlBar({
 
   const fallbackOverflowAction = !cleanupBlockedByAmbiguity && disposition.showCleanUp && disposition.primary !== 'clean_up'
     ? 'clean_up'
-    : !cleanupBlockedByAmbiguity && disposition.showAbandon && disposition.primary !== 'abandon'
+    : !cleanupBlockedByAmbiguity && disposition.showAbandon && !disposition.showCleanUp && disposition.primary !== 'abandon'
       ? 'abandon'
       : null;
   const fallbackHasOverflowActions = fallbackOverflowAction !== null;
@@ -809,24 +809,24 @@ export function WorkControlBar({
             <button
               type="button"
               className="mobile-pr-action mobile-pr-action--cleanup mobile-pr-action--hero"
-              aria-label={`Clean up. ${closeHintText()}`}
+              aria-label={`Close conversation. ${closeHintText()}`}
               title={closeHintText()}
               disabled={isLoading}
               onClick={handleCleanUp}
             >
-              {markingMerged ? 'Cleaning…' : 'Clean up'}
+              {markingMerged ? 'Closing…' : 'Close conversation'}
             </button>
           )}
           {disposition.primary === 'abandon' && !cleanupBlockedByAmbiguity && (
             <button
               type="button"
               className="mobile-pr-action mobile-pr-action--danger mobile-pr-action--hero"
-              aria-label={`Abandon. ${closeHintText()}`}
+              aria-label={`Close conversation. ${closeHintText()}`}
               title={closeHintText()}
               disabled={isLoading}
               onClick={handleAbandon}
             >
-              {abandoning ? 'Abandoning…' : 'Abandon'}
+              {abandoning ? 'Closing…' : 'Close conversation'}
             </button>
           )}
           {fallbackHasOverflowActions && (
@@ -868,27 +868,27 @@ export function WorkControlBar({
                 type="button"
                 className="mobile-pr-action mobile-pr-action--cleanup"
                 disabled={isLoading}
-                aria-label={`Clean up. ${closeHintText()}`}
+                aria-label={`Close conversation. ${closeHintText()}`}
                 title={closeHintText()}
                 onClick={async () => {
                   if (await handleCleanUp()) closeFallbackPanel();
                 }}
               >
-                Clean up
+                Close conversation
               </button>
             )}
-            {disposition.showAbandon && disposition.primary !== 'abandon' && !cleanupBlockedByAmbiguity && (
+            {disposition.showAbandon && !disposition.showCleanUp && disposition.primary !== 'abandon' && !cleanupBlockedByAmbiguity && (
               <button
                 type="button"
                 className="mobile-pr-action mobile-pr-action--danger"
-                aria-label={`Abandon. ${closeHintText()}`}
+                aria-label={`Close conversation. ${closeHintText()}`}
                 title={closeHintText()}
                 disabled={isLoading}
                 onClick={async () => {
                   if (await handleAbandon()) closeFallbackPanel();
                 }}
               >
-                Abandon
+                Close conversation
               </button>
             )}
           </div>
@@ -911,18 +911,18 @@ export function WorkControlBar({
         disabled={isLoading}
         onClick={handleCleanUp}
       >
-        Clean up
+        Close conversation
       </button>
     ) : disposition.primary === 'abandon' && !cleanupBlockedByAmbiguity ? (
       <button
         type="button"
         className="mobile-pr-action mobile-pr-action--hero mobile-pr-action--danger"
-        aria-label={`Abandon. ${closeHintText()}`}
+        aria-label={`Close conversation. ${closeHintText()}`}
         title={closeHintText()}
         disabled={isLoading}
         onClick={handleAbandon}
       >
-        Abandon
+        Close conversation
       </button>
     ) : disposition.resolve?.kind === 'address_feedback' && prSpecificActionsEnabled ? (
       <button
@@ -974,24 +974,24 @@ export function WorkControlBar({
                 <button
                   type="button"
                   className="mobile-pr-action mobile-pr-action--cleanup"
-                  aria-label={`Clean up. ${closeHintText()}`}
+                  aria-label={`Close conversation. ${closeHintText()}`}
                   title={closeHintText()}
                   disabled={isLoading}
                   onClick={handleCleanUp}
                 >
-                  <span className="mobile-pr-action-icon" aria-hidden="true">—</span><span>Clean up</span>
+                  <span className="mobile-pr-action-icon" aria-hidden="true">—</span><span>Close conversation</span>
                 </button>
               )}
-              {!cleanupBlockedByAmbiguity && disposition.showAbandon && disposition.primary !== 'abandon' && (
+              {!cleanupBlockedByAmbiguity && disposition.showAbandon && !disposition.showCleanUp && disposition.primary !== 'abandon' && (
                 <button
                   type="button"
                   className="mobile-pr-action mobile-pr-action--danger"
-                  aria-label={`Abandon. ${closeHintText()}`}
+                  aria-label={`Close conversation. ${closeHintText()}`}
                   title={closeHintText()}
                   disabled={isLoading}
                   onClick={handleAbandon}
                 >
-                  <span className="mobile-pr-action-icon" aria-hidden="true">!</span><span>Abandon</span>
+                  <span className="mobile-pr-action-icon" aria-hidden="true">!</span><span>Close conversation</span>
                 </button>
               )}
               {prStatusHandle.activeSelection?.active_pr?.provenance === 'pinned' && prStatusHandle.resumeInference && (
@@ -1125,27 +1125,27 @@ export function WorkControlBar({
             <button
               className={`work-actions-btn work-actions-clean-up${primaryClass('clean_up')}`}
               data-testid="clean-up-button"
-              aria-label={`Clean up. ${closeHintText()}`}
+              aria-label={`Close conversation. ${closeHintText()}`}
               title={closeHintText()}
               disabled={isLoading}
               onClick={handleCleanUp}
             >
-              {markingMerged ? 'Cleaning…' : 'Clean up'}
+              {markingMerged ? 'Closing…' : 'Close conversation'}
             </button>
             <InfoHint text={closeHintText()} />
           </div>
         )}
-        {!cleanupBlockedByAmbiguity && disposition.showAbandon && (
+        {!cleanupBlockedByAmbiguity && disposition.showAbandon && !disposition.showCleanUp && (
           <div className="desktop-work-actions-terminal">
             <button
               className={`work-actions-btn work-actions-abandon${primaryClass('abandon')}`}
               data-testid="abandon-button"
-              aria-label={`Abandon. ${closeHintText()}`}
+              aria-label={`Close conversation. ${closeHintText()}`}
               title={closeHintText()}
               disabled={isLoading}
               onClick={handleAbandon}
             >
-              {abandoning ? 'Abandoning…' : 'Abandon'}
+              {abandoning ? 'Closing…' : 'Close conversation'}
             </button>
             <InfoHint text={closeHintText()} />
           </div>

@@ -1170,6 +1170,7 @@ async fn observe_detached_head_and_submodules(
     losses: &mut Vec<CloseLossItem>,
 ) -> Result<(), String> {
     let path = path.to_path_buf();
+    let loss_path = path.clone();
     let observed = tokio::task::spawn_blocking(move || -> Result<WorktreeObservation, String> {
         let head = phoenix_core::git::command()
             .args(["rev-parse", "--verify", "HEAD"])
@@ -1211,10 +1212,12 @@ async fn observe_detached_head_and_submodules(
             let head = head_oid
                 .as_ref()
                 .ok_or_else(|| "detached worktree has no resolved HEAD".to_string())?;
-            losses.push(CloseLossItem::DetachedUnreachableCommit(
-                GitOidIdentity::parse_hex(String::from_utf8_lossy(head).trim())
-                    .map_err(|error| error.to_string())?,
-            ));
+            for oid in detached_unreachable_commits(&loss_path, head)? {
+                losses.push(CloseLossItem::DetachedUnreachableCommit(
+                    GitOidIdentity::parse_hex(String::from_utf8_lossy(&oid).trim())
+                        .map_err(|error| error.to_string())?,
+                ));
+            }
         }
         if let Some(record) = tag.strip_prefix(b"SUBMODULE_LOSS\0") {
             let separator = record
@@ -1264,6 +1267,35 @@ fn detached_head_is_unreachable(
         evidence.clone(),
     ));
     Ok(evidence.is_empty())
+}
+
+fn detached_unreachable_commits(
+    repository: &Path,
+    head_oid: &[u8],
+) -> Result<Vec<Vec<u8>>, String> {
+    let head_text = std::str::from_utf8(head_oid).map_err(|error| error.to_string())?;
+    let output = phoenix_core::git::command()
+        .args([
+            "rev-list",
+            head_text,
+            "--not",
+            "--branches",
+            "--remotes",
+            "--tags",
+            "--glob=refs/stash",
+        ])
+        .current_dir(repository)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|oid| !oid.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect())
 }
 
 fn detached_reachability_evidence(repository: &Path, head_oid: &[u8]) -> Result<Vec<u8>, String> {
