@@ -7051,15 +7051,16 @@ impl Database {
         sqlx::query(
             "INSERT INTO conversation_creation_jobs (
                  id, conversation_id, message_id, status, stage, attempt, generation, intent_json,
-                 error, accepted_at, provisioning_started_at, completed_at, failed_at, cancelled_at,
-                 deletion_requested_at, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, 'accepted', 'validate_intent', 0, 0, ?4, NULL, ?5, NULL,
-                       NULL, NULL, NULL, NULL, ?5, ?5)",
+                 exact_checkout_oid, error, accepted_at, provisioning_started_at, completed_at,
+                 failed_at, cancelled_at, deletion_requested_at, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, 'accepted', 'validate_intent', 0, 0, ?4, ?5, NULL, ?6, NULL,
+                       NULL, NULL, NULL, NULL, ?6, ?6)",
         )
         .bind(&job_id)
         .bind(&new_id)
         .bind(&message_id)
         .bind(intent_json)
+        .bind(&intent.checkout_ref)
         .bind(&now_str)
         .execute(&mut *tx)
         .await?;

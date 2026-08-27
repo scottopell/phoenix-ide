@@ -299,7 +299,7 @@ impl Database {
         conversation_id: &str,
     ) -> DbResult<Option<String>> {
         sqlx::query_scalar(
-            "SELECT COALESCE(provisioning.checkout_ref, direct.staging_exact_oid)
+            "SELECT COALESCE(provisioning.exact_checkout_oid, direct.staging_exact_oid)
              FROM conversations conversation
              LEFT JOIN conversation_creation_jobs provisioning
                ON provisioning.conversation_id = conversation.id
@@ -1094,6 +1094,10 @@ impl Database {
             tx.rollback().await?;
             return Ok(false);
         };
+        sqlx::query("DELETE FROM product_creation_job_images WHERE request_id = ?1")
+            .bind(request_id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("UPDATE conversations SET archived = 0 WHERE id = ?1")
             .bind(&published_conversation_id)
             .execute(&mut *tx)

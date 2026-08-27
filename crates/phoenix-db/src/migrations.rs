@@ -400,6 +400,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "persist_product_creation_jobs",
         sql: MIGRATION_076,
     },
+    Migration {
+        version: 77,
+        name: "persist_conversation_creation_exact_checkout_oid",
+        sql: "ALTER TABLE conversation_creation_jobs ADD COLUMN exact_checkout_oid TEXT;",
+    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
