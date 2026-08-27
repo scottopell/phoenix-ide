@@ -636,8 +636,12 @@ impl Database {
         if record.status != "delivery_pending" {
             return Ok(false);
         }
-        let next_attempt = record.delivery_attempt_count + 1;
-        let exhausted = next_attempt >= PRODUCT_CREATION_MAX_DELIVERY_ATTEMPTS;
+        let exhausted = record.delivery_attempt_count >= PRODUCT_CREATION_MAX_DELIVERY_ATTEMPTS;
+        let next_attempt = if exhausted {
+            record.delivery_attempt_count
+        } else {
+            record.delivery_attempt_count + 1
+        };
         let delay_seconds = match next_attempt {
             2 => 2,
             3 => 10,
@@ -1400,6 +1404,23 @@ mod product_creation_tests {
             .schedule_product_creation_delivery_retry("req-delivery", now)
             .await
             .unwrap());
+        assert!(db
+            .schedule_product_creation_delivery_retry("req-delivery", now)
+            .await
+            .unwrap());
+        let fourth = db
+            .get_product_creation_job("req-delivery")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fourth.delivery_attempt_count, 4);
+        assert_eq!(fourth.status, "delivery_pending");
+        assert_eq!(
+            fourth.delivery_retry_at,
+            DateTime::<Utc>::from_timestamp_micros(
+                (now + chrono::Duration::seconds(30)).timestamp_micros()
+            )
+        );
         assert!(db
             .schedule_product_creation_delivery_retry("req-delivery", now)
             .await

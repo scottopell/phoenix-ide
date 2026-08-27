@@ -200,7 +200,7 @@ async fn process_claimed_product_creation(
                             .ok_or_else(|| "worktree path lacked parent".to_string())?,
                     )
                     .map_err(|error| error.to_string())?;
-                    crate::git_ops::run_git(
+                    run_git_with_timeout(
                         Path::new(&repo_root),
                         &[
                             "worktree",
@@ -209,6 +209,7 @@ async fn process_claimed_product_creation(
                             path.to_string_lossy().as_ref(),
                             &oid,
                         ],
+                        Duration::from_secs(30),
                     )?;
                     Ok::<String, String>(path.to_string_lossy().to_string())
                 }
@@ -519,6 +520,18 @@ async fn process_product_creation_until_closed(
                     chrono::Duration::seconds(30),
                 ).await.map_err(|error| error.to_string())?;
                 if !renewed {
+                    let current = manager
+                        .db()
+                        .get_product_creation_job(&request_id)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    if current.is_some_and(|job| {
+                        job.status != "claimed"
+                            && job.published_product_id.is_some()
+                            && job.published_conversation_id.is_some()
+                    }) {
+                        return (&mut processing).await;
+                    }
                     return Err("product creation claim was lost during heartbeat renewal".to_string());
                 }
             }
@@ -606,7 +619,9 @@ fn ensure_phoenix_staging_ignored(repo_root: &Path) -> Result<(), String> {
 fn strict_product_creation_pin(repo_root: &Path) -> Result<(String, String), String> {
     let _lock =
         RepositoryMutationLock::acquire(repo_root.to_string_lossy().as_ref()).map_err(|e| e.0)?;
-    if crate::git_ops::run_git(repo_root, &["remote", "get-url", "origin"]).is_ok() {
+    let remotes = crate::git_ops::run_git(repo_root, &["remote"])
+        .map_err(|error| format!("could not inspect configured remotes: {error}"))?;
+    if remotes.lines().any(|remote| remote.trim() == "origin") {
         let stdout = run_git_with_timeout(
             repo_root,
             &["ls-remote", "--symref", "origin", "HEAD"],
