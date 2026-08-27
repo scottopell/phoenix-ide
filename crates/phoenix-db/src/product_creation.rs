@@ -712,6 +712,7 @@ impl Database {
     pub async fn schedule_product_creation_delivery_retry(
         &self,
         request_id: &str,
+        claim: &ProductCreationClaim,
         now: DateTime<Utc>,
     ) -> DbResult<bool> {
         let Some(record) = self.get_product_creation_job(request_id).await? else {
@@ -741,7 +742,9 @@ impl Database {
                  claim_lease_until_unix_micros = NULL,
                  updated_at_unix_micros = ?5
              WHERE request_id = ?1 AND status = 'delivery_pending'
-               AND delivery_attempt_count = ?6",
+               AND delivery_attempt_count = ?6 AND claim_generation = ?7
+               AND claim_worker_id = ?8 AND claim_token = ?9
+               AND claim_lease_until_unix_micros > ?5",
         )
         .bind(request_id)
         .bind(next_attempt)
@@ -751,6 +754,9 @@ impl Database {
         ))
         .bind(datetime_to_unix_micros(now))
         .bind(record.delivery_attempt_count)
+        .bind(claim.generation)
+        .bind(&claim.worker_id)
+        .bind(&claim.token)
         .execute(&self.pool)
         .await?;
         Ok(updated.rows_affected() == 1)
@@ -2187,7 +2193,7 @@ mod product_creation_tests {
         );
         db.publish_product_creation_atomically(&ProductCreationPublishInput {
             request_id: "req-delivery".to_string(),
-            claim: claim.claim,
+            claim: claim.claim.clone(),
             conversation: conv,
             authority_kind: AuthorityKind::Work,
             environment: EnvironmentContext::UnownedCwd {
@@ -2213,8 +2219,9 @@ mod product_creation_tests {
             .unwrap()
             .is_none());
         let now = Utc::now();
+        let mut delivery_claim = claim.claim;
         assert!(db
-            .schedule_product_creation_delivery_retry("req-delivery", now)
+            .schedule_product_creation_delivery_retry("req-delivery", &delivery_claim, now)
             .await
             .unwrap());
         let pending = db
@@ -2239,14 +2246,26 @@ mod product_creation_tests {
             .await
             .unwrap()
             .is_none());
-        assert!(db
-            .schedule_product_creation_delivery_retry("req-delivery", now)
-            .await
-            .unwrap());
-        assert!(db
-            .schedule_product_creation_delivery_retry("req-delivery", now)
-            .await
-            .unwrap());
+        for (worker, token, seconds) in [
+            ("delivery-worker-2", "delivery-token-2", 3),
+            ("delivery-worker-3", "delivery-token-3", 11),
+        ] {
+            delivery_claim = db
+                .claim_next_product_creation_delivery(
+                    worker,
+                    token,
+                    now + chrono::Duration::seconds(seconds),
+                    chrono::Duration::minutes(5),
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .claim;
+            assert!(db
+                .schedule_product_creation_delivery_retry("req-delivery", &delivery_claim, now,)
+                .await
+                .unwrap());
+        }
         let fourth = db
             .get_product_creation_job("req-delivery")
             .await
@@ -2260,8 +2279,19 @@ mod product_creation_tests {
                 (now + chrono::Duration::seconds(30)).timestamp_micros()
             )
         );
+        delivery_claim = db
+            .claim_next_product_creation_delivery(
+                "delivery-worker-4",
+                "delivery-token-4",
+                now + chrono::Duration::seconds(31),
+                chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .claim;
         assert!(db
-            .schedule_product_creation_delivery_retry("req-delivery", now)
+            .schedule_product_creation_delivery_retry("req-delivery", &delivery_claim, now)
             .await
             .unwrap());
         let exhausted = db
@@ -2273,7 +2303,7 @@ mod product_creation_tests {
         assert_eq!(exhausted.status, "delivery_failed");
         assert!(exhausted.delivery_retry_at.is_none());
         assert!(!db
-            .schedule_product_creation_delivery_retry("req-delivery", now)
+            .schedule_product_creation_delivery_retry("req-delivery", &delivery_claim, now)
             .await
             .unwrap());
     }

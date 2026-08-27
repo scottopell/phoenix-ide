@@ -158,15 +158,20 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/conversations/new", post(create_conversation))
         .route(
             "/api/product-conversations/new",
-            post(create_product_conversation)
-                .layer(DefaultBodyLimit::max(MAX_MULTIPART_BODY_BYTES)),
+            post(create_product_conversation).layer(DefaultBodyLimit::max(
+                MAX_MULTIPART_BODY_BYTES + 8 * 1024 * 1024,
+            )),
         )
         .route(
-            "/api/product-conversations/creation/{request_id}/cancel",
+            "/api/product-conversations/creation/:request_id/cancel",
             post(cancel_product_conversation_creation),
         )
         .route(
-            "/api/product-conversations/creation/{request_id}",
+            "/api/product-conversations/creation/:request_id/retry-delivery",
+            post(retry_product_conversation_delivery),
+        )
+        .route(
+            "/api/product-conversations/creation/:request_id",
             delete(delete_product_conversation_creation),
         )
         .route(
@@ -1918,6 +1923,25 @@ async fn cancel_product_conversation_creation(
     }
     state.runtime.kick_creation_worker();
     Ok(Json(SuccessResponse { success: true }))
+}
+
+async fn retry_product_conversation_delivery(
+    State(state): State<AppState>,
+    Path(request_id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let retried = state
+        .db
+        .retry_failed_product_creation_delivery(&request_id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    if !retried {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "product creation delivery is not awaiting explicit retry",
+            "delivery_not_retryable",
+        ))));
+    }
+    state.runtime.kick_creation_worker();
+    Ok(Json(serde_json::json!({ "accepted": true })))
 }
 
 async fn delete_product_conversation_creation(

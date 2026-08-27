@@ -455,7 +455,11 @@ async fn deliver_product_creation_objective(
     if let Err(error) = enqueue_result {
         manager
             .db()
-            .schedule_product_creation_delivery_retry(&job.request_id, chrono::Utc::now())
+            .schedule_product_creation_delivery_retry(
+                &job.request_id,
+                &claimed.claim,
+                chrono::Utc::now(),
+            )
             .await
             .map_err(|db_error| {
                 format!(
@@ -469,7 +473,11 @@ async fn deliver_product_creation_objective(
     if let Err(error) = enqueue_result.expect("checked timeout above") {
         manager
             .db()
-            .schedule_product_creation_delivery_retry(&job.request_id, chrono::Utc::now())
+            .schedule_product_creation_delivery_retry(
+                &job.request_id,
+                &claimed.claim,
+                chrono::Utc::now(),
+            )
             .await
             .map_err(|db_error| {
                 format!("{error}; delivery retry persistence failed: {db_error}")
@@ -611,11 +619,11 @@ async fn cleanup_unpublished_product_staging_path(
         return Ok(Ok(true));
     };
     tokio::task::spawn_blocking(move || {
-        let _lock = cleanup_lock.ok_or_else(|| "cleanup repository lock missing".to_string())?;
         let path = PathBuf::from(path);
         if !path.exists() {
             return Ok::<bool, String>(true);
         }
+        let _lock = cleanup_lock.ok_or_else(|| "cleanup repository lock missing".to_string())?;
         let actual_oid = crate::git_ops::run_git(&path, &["rev-parse", "HEAD^{commit}"])?;
         let actual_root = crate::git_ops::run_git(&path, &["rev-parse", "--show-toplevel"])?;
         validate_worktree_belongs_to_repository(&repo_root, &path).map_err(|error| error.0)?;
