@@ -420,6 +420,12 @@ async fn cleanup_and_retry_unpublished_product_creation(
     } else {
         fallback_job
     };
+    let cleanup_lock = match cleanup_job.staging_repo_root.as_deref() {
+        Some(repo_root) => {
+            Some(RepositoryMutationLock::acquire(repo_root).map_err(|error| error.0)?)
+        }
+        None => None,
+    };
     if !manager
         .db()
         .product_creation_claim_is_live(request_id, claim, chrono::Utc::now())
@@ -428,7 +434,7 @@ async fn cleanup_and_retry_unpublished_product_creation(
     {
         return Ok(());
     }
-    let cleaned = cleanup_unpublished_product_staging(manager, cleanup_job).await;
+    let cleaned = cleanup_unpublished_product_staging(manager, cleanup_job, cleanup_lock).await;
     if !cleaned {
         return Ok(());
     }
@@ -443,6 +449,7 @@ async fn cleanup_and_retry_unpublished_product_creation(
 async fn cleanup_unpublished_product_staging(
     manager: &Arc<RuntimeManager>,
     job: &crate::db::ProductCreationJobRecord,
+    cleanup_lock: Option<RepositoryMutationLock>,
 ) -> bool {
     let (Some(path), Some(repo_root), Some(expected_oid)) = (
         job.staging_path.clone(),
@@ -452,7 +459,7 @@ async fn cleanup_unpublished_product_staging(
         return true;
     };
     let cleanup = tokio::task::spawn_blocking(move || {
-        let _lock = RepositoryMutationLock::acquire(&repo_root).map_err(|error| error.0)?;
+        let _lock = cleanup_lock.ok_or_else(|| "cleanup repository lock missing".to_string())?;
         let path = PathBuf::from(path);
         if !path.exists() {
             return Ok::<bool, String>(true);
