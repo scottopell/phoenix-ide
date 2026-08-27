@@ -5200,7 +5200,11 @@ mod tests {
              (id, product_conversation_id, slug, title, user_initiated, state_updated_at,
               created_at, updated_at, runtime_role, work_scope_id)
              SELECT ?1, ?2, ?1, ?1, 1, '2025-01-01', '2025-01-01', '2025-01-01',
-                    'user', work_scope_id
+                    'user', COALESCE(
+                        (SELECT work_scope_id FROM product_conversation_work_scopes
+                         WHERE product_conversation_id = ?2 LIMIT 1),
+                        work_scope_id
+                    )
              FROM conversations
              WHERE id = 'conv-1'",
         )
@@ -8999,7 +9003,13 @@ mod tests {
         let workflow_id = WorkflowId(703);
         let mut input = intent();
         input.conversation_id = "conv-wt".into();
-        insert_conversation(&first.workflow_repo.pool, "conv-wt").await;
+        sqlx::query(
+            "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
+             VALUES ('product-conv-wt', 'ordinary', 'open')",
+        )
+        .execute(&first.workflow_repo.pool)
+        .await
+        .unwrap();
         let opaque_scope = "0196f15d-f1ac-7d4c-a3b2-88d90f414bcc";
         sqlx::query(
             "INSERT INTO work_scopes
@@ -9010,11 +9020,21 @@ mod tests {
         .execute(&first.workflow_repo.pool)
         .await
         .unwrap();
-        sqlx::query("UPDATE conversations SET work_scope_id = ?1 WHERE id = 'conv-wt'")
-            .bind(opaque_scope)
-            .execute(&first.workflow_repo.pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO product_conversation_work_scopes (work_scope_id, product_conversation_id)
+             VALUES (?1, 'product-conv-wt')",
+        )
+        .bind(opaque_scope)
+        .execute(&first.workflow_repo.pool)
+        .await
+        .unwrap();
+        insert_conversation_in_product(
+            &first.workflow_repo.pool,
+            "conv-wt",
+            "product-conv-wt",
+            None,
+        )
+        .await;
 
         input.registration_scope = wake_types::WorkScopeIdentity(opaque_scope.into());
         input.resource = WakeResourceIdentity::Bash(wake_types::BashResourceIdentity {
