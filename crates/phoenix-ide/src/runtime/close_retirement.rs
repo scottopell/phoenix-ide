@@ -9,10 +9,10 @@ use std::{
 use sha2::{Digest, Sha256};
 
 use phoenix_core::domain::close::{
-    CapturedWorktreeIdentity, CloseAttemptId, CloseLossItem, CloseOwnedResourceInventory,
-    ClosePhase, CloseRetirementSnapshot, GitOidIdentity, GitPathIdentity, LossItemIdentity,
-    OpaqueIdentity, RetiredResourceIdentity, RetiredResourceKind, RetirementFailureReason,
-    RetirementOutcome, WorktreeIdentity,
+    AbsenceBasis, CapturedWorktreeIdentity, CloseAttemptId, CloseLossItem,
+    CloseOwnedResourceInventory, ClosePhase, CloseRetirementSnapshot, GitOidIdentity,
+    GitPathIdentity, LossItemIdentity, OpaqueIdentity, RetiredResourceIdentity,
+    RetiredResourceKind, RetirementFailureReason, RetirementOutcome, WorktreeIdentity,
 };
 use phoenix_core::work_scope::{
     ResourceScopeKey, WorkScopeId, WorkScopeRetirementOutcome, WorkScopeRetirementPrecondition,
@@ -258,14 +258,36 @@ impl RuntimeManager {
             .await
             .map_err(|error| error.to_string())?;
         let mut requests = Vec::with_capacity(scopes.len());
+        let mut acquired_scopes = Vec::with_capacity(scopes.len());
         for captured in scopes {
-            let resources = self
+            let resources = match self
                 .acquire_close_resource_lease(&attempt_id, captured.scope.clone())
-                .await?;
+                .await
+            {
+                Ok(resources) => resources,
+                Err(reason) => {
+                    for scope in &acquired_scopes {
+                        self.cancel_close_resource_lease(&attempt_id, scope).await;
+                    }
+                    self.db()
+                        .route_close_attempt_to_repair(&attempt_id)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    return Err(reason);
+                }
+            };
+            acquired_scopes.push(captured.scope.clone());
             let worktree = match captured.captured_worktree {
                 None => None,
                 Some(CapturedWorktreeIdentity::Resolved(identity)) => Some(identity),
                 Some(CapturedWorktreeIdentity::Unresolved { .. }) => {
+                    for scope in &acquired_scopes {
+                        self.cancel_close_resource_lease(&attempt_id, scope).await;
+                    }
+                    self.db()
+                        .route_close_attempt_to_repair(&attempt_id)
+                        .await
+                        .map_err(|error| error.to_string())?;
                     return Err(format!(
                         "scope {} has unresolved captured worktree identity",
                         captured.scope
@@ -302,10 +324,6 @@ impl RuntimeManager {
                 inventory,
             });
         }
-        let acquired_scopes = requests
-            .iter()
-            .map(|request| request.scope.clone())
-            .collect::<Vec<_>>();
         match self
             .db()
             .capture_close_retirement_inventory(CaptureCloseRetirementInventoryRequest {
@@ -701,8 +719,50 @@ impl RuntimeManager {
                             )
                             .await;
                     };
+                    let worktree_root_missing =
+                        !path_buf_from_git_bytes(identity.locator().as_bytes())
+                            .try_exists()
+                            .map_err(|error| error.to_string())?;
                     let fresh_snapshot = match inspect_worktree(identity).await {
-                        Ok((fresh_snapshot, _)) => fresh_snapshot,
+                        Ok((fresh_snapshot, _)) => Some(fresh_snapshot),
+                        Err(reason) if worktree_root_missing => {
+                            let adopted = self
+                                .db()
+                                .record_close_retirement_evidence(
+                                    RecordCloseRetirementEvidenceRequest {
+                                        attempt_id: attempt_id.clone(),
+                                        snapshot: snapshot.clone(),
+                                        scope: scope.clone(),
+                                        resource: target.resource.clone(),
+                                        outcome: RetirementOutcome::AbsenceAdopted {
+                                            absence_basis:
+                                                AbsenceBasis::PreexistingExactIdentityEvidence,
+                                        },
+                                        detail: Some(
+                                            "exact prior close evidence adopted missing worktree"
+                                                .to_string(),
+                                        ),
+                                    },
+                                )
+                                .await;
+                            match adopted {
+                                Ok(()) => None,
+                                Err(_) => {
+                                    return self
+                                        .record_close_residual(
+                                            attempt_id,
+                                            snapshot,
+                                            &scope,
+                                            target.resource.clone(),
+                                            RetirementFailureReason::IdentityNotProven,
+                                            &format!(
+                                                "worktree is absent without adoptable exact identity evidence: {reason}"
+                                            ),
+                                        )
+                                        .await;
+                                }
+                            }
+                        }
                         Err(reason) => {
                             return self
                                 .record_close_residual(
@@ -718,47 +778,49 @@ impl RuntimeManager {
                                 .await;
                         }
                     };
-                    if fresh_snapshot != confirmed.snapshot {
-                        return self
-                            .record_close_residual(
-                                attempt_id,
-                                snapshot,
-                                &scope,
-                                target.resource.clone(),
-                                RetirementFailureReason::IdentityNotProven,
-                                "worktree changed after Close inspection confirmation",
-                            )
-                            .await;
+                    if let Some(fresh_snapshot) = fresh_snapshot {
+                        if fresh_snapshot != confirmed.snapshot {
+                            return self
+                                .record_close_residual(
+                                    attempt_id,
+                                    snapshot,
+                                    &scope,
+                                    target.resource.clone(),
+                                    RetirementFailureReason::IdentityNotProven,
+                                    "worktree changed after Close inspection confirmation",
+                                )
+                                .await;
+                        }
+                        if let Err(reason) = remove_exact_worktree(identity).await {
+                            let failure = if reason.contains("incarnation")
+                                || reason.contains("registered")
+                                || reason.contains("absent")
+                                || reason.contains("server-owned")
+                            {
+                                RetirementFailureReason::IdentityNotProven
+                            } else {
+                                RetirementFailureReason::RemovalFailed
+                            };
+                            return self
+                                .record_close_residual(
+                                    attempt_id,
+                                    snapshot,
+                                    &scope,
+                                    target.resource.clone(),
+                                    failure,
+                                    &reason,
+                                )
+                                .await;
+                        }
+                        self.record_close_retired(
+                            attempt_id,
+                            snapshot,
+                            &scope,
+                            target.resource.clone(),
+                            "exact captured Git worktree removal",
+                        )
+                        .await?;
                     }
-                    if let Err(reason) = remove_exact_worktree(identity).await {
-                        let failure = if reason.contains("incarnation")
-                            || reason.contains("registered")
-                            || reason.contains("absent")
-                            || reason.contains("server-owned")
-                        {
-                            RetirementFailureReason::IdentityNotProven
-                        } else {
-                            RetirementFailureReason::RemovalFailed
-                        };
-                        return self
-                            .record_close_residual(
-                                attempt_id,
-                                snapshot,
-                                &scope,
-                                target.resource.clone(),
-                                failure,
-                                &reason,
-                            )
-                            .await;
-                    }
-                    self.record_close_retired(
-                        attempt_id,
-                        snapshot,
-                        &scope,
-                        target.resource.clone(),
-                        "exact captured Git worktree removal",
-                    )
-                    .await?;
                 }
             }
             let work_scope_target = targets
