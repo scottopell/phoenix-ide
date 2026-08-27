@@ -7531,6 +7531,8 @@ DROP TRIGGER IF EXISTS runtime_resource_instances_preserve_identity;
 DROP INDEX IF EXISTS runtime_resource_instances_live_exact_identity;
 DROP TABLE runtime_resource_instances;
 DROP TRIGGER IF EXISTS close_expected_retirement_resources_reject_standalone_delete;
+DELETE FROM close_retirement_resource_history
+WHERE resource_kind IN ('bash_process_group', 'pty_session', 'browser_session');
 DELETE FROM close_retirement_resource_dispatches
 WHERE resource_kind IN ('bash_process_group', 'pty_session', 'browser_session');
 DELETE FROM close_expected_retirement_resources
@@ -7540,7 +7542,7 @@ BEFORE DELETE ON close_expected_retirement_resources
 FOR EACH ROW
 WHEN EXISTS (
     SELECT 1 FROM close_obligations obligation
-    JOIN conversations root ON root.id = obligation.root_conversation_id
+    JOIN product_conversations product ON product.id = obligation.product_conversation_id
     WHERE obligation.attempt_id = OLD.attempt_id
 )
 BEGIN

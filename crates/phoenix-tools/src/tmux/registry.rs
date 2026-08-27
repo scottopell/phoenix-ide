@@ -563,11 +563,6 @@ impl TmuxRegistry {
     /// lock; the loser observes the freshly-spawned server as `Live`
     /// and skips the spawn.
     ///
-    /// # Errors
-    /// - [`TmuxError::BinaryUnavailable`] when tmux was not found on PATH at
-    ///   registry init.
-    /// - Other [`TmuxError`] variants when the probe / unlink / spawn / mkdir
-    ///   steps fail.
     /// Discovers a running persistent tmux server without creating, adopting, or
     /// mutating one. Close uses this only to seal a durable token/socket pair.
     pub async fn discover_persistent_identity(
@@ -591,6 +586,10 @@ impl TmuxRegistry {
         })
     }
 
+    /// # Errors
+    ///
+    /// Returns [`TmuxError`] when tmux is unavailable or its server cannot be
+    /// probed, created, or configured.
     #[allow(clippy::too_many_lines)]
     pub async fn ensure_live(
         &self,
