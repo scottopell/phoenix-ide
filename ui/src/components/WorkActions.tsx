@@ -52,11 +52,13 @@ function CloseStatusPanel({
   snapshot,
   busy,
   onConfirm,
+  onCancel,
   onRetry,
 }: {
   snapshot: ProductConversationSnapshotView;
   busy: boolean;
   onConfirm: () => void;
+  onCancel: () => void;
   onRetry: () => void;
 }) {
   const close = snapshot.close;
@@ -75,6 +77,9 @@ function CloseStatusPanel({
         <p>No patch, stash, commit, branch deletion, or PR mutation will be created.</p>
         <button type="button" className="work-actions-btn work-actions-btn--danger" disabled={busy} onClick={onConfirm}>
           {busy ? 'Closing…' : 'Discard exact items and close'}
+        </button>
+        <button type="button" className="work-actions-btn" disabled={busy} onClick={onCancel}>
+          Keep work and cancel Close
         </button>
       </section>
     );
@@ -551,6 +556,19 @@ export function WorkControlBar({
     }
   };
 
+  const cancelClose = async () => {
+    setError(null);
+    setAbandoning(true);
+    try {
+      await api.cancelCloseBeforeRetirement(conversationId);
+      setCloseSnapshot(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to cancel Close');
+    } finally {
+      setAbandoning(false);
+    }
+  };
+
   const retryClose = async () => {
     setError(null);
     setMarkingMerged(true);
@@ -629,6 +647,7 @@ export function WorkControlBar({
       snapshot={closeSnapshot}
       busy={isLoading}
       onConfirm={() => { void confirmCloseLosses(); }}
+      onCancel={() => { void cancelClose(); }}
       onRetry={() => { void retryClose(); }}
     />
   ) : null;

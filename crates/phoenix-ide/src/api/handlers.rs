@@ -18,9 +18,9 @@ use super::git_handlers::{
 };
 use super::global_read;
 use super::lifecycle_handlers::{
-    abandon_task, approve_fork_proposal, approve_task, confirm_close_loss_retirement,
-    dismiss_fork_proposal, list_fork_proposals, mark_merged, reject_task,
-    request_changes_on_fork_proposal, retry_close_retirement, task_feedback,
+    abandon_task, approve_fork_proposal, approve_task, cancel_close_before_retirement,
+    confirm_close_loss_retirement, dismiss_fork_proposal, list_fork_proposals, mark_merged,
+    reject_task, request_changes_on_fork_proposal, retry_close_retirement, task_feedback,
 };
 use super::product_conversations::{get_product_conversation, list_product_conversations};
 use super::sse::{sse_stream, SseInitTrace};
@@ -267,6 +267,10 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/conversations/:id/close/confirm-loss-retirement",
             post(confirm_close_loss_retirement),
+        )
+        .route(
+            "/api/conversations/:id/close/cancel-before-retirement",
+            post(cancel_close_before_retirement),
         )
         .route(
             "/api/conversations/:id/close/retry-retirement",
@@ -5331,7 +5335,19 @@ async fn archive_conversation(
     refuse_if_chain_member(&state, &id, "archive").await?;
     let admission = state.runtime.conversation_admission(&id).await;
     let _admission_guard = admission.lock().await;
-    run_archive_cascade(&state, &id).await?;
+    let conversation = state
+        .db
+        .get_conversation(&id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    if matches!(
+        conversation.conv_mode,
+        ConvMode::Work { .. } | ConvMode::Branch { .. }
+    ) {
+        super::lifecycle_handlers::close_legacy_compat(&state, &id, "archive").await?;
+    } else {
+        run_archive_cascade(&state, &id).await?;
+    }
     Ok(Json(SuccessResponse { success: true }))
 }
 

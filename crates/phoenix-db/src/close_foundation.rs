@@ -1246,6 +1246,34 @@ impl Database {
         Ok(obligation)
     }
 
+    pub async fn cancel_close_before_retirement(
+        &self,
+        attempt_id: &str,
+    ) -> DbResult<CloseObligation> {
+        let mut tx = self.pool.begin().await?;
+        let obligation = close_obligation_for_update(&mut tx, attempt_id).await?;
+        if obligation.phase() != ClosePhase::AwaitingLossConfirmation {
+            return Err(close_precondition(format!(
+                "attempt {attempt_id} phase {} does not admit pre-retirement cancellation",
+                obligation.phase().as_str()
+            )));
+        }
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "UPDATE close_obligations
+             SET phase = 'completed', completed_at = ?2, updated_at = ?2,
+                 close_outcome = 'cancelled'
+             WHERE attempt_id = ?1 AND phase = 'awaiting_loss_confirmation'",
+        )
+        .bind(attempt_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        let obligation = close_obligation_for_update(&mut tx, attempt_id).await?;
+        tx.commit().await?;
+        Ok(obligation)
+    }
+
     pub async fn request_close_settlement_cancellation(
         &self,
         attempt_id: &str,

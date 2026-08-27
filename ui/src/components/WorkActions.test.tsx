@@ -55,6 +55,7 @@ vi.mock('../api', () => ({
     markMerged: vi.fn().mockResolvedValue({ success: true }),
     getProductConversationSnapshot: vi.fn().mockResolvedValue({ close: null }),
     confirmCloseLossRetirement: vi.fn().mockResolvedValue({ success: true }),
+    cancelCloseBeforeRetirement: vi.fn().mockResolvedValue({ success: true }),
     retryCloseRetirement: vi.fn().mockResolvedValue({ success: true }),
     getConversationDiff: vi.fn(),
     getPrStatus: vi.fn(),

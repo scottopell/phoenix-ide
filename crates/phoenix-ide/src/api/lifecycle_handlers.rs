@@ -385,6 +385,41 @@ pub(crate) async fn confirm_close_loss_retirement(
 }
 
 #[allow(clippy::too_many_lines)]
+pub(crate) async fn cancel_close_before_retirement(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    let admission = state.runtime.conversation_admission(&id).await;
+    let _guard = admission.lock().await;
+    let transcript = state
+        .db
+        .get_conversation(&id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    let obligation = state
+        .db
+        .get_active_close_obligation_for_product(&transcript.product_conversation_id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+        .ok_or_else(|| {
+            AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                "No active Close attempt",
+                "close_attempt_not_active",
+            )))
+        })?;
+    state
+        .db
+        .cancel_close_before_retirement(obligation.attempt_id().as_str())
+        .await
+        .map_err(|error| {
+            AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                error.to_string(),
+                "close_cancel_failed",
+            )))
+        })?;
+    Ok(Json(SuccessResponse { success: true }))
+}
+
 pub(crate) async fn retry_close_retirement(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -590,6 +625,14 @@ async fn run_legacy_close_compat(state: &AppState, id: &str, action: &str) -> Re
             ClosePhase::Completed => return Ok(()),
         };
     }
+}
+
+pub(crate) async fn close_legacy_compat(
+    state: &AppState,
+    id: &str,
+    action: &str,
+) -> Result<(), AppError> {
+    run_legacy_close_compat(state, id, action).await
 }
 
 pub(crate) async fn abandon_task(
