@@ -410,7 +410,10 @@ async fn cleanup_and_retry_unpublished_product_creation(
     } else {
         fallback_job
     };
-    cleanup_unpublished_product_staging(manager, cleanup_job).await;
+    let cleaned = cleanup_unpublished_product_staging(manager, cleanup_job).await;
+    if !cleaned {
+        return Ok(());
+    }
     manager
         .db()
         .schedule_product_creation_retry(request_id, claim, chrono::Utc::now())
@@ -422,13 +425,13 @@ async fn cleanup_and_retry_unpublished_product_creation(
 async fn cleanup_unpublished_product_staging(
     manager: &Arc<RuntimeManager>,
     job: &crate::db::ProductCreationJobRecord,
-) {
+) -> bool {
     let (Some(path), Some(repo_root), Some(expected_oid)) = (
         job.staging_path.clone(),
         job.staging_repo_root.clone(),
         job.staging_exact_oid.clone(),
     ) else {
-        return;
+        return true;
     };
     let cleanup = tokio::task::spawn_blocking(move || {
         let _lock = RepositoryMutationLock::acquire(&repo_root).map_err(|error| error.0)?;
@@ -454,20 +457,22 @@ async fn cleanup_unpublished_product_staging(
         Ok(true)
     })
     .await;
-    if !matches!(cleanup, Ok(Ok(true))) {
-        let _ = manager
-            .db()
-            .mark_product_creation_cleanup_ambiguous(
-                &job.request_id,
-                &crate::db::ProductCreationClaim {
-                    worker_id: job.claim_worker_id.clone().unwrap_or_default(),
-                    token: job.claim_token.clone().unwrap_or_default(),
-                    generation: job.claim_generation,
-                    lease_until: job.claim_lease_until.unwrap_or_else(chrono::Utc::now),
-                },
-            )
-            .await;
+    if matches!(cleanup, Ok(Ok(true))) {
+        return true;
     }
+    manager
+        .db()
+        .mark_product_creation_cleanup_ambiguous(
+            &job.request_id,
+            &crate::db::ProductCreationClaim {
+                worker_id: job.claim_worker_id.clone().unwrap_or_default(),
+                token: job.claim_token.clone().unwrap_or_default(),
+                generation: job.claim_generation,
+                lease_until: job.claim_lease_until.unwrap_or_else(chrono::Utc::now),
+            },
+        )
+        .await
+        .unwrap_or(false)
 }
 
 async fn process_product_creation_until_closed(

@@ -975,7 +975,9 @@ impl Database {
               AND locator.locator_kind = 'management_root' AND locator.status = 'present'
              WHERE job.status IN ('delivery_pending', 'published')
              GROUP BY locator.path
-             ORDER BY MAX(job.updated_at_unix_micros) DESC, locator.path DESC
+             ORDER BY COUNT(DISTINCT conversation.id) DESC,
+                      MAX(job.updated_at_unix_micros) DESC,
+                      locator.path DESC
              LIMIT ?1",
         )
         .bind(
@@ -1745,7 +1747,7 @@ mod product_creation_tests {
     }
 
     #[tokio::test]
-    async fn product_creation_recent_distinct_published_cwd_by_recency() {
+    async fn product_creation_recent_management_roots_rank_by_support_then_recency() {
         let db = Database::open_in_memory().await.unwrap();
         for (idx, cwd) in [(1, "/repo/a"), (2, "/repo/b"), (3, "/repo/a")] {
             let req = format!("req-rec-{idx}");
