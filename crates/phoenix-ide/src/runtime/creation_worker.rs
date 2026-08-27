@@ -311,7 +311,7 @@ async fn process_claimed_product_creation(
         state_updated_at: now,
         created_at: now,
         updated_at: now,
-        archived: false,
+        archived: true,
         model: job.intent.model.clone(),
         effort: job.intent.effort,
         service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
@@ -565,6 +565,7 @@ async fn cleanup_unpublished_product_staging(
                 generation: job.claim_generation,
                 lease_until: job.claim_lease_until.unwrap_or_else(chrono::Utc::now),
             },
+            chrono::Utc::now(),
         )
         .await
         .unwrap_or(false)

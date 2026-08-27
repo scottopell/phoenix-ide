@@ -738,6 +738,7 @@ impl Database {
         &self,
         request_id: &str,
         claim: &ProductCreationClaim,
+        now: DateTime<Utc>,
     ) -> DbResult<bool> {
         let updated = sqlx::query(
             "UPDATE product_creation_jobs
@@ -745,12 +746,13 @@ impl Database {
                  claim_lease_until_unix_micros = NULL, retry_at_unix_micros = NULL,
                  updated_at_unix_micros = ?4
              WHERE request_id = ?1 AND status = 'claimed' AND claim_generation = ?2
-               AND claim_worker_id = ?3 AND claim_token = ?5",
+               AND claim_worker_id = ?3 AND claim_token = ?5
+               AND claim_lease_until_unix_micros > ?4",
         )
         .bind(request_id)
         .bind(claim.generation)
         .bind(&claim.worker_id)
-        .bind(unix_micros_now())
+        .bind(datetime_to_unix_micros(now))
         .bind(&claim.token)
         .execute(&self.pool)
         .await?;
@@ -828,19 +830,10 @@ impl Database {
         if let Some(attachment) = input.repository_attachment.as_ref() {
             let repository_root = attachment.repository_root.as_str();
             let git_common_dir = attachment.git_common_dir.as_str();
-            let repository_id: String = if let Some(id) = attachment.repository_id.clone() {
-                id
-            } else {
-                sqlx::query_scalar(
-                    "SELECT repository_id FROM git_repository_locator_observations
-                     WHERE locator_kind = 'common_dir' AND status = 'present' AND path = ?1
-                     LIMIT 1",
-                )
-                .bind(git_common_dir)
-                .fetch_optional(&mut *tx)
-                .await?
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
-            };
+            let repository_id = attachment
+                .repository_id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
             sqlx::query("INSERT OR IGNORE INTO git_repositories (id) VALUES (?1)")
                 .bind(&repository_id)
                 .execute(&mut *tx)
@@ -1058,6 +1051,30 @@ impl Database {
         {
             return Ok(false);
         }
+        let now = unix_micros_now();
+        let mut tx = self.pool.begin().await?;
+        let published_conversation_id: Option<String> = sqlx::query_scalar(
+            "SELECT published_conversation_id FROM product_creation_jobs
+             WHERE request_id = ?1 AND status = 'delivery_pending'
+               AND claim_generation = ?2 AND claim_worker_id = ?3 AND claim_token = ?4
+               AND claim_lease_until_unix_micros > ?5",
+        )
+        .bind(request_id)
+        .bind(claim.generation)
+        .bind(&claim.worker_id)
+        .bind(&claim.token)
+        .bind(now)
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten();
+        let Some(published_conversation_id) = published_conversation_id else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        sqlx::query("UPDATE conversations SET archived = 0 WHERE id = ?1")
+            .bind(&published_conversation_id)
+            .execute(&mut *tx)
+            .await?;
         let updated = sqlx::query(
             "UPDATE product_creation_jobs
              SET status = 'published', claim_worker_id = NULL, claim_token = NULL,
@@ -1067,14 +1084,19 @@ impl Database {
                AND claim_generation = ?3 AND claim_worker_id = ?4 AND claim_token = ?5
                AND claim_lease_until_unix_micros > ?1",
         )
-        .bind(unix_micros_now())
+        .bind(now)
         .bind(request_id)
         .bind(claim.generation)
         .bind(&claim.worker_id)
         .bind(&claim.token)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(updated.rows_affected() == 1)
+        if updated.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        tx.commit().await?;
+        Ok(true)
     }
 
     pub async fn get_product_creation_resource_reservations(
@@ -1571,18 +1593,21 @@ impl Database {
     ) -> DbResult<Vec<String>> {
         let rows = sqlx::query_scalar::<_, String>(
             "SELECT locator.path
-             FROM product_creation_jobs job
-             JOIN conversations conversation ON conversation.id = job.published_conversation_id
+             FROM conversations conversation
+             JOIN product_conversations product
+               ON product.id = conversation.product_conversation_id
+              AND product.kind = 'ordinary'
+              AND product.ordinary_lifecycle IN ('open', 'history')
              JOIN work_scope_git_repositories attachment
                ON attachment.work_scope_id = conversation.work_scope_id
              JOIN git_repository_locator_observations locator
                ON locator.repository_id = attachment.repository_id
               AND locator.locator_kind = 'management_root' AND locator.status = 'present'
-                       WHERE job.status IN ('delivery_pending', 'published')
-
-             GROUP BY locator.path
+             WHERE conversation.archived = 0 AND conversation.user_initiated = 1
+               AND conversation.runtime_role = 'user'
+             GROUP BY attachment.repository_id, locator.path
              ORDER BY COUNT(DISTINCT conversation.id) DESC,
-                      MAX(job.updated_at_unix_micros) DESC,
+                      MAX(conversation.updated_at) DESC,
                       locator.path DESC
              LIMIT ?1",
         )
@@ -1893,6 +1918,42 @@ mod product_creation_tests {
         assert_eq!(
             scheduled.retry_at.map(datetime_to_unix_micros),
             Some(datetime_to_unix_micros(now) + 2_000_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_ambiguous_requires_a_live_claim() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.accept_product_creation("req-cleanup-lease", &intent("/repo/a", "cleanup"))
+            .await
+            .unwrap();
+        let now = Utc::now();
+        let claimed = db
+            .claim_product_creation(
+                "req-cleanup-lease",
+                "worker",
+                "token",
+                now,
+                chrono::Duration::seconds(1),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!db
+            .mark_product_creation_cleanup_ambiguous(
+                "req-cleanup-lease",
+                &claimed.claim,
+                now + chrono::Duration::seconds(1),
+            )
+            .await
+            .unwrap());
+        assert_eq!(
+            db.get_product_creation_job("req-cleanup-lease")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "claimed"
         );
     }
 
@@ -2316,12 +2377,14 @@ mod product_creation_tests {
             .await
             .unwrap()
             .unwrap();
-        let conv = published_conversation(
+        let mut conv = published_conversation(
             "conv-delivery-complete",
             accepted.product_conversation_id,
             WorkScopeId::new(),
             "/repo/a",
         );
+        conv.archived = true;
+
         db.publish_product_creation_atomically(&ProductCreationPublishInput {
             request_id: "req-delivery-complete".to_string(),
             claim: claim.claim.clone(),
@@ -2401,6 +2464,12 @@ mod product_creation_tests {
             )
             .await
             .unwrap());
+        assert!(
+            !db.get_conversation("conv-delivery-complete")
+                .await
+                .unwrap()
+                .archived
+        );
     }
 
     #[tokio::test]
@@ -2860,7 +2929,7 @@ mod product_creation_tests {
                     cwd: cwd.to_string(),
                 },
                 repository_attachment: Some(ProductCreationRepositoryAttachment {
-                    repository_id: Some(format!("repo-{idx}")),
+                    repository_id: Some(format!("repo-{}", cwd.replace('/', "-"))),
                     exact_checkout_oid: format!("oid-{idx}"),
                     repository_root: cwd.to_string(),
                     git_common_dir: format!("{cwd}/.git"),
