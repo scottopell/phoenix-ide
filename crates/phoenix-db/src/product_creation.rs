@@ -797,6 +797,21 @@ impl Database {
         .map_err(DbError::from)
     }
 
+    pub async fn retry_failed_product_creation_delivery(&self, request_id: &str) -> DbResult<bool> {
+        let now = unix_micros_now();
+        let updated = sqlx::query(
+            "UPDATE product_creation_jobs
+             SET status = 'delivery_pending', delivery_attempt_count = 1,
+                 delivery_retry_at_unix_micros = ?1, updated_at_unix_micros = ?1
+             WHERE request_id = ?2 AND status = 'delivery_failed'",
+        )
+        .bind(now)
+        .bind(request_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(updated.rows_affected() == 1)
+    }
+
     pub async fn complete_product_creation_delivery(&self, request_id: &str) -> DbResult<bool> {
         let updated = sqlx::query(
             "UPDATE product_creation_jobs

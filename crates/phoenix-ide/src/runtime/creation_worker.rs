@@ -37,6 +37,21 @@ pub(crate) async fn process_product_creation_request(
         if job.status == "delivery_pending" {
             return deliver_product_creation_objective(manager, &job).await;
         }
+        if job.status == "delivery_failed"
+            && manager
+                .db()
+                .retry_failed_product_creation_delivery(request_id)
+                .await
+                .map_err(|error| error.to_string())?
+        {
+            let retry = manager
+                .db()
+                .get_product_creation_job(request_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "delivery retry job disappeared".to_string())?;
+            return deliver_product_creation_objective(manager, &retry).await;
+        }
         if let (Some(product_id), Some(conversation_id)) =
             (job.published_product_id, job.published_conversation_id)
         {
@@ -206,7 +221,7 @@ async fn process_claimed_product_creation(
         (
             cwd.clone(),
             ConvMode::Direct,
-            phoenix_core::work_scope::AuthorityKind::RestrictedExplore,
+            phoenix_core::work_scope::AuthorityKind::Direct,
             phoenix_core::work_scope::EnvironmentContext::UnownedCwd { cwd },
             None,
             None,
@@ -560,6 +575,9 @@ where
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn drain_pending_jobs(manager: &Arc<RuntimeManager>) -> Result<(), String> {
     let worker_id = CreationWorkerId(format!("creation-worker-{}", uuid::Uuid::new_v4()));
+    let Ok(_product_authority) = manager.acquire_local_authority_pass() else {
+        return Ok(());
+    };
     while let Some(delivery) = manager
         .db()
         .next_product_creation_delivery()

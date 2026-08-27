@@ -140,6 +140,7 @@ impl RuntimeRole {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthorityKind {
+    Direct,
     RestrictedExplore,
     Work,
 }
@@ -148,6 +149,7 @@ impl AuthorityKind {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Direct => "direct",
             Self::RestrictedExplore => "restricted_explore",
             Self::Work => "work",
         }

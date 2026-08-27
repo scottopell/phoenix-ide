@@ -2089,6 +2089,16 @@ CREATE UNIQUE INDEX close_obligations_one_active_per_product ON close_obligation
 ";
 
 const MIGRATION_076: &str = r"
+PRAGMA writable_schema = ON;
+UPDATE sqlite_schema
+SET sql = replace(
+    sql,
+    'authority_kind IN (''restricted_explore'', ''work'')',
+    'authority_kind IN (''direct'', ''restricted_explore'', ''work'')'
+)
+WHERE type = 'table' AND name = 'work_scopes';
+PRAGMA writable_schema = RESET;
+
 CREATE TABLE product_creation_jobs (
     request_id TEXT PRIMARY KEY CHECK (typeof(request_id) = 'text' AND trim(request_id) <> ''),
     product_conversation_id TEXT NOT NULL UNIQUE
