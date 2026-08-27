@@ -7577,6 +7577,23 @@ WHERE c.work_scope_id IS NOT NULL
 GROUP BY c.work_scope_id
 HAVING COUNT(DISTINCT c.product_conversation_id) > 1;
 
+CREATE TABLE product_conversation_work_scope_missing_owners (
+    work_scope_id TEXT PRIMARY KEY REFERENCES work_scopes(id) ON DELETE RESTRICT,
+    state TEXT NOT NULL CHECK (state = 'needs_repair')
+);
+
+INSERT INTO product_conversation_work_scope_missing_owners (work_scope_id, state)
+SELECT scope.id, 'needs_repair'
+FROM work_scopes scope
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM conversations c
+    JOIN product_conversations product ON product.id = c.product_conversation_id
+    WHERE c.work_scope_id = scope.id
+      AND c.runtime_role = 'user'
+      AND product.kind = 'ordinary'
+);
+
 CREATE TABLE product_conversation_work_scopes (
     work_scope_id TEXT PRIMARY KEY REFERENCES work_scopes(id) ON DELETE RESTRICT,
     product_conversation_id TEXT NOT NULL REFERENCES product_conversations(id) ON DELETE CASCADE,
@@ -7598,9 +7615,15 @@ BEFORE INSERT ON conversations
 FOR EACH ROW
 WHEN NEW.work_scope_id IS NOT NULL
  AND NEW.runtime_role <> 'coordinator'
- AND EXISTS (
-    SELECT 1 FROM product_conversation_work_scope_repairs
-    WHERE work_scope_id = NEW.work_scope_id
+ AND (
+    EXISTS (
+        SELECT 1 FROM product_conversation_work_scope_repairs
+        WHERE work_scope_id = NEW.work_scope_id
+    )
+    OR EXISTS (
+        SELECT 1 FROM product_conversation_work_scope_missing_owners
+        WHERE work_scope_id = NEW.work_scope_id
+    )
  )
 BEGIN
     SELECT RAISE(ABORT, 'work scope has unresolved product conversation ownership repair');
@@ -7611,9 +7634,15 @@ BEFORE UPDATE OF product_conversation_id, work_scope_id, runtime_role ON convers
 FOR EACH ROW
 WHEN NEW.work_scope_id IS NOT NULL
  AND NEW.runtime_role <> 'coordinator'
- AND EXISTS (
-    SELECT 1 FROM product_conversation_work_scope_repairs
-    WHERE work_scope_id = NEW.work_scope_id
+ AND (
+    EXISTS (
+        SELECT 1 FROM product_conversation_work_scope_repairs
+        WHERE work_scope_id = NEW.work_scope_id
+    )
+    OR EXISTS (
+        SELECT 1 FROM product_conversation_work_scope_missing_owners
+        WHERE work_scope_id = NEW.work_scope_id
+    )
  )
 BEGIN
     SELECT RAISE(ABORT, 'work scope has unresolved product conversation ownership repair');
