@@ -462,9 +462,12 @@ impl RuntimeManager {
                 Ok(resources) => resources,
                 Err(reason) => {
                     let Some(resource) = expected.first().cloned() else {
-                        self.cancel_close_resource_lease(&attempt_id, &scope).await;
+                        self.db()
+                            .route_close_attempt_to_repair(&attempt_id)
+                            .await
+                            .map_err(|error| error.to_string())?;
                         return Err(format!(
-                            "process-epoch Close teardown failed for sealed scope {scope}: {reason}"
+                            "process-epoch Close teardown requires repair for sealed scope {scope}: {reason}"
                         ));
                     };
                     return self

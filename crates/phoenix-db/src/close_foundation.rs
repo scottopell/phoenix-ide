@@ -2285,6 +2285,17 @@ impl Database {
         Ok(resources)
     }
 
+    /// Routes an exact Close attempt to repair without fabricating a per-resource receipt.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] when the attempt is not in a retirement phase or persistence fails.
+    pub async fn route_close_attempt_to_repair(&self, attempt_id: &CloseAttemptId) -> DbResult<()> {
+        let mut tx = self.pool.begin().await?;
+        route_unresolved_worktree_to_repair(&mut tx, attempt_id).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Lists expected retirement resources for the current exact attempt snapshot.
     ///
     /// # Errors
