@@ -604,7 +604,7 @@ async fn close_view(
                         identity.as_str().to_string()
                     }
                     phoenix_core::domain::close::LossItemIdentity::Worktree(identity) => {
-                        format!("{:?}", identity)
+                        format!("{identity:?}")
                     }
                 },
             })

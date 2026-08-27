@@ -1038,7 +1038,7 @@ fn observe_initialized_submodules(
         let path_bytes = &declaration[separator + 1..];
         let path_identity = git_path_from_observation(path_bytes)?;
         let relative_path = join_git_paths(relative_prefix, path_identity.as_bytes())?;
-        let submodule_path = repository.join(path_buf_from_git_bytes(path_identity.as_bytes())?);
+        let submodule_path = repository.join(path_buf_from_git_bytes(path_identity.as_bytes()));
         if !submodule_path.join(".git").exists() {
             continue;
         }
@@ -1068,7 +1068,7 @@ fn observe_initialized_submodules(
 
         let gitlink = phoenix_core::git::command()
             .args(["submodule", "status", "--"])
-            .arg(path_buf_from_git_bytes(path_identity.as_bytes())?)
+            .arg(path_buf_from_git_bytes(path_identity.as_bytes()))
             .current_dir(repository)
             .output()
             .map_err(|error| error.to_string())?;
@@ -1105,7 +1105,10 @@ fn git_path_from_observation(bytes: &[u8]) -> Result<GitPathIdentity, String> {
     if bytes.contains(&0) {
         return Err("observed Git path contains NUL".to_string());
     }
-    let path = path_buf_from_git_bytes(bytes)?;
+    #[cfg(not(unix))]
+    std::str::from_utf8(bytes)
+        .map_err(|_| "observed Git path is not valid platform text".to_string())?;
+    let path = path_buf_from_git_bytes(bytes);
     if path.is_absolute()
         || path.components().any(|component| {
             !matches!(
@@ -1131,17 +1134,18 @@ fn join_git_paths(prefix: &[u8], path: &[u8]) -> Result<Vec<u8>, String> {
     Ok(joined)
 }
 
-fn path_buf_from_git_bytes(bytes: &[u8]) -> Result<PathBuf, String> {
+fn path_buf_from_git_bytes(bytes: &[u8]) -> PathBuf {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStringExt as _;
-        Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec())))
+        PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec()))
     }
     #[cfg(not(unix))]
     {
-        String::from_utf8(bytes.to_vec())
-            .map(PathBuf::from)
-            .map_err(|_| "observed Git path is not valid platform text".to_string())
+        PathBuf::from(
+            std::str::from_utf8(bytes)
+                .expect("Git path bytes are validated before platform conversion"),
+        )
     }
 }
 
@@ -1390,10 +1394,9 @@ mod tests {
         CloseLossItem, GitPathIdentity, WorktreeFingerprint, WorktreeId, WorktreeIdentity,
     };
     use std::path::Path;
-    use std::process::Command;
 
     fn run_git(repository: &Path, arguments: &[&str]) {
-        let output = Command::new("git")
+        let output = phoenix_core::git::command()
             .args(arguments)
             .current_dir(repository)
             .env("GIT_AUTHOR_NAME", "Close Test")
@@ -1462,7 +1465,7 @@ mod tests {
         initialize_repository(&child);
         initialize_repository(&parent);
         let child_text = child.to_string_lossy().into_owned();
-        let output = Command::new("git")
+        let output = phoenix_core::git::command()
             .args([
                 "-c",
                 "protocol.file.allow=always",
