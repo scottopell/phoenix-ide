@@ -2062,15 +2062,31 @@ async fn create_product_conversation(
         crate::db::ProductCreationAcceptOutcome::Accepted(_)
         | crate::db::ProductCreationAcceptOutcome::Replayed(_) => {}
     }
-    let published = crate::runtime::creation_worker::process_product_creation_request(
+    let published = match crate::runtime::creation_worker::process_product_creation_request(
         &state.runtime,
         &req.request_id,
     )
     .await
-    .map_err(|message| AppError::TypedInternal {
-        message,
-        error_type: "product_creation_retry_scheduled".to_string(),
-    })?;
+    {
+        Ok(published) => published,
+        Err(message) => {
+            let terminal = state
+                .db
+                .get_product_creation_job(&req.request_id)
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?
+                .is_some_and(|job| job.status == "failed");
+            return Err(AppError::TypedInternal {
+                message,
+                error_type: if terminal {
+                    "product_creation_failed"
+                } else {
+                    "product_creation_retry_scheduled"
+                }
+                .to_string(),
+            });
+        }
+    };
     Ok(Json(ProductConversationCreateAcceptedResponse {
         canonical_route: format!(
             "/product-conversations/{}",
