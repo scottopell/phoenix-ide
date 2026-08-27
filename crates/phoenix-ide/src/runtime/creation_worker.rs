@@ -823,12 +823,51 @@ fn materialize_approved_task_snapshot(
     worktree_path: &Path,
     snapshot: &phoenix_core::task_handoff::ApprovedTaskSnapshot,
 ) -> Result<(), String> {
-    let path = worktree_path.join(&snapshot.task_file);
-    std::fs::create_dir_all(
-        path.parent()
-            .ok_or_else(|| "approved task artifact path lacked parent directory".to_string())?,
-    )
-    .map_err(|error| format!("failed to create approved task artifact parent: {error}"))?;
+    let relative = Path::new(&snapshot.task_file);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(
+            "approved task artifact path must stay within the detached worktree".to_string(),
+        );
+    }
+    let filename = relative
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "approved task artifact path lacked a filename".to_string())?;
+    let promoted_filename = taskmd_core::filename::parse_filename(filename).map_or_else(
+        || filename.to_string(),
+        |parsed| {
+            taskmd_core::filename::format_filename(
+                &parsed.id,
+                parsed.priority,
+                taskmd_core::constants::Status::InProgress,
+                &parsed.slug,
+            )
+        },
+    );
+    let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+    let canonical_worktree = worktree_path
+        .canonicalize()
+        .map_err(|error| format!("failed to canonicalize detached worktree: {error}"))?;
+    let target_parent = canonical_worktree.join(parent);
+    std::fs::create_dir_all(&target_parent)
+        .map_err(|error| format!("failed to create approved task artifact parent: {error}"))?;
+    let canonical_parent = target_parent
+        .canonicalize()
+        .map_err(|error| format!("failed to canonicalize approved task parent: {error}"))?;
+    if !canonical_parent.starts_with(&canonical_worktree) {
+        return Err("approved task artifact parent escaped the detached worktree".to_string());
+    }
+    let path = canonical_parent.join(promoted_filename);
+    if path
+        .symlink_metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err("approved task artifact target must not be a symlink".to_string());
+    }
     std::fs::write(&path, &snapshot.artifact_body)
         .map_err(|error| format!("failed to materialize approved task artifact: {error}"))?;
     Ok(())

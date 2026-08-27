@@ -1513,7 +1513,12 @@ impl Database {
             "SELECT MIN(deadline) FROM (
                  SELECT retry_at_unix_micros AS deadline FROM product_creation_jobs WHERE status = 'retry_scheduled'
                  UNION ALL SELECT claim_lease_until_unix_micros FROM product_creation_jobs WHERE status = 'claimed'
-                 UNION ALL SELECT delivery_retry_at_unix_micros FROM product_creation_jobs WHERE status = 'delivery_pending'
+                 UNION ALL SELECT CASE
+                     WHEN delivery_retry_at_unix_micros IS NULL THEN claim_lease_until_unix_micros
+                     WHEN claim_lease_until_unix_micros IS NULL THEN delivery_retry_at_unix_micros
+                     WHEN delivery_retry_at_unix_micros > claim_lease_until_unix_micros THEN delivery_retry_at_unix_micros
+                     ELSE claim_lease_until_unix_micros
+                 END FROM product_creation_jobs WHERE status = 'delivery_pending'
                  UNION ALL
                  SELECT CASE
                             WHEN cleanup_lease_until_unix_micros IS NOT NULL

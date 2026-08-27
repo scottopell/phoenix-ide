@@ -177,13 +177,15 @@ pub(crate) fn run_git_bounded_with_env(
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
 
+    let remaining = timeout.saturating_sub(start.elapsed());
     let stdout_bytes = stdout_rx
-        .recv()
-        .map_err(|_| format!("stdout reader dropped for git {}", args.join(" ")))?
+        .recv_timeout(remaining)
+        .map_err(|_| format!("stdout drain timed out for git {}", args.join(" ")))?
         .map_err(|error| format!("failed reading git stdout: {error}"))?;
+    let remaining = timeout.saturating_sub(start.elapsed());
     let stderr_bytes = stderr_rx
-        .recv()
-        .map_err(|_| format!("stderr reader dropped for git {}", args.join(" ")))?
+        .recv_timeout(remaining)
+        .map_err(|_| format!("stderr drain timed out for git {}", args.join(" ")))?
         .map_err(|error| format!("failed reading git stderr: {error}"))?;
     let _ = stdout_reader.join();
     let _ = stderr_reader.join();
