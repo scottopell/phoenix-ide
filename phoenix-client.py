@@ -199,7 +199,8 @@ class PhoenixClient:
         """Get all projects."""
         resp = self.http.get(f"{self.base_url}/api/projects")
         resp.raise_for_status()
-        return resp.json().get('projects', [])
+        payload = resp.json()
+        return payload if isinstance(payload, list) else payload.get('projects', [])
 
     def get_wake_status(self, conv_id: str) -> dict:
         """Get active durable wake contracts for a conversation."""

@@ -64,5 +64,29 @@ class PhoenixClientStateTests(unittest.TestCase):
         )
 
 
+class PhoenixClientProjectTests(unittest.TestCase):
+    def test_get_projects_accepts_bare_project_list(self):
+        client = phoenix_client.PhoenixClient("http://localhost:1")
+        self.addCleanup(client.http.close)
+        projects = [{"id": "project-1", "name": "Project One"}]
+        response = Mock()
+        response.json.return_value = projects
+        client.http.get = Mock(return_value=response)
+
+        self.assertEqual(client.get_projects(), projects)
+        response.raise_for_status.assert_called_once_with()
+
+    def test_get_projects_accepts_wrapped_project_list(self):
+        client = phoenix_client.PhoenixClient("http://localhost:1")
+        self.addCleanup(client.http.close)
+        projects = [{"id": "project-1", "name": "Project One"}]
+        response = Mock()
+        response.json.return_value = {"projects": projects}
+        client.http.get = Mock(return_value=response)
+
+        self.assertEqual(client.get_projects(), projects)
+        response.raise_for_status.assert_called_once_with()
+
+
 if __name__ == "__main__":
     unittest.main()
