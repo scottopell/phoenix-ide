@@ -3,6 +3,10 @@ import type { ProductConversationScenario } from './types';
 
 export function installProductConversationFixtureApi(scenario: ProductConversationScenario): () => void {
   const originalGetProductConversationSnapshot = api.getProductConversationSnapshot;
+  const originalGetConversationRouteBySlug = api.getConversationRouteBySlug;
+  const originalGetConversationRoute = api.getConversationRoute;
+  const originalGetConversation = api.getConversation;
+  const originalGetConversationBySlug = api.getConversationBySlug;
   const originalGetChain = api.getChain;
   const originalSubmitChainQuestion = api.submitChainQuestion;
   const originalSubscribeToChainStream = streamApi.subscribeToChainStream;
@@ -19,6 +23,32 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     }
     return scenario.snapshot;
   };
+
+  api.getConversationRouteBySlug = async (slug: string) => ({ id: slug, slug });
+  api.getConversationRoute = async (id: string) => ({ id, slug: id });
+  const fixtureConversation = (id: string) => {
+    const segment = scenario.snapshot?.segments.find((candidate) => candidate.transcript_row_id === id)
+      ?? scenario.snapshot?.segments.at(-1);
+    return {
+      conversation: {
+        id,
+        slug: id,
+        title: segment?.title ?? scenario.title,
+        model: 'gpt-5',
+        cwd: scenario.snapshot?.work_identity?.worktree_path ?? '/tmp',
+        created_at: scenario.snapshot?.updated_at ?? new Date(0).toISOString(),
+        updated_at: scenario.snapshot?.updated_at ?? new Date(0).toISOString(),
+        message_count: segment?.messages.length ?? 0,
+        state: { type: 'idle' as const },
+      },
+      messages: segment?.messages ?? [],
+      agent_working: false,
+      presentation_mode: 'idle',
+      context_window_size: 0,
+    };
+  };
+  api.getConversation = async (id: string) => fixtureConversation(id);
+  api.getConversationBySlug = async (slug: string) => fixtureConversation(slug);
 
   api.getChain = async () => {
     if (!scenario.chain) {
@@ -42,6 +72,10 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
 
   return () => {
     api.getProductConversationSnapshot = originalGetProductConversationSnapshot;
+    api.getConversationRouteBySlug = originalGetConversationRouteBySlug;
+    api.getConversationRoute = originalGetConversationRoute;
+    api.getConversation = originalGetConversation;
+    api.getConversationBySlug = originalGetConversationBySlug;
     api.getChain = originalGetChain;
     api.submitChainQuestion = originalSubmitChainQuestion;
     streamApi.subscribeToChainStream = originalSubscribeToChainStream;
