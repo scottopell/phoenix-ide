@@ -6969,6 +6969,21 @@ impl Database {
         Self::insert_work_scope_tx(&mut tx, &scope_id, authority_kind, environment, &now_str)
             .await?;
         sqlx::query(
+            "INSERT INTO work_scope_git_repositories (work_scope_id, repository_id)
+             SELECT ?1, repository_id
+             FROM work_scope_git_repositories
+             WHERE work_scope_id = ?2",
+        )
+        .bind(scope_id.as_str())
+        .bind(
+            parent
+                .attached_work_scope_id
+                .as_ref()
+                .map(WorkScopeId::as_str),
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
             "INSERT INTO product_conversation_sources (
                  target_product_conversation_id, source_product_conversation_id,
                  source_conversation_id, relation_kind, relation_key, created_at_us
@@ -20755,6 +20770,19 @@ mod tests {
             .await
             .unwrap();
         let parent = db.get_conversation("handoff-parent").await.unwrap();
+        let parent_scope = parent.attached_work_scope_id.clone().unwrap();
+        sqlx::query("INSERT INTO git_repositories (id) VALUES ('handoff-repository')")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO work_scope_git_repositories (work_scope_id, repository_id)
+             VALUES (?1, 'handoff-repository')",
+        )
+        .bind(parent_scope.as_str())
+        .execute(&db.pool)
+        .await
+        .unwrap();
         let approval = phoenix_core::task_handoff::TaskApprovalHandoffData {
             task_id: "27002".to_string(),
             task_title: "Approve Fresh".to_string(),
@@ -20769,7 +20797,15 @@ mod tests {
             .await
             .unwrap();
         let successor_scope = successor.attached_work_scope_id.clone().unwrap();
-        assert_ne!(successor_scope, parent.attached_work_scope_id.unwrap());
+        assert_ne!(successor_scope, parent_scope);
+        let successor_repository: String = sqlx::query_scalar(
+            "SELECT repository_id FROM work_scope_git_repositories WHERE work_scope_id = ?1",
+        )
+        .bind(successor_scope.as_str())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(successor_repository, "handoff-repository");
         assert!(matches!(successor.state, ConvState::Provisioning { .. }));
         assert_eq!(successor.conv_mode, ConvMode::Direct);
         let job = db
