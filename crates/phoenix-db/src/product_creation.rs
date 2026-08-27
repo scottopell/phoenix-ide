@@ -976,6 +976,7 @@ mod product_creation_tests {
             })
             .await
             .unwrap();
+            // test-timing-allow: recency ordering is the behavior under test and SQLite stores the publication wall clock.
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
         let cwds = db

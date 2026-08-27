@@ -373,7 +373,8 @@ fn strict_product_creation_pin(repo_root: &Path) -> Result<(String, String), Str
     let _lock =
         RepositoryMutationLock::acquire(repo_root.to_string_lossy().as_ref()).map_err(|e| e.0)?;
     if crate::git_ops::run_git(repo_root, &["remote", "get-url", "origin"]).is_ok() {
-        let output = std::process::Command::new("git")
+        let mut command = phoenix_core::git::command();
+        let output = command
             .current_dir(repo_root)
             .args(["ls-remote", "--symref", "origin", "HEAD"])
             .output()
