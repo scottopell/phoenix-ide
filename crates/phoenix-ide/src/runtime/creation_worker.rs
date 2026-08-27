@@ -436,7 +436,7 @@ async fn deliver_product_creation_objective(
         })
         .collect();
     let enqueue_result = tokio::time::timeout(
-        std::time::Duration::from_secs(20),
+        std::time::Duration::from_secs(15),
         manager.enqueue_steer_message(
             &conversation_id,
             Event::SteerMessage {
