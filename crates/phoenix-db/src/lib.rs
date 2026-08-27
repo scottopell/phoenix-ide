@@ -1967,6 +1967,25 @@ impl Database {
             return Ok(WorkScopeRetirementOutcome::AlreadyRetired);
         }
 
+        let unresolved_product_ownership: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM product_conversation_work_scope_repairs
+                 WHERE work_scope_id = ?1 AND state = 'needs_repair'
+                 UNION ALL
+                 SELECT 1 FROM product_conversation_work_scope_missing_owners
+                 WHERE work_scope_id = ?1 AND state = 'needs_repair'
+             )",
+        )
+        .bind(scope_id.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+        if unresolved_product_ownership {
+            tx.rollback().await?;
+            return Ok(WorkScopeRetirementOutcome::Blocked(
+                WorkScopeRetirementBlocker::UnresolvedProductConversationOwnership,
+            ));
+        }
+
         if let Some(blocker) =
             Self::conversation_retirement_blocker(&mut tx, scope_id, close_attempt_id).await?
         {
@@ -22989,6 +23008,35 @@ mod tests {
 
     fn no_live_resource(scope: WorkScopeId) -> WorkScopeRetirementPrecondition {
         WorkScopeRetirementPrecondition::after_runtime_inventory_found_no_live_resource(scope)
+    }
+
+    #[tokio::test]
+    async fn retirement_blocks_persisted_product_ownership_repair() {
+        let db = Database::open_in_memory().await.unwrap();
+        let scope = retirement_fixture(
+            &db,
+            "ownership-repair-owner",
+            RuntimeRole::User,
+            &ConvState::Terminal,
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO product_conversation_work_scope_missing_owners (work_scope_id, state)
+             VALUES (?1, 'needs_repair')",
+        )
+        .bind(scope.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.retire_work_scope(no_live_resource(scope), "repair blocks retirement")
+                .await
+                .unwrap(),
+            WorkScopeRetirementOutcome::Blocked(
+                WorkScopeRetirementBlocker::UnresolvedProductConversationOwnership
+            )
+        );
     }
 
     #[tokio::test]

@@ -178,7 +178,7 @@ async fn reconcile_creation_cleanup(
             "creation cleanup mutation rejected after fatal local authority closure".to_string()
         })?;
         run_admitted_blocking(cleanup_admission, move || -> Result<(), String> {
-            let _lock = match RepositoryMutationLock::acquire(&repo) {
+            let _lock = match RepositoryMutationLock::acquire(Path::new(&repo)) {
                 Ok(lock) => Some(lock),
                 Err((_message, _))
                     if missing_repository_and_resource(Path::new(&repo), Path::new(&resource)) =>
@@ -578,7 +578,7 @@ async fn provision_conversation(
                 "branch worktree mutation rejected after fatal local authority closure",
             )?;
             let info = run_admitted_blocking(worktree_admission, move || {
-                let _lock = RepositoryMutationLock::acquire(&repo_for_blocking)?;
+                let _lock = RepositoryMutationLock::acquire(Path::new(&repo_for_blocking))?;
                 if reconcile_owned_worktree_path(&repo_for_blocking, &path_for_blocking)? {
                     if approved_task_creation {
                         validate_detached_task_worktree(
@@ -744,7 +744,7 @@ async fn provision_conversation(
                 "managed worktree mutation rejected after fatal local authority closure",
             )?;
             let worktree = run_admitted_blocking(worktree_admission, move || {
-                let _lock = RepositoryMutationLock::acquire(&repo_for_blocking)?;
+                let _lock = RepositoryMutationLock::acquire(Path::new(&repo_for_blocking))?;
                 if reconcile_owned_worktree_path(&repo_for_blocking, &path_for_blocking)? {
                     Ok(path_for_blocking.to_string_lossy().to_string())
                 } else {
@@ -1108,12 +1108,12 @@ async fn provision_conversation(
     Ok(ProvisionOutcome::InitialMessageSubmitted)
 }
 
-struct RepositoryMutationLock {
+pub(crate) struct RepositoryMutationLock {
     file: std::fs::File,
 }
 
 impl RepositoryMutationLock {
-    fn acquire(repo_root: &str) -> Result<Self, (String, ErrorKind)> {
+    pub(crate) fn acquire(repo_root: &Path) -> Result<Self, (String, ErrorKind)> {
         let (file, lock_path) = Self::open_file(repo_root)?;
         file.lock_exclusive().map_err(|error| {
             (
@@ -1124,9 +1124,9 @@ impl RepositoryMutationLock {
         Ok(Self { file })
     }
 
-    fn open_file(repo_root: &str) -> Result<(std::fs::File, PathBuf), (String, ErrorKind)> {
+    fn open_file(repo_root: &Path) -> Result<(std::fs::File, PathBuf), (String, ErrorKind)> {
         let common_dir = crate::git_ops::run_git(
-            Path::new(repo_root),
+            repo_root,
             &["rev-parse", "--path-format=absolute", "--git-common-dir"],
         )
         .map_err(|error| (error, ErrorKind::ServerError))?;
@@ -1768,8 +1768,9 @@ mod repository_lock_tests {
             .unwrap();
         assert!(status.success());
         let repo_path = repo.path().to_string_lossy().to_string();
-        let first = RepositoryMutationLock::acquire(&repo_path).unwrap();
-        let (second, _) = RepositoryMutationLock::open_file(&repo_path).unwrap();
+        let first = RepositoryMutationLock::acquire(std::path::Path::new(&repo_path)).unwrap();
+        let (second, _) =
+            RepositoryMutationLock::open_file(std::path::Path::new(&repo_path)).unwrap();
 
         assert!(second.try_lock_exclusive().is_err());
         drop(first);

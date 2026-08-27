@@ -323,15 +323,25 @@ impl ActiveTerminals {
         self.try_insert_exact(scope, handle).ok()
     }
 
-    /// Remove the terminal for `scope`, if present.
-    ///
-    /// Legacy removal clears both the live handle and any retirement fence so
-    /// tests and older callers keep the pre-retirement semantics. Exact Close-
-    /// authority teardown uses [`Self::complete_retirement`] instead.
+    /// Remove one relay-owned handle without clearing a Close fence.
     ///
     /// # Panics
     /// Panics if the registry mutex is poisoned.
-    pub fn remove(&self, scope: &ResourceScopeKey) {
+    pub fn remove_from_relay(&self, scope: &ResourceScopeKey) {
+        self.0
+            .lock()
+            .expect("terminal registry poisoned")
+            .handles
+            .remove(scope);
+    }
+
+    /// Remove the terminal for `scope` and explicitly reopen normal admission.
+    ///
+    /// This is reserved for non-Close cleanup that owns both effects.
+    ///
+    /// # Panics
+    /// Panics if the registry mutex is poisoned.
+    pub fn remove_and_reopen(&self, scope: &ResourceScopeKey) {
         let mut map = self.0.lock().expect("terminal registry poisoned");
         map.handles.remove(scope);
         map.retirements.remove(scope);

@@ -149,10 +149,30 @@ fn remove_allows_reinsertion() {
     registry
         .try_insert(scope.clone(), dummy_handle(dims))
         .unwrap();
-    registry.remove(&scope);
+    registry.remove_and_reopen(&scope);
 
     let third = registry.try_insert(scope.clone(), dummy_handle(dims));
     assert!(third.is_some(), "insert after remove must succeed");
+}
+
+#[test]
+fn relay_removal_preserves_close_retirement_fence() {
+    let registry = ActiveTerminals::default();
+    let scope = scope("relay-fence");
+    registry
+        .try_insert(scope.clone(), dummy_handle(Dims::try_new(80, 24).unwrap()))
+        .expect("insert terminal");
+    let _permit = registry.begin_retirement(&scope);
+
+    registry.remove_from_relay(&scope);
+
+    assert!(registry.is_retirement_fenced(&scope));
+    assert!(
+        registry
+            .try_insert(scope.clone(), dummy_handle(Dims::try_new(80, 24).unwrap()))
+            .is_none(),
+        "relay teardown must not reopen Close-fenced admission"
+    );
 }
 
 #[test]
@@ -180,7 +200,7 @@ fn begin_retirement_fences_admission_until_reopened() {
 
     registry.reopen_after_repair(&scope);
     assert!(!registry.is_retirement_fenced(&scope));
-    registry.remove(&scope);
+    registry.remove_and_reopen(&scope);
     assert!(
         registry
             .try_insert(scope.clone(), dummy_handle(dims))
@@ -257,7 +277,7 @@ async fn complete_retirement_verifies_absence_without_touching_replacement() {
         .expect("original insert");
     let permit = registry.begin_retirement(&scope);
 
-    registry.remove(&scope);
+    registry.remove_and_reopen(&scope);
     let replacement = registry.begin_retirement(&scope);
     registry.reopen_after_repair(&scope);
     registry
@@ -398,7 +418,7 @@ proptest! {
                 // try_insert either succeeds or returns None — never panics.
                 let _ = registry.try_insert(scope.clone(), dummy_handle(dims));
             } else {
-                registry.remove(&scope);
+                registry.remove_and_reopen(&scope);
             }
 
             // Invariant: count per scope must be 0 or 1.

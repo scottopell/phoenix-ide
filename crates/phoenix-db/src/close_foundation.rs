@@ -2332,11 +2332,21 @@ async fn route_unresolved_worktree_to_repair(
             .await?
             .ok_or_else(|| DbError::CloseFoundationNotFound(attempt_id.as_str().to_string()))?;
     match phase.as_str() {
-        "retirement_requested" => {
+        "awaiting_retirement_inspection" | "retirement_requested" => {
             sqlx::query(
                 "UPDATE close_obligations
-                 SET phase = 'needs_repair', updated_at = ?2
-                 WHERE attempt_id = ?1 AND phase = 'retirement_requested'",
+                 SET phase = 'needs_repair',
+                     inspection_generation = COALESCE(
+                         inspection_generation,
+                         'no-worktree'
+                     ),
+                     inspection_fingerprint = COALESCE(
+                         inspection_fingerprint,
+                         'no-worktree'
+                     ),
+                     updated_at = ?2
+                 WHERE attempt_id = ?1
+                   AND phase IN ('awaiting_retirement_inspection', 'retirement_requested')",
             )
             .bind(attempt_id.as_str())
             .bind(Utc::now().to_rfc3339())
@@ -2346,7 +2356,7 @@ async fn route_unresolved_worktree_to_repair(
         "needs_repair" => {}
         _ => {
             return Err(close_precondition(format!(
-                "attempt {attempt_id} unresolved worktree repair requires retirement_requested or needs_repair"
+                "attempt {attempt_id} unresolved worktree repair requires awaiting_retirement_inspection, retirement_requested, or needs_repair"
             )))
         }
     }
@@ -4551,6 +4561,36 @@ mod tests {
         assert_eq!(members.len(), 1);
         assert_eq!(members[0].conversation_id.as_str(), "root");
         assert_eq!(members[0].role, CloseMemberRole::RootLatest);
+    }
+
+    #[tokio::test]
+    async fn unresolved_worktree_routes_from_inspection_directly_to_repair() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        allocate_scope_worktree(&db, "root").await;
+        db.begin_close_foundation(&product_id("root"), "attempt-inspection-repair")
+            .await
+            .unwrap();
+        set_close_phase(
+            &db,
+            "attempt-inspection-repair",
+            ClosePhase::AwaitingRetirementInspection,
+        )
+        .await;
+
+        db.route_close_attempt_to_repair(
+            &CloseAttemptId::parse("attempt-inspection-repair").unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.get_close_obligation("attempt-inspection-repair")
+                .await
+                .unwrap()
+                .phase(),
+            ClosePhase::NeedsRepair
+        );
     }
 
     #[allow(clippy::too_many_lines)]

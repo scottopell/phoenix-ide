@@ -27,6 +27,7 @@ use phoenix_tools::{
     },
 };
 
+use super::creation_worker::RepositoryMutationLock;
 use super::RuntimeManager;
 use crate::db::{
     CaptureCloseRetirementInventoryRequest, CaptureCloseRetirementInventoryScopeRequest,
@@ -85,11 +86,15 @@ impl RuntimeManager {
         let mut requests = Vec::with_capacity(scopes.len());
         for scope in scopes {
             let (snapshot, losses) = match scope.captured_worktree {
-                None => (snapshot_for(b"no-worktree"), Vec::new()),
+                None => continue,
                 Some(CapturedWorktreeIdentity::Resolved(identity)) => {
                     inspect_worktree(&identity).await?
                 }
                 Some(CapturedWorktreeIdentity::Unresolved { .. }) => {
+                    self.db()
+                        .route_close_attempt_to_repair(&attempt_id)
+                        .await
+                        .map_err(|error| error.to_string())?;
                     return Err(format!(
                         "scope {} has unresolved captured worktree identity",
                         scope.scope
@@ -151,12 +156,18 @@ impl RuntimeManager {
         };
         let key = ResourceScopeKey::Work(scope.clone());
         let bash = self.bash_handles().begin_retirement(&key).await;
-        let tmux = match self
+        let tmux_discovery = match self
             .tmux_registry()
             .discover_persistent_identity(&key, legacy_worktree_path.as_deref(), None)
             .await
-            .map_err(|error| format!("tmux identity discovery failed: {error}"))?
         {
+            Ok(discovery) => discovery,
+            Err(error) => {
+                self.bash_handles().cancel_retirement(bash).await;
+                return Err(format!("tmux identity discovery failed: {error}"));
+            }
+        };
+        let tmux = match tmux_discovery {
             PersistentTmuxDiscovery::Absent => {
                 self.tmux_registry()
                     .begin_retirement(&key, legacy_worktree_path.as_deref(), None)
@@ -719,13 +730,17 @@ impl RuntimeManager {
                             )
                             .await;
                     };
-                    let worktree_root_missing =
-                        !path_buf_from_git_bytes(identity.locator().as_bytes())
-                            .try_exists()
-                            .map_err(|error| error.to_string())?;
-                    let fresh_snapshot = match inspect_worktree(identity).await {
-                        Ok((fresh_snapshot, _)) => Some(fresh_snapshot),
-                        Err(reason) if worktree_root_missing => {
+                    let identity = identity.clone();
+                    let confirmed_snapshot = confirmed.snapshot.clone();
+                    let runtime = tokio::runtime::Handle::current();
+                    let final_removal = tokio::task::spawn_blocking(move || {
+                        inspect_and_remove_exact_worktree(&runtime, &identity, &confirmed_snapshot)
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?;
+                    let fresh_snapshot = match final_removal {
+                        Ok(ExactWorktreeRemoval::Removed) => Some(confirmed.snapshot.clone()),
+                        Ok(ExactWorktreeRemoval::Missing { reason }) => {
                             let adopted = self
                                 .db()
                                 .record_close_retirement_evidence(
@@ -763,6 +778,18 @@ impl RuntimeManager {
                                 }
                             }
                         }
+                        Ok(ExactWorktreeRemoval::Changed) => {
+                            return self
+                                .record_close_residual(
+                                    attempt_id,
+                                    snapshot,
+                                    &scope,
+                                    target.resource.clone(),
+                                    RetirementFailureReason::IdentityNotProven,
+                                    "worktree changed after Close inspection confirmation",
+                                )
+                                .await;
+                        }
                         Err(reason) => {
                             return self
                                 .record_close_residual(
@@ -788,27 +815,6 @@ impl RuntimeManager {
                                     target.resource.clone(),
                                     RetirementFailureReason::IdentityNotProven,
                                     "worktree changed after Close inspection confirmation",
-                                )
-                                .await;
-                        }
-                        if let Err(reason) = remove_exact_worktree(identity).await {
-                            let failure = if reason.contains("incarnation")
-                                || reason.contains("registered")
-                                || reason.contains("absent")
-                                || reason.contains("server-owned")
-                            {
-                                RetirementFailureReason::IdentityNotProven
-                            } else {
-                                RetirementFailureReason::RemovalFailed
-                            };
-                            return self
-                                .record_close_residual(
-                                    attempt_id,
-                                    snapshot,
-                                    &scope,
-                                    target.resource.clone(),
-                                    failure,
-                                    &reason,
                                 )
                                 .await;
                         }
@@ -1106,6 +1112,10 @@ fn detached_reachability_evidence(repository: &Path, head_oid: &[u8]) -> Result<
             "--contains",
             head_text,
             "--format=%(refname)",
+            "refs/heads",
+            "refs/remotes",
+            "refs/tags",
+            "refs/stash",
         ])
         .current_dir(repository)
         .output()
@@ -1180,7 +1190,10 @@ fn observe_initialized_submodules(
         .current_dir(repository)
         .output()
         .map_err(|error| error.to_string())?;
-    if !declarations.status.success() {
+    let no_declared_submodules = declarations.status.code() == Some(1)
+        && declarations.stdout.is_empty()
+        && declarations.stderr.is_empty();
+    if !declarations.status.success() && !no_declared_submodules {
         return Err(format!(
             "cannot read declared submodule paths: {}",
             String::from_utf8_lossy(&declarations.stderr).trim()
@@ -1316,6 +1329,36 @@ fn path_buf_from_git_bytes(bytes: &[u8]) -> PathBuf {
     }
 }
 
+enum ExactWorktreeRemoval {
+    Removed,
+    Missing { reason: String },
+    Changed,
+}
+
+fn inspect_and_remove_exact_worktree(
+    runtime: &tokio::runtime::Handle,
+    identity: &WorktreeIdentity,
+    confirmed_snapshot: &CloseRetirementSnapshot,
+) -> Result<ExactWorktreeRemoval, String> {
+    let path = worktree_path(identity);
+    if !path
+        .try_exists()
+        .map_err(|error| format!("cannot observe captured worktree path: {error}"))?
+    {
+        return Ok(ExactWorktreeRemoval::Missing {
+            reason: "captured worktree path is absent".to_string(),
+        });
+    }
+    let _repository_lock =
+        RepositoryMutationLock::acquire(&path).map_err(|(message, _)| message)?;
+    let (fresh_snapshot, _) = runtime.block_on(inspect_worktree(identity))?;
+    if &fresh_snapshot != confirmed_snapshot {
+        return Ok(ExactWorktreeRemoval::Changed);
+    }
+    runtime.block_on(remove_exact_worktree(identity))?;
+    Ok(ExactWorktreeRemoval::Removed)
+}
+
 async fn remove_exact_worktree(identity: &WorktreeIdentity) -> Result<(), String> {
     let path = worktree_path(identity);
     if !path.exists() {
@@ -1381,7 +1424,8 @@ async fn remove_exact_worktree(identity: &WorktreeIdentity) -> Result<(), String
 
 fn parse_status_losses(status: &[u8]) -> Vec<CloseLossItem> {
     let mut losses = Vec::new();
-    for row in status.split(|byte| *byte == 0) {
+    let mut rows = status.split(|byte| *byte == 0);
+    while let Some(row) = rows.next() {
         if row.len() < 4 {
             continue;
         }
@@ -1395,6 +1439,9 @@ fn parse_status_losses(status: &[u8]) -> Vec<CloseLossItem> {
                 }
                 if xy[1] != b' ' {
                     losses.push(CloseLossItem::UnstagedTrackedPath(path));
+                }
+                if matches!(xy[0], b'R' | b'C') || matches!(xy[1], b'R' | b'C') {
+                    let _source_path = rows.next();
                 }
             }
         }
@@ -1610,7 +1657,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detached_commit_reachability_uses_custom_refs_and_detects_true_loss() {
+    async fn detached_commit_reachability_ignores_nondurable_custom_refs() {
         let temp = tempfile::tempdir().unwrap();
         initialize_repository(temp.path());
         run_git(temp.path(), &["checkout", "--quiet", "--detach"]);
@@ -1619,14 +1666,14 @@ mod tests {
         run_git(temp.path(), &["update-ref", "refs/custom/keep", "HEAD"]);
 
         let identity = inspection_identity(temp.path());
-        let (_, reachable_losses) = inspect_worktree(&identity).await.unwrap();
-        assert!(!reachable_losses
+        let (_, custom_ref_losses) = inspect_worktree(&identity).await.unwrap();
+        assert!(custom_ref_losses
             .iter()
             .any(|loss| matches!(loss, CloseLossItem::DetachedUnreachableCommit(_))));
 
-        run_git(temp.path(), &["update-ref", "-d", "refs/custom/keep"]);
-        let (_, unreachable_losses) = inspect_worktree(&identity).await.unwrap();
-        assert!(unreachable_losses
+        run_git(temp.path(), &["update-ref", "refs/tags/keep", "HEAD"]);
+        let (_, durable_ref_losses) = inspect_worktree(&identity).await.unwrap();
+        assert!(!durable_ref_losses
             .iter()
             .any(|loss| matches!(loss, CloseLossItem::DetachedUnreachableCommit(_))));
     }
@@ -1778,6 +1825,31 @@ mod tests {
             CloseLossItem::InitializedSubmoduleState(path)
                 if path.as_bytes() == b"deps/child"
         )));
+    }
+
+    #[tokio::test]
+    async fn empty_gitmodules_is_a_valid_empty_declaration_set() {
+        let temp = tempfile::tempdir().unwrap();
+        initialize_repository(temp.path());
+        std::fs::write(temp.path().join(".gitmodules"), "# no submodules\n").unwrap();
+
+        let (_, losses) = inspect_worktree(&inspection_identity(temp.path()))
+            .await
+            .unwrap();
+        assert!(!losses
+            .iter()
+            .any(|loss| matches!(loss, CloseLossItem::InitializedSubmoduleState(_))));
+    }
+
+    #[test]
+    fn porcelain_rename_source_is_not_parsed_as_another_status_record() {
+        let losses = parse_status_losses(b"R  new-name.txt\0old-long-name.txt\0");
+        assert_eq!(
+            losses,
+            vec![CloseLossItem::StagedTrackedPath(
+                GitPathIdentity::from_bytes(b"new-name.txt".to_vec())
+            )]
+        );
     }
 
     #[test]

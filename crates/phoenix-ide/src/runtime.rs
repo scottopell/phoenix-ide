@@ -3231,7 +3231,16 @@ impl RuntimeManager {
                     .advance_close_settlement_when_quiescent(obligation.attempt_id().as_str())
                     .await
                 {
-                    Ok(_) => Ok(true),
+                    Ok(advanced) => {
+                        if advanced.phase()
+                            == phoenix_core::domain::close::ClosePhase::AwaitingRetirementInspection
+                        {
+                            manager
+                                .inspect_close_retirement(advanced.attempt_id().clone())
+                                .await?;
+                        }
+                        Ok(true)
+                    }
                     Err(crate::db::DbError::CloseFoundationPrecondition(_)) => Ok(false),
                     Err(error) => Err(error.to_string()),
                 }

@@ -498,7 +498,7 @@ async fn full_teardown(
     arc_handle: Arc<TerminalHandle>,
     child_pid: nix::unistd::Pid,
 ) {
-    terminals.remove(scope);
+    terminals.remove_from_relay(scope);
     // When this and any other Arc clones drop, master_fd closes → SIGHUP → shell exits.
     drop(arc_handle);
     let _ = tokio::task::spawn_blocking(move || {
