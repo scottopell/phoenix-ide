@@ -693,15 +693,6 @@ impl RuntimeManager {
             });
             if let Some(target) = worktree_target {
                 if !retired.contains(&(scope.clone(), resource_key(&target.resource))) {
-                    self.db()
-                        .record_close_retirement_dispatch(RecordCloseRetirementDispatchRequest {
-                            attempt_id: attempt_id.clone(),
-                            scope: scope.clone(),
-                            snapshot: snapshot.clone(),
-                            resource: target.resource.clone(),
-                        })
-                        .await
-                        .map_err(|error| error.to_string())?;
                     let identity = match &captured.captured_worktree {
                         Some(CapturedWorktreeIdentity::Resolved(identity)) => identity,
                         Some(CapturedWorktreeIdentity::Unresolved { .. }) => {
@@ -749,6 +740,21 @@ impl RuntimeManager {
                             )
                             .await;
                     };
+                    if worktree_path(identity).try_exists().map_err(|error| {
+                        format!("cannot observe captured worktree path: {error}")
+                    })? {
+                        self.db()
+                            .record_close_retirement_dispatch(
+                                RecordCloseRetirementDispatchRequest {
+                                    attempt_id: attempt_id.clone(),
+                                    scope: scope.clone(),
+                                    snapshot: snapshot.clone(),
+                                    resource: target.resource.clone(),
+                                },
+                            )
+                            .await
+                            .map_err(|error| error.to_string())?;
+                    }
                     let identity = identity.clone();
                     let confirmed_snapshot = confirmed.snapshot.clone();
                     let runtime = tokio::runtime::Handle::current();
@@ -760,6 +766,21 @@ impl RuntimeManager {
                     let fresh_snapshot = match final_removal {
                         Ok(ExactWorktreeRemoval::Removed) => Some(confirmed.snapshot.clone()),
                         Ok(ExactWorktreeRemoval::Missing { reason }) => {
+                            let absence_basis = if self
+                                .db()
+                                .close_retirement_resource_was_dispatched(
+                                    attempt_id,
+                                    &scope,
+                                    snapshot,
+                                    &target.resource,
+                                )
+                                .await
+                                .map_err(|error| error.to_string())?
+                            {
+                                AbsenceBasis::SameAttemptPriorRetirement
+                            } else {
+                                AbsenceBasis::PreexistingExactIdentityEvidence
+                            };
                             let adopted = self
                                 .db()
                                 .record_close_retirement_evidence(
@@ -769,8 +790,7 @@ impl RuntimeManager {
                                         scope: scope.clone(),
                                         resource: target.resource.clone(),
                                         outcome: RetirementOutcome::AbsenceAdopted {
-                                            absence_basis:
-                                                AbsenceBasis::PreexistingExactIdentityEvidence,
+                                            absence_basis,
                                         },
                                         detail: Some(
                                             "exact prior close evidence adopted missing worktree"

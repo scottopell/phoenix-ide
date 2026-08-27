@@ -811,11 +811,13 @@ impl BrowserSession {
             Ok(Err(e)) => {
                 handler_task.abort();
                 let _ = browser.kill().await;
+                let _ = std::fs::remove_dir_all(&user_data_dir);
                 return Err(BrowserError::LaunchFailed(e.to_string()));
             }
             Err(_) => {
                 handler_task.abort();
                 let _ = browser.kill().await;
+                let _ = std::fs::remove_dir_all(&user_data_dir);
                 return Err(BrowserError::InitTimeout(SESSION_INIT_TIMEOUT));
             }
         };

@@ -489,6 +489,12 @@ async fn validate_adopted_absence_evidence(
                        AND resource_kind = ?5 AND identity_kind = ?6
                        AND identity_codec = ?7 AND identity_value = ?8
                        AND proof_kind = 'retired'
+                     UNION ALL
+                     SELECT 1 FROM close_retirement_resource_dispatches
+                     WHERE attempt_id = ?1 AND scope = ?2 AND inspection_generation = ?3
+                       AND inspection_fingerprint = ?4
+                       AND resource_kind = ?5 AND identity_kind = ?6
+                       AND identity_codec = ?7 AND identity_value = ?8
                  )",
             )
             .bind(request.attempt_id.as_str())

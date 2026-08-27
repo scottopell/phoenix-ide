@@ -430,7 +430,7 @@ pub(crate) async fn retry_close_retirement(
             "close_retry_unavailable",
         )))
     })?;
-    state
+    let retried = state
         .db
         .retry_close_retirement(attempt.attempt_id())
         .await
@@ -440,16 +440,21 @@ pub(crate) async fn retry_close_retirement(
                 "close_retry_unavailable",
             )))
         })?;
-    state
+    if let Err(error) = state
         .runtime
-        .retire_close_runtime_resources(attempt.attempt_id().clone())
+        .retire_close_runtime_resources(retried.attempt_id().clone())
         .await
-        .map_err(|error| {
-            AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                error,
-                "close_retirement_needs_repair",
-            )))
-        })?;
+    {
+        state
+            .db
+            .route_close_attempt_to_repair(retried.attempt_id())
+            .await
+            .map_err(|route_error| AppError::Internal(route_error.to_string()))?;
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            error,
+            "close_retirement_needs_repair",
+        ))));
+    }
     Ok(Json(SuccessResponse { success: true }))
 }
 
