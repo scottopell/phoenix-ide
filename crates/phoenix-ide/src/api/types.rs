@@ -243,6 +243,25 @@ pub enum OrdinaryProductConversationLifecycleView {
 pub struct ProductConversationCloseView {
     pub attempt_id: String,
     pub phase: ProductConversationClosePhaseView,
+    pub inspections: Vec<ProductConversationCloseInspectionView>,
+    pub losses: Vec<ProductConversationCloseLossView>,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProductConversationCloseInspectionView {
+    pub scope: String,
+    pub generation: String,
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProductConversationCloseLossView {
+    pub scope: String,
+    pub generation: String,
+    pub category: String,
+    pub identity: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, TS)]

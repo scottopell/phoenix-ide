@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use super::handlers::AppError;
 use super::types::{
     OrdinaryProductConversationLifecycleView, ProductConversationChainQaCompatibilityView,
+    ProductConversationCloseInspectionView, ProductConversationCloseLossView,
     ProductConversationClosePhaseView, ProductConversationCloseView,
     ProductConversationHandoffView, ProductConversationListResponse, ProductConversationListRow,
     ProductConversationPresentationView, ProductConversationSegmentView,
@@ -173,13 +174,15 @@ async fn snapshot_view(
             .conversation
             .archived,
     );
-    let close = state
+    let close_obligation = state
         .db
         .get_active_close_obligation_for_product(aggregate.product_conversation.id())
         .await
-        .map_err(db_to_app)?
-        .as_ref()
-        .map(close_view);
+        .map_err(db_to_app)?;
+    let close = match close_obligation.as_ref() {
+        Some(obligation) => Some(close_view(&state.db, obligation).await?),
+        None => None,
+    };
     let generation = aggregate_generation(&aggregate);
     let segment_ceilings = cursor.as_ref().map_or_else(
         || aggregate_segment_ceilings(&aggregate),
@@ -535,9 +538,10 @@ fn validate_cursor(
     Ok(())
 }
 
-fn close_view(
+async fn close_view(
+    db: &crate::db::Database,
     obligation: &phoenix_core::domain::close::CloseObligation,
-) -> ProductConversationCloseView {
+) -> Result<ProductConversationCloseView, AppError> {
     use phoenix_core::domain::close::ClosePhase;
 
     let phase = match obligation.phase() {
@@ -561,10 +565,33 @@ fn close_view(
         ClosePhase::NeedsRepair => ProductConversationClosePhaseView::NeedsRepair,
         ClosePhase::Completed => ProductConversationClosePhaseView::Completed,
     };
-    ProductConversationCloseView {
+    Ok(ProductConversationCloseView {
         attempt_id: obligation.attempt_id().to_string(),
         phase,
-    }
+        inspections: db
+            .list_close_retirement_inspections(obligation.attempt_id().as_str())
+            .await
+            .map_err(db_to_app)?
+            .into_iter()
+            .map(|inspection| ProductConversationCloseInspectionView {
+                scope: inspection.target.scope.as_str().to_string(),
+                generation: inspection.snapshot.generation().to_string(),
+                fingerprint: inspection.snapshot.fingerprint().to_string(),
+            })
+            .collect(),
+        losses: db
+            .list_close_retirement_losses(obligation.attempt_id().as_str())
+            .await
+            .map_err(db_to_app)?
+            .into_iter()
+            .map(|loss| ProductConversationCloseLossView {
+                scope: loss.scope.as_str().to_string(),
+                generation: loss.snapshot.generation().to_string(),
+                category: format!("{:?}", loss.item),
+                identity: format!("{:?}", loss.item),
+            })
+            .collect(),
+    })
 }
 
 fn lifecycle_view(
