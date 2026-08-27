@@ -139,7 +139,6 @@ export type { ConnectionState } from './connectionMachine';
 import {
   ConversationOpenMeasurement,
   reportConversationOpen,
-  type ConversationOpenTelemetryPayload,
 } from './conversationOpenTelemetry';
 
 export interface ConnectionInfo {
@@ -157,8 +156,10 @@ interface UseConnectionOptions {
   getLastAppliedEventSeq?: () => number;
   /** Generation paired with a replay cursor so the server may safely preserve the transcript. */
   getTranscriptGeneration?: () => number | null;
+  /** Initial route-to-paint measurement, consumed by the first stream open only. */
+  initialOpenMeasurement?: ConversationOpenMeasurement | null;
   /** Called only after an init has passed runtime validation and stream identity checks. */
-  onValidatedInit?: (payload: InitPayload) => void;
+  onValidatedInit?: (payload: InitPayload, reportFirstPaint: () => void) => void;
   /** Called when a validated live event transfers one steering identity to server authority. */
   onValidatedSteeringQueued?: (messageId: string) => void;
 }
@@ -226,6 +227,7 @@ export function useConnection({
   dispatch,
   getLastAppliedEventSeq,
   getTranscriptGeneration,
+  initialOpenMeasurement,
   onValidatedInit,
   onValidatedSteeringQueued,
 }: UseConnectionOptions): ConnectionInfo {
@@ -235,11 +237,17 @@ export function useConnection({
   // Refs for values that shouldn't trigger effect re-runs
   const eventSourceRef = useRef<EventSource | null>(null);
   const openMeasurementRef = useRef<ConversationOpenMeasurement | null>(null);
+  const initialOpenMeasurementRef = useRef(initialOpenMeasurement);
+  const initialOpenMeasurementPropRef = useRef(initialOpenMeasurement);
+  if (initialOpenMeasurementPropRef.current !== initialOpenMeasurement) {
+    initialOpenMeasurementPropRef.current = initialOpenMeasurement;
+    initialOpenMeasurementRef.current = initialOpenMeasurement;
+  }
   const openAttemptRef = useRef<{ conversationId: string; attempt: number } | null>(null);
   const pendingCancellationsRef = useRef<Array<{
     conversationId: string;
     timeout: number;
-    telemetry: ConversationOpenTelemetryPayload;
+    measurement: ConversationOpenMeasurement;
   }>>([]);
   const retryTimeoutRef = useRef<number | null>(null);
   const countdownIntervalRef = useRef<number | null>(null);
@@ -309,16 +317,17 @@ export function useConnection({
   }, [dispatchMachine]);
 
   const reportCanceledOpen = useCallback((conversationId: string) => {
-    const telemetry = openMeasurementRef.current?.canceled();
+    const measurement = openMeasurementRef.current;
     openMeasurementRef.current = null;
-    if (!telemetry) return;
+    if (!measurement) return;
     const timeout = window.setTimeout(() => {
       pendingCancellationsRef.current = pendingCancellationsRef.current.filter(
         (pending) => pending.timeout !== timeout,
       );
-      reportConversationOpen(telemetry);
+      const telemetry = measurement.canceled();
+      if (telemetry) reportConversationOpen(telemetry);
     }, 0);
-    pendingCancellationsRef.current.push({ conversationId, timeout, telemetry });
+    pendingCancellationsRef.current.push({ conversationId, timeout, measurement });
   }, []);
 
   useEffect(() => {
@@ -327,7 +336,8 @@ export function useConnection({
       pendingCancellationsRef.current = [];
       for (const cancellation of pending) {
         clearTimeout(cancellation.timeout);
-        reportConversationOpen(cancellation.telemetry);
+        const telemetry = cancellation.measurement.canceled();
+        if (telemetry) reportConversationOpen(telemetry);
       }
       const telemetry = openMeasurementRef.current?.canceled();
       openMeasurementRef.current = null;
@@ -347,9 +357,11 @@ export function useConnection({
           const replayIndex = pendingCancellationsRef.current.findLastIndex(
             (pending) => pending.conversationId === convId,
           );
-          if (replayIndex >= 0) {
-            const [replayed] = pendingCancellationsRef.current.splice(replayIndex, 1);
-            if (replayed) clearTimeout(replayed.timeout);
+          const replayed = replayIndex >= 0
+            ? pendingCancellationsRef.current.splice(replayIndex, 1)[0]
+            : undefined;
+          if (replayed) {
+            clearTimeout(replayed.timeout);
             openAttemptRef.current = null;
           }
           if (eventSourceRef.current) {
@@ -365,15 +377,20 @@ export function useConnection({
 
           const lastAppliedEventSeq = getLastAppliedEventSeqRef.current?.() ?? 0;
           const transcriptGeneration = getTranscriptGenerationRef.current?.() ?? null;
-          const openId = generateUUID();
           const previousAttempt = openAttemptRef.current;
           const openAttempt = previousAttempt?.conversationId === convId
             ? Math.min(previousAttempt.attempt + 1, 10_000)
             : 0;
           openAttemptRef.current = { conversationId: convId, attempt: openAttempt };
-          const measurement = new ConversationOpenMeasurement(openId, openAttempt);
+          const initialMeasurement = openAttempt === 0 ? initialOpenMeasurementRef.current : null;
+          if (initialMeasurement) initialOpenMeasurementRef.current = null;
+          const measurement = replayed?.measurement
+            ?? initialMeasurement
+            ?? new ConversationOpenMeasurement(generateUUID(), openAttempt);
+          const openId = measurement.openId;
           const url = buildStreamUrl(convId, lastAppliedEventSeq, transcriptGeneration, openId);
           const es = new EventSource(url);
+          measurement.eventSourceCreated();
           es.addEventListener('open', () => measurement.nativeOpen());
           eventSourceRef.current = es;
           openMeasurementRef.current = measurement;
@@ -436,9 +453,13 @@ export function useConnection({
               type: 'sse_init',
               payload,
             });
-            onValidatedInitRef.current?.(payload);
-            const telemetry = measurement.connected();
-            if (telemetry) reportConversationOpen(telemetry);
+            measurement.initHandled();
+            const reportFirstPaint = () => {
+              const telemetry = measurement.firstPaint();
+              if (telemetry) reportConversationOpen(telemetry);
+            };
+            onValidatedInitRef.current?.(payload, reportFirstPaint);
+            if (!onValidatedInitRef.current) reportFirstPaint();
           }, () => measurement.initReceived());
 
           on('message', (e) => {

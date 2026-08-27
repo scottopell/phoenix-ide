@@ -10,6 +10,7 @@ import {
 } from '../utils';
 import { copyToClipboard } from '../utils/clipboard';
 import { generateUUID } from '../utils/uuid';
+import { ConversationOpenMeasurement, reportConversationOpen } from '../hooks/conversationOpenTelemetry';
 import { cacheDB } from '../cache';
 import { terminalPaneStorageKey } from '../storage/terminalPaneStorage';
 import type { PendingUserMessage } from '../hooks/useMessageQueue';
@@ -707,6 +708,27 @@ function ConversationPageContent({
 
   const atomRef = useRef(atom);
   atomRef.current = atom;
+  const initialOpenJourneyRef = useRef<{
+    slug: string | undefined;
+    measurement: ConversationOpenMeasurement;
+  } | null>(null);
+  const expectedCanonicalSlugRef = useRef<string | null>(null);
+  if (initialOpenJourneyRef.current?.slug !== slug) {
+    if (expectedCanonicalSlugRef.current === slug && initialOpenJourneyRef.current) {
+      initialOpenJourneyRef.current.slug = slug;
+      expectedCanonicalSlugRef.current = null;
+    } else {
+      initialOpenJourneyRef.current = {
+        slug,
+        measurement: new ConversationOpenMeasurement(generateUUID(), 0),
+      };
+    }
+  }
+  const initialOpenMeasurement = initialOpenJourneyRef.current.measurement;
+  const initialOpenCancellationRef = useRef<{
+    measurement: ConversationOpenMeasurement;
+    timeout: number;
+  } | null>(null);
   const locationRef = useRef(location);
   locationRef.current = location;
   const conversationRouteIdentity = `${slug ?? ''}\u0000${conversationId ?? ''}`;
@@ -749,7 +771,8 @@ function ConversationPageContent({
     getTranscriptGeneration: () => atomRef.current.conversationId === resolvedRouteConversationId
       ? atomRef.current.transcriptGeneration
       : null,
-    onValidatedInit: (payload) => {
+    initialOpenMeasurement,
+    onValidatedInit: (payload, reportFirstPaint = () => undefined) => {
       reconcileAuthoritative(payload.steeringMessages.map((message) => message.message_id));
       setArchiveStatusConfirmedConversationId(payload.conversation.id);
       historyGenerationRef.current += 1;
@@ -762,6 +785,7 @@ function ConversationPageContent({
         },
         hasEarlierHistory: transcriptCoverageAfterInit(atomRef.current, payload) === 'tail',
       });
+      requestAnimationFrame(() => requestAnimationFrame(reportFirstPaint));
     },
     onValidatedSteeringQueued: (messageId) => {
       reconcileAuthoritative([messageId]);
@@ -902,6 +926,15 @@ function ConversationPageContent({
       navigate('/');
       return;
     }
+    const pendingCancellation = initialOpenCancellationRef.current;
+    if (pendingCancellation) {
+      clearTimeout(pendingCancellation.timeout);
+      initialOpenCancellationRef.current = null;
+      if (pendingCancellation.measurement !== initialOpenMeasurement) {
+        const telemetry = pendingCancellation.measurement.canceled();
+        if (telemetry) reportConversationOpen(telemetry);
+      }
+    }
 
     setError(null);
     setArchiveStatusConfirmedConversationId(null);
@@ -922,6 +955,7 @@ function ConversationPageContent({
     const resolveAuthoritativeRoute = async () => {
       const route = await resolveConversationRoute(slug);
       if (cancelled) return;
+      initialOpenMeasurement.routeResolved();
       setResolvedRouteConversationId(route.id);
       const preserveTranscriptRouteId = (
         locationRef.current.state as { preserveTranscriptRouteId?: boolean } | null
@@ -933,6 +967,7 @@ function ConversationPageContent({
         && !suppressCanonicalization
         && !preserveTranscriptRouteId
       ) {
+        expectedCanonicalSlugRef.current = route.slug;
         navigate({
           pathname: `/c/${route.slug}`,
           search: locationRef.current.search,
@@ -953,6 +988,8 @@ function ConversationPageContent({
       } catch (err) {
         if (!cancelled) {
           console.error('Failed to resolve conversation route:', err);
+          const telemetry = initialOpenMeasurement.error();
+          if (telemetry) reportConversationOpen(telemetry);
           if (!atomRef.current.conversationId) {
             setError(err instanceof Error ? err.message : 'Failed to resolve conversation route');
           }
@@ -982,9 +1019,17 @@ function ConversationPageContent({
 
     return () => {
       cancelled = true;
+      const timeout = window.setTimeout(() => {
+        if (initialOpenCancellationRef.current?.timeout === timeout) {
+          initialOpenCancellationRef.current = null;
+        }
+        const telemetry = initialOpenMeasurement.canceled();
+        if (telemetry) reportConversationOpen(telemetry);
+      }, 0);
+      initialOpenCancellationRef.current = { measurement: initialOpenMeasurement, timeout };
       window.removeEventListener('online', handleOnline);
     };
-  }, [slug, navigate, dispatch, eventCursorRef, routePrefix, suppressCanonicalization]);
+  }, [slug, navigate, dispatch, eventCursorRef, routePrefix, suppressCanonicalization, initialOpenMeasurement]);
 
   const loadOlderMessagesForIntent = useCallback(async (intent: HistoryIntent) => {
     if (!slug || !conversationId || historyExpansion.coverage !== 'tail' || historyExpansion.activeRequest) return;

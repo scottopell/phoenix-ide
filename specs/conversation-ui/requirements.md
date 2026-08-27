@@ -635,3 +635,18 @@ state instead of recognizing the moment they want. A fixed role — navigation
 always, on cold load and while streaming — avoids the ambiguity of a slot that
 means different things at different moments; live activity is the StateBar's
 job (REQ-CONV-007).
+
+---
+
+### REQ-CONV-024: Content-Free Conversation Readiness Telemetry
+
+WHEN the browser opens a conversation
+THE SYSTEM SHALL extend the conversation-open telemetry timeline from the conversation page's route-render start through authoritative route resolution, EventSource construction, native EventSource open when observed, SSE init receipt, validated init handling, and the first transcript paint opportunity
+AND SHALL correlate that browser timeline with the server stream-open timeline through one opaque open identifier
+
+WHEN a stream reconnects without a new route-render start
+THE SYSTEM SHALL record the available stream milestones without fabricating route milestones
+
+The conversation-open telemetry SHALL contain only bounded cumulative milestone offsets, outcome, retry attempt, page visibility, coarse network effective type, and the opaque open identifier. It SHALL NOT contain a conversation identifier, route slug, title, message text, transcript content, working directory, or other user content.
+
+**Rationale:** A correlated route-to-paint timeline distinguishes browser, route, transport, validation, and rendering delays while preserving conversation confidentiality.

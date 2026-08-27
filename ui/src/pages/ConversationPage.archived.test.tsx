@@ -13,6 +13,7 @@ import { api, ExpansionError, type Conversation, type Message } from '../api';
 import { ConversationReadinessProvider } from '../contexts/ConversationReadinessContext';
 import { FocusScopeProvider, useFocusScopeCommands } from '../hooks/useFocusScope';
 import { cacheDB } from '../cache';
+import type { ConversationOpenMeasurement } from '../hooks/conversationOpenTelemetry';
 
 const viewportFlags = vi.hoisted(() => ({ isDesktop: true, isWideDesktop: true }));
 
@@ -59,7 +60,8 @@ vi.mock('../cache', () => ({
 type ConnectionOptions = {
   conversationId?: string;
   dispatch: (action: SSEAction) => void;
-  onValidatedInit?: (payload: InitPayload) => void;
+  initialOpenMeasurement?: ConversationOpenMeasurement;
+  onValidatedInit?: (payload: InitPayload, reportFirstPaint?: () => void) => void;
   onValidatedSteeringQueued?: (messageId: string) => void;
 };
 
@@ -90,7 +92,7 @@ function useConnectedConnection(options: ConnectionOptions) {
     if (!connectedConversationId) return;
     const conversation = authoritativeConversations.get(connectedConversationId)
       ?? makeConversation({ id: connectedConversationId });
-    validatedInitRef.current?.(makeConnectionInit(conversation));
+    validatedInitRef.current?.(makeConnectionInit(conversation), () => undefined);
   }, [connectedConversationId]);
   return { state: 'connected' as const, attempt: 0, nextRetryIn: null, retryNow: vi.fn() };
 }
@@ -317,6 +319,7 @@ afterEach(() => {
   authoritativeConversations.clear();
   vi.clearAllMocks();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
   hooksMockState.useConnection.mockImplementation(useConnectedConnection);
   localStorage.clear();
 });
@@ -324,6 +327,35 @@ afterEach(() => {
 hooksMockState.useConnection.mockImplementation(useConnectedConnection);
 
 describe('ConversationPage message viewer layout', () => {
+  it('reports first transcript paint only after two animation frames', async () => {
+    const animationFrames: FrameRequestCallback[] = [];
+    vi.stubGlobal('requestAnimationFrame', vi.fn((callback: FrameRequestCallback) => {
+      animationFrames.push(callback);
+      return animationFrames.length;
+    }));
+    const reportFirstPaint = vi.fn();
+    hooksMockState.useConnection.mockImplementation((options: ConnectionOptions) => {
+      const validatedInitRef = useRef(options.onValidatedInit);
+      validatedInitRef.current = options.onValidatedInit;
+      useEffect(() => {
+        if (!options.conversationId) return;
+        const conversation = authoritativeConversations.get(options.conversationId)
+          ?? makeConversation({ id: options.conversationId });
+        validatedInitRef.current?.(makeConnectionInit(conversation), reportFirstPaint);
+      }, [options.conversationId]);
+      return { state: 'connected' as const, attempt: 0, nextRetryIn: null, retryNow: vi.fn() };
+    });
+
+    renderPage(makeConversation());
+    await waitFor(() => expect(animationFrames).toHaveLength(1));
+
+    act(() => animationFrames.shift()!(0));
+    expect(reportFirstPaint).not.toHaveBeenCalled();
+    expect(animationFrames).toHaveLength(1);
+
+    act(() => animationFrames.shift()!(16));
+    expect(reportFirstPaint).toHaveBeenCalledTimes(1);
+  });
   it('keeps a direct fullscreen message open out of split-pane layout', async () => {
     const { container } = renderPage(
       makeConversation(),
@@ -1296,12 +1328,18 @@ describe('ConversationPage archived read-only rendering', () => {
     const conversation = makeConversation({ id: uuidRoute, slug: 'canonical-route' });
 
     renderPage(conversation, uuidRoute, '?keep=route-state#message-missing-target');
+    await waitFor(() => expect(hooksMockState.useConnection).toHaveBeenCalled());
+    const initialMeasurement = (hooksMockState.useConnection.mock.calls[0]![0] as ConnectionOptions)
+      .initialOpenMeasurement;
 
     await waitFor(() => expect(api.getConversationRoute).toHaveBeenCalledWith(uuidRoute));
     expect(await screen.findByText('keep this history visible')).toBeInTheDocument();
     await waitFor(() => expect(screen.getByTestId('route-location')).toHaveTextContent(
       '/c/canonical-route?keep=route-state#message-missing-target',
     ));
+    const canonicalMeasurement = (hooksMockState.useConnection.mock.calls.at(-1)![0] as ConnectionOptions)
+      .initialOpenMeasurement;
+    expect(canonicalMeasurement).toBe(initialMeasurement);
   });
 
   it('uses the authoritative route owner when the cached slug owner changed', async () => {
