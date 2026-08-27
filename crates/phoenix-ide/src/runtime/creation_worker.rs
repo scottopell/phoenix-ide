@@ -170,6 +170,22 @@ async fn process_claimed_product_creation(
         };
         let planned_path =
             deterministic_worktree_path(&repo_root, job.product_conversation_id.as_str());
+        let reservation_id = format!("{}:worktree", job.request_id);
+        let reserved = manager
+            .db()
+            .reserve_product_creation_resource(
+                &reservation_id,
+                &job.request_id,
+                &claimed.claim,
+                &repo_root,
+                planned_path.to_string_lossy().as_ref(),
+                chrono::Utc::now(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if !reserved {
+            return Err("product creation claim was lost before reserving worktree".to_string());
+        }
         if !manager
             .db()
             .record_product_creation_staging(
@@ -220,6 +236,19 @@ async fn process_claimed_product_creation(
         .map_err(|error| format!("worktree materialization join failed: {error}"))??;
         let non_empty = NonEmptyString::new(worktree.clone())
             .map_err(|_| "materialized worktree path was empty".to_string())?;
+        let present = manager
+            .db()
+            .mark_product_creation_resource_present(
+                &job.request_id,
+                &claimed.claim,
+                &planned_path.to_string_lossy(),
+                chrono::Utc::now(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if !present {
+            return Err("product creation claim was lost after materializing worktree".to_string());
+        }
         (
             worktree.clone(),
             ConvMode::Explore {
@@ -457,14 +486,45 @@ async fn cleanup_unpublished_product_staging(
     job: &crate::db::ProductCreationJobRecord,
     cleanup_lock: Option<RepositoryMutationLock>,
 ) -> bool {
-    let (Some(path), Some(repo_root), Some(expected_oid)) = (
-        job.staging_path.clone(),
-        job.staging_repo_root.clone(),
-        job.staging_exact_oid.clone(),
-    ) else {
+    let cleanup = cleanup_unpublished_product_staging_path(
+        job.staging_path.as_deref(),
+        job.staging_repo_root.as_deref(),
+        job.staging_exact_oid.as_deref(),
+        cleanup_lock,
+    )
+    .await;
+    if matches!(cleanup, Ok(Ok(true))) {
         return true;
+    }
+    manager
+        .db()
+        .mark_product_creation_cleanup_ambiguous(
+            &job.request_id,
+            &crate::db::ProductCreationClaim {
+                worker_id: job.claim_worker_id.clone().unwrap_or_default(),
+                token: job.claim_token.clone().unwrap_or_default(),
+                generation: job.claim_generation,
+                lease_until: job.claim_lease_until.unwrap_or_else(chrono::Utc::now),
+            },
+        )
+        .await
+        .unwrap_or(false)
+}
+
+async fn cleanup_unpublished_product_staging_path(
+    staging_path: Option<&str>,
+    staging_repo_root: Option<&str>,
+    staging_exact_oid: Option<&str>,
+    cleanup_lock: Option<RepositoryMutationLock>,
+) -> Result<Result<bool, String>, tokio::task::JoinError> {
+    let (Some(path), Some(repo_root), Some(expected_oid)) = (
+        staging_path.map(ToOwned::to_owned),
+        staging_repo_root.map(ToOwned::to_owned),
+        staging_exact_oid.map(ToOwned::to_owned),
+    ) else {
+        return Ok(Ok(true));
     };
-    let cleanup = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         let _lock = cleanup_lock.ok_or_else(|| "cleanup repository lock missing".to_string())?;
         let path = PathBuf::from(path);
         if !path.exists() {
@@ -487,23 +547,58 @@ async fn cleanup_unpublished_product_staging(
         )?;
         Ok(true)
     })
-    .await;
-    if matches!(cleanup, Ok(Ok(true))) {
-        return true;
-    }
-    manager
-        .db()
-        .mark_product_creation_cleanup_ambiguous(
-            &job.request_id,
-            &crate::db::ProductCreationClaim {
-                worker_id: job.claim_worker_id.clone().unwrap_or_default(),
-                token: job.claim_token.clone().unwrap_or_default(),
-                generation: job.claim_generation,
-                lease_until: job.claim_lease_until.unwrap_or_else(chrono::Utc::now),
-            },
+    .await
+}
+
+async fn reconcile_product_creation_cleanup(
+    manager: &Arc<RuntimeManager>,
+    cleanup: &crate::db::ProductCreationCleanupJob,
+) -> Result<(), String> {
+    for reservation in &cleanup.reservations {
+        if reservation.status == "released" {
+            continue;
+        }
+        let cleanup_lock = match RepositoryMutationLock::acquire(&reservation.repository_identity) {
+            Ok(lock) => Some(lock),
+            Err((_, _))
+                if missing_repository_and_resource(
+                    Path::new(&reservation.repository_identity),
+                    Path::new(&reservation.resource_identity),
+                ) =>
+            {
+                None
+            }
+            Err((message, _)) => return Err(message),
+        };
+        let cleaned = cleanup_unpublished_product_staging_path(
+            Some(&reservation.resource_identity),
+            Some(&reservation.repository_identity),
+            cleanup.job.staging_exact_oid.as_deref(),
+            cleanup_lock,
         )
         .await
-        .unwrap_or(false)
+        .map_err(|error| error.to_string())??;
+        if !cleaned {
+            return Err("product creation cleanup could not prove staging ownership".to_string());
+        }
+        let released = manager
+            .db()
+            .release_product_creation_resource(cleanup, &reservation.id, chrono::Utc::now())
+            .await
+            .map_err(|error| error.to_string())?;
+        if !released {
+            return Ok(());
+        }
+    }
+    if !manager
+        .db()
+        .finish_product_creation_cleanup(cleanup, chrono::Utc::now())
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        return Ok(());
+    }
+    Ok(())
 }
 
 async fn process_product_creation_until_closed(
@@ -807,6 +902,35 @@ pub(crate) async fn drain_pending_jobs(manager: &Arc<RuntimeManager>) -> Result<
                 &error,
             )
             .await?;
+        }
+    }
+    loop {
+        let Some(cleanup) = manager
+            .db()
+            .claim_next_product_creation_cleanup(
+                &worker_id.0,
+                &uuid::Uuid::new_v4().to_string(),
+                chrono::Utc::now(),
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            break;
+        };
+        let _owner = manager.acquire_local_authority_pass().map_err(|()| {
+            "product creation cleanup rejected after fatal local authority closure".to_string()
+        })?;
+        if let Err(error) = reconcile_product_creation_cleanup(manager, &cleanup).await {
+            tracing::warn!(request_id = %cleanup.job.request_id, error = %error, "product creation cleanup will retry");
+            manager
+                .db()
+                .schedule_product_creation_cleanup_retry(
+                    &cleanup,
+                    chrono::Utc::now() + chrono::Duration::seconds(30),
+                )
+                .await
+                .map_err(|db_error| db_error.to_string())?;
         }
     }
     loop {

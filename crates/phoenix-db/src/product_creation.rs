@@ -66,6 +66,8 @@ pub struct ProductCreationJobRecord {
     pub published_product_id: Option<ProductConversationId>,
     pub published_conversation_id: Option<String>,
     pub last_error: Option<String>,
+    pub cancelled_at: Option<DateTime<Utc>>,
+    pub deletion_requested_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +96,31 @@ pub struct ProductCreationClaim {
 pub struct ClaimedProductCreationJob {
     pub job: ProductCreationJobRecord,
     pub claim: ProductCreationClaim,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProductCreationCleanupClaim {
+    pub worker_id: String,
+    pub token: String,
+    pub generation: i64,
+    pub lease_until: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProductCreationResourceReservation {
+    pub id: String,
+    pub request_id: String,
+    pub generation: i64,
+    pub repository_identity: String,
+    pub resource_identity: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProductCreationCleanupJob {
+    pub job: ProductCreationJobRecord,
+    pub claim: ProductCreationCleanupClaim,
+    pub reservations: Vec<ProductCreationResourceReservation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,6 +159,19 @@ fn next_product_creation_retry_at(attempt_count: i64, now: DateTime<Utc>) -> Opt
     PRODUCT_CREATION_RETRY_DELAYS_SECONDS
         .get(usize::try_from(attempt_count.saturating_sub(1)).ok()?)
         .map(|seconds| now + chrono::Duration::seconds(*seconds))
+}
+
+fn parse_product_creation_resource_reservation_row(
+    row: &SqliteRow,
+) -> Result<ProductCreationResourceReservation, sqlx::Error> {
+    Ok(ProductCreationResourceReservation {
+        id: row.try_get("id")?,
+        request_id: row.try_get("request_id")?,
+        generation: row.try_get("generation")?,
+        repository_identity: row.try_get("repository_identity")?,
+        resource_identity: row.try_get("resource_identity")?,
+        status: row.try_get("status")?,
+    })
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -192,6 +232,14 @@ fn parse_product_creation_job_row(row: SqliteRow) -> Result<ProductCreationJobRe
             .map_err(|error| sqlx::Error::Decode(Box::new(error)))?,
         published_conversation_id: row.try_get("published_conversation_id")?,
         last_error: row.try_get("last_error")?,
+        cancelled_at: row
+            .try_get::<Option<i64>, _>("cancelled_at_unix_micros")?
+            .map(unix_micros_to_datetime)
+            .transpose()?,
+        deletion_requested_at: row
+            .try_get::<Option<i64>, _>("deletion_requested_at_unix_micros")?
+            .map(unix_micros_to_datetime)
+            .transpose()?,
     })
 }
 
@@ -229,6 +277,7 @@ impl Database {
                     j.pin_exact_checkout_oid, j.pin_logical_base, j.pin_freshness,
                     j.staging_path, j.staging_repo_root, j.staging_exact_oid,
                     j.published_product_id, j.published_conversation_id, j.last_error,
+                    j.cancelled_at_unix_micros, j.deletion_requested_at_unix_micros,
                     COALESCE((
                         SELECT json_group_array(json_object('media_type', i.media_type, 'data', i.data))
                         FROM product_creation_job_images i
@@ -263,6 +312,7 @@ impl Database {
                     pin_exact_checkout_oid, pin_logical_base, pin_freshness,
                     staging_path, staging_repo_root, staging_exact_oid,
                     published_product_id, published_conversation_id, last_error,
+                    cancelled_at_unix_micros, deletion_requested_at_unix_micros,
                     COALESCE((
                         SELECT json_group_array(json_object('media_type', i.media_type, 'data', i.data))
                         FROM product_creation_job_images i
@@ -919,6 +969,7 @@ impl Database {
                     j.pin_exact_checkout_oid, j.pin_logical_base, j.pin_freshness,
                     j.staging_path, j.staging_repo_root, j.staging_exact_oid,
                     j.published_product_id, j.published_conversation_id, j.last_error,
+                    j.cancelled_at_unix_micros, j.deletion_requested_at_unix_micros,
                     COALESCE((SELECT json_group_array(json_object('media_type', i.media_type, 'data', i.data))
                               FROM product_creation_job_images i WHERE i.request_id = j.request_id
                               ORDER BY i.ordinal), '[]') AS images_json
@@ -964,12 +1015,451 @@ impl Database {
         Ok(updated.rows_affected() == 1)
     }
 
+    pub async fn get_product_creation_resource_reservations(
+        &self,
+        request_id: &str,
+    ) -> DbResult<Vec<ProductCreationResourceReservation>> {
+        sqlx::query(
+            "SELECT id, request_id, generation, repository_identity, resource_identity, status
+             FROM product_creation_resource_reservations
+             WHERE request_id = ?1
+             ORDER BY id",
+        )
+        .bind(request_id)
+        .try_map(|row| parse_product_creation_resource_reservation_row(&row))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(DbError::from)
+    }
+
+    pub async fn reserve_product_creation_resource(
+        &self,
+        reservation_id: &str,
+        request_id: &str,
+        claim: &ProductCreationClaim,
+        repository_identity: &str,
+        resource_identity: &str,
+        now: DateTime<Utc>,
+    ) -> DbResult<bool> {
+        let inserted = sqlx::query(
+            "INSERT INTO product_creation_resource_reservations (
+                id, request_id, generation, repository_identity, resource_identity,
+                status, created_at_unix_micros, updated_at_unix_micros
+             ) SELECT ?1, ?2, ?3, ?4, ?5, 'reserved', ?6, ?6
+               WHERE EXISTS (
+                   SELECT 1 FROM product_creation_jobs j
+                   WHERE j.request_id = ?2 AND j.status = 'claimed'
+                     AND j.claim_generation = ?3 AND j.claim_worker_id = ?7 AND j.claim_token = ?8
+                     AND j.claim_lease_until_unix_micros > ?6
+                     AND j.published_product_id IS NULL AND j.published_conversation_id IS NULL
+               )
+             ON CONFLICT(request_id, resource_identity) DO UPDATE SET
+                generation = excluded.generation,
+                repository_identity = excluded.repository_identity,
+                status = CASE
+                    WHEN product_creation_resource_reservations.status = 'present'
+                        THEN 'present'
+                    ELSE 'reserved'
+                END,
+                updated_at_unix_micros = excluded.updated_at_unix_micros",
+        )
+        .bind(reservation_id)
+        .bind(request_id)
+        .bind(claim.generation)
+        .bind(repository_identity)
+        .bind(resource_identity)
+        .bind(datetime_to_unix_micros(now))
+        .bind(&claim.worker_id)
+        .bind(&claim.token)
+        .execute(&self.pool)
+        .await?;
+        Ok(inserted.rows_affected() == 1)
+    }
+
+    pub async fn mark_product_creation_resource_present(
+        &self,
+        request_id: &str,
+        claim: &ProductCreationClaim,
+        resource_identity: &str,
+        now: DateTime<Utc>,
+    ) -> DbResult<bool> {
+        let updated = sqlx::query(
+            "UPDATE product_creation_resource_reservations
+             SET status = 'present', updated_at_unix_micros = ?1
+             WHERE request_id = ?2 AND generation = ?3 AND resource_identity = ?4
+               AND status = 'reserved'
+               AND EXISTS (
+                   SELECT 1 FROM product_creation_jobs j
+                   WHERE j.request_id = ?2 AND j.status = 'claimed'
+                     AND j.claim_generation = ?3 AND j.claim_worker_id = ?5 AND j.claim_token = ?6
+                     AND j.claim_lease_until_unix_micros > ?1
+                     AND j.published_product_id IS NULL AND j.published_conversation_id IS NULL
+               )",
+        )
+        .bind(datetime_to_unix_micros(now))
+        .bind(request_id)
+        .bind(claim.generation)
+        .bind(resource_identity)
+        .bind(&claim.worker_id)
+        .bind(&claim.token)
+        .execute(&self.pool)
+        .await?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    pub async fn cancel_product_creation(
+        &self,
+        request_id: &str,
+        now: DateTime<Utc>,
+    ) -> DbResult<bool> {
+        let now_micros = datetime_to_unix_micros(now);
+        let mut tx = self.pool.begin().await?;
+        let job: Option<(i64, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT claim_generation, published_product_id, published_conversation_id
+             FROM product_creation_jobs
+             WHERE request_id = ?1
+               AND status IN ('accepted', 'claimed', 'retry_scheduled')",
+        )
+        .bind(request_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((generation, published_product_id, published_conversation_id)) = job else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        if published_product_id.is_some() || published_conversation_id.is_some() {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let updated = sqlx::query(
+            "UPDATE product_creation_jobs
+             SET status = 'cancelling', claim_generation = claim_generation + 1,
+                 claim_worker_id = NULL, claim_token = NULL, claim_lease_until_unix_micros = NULL,
+                 retry_at_unix_micros = NULL,
+                 cleanup_worker_id = NULL, cleanup_token = NULL, cleanup_lease_until_unix_micros = NULL,
+                 last_error = NULL, cancelled_at_unix_micros = NULL,
+                 deletion_requested_at_unix_micros = NULL, updated_at_unix_micros = ?2
+             WHERE request_id = ?1 AND claim_generation = ?3
+               AND status IN ('accepted', 'claimed', 'retry_scheduled')
+               AND published_product_id IS NULL AND published_conversation_id IS NULL",
+        )
+        .bind(request_id)
+        .bind(now_micros)
+        .bind(generation)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        sqlx::query(
+            "UPDATE product_creation_resource_reservations
+             SET generation = ?3, status = 'cleanup_required', updated_at_unix_micros = ?2
+             WHERE request_id = ?1 AND status IN ('reserved', 'present')",
+        )
+        .bind(request_id)
+        .bind(now_micros)
+        .bind(generation + 1)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn request_product_creation_deletion(
+        &self,
+        request_id: &str,
+        now: DateTime<Utc>,
+    ) -> DbResult<bool> {
+        let now_micros = datetime_to_unix_micros(now);
+        let mut tx = self.pool.begin().await?;
+        let job: Option<i64> = sqlx::query_scalar(
+            "SELECT claim_generation FROM product_creation_jobs
+             WHERE request_id = ?1
+               AND status IN ('accepted', 'claimed', 'retry_scheduled', 'cancelling', 'cancelled', 'failed', 'cleanup_ambiguous')
+               AND published_product_id IS NULL AND published_conversation_id IS NULL",
+        )
+        .bind(request_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(generation) = job else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        let updated = sqlx::query(
+            "UPDATE product_creation_jobs
+             SET status = 'deletion_pending', claim_generation = claim_generation + 1,
+                 claim_worker_id = NULL, claim_token = NULL, claim_lease_until_unix_micros = NULL,
+                 retry_at_unix_micros = NULL,
+                 cleanup_worker_id = NULL, cleanup_token = NULL, cleanup_lease_until_unix_micros = NULL,
+                 last_error = NULL, cancelled_at_unix_micros = NULL,
+                 deletion_requested_at_unix_micros = ?2, updated_at_unix_micros = ?2
+             WHERE request_id = ?1 AND claim_generation = ?3
+               AND status IN ('accepted', 'claimed', 'retry_scheduled', 'cancelling', 'cancelled', 'failed', 'cleanup_ambiguous')
+               AND published_product_id IS NULL AND published_conversation_id IS NULL",
+        )
+        .bind(request_id)
+        .bind(now_micros)
+        .bind(generation)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        sqlx::query(
+            "UPDATE product_creation_resource_reservations
+             SET generation = ?3, status = 'cleanup_required', updated_at_unix_micros = ?2
+             WHERE request_id = ?1 AND status IN ('reserved', 'present')",
+        )
+        .bind(request_id)
+        .bind(now_micros)
+        .bind(generation + 1)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn claim_next_product_creation_cleanup(
+        &self,
+        worker_id: &str,
+        token: &str,
+        now: DateTime<Utc>,
+        lease_duration: chrono::Duration,
+    ) -> DbResult<Option<ProductCreationCleanupJob>> {
+        let now_micros = datetime_to_unix_micros(now);
+        let lease_until = now + lease_duration;
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT request_id, product_conversation_id, cwd, objective, model, effort, llm_language, status,
+                    accepted_at_unix_micros, updated_at_unix_micros, attempt_count,
+                    claim_generation, claim_worker_id, claim_token, claim_lease_until_unix_micros,
+                    retry_at_unix_micros, cleanup_worker_id, cleanup_token, cleanup_lease_until_unix_micros,
+                    delivery_attempt_count, delivery_retry_at_unix_micros,
+                    pin_exact_checkout_oid, pin_logical_base, pin_freshness,
+                    staging_path, staging_repo_root, staging_exact_oid,
+                    published_product_id, published_conversation_id, last_error,
+                    cancelled_at_unix_micros, deletion_requested_at_unix_micros,
+                    COALESCE((SELECT json_group_array(json_object('media_type', i.media_type, 'data', i.data))
+                              FROM product_creation_job_images i WHERE i.request_id = j.request_id
+                              ORDER BY i.ordinal), '[]') AS images_json
+             FROM product_creation_jobs j
+             WHERE updated_at_unix_micros <= ?1
+               AND (cleanup_lease_until_unix_micros IS NULL OR cleanup_lease_until_unix_micros <= ?1)
+               AND status IN ('cancelling', 'deletion_pending')
+             ORDER BY updated_at_unix_micros, request_id
+             LIMIT 1",
+        )
+        .bind(now_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let request_id: String = row.try_get("request_id")?;
+        let generation: i64 = row.try_get("claim_generation")?;
+        let claimed = sqlx::query(
+            "UPDATE product_creation_jobs
+             SET cleanup_worker_id = ?1, cleanup_token = ?2,
+                 cleanup_lease_until_unix_micros = ?3
+             WHERE request_id = ?4 AND claim_generation = ?5
+               AND (cleanup_lease_until_unix_micros IS NULL OR cleanup_lease_until_unix_micros <= ?6)",
+        )
+        .bind(worker_id)
+        .bind(token)
+        .bind(datetime_to_unix_micros(lease_until))
+        .bind(&request_id)
+        .bind(generation)
+        .bind(now_micros)
+        .execute(&mut *tx)
+        .await?;
+        if claimed.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        tx.commit().await?;
+        let mut job = self
+            .get_product_creation_job(&request_id)
+            .await?
+            .ok_or_else(|| {
+                DbError::Serialization("claimed product cleanup job missing".to_string())
+            })?;
+        job.claim_generation = generation;
+        let reservations = self
+            .get_product_creation_resource_reservations(&request_id)
+            .await?;
+        Ok(Some(ProductCreationCleanupJob {
+            job,
+            claim: ProductCreationCleanupClaim {
+                worker_id: worker_id.to_string(),
+                token: token.to_string(),
+                generation,
+                lease_until,
+            },
+            reservations,
+        }))
+    }
+
+    pub async fn schedule_product_creation_cleanup_retry(
+        &self,
+        cleanup: &ProductCreationCleanupJob,
+        next_attempt_at: DateTime<Utc>,
+    ) -> DbResult<bool> {
+        let result = sqlx::query(
+            "UPDATE product_creation_jobs
+             SET updated_at_unix_micros = ?1,
+                 cleanup_worker_id = NULL, cleanup_token = NULL, cleanup_lease_until_unix_micros = NULL
+             WHERE request_id = ?2 AND claim_generation = ?3
+               AND status IN ('cancelling', 'deletion_pending')
+               AND cleanup_worker_id = ?4 AND cleanup_token = ?5",
+        )
+        .bind(datetime_to_unix_micros(next_attempt_at))
+        .bind(&cleanup.job.request_id)
+        .bind(cleanup.claim.generation)
+        .bind(&cleanup.claim.worker_id)
+        .bind(&cleanup.claim.token)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn release_product_creation_resource(
+        &self,
+        cleanup: &ProductCreationCleanupJob,
+        reservation_id: &str,
+        now: DateTime<Utc>,
+    ) -> DbResult<bool> {
+        let result = sqlx::query(
+            "UPDATE product_creation_resource_reservations
+             SET status = 'released', updated_at_unix_micros = ?1
+             WHERE id = ?2 AND request_id = ?3 AND generation = ?4
+               AND status = 'cleanup_required'
+               AND EXISTS (
+                   SELECT 1 FROM product_creation_jobs j
+                   WHERE j.request_id = ?3 AND j.claim_generation = ?4
+                     AND j.cleanup_worker_id = ?5 AND j.cleanup_token = ?6
+                     AND j.cleanup_lease_until_unix_micros > ?1
+               )",
+        )
+        .bind(datetime_to_unix_micros(now))
+        .bind(reservation_id)
+        .bind(&cleanup.job.request_id)
+        .bind(cleanup.claim.generation)
+        .bind(&cleanup.claim.worker_id)
+        .bind(&cleanup.claim.token)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn finish_product_creation_cleanup(
+        &self,
+        cleanup: &ProductCreationCleanupJob,
+        now: DateTime<Utc>,
+    ) -> DbResult<bool> {
+        let now_micros = datetime_to_unix_micros(now);
+        let mut tx = self.pool.begin().await?;
+        let authoritative: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM product_creation_jobs
+             WHERE request_id = ?1 AND status = ?2 AND claim_generation = ?3
+               AND cleanup_worker_id = ?4 AND cleanup_token = ?5
+               AND cleanup_lease_until_unix_micros > ?6",
+        )
+        .bind(&cleanup.job.request_id)
+        .bind(&cleanup.job.status)
+        .bind(cleanup.claim.generation)
+        .bind(&cleanup.claim.worker_id)
+        .bind(&cleanup.claim.token)
+        .bind(now_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if authoritative.is_none() {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM product_creation_resource_reservations
+             WHERE request_id = ?1 AND status != 'released'",
+        )
+        .bind(&cleanup.job.request_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if remaining != 0 {
+            tx.rollback().await?;
+            return Err(DbError::Serialization(
+                "product creation cleanup still has unreconciled resources".to_string(),
+            ));
+        }
+        match cleanup.job.status.as_str() {
+            "cancelling" => {
+                let updated = sqlx::query(
+                    "UPDATE product_creation_jobs
+                     SET status = 'cancelled', cancelled_at_unix_micros = ?1,
+                         updated_at_unix_micros = ?1,
+                         cleanup_worker_id = NULL, cleanup_token = NULL,
+                         cleanup_lease_until_unix_micros = NULL
+                     WHERE request_id = ?2 AND status = 'cancelling' AND claim_generation = ?3
+                       AND cleanup_worker_id = ?4 AND cleanup_token = ?5
+                       AND cleanup_lease_until_unix_micros > ?1",
+                )
+                .bind(now_micros)
+                .bind(&cleanup.job.request_id)
+                .bind(cleanup.claim.generation)
+                .bind(&cleanup.claim.worker_id)
+                .bind(&cleanup.claim.token)
+                .execute(&mut *tx)
+                .await?;
+                if updated.rows_affected() != 1 {
+                    tx.rollback().await?;
+                    return Ok(false);
+                }
+            }
+            "deletion_pending" => {
+                let deleted = sqlx::query(
+                    "DELETE FROM product_creation_jobs
+                     WHERE request_id = ?1 AND status = 'deletion_pending' AND claim_generation = ?2
+                       AND cleanup_worker_id = ?3 AND cleanup_token = ?4
+                       AND cleanup_lease_until_unix_micros > ?5",
+                )
+                .bind(&cleanup.job.request_id)
+                .bind(cleanup.claim.generation)
+                .bind(&cleanup.claim.worker_id)
+                .bind(&cleanup.claim.token)
+                .bind(now_micros)
+                .execute(&mut *tx)
+                .await?;
+                if deleted.rows_affected() != 1 {
+                    tx.rollback().await?;
+                    return Ok(false);
+                }
+            }
+            other => {
+                tx.rollback().await?;
+                return Err(DbError::Serialization(format!(
+                    "unexpected product creation cleanup status: {other}"
+                )));
+            }
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
     pub async fn next_product_creation_deadline(&self) -> DbResult<Option<DateTime<Utc>>> {
         let deadline: Option<i64> = sqlx::query_scalar(
             "SELECT MIN(deadline) FROM (
                  SELECT retry_at_unix_micros AS deadline FROM product_creation_jobs WHERE status = 'retry_scheduled'
                  UNION ALL SELECT claim_lease_until_unix_micros FROM product_creation_jobs WHERE status = 'claimed'
                  UNION ALL SELECT delivery_retry_at_unix_micros FROM product_creation_jobs WHERE status = 'delivery_pending'
+                 UNION ALL
+                 SELECT CASE
+                            WHEN cleanup_lease_until_unix_micros IS NOT NULL
+                            THEN cleanup_lease_until_unix_micros
+                            ELSE updated_at_unix_micros
+                        END AS deadline
+                 FROM product_creation_jobs
+                 WHERE status IN ('cancelling', 'deletion_pending')
              )",
         )
         .fetch_one(&self.pool)
@@ -1021,7 +1511,8 @@ impl Database {
              JOIN git_repository_locator_observations locator
                ON locator.repository_id = attachment.repository_id
               AND locator.locator_kind = 'management_root' AND locator.status = 'present'
-             WHERE job.status IN ('delivery_pending', 'published')
+                       WHERE job.status IN ('delivery_pending', 'published')
+
              GROUP BY locator.path
              ORDER BY COUNT(DISTINCT conversation.id) DESC,
                       MAX(job.updated_at_unix_micros) DESC,
@@ -1531,6 +2022,153 @@ mod product_creation_tests {
         assert!(exhausted.delivery_retry_at.is_none());
         assert!(!db
             .schedule_product_creation_delivery_retry("req-delivery", now)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn product_creation_cancellation_revokes_claim_and_finishes_cancelled() {
+        let db = Database::open_in_memory().await.unwrap();
+        let now = Utc::now();
+        db.accept_product_creation("req-cancel", &intent("/repo/a", "cancel"))
+            .await
+            .unwrap();
+        let claimed = db
+            .claim_product_creation(
+                "req-cancel",
+                "worker",
+                "token",
+                now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(db
+            .cancel_product_creation("req-cancel", now + chrono::Duration::seconds(1))
+            .await
+            .unwrap());
+        let cancelling = db
+            .get_product_creation_job("req-cancel")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelling.status, "cancelling");
+        assert_eq!(cancelling.claim_generation, claimed.claim.generation + 1);
+        assert!(cancelling.claim_token.is_none());
+
+        let cleanup = db
+            .claim_next_product_creation_cleanup(
+                "cleanup-worker",
+                "cleanup-token",
+                now + chrono::Duration::seconds(1),
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(db
+            .finish_product_creation_cleanup(&cleanup, now + chrono::Duration::seconds(2))
+            .await
+            .unwrap());
+        let cancelled = db
+            .get_product_creation_job("req-cancel")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled.status, "cancelled");
+        assert!(cancelled.cancelled_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn product_creation_deletion_tombstone_is_physically_removed_after_cleanup() {
+        let db = Database::open_in_memory().await.unwrap();
+        let now = Utc::now();
+        db.accept_product_creation("req-delete", &intent("/repo/a", "delete"))
+            .await
+            .unwrap();
+
+        assert!(db
+            .request_product_creation_deletion("req-delete", now)
+            .await
+            .unwrap());
+        let tombstone = db
+            .get_product_creation_job("req-delete")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(tombstone.status, "deletion_pending");
+        assert!(tombstone.deletion_requested_at.is_some());
+
+        let cleanup = db
+            .claim_next_product_creation_cleanup(
+                "cleanup-worker",
+                "cleanup-token",
+                now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(db
+            .finish_product_creation_cleanup(&cleanup, now + chrono::Duration::seconds(1))
+            .await
+            .unwrap());
+        assert!(db
+            .get_product_creation_job("req-delete")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn published_product_creation_rejects_cancel_and_pending_delete() {
+        let db = Database::open_in_memory().await.unwrap();
+        let now = Utc::now();
+        db.accept_product_creation("req-published-lifecycle", &intent("/repo/a", "published"))
+            .await
+            .unwrap();
+        let claimed = db
+            .claim_product_creation(
+                "req-published-lifecycle",
+                "worker",
+                "token",
+                now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.publish_product_creation_atomically(&ProductCreationPublishInput {
+            request_id: "req-published-lifecycle".to_string(),
+            claim: claimed.claim,
+            conversation: published_conversation(
+                "conv-published-lifecycle",
+                claimed.job.product_conversation_id.clone(),
+                WorkScopeId::new(),
+                "/repo/a",
+            ),
+            authority_kind: AuthorityKind::Work,
+            environment: EnvironmentContext::UnownedCwd {
+                cwd: "/repo/a".to_string(),
+            },
+            repository_attachment: Some(ProductCreationRepositoryAttachment {
+                repository_id: None,
+                repository_root: "/repo/a".to_string(),
+                git_common_dir: "/repo/a/.git".to_string(),
+                exact_checkout_oid: "abc123".to_string(),
+            }),
+        })
+        .await
+        .unwrap();
+
+        assert!(!db
+            .cancel_product_creation("req-published-lifecycle", now)
+            .await
+            .unwrap());
+        assert!(!db
+            .request_product_creation_deletion("req-published-lifecycle", now)
             .await
             .unwrap());
     }
