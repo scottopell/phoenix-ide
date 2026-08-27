@@ -335,23 +335,40 @@ pub(crate) async fn confirm_close_loss_retirement(
         .get_close_obligation(attempt_id.as_str())
         .await
         .map_err(|error| AppError::NotFound(error.to_string()))?;
-    let topology = state
+    let aggregate = state
         .db
-        .close_foundation_topology(attempt.product_conversation_id())
+        .get_ordinary_product_conversation(attempt.product_conversation_id())
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?;
-    if !topology
-        .member_ids()
-        .into_iter()
-        .any(|candidate| candidate == id)
-    {
-        return Err(AppError::NotFound(
-            "Close attempt does not own this conversation".to_string(),
-        ));
+    let active_transcript = aggregate
+        .segments
+        .last()
+        .map(|segment| segment.transcript_row.conversation.id.as_str());
+    if active_transcript != Some(id.as_str()) {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Close confirmation is accepted only from the active aggregate transcript",
+            "inactive_close_transcript",
+        ))));
+    }
+    let fresh_snapshot = state
+        .runtime
+        .inspect_close_retirement(attempt_id.clone())
+        .await
+        .map_err(|error| {
+            AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                error,
+                "close_inspection_failed",
+            )))
+        })?;
+    if fresh_snapshot != snapshot {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Close confirmation does not match fresh server inspection",
+            "stale_close_inspection",
+        ))));
     }
     state
         .db
-        .confirm_close_loss_retirement(&attempt_id, &snapshot)
+        .confirm_close_loss_retirement(&attempt_id, &fresh_snapshot)
         .await
         .map_err(|error| {
             AppError::Conflict(Box::new(ConflictErrorResponse::new(
