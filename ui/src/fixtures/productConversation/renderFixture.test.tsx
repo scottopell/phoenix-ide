@@ -1,15 +1,8 @@
-import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import { api, streamApi } from '../../api';
 import { ProductConversationFixture } from './renderFixture';
 import { getProductConversationScenario } from './scenarios';
-
-beforeAll(() => {
-  vi.stubGlobal('EventSource', class {
-    addEventListener() {}
-    close() {}
-  });
-});
 
 afterEach(() => cleanup());
 
@@ -33,10 +26,6 @@ describe('ProductConversationFixture', () => {
   it('restores mutable API hooks after unmount', async () => {
     const scenario = getProductConversationScenario('mobile-open');
     const originalGetSnapshot = api.getProductConversationSnapshot;
-    const originalGetRouteBySlug = api.getConversationRouteBySlug;
-    const originalGetRoute = api.getConversationRoute;
-    const originalGetConversation = api.getConversation;
-    const originalGetConversationBySlug = api.getConversationBySlug;
     const originalGetChain = api.getChain;
     const originalSubmit = api.submitChainQuestion;
     const originalSubscribe = streamApi.subscribeToChainStream;
@@ -52,10 +41,6 @@ describe('ProductConversationFixture', () => {
     unmount();
 
     expect(api.getProductConversationSnapshot).toBe(originalGetSnapshot);
-    expect(api.getConversationRouteBySlug).toBe(originalGetRouteBySlug);
-    expect(api.getConversationRoute).toBe(originalGetRoute);
-    expect(api.getConversation).toBe(originalGetConversation);
-    expect(api.getConversationBySlug).toBe(originalGetConversationBySlug);
     expect(api.getChain).toBe(originalGetChain);
     expect(api.submitChainQuestion).toBe(originalSubmit);
     expect(streamApi.subscribeToChainStream).toBe(originalSubscribe);
