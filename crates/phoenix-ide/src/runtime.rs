@@ -468,6 +468,7 @@ pub struct RuntimeManager {
     message_retriever: Arc<dyn crate::db::MessageRetriever>,
     platform: PlatformCapability,
     browser_sessions: Arc<BrowserSessionManager>,
+    runtime_home: PathBuf,
     /// Per-process bash handle registry. Shared by every conversation's
     /// `ToolContext`; each `ResourceScopeKey` gets its own `WorkScopeHandles`
     /// table inside, so a continuation chain on one worktree shares one
@@ -2116,6 +2117,7 @@ impl RuntimeManager {
                 Some(browser_lifecycle_tx),
                 runtime_env,
             ),
+            runtime_home: runtime_env.home().to_path_buf(),
             bash_handles: Arc::new(BashHandleRegistry::with_lifecycle_sink(Some(
                 bash_lifecycle_tx,
             ))),
@@ -2183,6 +2185,11 @@ impl RuntimeManager {
             fatal_local_authority_fence,
             wake_registrar: Some(wake_registrar),
         }
+    }
+
+    #[must_use]
+    pub fn runtime_home(&self) -> &std::path::Path {
+        &self.runtime_home
     }
 
     /// Get the detected platform capability

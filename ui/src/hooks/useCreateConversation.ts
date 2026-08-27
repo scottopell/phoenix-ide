@@ -225,15 +225,6 @@ export function useCreateConversation(navigate: (path: string) => void) {
 
     try {
       const trimmedCwd = cwd.trim();
-      if (dirStatus === 'will-create') {
-        const mkdirResult = await api.mkdir(trimmedCwd);
-        if (!mkdirResult.created) {
-          setError(mkdirResult.error || 'Failed to create directory');
-          setCreating(false);
-          return;
-        }
-      }
-
       try { localStorage.setItem(REPLAY_CREATE_REQUEST_KEY, requestId); } catch { /* in-memory identity remains stable */ }
       if (files.length > 0) {
         setError('File attachments are not available for this conversation flow yet.');

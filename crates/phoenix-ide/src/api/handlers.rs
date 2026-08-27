@@ -34,14 +34,13 @@ use super::types::{
     CreateConversationRequest, CreateProductConversationRequest, CredentialStatusApi,
     DirectoryEntry, ErrorResponse, ExpansionErrorResponse, FileEntry, FileSearchEntry,
     FileSearchQuery, FileSearchResponse, FileViewerKind, ListDirectoryResponse, ListFilesResponse,
-    MkdirResponse, ModelsResponse, NotificationSettingsRequest,
-    ProductConversationCreateAcceptedResponse, ProductConversationRouteResponse,
-    ProjectFileSearchQuery, ProjectSkillsQuery, ProjectTasksQuery, ReadFileResponse,
-    RecentManagementRootSuggestion, RecentManagementRootSuggestionsResponse,
-    ReconcileAcceptedMessagesRequest, ReconcileAcceptedMessagesResponse, RenameRequest, SkillEntry,
-    SkillsResponse, SuccessResponse, SuggestRequest, SuggestResponse, SystemPromptResponse,
-    TaskCountQuery, TaskCountResponse, TaskEntry, TasksResponse, UpgradeModelRequest,
-    ValidateCwdResponse,
+    ModelsResponse, NotificationSettingsRequest, ProductConversationCreateAcceptedResponse,
+    ProductConversationRouteResponse, ProjectFileSearchQuery, ProjectSkillsQuery,
+    ProjectTasksQuery, ReadFileResponse, RecentManagementRootSuggestion,
+    RecentManagementRootSuggestionsResponse, ReconcileAcceptedMessagesRequest,
+    ReconcileAcceptedMessagesResponse, RenameRequest, SkillEntry, SkillsResponse, SuccessResponse,
+    SuggestRequest, SuggestResponse, SystemPromptResponse, TaskCountQuery, TaskCountResponse,
+    TaskEntry, TasksResponse, UpgradeModelRequest, ValidateCwdResponse,
 };
 use super::AppState;
 use crate::api::terminal_ws::{terminal_ws_global_handler, terminal_ws_handler};
@@ -159,7 +158,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/conversations/new", post(create_conversation))
         .route(
             "/api/product-conversations/new",
-            post(create_product_conversation),
+            post(create_product_conversation)
+                .layer(DefaultBodyLimit::max(MAX_MULTIPART_BODY_BYTES)),
         )
         .route(
             "/api/recent-management-root-suggestions",
@@ -337,7 +337,6 @@ pub fn create_router(state: AppState) -> Router {
         // Directory browser (REQ-API-008)
         .route("/api/validate-cwd", get(validate_cwd))
         .route("/api/list-directory", get(list_directory))
-        .route("/api/mkdir", post(mkdir))
         // File browser API (REQ-PF-001 through REQ-PF-004)
         .route("/api/files/list", get(list_files))
         .route("/api/files/read", get(read_file))
@@ -1924,10 +1923,13 @@ async fn create_product_conversation(
             req.model
         )));
     }
-    let canonical_cwd = crate::conversation_cwd::validate_conversation_cwd(&req.cwd)
-        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    let canonical_cwd = crate::conversation_cwd::normalize_product_creation_cwd_intent(
+        &req.cwd,
+        state.runtime_env.home(),
+    )
+    .map_err(|error| AppError::BadRequest(error.to_string()))?;
     let intent = crate::db::ProductCreationIntent {
-        cwd: canonical_cwd.raw().to_string(),
+        cwd: canonical_cwd,
         objective: req.objective,
         model: Some(req.model),
         effort: req.effort,
@@ -6585,95 +6587,6 @@ async fn list_directory(
     });
 
     Ok(Json(ListDirectoryResponse { entries: result }))
-}
-
-/// Whether `path` is a safe `POST /api/mkdir` target: confined to `$HOME` or
-/// `/tmp`.
-///
-/// A raw string prefix on a non-canonicalized path is bypassable two ways:
-/// `..` traversal (`/tmp/../etc/x` string-matches `/tmp/`, but `create_dir_all`
-/// resolves the `..` at the OS level and escapes) and sibling-prefix
-/// (`/home/userevil` string-matches `/home/user`). This rejects `..` components
-/// outright, then requires the nearest EXISTING ancestor — canonicalized so
-/// symlinks in the existing portion are resolved — to live under a canonical
-/// allowed root via component-wise `Path::starts_with`. With no `..` and a
-/// contained anchor, the not-yet-existing leaf components only extend downward,
-/// so the created directory stays confined.
-fn mkdir_target_is_confined(path: &FsPath, home: &FsPath) -> bool {
-    if path
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        return false;
-    }
-
-    let allowed_roots: Vec<PathBuf> = [home.to_path_buf(), PathBuf::from("/tmp")]
-        .into_iter()
-        .filter_map(|root| fs::canonicalize(root).ok())
-        .collect();
-
-    path.ancestors()
-        .find(|a| a.exists())
-        .and_then(|anchor| fs::canonicalize(anchor).ok())
-        .is_some_and(|anchor| allowed_roots.iter().any(|root| anchor.starts_with(root)))
-}
-
-/// Create a directory (with parents if needed)
-async fn mkdir(
-    State(state): State<AppState>,
-    Json(payload): Json<PathQuery>,
-) -> Json<MkdirResponse> {
-    // Normalize path: remove trailing slashes (except for root)
-    let path_str = payload.path.trim_end_matches('/');
-    let path_str = if path_str.is_empty() { "/" } else { path_str };
-    let path = PathBuf::from(path_str);
-
-    // Security: ensure path is absolute and under allowed roots
-    if !path.is_absolute() {
-        return Json(MkdirResponse {
-            created: false,
-            error: Some("Path must be absolute".to_string()),
-        });
-    }
-
-    // Confine creation to $HOME or /tmp (see [`mkdir_target_is_confined`]).
-    let home = state.runtime_env.home();
-    if !mkdir_target_is_confined(&path, home) {
-        let home = home.to_string_lossy();
-        return Json(MkdirResponse {
-            created: false,
-            error: Some(format!(
-                "Can only create directories under {} or /tmp",
-                if home.is_empty() { "$HOME" } else { &home }
-            )),
-        });
-    }
-
-    // Check if already exists
-    if path.exists() {
-        if path.is_dir() {
-            return Json(MkdirResponse {
-                created: true, // Already exists, that's fine
-                error: None,
-            });
-        }
-        return Json(MkdirResponse {
-            created: false,
-            error: Some("Path exists but is not a directory".to_string()),
-        });
-    }
-
-    // Create the directory (and parents)
-    match fs::create_dir_all(&path) {
-        Ok(()) => Json(MkdirResponse {
-            created: true,
-            error: None,
-        }),
-        Err(e) => Json(MkdirResponse {
-            created: false,
-            error: Some(format!("Failed to create directory: {e}")),
-        }),
-    }
 }
 
 // ============================================================
@@ -14598,115 +14511,13 @@ mod upgrade_model_state_guard_tests {
 }
 
 #[cfg(test)]
-mod mkdir_confinement_tests {
-    use super::mkdir_target_is_confined;
-    use std::fs;
-
+mod user_ref_tests {
     #[test]
-    fn admits_a_new_subdir_under_home() {
-        let home = tempfile::tempdir().unwrap();
-        let target = home.path().join("new").join("nested");
-        assert!(mkdir_target_is_confined(&target, home.path()));
-    }
-
-    #[test]
-    fn admits_a_new_subdir_under_tmp() {
-        // `/tmp` is the second hard-coded allowed root. Use an unrelated home so
-        // only the `/tmp` branch can admit it.
-        let home = tempfile::tempdir().unwrap();
-        let target =
-            std::path::Path::new("/tmp").join(format!("phoenix-mkdir-test-{}", std::process::id()));
-        assert!(mkdir_target_is_confined(&target, home.path()));
-        let _ = fs::remove_dir_all(&target);
-    }
-
-    #[test]
-    fn rejects_dotdot_traversal_out_of_tmp() {
-        // The bypass: `/tmp/../etc/...` string-starts-with `/tmp/` but escapes
-        // once the OS resolves `..`. The `..`-component rejection closes it.
-        let home = tempfile::tempdir().unwrap();
-        let target = std::path::Path::new("/tmp/../etc/phoenix-evil");
-        assert!(!mkdir_target_is_confined(target, home.path()));
-    }
-
-    #[test]
-    fn rejects_dotdot_traversal_out_of_home() {
-        let home = tempfile::tempdir().unwrap();
-        let target = home.path().join("..").join("escapee");
-        assert!(!mkdir_target_is_confined(&target, home.path()));
-    }
-
-    /// A unique base directory guaranteed NOT under `/tmp` — which is itself an
-    /// always-allowed `mkdir` root, so a fixture placed there would be admitted
-    /// by the `/tmp` branch regardless of the home check. Anchored under the
-    /// crate dir; the returned guard removes it on drop.
-    struct NonTmpBase(std::path::PathBuf);
-    impl NonTmpBase {
-        fn new(tag: &str) -> Self {
-            let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("target")
-                .join(format!("mkdir-confine-{}-{}", tag, std::process::id()));
-            let _ = fs::remove_dir_all(&base);
-            fs::create_dir_all(&base).unwrap();
-            Self(base)
-        }
-        fn path(&self) -> &std::path::Path {
-            &self.0
-        }
-    }
-    impl Drop for NonTmpBase {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
-    #[test]
-    fn rejects_sibling_prefix_of_home() {
-        // `<home>evil` shares a string prefix with `<home>` but is a different
-        // directory; component-wise `starts_with` must reject it.
-        let base = NonTmpBase::new("sibling");
-        let home = base.path().join("user");
-        fs::create_dir(&home).unwrap();
-        let sibling = base.path().join("userevil");
-        fs::create_dir(&sibling).unwrap();
-        assert!(!mkdir_target_is_confined(&sibling.join("x"), &home));
-    }
-
-    #[test]
-    fn rejects_path_entirely_outside_roots() {
-        let home = tempfile::tempdir().unwrap();
-        assert!(!mkdir_target_is_confined(
-            std::path::Path::new("/etc/phoenix-evil"),
-            home.path()
-        ));
-    }
-
-    #[test]
-    fn user_ref_rejects_flaglike_branch() {
-        // A `-`-prefixed ref could be misparsed as a git CLI option; reject it at
-        // the boundary. Legitimate branch names never begin with `-`.
+    fn rejects_flaglike_branch() {
         assert!(super::validate_user_ref("--upload-pack=touch /tmp/pwned").is_err());
         assert!(super::validate_user_ref("-x").is_err());
         assert!(super::validate_user_ref("feature/login").is_ok());
         assert!(super::validate_user_ref("main").is_ok());
-    }
-
-    #[test]
-    fn rejects_existing_ancestor_symlinked_outside_home() {
-        // An existing symlinked ancestor that escapes home must be rejected:
-        // canonicalizing the nearest existing ancestor resolves the symlink, and
-        // the resolved target is outside the allowed root. Anchored outside /tmp
-        // so the symlink target isn't rescued by the /tmp root.
-        let base = NonTmpBase::new("symlink");
-        let home = base.path().join("home");
-        fs::create_dir(&home).unwrap();
-        let outside = base.path().join("outside");
-        fs::create_dir(&outside).unwrap();
-        let link = home.join("escape");
-        std::os::unix::fs::symlink(&outside, &link).unwrap();
-        // `<home>/escape/sub` — nearest existing ancestor is the symlink, which
-        // resolves to `outside`, not under home.
-        assert!(!mkdir_target_is_confined(&link.join("sub"), &home));
     }
 }
 

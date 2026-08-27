@@ -8,10 +8,15 @@ As a developer starting a Phoenix conversation, I need Phoenix to accept one dur
 
 ### REQ-PROJ-000: Conversation Working Directory Root Floor
 
-WHEN a conversation is created or resumed with a working directory
+WHEN a conversation is resumed with a working directory or creation names an existing directory
 THE SYSTEM SHALL resolve symlinks and parent-directory traversal before accepting the path
 AND reject the working directory if it resolves to the filesystem root
 AND reject the working directory if the system cannot prove it is an existing directory
+
+WHEN ordinary ProductConversation creation names a missing directory beneath the server home directory or `/tmp`
+THE SYSTEM SHALL accept only an absolute path with no parent traversal whose nearest existing ancestor resolves beneath an allowed root
+AND SHALL persist the normalized directory intent without creating it during request validation or durable acceptance
+AND the claimed creation worker SHALL revalidate the allowed canonical ancestor and idempotently create and canonicalize each missing path segment after durable acceptance before repository detection or publication
 
 WHEN a sub-agent working directory is inherited from its parent or supplied as an override
 THE SYSTEM SHALL apply the same validation before the sub-agent conversation is persisted or run

@@ -16,7 +16,9 @@ use phoenix_core::domain::creation_protocol::{
 use phoenix_llm::ModelRegistry;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub(crate) struct PublishedProductCreation {
@@ -37,28 +39,21 @@ pub(crate) async fn process_product_creation_request(
         if job.status == "delivery_pending" {
             return deliver_product_creation_objective(manager, &job).await;
         }
-        if job.status == "delivery_failed"
-            && manager
-                .db()
-                .retry_failed_product_creation_delivery(request_id)
-                .await
-                .map_err(|error| error.to_string())?
-        {
-            let retry = manager
-                .db()
-                .get_product_creation_job(request_id)
-                .await
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| "delivery retry job disappeared".to_string())?;
-            return deliver_product_creation_objective(manager, &retry).await;
+        if job.status == "delivery_failed" {
+            return Err(
+                "product creation delivery previously failed and requires explicit retry"
+                    .to_string(),
+            );
         }
-        if let (Some(product_id), Some(conversation_id)) =
-            (job.published_product_id, job.published_conversation_id)
-        {
-            return Ok(PublishedProductCreation {
-                product_conversation_id: product_id.to_string(),
-                transcript_row_id: conversation_id,
-            });
+        if job.status == "published" {
+            if let (Some(product_id), Some(conversation_id)) =
+                (job.published_product_id, job.published_conversation_id)
+            {
+                return Ok(PublishedProductCreation {
+                    product_conversation_id: product_id.to_string(),
+                    transcript_row_id: conversation_id,
+                });
+            }
         }
     }
     let worker_id = format!("product-creation-worker-{}", uuid::Uuid::new_v4());
@@ -70,26 +65,24 @@ pub(crate) async fn process_product_creation_request(
             &worker_id,
             &token,
             chrono::Utc::now(),
-            chrono::Duration::minutes(5),
+            chrono::Duration::seconds(30),
         )
         .await
         .map_err(|e| e.to_string())?
     else {
         return Err("product creation is already being processed or awaiting retry".to_string());
     };
-    match process_claimed_product_creation(manager, &claimed).await {
+    match process_product_creation_until_closed(manager, claimed.clone()).await {
         Ok(published) => Ok(published),
         Err(error) => {
-            cleanup_unpublished_product_staging(manager, &claimed.job).await;
-            manager
-                .db()
-                .schedule_product_creation_retry(
-                    request_id,
-                    &claimed.claim,
-                    chrono::Utc::now() + chrono::Duration::seconds(5),
-                )
-                .await
-                .map_err(|db_error| format!("{error}; retry persistence failed: {db_error}"))?;
+            cleanup_and_retry_unpublished_product_creation(
+                manager,
+                request_id,
+                &claimed.claim,
+                &claimed.job,
+            )
+            .await
+            .map_err(|db_error| format!("{error}; retry persistence failed: {db_error}"))?;
             Err(error)
         }
     }
@@ -101,7 +94,17 @@ async fn process_claimed_product_creation(
     claimed: &crate::db::ClaimedProductCreationJob,
 ) -> Result<PublishedProductCreation, String> {
     let job = &claimed.job;
-    let cwd = job.intent.cwd.clone();
+    let cwd = tokio::task::spawn_blocking({
+        let cwd = job.intent.cwd.clone();
+        let home = manager.runtime_home().to_path_buf();
+        move || {
+            crate::conversation_cwd::ensure_product_creation_cwd(&cwd, &home)
+                .map(|valid| valid.into_raw())
+                .map_err(|error| error.to_string())
+        }
+    })
+    .await
+    .map_err(|error| format!("directory creation join failed: {error}"))??;
     let repo_root = tokio::task::spawn_blocking({
         let cwd = cwd.clone();
         move || discover_product_repository(Path::new(&cwd))
@@ -133,7 +136,13 @@ async fn process_claimed_product_creation(
             .map_err(|error| format!("starting-pin join failed: {error}"))??;
             match manager
                 .db()
-                .pin_product_creation_once(&job.request_id, &resolved.0, &resolved.1, "fresh")
+                .pin_product_creation_once(
+                    &job.request_id,
+                    &claimed.claim,
+                    &resolved.0,
+                    &resolved.1,
+                    "fresh",
+                )
                 .await
                 .map_err(|error| error.to_string())?
             {
@@ -271,9 +280,15 @@ async fn process_claimed_product_creation(
             conversation,
             authority_kind,
             environment,
-            repository_id: None,
-            exact_checkout_oid: staging_oid,
-            repository_root: staging_repo,
+            repository_attachment: staging_repo.zip(staging_oid).map(
+                |(repository_root, exact_checkout_oid)| {
+                    crate::db::ProductCreationRepositoryAttachment {
+                        repository_id: None,
+                        exact_checkout_oid,
+                        repository_root,
+                    }
+                },
+            ),
         })
         .await
         .map_err(|error| error.to_string())?;
@@ -372,6 +387,38 @@ async fn deliver_product_creation_objective(
     })
 }
 
+async fn cleanup_and_retry_unpublished_product_creation(
+    manager: &Arc<RuntimeManager>,
+    request_id: &str,
+    claim: &crate::db::ProductCreationClaim,
+    fallback_job: &crate::db::ProductCreationJobRecord,
+) -> Result<(), String> {
+    let current = manager
+        .db()
+        .get_product_creation_job(request_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "product creation job disappeared after worker failure".to_string())?;
+    if current.status != "claimed"
+        || current.published_product_id.is_some()
+        || current.published_conversation_id.is_some()
+    {
+        return Ok(());
+    }
+    let cleanup_job = if current.staging_path.is_some() {
+        &current
+    } else {
+        fallback_job
+    };
+    cleanup_unpublished_product_staging(manager, cleanup_job).await;
+    manager
+        .db()
+        .schedule_product_creation_retry(request_id, claim, chrono::Utc::now())
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 async fn cleanup_unpublished_product_staging(
     manager: &Arc<RuntimeManager>,
     job: &crate::db::ProductCreationJobRecord,
@@ -423,6 +470,81 @@ async fn cleanup_unpublished_product_staging(
     }
 }
 
+async fn process_product_creation_until_closed(
+    manager: &Arc<RuntimeManager>,
+    claimed: crate::db::ClaimedProductCreationJob,
+) -> Result<PublishedProductCreation, String> {
+    let request_id = claimed.job.request_id.clone();
+    let claim = claimed.claim.clone();
+    let mut fatal = manager.fatal_local_authority_receiver();
+    let mut processing = std::pin::pin!(process_claimed_product_creation(manager, &claimed));
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
+    heartbeat.tick().await;
+    loop {
+        tokio::select! {
+            result = &mut processing => return result,
+            _ = crate::tls::wait_for_fatal_local_authority(&mut fatal) => {
+                return Err("product creation stopped after fatal local authority closure".to_string());
+            }
+            _ = heartbeat.tick() => {
+                let _admitted = manager.acquire_local_authority_pass().map_err(|()| {
+                    "product creation claim renewal rejected after fatal local authority closure".to_string()
+                })?;
+                let renewed = manager.db().renew_product_creation_claim(
+                    &request_id,
+                    &claim,
+                    chrono::Utc::now(),
+                    chrono::Duration::seconds(30),
+                ).await.map_err(|error| error.to_string())?;
+                if !renewed {
+                    return Err("product creation claim was lost during heartbeat renewal".to_string());
+                }
+            }
+        }
+    }
+}
+
+fn run_git_with_timeout(
+    repo_root: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<String, String> {
+    let mut child = phoenix_core::git::command();
+    child
+        .current_dir(repo_root)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = child
+        .spawn()
+        .map_err(|error| format!("failed to spawn git {:?}: {error}", args))?;
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("failed waiting for git {:?}: {error}", args))?
+        {
+            let output = child
+                .wait_with_output()
+                .map_err(|error| format!("failed collecting git {:?}: {error}", args))?;
+            if status.success() {
+                return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+            }
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "git {:?} timed out after {} seconds",
+                args,
+                timeout.as_secs()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn discover_product_repository(cwd: &Path) -> Result<Option<String>, String> {
     match crate::git_ops::run_git(cwd, &["rev-parse", "--show-toplevel"]) {
         Ok(root) => Ok(Some(root)),
@@ -463,19 +585,12 @@ fn strict_product_creation_pin(repo_root: &Path) -> Result<(String, String), Str
     let _lock =
         RepositoryMutationLock::acquire(repo_root.to_string_lossy().as_ref()).map_err(|e| e.0)?;
     if crate::git_ops::run_git(repo_root, &["remote", "get-url", "origin"]).is_ok() {
-        let mut command = phoenix_core::git::command();
-        let output = command
-            .current_dir(repo_root)
-            .args(["ls-remote", "--symref", "origin", "HEAD"])
-            .output()
-            .map_err(|error| format!("could not discover origin default: {error}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "could not discover origin default: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = run_git_with_timeout(
+            repo_root,
+            &["ls-remote", "--symref", "origin", "HEAD"],
+            Duration::from_secs(30),
+        )
+        .map_err(|error| format!("could not discover origin default: {error}"))?;
         let branch = stdout
             .lines()
             .find_map(|line| line.strip_prefix("ref: refs/heads/"))
@@ -483,7 +598,7 @@ fn strict_product_creation_pin(repo_root: &Path) -> Result<(String, String), Str
             .ok_or_else(|| {
                 "origin did not advertise an authoritative default branch".to_string()
             })?;
-        crate::git_ops::run_git(
+        run_git_with_timeout(
             repo_root,
             &[
                 "fetch",
@@ -491,6 +606,7 @@ fn strict_product_creation_pin(repo_root: &Path) -> Result<(String, String), Str
                 "--no-tags",
                 &format!("+refs/heads/{branch}:refs/remotes/origin/{branch}"),
             ],
+            Duration::from_secs(30),
         )?;
         let oid = crate::git_ops::run_git(
             repo_root,
@@ -598,7 +714,7 @@ pub(crate) async fn drain_pending_jobs(manager: &Arc<RuntimeManager>) -> Result<
                 &worker_id.0,
                 &uuid::Uuid::new_v4().to_string(),
                 chrono::Utc::now(),
-                chrono::Duration::minutes(5),
+                chrono::Duration::seconds(30),
             )
             .await
             .map_err(|error| error.to_string())?
@@ -609,16 +725,13 @@ pub(crate) async fn drain_pending_jobs(manager: &Arc<RuntimeManager>) -> Result<
             .await
             .is_err()
         {
-            cleanup_unpublished_product_staging(manager, &claimed.job).await;
-            manager
-                .db()
-                .schedule_product_creation_retry(
-                    &claimed.job.request_id,
-                    &claimed.claim,
-                    chrono::Utc::now() + chrono::Duration::seconds(5),
-                )
-                .await
-                .map_err(|error| error.to_string())?;
+            cleanup_and_retry_unpublished_product_creation(
+                manager,
+                &claimed.job.request_id,
+                &claimed.claim,
+                &claimed.job,
+            )
+            .await?;
         }
     }
     loop {

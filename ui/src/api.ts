@@ -1982,15 +1982,6 @@ export const api = {
     return resp.json();
   },
 
-  async mkdir(path: string): Promise<{ created: boolean; error?: string }> {
-    const resp = await fetch('/api/mkdir', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path }),
-    });
-    return resp.json();
-  },
-
   async getWakeStatus(convId: string): Promise<WakeStatus> {
     const resp = await fetch(`/api/conversations/${convId}/wake`);
     if (!resp.ok) throw new Error(await resp.text());
