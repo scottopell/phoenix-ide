@@ -1284,7 +1284,9 @@ mod product_creation_tests {
             .unwrap();
         assert_eq!(
             job.claim_lease_until,
-            Some(now + chrono::Duration::seconds(35))
+            DateTime::<Utc>::from_timestamp_micros(
+                (now + chrono::Duration::seconds(35)).timestamp_micros()
+            )
         );
         assert!(!db
             .renew_product_creation_claim(
