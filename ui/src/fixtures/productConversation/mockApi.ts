@@ -7,6 +7,10 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   const originalGetConversationRoute = api.getConversationRoute;
   const originalGetConversation = api.getConversation;
   const originalGetConversationBySlug = api.getConversationBySlug;
+  const originalListConversations = api.listConversations;
+  const originalListArchivedConversations = api.listArchivedConversations;
+  const originalListModels = api.listModels;
+  const originalGetPrStatus = api.getPrStatus;
   const originalGetChain = api.getChain;
   const originalSubmitChainQuestion = api.submitChainQuestion;
   const originalSubscribeToChainStream = streamApi.subscribeToChainStream;
@@ -49,6 +53,10 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   };
   api.getConversation = async (id: string) => fixtureConversation(id);
   api.getConversationBySlug = async (slug: string) => fixtureConversation(slug);
+  api.listConversations = async () => [];
+  api.listArchivedConversations = async () => [];
+  api.listModels = async () => ({ models: [], default_model: null });
+  api.getPrStatus = async () => ({ configured: false, state: 'none' });
 
   api.getChain = async () => {
     if (!scenario.chain) {
@@ -76,6 +84,10 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     api.getConversationRoute = originalGetConversationRoute;
     api.getConversation = originalGetConversation;
     api.getConversationBySlug = originalGetConversationBySlug;
+    api.listConversations = originalListConversations;
+    api.listArchivedConversations = originalListArchivedConversations;
+    api.listModels = originalListModels;
+    api.getPrStatus = originalGetPrStatus;
     api.getChain = originalGetChain;
     api.submitChainQuestion = originalSubmitChainQuestion;
     streamApi.subscribeToChainStream = originalSubscribeToChainStream;
