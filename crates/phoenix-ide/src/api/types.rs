@@ -243,6 +243,7 @@ pub enum OrdinaryProductConversationLifecycleView {
 pub struct ProductConversationCloseView {
     pub attempt_id: String,
     pub phase: ProductConversationClosePhaseView,
+    pub confirmation_snapshot: Option<ProductConversationCloseInspectionView>,
     pub inspections: Vec<ProductConversationCloseInspectionView>,
     pub losses: Vec<ProductConversationCloseLossView>,
 }

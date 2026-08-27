@@ -525,6 +525,11 @@ impl<'de> Deserialize<'de> for GitOidIdentity {
 }
 
 impl GitOidIdentity {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
     /// Parses a SHA-1 or SHA-256 Git object identifier and normalizes it to lowercase.
     ///
     /// # Errors

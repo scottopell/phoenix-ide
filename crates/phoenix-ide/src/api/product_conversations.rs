@@ -568,6 +568,13 @@ async fn close_view(
     Ok(ProductConversationCloseView {
         attempt_id: obligation.attempt_id().to_string(),
         phase,
+        confirmation_snapshot: obligation.snapshot().map(|snapshot| {
+            ProductConversationCloseInspectionView {
+                scope: "aggregate".to_string(),
+                generation: snapshot.generation().to_string(),
+                fingerprint: snapshot.fingerprint().to_string(),
+            }
+        }),
         inspections: db
             .list_close_retirement_inspections(obligation.attempt_id().as_str())
             .await
@@ -587,8 +594,19 @@ async fn close_view(
             .map(|loss| ProductConversationCloseLossView {
                 scope: loss.scope.as_str().to_string(),
                 generation: loss.snapshot.generation().to_string(),
-                category: format!("{:?}", loss.item),
-                identity: format!("{:?}", loss.item),
+                category: loss.item.category().as_str().to_string(),
+                identity: match loss.item.identity() {
+                    phoenix_core::domain::close::LossItemIdentity::GitPath(path) => path.encode(),
+                    phoenix_core::domain::close::LossItemIdentity::GitOid(oid) => {
+                        oid.as_str().to_string()
+                    }
+                    phoenix_core::domain::close::LossItemIdentity::Opaque(identity) => {
+                        identity.as_str().to_string()
+                    }
+                    phoenix_core::domain::close::LossItemIdentity::Worktree(identity) => {
+                        format!("{:?}", identity)
+                    }
+                },
             })
             .collect(),
     })
