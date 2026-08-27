@@ -1928,11 +1928,18 @@ async fn create_product_conversation(
         state.runtime_env.home(),
     )
     .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    let selected_llm_language = state
+        .runtime
+        .db()
+        .get_default_llm_language()
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
     let intent = crate::db::ProductCreationIntent {
         cwd: canonical_cwd,
         objective: req.objective,
         model: Some(req.model),
         effort: req.effort,
+        llm_language: selected_llm_language,
         images: req
             .images
             .into_iter()

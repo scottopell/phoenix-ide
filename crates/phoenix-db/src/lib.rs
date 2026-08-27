@@ -14172,6 +14172,117 @@ mod tests {
             .is_some());
     }
 
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn creation_retry_and_failure_retain_last_error() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_test_creation_job(&db, "job-last-error", "conv-last-error").await;
+        let now = Utc::now();
+        let first = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-a".into()),
+                &CreationClaimToken("token-a".into()),
+                now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(first_job) = first else {
+            panic!("expected first claim");
+        };
+        let CreationStatus::Claimed(first_claim) = first_job.protocol.status else {
+            panic!("expected claim authority");
+        };
+        assert_eq!(
+            db.schedule_conversation_creation_retry(
+                "job-last-error",
+                &first_claim,
+                "terminal provisioning failed: first attempt",
+                now,
+                now + chrono::Duration::seconds(2),
+            )
+            .await
+            .unwrap(),
+            CreationCasOutcome::Applied
+        );
+        let retried = db
+            .get_conversation_creation_job("job-last-error")
+            .await
+            .unwrap();
+        assert_eq!(
+            retried.error.as_deref(),
+            Some("terminal provisioning failed: first attempt")
+        );
+        match retried.protocol.status {
+            CreationStatus::RetryScheduled { last_error, .. } => {
+                assert_eq!(
+                    last_error.message,
+                    "terminal provisioning failed: first attempt"
+                );
+            }
+            other @ (CreationStatus::Accepted
+            | CreationStatus::Claimed(_)
+            | CreationStatus::Cancelling
+            | CreationStatus::Cancelled
+            | CreationStatus::DeletionPending
+            | CreationStatus::Ready
+            | CreationStatus::Failed(_)) => {
+                panic!("expected retry scheduled, got {other:?}")
+            }
+        }
+
+        let second = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-b".into()),
+                &CreationClaimToken("token-b".into()),
+                now + chrono::Duration::seconds(2),
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(second_job) = second else {
+            panic!("expected second claim");
+        };
+        let CreationStatus::Claimed(second_claim) = second_job.protocol.status else {
+            panic!("expected second claim authority");
+        };
+        assert_eq!(
+            db.fail_conversation_creation_job(
+                "job-last-error",
+                &second_claim,
+                "terminal provisioning failed: final attempt",
+                &ErrorKind::ServerError,
+                now + chrono::Duration::seconds(3),
+            )
+            .await
+            .unwrap(),
+            CreationCasOutcome::Applied
+        );
+        let failed = db
+            .get_conversation_creation_job("job-last-error")
+            .await
+            .unwrap();
+        assert_eq!(
+            failed.error.as_deref(),
+            Some("terminal provisioning failed: final attempt")
+        );
+        match failed.protocol.status {
+            CreationStatus::Failed(last_error) => {
+                assert_eq!(
+                    last_error.message,
+                    "terminal provisioning failed: final attempt"
+                );
+            }
+            other @ (CreationStatus::Accepted
+            | CreationStatus::Claimed(_)
+            | CreationStatus::RetryScheduled { .. }
+            | CreationStatus::Cancelling
+            | CreationStatus::Cancelled
+            | CreationStatus::DeletionPending
+            | CreationStatus::Ready) => panic!("expected failed status, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn creation_retry_is_durable_and_due_without_a_kick() {
         let db = Database::open_in_memory().await.unwrap();

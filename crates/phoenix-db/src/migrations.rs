@@ -2107,6 +2107,7 @@ CREATE TABLE product_creation_jobs (
     objective TEXT NOT NULL CHECK (typeof(objective) = 'text'),
     model TEXT CHECK (model IS NULL OR (typeof(model) = 'text' AND trim(model) <> '')),
     effort TEXT CHECK (effort IS NULL OR (typeof(effort) = 'text' AND trim(effort) <> '')),
+    llm_language TEXT NOT NULL CHECK (llm_language IN ('phoenix-native', 'caveman')),
     status TEXT NOT NULL CHECK (status IN ('accepted', 'claimed', 'retry_scheduled', 'delivery_pending', 'delivery_failed', 'published', 'failed', 'cleanup_ambiguous')),
     accepted_at_unix_micros INTEGER NOT NULL CHECK (typeof(accepted_at_unix_micros) = 'integer' AND accepted_at_unix_micros >= 0),
     updated_at_unix_micros INTEGER NOT NULL CHECK (typeof(updated_at_unix_micros) = 'integer' AND updated_at_unix_micros >= 0),
@@ -2126,6 +2127,7 @@ CREATE TABLE product_creation_jobs (
     staging_exact_oid TEXT CHECK (staging_exact_oid IS NULL OR (typeof(staging_exact_oid) = 'text' AND trim(staging_exact_oid) <> '')),
     published_product_id TEXT UNIQUE REFERENCES product_conversations(id) ON DELETE CASCADE,
     published_conversation_id TEXT UNIQUE REFERENCES conversations(id) ON DELETE CASCADE,
+    last_error TEXT CHECK (last_error IS NULL OR typeof(last_error) = 'text'),
     CHECK ((status = 'accepted' AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until_unix_micros IS NULL AND retry_at_unix_micros IS NULL AND published_product_id IS NULL AND published_conversation_id IS NULL)
         OR (status = 'claimed' AND claim_worker_id IS NOT NULL AND claim_token IS NOT NULL AND claim_lease_until_unix_micros IS NOT NULL AND retry_at_unix_micros IS NULL AND published_product_id IS NULL AND published_conversation_id IS NULL)
         OR (status = 'retry_scheduled' AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until_unix_micros IS NULL AND retry_at_unix_micros IS NOT NULL AND published_product_id IS NULL AND published_conversation_id IS NULL)

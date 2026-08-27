@@ -89,6 +89,7 @@ pub(crate) async fn process_product_creation_request(
                 request_id,
                 &claimed.claim,
                 &claimed.job,
+                &error,
             )
             .await
             .map_err(|db_error| format!("{error}; retry persistence failed: {db_error}"))?;
@@ -279,7 +280,7 @@ async fn process_claimed_product_creation(
         seed_label: None,
         continued_in_conv_id: None,
         chain_name: None,
-        llm_language: phoenix_core::llm_language::LlmLanguage::default(),
+        llm_language: job.intent.llm_language,
         spawned_from_conversation_id: None,
     };
     let published = manager
@@ -406,6 +407,7 @@ async fn cleanup_and_retry_unpublished_product_creation(
     request_id: &str,
     claim: &crate::db::ProductCreationClaim,
     fallback_job: &crate::db::ProductCreationJobRecord,
+    provisioning_error: &str,
 ) -> Result<(), String> {
     let current = manager
         .db()
@@ -444,7 +446,7 @@ async fn cleanup_and_retry_unpublished_product_creation(
     }
     manager
         .db()
-        .schedule_product_creation_retry(request_id, claim, chrono::Utc::now())
+        .schedule_product_creation_retry(request_id, claim, provisioning_error, chrono::Utc::now())
         .await
         .map_err(|error| error.to_string())?;
     Ok(())
@@ -796,15 +798,13 @@ pub(crate) async fn drain_pending_jobs(manager: &Arc<RuntimeManager>) -> Result<
         else {
             break;
         };
-        if process_product_creation_until_closed(manager, claimed.clone())
-            .await
-            .is_err()
-        {
+        if let Err(error) = process_product_creation_until_closed(manager, claimed.clone()).await {
             cleanup_and_retry_unpublished_product_creation(
                 manager,
                 &claimed.job.request_id,
                 &claimed.claim,
                 &claimed.job,
+                &error,
             )
             .await?;
         }

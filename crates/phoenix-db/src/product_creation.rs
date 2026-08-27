@@ -2,6 +2,7 @@
 
 use super::*;
 use phoenix_core::domain::product_conversation::ProductConversationId;
+use phoenix_core::llm_language::LlmLanguage;
 
 const PRODUCT_CREATION_MAX_ATTEMPTS: i64 = 4;
 const PRODUCT_CREATION_RETRY_DELAYS_SECONDS: [i64; 3] = [2, 10, 30];
@@ -36,6 +37,7 @@ pub struct ProductCreationIntent {
     pub objective: String,
     pub model: Option<String>,
     pub effort: Option<ModelEffort>,
+    pub llm_language: LlmLanguage,
     pub images: Vec<ProductCreationImage>,
 }
 
@@ -63,6 +65,7 @@ pub struct ProductCreationJobRecord {
     pub staging_exact_oid: Option<String>,
     pub published_product_id: Option<ProductConversationId>,
     pub published_conversation_id: Option<String>,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,6 +156,7 @@ fn parse_product_creation_job_row(row: SqliteRow) -> Result<ProductCreationJobRe
                     ModelEffort::from_str(&value).map_err(|error| sqlx::Error::Decode(error.into()))
                 })
                 .transpose()?,
+            llm_language: LlmLanguage::parse_or_default(&row.try_get::<String, _>("llm_language")?),
             images,
         },
         status: row.try_get("status")?,
@@ -187,6 +191,7 @@ fn parse_product_creation_job_row(row: SqliteRow) -> Result<ProductCreationJobRe
             .transpose()
             .map_err(|error| sqlx::Error::Decode(Box::new(error)))?,
         published_conversation_id: row.try_get("published_conversation_id")?,
+        last_error: row.try_get("last_error")?,
     })
 }
 
@@ -216,14 +221,14 @@ impl Database {
         request_id: &str,
     ) -> DbResult<Option<ProductCreationJobRecord>> {
         sqlx::query(
-            "SELECT j.request_id, j.product_conversation_id, j.cwd, j.objective, j.model, j.effort, j.status,
+            "SELECT j.request_id, j.product_conversation_id, j.cwd, j.objective, j.model, j.effort, j.llm_language, j.status,
                     j.accepted_at_unix_micros, j.updated_at_unix_micros, j.attempt_count,
                     j.claim_generation, j.claim_worker_id, j.claim_token,
                     j.claim_lease_until_unix_micros, j.retry_at_unix_micros,
                     j.delivery_attempt_count, j.delivery_retry_at_unix_micros,
                     j.pin_exact_checkout_oid, j.pin_logical_base, j.pin_freshness,
                     j.staging_path, j.staging_repo_root, j.staging_exact_oid,
-                    j.published_product_id, j.published_conversation_id,
+                    j.published_product_id, j.published_conversation_id, j.last_error,
                     COALESCE((
                         SELECT json_group_array(json_object('media_type', i.media_type, 'data', i.data))
                         FROM product_creation_job_images i
@@ -250,14 +255,14 @@ impl Database {
         let now = unix_micros_now();
         let mut tx = self.pool.begin().await?;
         let existing = sqlx::query(
-            "SELECT request_id, product_conversation_id, cwd, objective, model, effort, status,
+            "SELECT request_id, product_conversation_id, cwd, objective, model, effort, llm_language, status,
                     accepted_at_unix_micros, updated_at_unix_micros, attempt_count,
                     claim_generation, claim_worker_id, claim_token,
                     claim_lease_until_unix_micros, retry_at_unix_micros,
                     delivery_attempt_count, delivery_retry_at_unix_micros,
                     pin_exact_checkout_oid, pin_logical_base, pin_freshness,
                     staging_path, staging_repo_root, staging_exact_oid,
-                    published_product_id, published_conversation_id,
+                    published_product_id, published_conversation_id, last_error,
                     COALESCE((
                         SELECT json_group_array(json_object('media_type', i.media_type, 'data', i.data))
                         FROM product_creation_job_images i
@@ -281,9 +286,9 @@ impl Database {
         }
         let inserted = sqlx::query(
             "INSERT OR IGNORE INTO product_creation_jobs (
-                request_id, product_conversation_id, cwd, objective, model, effort, status,
+                request_id, product_conversation_id, cwd, objective, model, effort, llm_language, status,
                 accepted_at_unix_micros, updated_at_unix_micros
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'accepted', ?7, ?7)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'accepted', ?8, ?8)",
         )
         .bind(request_id)
         .bind(accepted_product_conversation_id.as_str())
@@ -291,6 +296,7 @@ impl Database {
         .bind(&intent.objective)
         .bind(&intent.model)
         .bind(intent.effort.map(ModelEffort::as_wire_name))
+        .bind(intent.llm_language.as_str())
         .bind(now)
         .execute(&mut *tx)
         .await?;
@@ -543,6 +549,7 @@ impl Database {
         &self,
         request_id: &str,
         claim: &ProductCreationClaim,
+        error: &str,
         now: DateTime<Utc>,
     ) -> DbResult<bool> {
         let current_attempt_count: Option<i64> = sqlx::query_scalar(
@@ -566,14 +573,15 @@ impl Database {
                 "UPDATE product_creation_jobs
                  SET status = 'failed', claim_worker_id = NULL, claim_token = NULL,
                      claim_lease_until_unix_micros = NULL, retry_at_unix_micros = NULL,
-                     updated_at_unix_micros = ?4
+                     last_error = ?4, updated_at_unix_micros = ?5
                  WHERE request_id = ?1 AND status = 'claimed' AND claim_generation = ?2
-                   AND claim_worker_id = ?3 AND claim_token = ?5
-                   AND claim_lease_until_unix_micros > ?4",
+                   AND claim_worker_id = ?3 AND claim_token = ?6
+                   AND claim_lease_until_unix_micros > ?5",
             )
             .bind(request_id)
             .bind(claim.generation)
             .bind(&claim.worker_id)
+            .bind(error)
             .bind(datetime_to_unix_micros(now))
             .bind(&claim.token)
             .execute(&self.pool)
@@ -585,16 +593,17 @@ impl Database {
              SET status = 'retry_scheduled', attempt_count = attempt_count + 1,
                  claim_worker_id = NULL, claim_token = NULL,
                  claim_lease_until_unix_micros = NULL, retry_at_unix_micros = ?4,
-                 updated_at_unix_micros = ?5
+                 last_error = ?5, updated_at_unix_micros = ?6
              WHERE request_id = ?1 AND status = 'claimed' AND claim_generation = ?2
-               AND claim_worker_id = ?3 AND claim_token = ?6
-               AND claim_lease_until_unix_micros > ?5
-               AND attempt_count = ?7 AND attempt_count < ?8",
+               AND claim_worker_id = ?3 AND claim_token = ?7
+               AND claim_lease_until_unix_micros > ?6
+               AND attempt_count = ?8 AND attempt_count < ?9",
         )
         .bind(request_id)
         .bind(claim.generation)
         .bind(&claim.worker_id)
         .bind(datetime_to_unix_micros(retry_at))
+        .bind(error)
         .bind(datetime_to_unix_micros(now))
         .bind(&claim.token)
         .bind(current_attempt_count)
@@ -902,14 +911,14 @@ impl Database {
         &self,
     ) -> DbResult<Option<ProductCreationJobRecord>> {
         sqlx::query(
-            "SELECT j.request_id, j.product_conversation_id, j.cwd, j.objective, j.model, j.effort, j.status,
+            "SELECT j.request_id, j.product_conversation_id, j.cwd, j.objective, j.model, j.effort, j.llm_language, j.status,
                     j.accepted_at_unix_micros, j.updated_at_unix_micros, j.attempt_count,
                     j.claim_generation, j.claim_worker_id, j.claim_token,
                     j.claim_lease_until_unix_micros, j.retry_at_unix_micros,
                     j.delivery_attempt_count, j.delivery_retry_at_unix_micros,
                     j.pin_exact_checkout_oid, j.pin_logical_base, j.pin_freshness,
                     j.staging_path, j.staging_repo_root, j.staging_exact_oid,
-                    j.published_product_id, j.published_conversation_id,
+                    j.published_product_id, j.published_conversation_id, j.last_error,
                     COALESCE((SELECT json_group_array(json_object('media_type', i.media_type, 'data', i.data))
                               FROM product_creation_job_images i WHERE i.request_id = j.request_id
                               ORDER BY i.ordinal), '[]') AS images_json
@@ -1044,6 +1053,7 @@ mod product_creation_tests {
                 media_type: "image/png".to_string(),
                 data: "abc123".to_string(),
             }],
+            llm_language: LlmLanguage::Caveman,
         }
     }
 
@@ -1080,7 +1090,7 @@ mod product_creation_tests {
             seed_label: None,
             continued_in_conv_id: None,
             chain_name: None,
-            llm_language: LlmLanguage::default(),
+            llm_language: LlmLanguage::Caveman,
             spawned_from_conversation_id: None,
         }
     }
@@ -1120,6 +1130,7 @@ mod product_creation_tests {
                 media_type: "image/png".to_string(),
                 data: "abc123".to_string(),
             }],
+            llm_language: LlmLanguage::Caveman,
         };
         let accepted = match db
             .accept_product_creation("req-img", &image_only)
@@ -1161,6 +1172,7 @@ mod product_creation_tests {
                     model: None,
                     effort: None,
                     images: vec![],
+                    llm_language: LlmLanguage::Caveman,
                 },
             )
             .await
@@ -1230,7 +1242,12 @@ mod product_creation_tests {
             .unwrap();
         for (expected_attempt_count, expected_delay_secs) in [(2, 2), (3, 10), (4, 30)] {
             assert!(db
-                .schedule_product_creation_retry("req-retry", &claim.claim, now)
+                .schedule_product_creation_retry(
+                    "req-retry",
+                    &claim.claim,
+                    "temporary failure",
+                    now
+                )
                 .await
                 .unwrap());
             let job = db
@@ -1256,7 +1273,7 @@ mod product_creation_tests {
         }
         let final_claim = claim;
         assert!(db
-            .schedule_product_creation_retry("req-retry", &final_claim.claim, now)
+            .schedule_product_creation_retry("req-retry", &final_claim.claim, "final failure", now)
             .await
             .unwrap());
         let final_job = db
@@ -1267,6 +1284,7 @@ mod product_creation_tests {
         assert_eq!(final_job.status, "failed");
         assert_eq!(final_job.attempt_count, 4);
         assert!(final_job.retry_at.is_none());
+        assert_eq!(final_job.last_error.as_deref(), Some("final failure"));
     }
 
     #[tokio::test]
@@ -1297,7 +1315,12 @@ mod product_creation_tests {
         assert_eq!(current.attempt_count, 1);
         assert!(claim.claim.generation > current.attempt_count);
         assert!(db
-            .schedule_product_creation_retry("req-attempts", &claim.claim, now)
+            .schedule_product_creation_retry(
+                "req-attempts",
+                &claim.claim,
+                "retry after generation drift",
+                now
+            )
             .await
             .unwrap());
         let scheduled = db
@@ -1307,6 +1330,52 @@ mod product_creation_tests {
             .unwrap();
         assert_eq!(scheduled.attempt_count, 2);
         assert_eq!(scheduled.retry_at, Some(now + chrono::Duration::seconds(2)));
+    }
+
+    #[tokio::test]
+    async fn product_creation_snapshots_llm_language_and_retains_last_error() {
+        let db = Database::open_in_memory().await.unwrap();
+        let accepted_intent = intent("/repo/a", "ship it");
+        db.accept_product_creation("req-language", &accepted_intent)
+            .await
+            .unwrap();
+        let stored = db
+            .get_product_creation_job("req-language")
+            .await
+            .unwrap()
+            .expect("accepted job");
+        assert_eq!(stored.intent.llm_language, LlmLanguage::Caveman);
+
+        let now = Utc::now();
+        let claimed = db
+            .claim_product_creation(
+                "req-language",
+                "worker-a",
+                "token-a",
+                now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .expect("claim accepted job");
+        assert!(db
+            .schedule_product_creation_retry(
+                "req-language",
+                &claimed.claim,
+                "transient provisioning failure",
+                now,
+            )
+            .await
+            .unwrap());
+        let retried = db
+            .get_product_creation_job("req-language")
+            .await
+            .unwrap()
+            .expect("retried job");
+        assert_eq!(
+            retried.last_error.as_deref(),
+            Some("transient provisioning failure")
+        );
     }
 
     #[tokio::test]
