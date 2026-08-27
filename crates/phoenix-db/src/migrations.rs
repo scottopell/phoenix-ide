@@ -7544,14 +7544,14 @@ SELECT c.work_scope_id, MIN(c.product_conversation_id)
 FROM conversations c
 JOIN product_conversations product ON product.id = c.product_conversation_id
 WHERE c.work_scope_id IS NOT NULL
-  AND c.runtime_role <> 'coordinator'
+  AND c.runtime_role = 'user'
   AND product.kind = 'ordinary'
 GROUP BY c.work_scope_id;
 
 CREATE TRIGGER conversations_assign_or_validate_work_scope_owner
 BEFORE INSERT ON conversations
 FOR EACH ROW
-WHEN NEW.work_scope_id IS NOT NULL AND NEW.runtime_role <> 'coordinator'
+WHEN NEW.work_scope_id IS NOT NULL AND NEW.runtime_role = 'user'
 BEGIN
     INSERT OR IGNORE INTO product_conversation_work_scopes (work_scope_id, product_conversation_id)
     SELECT NEW.work_scope_id, NEW.product_conversation_id
@@ -7569,7 +7569,7 @@ END;
 CREATE TRIGGER conversations_validate_work_scope_owner_on_update
 BEFORE UPDATE OF product_conversation_id, work_scope_id, runtime_role ON conversations
 FOR EACH ROW
-WHEN NEW.work_scope_id IS NOT NULL AND NEW.runtime_role <> 'coordinator'
+WHEN NEW.work_scope_id IS NOT NULL AND NEW.runtime_role = 'user'
 BEGIN
     INSERT OR IGNORE INTO product_conversation_work_scopes (work_scope_id, product_conversation_id)
     SELECT NEW.work_scope_id, NEW.product_conversation_id
@@ -7892,7 +7892,7 @@ async fn migration_065_preflight(tx: &mut Transaction<'_, Sqlite>) -> DbResult<(
 
 async fn migration_080_preflight(tx: &mut Transaction<'_, Sqlite>) -> DbResult<()> {
     let conflict: Option<(String, String, String)> = sqlx::query_as(
-        "SELECT work_scope_id, MIN(product_conversation_id), MAX(product_conversation_id)\n         FROM conversations\n         WHERE work_scope_id IS NOT NULL AND runtime_role <> 'coordinator'\n         GROUP BY work_scope_id\n         HAVING COUNT(DISTINCT product_conversation_id) > 1\n         ORDER BY work_scope_id\n         LIMIT 1",
+        "SELECT work_scope_id, MIN(product_conversation_id), MAX(product_conversation_id)\n         FROM conversations\n         WHERE work_scope_id IS NOT NULL AND runtime_role = 'user'\n         GROUP BY work_scope_id\n         HAVING COUNT(DISTINCT product_conversation_id) > 1\n         ORDER BY work_scope_id\n         LIMIT 1",
     )
     .fetch_optional(&mut **tx)
     .await?;
