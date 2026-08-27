@@ -299,15 +299,12 @@ impl Database {
         conversation_id: &str,
     ) -> DbResult<Option<String>> {
         sqlx::query_scalar(
-            "SELECT COALESCE(direct.staging_exact_oid, source.staging_exact_oid)
+            "SELECT COALESCE(provisioning.checkout_ref, direct.staging_exact_oid)
              FROM conversations conversation
+             LEFT JOIN conversation_creation_jobs provisioning
+               ON provisioning.conversation_id = conversation.id
              LEFT JOIN product_creation_jobs direct
                ON direct.published_product_id = conversation.product_conversation_id
-             LEFT JOIN product_conversation_sources relation
-               ON relation.target_product_conversation_id = conversation.product_conversation_id
-              AND relation.relation_kind = 'approved_task'
-             LEFT JOIN product_creation_jobs source
-               ON source.published_product_id = relation.source_product_conversation_id
              WHERE conversation.id = ?1
              LIMIT 1",
         )

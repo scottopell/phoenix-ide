@@ -521,7 +521,12 @@ async fn cleanup_and_retry_unpublished_product_creation(
     };
     if !manager
         .db()
-        .product_creation_claim_is_live(request_id, claim, chrono::Utc::now())
+        .renew_product_creation_claim(
+            request_id,
+            claim,
+            chrono::Utc::now(),
+            chrono::Duration::seconds(30),
+        )
         .await
         .map_err(|error| error.to_string())?
     {

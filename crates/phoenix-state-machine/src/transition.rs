@@ -61,9 +61,6 @@ struct TaskFileSnapshot {
     task_file: String,
     title: String,
     priority: phoenix_core::task_source::Priority,
-    /// Display copy of the brief: the file body trimmed of surrounding
-    /// whitespace, for the approval reader.
-    plan: String,
     /// The authoritative file bytes, exactly as read from disk (untrimmed).
     /// A fork commits this verbatim, so it must equal the reviewed file
     /// byte-for-byte (REQ-PROJ-033).
@@ -190,13 +187,10 @@ fn resolve_task_file(
 
     let title = source.title(&body);
     let priority = source.priority();
-    let plan = body.trim().to_string();
-
     Ok(TaskFileSnapshot {
         task_file: task_file.replace('\\', "/"),
         title,
         priority,
-        plan,
         body_raw: body,
     })
 }
@@ -2355,7 +2349,7 @@ pub fn transition_parent(
                             task_file: snapshot.task_file.clone(),
                             title: snapshot.title.clone(),
                             priority: snapshot.priority,
-                            plan: snapshot.plan.clone(),
+                            plan: snapshot.body_raw.clone(),
                         })
                         .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                         .with_effect(Effect::PersistState)
@@ -7065,7 +7059,7 @@ mod resolve_task_file_tests {
             .expect("taskmd file should resolve");
         assert_eq!(snap.title, "Repair login");
         assert_eq!(snap.priority, phoenix_core::task_source::Priority::P1);
-        assert!(snap.plan.contains("plan body"));
+        assert!(snap.body_raw.contains("plan body"));
     }
 
     #[test]
@@ -7109,7 +7103,7 @@ mod resolve_task_file_tests {
         assert_eq!(snap.title, "Migrate the database");
         assert_eq!(snap.priority, phoenix_core::task_source::Priority::P2);
         assert_eq!(snap.task_file, "docs/plan.md");
-        assert!(snap.plan.contains("step one"));
+        assert!(snap.body_raw.contains("step one"));
 
         // README.md works too.
         std::fs::write(tmp.path().join("README.md"), "# The readme\n").unwrap();

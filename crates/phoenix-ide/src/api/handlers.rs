@@ -6266,6 +6266,22 @@ async fn cascade_projects_on_delete(
                 None
             }
         }
+    } else if let Some(work_scope_id) = conv.attached_work_scope_id.as_ref() {
+        match runtime
+            .db()
+            .repository_management_root_for_work_scope(work_scope_id)
+            .await
+        {
+            Ok(path) => path.map(PathBuf::from),
+            Err(error) => {
+                tracing::debug!(
+                    conv_id = %conv.id,
+                    error = %error,
+                    "work-scope repository lookup failed during cascade"
+                );
+                None
+            }
+        }
     } else {
         None
     };
