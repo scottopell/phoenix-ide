@@ -8113,12 +8113,19 @@ where
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<(), String> {
         let cwd = self.context.filesystem_root().to_path_buf();
-        // The spec invariant WorktreePathDerivedFromConversation requires
-        // the worktree path to be rooted at the repo root, not at cwd.
-        // For Managed conversations cwd IS the Explore worktree; for legacy
-        // pre-REQ-PROJ-028 Managed conversations cwd IS already the repo root.
-        let repo_root =
-            crate::git_ops::repo_root_from_phoenix_worktree(&cwd).unwrap_or_else(|| cwd.clone());
+        let attached_repo_root = self
+            .storage
+            .get_attached_repository_root(&self.context.conversation_id)
+            .await
+            .map_err(|error| format!("Failed to load attached repository root: {error}"))?
+            .map(std::path::PathBuf::from);
+        #[cfg(not(test))]
+        let repo_root = attached_repo_root
+            .ok_or_else(|| "Task approval requires attached GitRepository authority".to_string())?;
+        #[cfg(test)]
+        let repo_root = attached_repo_root.unwrap_or_else(|| {
+            crate::git_ops::repo_root_from_phoenix_worktree(&cwd).unwrap_or_else(|| cwd.clone())
+        });
         let worktree_identity = self
             .storage
             .get_product_conversation_id(&self.context.conversation_id)
@@ -8309,6 +8316,7 @@ where
             }
         }
     }
+    #[allow(clippy::too_many_lines)]
     async fn execute_approve_task_fresh_handoff(
         &mut self,
         task_file: String,
@@ -8318,8 +8326,19 @@ where
         authority: crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
         let cwd = self.context.filesystem_root().to_path_buf();
-        let repo_root =
-            crate::git_ops::repo_root_from_phoenix_worktree(&cwd).unwrap_or_else(|| cwd.clone());
+        let attached_repo_root = self
+            .storage
+            .get_attached_repository_root(&self.context.conversation_id)
+            .await
+            .map_err(|error| format!("Failed to load attached repository root: {error}"))?
+            .map(std::path::PathBuf::from);
+        #[cfg(not(test))]
+        let repo_root = attached_repo_root
+            .ok_or_else(|| "Task approval requires attached GitRepository authority".to_string())?;
+        #[cfg(test)]
+        let repo_root = attached_repo_root.unwrap_or_else(|| {
+            crate::git_ops::repo_root_from_phoenix_worktree(&cwd).unwrap_or_else(|| cwd.clone())
+        });
         let worktree_identity = self
             .storage
             .get_product_conversation_id(&self.context.conversation_id)

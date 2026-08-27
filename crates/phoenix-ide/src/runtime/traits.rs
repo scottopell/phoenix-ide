@@ -428,6 +428,9 @@ pub trait StateStore: Send + Sync {
 
     /// Resolve the stable `ProductConversation` identity owning one transcript runtime.
     async fn get_product_conversation_id(&self, conv_id: &str) -> Result<String, String>;
+    async fn get_attached_repository_root(&self, _conv_id: &str) -> Result<Option<String>, String> {
+        Ok(None)
+    }
 
     /// Update the conversation working directory. Conversation cwd is
     /// immutable post-creation; the only legitimate callers are
@@ -916,6 +919,10 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
 
     async fn get_product_conversation_id(&self, conv_id: &str) -> Result<String, String> {
         (**self).get_product_conversation_id(conv_id).await
+    }
+
+    async fn get_attached_repository_root(&self, conv_id: &str) -> Result<Option<String>, String> {
+        (**self).get_attached_repository_root(conv_id).await
     }
 
     async fn update_conversation_cwd_recovery_only(
@@ -1844,6 +1851,21 @@ impl StateStore for DatabaseStorage {
             .get_conversation(conv_id)
             .await
             .map(|conv| conv.product_conversation_id.to_string())
+            .map_err(|error| error.to_string())
+    }
+
+    async fn get_attached_repository_root(&self, conv_id: &str) -> Result<Option<String>, String> {
+        let conversation = self
+            .db
+            .get_conversation(conv_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let Some(scope_id) = conversation.attached_work_scope_id else {
+            return Ok(None);
+        };
+        self.db
+            .repository_management_root_for_work_scope(&scope_id)
+            .await
             .map_err(|error| error.to_string())
     }
 
