@@ -952,9 +952,6 @@ async fn observe_detached_head_and_submodules(
                     "--contains",
                     std::str::from_utf8(&head_oid).map_err(|error| error.to_string())?,
                     "--format=%(refname)",
-                    "refs/heads",
-                    "refs/remotes",
-                    "refs/tags",
                 ])
                 .current_dir(&path)
                 .output()
@@ -966,14 +963,7 @@ async fn observe_detached_head_and_submodules(
             }
             result.push((b"DETACHED".to_vec(), reachable.stdout));
         }
-        let modules = phoenix_core::git::command()
-            .args(["submodule", "status", "--recursive"])
-            .current_dir(&path)
-            .output()
-            .map_err(|error| error.to_string())?;
-        if modules.status.success() {
-            result.push((b"SUBMODULES".to_vec(), modules.stdout));
-        }
+        observe_initialized_submodules(&path, &[], &mut result)?;
         Ok(result)
     })
     .await
@@ -995,21 +985,164 @@ async fn observe_detached_head_and_submodules(
                     .map_err(|error| error.to_string())?,
             ));
         }
-        if tag == b"SUBMODULES" {
-            for line in value.split(|byte| *byte == b'\n') {
-                if line
-                    .first()
-                    .is_some_and(|prefix| matches!(prefix, b'+' | b'-' | b'U'))
-                {
-                    let path = line.split(|byte| *byte == b' ').nth(2).unwrap_or_default();
-                    losses.push(CloseLossItem::InitializedSubmoduleState(
-                        GitPathIdentity::from_bytes(path.to_vec()),
-                    ));
-                }
-            }
+        if let Some(path) = tag.strip_prefix(b"SUBMODULE_DIRTY\0") {
+            losses.push(CloseLossItem::InitializedSubmoduleState(
+                git_path_from_observation(path)?,
+            ));
         }
     }
     Ok(())
+}
+
+fn observe_initialized_submodules(
+    repository: &Path,
+    relative_prefix: &[u8],
+    observation: &mut WorktreeObservation,
+) -> Result<(), String> {
+    let modules_file = repository.join(".gitmodules");
+    if !modules_file.exists() {
+        return Ok(());
+    }
+    let declarations = phoenix_core::git::command()
+        .args([
+            "config",
+            "-z",
+            "--file",
+            ".gitmodules",
+            "--get-regexp",
+            "^submodule\\..*\\.path$",
+        ])
+        .current_dir(repository)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !declarations.status.success() {
+        return Err(format!(
+            "cannot read declared submodule paths: {}",
+            String::from_utf8_lossy(&declarations.stderr).trim()
+        ));
+    }
+    observation.push((
+        [b"SUBMODULE_DECLARATIONS\0".as_slice(), relative_prefix].concat(),
+        declarations.stdout.clone(),
+    ));
+    for declaration in declarations.stdout.split(|byte| *byte == 0) {
+        if declaration.is_empty() {
+            continue;
+        }
+        let separator = declaration
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .ok_or_else(|| {
+                "malformed declared submodule path record: missing key/value separator".to_string()
+            })?;
+        let path_bytes = &declaration[separator + 1..];
+        let path_identity = git_path_from_observation(path_bytes)?;
+        let relative_path = join_git_paths(relative_prefix, path_identity.as_bytes())?;
+        let submodule_path = repository.join(path_buf_from_git_bytes(path_identity.as_bytes())?);
+        if !submodule_path.join(".git").exists() {
+            continue;
+        }
+
+        let status = phoenix_core::git::command()
+            .args([
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--ignored",
+                "--untracked-files=all",
+            ])
+            .current_dir(&submodule_path)
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !status.status.success() {
+            return Err(format!(
+                "cannot inspect initialized submodule {}: {}",
+                String::from_utf8_lossy(&relative_path),
+                String::from_utf8_lossy(&status.stderr).trim()
+            ));
+        }
+        observation.push((
+            [b"SUBMODULE_STATUS\0".as_slice(), relative_path.as_slice()].concat(),
+            status.stdout.clone(),
+        ));
+
+        let gitlink = phoenix_core::git::command()
+            .args(["submodule", "status", "--"])
+            .arg(path_buf_from_git_bytes(path_identity.as_bytes())?)
+            .current_dir(repository)
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !gitlink.status.success() {
+            return Err(format!(
+                "cannot inspect initialized submodule gitlink {}: {}",
+                String::from_utf8_lossy(&relative_path),
+                String::from_utf8_lossy(&gitlink.stderr).trim()
+            ));
+        }
+        observation.push((
+            [b"SUBMODULE_GITLINK\0".as_slice(), relative_path.as_slice()].concat(),
+            gitlink.stdout.clone(),
+        ));
+        let gitlink_changed = gitlink
+            .stdout
+            .first()
+            .is_some_and(|prefix| matches!(prefix, b'+' | b'U'));
+        if gitlink_changed || !parse_status_losses(&status.stdout).is_empty() {
+            observation.push((
+                [b"SUBMODULE_DIRTY\0".as_slice(), relative_path.as_slice()].concat(),
+                Vec::new(),
+            ));
+        }
+        observe_initialized_submodules(&submodule_path, &relative_path, observation)?;
+    }
+    Ok(())
+}
+
+fn git_path_from_observation(bytes: &[u8]) -> Result<GitPathIdentity, String> {
+    if bytes.is_empty() {
+        return Err("observed Git path is empty".to_string());
+    }
+    if bytes.contains(&0) {
+        return Err("observed Git path contains NUL".to_string());
+    }
+    let path = path_buf_from_git_bytes(bytes)?;
+    if path.is_absolute()
+        || path.components().any(|component| {
+            !matches!(
+                component,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err("observed Git path escapes its repository".to_string());
+    }
+    Ok(GitPathIdentity::from_bytes(bytes.to_vec()))
+}
+
+fn join_git_paths(prefix: &[u8], path: &[u8]) -> Result<Vec<u8>, String> {
+    let mut joined =
+        Vec::with_capacity(prefix.len() + usize::from(!prefix.is_empty()) + path.len());
+    joined.extend_from_slice(prefix);
+    if !prefix.is_empty() {
+        joined.push(b'/');
+    }
+    joined.extend_from_slice(path);
+    git_path_from_observation(&joined)?;
+    Ok(joined)
+}
+
+fn path_buf_from_git_bytes(bytes: &[u8]) -> Result<PathBuf, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt as _;
+        Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec())))
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8(bytes.to_vec())
+            .map(PathBuf::from)
+            .map_err(|_| "observed Git path is not valid platform text".to_string())
+    }
 }
 
 async fn remove_exact_worktree(identity: &WorktreeIdentity) -> Result<(), String> {
@@ -1249,8 +1382,128 @@ fn require_browser_absent(outcome: BrowserRetirementOutcome) -> Result<(), Strin
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_status_losses, snapshot_for, CloseLeaseFailure};
-    use phoenix_core::domain::close::CloseLossItem;
+    use super::{
+        git_path_from_observation, inspect_worktree, parse_status_losses, snapshot_for,
+        CloseLeaseFailure,
+    };
+    use phoenix_core::domain::close::{
+        CloseLossItem, GitPathIdentity, WorktreeFingerprint, WorktreeId, WorktreeIdentity,
+    };
+    use std::path::Path;
+    use std::process::Command;
+
+    fn run_git(repository: &Path, arguments: &[&str]) {
+        let output = Command::new("git")
+            .args(arguments)
+            .current_dir(repository)
+            .env("GIT_AUTHOR_NAME", "Close Test")
+            .env("GIT_AUTHOR_EMAIL", "close@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Close Test")
+            .env("GIT_COMMITTER_EMAIL", "close@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {arguments:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn inspection_identity(path: &Path) -> WorktreeIdentity {
+        #[cfg(unix)]
+        let locator = {
+            use std::os::unix::ffi::OsStrExt as _;
+            GitPathIdentity::from_bytes(path.as_os_str().as_bytes().to_vec())
+        };
+        #[cfg(not(unix))]
+        let locator = GitPathIdentity::from_bytes(path.to_string_lossy().as_bytes().to_vec());
+        WorktreeIdentity::from_parts(
+            WorktreeId::parse("inspection-test-worktree").unwrap(),
+            WorktreeFingerprint::parse("inspection-test-fingerprint").unwrap(),
+            locator,
+        )
+    }
+
+    fn initialize_repository(path: &Path) {
+        std::fs::create_dir_all(path).unwrap();
+        run_git(path, &["init", "--quiet"]);
+        std::fs::write(path.join("tracked"), "initial\n").unwrap();
+        run_git(path, &["add", "tracked"]);
+        run_git(path, &["commit", "--quiet", "-m", "initial"]);
+    }
+
+    #[tokio::test]
+    async fn detached_commit_reachability_uses_custom_refs_and_detects_true_loss() {
+        let temp = tempfile::tempdir().unwrap();
+        initialize_repository(temp.path());
+        run_git(temp.path(), &["checkout", "--quiet", "--detach"]);
+        std::fs::write(temp.path().join("tracked"), "detached\n").unwrap();
+        run_git(temp.path(), &["commit", "--quiet", "-am", "detached"]);
+        run_git(temp.path(), &["update-ref", "refs/custom/keep", "HEAD"]);
+
+        let identity = inspection_identity(temp.path());
+        let (_, reachable_losses) = inspect_worktree(&identity).await.unwrap();
+        assert!(!reachable_losses
+            .iter()
+            .any(|loss| matches!(loss, CloseLossItem::DetachedUnreachableCommit(_))));
+
+        run_git(temp.path(), &["update-ref", "-d", "refs/custom/keep"]);
+        let (_, unreachable_losses) = inspect_worktree(&identity).await.unwrap();
+        assert!(unreachable_losses
+            .iter()
+            .any(|loss| matches!(loss, CloseLossItem::DetachedUnreachableCommit(_))));
+    }
+
+    #[tokio::test]
+    async fn initialized_submodule_dirty_state_changes_snapshot_and_emits_exact_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let child = temp.path().join("child");
+        let parent = temp.path().join("parent");
+        initialize_repository(&child);
+        initialize_repository(&parent);
+        let child_text = child.to_string_lossy().into_owned();
+        let output = Command::new("git")
+            .args([
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "--quiet",
+                &child_text,
+                "deps/child",
+            ])
+            .current_dir(&parent)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "submodule add failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        run_git(&parent, &["commit", "--quiet", "-am", "add submodule"]);
+
+        let identity = inspection_identity(&parent);
+        let (clean_snapshot, clean_losses) = inspect_worktree(&identity).await.unwrap();
+        assert!(!clean_losses
+            .iter()
+            .any(|loss| matches!(loss, CloseLossItem::InitializedSubmoduleState(_))));
+
+        std::fs::write(parent.join("deps/child/untracked"), "nested loss\n").unwrap();
+        let (dirty_snapshot, dirty_losses) = inspect_worktree(&identity).await.unwrap();
+        assert_ne!(clean_snapshot, dirty_snapshot);
+        assert!(dirty_losses.iter().any(|loss| matches!(
+            loss,
+            CloseLossItem::InitializedSubmoduleState(path)
+                if path.as_bytes() == b"deps/child"
+        )));
+    }
+
+    #[test]
+    fn malformed_observed_git_paths_return_errors_without_panicking() {
+        assert!(git_path_from_observation(b"").is_err());
+        assert!(git_path_from_observation(b"../outside").is_err());
+        assert!(git_path_from_observation(b"inside\0outside").is_err());
+    }
 
     #[test]
     fn close_lease_failure_origin_distinguishes_tmux_from_process_epoch() {
