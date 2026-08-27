@@ -1526,6 +1526,28 @@ async fn provision_conversation(
                 validate_user_ref(&branch_name).map_err(app_error_to_kind)?;
                 (branch_name, None, None)
             };
+            if let Some(oid) = approved_commit_oid.as_deref() {
+                if !manager
+                    .db()
+                    .persist_conversation_creation_exact_checkout_oid(
+                        &job.conversation_id,
+                        i64::try_from(claim.generation).map_err(|_| {
+                            (
+                                "approved-task claim generation exceeds SQLite range".to_string(),
+                                ErrorKind::InvalidRequest,
+                            )
+                        })?,
+                        oid,
+                    )
+                    .await
+                    .map_err(|error| (error.to_string(), ErrorKind::ServerError))?
+                {
+                    return Err(CreationProvisionError::Failed(
+                        "approved-task starting pin lost its provisioning claim".to_string(),
+                        ErrorKind::ServerError,
+                    ));
+                }
+            }
             validate_user_ref(&branch_name).map_err(app_error_to_kind)?;
             let existing_path = deterministic_worktree_path(&repo_root, &job.conversation_id);
             checkpoint_creation_stage(

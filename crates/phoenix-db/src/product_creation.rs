@@ -1094,10 +1094,6 @@ impl Database {
             tx.rollback().await?;
             return Ok(false);
         };
-        sqlx::query("DELETE FROM product_creation_job_images WHERE request_id = ?1")
-            .bind(request_id)
-            .execute(&mut *tx)
-            .await?;
         sqlx::query("UPDATE conversations SET archived = 0 WHERE id = ?1")
             .bind(&published_conversation_id)
             .execute(&mut *tx)

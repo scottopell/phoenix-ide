@@ -4711,7 +4711,33 @@ impl Database {
         .map_err(DbError::Sqlx)
     }
 
-    /// Load the creation job for a conversation, if one exists.
+    /// Persists the authoritative checkout pin selected while the generation owns provisioning.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the fenced database update fails.
+    pub async fn persist_conversation_creation_exact_checkout_oid(
+        &self,
+        conversation_id: &str,
+        generation: i64,
+        oid: &str,
+    ) -> DbResult<bool> {
+        let updated = sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET exact_checkout_oid = ?1, updated_at = ?2
+             WHERE conversation_id = ?3 AND generation = ?4
+               AND status = 'provisioning' AND exact_checkout_oid IS NULL",
+        )
+        .bind(oid)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(conversation_id)
+        .bind(generation)
+        .execute(&self.pool)
+        .await?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    /// Loads the creation job for a conversation, if one exists.
     ///
     /// # Errors
     ///
