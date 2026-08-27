@@ -876,6 +876,7 @@ impl Database {
         .bind(claim.generation)
         .bind(&claim.worker_id)
         .bind(&claim.token)
+        .bind(unix_micros_now())
         .execute(&self.pool)
         .await?;
         Ok(updated.rows_affected() == 1)

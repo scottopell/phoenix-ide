@@ -743,7 +743,7 @@ pub(crate) async fn drain_pending_jobs(manager: &Arc<RuntimeManager>) -> Result<
         else {
             break;
         };
-        if process_claimed_product_creation(manager, &claimed)
+        if process_product_creation_until_closed(manager, claimed.clone())
             .await
             .is_err()
         {

@@ -162,10 +162,14 @@ export function DirectoryPicker({ value, onChange, onStatusChange, onGitStatusCh
             onGitStatusChangeRef.current?.(validation.is_git);
           });
         } else {
-          const parentPath = trimmed.substring(0, trimmed.lastIndexOf('/')) || '/';
-          const parentValidation = await api.validateCwd(parentPath);
+          let ancestorPath = trimmed;
+          let ancestorValidation = validation;
+          while (!ancestorValidation.valid && ancestorPath !== '/') {
+            ancestorPath = ancestorPath.substring(0, ancestorPath.lastIndexOf('/')) || '/';
+            ancestorValidation = await api.validateCwd(ancestorPath);
+          }
           applyIfLatest(() => {
-            const status: DirStatus = parentValidation.valid ? 'will-create' : 'invalid';
+            const status: DirStatus = ancestorValidation.valid ? 'will-create' : 'invalid';
             setPathStatus(status);
             onStatusChangeRef.current?.(status);
             onGitStatusChangeRef.current?.(null);

@@ -114,6 +114,9 @@ pub(crate) fn ensure_product_creation_cwd(
 ) -> Result<ValidConversationCwd, ConversationCwdError> {
     let raw = cwd.as_ref();
     let path = Path::new(raw);
+    if path.exists() {
+        return validate_conversation_cwd(raw);
+    }
     let ancestor = path
         .ancestors()
         .find(|ancestor| ancestor.exists())
@@ -267,6 +270,20 @@ mod tests {
         assert!(requested.is_dir());
         assert_eq!(valid.raw(), normalized);
         assert_eq!(replayed, valid);
+    }
+
+    #[test]
+    fn worker_accepts_existing_directory_outside_creation_roots() {
+        let home = tempfile::tempdir().expect("home");
+        let existing = std::env::current_dir().expect("current directory");
+
+        let valid = ensure_product_creation_cwd(existing.to_string_lossy(), home.path())
+            .expect("existing directories keep the general cwd contract");
+
+        assert_eq!(
+            valid.as_path(),
+            existing.canonicalize().expect("canonical cwd")
+        );
     }
 
     #[cfg(unix)]

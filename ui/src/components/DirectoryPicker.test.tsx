@@ -65,4 +65,28 @@ describe('DirectoryPicker validation', () => {
 
     expect(gitChanges.at(-1)).toBe(true);
   });
+
+  it('accepts multiple missing directory segments when an ancestor exists', async () => {
+    vi.mocked(api.validateCwd).mockImplementation(async (path) => ({
+      valid: path === '/existing',
+      is_git: false,
+    }));
+    const statuses: string[] = [];
+
+    render(
+      <DirectoryPicker
+        value="/existing/missing/nested"
+        onChange={vi.fn()}
+        onStatusChange={(status) => statuses.push(status)}
+        onGitStatusChange={vi.fn()}
+      />,
+    );
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(300);
+    });
+
+    expect(statuses.at(-1)).toBe('will-create');
+    expect(api.validateCwd).toHaveBeenCalledWith('/existing');
+  });
 });
