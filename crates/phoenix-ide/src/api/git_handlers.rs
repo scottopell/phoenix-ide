@@ -2173,10 +2173,15 @@ pub(crate) async fn get_conversation_diff(
             worktree_path,
             base_branch,
             ..
+        }
+        | ConvMode::DetachedApprovedTask {
+            worktree_path,
+            base_branch,
+            ..
         } => (worktree_path.to_string(), base_branch.to_string()),
         _ => {
             return Err(AppError::BadRequest(
-                "Conversation is not in Work or Branch mode (no worktree to diff)".to_string(),
+                "Conversation has no worktree to diff".to_string(),
             ));
         }
     };
