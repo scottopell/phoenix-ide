@@ -44,6 +44,32 @@ pub(crate) struct CloseResourceLease {
     resources: Vec<RetiredResourceIdentity>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum CloseLeaseFailure {
+    ProcessEpoch {
+        kind: RetiredResourceKind,
+        reason: String,
+    },
+    Tmux {
+        reason: String,
+    },
+}
+
+impl std::fmt::Display for CloseLeaseFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProcessEpoch { kind, reason } => {
+                write!(
+                    formatter,
+                    "{} process-epoch teardown failed: {reason}",
+                    kind.as_str()
+                )
+            }
+            Self::Tmux { reason } => write!(formatter, "tmux teardown failed: {reason}"),
+        }
+    }
+}
+
 impl RuntimeManager {
     /// Inspects exact server-owned captured worktrees and persists normalized loss evidence.
     pub(crate) async fn inspect_close_retirement(
@@ -476,14 +502,28 @@ impl RuntimeManager {
                 .await
             {
                 Ok(resources) => resources,
-                Err(reason) => {
-                    let Some(resource) = expected.first().cloned() else {
+                Err(CloseLeaseFailure::ProcessEpoch { kind, reason }) => {
+                    self.db()
+                        .route_close_attempt_to_repair(&attempt_id)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    return Err(format!(
+                        "{} process-epoch Close teardown requires repair for sealed scope {scope}: {reason}",
+                        kind.as_str()
+                    ));
+                }
+                Err(CloseLeaseFailure::Tmux { reason }) => {
+                    let Some(resource) = expected
+                        .iter()
+                        .find(|resource| resource.kind() == RetiredResourceKind::TmuxServer)
+                        .cloned()
+                    else {
                         self.db()
                             .route_close_attempt_to_repair(&attempt_id)
                             .await
                             .map_err(|error| error.to_string())?;
                         return Err(format!(
-                            "process-epoch Close teardown requires repair for sealed scope {scope}: {reason}"
+                            "tmux Close teardown failed without a sealed tmux target for scope {scope}: {reason}"
                         ));
                     };
                     return self
@@ -797,31 +837,50 @@ impl RuntimeManager {
 
     /// Completes one live lease. Callers must persist exactly one receipt per
     /// returned identity; any residual outcome keeps the registry fence closed.
-    pub(crate) async fn complete_close_resource_lease(
+    async fn complete_close_resource_lease(
         &self,
         attempt_id: &CloseAttemptId,
         scope: &WorkScopeId,
-    ) -> Result<Vec<RetiredResourceIdentity>, String> {
+    ) -> Result<Vec<RetiredResourceIdentity>, CloseLeaseFailure> {
         let key = (attempt_id.as_str().to_string(), scope.clone());
         let lease = self.close_retirement_leases.lock().await.remove(&key);
         let Some(lease) = lease else {
-            return Err("Close resource lease is unavailable after restart; re-fence and verify durable identities".to_string());
+            return Err(CloseLeaseFailure::ProcessEpoch {
+                kind: RetiredResourceKind::EquivalentLiveResource,
+                reason: "Close resource lease is unavailable after restart; process-epoch identities cannot be rehydrated".to_string(),
+            });
         };
         let result = async {
-            require_absent(self.bash_handles().complete_retirement(&lease.bash).await)?;
-            require_tmux_absent(
-                self.tmux_registry()
-                    .complete_retirement(&lease.tmux)
-                    .await
-                    .map_err(|error| error.to_string())?,
+            require_absent(self.bash_handles().complete_retirement(&lease.bash).await).map_err(
+                |reason| CloseLeaseFailure::ProcessEpoch {
+                    kind: RetiredResourceKind::BashProcessGroup,
+                    reason,
+                },
             )?;
-            require_terminal_absent(self.terminals.complete_retirement(&lease.terminal).await)?;
+            let tmux_outcome = self
+                .tmux_registry()
+                .complete_retirement(&lease.tmux)
+                .await
+                .map_err(|error| CloseLeaseFailure::Tmux {
+                    reason: error.to_string(),
+                })?;
+            require_tmux_absent(tmux_outcome)
+                .map_err(|reason| CloseLeaseFailure::Tmux { reason })?;
+            require_terminal_absent(self.terminals.complete_retirement(&lease.terminal).await)
+                .map_err(|reason| CloseLeaseFailure::ProcessEpoch {
+                    kind: RetiredResourceKind::PtySession,
+                    reason,
+                })?;
             require_browser_absent(
                 self.browser_sessions()
                     .complete_retirement(&lease.browser)
                     .await,
-            )?;
-            Ok::<_, String>(lease.resources.clone())
+            )
+            .map_err(|reason| CloseLeaseFailure::ProcessEpoch {
+                kind: RetiredResourceKind::BrowserSession,
+                reason,
+            })?;
+            Ok(lease.resources.clone())
         }
         .await;
         if result.is_err() {
@@ -1190,8 +1249,28 @@ fn require_browser_absent(outcome: BrowserRetirementOutcome) -> Result<(), Strin
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_status_losses, snapshot_for};
+    use super::{parse_status_losses, snapshot_for, CloseLeaseFailure};
     use phoenix_core::domain::close::CloseLossItem;
+
+    #[test]
+    fn close_lease_failure_origin_distinguishes_tmux_from_process_epoch() {
+        let process_epoch = CloseLeaseFailure::ProcessEpoch {
+            kind: phoenix_core::domain::close::RetiredResourceKind::BrowserSession,
+            reason: "profile identity changed".to_string(),
+        };
+        let tmux = CloseLeaseFailure::Tmux {
+            reason: "server token changed".to_string(),
+        };
+
+        assert!(matches!(
+            process_epoch,
+            CloseLeaseFailure::ProcessEpoch {
+                kind: phoenix_core::domain::close::RetiredResourceKind::BrowserSession,
+                ..
+            }
+        ));
+        assert!(matches!(tmux, CloseLeaseFailure::Tmux { .. }));
+    }
 
     #[test]
     fn porcelain_loss_parser_distinguishes_loss_categories_and_ignores_ignored_paths() {
