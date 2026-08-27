@@ -22,8 +22,8 @@ use phoenix_tools::{
     bash::registry::{BashRetirementOutcome, BashRetirementPermit},
     browser::session::{BrowserRetirementOutcome, BrowserRetirementPermit},
     tmux::registry::{
-        TmuxRetirementOutcome, TmuxRetirementPermit, TmuxRetirementRehydration,
-        TmuxServerInstanceIdentity,
+        PersistentTmuxDiscovery, TmuxRetirementOutcome, TmuxRetirementPermit,
+        TmuxRetirementRehydration, TmuxServerInstanceIdentity,
     },
 };
 
@@ -99,37 +99,53 @@ impl RuntimeManager {
         &self,
         attempt_id: &CloseAttemptId,
         scope: WorkScopeId,
-    ) -> Vec<RetiredResourceIdentity> {
+    ) -> Result<Vec<RetiredResourceIdentity>, String> {
         let mut leases = self.close_retirement_leases.lock().await;
         if let Some(existing) = leases
             .get(&(attempt_id.as_str().to_string(), scope.clone()))
             .map(|lease| lease.resources.clone())
         {
-            return existing;
+            return Ok(existing);
         }
         let key = ResourceScopeKey::Work(scope.clone());
         let bash = self.bash_handles().begin_retirement(&key).await;
-        let tmux = if let Some(identity) = self
+        let tmux = match self
             .tmux_registry()
             .discover_persistent_identity(&key)
             .await
+            .map_err(|error| format!("tmux identity discovery failed: {error}"))?
         {
-            match self
-                .tmux_registry()
-                .rehydrate_retirement(&key, &identity)
-                .await
-            {
-                Ok(TmuxRetirementRehydration::Permit(permit)) => permit,
-                _ => {
-                    self.tmux_registry()
-                        .begin_retirement(&key, None, None)
-                        .await
+            PersistentTmuxDiscovery::Absent => {
+                self.tmux_registry()
+                    .begin_retirement(&key, None, None)
+                    .await
+            }
+            PersistentTmuxDiscovery::Exact(identity) => {
+                match self
+                    .tmux_registry()
+                    .rehydrate_retirement(&key, &identity)
+                    .await
+                {
+                    Ok(TmuxRetirementRehydration::Permit(permit)) => permit,
+                    Ok(TmuxRetirementRehydration::AbsenceVerified) => {
+                        self.tmux_registry()
+                            .begin_retirement(&key, None, None)
+                            .await
+                    }
+                    Ok(TmuxRetirementRehydration::Residual { reason }) => {
+                        self.bash_handles().cancel_retirement(bash).await;
+                        return Err(format!("tmux identity is ambiguous: {reason}"));
+                    }
+                    Err(error) => {
+                        self.bash_handles().cancel_retirement(bash).await;
+                        return Err(format!("tmux rehydration failed: {error}"));
+                    }
                 }
             }
-        } else {
-            self.tmux_registry()
-                .begin_retirement(&key, None, None)
-                .await
+            PersistentTmuxDiscovery::Ambiguous { reason } => {
+                self.bash_handles().cancel_retirement(bash).await;
+                return Err(format!("tmux identity is ambiguous: {reason}"));
+            }
         };
         let terminal = self.terminals.begin_retirement(&key);
         let browser = self.browser_sessions().begin_retirement(&key).await;
@@ -168,7 +184,7 @@ impl RuntimeManager {
                 resources: resources.clone(),
             },
         );
-        resources
+        Ok(resources)
     }
 
     async fn cancel_close_resource_lease(&self, attempt_id: &CloseAttemptId, scope: &WorkScopeId) {
@@ -203,7 +219,7 @@ impl RuntimeManager {
         for captured in scopes {
             let resources = self
                 .acquire_close_resource_lease(&attempt_id, captured.scope.clone())
-                .await;
+                .await?;
             let worktree = match captured.captured_worktree {
                 None => None,
                 Some(CapturedWorktreeIdentity::Resolved(identity)) => Some(identity),

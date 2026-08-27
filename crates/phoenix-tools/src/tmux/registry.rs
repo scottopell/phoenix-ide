@@ -357,6 +357,13 @@ pub struct TmuxRegistry {
     contain_test_spawns: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PersistentTmuxDiscovery {
+    Absent,
+    Exact(TmuxServerInstanceIdentity),
+    Ambiguous { reason: String },
+}
+
 impl TmuxRegistry {
     /// Construct a registry with the default socket directory rooted at
     /// `~/.phoenix-ide/tmux-sockets/` (or `$PHOENIX_DATA_DIR` if set).
@@ -582,7 +589,7 @@ impl TmuxRegistry {
     pub async fn discover_persistent_identity(
         &self,
         work_scope: &ResourceScopeKey,
-    ) -> Option<TmuxServerInstanceIdentity> {
+    ) -> Result<PersistentTmuxDiscovery, TmuxError> {
         let socket_path = match work_scope {
             ResourceScopeKey::Work(id) => {
                 socket_path_for_worktree(&self.socket_dir, Path::new(id.as_str()))
@@ -593,11 +600,25 @@ impl TmuxRegistry {
             ResourceScopeKey::Coordinator => socket_path_for_coordinator(&self.socket_dir),
             ResourceScopeKey::GlobalTerminal => socket_path_for_global(&self.socket_dir),
         };
-        let server_token = read_server_token(&socket_path).await?;
-        Some(TmuxServerInstanceIdentity {
-            socket_path,
-            server_token,
-        })
+        match probe(&socket_path)
+            .await
+            .map_err(|source| TmuxError::ProbeFailed {
+                socket_path: socket_path.clone(),
+                source,
+            })? {
+            ProbeResult::NoSocket | ProbeResult::DeadSocket => Ok(PersistentTmuxDiscovery::Absent),
+            ProbeResult::Live => match read_server_token(&socket_path).await {
+                Some(server_token) => {
+                    Ok(PersistentTmuxDiscovery::Exact(TmuxServerInstanceIdentity {
+                        socket_path,
+                        server_token,
+                    }))
+                }
+                None => Ok(PersistentTmuxDiscovery::Ambiguous {
+                    reason: "live tmux server has no readable Phoenix token".to_string(),
+                }),
+            },
+        }
     }
 
     /// # Errors
