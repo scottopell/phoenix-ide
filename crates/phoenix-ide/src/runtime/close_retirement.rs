@@ -127,6 +127,15 @@ impl RuntimeManager {
                 RetiredResourceKind::TmuxServer,
                 tmux.instance.stable_identity(),
             ));
+        } else if let Some(identity) = self
+            .tmux_registry()
+            .discover_persistent_identity(&key)
+            .await
+        {
+            resources.push(opaque_resource(
+                RetiredResourceKind::TmuxServer,
+                identity.stable_identity(),
+            ));
         }
         if let Some(instance) = &terminal.instance {
             resources.push(opaque_resource(
@@ -307,10 +316,18 @@ impl RuntimeManager {
                 !retired.contains(&(target.scope.clone(), resource_key(&target.resource)))
             })
             .collect::<Vec<_>>();
-        let scopes = runtime_targets
+        let mut scopes = runtime_targets
             .iter()
             .map(|target| target.scope.clone())
             .collect::<std::collections::BTreeSet<_>>();
+        scopes.extend(
+            self.close_retirement_leases
+                .lock()
+                .await
+                .keys()
+                .filter(|(lease_attempt, _)| lease_attempt == attempt_id.as_str())
+                .map(|(_, scope)| scope.clone()),
+        );
         for scope in scopes {
             let expected = runtime_targets
                 .iter()
@@ -418,10 +435,6 @@ impl RuntimeManager {
                 }
                 continue;
             }
-            if expected.is_empty() {
-                self.cancel_close_resource_lease(&attempt_id, &scope).await;
-                continue;
-            }
             for resource in &expected {
                 self.db()
                     .record_close_retirement_dispatch(RecordCloseRetirementDispatchRequest {
@@ -451,6 +464,9 @@ impl RuntimeManager {
                         .await;
                 }
             };
+            if expected.is_empty() {
+                continue;
+            }
             let expected_keys = expected
                 .iter()
                 .map(resource_key)

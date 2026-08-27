@@ -7530,8 +7530,42 @@ ALTER TABLE close_expected_retirement_resources DROP COLUMN runtime_resource_ins
 DROP TRIGGER IF EXISTS runtime_resource_instances_preserve_identity;
 DROP INDEX IF EXISTS runtime_resource_instances_live_exact_identity;
 DROP TABLE runtime_resource_instances;
+DROP TRIGGER IF EXISTS close_expected_retirement_resources_reject_standalone_delete;
+DELETE FROM close_retirement_resource_dispatches
+WHERE resource_kind IN ('bash_process_group', 'pty_session', 'browser_session');
 DELETE FROM close_expected_retirement_resources
 WHERE resource_kind IN ('bash_process_group', 'pty_session', 'browser_session');
+CREATE TRIGGER close_expected_retirement_resources_reject_standalone_delete
+BEFORE DELETE ON close_expected_retirement_resources
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM close_obligations obligation
+    JOIN conversations root ON root.id = obligation.root_conversation_id
+    WHERE obligation.attempt_id = OLD.attempt_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'expected retirement resource can only be deleted with its root');
+END;
+
+CREATE TABLE product_conversation_work_scope_repairs (
+    work_scope_id TEXT PRIMARY KEY REFERENCES work_scopes(id) ON DELETE RESTRICT,
+    first_product_conversation_id TEXT NOT NULL REFERENCES product_conversations(id) ON DELETE RESTRICT,
+    second_product_conversation_id TEXT NOT NULL REFERENCES product_conversations(id) ON DELETE RESTRICT,
+    state TEXT NOT NULL CHECK (state = 'needs_repair'),
+    CHECK (first_product_conversation_id <> second_product_conversation_id)
+);
+
+INSERT INTO product_conversation_work_scope_repairs (
+    work_scope_id, first_product_conversation_id, second_product_conversation_id, state
+)
+SELECT c.work_scope_id, MIN(c.product_conversation_id), MAX(c.product_conversation_id), 'needs_repair'
+FROM conversations c
+JOIN product_conversations product ON product.id = c.product_conversation_id
+WHERE c.work_scope_id IS NOT NULL
+  AND c.runtime_role = 'user'
+  AND product.kind = 'ordinary'
+GROUP BY c.work_scope_id
+HAVING COUNT(DISTINCT c.product_conversation_id) > 1;
 
 CREATE TABLE product_conversation_work_scopes (
     work_scope_id TEXT PRIMARY KEY REFERENCES work_scopes(id) ON DELETE RESTRICT,
@@ -7546,7 +7580,34 @@ JOIN product_conversations product ON product.id = c.product_conversation_id
 WHERE c.work_scope_id IS NOT NULL
   AND c.runtime_role = 'user'
   AND product.kind = 'ordinary'
-GROUP BY c.work_scope_id;
+GROUP BY c.work_scope_id
+HAVING COUNT(DISTINCT c.product_conversation_id) = 1;
+
+CREATE TRIGGER conversations_reject_repair_scope_owner
+BEFORE INSERT ON conversations
+FOR EACH ROW
+WHEN NEW.work_scope_id IS NOT NULL
+ AND NEW.runtime_role <> 'coordinator'
+ AND EXISTS (
+    SELECT 1 FROM product_conversation_work_scope_repairs
+    WHERE work_scope_id = NEW.work_scope_id
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'work scope has unresolved product conversation ownership repair');
+END;
+
+CREATE TRIGGER conversations_reject_repair_scope_owner_on_update
+BEFORE UPDATE OF product_conversation_id, work_scope_id, runtime_role ON conversations
+FOR EACH ROW
+WHEN NEW.work_scope_id IS NOT NULL
+ AND NEW.runtime_role <> 'coordinator'
+ AND EXISTS (
+    SELECT 1 FROM product_conversation_work_scope_repairs
+    WHERE work_scope_id = NEW.work_scope_id
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'work scope has unresolved product conversation ownership repair');
+END;
 
 CREATE TRIGGER conversations_assign_or_validate_work_scope_owner
 BEFORE INSERT ON conversations
@@ -7564,6 +7625,30 @@ BEGIN
         WHERE work_scope_id = NEW.work_scope_id
           AND product_conversation_id = NEW.product_conversation_id
     ) THEN RAISE(ABORT, 'work scope belongs to a different ordinary product conversation') END;
+END;
+
+CREATE TRIGGER conversations_validate_participant_work_scope_owner
+BEFORE INSERT ON conversations
+FOR EACH ROW
+WHEN NEW.work_scope_id IS NOT NULL AND NEW.runtime_role = 'sub_agent'
+BEGIN
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1 FROM product_conversation_work_scopes
+        WHERE work_scope_id = NEW.work_scope_id
+          AND product_conversation_id = NEW.product_conversation_id
+    ) THEN RAISE(ABORT, 'work scope participant belongs to a different product conversation') END;
+END;
+
+CREATE TRIGGER conversations_validate_participant_work_scope_owner_on_update
+BEFORE UPDATE OF product_conversation_id, work_scope_id, runtime_role ON conversations
+FOR EACH ROW
+WHEN NEW.work_scope_id IS NOT NULL AND NEW.runtime_role = 'sub_agent'
+BEGIN
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1 FROM product_conversation_work_scopes
+        WHERE work_scope_id = NEW.work_scope_id
+          AND product_conversation_id = NEW.product_conversation_id
+    ) THEN RAISE(ABORT, 'work scope participant belongs to a different product conversation') END;
 END;
 
 CREATE TRIGGER conversations_validate_work_scope_owner_on_update
@@ -7890,20 +7975,6 @@ async fn migration_065_preflight(tx: &mut Transaction<'_, Sqlite>) -> DbResult<(
     })
 }
 
-async fn migration_080_preflight(tx: &mut Transaction<'_, Sqlite>) -> DbResult<()> {
-    let conflict: Option<(String, String, String)> = sqlx::query_as(
-        "SELECT work_scope_id, MIN(product_conversation_id), MAX(product_conversation_id)\n         FROM conversations\n         WHERE work_scope_id IS NOT NULL AND runtime_role = 'user'\n         GROUP BY work_scope_id\n         HAVING COUNT(DISTINCT product_conversation_id) > 1\n         ORDER BY work_scope_id\n         LIMIT 1",
-    )
-    .fetch_optional(&mut **tx)
-    .await?;
-    if let Some((scope, first, second)) = conflict {
-        return Err(DbError::Serialization(format!(
-            "migration 80 cannot assign WorkScope {scope} to both ProductConversations {first} and {second}"
-        )));
-    }
-    Ok(())
-}
-
 async fn migration_080_prepare(tx: &mut Transaction<'_, Sqlite>) -> DbResult<bool> {
     let has_product_conversation: bool = sqlx::query_scalar(
         "SELECT EXISTS(\n            SELECT 1 FROM pragma_table_info('conversations')\n            WHERE name = 'product_conversation_id'\n        )",
@@ -7913,7 +7984,6 @@ async fn migration_080_prepare(tx: &mut Transaction<'_, Sqlite>) -> DbResult<boo
     if !has_product_conversation {
         return Ok(false);
     }
-    migration_080_preflight(tx).await?;
     Ok(true)
 }
 

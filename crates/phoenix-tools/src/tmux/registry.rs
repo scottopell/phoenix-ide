@@ -568,6 +568,29 @@ impl TmuxRegistry {
     ///   registry init.
     /// - Other [`TmuxError`] variants when the probe / unlink / spawn / mkdir
     ///   steps fail.
+    /// Discovers a running persistent tmux server without creating, adopting, or
+    /// mutating one. Close uses this only to seal a durable token/socket pair.
+    pub async fn discover_persistent_identity(
+        &self,
+        work_scope: &ResourceScopeKey,
+    ) -> Option<TmuxServerInstanceIdentity> {
+        let socket_path = match work_scope {
+            ResourceScopeKey::Work(id) => {
+                socket_path_for_worktree(&self.socket_dir, Path::new(id.as_str()))
+            }
+            ResourceScopeKey::Unattached(conversation_id) => {
+                socket_path_for(&self.socket_dir, conversation_id)
+            }
+            ResourceScopeKey::Coordinator => socket_path_for_coordinator(&self.socket_dir),
+            ResourceScopeKey::GlobalTerminal => socket_path_for_global(&self.socket_dir),
+        };
+        let server_token = read_server_token(&socket_path).await?;
+        Some(TmuxServerInstanceIdentity {
+            socket_path,
+            server_token,
+        })
+    }
+
     #[allow(clippy::too_many_lines)]
     pub async fn ensure_live(
         &self,
@@ -1224,6 +1247,15 @@ impl TmuxRegistry {
         if !exact_owned {
             return self.verify_exact_absence(permit).await;
         }
+        if read_server_token(&permit.instance.socket_path)
+            .await
+            .as_deref()
+            != Some(permit.instance.server_token.as_str())
+        {
+            return Ok(TmuxRetirementOutcome::Residual {
+                reason: "tmux server token changed before exact teardown".to_string(),
+            });
+        }
 
         let kill_error = if self.binary_available {
             match tokio::process::Command::new("tmux")
@@ -1385,7 +1417,26 @@ impl TmuxRegistry {
             };
         }
 
-        let had_entry = self.get_existing(work_scope).await.is_some();
+        let existing = self.get_existing(work_scope).await;
+        if existing.is_none() {
+            return CascadeReport {
+                socket_path: self.derived_socket_path(work_scope),
+                kill_server_error: None,
+                unlink_error: None,
+            };
+        }
+        let had_entry = true;
+        if let Some(entry) = existing {
+            if entry.read().await.status == ServerStatus::NotProbed {
+                self.inner.write().await.remove(&work_scope.stable_key());
+                self.emit_lifecycle(work_scope);
+                return CascadeReport {
+                    socket_path: self.derived_socket_path(work_scope),
+                    kill_server_error: None,
+                    unlink_error: None,
+                };
+            }
+        }
         let permit = self
             .begin_retirement_inner(
                 work_scope,
