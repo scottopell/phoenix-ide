@@ -109,6 +109,36 @@ impl RuntimeManager {
                     if !path.try_exists().map_err(|error| {
                         format!("cannot observe captured worktree path: {error}")
                     })? {
+                        let obligation = self
+                            .db()
+                            .get_close_obligation(attempt_id.as_str())
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        if let Some(prior_snapshot) = obligation.snapshot().cloned() {
+                            let worktree = RetiredResourceIdentity::parse(
+                                RetiredResourceKind::Worktree,
+                                LossItemIdentity::Worktree(identity.clone()),
+                            )
+                            .map_err(|error| error.to_string())?;
+                            if self
+                                .db()
+                                .close_retirement_resource_was_dispatched(
+                                    &attempt_id,
+                                    &scope.scope,
+                                    &prior_snapshot,
+                                    &worktree,
+                                )
+                                .await
+                                .map_err(|error| error.to_string())?
+                            {
+                                if continue_clean_retirement
+                                    && obligation.phase() == ClosePhase::RetirementRequested
+                                {
+                                    self.retire_close_runtime_resources(attempt_id).await?;
+                                }
+                                return Ok(prior_snapshot);
+                            }
+                        }
                         self.db()
                             .route_close_attempt_to_repair(&attempt_id)
                             .await
@@ -669,7 +699,12 @@ impl RuntimeManager {
             }
         }
         self.retire_close_worktrees_and_scopes(&attempt_id, &snapshot)
+            .await?;
+        self.db()
+            .complete_close_retirement(&attempt_id)
             .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_lines)]

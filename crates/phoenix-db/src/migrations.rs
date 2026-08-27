@@ -8233,6 +8233,15 @@ WHEN NEW.proof_kind = 'absence_adopted' AND NOT EXISTS (
       AND proof.identity_value = NEW.identity_value
       AND NEW.absence_basis = 'preexisting_exact_identity_evidence'
       AND proof.attempt_id <> NEW.attempt_id
+      AND EXISTS (
+          SELECT 1
+          FROM close_attempt_members proof_member
+          JOIN conversations proof_conversation ON proof_conversation.id = proof_member.conversation_id
+          JOIN close_attempt_members current_member ON current_member.attempt_id = NEW.attempt_id
+          JOIN conversations current_conversation ON current_conversation.id = current_member.conversation_id
+          WHERE proof_member.attempt_id = proof.attempt_id
+            AND proof_conversation.product_conversation_id = current_conversation.product_conversation_id
+      )
       AND proof.proof_kind IN ('retired', 'absence_adopted')
     UNION ALL
     SELECT 1 FROM close_retirement_resources proof
@@ -8284,6 +8293,15 @@ WHEN NEW.proof_kind = 'absence_adopted'
       AND proof.identity_value = NEW.identity_value
       AND NEW.absence_basis = 'preexisting_exact_identity_evidence'
       AND proof.attempt_id <> NEW.attempt_id
+      AND EXISTS (
+          SELECT 1
+          FROM close_attempt_members proof_member
+          JOIN conversations proof_conversation ON proof_conversation.id = proof_member.conversation_id
+          JOIN close_attempt_members current_member ON current_member.attempt_id = NEW.attempt_id
+          JOIN conversations current_conversation ON current_conversation.id = current_member.conversation_id
+          WHERE proof_member.attempt_id = proof.attempt_id
+            AND proof_conversation.product_conversation_id = current_conversation.product_conversation_id
+      )
       AND proof.proof_kind IN ('retired', 'absence_adopted')
     UNION ALL
     SELECT 1 FROM close_retirement_resources proof

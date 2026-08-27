@@ -2814,6 +2814,53 @@ impl Database {
         Ok(())
     }
 
+    /// Completes one fully retired Close attempt and archives its captured members.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] when the attempt is absent, not retirement-ready, or persistence fails.
+    pub async fn complete_close_retirement(
+        &self,
+        attempt_id: &CloseAttemptId,
+    ) -> DbResult<CloseObligation> {
+        let mut tx = self.pool.begin().await?;
+        let obligation = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
+        if obligation.phase() != ClosePhase::RetirementRequested {
+            return Err(close_precondition(format!(
+                "attempt {attempt_id} completion requires retirement_requested"
+            )));
+        }
+        let now = Utc::now().to_rfc3339();
+        let completed = sqlx::query(
+            "UPDATE close_obligations
+             SET phase = 'completed', close_outcome = 'archived',
+                 completed_at = ?2, updated_at = ?2
+             WHERE attempt_id = ?1 AND phase = 'retirement_requested'",
+        )
+        .bind(attempt_id.as_str())
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        if completed.rows_affected() != 1 {
+            return Err(close_precondition(format!(
+                "attempt {attempt_id} completion lost retirement authority"
+            )));
+        }
+        sqlx::query(
+            "UPDATE conversations
+             SET archived = 1, updated_at = ?2
+             WHERE id IN (
+                 SELECT conversation_id FROM close_attempt_members WHERE attempt_id = ?1
+             )",
+        )
+        .bind(attempt_id.as_str())
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        let obligation = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
+        tx.commit().await?;
+        Ok(obligation)
+    }
+
     /// Reopens one repairable Close attempt for exact retirement retry.
     ///
     /// # Errors

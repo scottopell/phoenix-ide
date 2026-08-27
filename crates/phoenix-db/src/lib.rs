@@ -2001,6 +2001,11 @@ impl Database {
                     JOIN conversations predecessor ON predecessor.continued_in_conv_id = successor.id
                     WHERE successor.work_scope_id = ?1 AND successor.runtime_role = 'user'
                       AND successor.archived = 0
+                      AND (?2 IS NULL OR NOT EXISTS (
+                          SELECT 1 FROM close_attempt_members member
+                          WHERE member.attempt_id = ?2
+                            AND member.conversation_id = successor.id
+                      ))
                  )",
             ),
             (
@@ -2024,6 +2029,7 @@ impl Database {
         for (blocker, query) in blockers {
             if sqlx::query_scalar::<_, i64>(query)
                 .bind(scope_id.as_str())
+                .bind(close_attempt_id.map(CloseAttemptId::as_str))
                 .fetch_one(&mut *tx)
                 .await?
                 != 0
