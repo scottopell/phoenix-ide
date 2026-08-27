@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { api, ExpansionError } from '../api';
 import { subscribeModels } from '../modelsPoller';
 import type { CreateProductConversationRequest, ImageData, ModelEffort, ModelsResponse, RecentManagementRootSuggestion } from '../api';
@@ -11,10 +11,12 @@ const LAST_CWD_KEY = 'phoenix-last-cwd';
 const LAST_MODEL_KEY = 'phoenix-last-model';
 const NEW_CONVERSATION_DRAFT_KEY = 'phoenix-new-conversation-draft';
 const REPLAY_CREATE_REQUEST_KEY = 'phoenix-replay-product-create-request';
+const REPLAY_CREATE_INTENT_KEY = 'phoenix-replay-product-create-intent';
 
 export function beginNewProductConversationIntent(): void {
   try {
     localStorage.removeItem(REPLAY_CREATE_REQUEST_KEY);
+    localStorage.removeItem(REPLAY_CREATE_INTENT_KEY);
     localStorage.removeItem('phoenix-pending-product-create-request');
   } catch { /* best effort */ }
 }
@@ -73,13 +75,16 @@ function clearNewConversationDraft(): void {
 }
 
 export function useCreateConversation(navigate: (path: string) => void) {
-  const requestId = useMemo(() => {
+  const [requestId, setRequestId] = useState(() => {
     try {
       const replay = localStorage.getItem(REPLAY_CREATE_REQUEST_KEY);
       if (replay) return replay;
     } catch { /* use a fresh in-memory identity */ }
     return generateUUID();
-  }, []);
+  });
+  const replayIntentRef = useRef<string | null>((() => {
+    try { return localStorage.getItem(REPLAY_CREATE_INTENT_KEY); } catch { return null; }
+  })());
   const [homeDir, setHomeDir] = useState<string>('');
   const [cwd, setCwd] = useState(() => localStorage.getItem(LAST_CWD_KEY) || '');
   const [dirStatus, setDirStatus] = useState<DirStatus>(() =>
@@ -236,8 +241,23 @@ export function useCreateConversation(navigate: (path: string) => void) {
         setCreating(false);
         return;
       }
+      const immutableIntent = JSON.stringify({
+        cwd: trimmedCwd,
+        objective: trimmed,
+        model: selectedModel,
+        effort: selectedEffort,
+        images,
+      });
+      let activeRequestId = requestId;
+      if (replayIntentRef.current !== null && replayIntentRef.current !== immutableIntent) {
+        activeRequestId = generateUUID();
+        setRequestId(activeRequestId);
+        try { localStorage.setItem(REPLAY_CREATE_REQUEST_KEY, activeRequestId); } catch { /* in-memory identity remains stable */ }
+      }
+      replayIntentRef.current = immutableIntent;
+      try { localStorage.setItem(REPLAY_CREATE_INTENT_KEY, immutableIntent); } catch { /* in-memory intent remains stable */ }
       const createRequest: CreateProductConversationRequest = {
-        request_id: requestId,
+        request_id: activeRequestId,
         cwd: trimmedCwd,
         objective: trimmed,
         model: selectedModel,
@@ -249,7 +269,10 @@ export function useCreateConversation(navigate: (path: string) => void) {
       setImages([]);
       setFiles([]);
       clearNewConversationDraft();
-      try { localStorage.removeItem(REPLAY_CREATE_REQUEST_KEY); } catch { /* best effort after success */ }
+      try {
+        localStorage.removeItem(REPLAY_CREATE_REQUEST_KEY);
+        localStorage.removeItem(REPLAY_CREATE_INTENT_KEY);
+      } catch { /* best effort after success */ }
       navigate(response.canonical_route);
     } catch (err) {
       setCreating(false);

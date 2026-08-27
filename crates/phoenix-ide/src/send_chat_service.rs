@@ -720,7 +720,9 @@ async fn lookup_durable_steering_replay(
                     "queued steering identity is missing its acceptance receipt".to_string(),
                 )
             })?;
-        validate_steering_fingerprint(&receipt, request_fingerprint)?;
+        if matches!(receipt, SteeringAcceptanceFingerprint::Exact(_)) {
+            validate_steering_fingerprint(&receipt, request_fingerprint)?;
+        }
         return Ok(Some(SendChatOutcome::QueuedAsSteering));
     }
     if let Some(outcome) = lookup_persisted_message_replay(db, req).await? {
@@ -1386,7 +1388,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_queued_steering_identity_conflicts_without_exact_acceptance_fingerprint() {
+    async fn legacy_queued_steering_identity_replays_when_payload_matches() {
         let req = request();
         let db = db_with_conversation(&req.conversation_id).await;
         let entry = phoenix_core::domain::sm_event::SteerEntry {
@@ -1402,11 +1404,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(matches!(
-            lookup_durable_steering_replay(&db, &req, &super::request_fingerprint(&req).unwrap(),)
-                .await,
-            Err(SendChatServiceError::IdempotencyConflict)
-        ));
+        assert_eq!(
+            lookup_durable_steering_replay(&db, &req, &super::request_fingerprint(&req).unwrap())
+                .await
+                .unwrap(),
+            Some(SendChatOutcome::QueuedAsSteering)
+        );
     }
 
     #[test]

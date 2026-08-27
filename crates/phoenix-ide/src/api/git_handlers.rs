@@ -2175,7 +2175,22 @@ pub(crate) async fn get_conversation_diff(
             ..
         } => (worktree_path.to_string(), base_branch.to_string()),
         ConvMode::DetachedApprovedTask { worktree_path, .. } => {
-            (worktree_path.to_string(), "HEAD".to_string())
+            let job = state
+                .db
+                .get_product_creation_job_for_conversation(&id)
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?
+                .ok_or_else(|| {
+                    AppError::Internal(
+                        "detached conversation is missing its creation job".to_string(),
+                    )
+                })?;
+            let starting_oid = job.staging_exact_oid.ok_or_else(|| {
+                AppError::Internal(
+                    "detached conversation is missing its immutable starting OID".to_string(),
+                )
+            })?;
+            (worktree_path.to_string(), starting_oid)
         }
         _ => {
             return Err(AppError::BadRequest(

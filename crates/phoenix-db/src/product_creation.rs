@@ -294,6 +294,23 @@ impl Database {
         .map_err(DbError::Sqlx)
     }
 
+    pub async fn get_product_creation_job_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<Option<ProductCreationJobRecord>> {
+        let request_id: Option<String> = sqlx::query_scalar(
+            "SELECT request_id FROM product_creation_jobs
+             WHERE published_conversation_id = ?1 LIMIT 1",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        match request_id {
+            Some(request_id) => self.get_product_creation_job(&request_id).await,
+            None => Ok(None),
+        }
+    }
+
     pub async fn accept_product_creation(
         &self,
         request_id: &str,
@@ -876,6 +893,7 @@ impl Database {
         .bind(scope_id.as_str())
         .execute(&mut *tx)
         .await?;
+        let commit_now = unix_micros_now();
         let updated = sqlx::query(
             "UPDATE product_creation_jobs
              SET status = 'delivery_pending', retry_at_unix_micros = NULL, staging_path = ?2,
@@ -883,7 +901,8 @@ impl Database {
                  published_product_id = ?5, published_conversation_id = ?6,
                  delivery_retry_at_unix_micros = ?7, updated_at_unix_micros = ?8
              WHERE request_id = ?1 AND status = 'claimed' AND claim_generation = ?9
-               AND claim_worker_id = ?10 AND claim_token = ?11",
+               AND claim_worker_id = ?10 AND claim_token = ?11
+               AND claim_lease_until_unix_micros > ?8",
         )
         .bind(&input.request_id)
         .bind(match &input.environment {
@@ -907,8 +926,8 @@ impl Database {
         )
         .bind(input.conversation.product_conversation_id.as_str())
         .bind(&input.conversation.id)
-        .bind(now + 2_000_000)
-        .bind(now)
+        .bind(commit_now + 2_000_000)
+        .bind(commit_now)
         .bind(input.claim.generation)
         .bind(&input.claim.worker_id)
         .bind(&input.claim.token)
@@ -1240,7 +1259,7 @@ impl Database {
         sqlx::query(
             "UPDATE product_creation_resource_reservations
              SET generation = ?3, status = 'cleanup_required', updated_at_unix_micros = ?2
-             WHERE request_id = ?1 AND status IN ('reserved', 'present')",
+             WHERE request_id = ?1 AND status IN ('reserved', 'present', 'cleanup_required')",
         )
         .bind(request_id)
         .bind(now_micros)
@@ -1295,7 +1314,7 @@ impl Database {
         sqlx::query(
             "UPDATE product_creation_resource_reservations
              SET generation = ?3, status = 'cleanup_required', updated_at_unix_micros = ?2
-             WHERE request_id = ?1 AND status IN ('reserved', 'present')",
+             WHERE request_id = ?1 AND status IN ('reserved', 'present', 'cleanup_required')",
         )
         .bind(request_id)
         .bind(now_micros)
