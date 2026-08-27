@@ -754,15 +754,32 @@ impl BrowserSession {
         executable: Option<&Path>,
     ) -> Result<Self, BrowserError> {
         let user_data_dir = prepare_profile_dir_for_launch(tmp_root, scope_key)?;
-        let config = Self::browser_config(&user_data_dir, executable)?;
+        let cleanup_unmarked_profile = || {
+            if !profile_marker_path(&user_data_dir).exists() {
+                let _ = std::fs::remove_dir_all(&user_data_dir);
+            }
+        };
+        let config = match Self::browser_config(&user_data_dir, executable) {
+            Ok(config) => config,
+            Err(error) => {
+                cleanup_unmarked_profile();
+                return Err(error);
+            }
+        };
 
         // Browser::launch can hang on a wedged chromium subprocess. Bound it.
         // If launch itself times out there is no browser handle to clean up.
         let (mut browser, mut handler) =
             match tokio::time::timeout(SESSION_INIT_TIMEOUT, Browser::launch(config)).await {
                 Ok(Ok(pair)) => pair,
-                Ok(Err(e)) => return Err(BrowserError::LaunchFailed(e.to_string())),
-                Err(_) => return Err(BrowserError::InitTimeout(SESSION_INIT_TIMEOUT)),
+                Ok(Err(e)) => {
+                    cleanup_unmarked_profile();
+                    return Err(BrowserError::LaunchFailed(e.to_string()));
+                }
+                Err(_) => {
+                    cleanup_unmarked_profile();
+                    return Err(BrowserError::InitTimeout(SESSION_INIT_TIMEOUT));
+                }
             };
         let chrome_pid = browser
             .get_mut_child()

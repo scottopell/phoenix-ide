@@ -1393,20 +1393,23 @@ async fn remove_exact_worktree(identity: &WorktreeIdentity) -> Result<(), String
         if !common.status.success() {
             return Ok::<_, std::io::Error>((None, false, false));
         }
-        let common = PathBuf::from(String::from_utf8_lossy(&common.stdout).trim());
+        let common = path_buf_from_git_bytes(common.stdout.trim_ascii());
         let Some(repo) = common.parent().map(Path::to_path_buf) else {
             return Ok((None, false, false));
         };
         let target = std::fs::canonicalize(&path_for_check)?;
         let listed = phoenix_core::git::command()
-            .args(["worktree", "list", "--porcelain"])
+            .args(["worktree", "list", "--porcelain", "-z"])
             .current_dir(&repo)
             .output()?;
         let registered = listed.status.success()
-            && String::from_utf8_lossy(&listed.stdout).lines().any(|line| {
-                line.strip_prefix("worktree ").is_some_and(|candidate| {
-                    std::fs::canonicalize(candidate).ok().as_ref() == Some(&target)
-                })
+            && listed.stdout.split(|byte| *byte == 0).any(|field| {
+                field
+                    .strip_prefix(b"worktree ")
+                    .map(path_buf_from_git_bytes)
+                    .and_then(|candidate| std::fs::canonicalize(candidate).ok())
+                    .as_ref()
+                    == Some(&target)
             });
         let fingerprint_matches =
             observe_worktree_fingerprint(&path_for_check).as_deref() == Some(expected.as_str());

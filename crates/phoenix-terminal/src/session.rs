@@ -467,16 +467,12 @@ impl ActiveTerminals {
         &self,
         permit: &TerminalRetirementPermit,
     ) -> TerminalRetirementOutcome {
-        let (handle, relay_attached) = {
+        let handle = {
             let mut map = self.0.lock().expect("terminal registry poisoned");
             if !Self::matches_exact_instance(&map, permit) {
                 return Self::verify_exact_absence(&map, permit);
             }
-            let handle = map.handles.remove(&permit.work_scope);
-            let relay_attached = handle
-                .as_ref()
-                .is_some_and(|handle| handle.attach_permit.available_permits() == 0);
-            (handle, relay_attached)
+            map.handles.remove(&permit.work_scope)
         };
 
         let Some(handle) = handle else {
@@ -488,13 +484,13 @@ impl ActiveTerminals {
         let _ = handle.stop_tx.send(StopReason::TearDown);
         drop(handle);
 
-        if !relay_attached {
-            let _ = tokio::task::spawn_blocking(move || {
-                let _ = nix::sys::wait::waitpid(child_pid, None);
-            })
-            .await;
+        let wait_outcome =
+            tokio::task::spawn_blocking(move || nix::sys::wait::waitpid(child_pid, None)).await;
+        if wait_outcome.is_err() {
+            return TerminalRetirementOutcome::Residual {
+                reason: "terminal child exit observation failed".to_string(),
+            };
         }
-
         let map = self.0.lock().expect("terminal registry poisoned");
         match Self::verify_exact_absence(&map, permit) {
             TerminalRetirementOutcome::AbsenceVerified if permit.had_entry => {

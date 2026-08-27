@@ -1291,6 +1291,9 @@ impl TmuxRegistry {
         &self,
         permit: &TmuxRetirementPermit,
     ) -> Result<TmuxRetirementOutcome, TmuxError> {
+        if !permit.had_entry {
+            return Ok(TmuxRetirementOutcome::AbsenceVerified);
+        }
         let current_entry = {
             let map = self.inner.read().await;
             map.get(&permit.work_scope.stable_key()).cloned()
