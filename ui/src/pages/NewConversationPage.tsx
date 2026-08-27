@@ -20,6 +20,7 @@ const TerminalPanel = lazy(() =>
 );
 
 const GLOBAL_TERMINAL_COLLAPSED_PX = 32;
+const DIRECT_CREATION_RESOLUTION = { kind: 'direct' } as const;
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -74,7 +75,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   const ir = useInlineReferences({
     cwd: conv.cwd,
     discoveryReady: inlineReferenceRootReady,
-    resolution: { kind: 'direct' },
+    resolution: DIRECT_CREATION_RESOLUTION,
     // The new-conversation composer's identity is its directory: switching the
     // chosen directory resets the dropdown / inline error.
     scopeKey: conv.cwd,
