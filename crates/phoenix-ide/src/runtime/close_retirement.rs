@@ -860,64 +860,65 @@ async fn inspect_worktree(
     Ok((snapshot_for(&observation), losses))
 }
 
+type WorktreeObservation = Vec<(Vec<u8>, Vec<u8>)>;
+
 async fn observe_detached_head_and_submodules(
     path: &Path,
     observation: &mut Vec<u8>,
     losses: &mut Vec<CloseLossItem>,
 ) -> Result<(), String> {
     let path = path.to_path_buf();
-    let observed =
-        tokio::task::spawn_blocking(move || -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
-            let head = phoenix_core::git::command()
-                .args(["rev-parse", "--verify", "HEAD"])
+    let observed = tokio::task::spawn_blocking(move || -> Result<WorktreeObservation, String> {
+        let head = phoenix_core::git::command()
+            .args(["rev-parse", "--verify", "HEAD"])
+            .current_dir(&path)
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !head.status.success() {
+            return Err(String::from_utf8_lossy(&head.stderr).trim().to_string());
+        }
+        let head_oid = head.stdout.trim_ascii().to_vec();
+        let detached = !phoenix_core::git::command()
+            .args(["symbolic-ref", "-q", "HEAD"])
+            .current_dir(&path)
+            .status()
+            .map_err(|error| error.to_string())?
+            .success();
+        let mut result = Vec::new();
+        result.push((b"HEAD".to_vec(), head_oid.clone()));
+        if detached {
+            let reachable = phoenix_core::git::command()
+                .args([
+                    "for-each-ref",
+                    "--contains",
+                    std::str::from_utf8(&head_oid).map_err(|error| error.to_string())?,
+                    "--format=%(refname)",
+                    "refs/heads",
+                    "refs/remotes",
+                    "refs/tags",
+                ])
                 .current_dir(&path)
                 .output()
                 .map_err(|error| error.to_string())?;
-            if !head.status.success() {
-                return Err(String::from_utf8_lossy(&head.stderr).trim().to_string());
+            if !reachable.status.success() {
+                return Err(String::from_utf8_lossy(&reachable.stderr)
+                    .trim()
+                    .to_string());
             }
-            let head_oid = head.stdout.trim_ascii().to_vec();
-            let detached = !phoenix_core::git::command()
-                .args(["symbolic-ref", "-q", "HEAD"])
-                .current_dir(&path)
-                .status()
-                .map_err(|error| error.to_string())?
-                .success();
-            let mut result = Vec::new();
-            result.push((b"HEAD".to_vec(), head_oid.clone()));
-            if detached {
-                let reachable = phoenix_core::git::command()
-                    .args([
-                        "for-each-ref",
-                        "--contains",
-                        std::str::from_utf8(&head_oid).map_err(|error| error.to_string())?,
-                        "--format=%(refname)",
-                        "refs/heads",
-                        "refs/remotes",
-                        "refs/tags",
-                    ])
-                    .current_dir(&path)
-                    .output()
-                    .map_err(|error| error.to_string())?;
-                if !reachable.status.success() {
-                    return Err(String::from_utf8_lossy(&reachable.stderr)
-                        .trim()
-                        .to_string());
-                }
-                result.push((b"DETACHED".to_vec(), reachable.stdout));
-            }
-            let modules = phoenix_core::git::command()
-                .args(["submodule", "status", "--recursive"])
-                .current_dir(&path)
-                .output()
-                .map_err(|error| error.to_string())?;
-            if modules.status.success() {
-                result.push((b"SUBMODULES".to_vec(), modules.stdout));
-            }
-            Ok(result)
-        })
-        .await
-        .map_err(|error| error.to_string())??;
+            result.push((b"DETACHED".to_vec(), reachable.stdout));
+        }
+        let modules = phoenix_core::git::command()
+            .args(["submodule", "status", "--recursive"])
+            .current_dir(&path)
+            .output()
+            .map_err(|error| error.to_string())?;
+        if modules.status.success() {
+            result.push((b"SUBMODULES".to_vec(), modules.stdout));
+        }
+        Ok(result)
+    })
+    .await
+    .map_err(|error| error.to_string())??;
     let head_oid = observed
         .iter()
         .find_map(|(tag, value)| (tag == b"HEAD").then_some(value.clone()));
