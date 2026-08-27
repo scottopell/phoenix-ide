@@ -438,6 +438,10 @@ impl RuntimeManager {
         &self,
         attempt_id: CloseAttemptId,
     ) -> Result<(), String> {
+        let _execution = self
+            .close_retirement_execution
+            .lock(attempt_id.as_str())
+            .await;
         let obligation = self
             .db()
             .get_close_obligation(attempt_id.as_str())
@@ -1212,10 +1216,20 @@ async fn observe_detached_head_and_submodules(
                     .map_err(|error| error.to_string())?,
             ));
         }
-        if let Some(path) = tag.strip_prefix(b"SUBMODULE_DIRTY\0") {
-            losses.push(CloseLossItem::InitializedSubmoduleState(
-                git_path_from_observation(path)?,
-            ));
+        if let Some(record) = tag.strip_prefix(b"SUBMODULE_LOSS\0") {
+            let separator = record
+                .iter()
+                .position(|byte| *byte == 0)
+                .ok_or_else(|| "malformed submodule loss record".to_string())?;
+            let category = &record[..separator];
+            let path = git_path_from_observation(&record[separator + 1..])?;
+            losses.push(match category {
+                b"staged" => CloseLossItem::StagedTrackedPath(path),
+                b"unstaged" => CloseLossItem::UnstagedTrackedPath(path),
+                b"untracked" => CloseLossItem::UntrackedNonIgnoredPath(path),
+                b"submodule" => CloseLossItem::InitializedSubmoduleState(path),
+                _ => return Err("unknown submodule loss category".to_string()),
+            });
         }
     }
     Ok(())
@@ -1317,6 +1331,7 @@ fn detached_reachability_evidence(repository: &Path, head_oid: &[u8]) -> Result<
     Ok(Vec::new())
 }
 
+#[allow(clippy::too_many_lines)]
 fn observe_initialized_submodules(
     repository: &Path,
     relative_prefix: &[u8],
@@ -1415,9 +1430,32 @@ fn observe_initialized_submodules(
             .stdout
             .first()
             .is_some_and(|prefix| matches!(prefix, b'+' | b'U'));
-        if gitlink_changed || detached_loss || !parse_status_losses(&status.stdout).is_empty() {
+        if gitlink_changed || detached_loss {
             observation.push((
-                [b"SUBMODULE_DIRTY\0".as_slice(), relative_path.as_slice()].concat(),
+                [
+                    b"SUBMODULE_LOSS\0submodule\0".as_slice(),
+                    relative_path.as_slice(),
+                ]
+                .concat(),
+                Vec::new(),
+            ));
+        }
+        for loss in parse_status_losses(&status.stdout) {
+            let (category, nested_path) = match loss {
+                CloseLossItem::StagedTrackedPath(path) => (b"staged".as_slice(), path),
+                CloseLossItem::UnstagedTrackedPath(path) => (b"unstaged".as_slice(), path),
+                CloseLossItem::UntrackedNonIgnoredPath(path) => (b"untracked".as_slice(), path),
+                _ => continue,
+            };
+            let full_path = join_git_paths(&relative_path, nested_path.as_bytes())?;
+            observation.push((
+                [
+                    b"SUBMODULE_LOSS\0".as_slice(),
+                    category,
+                    b"\0".as_slice(),
+                    full_path.as_slice(),
+                ]
+                .concat(),
                 Vec::new(),
             ));
         }
@@ -1438,12 +1476,9 @@ fn git_path_from_observation(bytes: &[u8]) -> Result<GitPathIdentity, String> {
         .map_err(|_| "observed Git path is not valid platform text".to_string())?;
     let path = path_buf_from_git_bytes(bytes);
     if path.is_absolute()
-        || path.components().any(|component| {
-            !matches!(
-                component,
-                std::path::Component::Normal(_) | std::path::Component::CurDir
-            )
-        })
+        || path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
     {
         return Err("observed Git path escapes its repository".to_string());
     }
@@ -1922,8 +1957,8 @@ mod tests {
         assert_ne!(clean_snapshot, dirty_snapshot);
         assert!(dirty_losses.iter().any(|loss| matches!(
             loss,
-            CloseLossItem::InitializedSubmoduleState(path)
-                if path.as_bytes() == b"deps/child"
+            CloseLossItem::UntrackedNonIgnoredPath(path)
+                if path.as_bytes() == b"deps/child/untracked"
         )));
     }
 
@@ -2023,6 +2058,12 @@ mod tests {
                 GitPathIdentity::from_bytes(b"new-name.txt".to_vec())
             )]
         );
+    }
+
+    #[test]
+    fn self_referential_git_path_is_rejected() {
+        assert!(git_path_from_observation(b".").is_err());
+        assert!(git_path_from_observation(b"./child").is_err());
     }
 
     #[test]

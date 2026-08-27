@@ -784,17 +784,23 @@ impl BrowserSession {
         let chrome_pid = browser
             .get_mut_child()
             .and_then(|child| child.as_mut_inner().id());
-        let chrome_process = chrome_pid.and_then(current_process_identity);
+        let Some(chrome_process) = chrome_pid.and_then(current_process_identity) else {
+            let _ = browser.kill().await;
+            let _ = std::fs::remove_dir_all(&user_data_dir);
+            return Err(BrowserError::LaunchFailed(
+                "could not capture Chrome process identity".to_string(),
+            ));
+        };
         let launch_identity = BrowserLaunchIdentity {
             launch_uuid: launch_uuid.to_string(),
-            chrome_process,
+            chrome_process: Some(chrome_process),
         };
-        if let Some(marker) = BrowserProfileMarker::from_launch(scope_key, &launch_identity) {
-            if let Err(error) = write_profile_marker_atomic(&user_data_dir, &marker) {
-                let _ = browser.kill().await;
-                let _ = std::fs::remove_dir_all(&user_data_dir);
-                return Err(error);
-            }
+        let marker = BrowserProfileMarker::from_launch(scope_key, &launch_identity)
+            .expect("launch identity contains a proven Chrome process");
+        if let Err(error) = write_profile_marker_atomic(&user_data_dir, &marker) {
+            let _ = browser.kill().await;
+            let _ = std::fs::remove_dir_all(&user_data_dir);
+            return Err(error);
         }
 
         let handler_task = tokio::spawn(async move {
@@ -844,7 +850,7 @@ impl BrowserSession {
         Ok(Self {
             browser,
             chrome_pid,
-            chrome_process,
+            chrome_process: Some(chrome_process),
             launch_identity,
             handler_task,
             console_task: None,

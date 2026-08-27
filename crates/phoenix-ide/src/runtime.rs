@@ -484,6 +484,7 @@ pub struct RuntimeManager {
     pub terminals: crate::terminal::ActiveTerminals,
     pub(crate) close_retirement_leases:
         AsyncMutex<HashMap<(String, WorkScopeId), close_retirement::CloseResourceLease>>,
+    close_retirement_execution: ConversationMutexGates,
     runtimes: RwLock<HashMap<String, ConversationHandle>>,
     /// Per-conversation single-flight results for slow runtime materialization.
     /// The mutex protects only map admission/removal; unrelated conversations
@@ -2126,6 +2127,7 @@ impl RuntimeManager {
             mcp_manager,
             terminals: crate::terminal::ActiveTerminals::new(),
             close_retirement_leases: AsyncMutex::new(HashMap::new()),
+            close_retirement_execution: ConversationMutexGates::default(),
             runtimes: RwLock::new(HashMap::new()),
             runtime_creations: AsyncMutex::new(HashMap::new()),
             conversation_admissions: AsyncMutex::new(HashMap::new()),

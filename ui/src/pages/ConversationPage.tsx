@@ -198,6 +198,7 @@ interface EmbeddedConversationHostProps {
   suppressMessageViewerOwner?: boolean;
   suppressTaskApprovalOwner?: boolean;
   onProjectionChange?: (projection: EmbeddedConversationProjection | null) => void;
+  onCloseCompleted?: () => void;
 }
 
 interface EmbeddedConversationPageProps extends ConversationPageProps, EmbeddedConversationHostProps {
@@ -221,6 +222,7 @@ export function EmbeddedConversationPage({
   ordinaryComposerEnabled = true,
   onProjectionChange,
   suppressMessageViewerOwner = false,
+  onCloseCompleted,
   suppressTaskApprovalOwner = false,
 }: EmbeddedConversationPageProps) {
   const navigate = useNavigate();
@@ -256,6 +258,7 @@ export function EmbeddedConversationPage({
         suppressMessageViewerOwner={suppressMessageViewerOwner}
         suppressTaskApprovalOwner={suppressTaskApprovalOwner}
         {...(onProjectionChange ? { onProjectionChange } : {})}
+        {...(onCloseCompleted ? { onCloseCompleted } : {})}
       />
     </ReviewNotesProvider>
   );
@@ -286,6 +289,7 @@ function ConversationPageContent({
   suppressCanonicalization,
   onProjectionChange,
   suppressMessageViewerOwner,
+  onCloseCompleted,
   suppressTaskApprovalOwner,
 }: {
   slug: string;
@@ -296,6 +300,7 @@ function ConversationPageContent({
   suppressCanonicalization: boolean;
   onProjectionChange?: (projection: EmbeddedConversationProjection | null) => void;
   suppressMessageViewerOwner: boolean;
+  onCloseCompleted?: () => void;
   suppressTaskApprovalOwner: boolean;
 }) {
   const { setConversationReadiness } = useConversationReadiness();
@@ -2500,6 +2505,7 @@ function ConversationPageContent({
             onSendMessage={handleSendTextOnly}
             showError={showError}
             prStatusHandle={prStatusHandle}
+            {...(onCloseCompleted ? { onCloseCompleted } : {})}
           />
         )}
         {credentialStatus && credentialStatus !== 'not_configured' && credentialStatus !== 'valid' && (

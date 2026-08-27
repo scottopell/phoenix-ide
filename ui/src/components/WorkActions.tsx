@@ -20,6 +20,7 @@ interface WorkControlBarProps {
   continuedInConvId: string | null | undefined;
   onSendMessage?: (text: string) => Promise<void> | void;
   showError?: (message: string) => void;
+  onCloseCompleted?: () => void;
   prStatusHandle: ConversationPrStatusHandle;
 }
 
@@ -30,6 +31,21 @@ function InfoHint({ text }: { text: string }) {
       <span role="tooltip">{text}</span>
     </details>
   );
+}
+
+function displayLossIdentity(identity: string): string {
+  const prefix = 'git_path_bytes_hex_v1:';
+  if (!identity.startsWith(prefix)) return identity;
+  const hex = identity.slice(prefix.length);
+  if (!/^(?:[0-9a-f]{2})+$/i.test(hex)) return identity;
+  const bytes = new Uint8Array(hex.match(/../g)?.map((pair) => Number.parseInt(pair, 16)) ?? []);
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {
+    return Array.from(bytes, (byte) => byte >= 0x20 && byte < 0x7f
+      ? String.fromCharCode(byte)
+      : `\\x${byte.toString(16).padStart(2, '0')}`).join('');
+  }
 }
 
 function CloseStatusPanel({
@@ -52,7 +68,7 @@ function CloseStatusPanel({
         <ul>
           {close.losses.map((loss) => (
             <li key={`${loss.scope}:${loss.generation}:${loss.category}:${loss.identity}`}>
-              <code>{loss.identity}</code> · {loss.category.replaceAll('_', ' ')}
+              <code>{loss.scope}: {displayLossIdentity(loss.identity)}</code> · {loss.category.replaceAll('_', ' ')}
             </li>
           ))}
         </ul>
@@ -221,6 +237,7 @@ export function WorkControlBar({
   onSendMessage,
   showError,
   prStatusHandle,
+  onCloseCompleted,
 }: WorkControlBarProps) {
   const [error, setError] = useState<string | null>(null);
   const [markingMerged, setMarkingMerged] = useState(false);
@@ -489,6 +506,7 @@ export function WorkControlBar({
     try {
       if (!(await terminalActionStillSafe())) return false;
       await api.markMerged(conversationId);
+      onCloseCompleted?.();
       return true;
     } catch (err) {
       return surfaceCloseConflict(err, 'Failed to close conversation');
@@ -503,6 +521,7 @@ export function WorkControlBar({
     try {
       if (!(await terminalActionStillSafe())) return false;
       await api.abandonTask(conversationId);
+      onCloseCompleted?.();
       return true;
     } catch (err) {
       return surfaceCloseConflict(err, 'Failed to close conversation');
@@ -524,6 +543,7 @@ export function WorkControlBar({
         inspection_fingerprint: inspection.fingerprint,
       });
       setCloseSnapshot(null);
+      onCloseCompleted?.();
     } catch (err) {
       await surfaceCloseConflict(err, 'Failed to confirm Close losses');
     } finally {
@@ -537,6 +557,7 @@ export function WorkControlBar({
     try {
       await api.retryCloseRetirement(conversationId);
       setCloseSnapshot(null);
+      onCloseCompleted?.();
     } catch (err) {
       await surfaceCloseConflict(err, 'Failed to retry Close retirement');
     } finally {
@@ -846,7 +867,7 @@ export function WorkControlBar({
                   if (await handleAbandon()) closeFallbackPanel();
                 }}
               >
-                Clean up
+                Abandon
               </button>
             )}
           </div>

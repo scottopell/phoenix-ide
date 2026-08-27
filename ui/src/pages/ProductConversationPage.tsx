@@ -817,6 +817,7 @@ function ProductConversationPageInner() {
                   suppressTaskApprovalOwner={true}
                   ordinaryComposerEnabled={isOpen}
                   onProjectionChange={setLatestProjection}
+                  onCloseCompleted={() => setSnapshotRetry((retry) => retry + 1)}
                 />
               </div>
             ) : (
