@@ -8117,6 +8117,47 @@ where
         plan: String,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<(), String> {
+        if matches!(
+            self.context.mode_context.as_ref(),
+            Some(ModeContext::DetachedApprovedTask { .. })
+        ) {
+            let tasks_dir_name = self.context.tasks_dir_name.clone();
+            let reviewed = reread_reviewed_task_handoff_snapshot(
+                self.context.filesystem_root(),
+                self.context.filesystem_root(),
+                &tasks_dir_name,
+                &task_file,
+                &title,
+                priority,
+                &plan,
+            )?;
+            let approval_msg = format!(
+                "Task approved in the existing detached worktree {}.\n\n## Approved plan: {}\n\nPriority: {}\n\n{}",
+                self.context.filesystem_root().display(),
+                reviewed.task_title,
+                priority,
+                plan,
+            );
+            let msg_id = uuid::Uuid::new_v4().to_string();
+            let content = MessageContent::User(crate::db::UserContent::meta(&approval_msg));
+            let seq = self.broadcast_tx.next_seq();
+            let msg = self
+                .storage
+                .add_message_with_seq(
+                    &msg_id,
+                    &self.context.conversation_id,
+                    seq,
+                    &content,
+                    None,
+                    None,
+                )
+                .await?;
+            let _ = self
+                .broadcast_tx
+                .admitted_publication(admitted)
+                .persisted_message(msg);
+            return Ok(());
+        }
         let cwd = self.context.filesystem_root().to_path_buf();
         let attached_repo_root = self
             .storage
