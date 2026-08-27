@@ -2,7 +2,7 @@
 
 ## User Story
 
-As a developer starting a Phoenix conversation, I need the conversation shell to appear immediately and provisioning to complete exactly once despite retries, process failure, or concurrent workers, so that creation never duplicates Git resources, corrupts conversation state, or leaves me without a recovery action.
+As a developer starting a Phoenix conversation, I need Phoenix to accept one durable creation job per request, publish the conversation only when its starting state is whole, and recover safely across retries or crashes, so that creation never duplicates Git resources, mutates the wrong repository state, or leaves me with an ambiguous starting workspace.
 
 ## Requirements
 
@@ -97,13 +97,13 @@ only loses an optimization, never correctness.
 
 ---
 
-### REQ-PROJ-017: Record Detached Default-Branch Provenance Without Mode Semantics
+### REQ-PROJ-017: Record One Pinned Starting Commit Without Fallback Semantics
 
 WHEN Phoenix provisions a Git-backed disposable worktree
-THE SYSTEM SHALL first produce a typed provisioning result that is either resolved(commit, canonical default-branch identity, freshness) or unresolved(error)
-AND SHALL record the repository's authoritative canonical default-branch identity and exact commit only in the resolved case
-AND SHALL record the worktree path and any approved task metadata needed for truthful UI and provenance only in the resolved case
-AND SHALL persist the unresolved failure reason without omitting it or encoding it as missing worktree metadata in the unresolved case
+THE SYSTEM SHALL resolve exactly one starting commit before materializing the worktree
+AND SHALL record that pinned exact commit together with the authoritative canonical default-branch identity that produced it
+AND SHALL record the worktree path only after materialization succeeds
+AND SHALL NOT persist a stale/local canonical fallback result, an unresolved provisioning result, or missing-as-implicit worktree metadata as creation success
 AND SHALL NOT require conversation ownership semantics to include a selected branch name, a dedicated branch-type discriminator, or a Phoenix-owned branch-lifecycle field
 
 THE Direct mode SHALL carry no Git-backed worktree metadata
@@ -112,38 +112,31 @@ WHEN a Git-backed conversation later closes
 THE SYSTEM SHALL release the same ProductConversation-scoped worktree according to the Close contract
 AND SHALL NOT infer any branch-ownership mutation from the recorded starting provenance
 
-**Rationale:** Users still need to know where a conversation started, but the model records that as provenance rather than as an owned lifecycle mode with branch-selection semantics.
+**Rationale:** Users still need to know where a conversation started, but creation records one exact pinned starting fact rather than a fallback ladder, staged unresolved shell, or owned branch lifecycle.
 
 ---
 
-### REQ-PROJ-022: Default-Branch Materialization Uses One Bounded Refresh and Typed Fallback
+### REQ-PROJ-022: Default-Branch Materialization Uses Authoritative Origin or Exact Local Main Only
 
 WHEN Phoenix materializes the starting commit for a new Git-backed conversation, a Start-in-new-conversation spawn, or a follow-up conversation
-THE SYSTEM SHALL resolve the repository's authoritative canonical default branch first
-AND SHALL run at most one targeted refresh for that branch before provisioning the detached worktree
-AND SHALL NOT run a blanket fetch, prune, or multi-branch refresh as part of ordinary provisioning
+THE SYSTEM SHALL first detect whether the repository has a remote named `origin`
 
-WHEN the targeted refresh succeeds
-THE SYSTEM SHALL provision from the refreshed canonical default-branch tip at detached `HEAD`
+WHEN remote `origin` exists
+THE SYSTEM SHALL hold the `RepositoryMutationLock` while discovering the remote's current authoritative default branch and fetching that branch tip fresh for provisioning
+AND SHALL provision from the freshly fetched authoritative default-branch tip at detached `HEAD`
+AND SHALL treat any remote-default discovery failure, authentication failure, authorization failure, transport failure, or fetch failure as an explicit retryable creation-job failure
+AND SHALL NOT fall back to cached remote state, previously observed canonical-default facts, local branch tips, the currently checked out branch, another arbitrary ref, or a synthetic default
 
-WHEN the targeted refresh fails but a previously resolved local or remote-tracking ref for the canonical default branch still exists
-THE SYSTEM SHALL return a typed resolved provisioning result carrying the exact commit, canonical default-branch identity, and `stale_cached` freshness
-AND SHALL provision from that cached canonical-default ref at detached `HEAD`
-AND SHALL surface that the starting point may be stale
+WHEN remote `origin` does NOT exist
+THE SYSTEM SHALL resolve only the exact OID of local `refs/heads/main`
+AND SHALL provision from that exact commit at detached `HEAD`
+AND SHALL treat a missing local `refs/heads/main` or an unresolvable local `refs/heads/main` OID as an explicit retryable creation-job failure
+AND SHALL NOT fall back to another local branch, HEAD, a remote-tracking ref, or a synthetic default
 
-WHEN no canonical default-branch commit can be resolved after the bounded refresh-or-fallback attempt
-THE SYSTEM SHALL return a typed unresolved provisioning result carrying the failure reason
-AND SHALL persist that unresolved provisioning failure on the still-Open conversation
-AND SHALL NOT fabricate a `WorkScope`, worktree attachment, detached branch label, or fallback branch selection for that conversation
-AND SHALL fail provisioning with a typed error instead of guessing from the repository's currently checked out branch or another arbitrary ref
-AND SHALL bind that unresolved provisioning failure directly to the target `ProductConversation` and concrete target transcript conversation
-AND, when local Git identity evidence already proves an existing `GitRepository`, SHALL bind the typed pre-scope failure evidence to that repository
-AND, when repository identity itself remains unresolved, SHALL preserve that uncertainty without a repository reference
-AND SHALL NOT create or fabricate a `GitRepository` merely to persist unresolved canonical-default failure evidence
+THE SYSTEM SHALL pin the exact starting OID once for the accepted creation job
+AND SHALL NOT refresh, rediscover, or replace that pinned OID on retry, restart, claim replacement, publication, or runtime bootstrap after it has been recorded
 
-THE SYSTEM SHALL preserve that one-branch refresh rule for provisioning even when repository-observation surfaces support broader branch discovery elsewhere
-
-**Rationale:** Ordinary conversation provisioning needs one predictable, bounded starting-point rule. A single targeted refresh keeps creation current without turning provisioning into repository-wide synchronization, and the cached fallback preserves availability without silently pretending the starting point is fresh.
+**Rationale:** Ordinary conversation provisioning needs one truthful starting-point rule. Either Phoenix provisions from the current authoritative `origin` default branch after a fresh fetch, or—when no `origin` exists—from the exact local `main` ref. Anything else is guesswork.
 
 ---
 
@@ -179,27 +172,36 @@ Branch discovery and checkout capabilities MAY still be reused later inside the 
 ### REQ-CCR-001: Durable Acceptance
 
 WHEN a structurally valid creation request is accepted
-THE SYSTEM SHALL atomically persist a navigable conversation shell and its complete creation intent before acknowledging acceptance
-AND filesystem, Git, reference expansion, attachment finalization, and runtime bootstrap SHALL occur after acceptance
+THE SYSTEM SHALL atomically persist exactly one durable creation job identity for that request, its complete creation intent, and any stable replay handle before acknowledging acceptance
+AND SHALL NOT publish a user-visible ready conversation, transcript row, attached `WorkScope`, objective, navigation side effect, or initial message until the creation job reaches one whole publishable outcome
+AND filesystem, Git, attachment finalization, runtime bootstrap, and any queued post-publication work SHALL occur after acceptance
 
-A created ordinary ProductConversation SHALL begin in Open state. The lifecycle-free Coordinator SHALL preserve its Coordinator identity when its singleton aggregate is created on demand and SHALL NOT receive Open/History state. Moving an ordinary ProductConversation to History is the Close action owned by the conversation lifecycle; provisioning, retries, cancellation, and deletion SHALL NOT invent a parallel lifecycle label.
+WHEN the same request is retried with the same request identifier and the same creation intent
+THE SYSTEM SHALL replay the original acceptance result rather than creating a second job
+
+WHEN the same request identifier is reused with different creation intent
+THE SYSTEM SHALL reject the reuse as a conflict rather than silently retargeting the accepted job
+
+A created ordinary ProductConversation SHALL begin in Open state only when publication succeeds. The lifecycle-free Coordinator SHALL preserve its Coordinator identity when its singleton aggregate is created on demand and SHALL NOT receive Open/History state. Moving an ordinary ProductConversation to History is the Close action owned by the conversation lifecycle; provisioning, retries, cancellation, and deletion SHALL NOT invent a parallel lifecycle label.
 
 ### REQ-CCR-002: Exclusive Provisioning Authority
 
 WHEN a worker begins or resumes provisioning
 THE SYSTEM SHALL grant that worker one time-bounded creation claim with a monotonically increasing generation
 AND every authoritative provisioning update SHALL require the current claim and generation
+AND the durable job identity SHALL remain the request identifier accepted under REQ-CCR-001 rather than a later worker-local token
 
 WHEN a worker reports a result after losing its claim
-THE SYSTEM SHALL reject the result without changing conversation, job, message, or resource ownership state
+THE SYSTEM SHALL reject the result without changing job, conversation publication, message publication, pin selection, or resource ownership state
 
 ### REQ-CCR-003: Crash Reconciliation
 
 WHEN a creation claim expires during an external operation
 THE SYSTEM SHALL fence that generation from further authoritative updates
-AND a replacement worker SHALL inspect durable reservations and observed external state before resuming, adopting, conflicting, or cleaning the operation
+AND a replacement worker SHALL inspect observed external state before resuming, adopting, conflicting, or cleaning the operation
 
 THE SYSTEM SHALL NOT infer that an external operation failed merely because its acknowledgement was not persisted
+AND SHALL preserve ambiguity when external ownership or cleanup safety cannot be proven exactly
 
 ### REQ-CCR-004: Bounded Retry
 
@@ -217,18 +219,48 @@ THE SYSTEM SHALL preserve the failed conversation without an automatic retry
 WHEN creation mutates Git refs or worktrees
 THE SYSTEM SHALL serialize mutation by canonical repository identity across live Phoenix processes
 AND cleanup SHALL remove only resources whose durable ownership still belongs to the cleanup operation
+AND SHALL enter an explicit non-destructive ambiguous cleanup outcome when ownership, equivalence, or safety cannot be proven exactly
+
+### REQ-CCR-005A: Immutable Starting Pin Selection
+
+WHEN Git-backed creation resolves its starting commit under REQ-PROJ-022
+THE SYSTEM SHALL persist exactly one immutable starting pin for that accepted creation job
+AND SHALL use the exact OID produced by either the freshly fetched authoritative `origin` default branch or local `refs/heads/main` when no `origin` exists
+AND SHALL treat any inability to produce that exact OID as explicit retryable creation-job failure rather than as an unresolved success outcome or fallback selection
+AND SHALL treat that pin as immutable across retries, claim replacement, runtime bootstrap, publication, and later conversation lifecycle operations
+AND SHALL allow later repository operations to move the worktree independently without rewriting the recorded creation pin
+
+**Rationale:** Creation needs one truthful starting-point fact. The pin records where the conversation began; it is not a branch-ownership claim and it does not get recomputed after acceptance.
+
+---
 
 ### REQ-CCR-006: First-Class Runtime Bootstrap
 
-WHEN provisioning submits an initial message
+WHEN provisioning needs to queue objective or navigation work after successful publication
 THE SYSTEM SHALL transition directly from provisioning into the normal conversation lifecycle through an idempotent bootstrap operation
-AND the system SHALL NOT temporarily persist an idle conversation solely to initialize a runtime
+AND SHALL queue that requested follow-on work only after the ProductConversation and attached usable `WorkScope` are published
+AND the system SHALL NOT temporarily publish a partial or idle conversation solely to initialize a runtime
+
+### REQ-CCR-006A: Atomic Publication
+
+WHEN creation reaches a publishable success outcome
+THE SYSTEM SHALL publish the ProductConversation, transcript state, attached usable `WorkScope`, and immutable starting pin as one atomic user-visible outcome after worktree materialization succeeds
+AND SHALL queue any requested objective or navigation work only after that publication boundary when the user flow says to queue it after creation
+AND SHALL NOT expose an earlier staged, partial, unresolved-shell, or early-publication state on normal user-facing surfaces
+AND SHALL NOT perform creation-time file expansion or creation-time skill expansion as part of that publication transaction
+
+WHEN publication cannot commit all required creation facts together
+THE SYSTEM SHALL leave the job non-ready and retryable or failed according to the ordinary creation policy rather than publishing a partial conversation
+
+**Rationale:** Users can recover from a failed creation, but they should never see a conversation that claims to exist before its starting state is whole.
+
+---
 
 ### REQ-CCR-007: Cancellation
 
 WHEN a user cancels an accepted, claimed, or retry-scheduled creation
 THE SYSTEM SHALL immediately revoke the active generation
-AND SHALL preserve a visible cancelled conversation with its original creation intent
+AND SHALL preserve a visible cancelled creation record with its original creation intent
 AND SHALL reconcile owned resources asynchronously
 
 WHEN reconciliation completes
@@ -238,7 +270,7 @@ THE SYSTEM SHALL offer Start over and Delete for the cancelled record
 
 WHEN a user deletes a non-ready creation record
 THE SYSTEM SHALL immediately omit it from normal user-facing conversation surfaces
-AND SHALL retain an internal deletion-pending record until owned resources are safely reconciled
+AND SHALL retain an internal deletion-pending record until owned resources are safely reconciled or explicit ambiguity is recorded
 AND SHALL physically delete the record only after reconciliation succeeds
 
 ### REQ-CCR-009: Durable Scheduling
@@ -249,6 +281,6 @@ THE SYSTEM SHALL make it discoverable without requiring another conversation req
 ### REQ-CCR-010: Deterministic Verification
 
 WHEN the creation protocol is verified
-THE SYSTEM SHALL exercise generated operation schedules containing concurrent claims, lease expiry, late results, crashes, retries, cancellation, deletion, and ambiguous external-effect completion
+THE SYSTEM SHALL exercise generated operation schedules containing concurrent claims, lease expiry, late results, crashes, retries, cancellation, deletion, immutable pin selection, atomic publication, and ambiguous external-effect completion
 AND SHALL check lifecycle and ownership invariants after every generated operation
 AND SHALL retain minimized failing schedules as deterministic regressions

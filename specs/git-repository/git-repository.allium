@@ -50,7 +50,6 @@ enum LocatorStatus {
 
 enum DefaultBranchProvenance {
     remote_head_cache
-    | local_checked_out_branch
     | user_selected
 }
 
@@ -140,6 +139,12 @@ external entity ProductConversationScopeAttachment {
     scope: WorkScopeRef
 }
 
+-- Ownership contract: a ProductConversation may have zero or one attached
+-- WorkScope, and each attached WorkScope belongs to exactly one owning
+-- ProductConversation. Repository-context consumers must stay inside that same
+-- aggregate boundary; sibling or foreign participants cannot borrow another
+-- aggregate's scope.
+
 external entity RepositoryProvisioningEvidence {
     product_conversation: bedrock/ProductConversation
     transcript_conversation_id: String
@@ -206,8 +211,7 @@ rule ResolvedDefaultBranchObservationIsAtomic {
 
     @guidance
         -- A resolved observation carries branch identity, provenance, and time as
-        -- one structural value. A checked-out-branch fallback uses provenance
-        -- `local_checked_out_branch`; only `remote_head_cache` is canonical evidence
+        -- one structural value. Only `remote_head_cache` is canonical evidence
         -- without separate corroboration. Phoenix never fabricates `main`.
 }
 
@@ -241,8 +245,11 @@ rule ProductConversationDerivesRepositoryContextFromAttachedScope {
 
     @guidance
         -- The ProductConversation reads repository context through its attached
-        -- WorkScope. There is no second independent writable ProductConversation-
-        -- to-repository authority.
+        -- WorkScope. A ProductConversation owns zero or one attached WorkScope,
+        -- each attached WorkScope has exactly one owning ProductConversation, and
+        -- repository-context consumers stay within that same aggregate boundary.
+        -- There is no second independent writable ProductConversation-to-
+        -- repository authority.
 }
 
 rule DeterministicLegacyProjectBackfillSeedsHiddenRepositoryIdentity {
@@ -459,7 +466,7 @@ rule RepositoryMayOutliveConversationDeletionWhenOtherRepositoryTruthRemains {
 --       resolved, and its provenance is remote_head_cache; or separate canonical
 --       evidence corroborates the same branch identity. No observation, an
 --       unresolved or incomplete highest generation, or duplicate highest
---       generations makes this false. local_checked_out_branch or user_selected
+--       generations makes this false. user_selected alone is observation,
 --       alone is never admissible canonical evidence.
 --
 --   exact_pre_activation_database_fingerprint_digest() -> String
@@ -562,6 +569,16 @@ rule RepositoryMayOutliveConversationDeletionWhenOtherRepositoryTruthRemains {
 invariant WorkScopeHasAtMostOneRepositoryAttachment {
     for s in WorkScopeRepositoryAttachment.scope:
         count(WorkScopeRepositoryAttachment{scope: s}) <= 1
+}
+
+invariant ProductConversationHasAtMostOneAttachedWorkScope {
+    for pc in bedrock/ProductConversation:
+        count(ProductConversationScopeAttachment{product_conversation: pc}) <= 1
+}
+
+invariant AttachedWorkScopeHasExactlyOneOwningProductConversation {
+    for a in ProductConversationScopeAttachment:
+        count(ProductConversationScopeAttachment{scope: a.scope}) = 1
 }
 
 invariant ProductConversationRepositoryContextFlowsThroughScope {

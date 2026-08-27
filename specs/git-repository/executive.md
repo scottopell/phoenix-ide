@@ -39,7 +39,7 @@ Current normative authority is `requirements.md` and `git-repository.allium`. AD
 |-------------|--------|-------|
 | REQ-GITREP-001 | Foundation implemented; activation deferred | Opaque Project-seeded hidden identities exist dormantly; Project remains live authority |
 | REQ-GITREP-002 | Foundation schema implemented | Mutable locator rows have typed status, but Foundation performs no live observation and valid tables may be empty |
-| REQ-GITREP-003 | Partially implemented | Typed dormant observation storage exists and Phoenix observes branch facts through legacy paths, but the hidden model is not live authority |
+| REQ-GITREP-003 | Partially implemented | Typed dormant observation storage exists and Phoenix observes branch facts through legacy paths, but origin-backed pin selection and stale no-origin pin truth are not yet live authority |
 | REQ-GITREP-004 | Foundation attachment implemented; activation deferred | Singular nullable `WorkScope.repository` is backfilled dormantly; ProductConversation and pre-scope hidden-authority consumers are not live |
 | REQ-GITREP-005 | Partially implemented | Continuation already preserves one work context, and follow-up is specified as fresh work, but repository attachment is still carried through legacy surfaces |
 | REQ-GITREP-006 | Not implemented | Immutable restart repair evidence bound to ProductConversation, WorkScope, hidden GitRepository, and fingerprint is not yet the shipped persistence contract |

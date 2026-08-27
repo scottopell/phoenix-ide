@@ -65,7 +65,8 @@ AND SHALL NOT guess continuity from the latest path string alone
 WHEN Phoenix has evidence for a hidden `GitRepository`'s canonical default branch
 THE SYSTEM SHALL represent that observation as an optional value carrying:
 - the observed branch identity
-- the provenance, one of `remote_head_cache`, `local_checked_out_branch`, or `user_selected`
+- whether origin-backed canonical evidence is present
+- the provenance, one of `remote_head_cache` or `user_selected`
 - the exact `observed_at` time
 
 THE SYSTEM SHALL persist new locator and default-branch observation times as non-negative Unix microseconds
@@ -73,19 +74,16 @@ THE SYSTEM SHALL persist new locator and default-branch observation times as non
 WHEN Phoenix lacks authoritative evidence for a canonical default branch
 THE SYSTEM SHALL represent that state as unresolved rather than fabricating a branch name
 
-WHEN the only available fallback is the repository's currently checked out branch
-THE SYSTEM SHALL record that fallback with provenance `local_checked_out_branch`
-AND SHALL NOT treat it as proof of the remote's canonical default branch
-
 THE SYSTEM SHALL treat provenance `remote_head_cache` as admissible canonical evidence of the remote's canonical default branch
+AND SHALL treat that case as origin-backed evidence for creation-pin selection
 
-THE SYSTEM SHALL treat provenances `local_checked_out_branch` and `user_selected` as observations only
-AND SHALL NOT treat either provenance by itself as proof of the remote's canonical default branch
-AND SHALL require separate canonical corroboration before any creation, provisioning, or other consumer that promises canonical-default behavior may rely on that branch identity as canonical
+THE SYSTEM SHALL treat provenance `user_selected` as observation only
+AND SHALL NOT treat it by itself as proof of the remote's canonical default branch
+AND SHALL require separate canonical corroboration before any consumer that promises canonical-default behavior may rely on that branch identity as canonical
 
 THE SYSTEM SHALL NEVER fabricate `main` or any other branch name as a synthetic default
 
-**Rationale:** Default-branch knowledge is an observation with provenance and freshness, not a permanent fact Phoenix can safely guess.
+**Rationale:** Default-branch knowledge is an observation with provenance, not a permanent fact Phoenix can safely guess.
 
 ---
 

@@ -459,12 +459,11 @@ THE SYSTEM SHALL treat the click as a no-op (the new-conversation form is alread
 ### REQ-PROJ-001A: Suggest Recent Repository Locations for New Conversations
 
 WHEN the user opens the new-conversation surface
-THE SYSTEM SHALL derive repository-location suggestions from surviving Open or History conversation activity and any surviving WorkScope attachment or pre-scope provisioning evidence that still resolves to a present server-side repository management-root locator
+THE SYSTEM SHALL derive repository-location suggestions only from successful published Open or History conversation activity whose attached `WorkScope` still resolves to a present server-side repository management-root locator
 AND SHALL project one suggested location per hidden `GitRepository` using that current management-root locator rather than a Phoenix-managed worktree path or arbitrary in-repository working directory
 AND SHALL collapse linked worktrees attached to the same hidden `GitRepository` into one suggestion
 AND SHALL keep separate local clones as separate suggestions even when their remotes, names, or commit graphs match
-AND SHALL allow an unresolved Git-backed creation failure to contribute only through still-surviving conversation-side evidence that resolves to a present management-root locator
-AND SHALL rank suggestions first by the number of distinct surviving Open or History conversations supporting the hidden `GitRepository` and then by the most recent supporting conversation or WorkScope activity
+AND SHALL rank suggestions first by the number of distinct surviving successful published Open or History conversations supporting the hidden `GitRepository` and then by the most recent supporting conversation or WorkScope activity
 AND SHALL allow the user to select a suggested server-side location as the conversation working directory
 
 WHEN deletion removes all conversation and WorkScope activity that supported a suggestion

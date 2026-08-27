@@ -756,32 +756,35 @@ acceptance binding before filesystem, Git, attachment, runtime, or provider
 effects begin.
 
 Creation acceptance SHALL declare externally retryable acceptance. Its
-client-supplied idempotency key SHALL therefore be load-bearing under
-REQ-DWF-029 and REQ-DWF-038 rather than incidental request metadata.
+client-supplied request identifier SHALL therefore be the durable job identity
+and replay key under REQ-DWF-029 and REQ-DWF-038 rather than incidental request metadata.
 
 ### REQ-DWF-CREATE-002: Creation Effect Mapping
 
-The creation profile SHALL represent repository resolution, resource reservation,
+The creation profile SHALL represent repository resolution, starting-pin resolution,
 worktree materialization or reconciliation, attachment finalization, metadata
-commit, initial-message expansion, runtime bootstrap, and initial LLM dispatch as
-typed effects with explicit dependencies and recovery policies.
+commit, runtime bootstrap, and initial LLM dispatch as typed effects with explicit
+dependencies and recovery policies.
 
-Seeded-empty creation SHALL declare a typed required barrier that omits message
-expansion and dispatch rather than fabricating those effects. Analytics and
-notifications, when present, SHALL be optional.
+Seeded-empty creation SHALL declare a typed required barrier that omits initial
+LLM dispatch rather than fabricating that effect. Analytics and notifications,
+when present, SHALL be optional.
 
 ### REQ-DWF-CREATE-003: Resource Reconciliation and Completion
 
-Worktree effects SHALL reserve normalized `WorkScope` ownership, hold the canonical
-repository mutation lock for destructive work, and inspect before replay. Owned
-complete resources MAY be adopted; owned partial resources MAY be repaired or
-compensated; foreign or conflicting resources SHALL enter durable conflict or
-manual resolution and SHALL NOT be removed.
+Worktree effects SHALL hold the canonical repository mutation lock for destructive
+work and inspect before replay. Owned complete resources MAY be adopted; owned
+partial resources MAY be repaired or compensated; foreign, conflicting, or
+ownership-ambiguous resources SHALL enter durable manual resolution or ambiguous
+cleanup and SHALL NOT be removed.
 
-Initial-turn creation SHALL reach execution completion only when its required
-barrier includes a compatible durable dispatch receipt. Seeded-empty creation
-SHALL complete only when its own required metadata and state barrier is
-satisfied. The product reducer alone SHALL publish `Ready` or failure.
+Git-backed creation SHALL derive exactly one immutable starting pin before ready
+publication. Initial-turn creation SHALL reach execution completion only when
+its required barrier includes a compatible durable dispatch receipt and every
+publishable creation fact can commit atomically. Seeded-empty creation SHALL
+complete only when its own required metadata and state barrier is satisfied and
+its publishable creation facts can commit atomically. The product reducer alone
+SHALL publish `Ready` or failure.
 
 ### REQ-DWF-CREATE-004: Retry, Cancellation, and Deletion Mapping
 
@@ -790,11 +793,12 @@ permanent-failure classification as durable effect deadlines and reducer events.
 Attempt loss or reclaimable lease loss SHALL NOT itself become user-visible
 failure.
 
-Cancellation SHALL immediately preserve a visible cancelled shell and creation
-intent while atomically declaring compensation for runtime revocation, owned
-worktree removal, reservation release, and staged-attachment cleanup as
-applicable. Deletion SHALL hide the shell immediately and retain a durable
-tombstone until the required compensation barrier is accepted by the reducer.
+Cancellation SHALL immediately preserve a visible cancelled creation record and
+creation intent while atomically declaring compensation for runtime revocation,
+owned worktree removal, and staged-attachment cleanup as applicable. Deletion
+SHALL hide the shell immediately and retain a durable tombstone until the
+required compensation barrier is accepted by the reducer or explicit cleanup
+ambiguity is recorded.
 
 Reducer publication from stale generation-bound creation effects or stale
 lifecycle completion evaluations SHALL NOT overwrite a later cancel, delete, or

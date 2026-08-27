@@ -64,7 +64,7 @@ These artifacts now state:
 | REQ-DWF-CHAT-001–011 direct-chat profile | Specified only | Target-bound direct-turn durable acceptance, immutable prepared payloads, typed committed/replay outcomes, target-local runtime arbitration, exact-ID reconciliation, capability-isolated target resolution, and independent per-target fan-out have no matching vertical-slice implementation. |
 | REQ-DWF-CHAT-012–014 direct-turn authority, refinement, and verification | Partially implemented | The pure aggregate and authoritative repository implement scoped replay, immutable prepared semantics, runtime ownership, canonical materialization identity, terminal generation, atomic response-plus-terminal-obligation establishment, bounded settlement retry after durable establishment, active restart rematerialization, legacy ambiguous-turn retirement, deterministic transaction-cut tests, and commit-before-publication for direct-turn adoption. Exact-turn Stop fencing, exact terminal-row post-commit classification, and the complete interleaving matrix remain incomplete. |
 | REQ-DWF-WAKE-001–005 wake profile | Implemented | Durable Bash/tmux registration, observation, expiry and cancellation arbitration, continuation transfer, canonical terminal delivery, exact-set adoption, restart recovery, and coalesced auto-resume use the normalized foundation. |
-| REQ-DWF-CREATE-001–005 creation profile | Specified only | Conversation creation has no matching vertical-slice implementation against the normalized foundation. |
+| REQ-DWF-CREATE-001–005 creation profile | Specified only | Conversation creation has no matching vertical-slice implementation against the normalized foundation; request-bound job identity, immutable starting-pin selection, atomic publication, and ambiguity-safe cleanup remain normative only. |
 
 ## Relationship to Historical ADRs
 
@@ -85,7 +85,8 @@ Remaining profile work is:
 - direct-chat acceptance, replay, conflict, exact-ID reconciliation, and
   target-local runtime arbitration;
 - conversation-creation execution and compensation against the normalized
-  foundation.
+  foundation, including request-bound job identity, immutable starting-pin
+  selection, atomic publication, and ambiguity-safe cleanup.
 
 ## Related Decisions
 

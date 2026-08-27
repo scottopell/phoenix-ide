@@ -1,8 +1,12 @@
 -- allium: 3
 -- Durable Conversation Creation: Behavioural Specification
 --
--- Scope: shell acceptance, exclusive provisioning authority, retry and
+-- Scope: request-bound durable acceptance, exclusive provisioning authority,
+-- immutable starting-pin selection, atomic publication, retry and
 -- reconciliation, cancellation, and deletion cleanup.
+--
+-- Creation has no unresolved success outcome, no visible shell before publication,
+-- no stale/local canonical fallback, and no creation-time file or skill expansion.
 -- Excludes: Git command details, database representation, HTTP and UI layout.
 --
 -- Requirement traceability: REQ-CCR-001 through REQ-CCR-010.
@@ -25,16 +29,16 @@ config {
 
 enum CreationStatus {
     accepted | claimed | retry_scheduled | cancelling | cancelled
-    | deletion_pending | ready | failed
+    | deletion_pending | ready | failed | cleanup_ambiguous
 }
 
 enum CreationStage {
-    validate_intent | resolve_repository | reserve_resources
-    | materialize_worktree | finalize_attachments | expand_initial_message
-    | commit_metadata | bootstrap_initial_turn | finalize
+    validate_intent | resolve_repository | resolve_starting_pin
+    | materialize_worktree | finalize_attachments
+    | commit_metadata | bootstrap_initial_turn | finalize_publication
 }
 
-enum ReservationStatus { reserved | present | cleanup_required | released | conflict }
+enum StartingPinSource { authoritative_origin_default | local_main_without_origin }
 
 ------------------------------------------------------------
 -- Actors
@@ -48,13 +52,14 @@ actor CreationWorker {}
 ------------------------------------------------------------
 
 entity CreationJob {
+    request_id: String
     conversation_id: String
     status: CreationStatus
     stage: CreationStage
     attempt: Integer
     generation: Integer
     creation_intent: String
-    reservations: ResourceReservation with job = this
+    accepted_handle: String
 
     claim_owner: CreationWorker when status = claimed
     claim_token: String when status = claimed
@@ -78,9 +83,11 @@ entity CreationJob {
         retry_scheduled -> deletion_pending
         cancelling -> cancelled
         cancelling -> deletion_pending
+        cancelling -> cleanup_ambiguous
         cancelled -> deletion_pending
         failed -> deletion_pending
-        terminal: ready
+        deletion_pending -> cleanup_ambiguous
+        terminal: ready, cleanup_ambiguous
     }
 
     invariant AttemptBudgetBounded {
@@ -92,22 +99,11 @@ entity CreationJob {
     }
 }
 
-entity ResourceReservation {
+entity StartingPin {
     job: CreationJob
-    generation: Integer
-    repository_identity: String
-    resource_identity: String
-    status: ReservationStatus
-
-    transitions status {
-        reserved -> present
-        reserved -> conflict
-        reserved -> cleanup_required
-        present -> cleanup_required
-        cleanup_required -> released
-        cleanup_required -> conflict
-        terminal: released, conflict
-    }
+    commit_id: String
+    branch_name: String
+    source: StartingPinSource
 }
 
 ------------------------------------------------------------
@@ -115,21 +111,43 @@ entity ResourceReservation {
 ------------------------------------------------------------
 
 rule CreationAcceptedDurably {
-    when: StructurallyValidCreationRequested(conversation_id, creation_intent)
+    when: StructurallyValidCreationRequested(request_id, conversation_id, creation_intent, accepted_handle)
+    requires: not CreationJob.exists(request_id: request_id)
 
     ensures: CreationJob.created(
+        request_id: request_id,
         conversation_id: conversation_id,
         status: accepted,
         stage: validate_intent,
         attempt: 0,
         generation: 0,
-        creation_intent: creation_intent
+        creation_intent: creation_intent,
+        accepted_handle: accepted_handle
     )
-    ensures: ConversationShellAccepted(conversation_id)
+    ensures: CreationAcceptedReplayHandle(request_id, accepted_handle)
 
     @guidance
-        -- Persist the shell, intent, and normalized child records atomically.
-        -- Filesystem, Git, expansion, and runtime work begins only afterward.
+        -- Persist the request-bound durable job identity, replay handle, and
+        -- creation intent atomically before any filesystem, Git, runtime, or
+        -- publication work begins.
+}
+
+rule DuplicateRequestReplaysAcceptance {
+    when: StructurallyValidCreationRequested(request_id, conversation_id, creation_intent, accepted_handle)
+
+    requires: CreationJob.exists(request_id: request_id)
+    requires: CreationJob{request_id: request_id}.creation_intent = creation_intent
+
+    ensures: CreationAcceptedReplayHandle(request_id, CreationJob{request_id: request_id}.accepted_handle)
+}
+
+rule ReusedRequestIdWithDifferentIntentConflicts {
+    when: StructurallyValidCreationRequested(request_id, conversation_id, creation_intent, accepted_handle)
+
+    requires: CreationJob.exists(request_id: request_id)
+    requires: CreationJob{request_id: request_id}.creation_intent != creation_intent
+
+    ensures: CreationRequestConflict(request_id)
 }
 
 rule EligibleCreationClaimed {
@@ -155,8 +173,8 @@ rule ExpiredClaimReconciledBeforeResume {
     ensures: ExternalStateInspectionRequested(worker, job, job.stage)
 
     @guidance
-        -- Replacement observes reservations and external state before deciding
-        -- whether to adopt, conflict, clean, or resume the interrupted stage.
+        -- Replacement observes external state before deciding whether to adopt,
+        -- conflict, preserve ambiguity, clean, or resume the interrupted stage.
 }
 
 rule CurrentClaimAdvancesStage {
@@ -167,9 +185,53 @@ rule CurrentClaimAdvancesStage {
     requires: job.claim_token = token
     requires: job.generation = generation
     requires: job.lease_until > now()
-    requires: job.stage != finalize
+    requires: job.stage != finalize_publication
 
     ensures: job.stage = next_creation_stage(job.stage)
+}
+
+rule OriginDefaultStartingPinSelected {
+    when: StartingPinResolvedFromAuthoritativeOrigin(job, branch_name, commit_id)
+
+    requires: job.status = claimed
+    requires: job.stage = resolve_starting_pin
+    requires: not StartingPin.exists(job: job)
+
+    ensures: StartingPin.created(
+        job: job,
+        commit_id: commit_id,
+        branch_name: branch_name,
+        source: authoritative_origin_default
+    )
+}
+
+rule LocalMainStartingPinSelectedWithoutOrigin {
+    when: StartingPinResolvedFromLocalMain(job, commit_id)
+
+    requires: job.status = claimed
+    requires: job.stage = resolve_starting_pin
+    requires: not repository_has_remote_named_origin(job)
+    requires: not StartingPin.exists(job: job)
+
+    ensures: StartingPin.created(
+        job: job,
+        commit_id: commit_id,
+        branch_name: "main",
+        source: local_main_without_origin
+    )
+}
+
+rule StartingPinResolutionFailureIsRetryableAndNeverFallsBack {
+    when: StartingPinResolutionFailed(job, reason)
+
+    requires: job.status = claimed
+    requires: job.stage = resolve_starting_pin
+    requires: not StartingPin.exists(job: job)
+
+    ensures: job.status = retry_scheduled
+    ensures: job.next_attempt_at = retry_deadline(job.attempt + 1)
+    ensures: CreationSchedulerWakeRequested(job.next_attempt_at)
+    ensures: NoFallbackBranchGuessed(job)
 }
 
 rule CurrentClaimCompletesCreation {
@@ -180,10 +242,20 @@ rule CurrentClaimCompletesCreation {
     requires: job.claim_token = token
     requires: job.generation = generation
     requires: job.lease_until > now()
-    requires: job.stage = finalize
+    requires: job.stage = finalize_publication
+    requires: WholePublicationFactsAvailable(job)
 
     ensures: job.status = ready
-    ensures: ConversationCreationReady(job.conversation_id)
+    ensures: ConversationCreationPublishedAtomically(job.conversation_id)
+    ensures: ObjectiveOrNavigationQueuedAfterPublication(job.conversation_id)
+}
+
+rule PartialPublicationForbidden {
+    when: PublicationAttempted(job)
+
+    requires: not WholePublicationFactsAvailable(job)
+
+    ensures: PartialPublicationRejected(job)
 }
 
 rule StaleClaimResultRejected {
@@ -196,6 +268,8 @@ rule StaleClaimResultRejected {
         or job.lease_until <= now()
 
     ensures: ProvisioningResultRejectedAsStale(job, generation)
+    ensures: StartingPinImmutable(job)
+    ensures: PublishedConversationUnchanged(job.conversation_id)
 }
 
 rule TransientFailureSchedulesRetry {
@@ -254,17 +328,17 @@ rule CancelledCreationPreserved {
     requires: job.status = cancelling
 
     ensures: job.status = cancelled
-    ensures: CancelledCreationVisible(job.conversation_id, job.creation_intent)
+    ensures: CancelledCreationVisible(job.request_id, job.creation_intent)
 }
 
 rule CreationDeletionHidesImmediately {
     when: UserDeletesCreation(user, job)
 
-    requires: job.status in { accepted, claimed, retry_scheduled, cancelling, cancelled, failed }
+    requires: job.status in { accepted, claimed, retry_scheduled, cancelling, cancelled, failed, cleanup_ambiguous }
 
     ensures: job.generation = job.generation + 1
     ensures: job.status = deletion_pending
-    ensures: CreationHiddenFromNormalSurfaces(job.conversation_id)
+    ensures: CreationHiddenFromNormalSurfaces(job.request_id)
     ensures: ResourceReconciliationRequested(job)
 }
 
@@ -276,15 +350,14 @@ rule DeletionCompletesAfterReconciliation {
     ensures: CreationTombstoneDeletionRequested(job)
 }
 
-rule ReservationCleanupRequiresCurrentOwnership {
-    when: ReservationCleanupRequested(reservation, job, generation)
+rule AmbiguousCleanupPreservesRecord {
+    when: CleanupAmbiguityObserved(job, generation)
 
-    requires: reservation.job = job
-    requires: reservation.generation = generation
     requires: job.generation = generation
-    requires: reservation.status = cleanup_required
+    requires: job.status in { cancelling, deletion_pending }
 
-    ensures: ReservationCleanupAuthorized(reservation)
+    ensures: job.status = cleanup_ambiguous
+    ensures: CleanupLeftForManualResolution(job.request_id)
 }
 
 ------------------------------------------------------------
@@ -297,14 +370,14 @@ surface CreationControls {
 
     exposes:
         job.status
-        job.creation_intent when job.status in { accepted, claimed, retry_scheduled, cancelling, cancelled, failed }
+        job.creation_intent when job.status in { accepted, claimed, retry_scheduled, cancelling, cancelled, failed, cleanup_ambiguous }
 
     provides:
-        StructurallyValidCreationRequested(conversation_id, creation_intent)
+        StructurallyValidCreationRequested(request_id, conversation_id, creation_intent, accepted_handle)
         UserCancelsCreation(user, job)
             when job.status in { accepted, claimed, retry_scheduled }
         UserDeletesCreation(user, job)
-            when job.status in { accepted, claimed, retry_scheduled, cancelling, cancelled, failed }
+            when job.status in { accepted, claimed, retry_scheduled, cancelling, cancelled, failed, cleanup_ambiguous }
 }
 
 ------------------------------------------------------------
@@ -314,3 +387,7 @@ surface CreationControls {
 -- next_creation_stage(stage) returns the next value in CreationStage order.
 -- retry_deadline(attempt) uses config.retry_delay_2, retry_delay_3, or
 -- config.retry_delay_4 for attempts two, three, and four respectively.
+-- WholePublicationFactsAvailable(job) is true iff the accepted job has every
+-- user-visible fact required for one atomic publication outcome.
+-- StartingPinImmutable(job) asserts that an already-created StartingPin row is
+-- never rewritten by retries, replacement claims, or stale results.

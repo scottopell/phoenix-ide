@@ -704,6 +704,8 @@ AND SHALL keep the user on the handoff surface when dispatch remains unsuccessfu
 AND SHALL NOT replace the original intent with later request text
 AND SHALL NOT create a second manual-send path for the same handoff
 AND SHALL NOT duplicate an opening message when an idempotent dispatch is retried
+AND SHALL require Start in new conversation provisioning to derive any Git-backed starting pin under `specs/conversation-creation/` rather than from approval state alone
+AND SHALL NOT let approval metadata publish a target conversation, target `WorkScope`, or target starting pin before creation publication commits atomically
 
 WHEN the opening handoff is persisted as the successor's message or steering entry
 THE SYSTEM SHALL atomically consume the pending dispatch intent
