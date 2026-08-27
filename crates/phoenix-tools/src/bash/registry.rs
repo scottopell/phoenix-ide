@@ -881,7 +881,8 @@ impl BashHandleRegistry {
                 record_retirement_target_in_report(&mut report, target);
                 #[cfg(unix)]
                 {
-                    if target.pgid <= 0 || target.pgid as u32 != target.launch_identity.process.pid
+                    if target.pgid <= 0
+                        || target.pgid.cast_unsigned() != target.launch_identity.process.pid
                     {
                         report.kill_failures.push((
                             target.pgid,

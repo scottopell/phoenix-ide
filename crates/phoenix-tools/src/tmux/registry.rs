@@ -586,6 +586,9 @@ impl TmuxRegistry {
     ///
     /// Discovers a running persistent tmux server without creating, adopting, or
     /// mutating one. Close uses this only to seal a durable token/socket pair.
+    /// # Errors
+    ///
+    /// Returns [`TmuxError`] when the server endpoint cannot be probed.
     pub async fn discover_persistent_identity(
         &self,
         work_scope: &ResourceScopeKey,
@@ -1262,6 +1265,7 @@ impl TmuxRegistry {
 
     /// # Errors
     /// Returns [`TmuxError`] when exact-instance absence cannot be verified.
+    #[allow(clippy::too_many_lines)]
     pub async fn complete_retirement(
         &self,
         permit: &TmuxRetirementPermit,
