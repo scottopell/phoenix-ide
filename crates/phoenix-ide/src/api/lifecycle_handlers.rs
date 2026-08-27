@@ -352,7 +352,7 @@ pub(crate) async fn confirm_close_loss_retirement(
     }
     let fresh_snapshot = state
         .runtime
-        .inspect_close_retirement(attempt_id.clone())
+        .inspect_close_retirement_only(attempt_id.clone())
         .await
         .map_err(|error| {
             AppError::Conflict(Box::new(ConflictErrorResponse::new(

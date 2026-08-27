@@ -1313,11 +1313,11 @@ impl TmuxRegistry {
                 permit.instance.server_token
             );
             match tokio::process::Command::new("tmux")
+                .arg("-f")
+                .arg(self.config_path())
+                .arg("-S")
+                .arg(&permit.instance.socket_path)
                 .args([
-                    "-f",
-                    &self.config_path().to_string_lossy(),
-                    "-S",
-                    &permit.instance.socket_path.to_string_lossy(),
                     "if-shell",
                     "-F",
                     &token_test,

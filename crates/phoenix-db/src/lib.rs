@@ -8713,6 +8713,20 @@ impl Database {
         work_scope_id: &str,
     ) -> DbResult<()> {
         sqlx::query(
+            "DELETE FROM product_conversation_work_scope_repairs
+             WHERE work_scope_id = ?1
+               AND NOT EXISTS (SELECT 1 FROM conversations WHERE work_scope_id = ?1);
+             DELETE FROM product_conversation_work_scope_missing_owners
+             WHERE work_scope_id = ?1
+               AND NOT EXISTS (SELECT 1 FROM conversations WHERE work_scope_id = ?1);
+             DELETE FROM product_conversation_work_scopes
+             WHERE work_scope_id = ?1
+               AND NOT EXISTS (SELECT 1 FROM conversations WHERE work_scope_id = ?1);",
+        )
+        .bind(work_scope_id)
+        .execute(&mut *connection)
+        .await?;
+        sqlx::query(
             "DELETE FROM work_scopes
              WHERE id = ?1
                AND NOT EXISTS (

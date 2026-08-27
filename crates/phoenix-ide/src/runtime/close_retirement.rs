@@ -78,6 +78,23 @@ impl RuntimeManager {
         &self,
         attempt_id: CloseAttemptId,
     ) -> Result<CloseRetirementSnapshot, String> {
+        self.inspect_close_retirement_with_continuation(attempt_id, true)
+            .await
+    }
+
+    pub(crate) async fn inspect_close_retirement_only(
+        &self,
+        attempt_id: CloseAttemptId,
+    ) -> Result<CloseRetirementSnapshot, String> {
+        self.inspect_close_retirement_with_continuation(attempt_id, false)
+            .await
+    }
+
+    async fn inspect_close_retirement_with_continuation(
+        &self,
+        attempt_id: CloseAttemptId,
+        continue_clean_retirement: bool,
+    ) -> Result<CloseRetirementSnapshot, String> {
         let scopes = self
             .db()
             .list_close_attempt_scopes(attempt_id.as_str())
@@ -136,7 +153,7 @@ impl RuntimeManager {
             .snapshot()
             .cloned()
             .ok_or_else(|| "server inspection did not persist aggregate snapshot".to_string())?;
-        if obligation.phase() == ClosePhase::RetirementRequested {
+        if continue_clean_retirement && obligation.phase() == ClosePhase::RetirementRequested {
             self.retire_close_runtime_resources(attempt_id).await?;
         }
         Ok(snapshot)

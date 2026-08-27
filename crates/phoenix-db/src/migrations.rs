@@ -420,6 +420,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "simplify_close_runtime_authority_and_scope_owners",
         sql: MIGRATION_080,
     },
+    Migration {
+        version: 81,
+        name: "repair_scope_owner_foreign_keys_and_absence_proof",
+        sql: MIGRATION_081,
+    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -8212,6 +8217,96 @@ CREATE TABLE IF NOT EXISTS global_recall_messages (
 
 CREATE INDEX IF NOT EXISTS idx_global_recall_messages_session_ordinal
     ON global_recall_messages(session_id, ordinal);
+";
+
+const MIGRATION_081: &str = r"
+DROP TRIGGER close_retirement_resources_require_absence_proof_on_insert;
+CREATE TRIGGER close_retirement_resources_require_absence_proof_on_insert
+BEFORE INSERT ON close_retirement_resources
+FOR EACH ROW
+WHEN NEW.proof_kind = 'absence_adopted' AND NOT EXISTS (
+    SELECT 1 FROM close_retirement_resources proof
+    WHERE proof.scope = NEW.scope
+      AND proof.resource_kind = NEW.resource_kind
+      AND proof.identity_kind = NEW.identity_kind
+      AND proof.identity_codec = NEW.identity_codec
+      AND proof.identity_value = NEW.identity_value
+      AND NEW.absence_basis = 'preexisting_exact_identity_evidence'
+      AND proof.attempt_id <> NEW.attempt_id
+      AND proof.proof_kind IN ('retired', 'absence_adopted')
+    UNION ALL
+    SELECT 1 FROM close_retirement_resources proof
+    WHERE NEW.absence_basis = 'same_attempt_prior_retirement'
+      AND proof.attempt_id = NEW.attempt_id
+      AND proof.scope = NEW.scope
+      AND proof.inspection_generation = NEW.inspection_generation
+      AND proof.inspection_fingerprint = NEW.inspection_fingerprint
+      AND proof.resource_kind = NEW.resource_kind
+      AND proof.identity_kind = NEW.identity_kind
+      AND proof.identity_codec = NEW.identity_codec
+      AND proof.identity_value = NEW.identity_value
+      AND proof.proof_kind = 'retired'
+    UNION ALL
+    SELECT 1 FROM close_retirement_resource_dispatches dispatch
+    WHERE NEW.absence_basis = 'same_attempt_prior_retirement'
+      AND dispatch.attempt_id = NEW.attempt_id
+      AND dispatch.scope = NEW.scope
+      AND dispatch.inspection_generation = NEW.inspection_generation
+      AND dispatch.inspection_fingerprint = NEW.inspection_fingerprint
+      AND dispatch.resource_kind = NEW.resource_kind
+      AND dispatch.identity_kind = NEW.identity_kind
+      AND dispatch.identity_codec = NEW.identity_codec
+      AND dispatch.identity_value = NEW.identity_value
+)
+BEGIN
+    SELECT RAISE(ABORT, 'adopted absence requires exact retained proof');
+END;
+
+DROP TRIGGER close_retirement_resources_require_absence_proof_on_update;
+CREATE TRIGGER close_retirement_resources_require_absence_proof_on_update
+BEFORE UPDATE ON close_retirement_resources
+FOR EACH ROW
+WHEN NEW.proof_kind = 'absence_adopted'
+ AND (
+     OLD.proof_kind <> 'absence_adopted' OR OLD.absence_basis IS NOT NEW.absence_basis
+     OR OLD.attempt_id <> NEW.attempt_id OR OLD.scope <> NEW.scope
+     OR OLD.inspection_generation <> NEW.inspection_generation
+     OR OLD.inspection_fingerprint <> NEW.inspection_fingerprint
+     OR OLD.resource_kind <> NEW.resource_kind OR OLD.identity_kind <> NEW.identity_kind
+     OR OLD.identity_codec <> NEW.identity_codec OR OLD.identity_value <> NEW.identity_value
+ )
+ AND NOT EXISTS (
+    SELECT 1 FROM close_retirement_resources proof
+    WHERE proof.scope = NEW.scope
+      AND proof.resource_kind = NEW.resource_kind
+      AND proof.identity_kind = NEW.identity_kind
+      AND proof.identity_codec = NEW.identity_codec
+      AND proof.identity_value = NEW.identity_value
+      AND NEW.absence_basis = 'preexisting_exact_identity_evidence'
+      AND proof.attempt_id <> NEW.attempt_id
+      AND proof.proof_kind IN ('retired', 'absence_adopted')
+    UNION ALL
+    SELECT 1 FROM close_retirement_resources proof
+    WHERE NEW.absence_basis = 'same_attempt_prior_retirement'
+      AND proof.attempt_id = NEW.attempt_id AND proof.scope = NEW.scope
+      AND proof.inspection_generation = NEW.inspection_generation
+      AND proof.inspection_fingerprint = NEW.inspection_fingerprint
+      AND proof.resource_kind = NEW.resource_kind AND proof.identity_kind = NEW.identity_kind
+      AND proof.identity_codec = NEW.identity_codec AND proof.identity_value = NEW.identity_value
+      AND proof.proof_kind = 'retired'
+    UNION ALL
+    SELECT 1 FROM close_retirement_resource_dispatches dispatch
+    WHERE NEW.absence_basis = 'same_attempt_prior_retirement'
+      AND dispatch.attempt_id = NEW.attempt_id AND dispatch.scope = NEW.scope
+      AND dispatch.inspection_generation = NEW.inspection_generation
+      AND dispatch.inspection_fingerprint = NEW.inspection_fingerprint
+      AND dispatch.resource_kind = NEW.resource_kind AND dispatch.identity_kind = NEW.identity_kind
+      AND dispatch.identity_codec = NEW.identity_codec AND dispatch.identity_value = NEW.identity_value
+)
+BEGIN
+    SELECT RAISE(ABORT, 'adopted absence requires exact retained proof');
+END;
+
 ";
 
 #[cfg(test)]
