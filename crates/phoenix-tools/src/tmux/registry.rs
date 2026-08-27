@@ -172,7 +172,8 @@ impl TmuxRetirementPermit {
 pub enum TmuxRetirementOutcome {
     Retired,
     AbsenceVerified,
-    Residual { reason: String },
+    IdentityNotProven { reason: String },
+    RemovalFailed { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -592,8 +593,10 @@ impl TmuxRegistry {
     pub async fn discover_persistent_identity(
         &self,
         work_scope: &ResourceScopeKey,
+        legacy_worktree_path: Option<&Path>,
+        legacy_conversation_id: Option<&str>,
     ) -> Result<PersistentTmuxDiscovery, TmuxError> {
-        let socket_path = match work_scope {
+        let current_socket = match work_scope {
             ResourceScopeKey::Work(id) => {
                 socket_path_for_worktree(&self.socket_dir, Path::new(id.as_str()))
             }
@@ -602,6 +605,24 @@ impl TmuxRegistry {
             }
             ResourceScopeKey::Coordinator => socket_path_for_coordinator(&self.socket_dir),
             ResourceScopeKey::GlobalTerminal => socket_path_for_global(&self.socket_dir),
+        };
+        let legacy_socket = legacy_worktree_path
+            .map(|path| socket_path_for_worktree(&self.socket_dir, path))
+            .or_else(|| legacy_conversation_id.map(|id| socket_path_for(&self.socket_dir, id)));
+        let socket_path = if let Some(legacy) = legacy_socket {
+            if legacy != current_socket
+                && matches!(
+                    probe(&current_socket).await,
+                    Ok(ProbeResult::NoSocket | ProbeResult::DeadSocket)
+                )
+                && matches!(probe(&legacy).await, Ok(ProbeResult::Live))
+            {
+                legacy
+            } else {
+                current_socket
+            }
+        } else {
+            current_socket
         };
         match probe(&socket_path)
             .await
@@ -1252,7 +1273,7 @@ impl TmuxRegistry {
                     .as_deref()
                     == Some(permit.instance.server_token.as_str())
                 {
-                    Ok(TmuxRetirementOutcome::Residual {
+                    Ok(TmuxRetirementOutcome::RemovalFailed {
                         reason: "exact tmux server instance remained live after teardown"
                             .to_string(),
                     })
@@ -1283,7 +1304,7 @@ impl TmuxRegistry {
         if !exact_owned {
             return self.verify_exact_absence(permit).await;
         }
-        let kill_error = if self.binary_available {
+        let kill_failure = if self.binary_available {
             let token_test = format!(
                 "#{{==:#{{E:{SERVER_TOKEN_VAR}}},{}}}",
                 permit.instance.server_token
@@ -1309,16 +1330,22 @@ impl TmuxRegistry {
             {
                 Ok(output) if output.status.success() => {
                     if String::from_utf8_lossy(&output.stdout).contains("PHOENIX_TOKEN_MISMATCH") {
-                        Some("tmux server token changed before exact teardown".to_string())
+                        Some(TmuxRetirementOutcome::IdentityNotProven {
+                            reason: "tmux server token changed before exact teardown".to_string(),
+                        })
                     } else {
                         None
                     }
                 }
-                Ok(output) => Some(format!(
-                    "exact token-bound kill-server failed: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                )),
-                Err(error) => Some(error.to_string()),
+                Ok(output) => Some(TmuxRetirementOutcome::RemovalFailed {
+                    reason: format!(
+                        "exact token-bound kill-server failed: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ),
+                }),
+                Err(error) => Some(TmuxRetirementOutcome::RemovalFailed {
+                    reason: error.to_string(),
+                }),
             }
         } else {
             None
@@ -1343,13 +1370,11 @@ impl TmuxRegistry {
         } else {
             None
         };
-        if let Some(error) = kill_error {
-            return Ok(TmuxRetirementOutcome::Residual {
-                reason: format!("kill-server failed: {error}"),
-            });
+        if let Some(failure) = kill_failure {
+            return Ok(failure);
         }
         if let Some(error) = unlink_error {
-            return Ok(TmuxRetirementOutcome::Residual {
+            return Ok(TmuxRetirementOutcome::RemovalFailed {
                 reason: format!("dead socket unlink failed: {error}"),
             });
         }
@@ -1383,10 +1408,9 @@ impl TmuxRegistry {
                 }
                 Ok(TmuxRetirementOutcome::Retired)
             }
-            residual
-            @ (TmuxRetirementOutcome::Retired | TmuxRetirementOutcome::Residual { .. }) => {
-                Ok(residual)
-            }
+            residual @ (TmuxRetirementOutcome::Retired
+            | TmuxRetirementOutcome::IdentityNotProven { .. }
+            | TmuxRetirementOutcome::RemovalFailed { .. }) => Ok(residual),
         }
     }
 
@@ -1504,7 +1528,7 @@ impl TmuxRegistry {
             .await;
         let outcome = match self.complete_retirement(&permit).await {
             Ok(outcome) => outcome,
-            Err(error) => TmuxRetirementOutcome::Residual {
+            Err(error) => TmuxRetirementOutcome::RemovalFailed {
                 reason: error.to_string(),
             },
         };
@@ -1517,7 +1541,8 @@ impl TmuxRegistry {
                     unlink_error: None,
                 }
             }
-            TmuxRetirementOutcome::Residual { reason } => {
+            TmuxRetirementOutcome::IdentityNotProven { reason }
+            | TmuxRetirementOutcome::RemovalFailed { reason } => {
                 if !had_entry {
                     let _ = self.inner.write().await.remove(&work_scope.stable_key());
                 }
@@ -1578,7 +1603,8 @@ impl From<TmuxRetirementOutcome> for CascadeReport {
                 kill_server_error: None,
                 unlink_error: None,
             },
-            TmuxRetirementOutcome::Residual { reason } => Self {
+            TmuxRetirementOutcome::IdentityNotProven { reason }
+            | TmuxRetirementOutcome::RemovalFailed { reason } => Self {
                 socket_path: PathBuf::new(),
                 kill_server_error: Some(reason),
                 unlink_error: None,
@@ -2517,6 +2543,39 @@ mod tests {
             .unwrap();
 
         assert_eq!(server.read().await.socket_path, legacy_socket);
+        owner.shutdown();
+    }
+
+    #[tokio::test]
+    async fn persistent_discovery_finds_live_legacy_worktree_socket() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let owner = TestTmuxServerOwner::new();
+        let legacy_worktree = owner.path().join("legacy-discovery-worktree");
+        std::fs::create_dir_all(&legacy_worktree).unwrap();
+        let legacy_socket = socket_path_for_worktree(owner.path(), &legacy_worktree);
+        spawn_session(
+            &legacy_socket,
+            &owner.path().join("missing.conf"),
+            &legacy_worktree,
+        )
+        .await
+        .unwrap();
+
+        let discovery = owner
+            .registry()
+            .discover_persistent_identity(
+                &scope("opaque-discovery-after-migration"),
+                Some(&legacy_worktree),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            discovery,
+            PersistentTmuxDiscovery::Exact(identity) if identity.socket_path == legacy_socket
+        ));
         owner.shutdown();
     }
 

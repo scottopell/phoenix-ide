@@ -51,7 +51,8 @@ enum CloseLeaseFailure {
         reason: String,
     },
     Tmux {
-        reason: String,
+        reason: RetirementFailureReason,
+        detail: String,
     },
 }
 
@@ -65,7 +66,7 @@ impl std::fmt::Display for CloseLeaseFailure {
                     kind.as_str()
                 )
             }
-            Self::Tmux { reason } => write!(formatter, "tmux teardown failed: {reason}"),
+            Self::Tmux { detail, .. } => write!(formatter, "tmux teardown failed: {detail}"),
         }
     }
 }
@@ -121,6 +122,7 @@ impl RuntimeManager {
     ///
     /// The map lock spans check, fencing, and insertion so concurrent callers for
     /// one exact `(attempt, scope)` cannot mint competing generations.
+    #[allow(clippy::too_many_lines)]
     pub(crate) async fn acquire_close_resource_lease(
         &self,
         attempt_id: &CloseAttemptId,
@@ -133,17 +135,31 @@ impl RuntimeManager {
         {
             return Ok(existing);
         }
+        let captured = self
+            .db()
+            .list_close_attempt_scopes(attempt_id.as_str())
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|captured| captured.scope == scope)
+            .ok_or_else(|| format!("Close attempt {attempt_id} did not capture scope {scope}"))?;
+        let legacy_worktree_path = match &captured.captured_worktree {
+            Some(CapturedWorktreeIdentity::Resolved(identity)) => {
+                Some(path_buf_from_git_bytes(identity.locator().as_bytes()))
+            }
+            Some(CapturedWorktreeIdentity::Unresolved { .. }) | None => None,
+        };
         let key = ResourceScopeKey::Work(scope.clone());
         let bash = self.bash_handles().begin_retirement(&key).await;
         let tmux = match self
             .tmux_registry()
-            .discover_persistent_identity(&key)
+            .discover_persistent_identity(&key, legacy_worktree_path.as_deref(), None)
             .await
             .map_err(|error| format!("tmux identity discovery failed: {error}"))?
         {
             PersistentTmuxDiscovery::Absent => {
                 self.tmux_registry()
-                    .begin_retirement(&key, None, None)
+                    .begin_retirement(&key, legacy_worktree_path.as_deref(), None)
                     .await
             }
             PersistentTmuxDiscovery::Exact(identity) => {
@@ -155,7 +171,7 @@ impl RuntimeManager {
                     Ok(TmuxRetirementRehydration::Permit(permit)) => permit,
                     Ok(TmuxRetirementRehydration::AbsenceVerified) => {
                         self.tmux_registry()
-                            .begin_retirement(&key, None, None)
+                            .begin_retirement(&key, legacy_worktree_path.as_deref(), None)
                             .await
                     }
                     Ok(TmuxRetirementRehydration::Residual { reason }) => {
@@ -433,12 +449,23 @@ impl RuntimeManager {
                         .await
                     {
                         Ok(TmuxRetirementRehydration::Permit(permit)) => {
-                            require_tmux_absent(
-                                self.tmux_registry()
-                                    .complete_retirement(&permit)
-                                    .await
-                                    .map_err(|error| error.to_string())?,
-                            )?;
+                            let outcome = self
+                                .tmux_registry()
+                                .complete_retirement(&permit)
+                                .await
+                                .map_err(|error| error.to_string())?;
+                            if let Err((reason, detail)) = require_tmux_absent(outcome) {
+                                return self
+                                    .record_close_residual(
+                                        &attempt_id,
+                                        &snapshot,
+                                        &scope,
+                                        resource.clone(),
+                                        reason,
+                                        &detail,
+                                    )
+                                    .await;
+                            }
                             self.record_close_retired(
                                 &attempt_id,
                                 &snapshot,
@@ -512,7 +539,7 @@ impl RuntimeManager {
                         kind.as_str()
                     ));
                 }
-                Err(CloseLeaseFailure::Tmux { reason }) => {
+                Err(CloseLeaseFailure::Tmux { reason, detail }) => {
                     let Some(resource) = expected
                         .iter()
                         .find(|resource| resource.kind() == RetiredResourceKind::TmuxServer)
@@ -523,7 +550,7 @@ impl RuntimeManager {
                             .await
                             .map_err(|error| error.to_string())?;
                         return Err(format!(
-                            "tmux Close teardown failed without a sealed tmux target for scope {scope}: {reason}"
+                            "tmux Close teardown failed without a sealed tmux target for scope {scope}: {detail}"
                         ));
                     };
                     return self
@@ -532,8 +559,8 @@ impl RuntimeManager {
                             &snapshot,
                             &scope,
                             resource,
-                            RetirementFailureReason::RemovalFailed,
-                            &reason,
+                            reason,
+                            &detail,
                         )
                         .await;
                 }
@@ -618,16 +645,6 @@ impl RuntimeManager {
             });
             if let Some(target) = worktree_target {
                 if !retired.contains(&(scope.clone(), resource_key(&target.resource))) {
-                    let was_dispatched = self
-                        .db()
-                        .close_retirement_resource_was_dispatched(
-                            attempt_id,
-                            &scope,
-                            snapshot,
-                            &target.resource,
-                        )
-                        .await
-                        .map_err(|error| error.to_string())?;
                     self.db()
                         .record_close_retirement_dispatch(RecordCloseRetirementDispatchRequest {
                             attempt_id: attempt_id.clone(),
@@ -684,7 +701,23 @@ impl RuntimeManager {
                             )
                             .await;
                     };
-                    let (fresh_snapshot, _) = inspect_worktree(identity).await?;
+                    let fresh_snapshot = match inspect_worktree(identity).await {
+                        Ok((fresh_snapshot, _)) => fresh_snapshot,
+                        Err(reason) => {
+                            return self
+                                .record_close_residual(
+                                    attempt_id,
+                                    snapshot,
+                                    &scope,
+                                    target.resource.clone(),
+                                    RetirementFailureReason::IdentityNotProven,
+                                    &format!(
+                                        "worktree cannot be reinspected before removal: {reason}"
+                                    ),
+                                )
+                                .await;
+                        }
+                    };
                     if fresh_snapshot != confirmed.snapshot {
                         return self
                             .record_close_residual(
@@ -698,17 +731,6 @@ impl RuntimeManager {
                             .await;
                     }
                     if let Err(reason) = remove_exact_worktree(identity).await {
-                        if was_dispatched && reason.contains("absent") {
-                            self.record_close_retired(
-                                attempt_id,
-                                snapshot,
-                                &scope,
-                                target.resource.clone(),
-                                "exact prior dispatch and restart worktree absence verification",
-                            )
-                            .await?;
-                            continue;
-                        }
                         let failure = if reason.contains("incarnation")
                             || reason.contains("registered")
                             || reason.contains("absent")
@@ -862,10 +884,11 @@ impl RuntimeManager {
                 .complete_retirement(&lease.tmux)
                 .await
                 .map_err(|error| CloseLeaseFailure::Tmux {
-                    reason: error.to_string(),
+                    reason: RetirementFailureReason::IdentityNotProven,
+                    detail: error.to_string(),
                 })?;
             require_tmux_absent(tmux_outcome)
-                .map_err(|reason| CloseLeaseFailure::Tmux { reason })?;
+                .map_err(|(reason, detail)| CloseLeaseFailure::Tmux { reason, detail })?;
             require_terminal_absent(self.terminals.complete_retirement(&lease.terminal).await)
                 .map_err(|reason| CloseLeaseFailure::ProcessEpoch {
                     kind: RetiredResourceKind::PtySession,
@@ -946,22 +969,10 @@ async fn observe_detached_head_and_submodules(
         let mut result = Vec::new();
         result.push((b"HEAD".to_vec(), head_oid.clone()));
         if detached {
-            let reachable = phoenix_core::git::command()
-                .args([
-                    "for-each-ref",
-                    "--contains",
-                    std::str::from_utf8(&head_oid).map_err(|error| error.to_string())?,
-                    "--format=%(refname)",
-                ])
-                .current_dir(&path)
-                .output()
-                .map_err(|error| error.to_string())?;
-            if !reachable.status.success() {
-                return Err(String::from_utf8_lossy(&reachable.stderr)
-                    .trim()
-                    .to_string());
-            }
-            result.push((b"DETACHED".to_vec(), reachable.stdout));
+            result.push((
+                b"DETACHED".to_vec(),
+                detached_reachability_evidence(&path, &head_oid)?,
+            ));
         }
         observe_initialized_submodules(&path, &[], &mut result)?;
         Ok(result)
@@ -992,6 +1003,98 @@ async fn observe_detached_head_and_submodules(
         }
     }
     Ok(())
+}
+
+fn detached_head_is_unreachable(
+    repository: &Path,
+    observation: &mut WorktreeObservation,
+    relative_path: &[u8],
+) -> Result<bool, String> {
+    let detached = !phoenix_core::git::command()
+        .args(["symbolic-ref", "-q", "HEAD"])
+        .current_dir(repository)
+        .status()
+        .map_err(|error| error.to_string())?
+        .success();
+    if !detached {
+        return Ok(false);
+    }
+    let head = phoenix_core::git::command()
+        .args(["rev-parse", "--verify", "HEAD"])
+        .current_dir(repository)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !head.status.success() {
+        return Err(String::from_utf8_lossy(&head.stderr).trim().to_string());
+    }
+    let head_oid = head.stdout.trim_ascii().to_vec();
+    let evidence = detached_reachability_evidence(repository, &head_oid)?;
+    observation.push((
+        [b"SUBMODULE_DETACHED\0".as_slice(), relative_path].concat(),
+        evidence.clone(),
+    ));
+    Ok(evidence.is_empty())
+}
+
+fn detached_reachability_evidence(repository: &Path, head_oid: &[u8]) -> Result<Vec<u8>, String> {
+    let head_text = std::str::from_utf8(head_oid).map_err(|error| error.to_string())?;
+    let reachable = phoenix_core::git::command()
+        .args([
+            "for-each-ref",
+            "--contains",
+            head_text,
+            "--format=%(refname)",
+        ])
+        .current_dir(repository)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !reachable.status.success() {
+        return Err(String::from_utf8_lossy(&reachable.stderr)
+            .trim()
+            .to_string());
+    }
+    if !reachable.stdout.is_empty() {
+        return Ok(reachable.stdout);
+    }
+    let listing = phoenix_core::git::command()
+        .args(["worktree", "list", "--porcelain", "-z"])
+        .current_dir(repository)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !listing.status.success() {
+        return Err(String::from_utf8_lossy(&listing.stderr).trim().to_string());
+    }
+    let repository = repository
+        .canonicalize()
+        .map_err(|error| format!("cannot canonicalize inspected worktree: {error}"))?;
+    let git_dir = phoenix_core::git::command()
+        .args(["rev-parse", "--absolute-git-dir"])
+        .current_dir(&repository)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !git_dir.status.success() {
+        return Err(String::from_utf8_lossy(&git_dir.stderr).trim().to_string());
+    }
+    let git_dir = path_buf_from_git_bytes(git_dir.stdout.trim_ascii())
+        .canonicalize()
+        .map_err(|error| format!("cannot canonicalize inspected Git directory: {error}"))?;
+    let mut worktree_path: Option<PathBuf> = None;
+    for field in listing.stdout.split(|byte| *byte == 0) {
+        if field.is_empty() {
+            worktree_path = None;
+        } else if let Some(path) = field.strip_prefix(b"worktree ") {
+            worktree_path = Some(path_buf_from_git_bytes(path));
+        } else if let Some(oid) = field.strip_prefix(b"HEAD ") {
+            let is_other = worktree_path
+                .as_ref()
+                .and_then(|path| path.canonicalize().ok())
+                .is_some_and(|path| path != repository && path != git_dir);
+            if oid == head_oid && is_other {
+                return Ok(b"OTHER_WORKTREE_HEAD\n".to_vec());
+            }
+        }
+    }
+    Ok(Vec::new())
 }
 
 fn observe_initialized_submodules(
@@ -1083,11 +1186,13 @@ fn observe_initialized_submodules(
             [b"SUBMODULE_GITLINK\0".as_slice(), relative_path.as_slice()].concat(),
             gitlink.stdout.clone(),
         ));
+        let detached_loss =
+            detached_head_is_unreachable(&submodule_path, observation, &relative_path)?;
         let gitlink_changed = gitlink
             .stdout
             .first()
             .is_some_and(|prefix| matches!(prefix, b'+' | b'U'));
-        if gitlink_changed || !parse_status_losses(&status.stdout).is_empty() {
+        if gitlink_changed || detached_loss || !parse_status_losses(&status.stdout).is_empty() {
             observation.push((
                 [b"SUBMODULE_DIRTY\0".as_slice(), relative_path.as_slice()].concat(),
                 Vec::new(),
@@ -1363,10 +1468,17 @@ fn require_absent(outcome: BashRetirementOutcome) -> Result<(), String> {
     }
 }
 
-fn require_tmux_absent(outcome: TmuxRetirementOutcome) -> Result<(), String> {
+fn require_tmux_absent(
+    outcome: TmuxRetirementOutcome,
+) -> Result<(), (RetirementFailureReason, String)> {
     match outcome {
         TmuxRetirementOutcome::Retired | TmuxRetirementOutcome::AbsenceVerified => Ok(()),
-        TmuxRetirementOutcome::Residual { reason } => Err(reason),
+        TmuxRetirementOutcome::IdentityNotProven { reason } => {
+            Err((RetirementFailureReason::IdentityNotProven, reason))
+        }
+        TmuxRetirementOutcome::RemovalFailed { reason } => {
+            Err((RetirementFailureReason::RemovalFailed, reason))
+        }
     }
 }
 
@@ -1458,6 +1570,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn detached_commit_held_by_another_worktree_is_not_reported_as_loss() {
+        let temp = tempfile::tempdir().unwrap();
+        initialize_repository(temp.path());
+        run_git(temp.path(), &["checkout", "--quiet", "--detach"]);
+        std::fs::write(temp.path().join("tracked"), "detached\n").unwrap();
+        run_git(temp.path(), &["commit", "--quiet", "-am", "detached"]);
+        let sibling = temp.path().with_file_name("close-inspection-sibling");
+        run_git(
+            temp.path(),
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                sibling.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+
+        let (_, losses) = inspect_worktree(&inspection_identity(temp.path()))
+            .await
+            .unwrap();
+        assert!(!losses
+            .iter()
+            .any(|loss| matches!(loss, CloseLossItem::DetachedUnreachableCommit(_))));
+        run_git(
+            temp.path(),
+            &["worktree", "remove", "--force", sibling.to_str().unwrap()],
+        );
+    }
+
+    #[tokio::test]
     async fn initialized_submodule_dirty_state_changes_snapshot_and_emits_exact_path() {
         let temp = tempfile::tempdir().unwrap();
         let child = temp.path().join("child");
@@ -1501,6 +1645,79 @@ mod tests {
         )));
     }
 
+    #[tokio::test]
+    async fn initialized_submodule_clean_detached_commit_is_reported_as_loss() {
+        let temp = tempfile::tempdir().unwrap();
+        let child = temp.path().join("child-detached");
+        let parent = temp.path().join("parent-detached");
+        initialize_repository(&child);
+        initialize_repository(&parent);
+        let child_text = child.to_string_lossy().into_owned();
+        let output = phoenix_core::git::command()
+            .args([
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "--quiet",
+                &child_text,
+                "deps/child",
+            ])
+            .current_dir(&parent)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        run_git(&parent, &["commit", "--quiet", "-am", "add submodule"]);
+
+        let closing = temp.path().join("closing-worktree");
+        run_git(
+            &parent,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "closing-test",
+                closing.to_str().unwrap(),
+            ],
+        );
+        let update = phoenix_core::git::command()
+            .args([
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "update",
+                "--init",
+                "--quiet",
+            ])
+            .current_dir(&closing)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(update.status.success());
+        let submodule = closing.join("deps/child");
+        run_git(&submodule, &["checkout", "--quiet", "--detach"]);
+        std::fs::write(submodule.join("tracked"), "detached submodule\n").unwrap();
+        run_git(
+            &submodule,
+            &["commit", "--quiet", "-am", "detached submodule"],
+        );
+        run_git(&closing, &["add", "deps/child"]);
+        run_git(
+            &closing,
+            &["commit", "--quiet", "-m", "record detached gitlink"],
+        );
+
+        let (_, losses) = inspect_worktree(&inspection_identity(&closing))
+            .await
+            .unwrap();
+        assert!(losses.iter().any(|loss| matches!(
+            loss,
+            CloseLossItem::InitializedSubmoduleState(path)
+                if path.as_bytes() == b"deps/child"
+        )));
+    }
+
     #[test]
     fn malformed_observed_git_paths_return_errors_without_panicking() {
         assert!(git_path_from_observation(b"").is_err());
@@ -1515,7 +1732,8 @@ mod tests {
             reason: "profile identity changed".to_string(),
         };
         let tmux = CloseLeaseFailure::Tmux {
-            reason: "server token changed".to_string(),
+            reason: phoenix_core::domain::close::RetirementFailureReason::IdentityNotProven,
+            detail: "server token changed".to_string(),
         };
 
         assert!(matches!(
