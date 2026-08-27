@@ -1343,9 +1343,6 @@ async fn insert_creation_job_images_tx(
     Ok(())
 }
 
-const GIT_POINTER_FORMAT_OVERHEAD: u64 = b"gitdir: \r\n".len() as u64;
-const MAX_GIT_POINTER_BYTES: u64 = libc::PATH_MAX as u64 + GIT_POINTER_FORMAT_OVERHEAD;
-
 enum ExpectedParentScope<'a> {
     NotChecked,
     Snapshot(Option<&'a WorkScopeId>),
@@ -1516,55 +1513,7 @@ impl Database {
     }
 
     fn observe_worktree_fingerprint(worktree_path: &str) -> Option<String> {
-        use std::fmt::Write as _;
-        use std::io::Read as _;
-        use std::os::unix::fs::MetadataExt as _;
-
-        let marker = std::path::Path::new(worktree_path).join(".git");
-        let metadata = std::fs::symlink_metadata(&marker).ok()?;
-        let marker_bytes = if metadata.is_file() {
-            if metadata.len() > MAX_GIT_POINTER_BYTES {
-                return None;
-            }
-            let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).ok()?);
-            std::fs::File::open(&marker)
-                .ok()?
-                .take(MAX_GIT_POINTER_BYTES + 1)
-                .read_to_end(&mut bytes)
-                .ok()?;
-            if u64::try_from(bytes.len()).ok()? > MAX_GIT_POINTER_BYTES {
-                return None;
-            }
-            let pointer = std::str::from_utf8(&bytes).ok()?;
-            let git_dir = pointer
-                .strip_suffix("\r\n")
-                .or_else(|| pointer.strip_suffix('\n'))
-                .unwrap_or(pointer)
-                .strip_prefix("gitdir: ")?;
-            if git_dir.is_empty() || git_dir.contains('\n') || git_dir.contains('\r') {
-                return None;
-            }
-            git_dir.as_bytes().to_vec()
-        } else if metadata.is_dir() {
-            Vec::new()
-        } else {
-            return None;
-        };
-        let mut encoded = String::with_capacity(marker_bytes.len() * 2);
-        for byte in marker_bytes {
-            write!(&mut encoded, "{byte:02x}").ok()?;
-        }
-        let created_nanos = metadata
-            .created()
-            .ok()
-            .and_then(|created| created.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|duration| duration.as_nanos().to_string());
-        let created_nanos = created_nanos?;
-        Some(format!(
-            "git_admin_incarnation_v1:{}:{}:{created_nanos}:{encoded}",
-            metadata.dev(),
-            metadata.ino()
-        ))
+        phoenix_core::git::observe_worktree_fingerprint(std::path::Path::new(worktree_path))
     }
 
     async fn insert_work_scope_tx(
@@ -1869,6 +1818,29 @@ impl Database {
     ) -> DbResult<WorkScopeRetirementOutcome> {
         self.retire_work_scope_with_close_attempt(precondition, reason, None)
             .await
+    }
+
+    /// Report whether persisted `ProductConversation` ownership repair blocks
+    /// destructive Close work for this exact captured scope.
+    /// # Errors
+    /// Returns a [`DbError`] when the repair tables cannot be read.
+    pub async fn work_scope_has_unresolved_product_ownership(
+        &self,
+        scope_id: &WorkScopeId,
+    ) -> DbResult<bool> {
+        sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM product_conversation_work_scope_repairs
+                 WHERE work_scope_id = ?1 AND state = 'needs_repair'
+                 UNION ALL
+                 SELECT 1 FROM product_conversation_work_scope_missing_owners
+                 WHERE work_scope_id = ?1 AND state = 'needs_repair'
+             )",
+        )
+        .bind(scope_id.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
     }
 
     /// Retire a scope under an exact active Close attempt's captured authority.
@@ -12835,7 +12807,7 @@ mod tests {
         std::fs::write(&marker, "gitdir: /tmp/second\n").unwrap();
         let replacement = Database::observe_worktree_fingerprint(root.to_str().unwrap()).unwrap();
         assert_ne!(first, replacement);
-        let max_pointer_bytes = usize::try_from(MAX_GIT_POINTER_BYTES).unwrap();
+        let max_pointer_bytes = usize::try_from(libc::PATH_MAX).unwrap() + b"gitdir: \r\n".len();
         let mut maximum_pointer = b"gitdir: ".to_vec();
         maximum_pointer.resize(max_pointer_bytes - 1, b'x');
         maximum_pointer.push(b'\n');

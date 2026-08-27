@@ -5534,31 +5534,6 @@ impl RuntimeManager {
         Ok(outcome)
     }
 
-    pub async fn send_event_and_wait_for_state(
-        self: &Arc<Self>,
-        conversation_id: &str,
-        event: Event,
-        _accepted: impl Fn(&ConvState) -> bool,
-    ) -> Result<(), String> {
-        let handle = self.get_or_create(conversation_id).await?;
-        deposit_turn_trigger(&handle);
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        let (_retirement_tx, retirement_rx) = tokio::sync::oneshot::channel();
-        handle
-            .acknowledged_event_tx
-            .send(AcknowledgedEventRequest {
-                event,
-                acknowledgement: ack_tx,
-                retirement: retirement_rx,
-            })
-            .await
-            .map_err(|error| error.to_string())?;
-        ack_rx
-            .await
-            .map_err(|_| "runtime stopped before event settled".to_string())?
-            .map(|_| ())
-    }
-
     pub async fn admit_continuation_retry(
         self: &Arc<Self>,
         conversation_id: &str,

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { requestActivePrSelectorOpen } from './activePrSelectorIntent';
 import { api } from '../api';
+import type { ProductConversationSnapshotView } from '../api';
 import type { AssociatedPrSummaryResponse, PrStatusResponse } from '../api';
 import type { ConversationPrStatusHandle } from '../hooks/useConversationPrStatus';
 import { useViewerSlotCommands } from '../contexts/ViewerSlotContext';
@@ -29,6 +30,51 @@ function InfoHint({ text }: { text: string }) {
       <span role="tooltip">{text}</span>
     </details>
   );
+}
+
+function CloseStatusPanel({
+  snapshot,
+  busy,
+  onConfirm,
+  onRetry,
+}: {
+  snapshot: ProductConversationSnapshotView;
+  busy: boolean;
+  onConfirm: () => void;
+  onRetry: () => void;
+}) {
+  const close = snapshot.close;
+  if (!close) return null;
+  if (close.phase === 'awaiting_loss_confirmation') {
+    return (
+      <section className="work-actions-close-status" aria-label="Close loss confirmation">
+        <strong>⚠ Closing will discard these exact items</strong>
+        <ul>
+          {close.losses.map((loss) => (
+            <li key={`${loss.scope}:${loss.generation}:${loss.category}:${loss.identity}`}>
+              <code>{loss.identity}</code> · {loss.category.replaceAll('_', ' ')}
+            </li>
+          ))}
+        </ul>
+        <p>No patch, stash, commit, branch deletion, or PR mutation will be created.</p>
+        <button type="button" className="work-actions-btn work-actions-btn--danger" disabled={busy} onClick={onConfirm}>
+          {busy ? 'Closing…' : 'Discard exact items and close'}
+        </button>
+      </section>
+    );
+  }
+  if (close.phase === 'needs_repair') {
+    return (
+      <section className="work-actions-close-status" aria-label="Close repair required">
+        <strong>⚠ Close needs repair</strong>
+        <p>Phoenix stopped before it could prove every owned resource was retired.</p>
+        <button type="button" className="work-actions-btn" disabled={busy} onClick={onRetry}>
+          {busy ? 'Retrying…' : 'Retry exact Close attempt'}
+        </button>
+      </section>
+    );
+  }
+  return null;
 }
 
 /** The orthogonal PR feedback coverage marker (e.g. "⚠ GitHub sign-in needed").
@@ -89,16 +135,8 @@ function ResolveLink({
   );
 }
 
-function cleanUpHintText(isBranch: boolean): string {
-  return isBranch
-    ? 'Mark as merged. Deletes the worktree; your branch is kept. No confirmation — use Abandon if you want a diff snapshot first.'
-    : 'Mark as merged. Deletes the worktree and the task branch Phoenix created. No confirmation — use Abandon if you want a diff snapshot first.';
-}
-
-function abandonHintText(isBranch: boolean): string {
-  return isBranch
-    ? 'Captures a diff snapshot and deletes the worktree; your branch is kept. Asks for confirmation.'
-    : 'Captures a diff snapshot, then deletes the worktree and the task branch. Asks for confirmation.';
+function closeHintText(): string {
+  return 'Closes this conversation and retires Phoenix-owned resources. Exact tracked, untracked, submodule, or detached work loss requires confirmation. Phoenix does not create recovery artifacts or move/delete branches or PRs.';
 }
 
 type CompactFallbackStatus = {
@@ -187,6 +225,7 @@ export function WorkControlBar({
   const [error, setError] = useState<string | null>(null);
   const [markingMerged, setMarkingMerged] = useState(false);
   const [abandoning, setAbandoning] = useState(false);
+  const [closeSnapshot, setCloseSnapshot] = useState<ProductConversationSnapshotView | null>(null);
   const [capturing, setCapturing] = useState(false);
   const [openSelectorAfterRefresh, setOpenSelectorAfterRefresh] = useState(false);
   const [expandedPrIdentity, setExpandedPrIdentity] = useState<string | null>(null);
@@ -215,6 +254,19 @@ export function WorkControlBar({
     if (fallbackOwnedFocus) {
       requestAnimationFrame(() => fallbackInfoButtonRef.current?.focus());
     }
+    setCloseSnapshot(null);
+  }, [conversationId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void api.getProductConversationSnapshot(conversationId)
+      .then((snapshot) => {
+        if (!cancelled && (snapshot.close?.phase === 'awaiting_loss_confirmation' || snapshot.close?.phase === 'needs_repair')) {
+          setCloseSnapshot(snapshot);
+        }
+      })
+      .catch(() => undefined);
+    return () => { cancelled = true; };
   }, [conversationId]);
 
   useEffect(() => {
@@ -331,7 +383,6 @@ export function WorkControlBar({
     workChange: prStatus?.work_change ?? null,
   });
 
-  const isBranch = convModeLabel === 'Branch';
   const fallbackOverflowAction = !cleanupBlockedByAmbiguity && disposition.showCleanUp && disposition.primary !== 'clean_up'
     ? 'clean_up'
     : !cleanupBlockedByAmbiguity && disposition.showAbandon && disposition.primary !== 'abandon'
@@ -413,6 +464,25 @@ export function WorkControlBar({
     return labels.length > 1 ? `Associated PRs: ${labels.join(' · ')}. Cleanup still applies only to this task branch.` : null;
   }, [actionablePrs, associatedPrs]);
 
+  const surfaceCloseConflict = async (err: unknown, fallback: string): Promise<boolean> => {
+    const code = err instanceof Error && 'code' in err && typeof err.code === 'string' ? err.code : undefined;
+    if (
+      code === 'close_loss_confirmation_required'
+      || code === 'close_retirement_needs_repair'
+      || code === 'stale_close_inspection'
+    ) {
+      try {
+        setCloseSnapshot(await api.getProductConversationSnapshot(conversationId));
+        return false;
+      } catch (snapshotError) {
+        setError(snapshotError instanceof Error ? snapshotError.message : 'Failed to load Close status');
+        return false;
+      }
+    }
+    setError(err instanceof Error ? err.message : fallback);
+    return false;
+  };
+
   const handleCleanUp = async (): Promise<boolean> => {
     setError(null);
     setMarkingMerged(true);
@@ -421,18 +491,13 @@ export function WorkControlBar({
       await api.markMerged(conversationId);
       return true;
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to mark as merged');
-      return false;
+      return surfaceCloseConflict(err, 'Failed to close conversation');
     } finally {
       setMarkingMerged(false);
     }
   };
 
   const handleAbandon = async (): Promise<boolean> => {
-    const confirmText = isBranch
-      ? 'Abandon this conversation? The worktree will be deleted but your branch will be kept.'
-      : 'Abandon this task? The worktree and task branch will be deleted.';
-    if (!window.confirm(confirmText)) return false;
     setError(null);
     setAbandoning(true);
     try {
@@ -440,10 +505,42 @@ export function WorkControlBar({
       await api.abandonTask(conversationId);
       return true;
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to abandon task');
-      return false;
+      return surfaceCloseConflict(err, 'Failed to close conversation');
     } finally {
       setAbandoning(false);
+    }
+  };
+
+  const confirmCloseLosses = async () => {
+    const close = closeSnapshot?.close;
+    const inspection = close?.confirmation_snapshot;
+    if (!close || !inspection) return;
+    setError(null);
+    setAbandoning(true);
+    try {
+      await api.confirmCloseLossRetirement(conversationId, {
+        attempt_id: close.attempt_id,
+        inspection_generation: inspection.generation,
+        inspection_fingerprint: inspection.fingerprint,
+      });
+      setCloseSnapshot(null);
+    } catch (err) {
+      await surfaceCloseConflict(err, 'Failed to confirm Close losses');
+    } finally {
+      setAbandoning(false);
+    }
+  };
+
+  const retryClose = async () => {
+    setError(null);
+    setMarkingMerged(true);
+    try {
+      await api.retryCloseRetirement(conversationId);
+      setCloseSnapshot(null);
+    } catch (err) {
+      await surfaceCloseConflict(err, 'Failed to retry Close retirement');
+    } finally {
+      setMarkingMerged(false);
     }
   };
 
@@ -506,6 +603,15 @@ export function WorkControlBar({
     ? `${addressFeedbackLabel}. Review ${activePrLabel} diff separately if needed.`
     : addressFeedbackLabel;
 
+  const closePanel = closeSnapshot ? (
+    <CloseStatusPanel
+      snapshot={closeSnapshot}
+      busy={isLoading}
+      onConfirm={() => { void confirmCloseLosses(); }}
+      onRetry={() => { void retryClose(); }}
+    />
+  ) : null;
+
   if (usesCompactLayout && !canRepresentActiveSelection) {
     const status = compactFallbackStatus(disposition, prStatus, explicitSelectionUnresolved, activePr);
     const primaryGuidance = explicitSelectionUnresolved
@@ -523,8 +629,8 @@ export function WorkControlBar({
               : null;
     const detailItems = [
       disposition.note?.text ?? primaryGuidance,
-      disposition.showCleanUp ? cleanUpHintText(isBranch) : null,
-      disposition.showAbandon ? abandonHintText(isBranch) : null,
+      disposition.showCleanUp ? closeHintText() : null,
+      disposition.showAbandon ? closeHintText() : null,
     ].filter((item): item is string => item !== null);
     const closeFallbackPanel = () => setFallbackPanel(null);
 
@@ -661,8 +767,8 @@ export function WorkControlBar({
             <button
               type="button"
               className="mobile-pr-action mobile-pr-action--cleanup mobile-pr-action--hero"
-              aria-label={`Clean up. ${cleanUpHintText(isBranch)}`}
-              title={cleanUpHintText(isBranch)}
+              aria-label={`Clean up. ${closeHintText()}`}
+              title={closeHintText()}
               disabled={isLoading}
               onClick={handleCleanUp}
             >
@@ -673,8 +779,8 @@ export function WorkControlBar({
             <button
               type="button"
               className="mobile-pr-action mobile-pr-action--danger mobile-pr-action--hero"
-              aria-label={`Abandon. ${abandonHintText(isBranch)}`}
-              title={abandonHintText(isBranch)}
+              aria-label={`Abandon. ${closeHintText()}`}
+              title={closeHintText()}
               disabled={isLoading}
               onClick={handleAbandon}
             >
@@ -707,7 +813,7 @@ export function WorkControlBar({
         {fallbackPanel === 'info' && (
           <div className="mobile-work-fallback-panel" role="status">
             {detailItems.map((item, index) => (
-              <span key={item} className={index > 0 ? 'mobile-work-fallback-panel-item--terminal' : undefined}>
+              <span key={`${index}:${item}`} className={index > 0 ? 'mobile-work-fallback-panel-item--terminal' : undefined}>
                 {item}
               </span>
             ))}
@@ -720,8 +826,8 @@ export function WorkControlBar({
                 type="button"
                 className="mobile-pr-action mobile-pr-action--cleanup"
                 disabled={isLoading}
-                aria-label={`Clean up. ${cleanUpHintText(isBranch)}`}
-                title={cleanUpHintText(isBranch)}
+                aria-label={`Clean up. ${closeHintText()}`}
+                title={closeHintText()}
                 onClick={async () => {
                   if (await handleCleanUp()) closeFallbackPanel();
                 }}
@@ -733,18 +839,19 @@ export function WorkControlBar({
               <button
                 type="button"
                 className="mobile-pr-action mobile-pr-action--danger"
-                aria-label={`Abandon. ${abandonHintText(isBranch)}`}
-                title={abandonHintText(isBranch)}
+                aria-label={`Abandon. ${closeHintText()}`}
+                title={closeHintText()}
                 disabled={isLoading}
                 onClick={async () => {
                   if (await handleAbandon()) closeFallbackPanel();
                 }}
               >
-                Abandon
+                Clean up
               </button>
             )}
           </div>
         )}
+        {closePanel}
         {error && <div className="work-actions-error mobile-work-fallback-error" role="alert">{error}</div>}
       </div>
     );
@@ -768,6 +875,8 @@ export function WorkControlBar({
       <button
         type="button"
         className="mobile-pr-action mobile-pr-action--hero mobile-pr-action--danger"
+        aria-label={`Abandon. ${closeHintText()}`}
+        title={closeHintText()}
         disabled={isLoading}
         onClick={handleAbandon}
       >
@@ -823,8 +932,8 @@ export function WorkControlBar({
                 <button
                   type="button"
                   className="mobile-pr-action mobile-pr-action--cleanup"
-                  aria-label={`Clean up. ${cleanUpHintText(isBranch)}`}
-                  title={cleanUpHintText(isBranch)}
+                  aria-label={`Clean up. ${closeHintText()}`}
+                  title={closeHintText()}
                   disabled={isLoading}
                   onClick={handleCleanUp}
                 >
@@ -835,8 +944,8 @@ export function WorkControlBar({
                 <button
                   type="button"
                   className="mobile-pr-action mobile-pr-action--danger"
-                  aria-label={`Abandon. ${abandonHintText(isBranch)}`}
-                  title={abandonHintText(isBranch)}
+                  aria-label={`Abandon. ${closeHintText()}`}
+                  title={closeHintText()}
                   disabled={isLoading}
                   onClick={handleAbandon}
                 >
@@ -890,6 +999,7 @@ export function WorkControlBar({
             );
           })}
         </div>
+        {closePanel}
         {error && <div className="work-actions-error" role="alert">{error}</div>}
         {note && <span className="work-actions-note mobile-pr-dock-note">{note.text}</span>}
       </div>
@@ -973,14 +1083,14 @@ export function WorkControlBar({
             <button
               className={`work-actions-btn work-actions-clean-up${primaryClass('clean_up')}`}
               data-testid="clean-up-button"
-              aria-label={`Clean up. ${cleanUpHintText(isBranch)}`}
-              title={cleanUpHintText(isBranch)}
+              aria-label={`Clean up. ${closeHintText()}`}
+              title={closeHintText()}
               disabled={isLoading}
               onClick={handleCleanUp}
             >
               {markingMerged ? 'Cleaning…' : 'Clean up'}
             </button>
-            <InfoHint text={cleanUpHintText(isBranch)} />
+            <InfoHint text={closeHintText()} />
           </div>
         )}
         {!cleanupBlockedByAmbiguity && disposition.showAbandon && (
@@ -988,14 +1098,14 @@ export function WorkControlBar({
             <button
               className={`work-actions-btn work-actions-abandon${primaryClass('abandon')}`}
               data-testid="abandon-button"
-              aria-label={`Abandon. ${abandonHintText(isBranch)}`}
-              title={abandonHintText(isBranch)}
+              aria-label={`Abandon. ${closeHintText()}`}
+              title={closeHintText()}
               disabled={isLoading}
               onClick={handleAbandon}
             >
               {abandoning ? 'Abandoning…' : 'Abandon'}
             </button>
-            <InfoHint text={abandonHintText(isBranch)} />
+            <InfoHint text={closeHintText()} />
           </div>
         )}
         {note && (
@@ -1009,6 +1119,7 @@ export function WorkControlBar({
           </span>
         )}
       </div>
+      {closePanel}
       {error && <div className="work-actions-error desktop-work-actions-error" role="alert">{error}</div>}
     </div>
   );

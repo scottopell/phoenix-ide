@@ -49,6 +49,13 @@ pub struct CloseAdmissionFence {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseProjection {
+    pub obligation: CloseObligation,
+    pub inspections: Vec<CloseInspection>,
+    pub losses: Vec<CloseInspectionLoss>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProductConversationAdmission {
     Accepted {
         product_conversation_id: ProductConversationId,
@@ -1908,6 +1915,68 @@ impl Database {
         Ok(confirmed)
     }
 
+    /// Reads one complete active Close projection from a single `SQLite` snapshot.
+    /// # Errors
+    /// Returns [`DbError`] when the obligation or normalized evidence cannot be read.
+    pub async fn get_active_close_projection_for_product(
+        &self,
+        product_conversation_id: &ProductConversationId,
+    ) -> DbResult<Option<CloseProjection>> {
+        let mut connection = self.pool.acquire().await?;
+        let mut tx = connection.begin().await?;
+        let obligation = sqlx::query(
+            "SELECT attempt_id, product_conversation_id, phase,
+                    inspection_generation, inspection_fingerprint,
+                    created_at, updated_at, completed_at, close_outcome
+             FROM close_obligations
+             WHERE product_conversation_id = ?1 AND phase <> 'completed'",
+        )
+        .bind(product_conversation_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(parse_close_obligation_row)
+        .transpose()?;
+        let Some(obligation) = obligation else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let inspections = sqlx::query(
+            "SELECT attempt_id, scope, generation, fingerprint, inspected_at
+             FROM close_retirement_inspections
+             WHERE attempt_id = ?1
+             ORDER BY scope, inspected_at",
+        )
+        .bind(obligation.attempt_id().as_str())
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(parse_close_inspection_row)
+        .collect::<DbResult<Vec<_>>>()?;
+        let losses = sqlx::query(
+            "SELECT loss.attempt_id, loss.scope, loss.generation, inspection.fingerprint,
+                    loss.category, loss.identity_kind, loss.identity_codec, loss.identity_value
+             FROM close_retirement_losses loss
+             JOIN close_retirement_inspections inspection
+               ON inspection.attempt_id = loss.attempt_id
+              AND inspection.scope = loss.scope
+              AND inspection.generation = loss.generation
+             WHERE loss.attempt_id = ?1
+             ORDER BY loss.scope, loss.generation, loss.category, loss.identity_kind, loss.identity_value",
+        )
+        .bind(obligation.attempt_id().as_str())
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(parse_close_inspection_loss_row)
+        .collect::<DbResult<Vec<_>>>()?;
+        tx.rollback().await?;
+        Ok(Some(CloseProjection {
+            obligation,
+            inspections,
+            losses,
+        }))
+    }
+
     pub async fn list_close_retirement_inspections(
         &self,
         attempt_id: &str,
@@ -2830,6 +2899,17 @@ impl Database {
             )));
         }
         let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "UPDATE conversations
+             SET archived = 1, updated_at = ?2
+             WHERE id IN (
+                 SELECT conversation_id FROM close_attempt_members WHERE attempt_id = ?1
+             )",
+        )
+        .bind(attempt_id.as_str())
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
         let completed = sqlx::query(
             "UPDATE close_obligations
              SET phase = 'completed', close_outcome = 'archived',
@@ -2845,17 +2925,6 @@ impl Database {
                 "attempt {attempt_id} completion lost retirement authority"
             )));
         }
-        sqlx::query(
-            "UPDATE conversations
-             SET archived = 1, updated_at = ?2
-             WHERE id IN (
-                 SELECT conversation_id FROM close_attempt_members WHERE attempt_id = ?1
-             )",
-        )
-        .bind(attempt_id.as_str())
-        .bind(&now)
-        .execute(&mut *tx)
-        .await?;
         let obligation = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
         tx.commit().await?;
         Ok(obligation)

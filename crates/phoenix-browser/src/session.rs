@@ -790,7 +790,11 @@ impl BrowserSession {
             chrome_process,
         };
         if let Some(marker) = BrowserProfileMarker::from_launch(scope_key, &launch_identity) {
-            write_profile_marker_atomic(&user_data_dir, &marker)?;
+            if let Err(error) = write_profile_marker_atomic(&user_data_dir, &marker) {
+                let _ = browser.kill().await;
+                let _ = std::fs::remove_dir_all(&user_data_dir);
+                return Err(error);
+            }
         }
 
         let handler_task = tokio::spawn(async move {

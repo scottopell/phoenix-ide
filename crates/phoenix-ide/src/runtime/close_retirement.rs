@@ -90,6 +90,7 @@ impl RuntimeManager {
             .await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn inspect_close_retirement_with_continuation(
         &self,
         attempt_id: CloseAttemptId,
@@ -106,49 +107,59 @@ impl RuntimeManager {
                 None => continue,
                 Some(CapturedWorktreeIdentity::Resolved(identity)) => {
                     let path = worktree_path(&identity);
-                    if !path.try_exists().map_err(|error| {
-                        format!("cannot observe captured worktree path: {error}")
-                    })? {
-                        let obligation = self
-                            .db()
-                            .get_close_obligation(attempt_id.as_str())
-                            .await
-                            .map_err(|error| error.to_string())?;
-                        if let Some(prior_snapshot) = obligation.snapshot().cloned() {
-                            let worktree = RetiredResourceIdentity::parse(
-                                RetiredResourceKind::Worktree,
-                                LossItemIdentity::Worktree(identity.clone()),
-                            )
-                            .map_err(|error| error.to_string())?;
-                            if self
+                    match path.try_exists() {
+                        Ok(true) => inspect_worktree(&identity).await?,
+                        Ok(false) => {
+                            let obligation = self
                                 .db()
-                                .close_retirement_resource_was_dispatched(
-                                    &attempt_id,
-                                    &scope.scope,
-                                    &prior_snapshot,
-                                    &worktree,
-                                )
+                                .get_close_obligation(attempt_id.as_str())
                                 .await
-                                .map_err(|error| error.to_string())?
-                            {
-                                if continue_clean_retirement
-                                    && obligation.phase() == ClosePhase::RetirementRequested
+                                .map_err(|error| error.to_string())?;
+                            if let Some(prior_snapshot) = obligation.snapshot().cloned() {
+                                let worktree = RetiredResourceIdentity::parse(
+                                    RetiredResourceKind::Worktree,
+                                    LossItemIdentity::Worktree(identity.clone()),
+                                )
+                                .map_err(|error| error.to_string())?;
+                                if self
+                                    .db()
+                                    .close_retirement_resource_was_dispatched(
+                                        &attempt_id,
+                                        &scope.scope,
+                                        &prior_snapshot,
+                                        &worktree,
+                                    )
+                                    .await
+                                    .map_err(|error| error.to_string())?
                                 {
-                                    self.retire_close_runtime_resources(attempt_id).await?;
+                                    if continue_clean_retirement
+                                        && obligation.phase() == ClosePhase::RetirementRequested
+                                    {
+                                        self.retire_close_runtime_resources(attempt_id).await?;
+                                    }
+                                    return Ok(prior_snapshot);
                                 }
-                                return Ok(prior_snapshot);
                             }
+                            self.db()
+                                .route_close_attempt_to_repair(&attempt_id)
+                                .await
+                                .map_err(|error| error.to_string())?;
+                            return Err(format!(
+                                "scope {} captured worktree is absent before inspection",
+                                scope.scope
+                            ));
                         }
-                        self.db()
-                            .route_close_attempt_to_repair(&attempt_id)
-                            .await
-                            .map_err(|error| error.to_string())?;
-                        return Err(format!(
-                            "scope {} captured worktree is absent before inspection",
-                            scope.scope
-                        ));
+                        Err(error) => {
+                            self.db()
+                                .route_close_attempt_to_repair(&attempt_id)
+                                .await
+                                .map_err(|db_error| db_error.to_string())?;
+                            return Err(format!(
+                                "scope {} captured worktree is inaccessible before inspection: {error}",
+                                scope.scope
+                            ));
+                        }
                     }
-                    inspect_worktree(&identity).await?
                 }
                 Some(CapturedWorktreeIdentity::Unresolved { .. }) => {
                     self.db()
@@ -743,6 +754,37 @@ impl RuntimeManager {
             let worktree_target = targets.iter().find(|target| {
                 target.scope == scope && target.resource.kind() == RetiredResourceKind::Worktree
             });
+            if self
+                .db()
+                .work_scope_has_unresolved_product_ownership(&scope)
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                let resource = worktree_target
+                    .map_or_else(
+                        || {
+                            RetiredResourceIdentity::parse(
+                                RetiredResourceKind::WorkScope,
+                                LossItemIdentity::Opaque(
+                                    OpaqueIdentity::parse(scope.as_str())
+                                        .expect("WorkScopeId is non-empty"),
+                                ),
+                            )
+                        },
+                        |target| Ok(target.resource.clone()),
+                    )
+                    .map_err(|error| error.to_string())?;
+                return self
+                    .record_close_residual(
+                        attempt_id,
+                        snapshot,
+                        &scope,
+                        resource,
+                        RetirementFailureReason::IdentityNotProven,
+                        "work scope has unresolved ProductConversation ownership",
+                    )
+                    .await;
+            }
             if let Some(target) = worktree_target {
                 if !retired.contains(&(scope.clone(), resource_key(&target.resource))) {
                     let identity = match &captured.captured_worktree {
@@ -792,20 +834,35 @@ impl RuntimeManager {
                             )
                             .await;
                     };
-                    if worktree_path(identity).try_exists().map_err(|error| {
-                        format!("cannot observe captured worktree path: {error}")
-                    })? {
-                        self.db()
-                            .record_close_retirement_dispatch(
-                                RecordCloseRetirementDispatchRequest {
-                                    attempt_id: attempt_id.clone(),
-                                    scope: scope.clone(),
-                                    snapshot: snapshot.clone(),
-                                    resource: target.resource.clone(),
-                                },
-                            )
-                            .await
-                            .map_err(|error| error.to_string())?;
+                    match worktree_path(identity).try_exists() {
+                        Ok(true) => {
+                            self.db()
+                                .record_close_retirement_dispatch(
+                                    RecordCloseRetirementDispatchRequest {
+                                        attempt_id: attempt_id.clone(),
+                                        scope: scope.clone(),
+                                        snapshot: snapshot.clone(),
+                                        resource: target.resource.clone(),
+                                    },
+                                )
+                                .await
+                                .map_err(|error| error.to_string())?;
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            return self
+                                .record_close_residual(
+                                    attempt_id,
+                                    snapshot,
+                                    &scope,
+                                    target.resource.clone(),
+                                    RetirementFailureReason::IdentityNotProven,
+                                    &format!(
+                                        "captured worktree is inaccessible before retirement dispatch: {error}"
+                                    ),
+                                )
+                                .await;
+                        }
                     }
                     let identity = identity.clone();
                     let confirmed_snapshot = confirmed.snapshot.clone();
@@ -1095,8 +1152,8 @@ async fn inspect_worktree(
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
-    let mut observation = output.stdout;
-    let mut losses = parse_status_losses(&observation);
+    let mut observation = canonical_status_observation(&output.stdout);
+    let mut losses = parse_status_losses(&output.stdout);
     observe_detached_head_and_submodules(&path, &mut observation, &mut losses).await?;
     Ok((snapshot_for(&observation), losses))
 }
@@ -1332,7 +1389,7 @@ fn observe_initialized_submodules(
         }
         observation.push((
             [b"SUBMODULE_STATUS\0".as_slice(), relative_path.as_slice()].concat(),
-            status.stdout.clone(),
+            canonical_status_observation(&status.stdout),
         ));
 
         let gitlink = phoenix_core::git::command()
@@ -1466,8 +1523,13 @@ async fn remove_exact_worktree(identity: &WorktreeIdentity) -> Result<(), String
             return Ok::<_, std::io::Error>((None, false, false));
         }
         let common = path_buf_from_git_bytes(common.stdout.trim_ascii());
-        let Some(repo) = common.parent().map(Path::to_path_buf) else {
-            return Ok((None, false, false));
+        let repo = if common.join("HEAD").is_file() && !common.join(".git").exists() {
+            common.clone()
+        } else {
+            let Some(repo) = common.parent().map(Path::to_path_buf) else {
+                return Ok((None, false, false));
+            };
+            repo
         };
         let target = std::fs::canonicalize(&path_for_check)?;
         let listed = phoenix_core::git::command()
@@ -1516,6 +1578,25 @@ async fn remove_exact_worktree(identity: &WorktreeIdentity) -> Result<(), String
     }
 }
 
+fn canonical_status_observation(status: &[u8]) -> Vec<u8> {
+    let mut observation = Vec::with_capacity(status.len());
+    let mut rows = status.split(|byte| *byte == 0);
+    while let Some(row) = rows.next() {
+        if row.len() < 4 || &row[..2] == b"!!" {
+            continue;
+        }
+        observation.extend_from_slice(row);
+        observation.push(0);
+        if matches!(row[0], b'R' | b'C') || matches!(row[1], b'R' | b'C') {
+            if let Some(source) = rows.next() {
+                observation.extend_from_slice(source);
+                observation.push(0);
+            }
+        }
+    }
+    observation
+}
+
 fn parse_status_losses(status: &[u8]) -> Vec<CloseLossItem> {
     let mut losses = Vec::new();
     let mut rows = status.split(|byte| *byte == 0);
@@ -1556,73 +1637,7 @@ fn snapshot_for(bytes: &[u8]) -> CloseRetirementSnapshot {
 }
 
 fn observe_worktree_fingerprint(path: &Path) -> Option<String> {
-    use std::fmt::Write as _;
-    use std::io::Read as _;
-    #[cfg(unix)]
-    use std::os::unix::fs::MetadataExt as _;
-    const MAX_GIT_POINTER_BYTES: u64 = 16 * 1024;
-    let marker = path.join(".git");
-    let metadata = std::fs::symlink_metadata(&marker).ok()?;
-    let marker_bytes = if metadata.is_file() {
-        if metadata.len() > MAX_GIT_POINTER_BYTES {
-            return None;
-        }
-        let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).ok()?);
-        std::fs::File::open(&marker)
-            .ok()?
-            .take(MAX_GIT_POINTER_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .ok()?;
-        if u64::try_from(bytes.len()).ok()? > MAX_GIT_POINTER_BYTES {
-            return None;
-        }
-        let pointer = std::str::from_utf8(&bytes).ok()?;
-        let git_dir = pointer
-            .strip_suffix("\r\n")
-            .or_else(|| pointer.strip_suffix('\n'))
-            .unwrap_or(pointer)
-            .strip_prefix("gitdir: ")?;
-        if git_dir.is_empty() || git_dir.contains(['\n', '\r']) {
-            return None;
-        }
-        git_dir.as_bytes().to_vec()
-    } else if metadata.is_dir() {
-        Vec::new()
-    } else {
-        return None;
-    };
-    let mut encoded = String::with_capacity(marker_bytes.len() * 2);
-    for byte in marker_bytes {
-        write!(&mut encoded, "{byte:02x}").ok()?;
-    }
-    #[cfg(unix)]
-    {
-        let created_nanos = metadata
-            .created()
-            .ok()
-            .and_then(|created| created.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|duration| duration.as_nanos().to_string());
-        let created_nanos = created_nanos?;
-        Some(format!(
-            "git_admin_incarnation_v1:{}:{}:{}:{encoded}",
-            metadata.dev(),
-            metadata.ino(),
-            created_nanos
-        ))
-    }
-    #[cfg(not(unix))]
-    {
-        let created_nanos = metadata
-            .created()
-            .ok()?
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_nanos();
-        Some(format!(
-            "git_admin_incarnation_v1:portable:{}:{created_nanos}",
-            metadata.len()
-        ))
-    }
+    phoenix_core::git::observe_worktree_fingerprint(path)
 }
 
 fn worktree_path(identity: &WorktreeIdentity) -> PathBuf {
@@ -1713,8 +1728,8 @@ fn require_browser_absent(outcome: BrowserRetirementOutcome) -> Result<(), Strin
 #[cfg(test)]
 mod tests {
     use super::{
-        git_path_from_observation, inspect_worktree, parse_status_losses, snapshot_for,
-        CloseLeaseFailure,
+        canonical_status_observation, git_path_from_observation, inspect_worktree,
+        parse_status_losses, remove_exact_worktree, snapshot_for, CloseLeaseFailure,
     };
     use phoenix_core::domain::close::{
         CloseLossItem, GitPathIdentity, WorktreeFingerprint, WorktreeId, WorktreeIdentity,
@@ -1759,6 +1774,59 @@ mod tests {
         std::fs::write(path.join("tracked"), "initial\n").unwrap();
         run_git(path, &["add", "tracked"]);
         run_git(path, &["commit", "--quiet", "-m", "initial"]);
+    }
+
+    #[tokio::test]
+    async fn remove_exact_worktree_uses_bare_common_repository_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let seed = temp.path().join("seed");
+        let bare = temp.path().join("origin.git");
+        let linked = temp.path().join("linked");
+        initialize_repository(&seed);
+        run_git(
+            temp.path(),
+            &[
+                "clone",
+                "--quiet",
+                "--bare",
+                seed.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+        );
+        run_git(
+            &bare,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                linked.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let fingerprint = phoenix_core::git::observe_worktree_fingerprint(&linked).unwrap();
+        #[cfg(unix)]
+        let locator = {
+            use std::os::unix::ffi::OsStrExt as _;
+            GitPathIdentity::from_bytes(linked.as_os_str().as_bytes().to_vec())
+        };
+        #[cfg(not(unix))]
+        let locator = GitPathIdentity::from_bytes(linked.to_string_lossy().as_bytes().to_vec());
+        let identity = WorktreeIdentity::from_parts(
+            WorktreeId::parse("bare-linked-worktree").unwrap(),
+            WorktreeFingerprint::parse(fingerprint).unwrap(),
+            locator,
+        );
+
+        remove_exact_worktree(&identity).await.unwrap();
+
+        assert!(!linked.exists());
+        let listing = phoenix_core::git::command()
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(&bare)
+            .output()
+            .unwrap();
+        assert!(listing.status.success());
+        assert!(!String::from_utf8_lossy(&listing.stdout).contains(linked.to_str().unwrap()));
     }
 
     #[tokio::test]
@@ -1995,6 +2063,21 @@ mod tests {
         assert!(losses.iter().any(|loss| matches!(loss, CloseLossItem::StagedTrackedPath(path) if path.as_bytes() == b"both")));
         assert!(losses.iter().any(|loss| matches!(loss, CloseLossItem::UnstagedTrackedPath(path) if path.as_bytes() == b"both")));
         assert!(losses.iter().any(|loss| matches!(loss, CloseLossItem::UntrackedNonIgnoredPath(path) if path.as_bytes() == b"untracked")));
+    }
+
+    #[test]
+    fn ignored_paths_do_not_change_canonical_snapshot() {
+        let clean = snapshot_for(&canonical_status_observation(b""));
+        let ignored = snapshot_for(&canonical_status_observation(b"!! target/log.txt\0"));
+        assert_eq!(clean, ignored);
+    }
+
+    #[test]
+    fn canonical_status_preserves_rename_source_record() {
+        assert_eq!(
+            canonical_status_observation(b"R  new-name.txt\0old-name.txt\0!! ignored\0"),
+            b"R  new-name.txt\0old-name.txt\0"
+        );
     }
 
     #[test]

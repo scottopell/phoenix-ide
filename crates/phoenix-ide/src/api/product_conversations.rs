@@ -174,15 +174,12 @@ async fn snapshot_view(
             .conversation
             .archived,
     );
-    let close_obligation = state
+    let close = state
         .db
-        .get_active_close_obligation_for_product(aggregate.product_conversation.id())
+        .get_active_close_projection_for_product(aggregate.product_conversation.id())
         .await
-        .map_err(db_to_app)?;
-    let close = match close_obligation.as_ref() {
-        Some(obligation) => Some(close_view(&state.db, obligation).await?),
-        None => None,
-    };
+        .map_err(db_to_app)?
+        .map(close_view);
     let generation = aggregate_generation(&aggregate);
     let segment_ceilings = cursor.as_ref().map_or_else(
         || aggregate_segment_ceilings(&aggregate),
@@ -538,11 +535,10 @@ fn validate_cursor(
     Ok(())
 }
 
-async fn close_view(
-    db: &crate::db::Database,
-    obligation: &phoenix_core::domain::close::CloseObligation,
-) -> Result<ProductConversationCloseView, AppError> {
+fn close_view(projection: crate::db::CloseProjection) -> ProductConversationCloseView {
     use phoenix_core::domain::close::ClosePhase;
+
+    let obligation = projection.obligation;
 
     let phase = match obligation.phase() {
         ClosePhase::AwaitingBlockerResolution => {
@@ -565,7 +561,7 @@ async fn close_view(
         ClosePhase::NeedsRepair => ProductConversationClosePhaseView::NeedsRepair,
         ClosePhase::Completed => ProductConversationClosePhaseView::Completed,
     };
-    Ok(ProductConversationCloseView {
+    ProductConversationCloseView {
         attempt_id: obligation.attempt_id().to_string(),
         phase,
         confirmation_snapshot: obligation.snapshot().map(|snapshot| {
@@ -575,10 +571,8 @@ async fn close_view(
                 fingerprint: snapshot.fingerprint().to_string(),
             }
         }),
-        inspections: db
-            .list_close_retirement_inspections(obligation.attempt_id().as_str())
-            .await
-            .map_err(db_to_app)?
+        inspections: projection
+            .inspections
             .into_iter()
             .map(|inspection| ProductConversationCloseInspectionView {
                 scope: inspection.target.scope.as_str().to_string(),
@@ -586,10 +580,8 @@ async fn close_view(
                 fingerprint: inspection.snapshot.fingerprint().to_string(),
             })
             .collect(),
-        losses: db
-            .list_close_retirement_losses(obligation.attempt_id().as_str())
-            .await
-            .map_err(db_to_app)?
+        losses: projection
+            .losses
             .into_iter()
             .map(|loss| ProductConversationCloseLossView {
                 scope: loss.scope.as_str().to_string(),
@@ -609,7 +601,7 @@ async fn close_view(
                 },
             })
             .collect(),
-    })
+    }
 }
 
 fn lifecycle_view(

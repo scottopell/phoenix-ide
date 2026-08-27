@@ -1267,20 +1267,18 @@ impl TmuxRegistry {
             ProbeResult::NoSocket | ProbeResult::DeadSocket => {
                 Ok(TmuxRetirementOutcome::AbsenceVerified)
             }
-            ProbeResult::Live => {
-                if read_server_token(&permit.instance.socket_path)
-                    .await
-                    .as_deref()
-                    == Some(permit.instance.server_token.as_str())
-                {
+            ProbeResult::Live => match read_server_token(&permit.instance.socket_path).await {
+                Some(token) if token == permit.instance.server_token => {
                     Ok(TmuxRetirementOutcome::RemovalFailed {
                         reason: "exact tmux server instance remained live after teardown"
                             .to_string(),
                     })
-                } else {
-                    Ok(TmuxRetirementOutcome::AbsenceVerified)
                 }
-            }
+                Some(_) => Ok(TmuxRetirementOutcome::AbsenceVerified),
+                None => Ok(TmuxRetirementOutcome::IdentityNotProven {
+                    reason: "live tmux server token is unreadable".to_string(),
+                }),
+            },
         }
     }
 
@@ -1356,30 +1354,8 @@ impl TmuxRegistry {
         drop(server);
 
         let verified = self.verify_exact_absence(permit).await?;
-        let unlink_error = if matches!(
-            probe(&permit.instance.socket_path)
-                .await
-                .map_err(|source| TmuxError::ProbeFailed {
-                    socket_path: permit.instance.socket_path.clone(),
-                    source,
-                })?,
-            ProbeResult::DeadSocket
-        ) {
-            tokio::fs::remove_file(&permit.instance.socket_path)
-                .await
-                .err()
-                .filter(|error| error.kind() != std::io::ErrorKind::NotFound)
-                .map(|error| error.to_string())
-        } else {
-            None
-        };
         if let Some(failure) = kill_failure {
             return Ok(failure);
-        }
-        if let Some(error) = unlink_error {
-            return Ok(TmuxRetirementOutcome::RemovalFailed {
-                reason: format!("dead socket unlink failed: {error}"),
-            });
         }
 
         match verified {
@@ -1467,6 +1443,7 @@ impl TmuxRegistry {
     /// gone) are non-fatal.
     ///
     /// REQ-TMUX-007, REQ-TMUX-WS-001, REQ-TMUX-WS-002.
+    #[allow(clippy::too_many_lines)]
     pub async fn cascade_on_delete(
         &self,
         work_scope: &ResourceScopeKey,
@@ -1503,24 +1480,75 @@ impl TmuxRegistry {
 
         let existing = self.get_existing(work_scope).await;
         if existing.is_none() {
-            let socket_path = self.derived_socket_path(work_scope);
-            if matches!(probe(&socket_path).await, Ok(ProbeResult::Live)) {
-                return CascadeReport {
-                    socket_path,
-                    kill_server_error: Some(
-                        "live tmux socket has no registry token; refusing destructive cascade"
-                            .to_string(),
-                    ),
+            let discovery = match self
+                .discover_persistent_identity(
+                    work_scope,
+                    legacy_worktree_path,
+                    legacy_conversation_id,
+                )
+                .await
+            {
+                Ok(discovery) => discovery,
+                Err(error) => {
+                    return CascadeReport {
+                        socket_path: self.derived_socket_path(work_scope),
+                        kill_server_error: Some(error.to_string()),
+                        unlink_error: None,
+                    };
+                }
+            };
+            let identity = match discovery {
+                PersistentTmuxDiscovery::Absent => {
+                    return CascadeReport {
+                        socket_path: self.derived_socket_path(work_scope),
+                        kill_server_error: None,
+                        unlink_error: None,
+                    };
+                }
+                PersistentTmuxDiscovery::Ambiguous { reason } => {
+                    return CascadeReport {
+                        socket_path: self.derived_socket_path(work_scope),
+                        kill_server_error: Some(reason),
+                        unlink_error: None,
+                    };
+                }
+                PersistentTmuxDiscovery::Exact(identity) => identity,
+            };
+            let outcome = match self.rehydrate_retirement(work_scope, &identity).await {
+                Ok(TmuxRetirementRehydration::Permit(permit)) => {
+                    match self.complete_retirement(&permit).await {
+                        Ok(outcome) => outcome,
+                        Err(error) => TmuxRetirementOutcome::RemovalFailed {
+                            reason: error.to_string(),
+                        },
+                    }
+                }
+                Ok(TmuxRetirementRehydration::AbsenceVerified) => {
+                    TmuxRetirementOutcome::AbsenceVerified
+                }
+                Ok(TmuxRetirementRehydration::Residual { reason }) => {
+                    TmuxRetirementOutcome::IdentityNotProven { reason }
+                }
+                Err(error) => TmuxRetirementOutcome::RemovalFailed {
+                    reason: error.to_string(),
+                },
+            };
+            return match outcome {
+                TmuxRetirementOutcome::Retired | TmuxRetirementOutcome::AbsenceVerified => {
+                    CascadeReport {
+                        socket_path: identity.socket_path,
+                        kill_server_error: None,
+                        unlink_error: None,
+                    }
+                }
+                TmuxRetirementOutcome::IdentityNotProven { reason }
+                | TmuxRetirementOutcome::RemovalFailed { reason } => CascadeReport {
+                    socket_path: identity.socket_path,
+                    kill_server_error: Some(reason),
                     unlink_error: None,
-                };
-            }
-            return CascadeReport {
-                socket_path,
-                kill_server_error: None,
-                unlink_error: None,
+                },
             };
         }
-        let had_entry = true;
         if let Some(entry) = existing {
             if entry.read().await.status == ServerStatus::NotProbed {
                 self.inner.write().await.remove(&work_scope.stable_key());
@@ -1556,16 +1584,11 @@ impl TmuxRegistry {
                 }
             }
             TmuxRetirementOutcome::IdentityNotProven { reason }
-            | TmuxRetirementOutcome::RemovalFailed { reason } => {
-                if !had_entry {
-                    let _ = self.inner.write().await.remove(&work_scope.stable_key());
-                }
-                CascadeReport {
-                    socket_path: permit.instance.socket_path,
-                    kill_server_error: Some(reason),
-                    unlink_error: None,
-                }
-            }
+            | TmuxRetirementOutcome::RemovalFailed { reason } => CascadeReport {
+                socket_path: permit.instance.socket_path,
+                kill_server_error: Some(reason),
+                unlink_error: None,
+            },
         }
     }
 
@@ -2311,8 +2334,9 @@ mod tests {
         assert_eq!(outcome, TmuxRetirementOutcome::Retired);
         assert!(matches!(
             probe(&persisted.socket_path).await.unwrap(),
-            ProbeResult::NoSocket
+            ProbeResult::NoSocket | ProbeResult::DeadSocket
         ));
+        let _ = std::fs::remove_file(&persisted.socket_path);
         owner.shutdown();
     }
 
@@ -2769,6 +2793,67 @@ mod tests {
     /// is gone, and the stored `socket_path` is PRESERVED (the running tmux
     /// server lives on the old socket — re-deriving from the new scope would
     /// orphan it). The `work_scope` diagnostic field follows the new scope.
+    #[tokio::test]
+    async fn cascade_on_delete_empty_registry_reclaims_persistent_server() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let owner = TestTmuxServerOwner::new();
+        let scope = scope("cascade-persistent-empty-registry");
+        let bootstrap = owner.registry();
+        let live = bootstrap
+            .ensure_live(&scope, owner.path(), None, None)
+            .await
+            .expect("bootstrap persistent server");
+        let socket_path = live.read().await.socket_path.clone();
+
+        let restarted = owner.registry();
+        assert_eq!(restarted.conversation_count().await, 0);
+        let report = restarted.cascade_on_delete(&scope, None, None, None).await;
+
+        assert!(report.kill_server_error.is_none(), "{report:?}");
+        assert!(matches!(
+            probe(&socket_path).await.unwrap(),
+            ProbeResult::NoSocket | ProbeResult::DeadSocket
+        ));
+        let _ = std::fs::remove_file(&socket_path);
+        owner.shutdown();
+    }
+
+    #[tokio::test]
+    async fn cascade_on_delete_empty_registry_reclaims_legacy_persistent_server() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let owner = TestTmuxServerOwner::new();
+        let scope = scope("cascade-persistent-legacy-empty-registry");
+        let legacy_worktree = owner.path().join("legacy-worktree");
+        std::fs::create_dir_all(&legacy_worktree).unwrap();
+        let legacy_socket = socket_path_for_worktree(owner.path(), &legacy_worktree);
+        spawn_session_owned(
+            &legacy_socket,
+            &owner.path().join(SERVER_CONFIG_FILENAME),
+            &legacy_worktree,
+            true,
+        )
+        .await
+        .expect("bootstrap legacy persistent server");
+
+        let restarted = owner.registry();
+        let report = restarted
+            .cascade_on_delete(&scope, None, Some(&legacy_worktree), None)
+            .await;
+
+        assert!(report.kill_server_error.is_none(), "{report:?}");
+        assert_eq!(report.socket_path, legacy_socket);
+        assert!(matches!(
+            probe(&report.socket_path).await.unwrap(),
+            ProbeResult::NoSocket | ProbeResult::DeadSocket
+        ));
+        let _ = std::fs::remove_file(&report.socket_path);
+        owner.shutdown();
+    }
+
     #[tokio::test]
     async fn cascade_on_delete_no_entry_attempts_socket_unlink() {
         let tmp = TempDir::new().unwrap();

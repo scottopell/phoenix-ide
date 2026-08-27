@@ -11,8 +11,8 @@
 //     the #288 freshness (.work-actions-pr-freshness) + coverage
 //     (.work-actions-pr-coverage[--auth] ⚠) spans.
 //   - merge-pr-link / open-pr-link — honest <a> links to the PR url.
-//   - clean-up-button ("Clean up" / "Cleaning...") — single click → api.markMerged.
-//   - abandon-button ("Abandon" / "Abandoning...") — window.confirm → api.abandonTask.
+//   - clean-up-button / abandon-button initiate the server-authoritative Close contract.
+//   - persisted loss-confirmation and repair phases surface exact follow-up actions.
 //   - Exactly one element carries work-actions-btn--primary.
 //   - Notes are muted spans, never buttons.
 
@@ -53,6 +53,9 @@ vi.mock('../api', () => ({
   api: {
     abandonTask: vi.fn().mockResolvedValue({ success: true }),
     markMerged: vi.fn().mockResolvedValue({ success: true }),
+    getProductConversationSnapshot: vi.fn().mockResolvedValue({ close: null }),
+    confirmCloseLossRetirement: vi.fn().mockResolvedValue({ success: true }),
+    retryCloseRetirement: vi.fn().mockResolvedValue({ success: true }),
     getConversationDiff: vi.fn(),
     getPrStatus: vi.fn(),
     createPrAutoFixContext: vi
@@ -152,6 +155,7 @@ function primaryCount() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.mocked(api.getProductConversationSnapshot).mockResolvedValue({ close: null } as never);
   Object.defineProperty(window, 'matchMedia', {
     writable: true,
     value: vi.fn().mockImplementation((query: string) => ({
@@ -661,48 +665,23 @@ describe('WorkControlBar — terminal cleanup actions', () => {
     expect(api.markMerged).toHaveBeenCalledWith('conv-1');
   });
 
-  it('Abandon confirms then calls api.abandonTask', async () => {
-    const confirmSpy = vi.fn().mockReturnValue(true);
-    const prevConfirm = window.confirm;
+  it('Abandon starts the server-authoritative Close contract without a generic browser confirmation', async () => {
+    const confirmSpy = vi.fn();
+    const previousConfirm = window.confirm;
     window.confirm = confirmSpy;
-    try {
-      renderWithProviders(
-        <WorkControlBar
-          conversationId="conv-1"
-          convModeLabel="Work"
-          phaseType="idle"
-          continuedInConvId={null}
-          prStatusHandle={prStatusHandle({ found: false })}
-        />,
-      );
-      fireEvent.click(screen.getByTestId('abandon-button'));
-      expect(confirmSpy).toHaveBeenCalled();
-      await waitFor(() => expect(api.abandonTask).toHaveBeenCalledWith('conv-1'));
-    } finally {
-      window.confirm = prevConfirm;
-    }
-  });
-
-  it('Abandon does NOT call api.abandonTask when the confirm is declined', () => {
-    const confirmSpy = vi.fn().mockReturnValue(false);
-    const prevConfirm = window.confirm;
-    window.confirm = confirmSpy;
-    try {
-      renderWithProviders(
-        <WorkControlBar
-          conversationId="conv-1"
-          convModeLabel="Work"
-          phaseType="idle"
-          continuedInConvId={null}
-          prStatusHandle={prStatusHandle({ found: false })}
-        />,
-      );
-      fireEvent.click(screen.getByTestId('abandon-button'));
-      expect(confirmSpy).toHaveBeenCalled();
-      expect(api.abandonTask).not.toHaveBeenCalled();
-    } finally {
-      window.confirm = prevConfirm;
-    }
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-1"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle({ found: false })}
+      />,
+    );
+    fireEvent.click(screen.getByTestId('abandon-button'));
+    await waitFor(() => expect(api.abandonTask).toHaveBeenCalledWith('conv-1'));
+    expect(confirmSpy).not.toHaveBeenCalled();
+    window.confirm = previousConfirm;
   });
 });
 
@@ -852,7 +831,7 @@ describe('WorkControlBar — active PR interactions', () => {
 
     await waitFor(() => expect(handle.refreshForSafety).toHaveBeenCalledTimes(1));
     expect(api.markMerged).not.toHaveBeenCalled();
-    expect(screen.getAllByLabelText(/Mark as merged\. Deletes the worktree/)).toHaveLength(2);
+    expect(screen.getAllByLabelText(/Closes this conversation/, { selector: 'summary' })).toHaveLength(2);
     expect(screen.getAllByText('ⓘ')).toHaveLength(2);
     expect(screen.getByText('Select an active PR before cleaning up or abandoning this task.')).toBeInTheDocument();
     const alert = screen.getByRole('alert');
@@ -1554,7 +1533,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Work status details' }));
     const details = screen.getByRole('status');
     expect(details).toHaveTextContent('Review, commit, and push before opening a PR.');
-    expect(details).toHaveTextContent('Captures a diff snapshot');
+    expect(details).toHaveTextContent('Closes this conversation');
     const infoTrigger = screen.getByRole('button', { name: 'Work status details' });
     fireEvent.click(infoTrigger);
     expect(screen.queryByRole('status')).not.toBeInTheDocument();
@@ -1586,11 +1565,9 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(trigger).toHaveFocus();
   });
 
-  it('keeps overflow open and focus in place when Abandon confirmation is declined', async () => {
+  it('keeps overflow open and focus in place when Abandon fails', async () => {
     enableMobile();
-    const prevConfirm = window.confirm;
-    const confirmSpy = vi.fn(() => false);
-    window.confirm = confirmSpy;
+    vi.mocked(api.abandonTask).mockRejectedValueOnce(new Error('abandon failed'));
     renderWithProviders(
       <WorkControlBar
         conversationId="conv-mobile-cancel"
@@ -1606,14 +1583,12 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     abandon.focus();
     fireEvent.click(abandon);
 
-    await waitFor(() => expect(confirmSpy).toHaveBeenCalledTimes(1));
+    expect(await screen.findByRole('alert')).toHaveTextContent('abandon failed');
     expect(screen.getByLabelText('More work actions', { selector: 'div' })).toBeInTheDocument();
     expect(abandon).toHaveFocus();
-    expect(api.abandonTask).not.toHaveBeenCalled();
-    window.confirm = prevConfirm;
   });
 
-  it('keeps overflow open and focus in place when Abandon fails', async () => {
+  it('keeps overflow open and focus in place when another Abandon fails', async () => {
     enableMobile();
     const prevConfirm = window.confirm;
     window.confirm = vi.fn(() => true);
@@ -2567,7 +2542,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Work status details' }));
     const details = screen.getByRole('status');
     expect(details).toHaveTextContent('Open PR #12 on GitHub to review its current state.');
-    expect(details).toHaveTextContent('Captures a diff snapshot');
+    expect(details).toHaveTextContent('Closes this conversation');
     expect(details).not.toHaveTextContent('Mark as merged');
   });
 
@@ -2628,7 +2603,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: /#12 open/ }));
-    expect(screen.getByRole('button', { name: /^Abandon\./ })).toHaveAttribute('title', expect.stringContaining('Captures a diff snapshot'));
+    expect(screen.getByRole('button', { name: /^Abandon\./ })).toHaveAttribute('title', expect.stringContaining('Closes this conversation'));
   });
 
   it('uses lifecycle fallback when the active PR is terminal but another PR is open', () => {
@@ -2645,7 +2620,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     );
 
     expect(screen.getByTestId('mobile-work-fallback')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /^Clean up\./ })).toHaveAttribute('title', expect.stringContaining('No confirmation'));
+    expect(screen.getByRole('button', { name: /^Clean up\./ })).toHaveAttribute('title', expect.stringContaining('Exact tracked, untracked'));
     expect(screen.queryByLabelText('Open pull requests')).not.toBeInTheDocument();
   });
 
@@ -2687,7 +2662,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: /#12 open/ }));
-    expect(screen.getByRole('button', { name: 'Abandon' })).toHaveClass('mobile-pr-action--hero');
+    expect(screen.getByRole('button', { name: /^Abandon\./ })).toHaveClass('mobile-pr-action--hero');
     expect(screen.getByRole('button', { name: /^Clean up\./ })).not.toHaveClass('mobile-pr-action--hero');
   });
 
