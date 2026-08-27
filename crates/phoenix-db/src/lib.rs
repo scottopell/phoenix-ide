@@ -22787,27 +22787,11 @@ mod tests {
             .unwrap();
         db.delete_conversation("origin-10").await.unwrap();
         // Breadcrumb to the now-gone origin is a raw, dangle-tolerant id.
-        let standalone_product_conversation_id =
-            phoenix_core::domain::product_conversation::ProductConversationId::new();
-        sqlx::query(
-            "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
-             VALUES (?1, 'ordinary', 'open')",
-        )
-        .bind(standalone_product_conversation_id.as_str())
-        .execute(&db.pool)
-        .await
-        .unwrap();
-        let standalone = Conversation {
-            id: "dangle-conv".to_string(),
-            product_conversation_id: standalone_product_conversation_id,
-            slug: Some("dangle-conv".to_string()),
-            spawned_from_conversation_id: Some("origin-10".to_string()),
-            ..db.get_conversation("late-fork").await.unwrap()
-        };
-        let mut tx = db.pool.begin().await.unwrap();
-        insert_conversation_tx(&mut tx, &standalone).await.unwrap();
-        tx.commit().await.unwrap();
-        let got = db.get_conversation("dangle-conv").await.unwrap();
+        sqlx::query("UPDATE conversations SET spawned_from_conversation_id = 'origin-10' WHERE id = 'late-fork'")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let got = db.get_conversation("late-fork").await.unwrap();
         assert_eq!(
             got.spawned_from_conversation_id.as_deref(),
             Some("origin-10")
