@@ -1975,6 +1975,14 @@ async fn create_product_conversation(
             req.model
         )));
     }
+    if let Some(effort) = req.effort {
+        if !state.llm_registry.supports_effort(&req.model, effort) {
+            return Err(AppError::BadRequest(format!(
+                "Model '{}' does not support effort '{effort:?}'",
+                req.model
+            )));
+        }
+    }
     let canonical_cwd = crate::conversation_cwd::normalize_product_creation_cwd_intent(
         &req.cwd,
         state.runtime_env.home(),
@@ -6608,7 +6616,10 @@ struct PreviewQuery {
 // file contents — so the recon surface is bounded to directory structure, which
 // the picker exists to expose. Content-reading handlers (`read_file`,
 // `list_files`) ARE confined via `canonicalize_within_roots`.
-async fn validate_cwd(Query(query): Query<PathQuery>) -> Json<ValidateCwdResponse> {
+async fn validate_cwd(
+    State(state): State<AppState>,
+    Query(query): Query<PathQuery>,
+) -> Json<ValidateCwdResponse> {
     // Normalize path: remove trailing slashes (except for root)
     let path_str = query.path.trim_end_matches('/');
     let path_str = if path_str.is_empty() { "/" } else { path_str };
@@ -6621,11 +6632,21 @@ async fn validate_cwd(Query(query): Query<PathQuery>) -> Json<ValidateCwdRespons
                 is_git,
             })
         }
-        Err(error) => Json(ValidateCwdResponse {
-            valid: false,
-            error: Some(error.to_string()),
-            is_git: false,
-        }),
+        Err(error) => match crate::conversation_cwd::normalize_product_creation_cwd_intent(
+            path_str,
+            state.runtime_env.home(),
+        ) {
+            Ok(_) => Json(ValidateCwdResponse {
+                valid: false,
+                error: None,
+                is_git: false,
+            }),
+            Err(_) => Json(ValidateCwdResponse {
+                valid: false,
+                error: Some(error.to_string()),
+                is_git: false,
+            }),
+        },
     }
 }
 
@@ -8815,10 +8836,14 @@ mod conversation_cwd_validation_tests {
 
     #[tokio::test]
     async fn validate_cwd_rejects_filesystem_root() {
-        let Json(response) = validate_cwd(Query(PathQuery {
-            path: "/".to_string(),
-            cwd: None,
-        }))
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        let Json(response) = validate_cwd(
+            State(state),
+            Query(PathQuery {
+                path: "/".to_string(),
+                cwd: None,
+            }),
+        )
         .await;
 
         assert!(!response.valid);

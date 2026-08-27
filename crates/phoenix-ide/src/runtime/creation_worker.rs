@@ -531,6 +531,21 @@ async fn cleanup_and_retry_unpublished_product_creation(
     if !cleaned {
         return Ok(());
     }
+    if let Some(resource_identity) = cleanup_job.staging_path.as_deref() {
+        if !manager
+            .db()
+            .reset_product_creation_resource_after_cleanup(
+                request_id,
+                claim,
+                resource_identity,
+                chrono::Utc::now(),
+            )
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            return Ok(());
+        }
+    }
     manager
         .db()
         .schedule_product_creation_retry(request_id, claim, provisioning_error, chrono::Utc::now())
@@ -722,29 +737,13 @@ fn run_git_with_timeout(
 
 fn discover_product_repository(cwd: &Path) -> Result<Option<String>, String> {
     match crate::git_ops::run_git(cwd, &["rev-parse", "--show-toplevel"]) {
-        Ok(root) => normalize_management_root(Path::new(root.trim())).map(Some),
+        Ok(root) => Path::new(root.trim())
+            .canonicalize()
+            .map(|path| Some(path.to_string_lossy().to_string()))
+            .map_err(|error| format!("could not canonicalize repository checkout root: {error}")),
         Err(error) if error.contains("not a git repository") => Ok(None),
         Err(error) => Err(format!("could not determine repository context: {error}")),
     }
-}
-
-fn normalize_management_root(repo_root: &Path) -> Result<String, String> {
-    let common_dir = git_common_dir_for_repository_root(repo_root)?;
-    let common_dir_path = Path::new(&common_dir);
-    let management_root = if common_dir_path
-        .file_name()
-        .is_some_and(|name| name == ".git")
-    {
-        common_dir_path
-            .parent()
-            .ok_or_else(|| format!("git common dir has no parent: {common_dir}"))?
-    } else {
-        common_dir_path
-    };
-    management_root
-        .canonicalize()
-        .map(|path| path.to_string_lossy().to_string())
-        .map_err(|error| format!("could not canonicalize repository management root: {error}"))
 }
 
 fn git_common_dir_for_repository_root(repo_root: &Path) -> Result<String, String> {

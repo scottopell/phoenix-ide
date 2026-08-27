@@ -8303,12 +8303,11 @@ where
                 // Push updated conversation metadata to the client so it
                 // reflects the new cwd, branch, worktree_path, and mode label
                 // without requiring a reconnect.
-                let (branch_name, conv_mode_label) = match &work_mode {
-                    crate::db::ConvMode::DetachedApprovedTask { .. } => {
-                        (None, "DetachedApprovedTask")
-                    }
-                    _ => (Some(approval_result.branch_name.clone()), "Work"),
+                let branch_name = match &work_mode {
+                    crate::db::ConvMode::DetachedApprovedTask { .. } => None,
+                    _ => Some(approval_result.branch_name.clone()),
                 };
+                let conv_mode_label = work_mode.label();
                 let _ = self
                     .broadcast_tx
                     .admitted_publication(admitted)

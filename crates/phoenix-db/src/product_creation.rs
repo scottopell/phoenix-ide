@@ -294,21 +294,27 @@ impl Database {
         .map_err(DbError::Sqlx)
     }
 
-    pub async fn get_product_creation_job_for_conversation(
+    pub async fn immutable_starting_oid_for_conversation(
         &self,
         conversation_id: &str,
-    ) -> DbResult<Option<ProductCreationJobRecord>> {
-        let request_id: Option<String> = sqlx::query_scalar(
-            "SELECT request_id FROM product_creation_jobs
-             WHERE published_conversation_id = ?1 LIMIT 1",
+    ) -> DbResult<Option<String>> {
+        sqlx::query_scalar(
+            "SELECT COALESCE(direct.staging_exact_oid, source.staging_exact_oid)
+             FROM conversations conversation
+             LEFT JOIN product_creation_jobs direct
+               ON direct.published_product_id = conversation.product_conversation_id
+             LEFT JOIN product_conversation_sources relation
+               ON relation.target_product_conversation_id = conversation.product_conversation_id
+              AND relation.relation_kind = 'approved_task'
+             LEFT JOIN product_creation_jobs source
+               ON source.published_product_id = relation.source_product_conversation_id
+             WHERE conversation.id = ?1
+             LIMIT 1",
         )
         .bind(conversation_id)
         .fetch_optional(&self.pool)
-        .await?;
-        match request_id {
-            Some(request_id) => self.get_product_creation_job(&request_id).await,
-            None => Ok(None),
-        }
+        .await
+        .map_err(DbError::Sqlx)
     }
 
     pub async fn accept_product_creation(
@@ -1211,6 +1217,36 @@ impl Database {
         Ok(updated.rows_affected() == 1)
     }
 
+    pub async fn reset_product_creation_resource_after_cleanup(
+        &self,
+        request_id: &str,
+        claim: &ProductCreationClaim,
+        resource_identity: &str,
+        now: DateTime<Utc>,
+    ) -> DbResult<bool> {
+        let updated = sqlx::query(
+            "UPDATE product_creation_resource_reservations
+             SET status = 'reserved', updated_at_unix_micros = ?1
+             WHERE request_id = ?2 AND generation = ?3 AND resource_identity = ?4
+               AND status IN ('reserved', 'present')
+               AND EXISTS (
+                   SELECT 1 FROM product_creation_jobs job
+                   WHERE job.request_id = ?2 AND job.status = 'claimed'
+                     AND job.claim_generation = ?3 AND job.claim_worker_id = ?5
+                     AND job.claim_token = ?6 AND job.claim_lease_until_unix_micros > ?1
+               )",
+        )
+        .bind(datetime_to_unix_micros(now))
+        .bind(request_id)
+        .bind(claim.generation)
+        .bind(resource_identity)
+        .bind(&claim.worker_id)
+        .bind(&claim.token)
+        .execute(&self.pool)
+        .await?;
+        Ok(updated.rows_affected() == 1)
+    }
+
     pub async fn cancel_product_creation(
         &self,
         request_id: &str,
@@ -1414,6 +1450,7 @@ impl Database {
         let result = sqlx::query(
             "UPDATE product_creation_jobs
              SET status = 'cleanup_ambiguous', retry_at_unix_micros = NULL,
+                 deletion_requested_at_unix_micros = NULL,
                  cleanup_worker_id = NULL, cleanup_token = NULL,
                  cleanup_lease_until_unix_micros = NULL,
                  updated_at_unix_micros = ?1

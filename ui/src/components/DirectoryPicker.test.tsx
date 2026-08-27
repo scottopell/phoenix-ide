@@ -87,6 +87,6 @@ describe('DirectoryPicker validation', () => {
     });
 
     expect(statuses.at(-1)).toBe('will-create');
-    expect(api.validateCwd).toHaveBeenCalledWith('/existing');
+    expect(api.validateCwd).toHaveBeenCalledWith('/existing/missing/nested');
   });
 });

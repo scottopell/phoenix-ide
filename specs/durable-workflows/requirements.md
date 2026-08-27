@@ -747,13 +747,16 @@ duplicating semantic delivery.
 
 ## Conversation-Creation Profile
 
-### REQ-DWF-CREATE-001: Shell-First Acceptance
+### REQ-DWF-CREATE-001: Private-Binding-First Acceptance
 
 WHEN a structurally valid creation request is accepted
-THE creation profile SHALL atomically persist the user-visible conversation
-shell, creation intent, initial workflow transition, effect DAG, barriers, and
+THE creation profile SHALL atomically persist the private durable creation
+binding, creation intent, initial workflow transition, effect DAG, barriers, and
 acceptance binding before filesystem, Git, attachment, runtime, or provider
 effects begin.
+
+The private creation binding SHALL NOT appear as a user-visible conversation
+until the profile reaches its declared publication boundary.
 
 Creation acceptance SHALL declare externally retryable acceptance. Its
 client-supplied request identifier SHALL therefore be the durable job identity
