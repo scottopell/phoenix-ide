@@ -9,6 +9,7 @@ import {
   useConversationsRefresh,
 } from '../conversation';
 import { NewConversationPage } from './NewConversationPage';
+import { beginNewProductConversationIntent } from '../hooks/useCreateConversation';
 import { ConversationList } from '../components/ConversationList';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { RenameDialog } from '../components/RenameDialog';
@@ -228,6 +229,7 @@ export function ConversationListPage() {
   }, [navigate, saveScrollPosition]);
 
   const handleNewConversation = () => {
+    beginNewProductConversationIntent();
     navigate('/new');
   };
 

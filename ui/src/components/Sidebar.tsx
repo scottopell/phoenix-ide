@@ -12,6 +12,7 @@ import type { CodexLoginPreflight } from '../api';
 import { subscribeModels } from '../modelsPoller';
 import { ConversationContext } from '../conversation/ConversationContext';
 import { getProductConversationListRevision, subscribeProductConversationListRevision } from '../notifications';
+import { beginNewProductConversationIntent } from '../hooks/useCreateConversation';
 
 const COLLAPSED_DOT_LIMIT = 9;
 const PRODUCT_REFRESH_COALESCE_MS = 50;
@@ -213,6 +214,7 @@ export function Sidebar({
   }, [activeSlug, archivedConversations, archivedProductConversations, conversations, openProductConversations, showArchived]);
 
   const handleNewClick = useCallback(() => {
+    beginNewProductConversationIntent();
     navigate('/new');
   }, [navigate]);
 

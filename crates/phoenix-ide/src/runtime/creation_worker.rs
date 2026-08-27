@@ -303,7 +303,8 @@ async fn process_claimed_product_creation(
         id: conversation_id.clone(),
         product_conversation_id: product_id.clone(),
         slug: Some(generate_slug()),
-        title: Some(title_from_text(&job.intent.objective)),
+        title: (!job.intent.objective.trim().is_empty())
+            .then(|| title_from_text(&job.intent.objective)),
         cwd: effective_cwd,
         parent_conversation_id: None,
         user_initiated: true,
@@ -329,6 +330,23 @@ async fn process_claimed_product_creation(
         llm_language: job.intent.llm_language,
         spawned_from_conversation_id: None,
     };
+    let repository_attachment = match staging_repo.zip(staging_oid) {
+        Some((repository_root, exact_checkout_oid)) => {
+            let git_common_dir = git_common_dir_for_repository_root(Path::new(&repository_root))?;
+            let repository_id = manager
+                .db()
+                .repository_id_for_management_root(&repository_root)
+                .await
+                .map_err(|error| error.to_string())?;
+            Some(crate::db::ProductCreationRepositoryAttachment {
+                repository_id,
+                exact_checkout_oid,
+                repository_root,
+                git_common_dir,
+            })
+        }
+        None => None,
+    };
     let published = manager
         .db()
         .publish_product_creation_atomically(&crate::db::ProductCreationPublishInput {
@@ -337,19 +355,7 @@ async fn process_claimed_product_creation(
             conversation,
             authority_kind,
             environment,
-            repository_attachment: staging_repo
-                .zip(staging_oid)
-                .map(|(repository_root, exact_checkout_oid)| {
-                    let git_common_dir =
-                        git_common_dir_for_repository_root(Path::new(&repository_root))?;
-                    Ok::<_, String>(crate::db::ProductCreationRepositoryAttachment {
-                        repository_id: None,
-                        exact_checkout_oid,
-                        repository_root,
-                        git_common_dir,
-                    })
-                })
-                .transpose()?,
+            repository_attachment,
         })
         .await
         .map_err(|error| error.to_string())?;
@@ -872,12 +878,17 @@ fn materialize_approved_task_snapshot(
     if !canonical_parent.starts_with(&canonical_worktree) {
         return Err("approved task artifact parent escaped the detached worktree".to_string());
     }
+    let source_path = canonical_parent.join(filename);
     let path = canonical_parent.join(promoted_filename);
     if path
         .symlink_metadata()
         .is_ok_and(|metadata| metadata.file_type().is_symlink())
     {
         return Err("approved task artifact target must not be a symlink".to_string());
+    }
+    if source_path != path && source_path.exists() {
+        std::fs::remove_file(&source_path)
+            .map_err(|error| format!("failed to remove superseded task artifact: {error}"))?;
     }
     std::fs::write(&path, &snapshot.artifact_body)
         .map_err(|error| format!("failed to materialize approved task artifact: {error}"))?;
