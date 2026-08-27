@@ -2808,6 +2808,32 @@ impl Database {
         Ok(())
     }
 
+    /// Reopens one repairable Close attempt for exact retirement retry.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] when the attempt is absent, is not in repair, or persistence fails.
+    pub async fn retry_close_retirement(
+        &self,
+        attempt_id: &CloseAttemptId,
+    ) -> DbResult<CloseObligation> {
+        let mut tx = self.pool.begin().await?;
+        let obligation = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
+        if obligation.phase() != ClosePhase::NeedsRepair {
+            return Err(close_precondition(format!(
+                "attempt {attempt_id} retry requires needs_repair"
+            )));
+        }
+        set_close_phase_tx(
+            &mut tx,
+            attempt_id.as_str(),
+            ClosePhase::RetirementRequested,
+        )
+        .await?;
+        let obligation = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
+        tx.commit().await?;
+        Ok(obligation)
+    }
+
     /// Lists retained retirement evidence for an attempt.
     ///
     /// # Errors

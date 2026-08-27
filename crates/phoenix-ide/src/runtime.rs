@@ -2610,6 +2610,15 @@ impl RuntimeManager {
                         }
                         BashLifecycleBridgeAction::Broadcast => {
                             manager.broadcast_work_scope_update(&event.owner).await;
+                            if event.phase == phoenix_tools::bash::BashLifecyclePhase::Terminal {
+                                if let Err(error) = manager.resume_pending_close_settlements().await
+                                {
+                                    tracing::warn!(
+                                        error = %error,
+                                        "failed to recheck Close settlement after bash exit"
+                                    );
+                                }
+                            }
                         }
                         BashLifecycleBridgeAction::Reconcile => {
                             manager.broadcast_work_scope_update(&event.owner).await;

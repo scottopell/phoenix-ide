@@ -20,7 +20,7 @@ use super::global_read;
 use super::lifecycle_handlers::{
     abandon_task, approve_fork_proposal, approve_task, confirm_close_loss_retirement,
     dismiss_fork_proposal, list_fork_proposals, mark_merged, reject_task,
-    request_changes_on_fork_proposal, task_feedback,
+    request_changes_on_fork_proposal, retry_close_retirement, task_feedback,
 };
 use super::product_conversations::{get_product_conversation, list_product_conversations};
 use super::sse::{sse_stream, SseInitTrace};
@@ -267,6 +267,10 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/conversations/:id/close/confirm-loss-retirement",
             post(confirm_close_loss_retirement),
+        )
+        .route(
+            "/api/conversations/:id/close/retry-retirement",
+            post(retry_close_retirement),
         )
         // Lifecycle (REQ-API-006). Archive and delete are both terminal
         // transitions that run the resource-cleanup cascade (REQ-BED-032);

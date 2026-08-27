@@ -88,6 +88,19 @@ impl RuntimeManager {
             let (snapshot, losses) = match scope.captured_worktree {
                 None => continue,
                 Some(CapturedWorktreeIdentity::Resolved(identity)) => {
+                    let path = worktree_path(&identity);
+                    if !path.try_exists().map_err(|error| {
+                        format!("cannot observe captured worktree path: {error}")
+                    })? {
+                        self.db()
+                            .route_close_attempt_to_repair(&attempt_id)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        return Err(format!(
+                            "scope {} captured worktree is absent before inspection",
+                            scope.scope
+                        ));
+                    }
                     inspect_worktree(&identity).await?
                 }
                 Some(CapturedWorktreeIdentity::Unresolved { .. }) => {
@@ -114,13 +127,19 @@ impl RuntimeManager {
             })
             .await
             .map_err(|error| error.to_string())?;
-        self.db()
+        let obligation = self
+            .db()
             .get_close_obligation(attempt_id.as_str())
             .await
-            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        let snapshot = obligation
             .snapshot()
             .cloned()
-            .ok_or_else(|| "server inspection did not persist aggregate snapshot".to_string())
+            .ok_or_else(|| "server inspection did not persist aggregate snapshot".to_string())?;
+        if obligation.phase() == ClosePhase::RetirementRequested {
+            self.retire_close_runtime_resources(attempt_id).await?;
+        }
+        Ok(snapshot)
     }
 
     /// Acquires every registry admission fence before Close seals inventory.

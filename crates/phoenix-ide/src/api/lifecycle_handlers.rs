@@ -390,6 +390,70 @@ pub(crate) async fn confirm_close_loss_retirement(
 }
 
 #[allow(clippy::too_many_lines)]
+pub(crate) async fn retry_close_retirement(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    let transcript = state
+        .db
+        .get_conversation(&id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    let aggregate = state
+        .db
+        .get_ordinary_product_conversation(&transcript.product_conversation_id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    let active_transcript = aggregate
+        .segments
+        .last()
+        .map(|segment| segment.transcript_row.conversation.id.as_str());
+    if active_transcript != Some(id.as_str()) {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Close retry is accepted only from the active aggregate transcript",
+            "inactive_close_transcript",
+        ))));
+    }
+    let attempt = state
+        .db
+        .get_active_close_obligation_for_product(&transcript.product_conversation_id)
+        .await
+        .map_err(|error| {
+            AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                error.to_string(),
+                "close_retry_unavailable",
+            )))
+        })?;
+    let attempt = attempt.ok_or_else(|| {
+        AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "No active Close attempt is available for retry",
+            "close_retry_unavailable",
+        )))
+    })?;
+    state
+        .db
+        .retry_close_retirement(attempt.attempt_id())
+        .await
+        .map_err(|error| {
+            AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                error.to_string(),
+                "close_retry_unavailable",
+            )))
+        })?;
+    state
+        .runtime
+        .retire_close_runtime_resources(attempt.attempt_id().clone())
+        .await
+        .map_err(|error| {
+            AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                error,
+                "close_retirement_needs_repair",
+            )))
+        })?;
+    Ok(Json(SuccessResponse { success: true }))
+}
+
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn abandon_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
