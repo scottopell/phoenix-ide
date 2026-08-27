@@ -1798,7 +1798,7 @@ mod product_creation_tests {
             .await
             .unwrap()
             .unwrap();
-        for (expected_attempt_count, expected_delay_secs) in [(2, 2), (3, 10), (4, 30)] {
+        for (expected_attempt_count, expected_delay_secs) in [(2, 2_i64), (3, 10), (4, 30)] {
             assert!(db
                 .schedule_product_creation_retry(
                     "req-retry",
@@ -1815,8 +1815,11 @@ mod product_creation_tests {
                 .unwrap();
             assert_eq!(job.status, "retry_scheduled");
             assert_eq!(job.attempt_count, expected_attempt_count);
-            let delta = job.retry_at.unwrap() - now;
-            assert_eq!(delta.num_seconds(), expected_delay_secs);
+            let retry_at_micros = datetime_to_unix_micros(job.retry_at.unwrap());
+            assert_eq!(
+                retry_at_micros - datetime_to_unix_micros(now),
+                expected_delay_secs * 1_000_000
+            );
             claim = db
                 .claim_product_creation(
                     "req-retry",
@@ -1887,7 +1890,10 @@ mod product_creation_tests {
             .unwrap()
             .unwrap();
         assert_eq!(scheduled.attempt_count, 2);
-        assert_eq!(scheduled.retry_at, Some(now + chrono::Duration::seconds(2)));
+        assert_eq!(
+            scheduled.retry_at.map(datetime_to_unix_micros),
+            Some(datetime_to_unix_micros(now) + 2_000_000)
+        );
     }
 
     #[tokio::test]
