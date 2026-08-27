@@ -4482,7 +4482,7 @@ impl Database {
              WHERE c.archived = 1 AND c.user_initiated = 1 AND c.runtime_role = 'user'
                AND NOT EXISTS (
                    SELECT 1 FROM conversation_creation_jobs j
-                   WHERE j.conversation_id = c.id AND j.status <> 'completed'
+                   WHERE j.conversation_id = c.id AND j.status <> 'ready'
                )
              ORDER BY c.updated_at DESC",
         )

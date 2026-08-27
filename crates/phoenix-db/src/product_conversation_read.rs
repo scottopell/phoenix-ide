@@ -284,7 +284,7 @@ impl Database {
                    AND NOT EXISTS (
                        SELECT 1 FROM conversation_creation_jobs creation
                        WHERE creation.conversation_id = root.id
-                         AND creation.status <> 'completed'
+                         AND creation.status <> 'ready'
                    )
                    AND NOT (root.archived = 1 AND EXISTS (
                        SELECT 1 FROM conversation_creation_jobs job

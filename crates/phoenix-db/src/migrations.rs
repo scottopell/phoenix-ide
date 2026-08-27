@@ -2186,12 +2186,26 @@ CREATE TABLE product_conversation_work_scopes (
     product_conversation_id TEXT PRIMARY KEY REFERENCES product_conversations(id) ON DELETE CASCADE,
     work_scope_id TEXT NOT NULL UNIQUE REFERENCES work_scopes(id) ON DELETE RESTRICT
 );
-INSERT OR IGNORE INTO product_conversation_work_scopes (product_conversation_id, work_scope_id)
-SELECT DISTINCT c.product_conversation_id, c.work_scope_id
+CREATE TABLE conflicting_product_conversation_work_scopes AS
+SELECT product_conversation_id
+FROM conversations
+WHERE product_conversation_id IS NOT NULL
+  AND work_scope_id IS NOT NULL
+  AND runtime_role = 'user'
+GROUP BY product_conversation_id
+HAVING COUNT(DISTINCT work_scope_id) > 1;
+INSERT INTO product_conversation_work_scopes (product_conversation_id, work_scope_id)
+SELECT c.product_conversation_id, MIN(c.work_scope_id)
 FROM conversations c
 WHERE c.product_conversation_id IS NOT NULL
   AND c.work_scope_id IS NOT NULL
-  AND c.runtime_role = 'user';
+  AND c.runtime_role = 'user'
+  AND NOT EXISTS (
+      SELECT 1 FROM conflicting_product_conversation_work_scopes conflict
+      WHERE conflict.product_conversation_id = c.product_conversation_id
+  )
+GROUP BY c.product_conversation_id;
+DROP TABLE conflicting_product_conversation_work_scopes;
 
 CREATE TRIGGER product_conversation_work_scopes_insert_conversation_owner_match
 BEFORE INSERT ON product_conversation_work_scopes

@@ -2016,11 +2016,14 @@ async fn create_product_conversation(
             )));
         }
     }
-    let canonical_cwd = crate::conversation_cwd::normalize_product_creation_cwd_intent(
-        &req.cwd,
-        state.runtime_env.home(),
-    )
-    .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    let canonical_cwd = match existing_job.as_ref() {
+        Some(existing) => existing.intent.cwd.clone(),
+        None => crate::conversation_cwd::normalize_product_creation_cwd_intent(
+            &req.cwd,
+            state.runtime_env.home(),
+        )
+        .map_err(|error| AppError::BadRequest(error.to_string()))?,
+    };
     let selected_llm_language = match existing_job {
         Some(existing) => existing.intent.llm_language,
         None => state
