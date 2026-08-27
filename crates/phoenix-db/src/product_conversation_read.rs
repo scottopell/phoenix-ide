@@ -276,6 +276,11 @@ impl Database {
                    AND root.user_initiated = 1
                    AND root.runtime_role = 'user'
                    AND root.parent_conversation_id IS NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM product_creation_jobs creation
+                       WHERE creation.published_conversation_id = root.id
+                         AND creation.status <> 'published'
+                   )
                    AND NOT (root.archived = 1 AND EXISTS (
                        SELECT 1 FROM conversation_creation_jobs job
                        WHERE job.conversation_id = root.id AND job.status = 'deletion_pending'

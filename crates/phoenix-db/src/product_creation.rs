@@ -716,9 +716,9 @@ impl Database {
              SET delivery_attempt_count = ?2,
                  status = CASE WHEN ?3 THEN 'delivery_failed' ELSE status END,
                  delivery_retry_at_unix_micros = CASE WHEN ?3 THEN NULL ELSE ?4 END,
-                 claim_worker_id = CASE WHEN ?3 THEN NULL ELSE claim_worker_id END,
-                 claim_token = CASE WHEN ?3 THEN NULL ELSE claim_token END,
-                 claim_lease_until_unix_micros = CASE WHEN ?3 THEN NULL ELSE claim_lease_until_unix_micros END,
+                 claim_worker_id = NULL,
+                 claim_token = NULL,
+                 claim_lease_until_unix_micros = NULL,
                  updated_at_unix_micros = ?5
              WHERE request_id = ?1 AND status = 'delivery_pending'
                AND delivery_attempt_count = ?6",
@@ -726,7 +726,9 @@ impl Database {
         .bind(request_id)
         .bind(next_attempt)
         .bind(exhausted)
-        .bind(datetime_to_unix_micros(now + chrono::Duration::seconds(delay_seconds)))
+        .bind(datetime_to_unix_micros(
+            now + chrono::Duration::seconds(delay_seconds),
+        ))
         .bind(datetime_to_unix_micros(now))
         .bind(record.delivery_attempt_count)
         .execute(&self.pool)
@@ -879,8 +881,7 @@ impl Database {
              SET status = 'delivery_pending', retry_at_unix_micros = NULL, staging_path = ?2,
                  staging_repo_root = ?3, staging_exact_oid = ?4,
                  published_product_id = ?5, published_conversation_id = ?6,
-                 delivery_retry_at_unix_micros = ?7, updated_at_unix_micros = ?8,
-                 claim_worker_id = NULL, claim_token = NULL, claim_lease_until_unix_micros = NULL
+                 delivery_retry_at_unix_micros = ?7, updated_at_unix_micros = ?8
              WHERE request_id = ?1 AND status = 'claimed' AND claim_generation = ?9
                AND claim_worker_id = ?10 AND claim_token = ?11",
         )
@@ -1603,8 +1604,12 @@ impl Database {
              JOIN git_repository_locator_observations locator
                ON locator.repository_id = attachment.repository_id
               AND locator.locator_kind = 'management_root' AND locator.status = 'present'
-             WHERE conversation.archived = 0 AND conversation.user_initiated = 1
-               AND conversation.runtime_role = 'user'
+             WHERE conversation.user_initiated = 1 AND conversation.runtime_role = 'user'
+               AND NOT EXISTS (
+                   SELECT 1 FROM product_creation_jobs job
+                   WHERE job.published_conversation_id = conversation.id
+                     AND job.status <> 'published'
+               )
              GROUP BY attachment.repository_id, locator.path
              ORDER BY COUNT(DISTINCT conversation.id) DESC,
                       MAX(conversation.updated_at) DESC,
@@ -2935,6 +2940,16 @@ mod product_creation_tests {
                     git_common_dir: format!("{cwd}/.git"),
                 }),
             })
+            .await
+            .unwrap();
+            sqlx::query(
+                "UPDATE product_creation_jobs
+                 SET status = 'published', claim_worker_id = NULL, claim_token = NULL,
+                     claim_lease_until_unix_micros = NULL, delivery_retry_at_unix_micros = NULL
+                 WHERE request_id = ?1",
+            )
+            .bind(format!("req-rec-{idx}"))
+            .execute(db.pool())
             .await
             .unwrap();
             // test-timing-allow: recency ordering is the behavior under test and SQLite stores the publication wall clock.

@@ -8514,7 +8514,7 @@ fn reread_reviewed_task_handoff_snapshot(
     let path = cwd.join(task_file);
     let body = std::fs::read_to_string(&path)
         .map_err(|error| format!("Failed to read reviewed task file '{task_file}': {error}"))?;
-    if body.trim() != expected_plan.trim() {
+    if body != expected_plan {
         return Err(format!(
             "Reviewed task file '{task_file}' no longer matches the approved plan. Reject and re-approve the updated artifact."
         ));
@@ -14642,7 +14642,7 @@ mod approve_task_failure_effect_tests {
                 task_file: format!("tasks/{task_filename}"),
                 title: "Fresh handoff".to_string(),
                 priority: crate::task_source::Priority::P2,
-                plan: "Plan".to_string(),
+                plan: "Plan\n".to_string(),
             },
             Arc::new(InMemoryStorage::new()),
             llm,
