@@ -605,6 +605,39 @@ impl RuntimeManager {
                                 .await;
                         }
                     };
+                    let inspections = self
+                        .db()
+                        .list_close_retirement_inspections(attempt_id.as_str())
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let Some(confirmed) = inspections
+                        .iter()
+                        .find(|inspection| inspection.target.scope == scope)
+                    else {
+                        return self
+                            .record_close_residual(
+                                attempt_id,
+                                snapshot,
+                                &scope,
+                                target.resource.clone(),
+                                RetirementFailureReason::IdentityNotProven,
+                                "worktree removal has no confirmed inspection",
+                            )
+                            .await;
+                    };
+                    let (fresh_snapshot, _) = inspect_worktree(identity).await?;
+                    if fresh_snapshot != confirmed.snapshot {
+                        return self
+                            .record_close_residual(
+                                attempt_id,
+                                snapshot,
+                                &scope,
+                                target.resource.clone(),
+                                RetirementFailureReason::IdentityNotProven,
+                                "worktree changed after Close inspection confirmation",
+                            )
+                            .await;
+                    }
                     if let Err(reason) = remove_exact_worktree(identity).await {
                         if was_dispatched && reason.contains("absent") {
                             self.record_close_retired(
