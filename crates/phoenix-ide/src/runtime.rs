@@ -1961,9 +1961,10 @@ fn sub_agent_registry_for_conv_mode(
 ) -> ToolRegistry {
     match conv_mode {
         ConvMode::Explore { .. } => ToolRegistry::for_subagent_explore(policy),
-        ConvMode::Direct | ConvMode::Work { .. } | ConvMode::Branch { .. } => {
-            ToolRegistry::for_subagent_work()
-        }
+        ConvMode::Direct
+        | ConvMode::Work { .. }
+        | ConvMode::Branch { .. }
+        | ConvMode::DetachedApprovedTask { .. } => ToolRegistry::for_subagent_work(),
     }
 }
 
@@ -2008,7 +2009,10 @@ pub(crate) fn cleanup_branch_for_unretained_work_scope<'a>(
     let conversations: Vec<_> = conversations.into_iter().collect();
     if let Some(branch) = conversations.iter().find_map(|conv| match &conv.conv_mode {
         ConvMode::Work { branch_name, .. } => Some(branch_name.as_str().to_string()),
-        ConvMode::Explore { .. } | ConvMode::Direct | ConvMode::Branch { .. } => None,
+        ConvMode::Explore { .. }
+        | ConvMode::Direct
+        | ConvMode::Branch { .. }
+        | ConvMode::DetachedApprovedTask { .. } => None,
     }) {
         if crate::git_ops::run_git(worktree_path, &["symbolic-ref", "-q", "HEAD"]).is_err() {
             return None;
@@ -3806,7 +3810,9 @@ impl RuntimeManager {
         conv_context.explore_bash = ExploreToolPolicy::from_platform(&self.platform).bash();
         conv_context.mode = match &sub_conv_mode {
             ConvMode::Direct => ModeKind::Direct,
-            ConvMode::Explore { .. } | ConvMode::Work { .. } => ModeKind::Managed,
+            ConvMode::Explore { .. }
+            | ConvMode::Work { .. }
+            | ConvMode::DetachedApprovedTask { .. } => ModeKind::Managed,
             ConvMode::Branch { .. } => ModeKind::Branch,
         };
         conv_context.work_scope_worktree = sub_conv_mode.worktree_path().map(PathBuf::from);
@@ -4782,9 +4788,10 @@ impl RuntimeManager {
         };
         context.resource_authority = match conv.conv_mode {
             ConvMode::Explore { .. } => crate::work_scope::ResourceAuthority::Restricted,
-            ConvMode::Direct | ConvMode::Work { .. } | ConvMode::Branch { .. } => {
-                crate::work_scope::ResourceAuthority::Work
-            }
+            ConvMode::Direct
+            | ConvMode::Work { .. }
+            | ConvMode::Branch { .. }
+            | ConvMode::DetachedApprovedTask { .. } => crate::work_scope::ResourceAuthority::Work,
         };
         context.mode_context = Some(mode_context);
         context.effort = conv.effort;
@@ -4797,7 +4804,9 @@ impl RuntimeManager {
         context.desired_base_branch = conv.desired_base_branch.clone();
         context.mode = match &conv.conv_mode {
             ConvMode::Direct => ModeKind::Direct,
-            ConvMode::Explore { .. } | ConvMode::Work { .. } => ModeKind::Managed,
+            ConvMode::Explore { .. }
+            | ConvMode::Work { .. }
+            | ConvMode::DetachedApprovedTask { .. } => ModeKind::Managed,
             ConvMode::Branch { .. } => ModeKind::Branch,
         };
         context.work_scope_worktree = conv.conv_mode.worktree_path().map(PathBuf::from);
@@ -4942,7 +4951,9 @@ impl RuntimeManager {
                             None,
                         )
                     }
-                    ConvMode::Work { .. } | ConvMode::Branch { .. } => {
+                    ConvMode::Work { .. }
+                    | ConvMode::Branch { .. }
+                    | ConvMode::DetachedApprovedTask { .. } => {
                         // Full tool suite plus `propose_task` (non-blocking fork
                         // proposal — REQ-PROJ-036). Work/Branch always sit on git
                         // history, so the tool is always offered.
@@ -6133,6 +6144,17 @@ pub(crate) fn conv_mode_to_context(mode: &ConvMode) -> ModeContext {
             branch_name: branch_name.to_string(),
             base_branch: base_branch.to_string(),
             worktree_path: worktree_path.to_string(),
+        },
+        ConvMode::DetachedApprovedTask {
+            base_branch,
+            worktree_path,
+            task_id,
+            task_title,
+        } => ModeContext::DetachedApprovedTask {
+            base_branch: base_branch.to_string(),
+            worktree_path: worktree_path.to_string(),
+            task_id: task_id.to_string(),
+            task_title: task_title.to_string(),
         },
         ConvMode::Branch {
             branch_name,

@@ -4689,9 +4689,12 @@ where
 
         // --- Mode validation and one-writer constraint (REQ-PROJ-008) ---
         let parent_allows_work = match self.context.mode_context.as_ref() {
-            Some(ModeContext::Work { .. } | ModeContext::Direct | ModeContext::Branch { .. }) => {
-                true
-            }
+            Some(
+                ModeContext::Work { .. }
+                | ModeContext::Direct
+                | ModeContext::Branch { .. }
+                | ModeContext::DetachedApprovedTask { .. },
+            ) => true,
             Some(ModeContext::Explore { .. }) | None => false,
         };
 
@@ -4751,7 +4754,9 @@ where
         // that own a worktree (Work/Branch).
         let parent_worktree_path: Option<&str> = match self.context.mode_context.as_ref() {
             Some(
-                ModeContext::Work { worktree_path, .. } | ModeContext::Branch { worktree_path, .. },
+                ModeContext::Work { worktree_path, .. }
+                | ModeContext::Branch { worktree_path, .. }
+                | ModeContext::DetachedApprovedTask { worktree_path, .. },
             ) => Some(worktree_path.as_str()),
             _ => None,
         };

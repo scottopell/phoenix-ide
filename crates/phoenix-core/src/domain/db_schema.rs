@@ -205,6 +205,18 @@ pub enum ConvMode {
         /// The branch this worktree was created from (same as `branch_name` for Branch mode)
         base_branch: NonEmptyString,
     },
+    /// Start-fresh successor for an approved task: detached at an approved
+    /// commit with a dedicated worktree and task identity, but no mutable branch.
+    DetachedApprovedTask {
+        /// Absolute path to the git worktree for this conversation.
+        worktree_path: NonEmptyString,
+        /// The default branch that anchored the approved detached commit.
+        base_branch: NonEmptyString,
+        /// The approved task ID (e.g., "YF042").
+        task_id: NonEmptyString,
+        /// Human-readable task title carried from approval.
+        task_title: NonEmptyString,
+    },
 }
 
 impl Default for ConvMode {
@@ -225,6 +237,7 @@ impl ConvMode {
             Self::Direct => "Direct",
             Self::Work { .. } => "Work",
             Self::Branch { .. } => "Branch",
+            Self::DetachedApprovedTask { .. } => "Approved Task",
         }
     }
 
@@ -235,7 +248,7 @@ impl ConvMode {
             Self::Work { branch_name, .. } | Self::Branch { branch_name, .. } => {
                 Some(branch_name.as_str())
             }
-            Self::Explore { .. } | Self::Direct => None,
+            Self::Explore { .. } | Self::Direct | Self::DetachedApprovedTask { .. } => None,
         }
     }
 
@@ -247,9 +260,9 @@ impl ConvMode {
     /// - Direct never has one.
     pub fn worktree_path(&self) -> Option<&str> {
         match self {
-            Self::Work { worktree_path, .. } | Self::Branch { worktree_path, .. } => {
-                Some(worktree_path.as_str())
-            }
+            Self::Work { worktree_path, .. }
+            | Self::Branch { worktree_path, .. }
+            | Self::DetachedApprovedTask { worktree_path, .. } => Some(worktree_path.as_str()),
             Self::Explore { worktree_path, .. } => {
                 worktree_path.as_ref().map(NonEmptyString::as_str)
             }
@@ -261,9 +274,9 @@ impl ConvMode {
     #[must_use]
     pub fn base_branch(&self) -> Option<&str> {
         match self {
-            Self::Work { base_branch, .. } | Self::Branch { base_branch, .. } => {
-                Some(base_branch.as_str())
-            }
+            Self::Work { base_branch, .. }
+            | Self::Branch { base_branch, .. }
+            | Self::DetachedApprovedTask { base_branch, .. } => Some(base_branch.as_str()),
             Self::Explore { .. } | Self::Direct => None,
         }
     }
@@ -272,7 +285,9 @@ impl ConvMode {
     #[must_use]
     pub fn task_id(&self) -> Option<&str> {
         match self {
-            Self::Work { task_id, .. } => Some(task_id.as_str()),
+            Self::Work { task_id, .. } | Self::DetachedApprovedTask { task_id, .. } => {
+                Some(task_id.as_str())
+            }
             Self::Explore { .. } | Self::Direct | Self::Branch { .. } => None,
         }
     }
@@ -281,7 +296,9 @@ impl ConvMode {
     #[must_use]
     pub fn task_title(&self) -> Option<&str> {
         match self {
-            Self::Work { task_title, .. } => Some(task_title.as_str()),
+            Self::Work { task_title, .. } | Self::DetachedApprovedTask { task_title, .. } => {
+                Some(task_title.as_str())
+            }
             Self::Explore { .. } | Self::Direct | Self::Branch { .. } => None,
         }
     }
@@ -307,7 +324,7 @@ impl ConvMode {
                 worktree_path: worktree_path.clone(),
                 base_branch: base_branch.clone(),
             }),
-            Self::Explore { .. } | Self::Direct => None,
+            Self::DetachedApprovedTask { .. } | Self::Explore { .. } | Self::Direct => None,
         }
     }
 }

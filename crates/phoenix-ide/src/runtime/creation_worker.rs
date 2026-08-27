@@ -1604,9 +1604,7 @@ async fn provision_conversation(
             effective_cwd.clone_from(&info.worktree_path);
             desired_base_branch = Some(info.base_branch.clone());
             conv_mode = if let Some(snapshot) = intent.approved_task.as_ref() {
-                ConvMode::Work {
-                    branch_name: NonEmptyString::new(info.branch_name)
-                        .map_err(|_| ("empty branch name".to_string(), ErrorKind::ServerError))?,
+                ConvMode::DetachedApprovedTask {
                     worktree_path: NonEmptyString::new(info.worktree_path)
                         .map_err(|_| ("empty worktree path".to_string(), ErrorKind::ServerError))?,
                     base_branch: NonEmptyString::new(info.base_branch)

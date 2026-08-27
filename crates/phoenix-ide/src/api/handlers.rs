@@ -6165,6 +6165,9 @@ async fn cascade_project_target(
             )
             .map(|branch| (branch, wt.to_string(), true))
         }
+        ConvMode::DetachedApprovedTask { worktree_path, .. } => {
+            Some((String::new(), worktree_path.to_string(), false))
+        }
         ConvMode::Direct
         | ConvMode::Explore {
             worktree_path: None,

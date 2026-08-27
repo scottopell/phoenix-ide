@@ -1224,7 +1224,10 @@ impl RuntimeManager {
         // Origin mode must be a writing mode (work, branch, direct). Explore is
         // the in-place gateway, not a fork proposer.
         match origin.conv_mode {
-            ConvMode::Work { .. } | ConvMode::Branch { .. } | ConvMode::Direct => {}
+            ConvMode::Work { .. }
+            | ConvMode::Branch { .. }
+            | ConvMode::Direct
+            | ConvMode::DetachedApprovedTask { .. } => {}
             ConvMode::Explore { .. } => {
                 return Err(ForkResolveError::Conflict(
                     "the originating conversation is in Explore mode and cannot have a fork proposal"

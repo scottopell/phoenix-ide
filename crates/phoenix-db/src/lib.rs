@@ -6664,9 +6664,10 @@ impl Database {
         }
         let authority = match mode {
             ConvMode::Explore { .. } => AuthorityKind::RestrictedExplore,
-            ConvMode::Direct | ConvMode::Work { .. } | ConvMode::Branch { .. } => {
-                AuthorityKind::Work
-            }
+            ConvMode::Direct
+            | ConvMode::Work { .. }
+            | ConvMode::Branch { .. }
+            | ConvMode::DetachedApprovedTask { .. } => AuthorityKind::Work,
         };
         sqlx::query("UPDATE work_scopes SET authority_kind = ?1, updated_at = ?2 WHERE id = ?3")
             .bind(authority.as_str())
@@ -6695,7 +6696,7 @@ impl Database {
         let row = sqlx::query(
             "SELECT COUNT(*) FROM conversations
              WHERE project_id = ?1 AND archived = 0
-             AND cm_kind = 'work'",
+             AND cm_kind IN ('work', 'detached_approved_task')",
         )
         .bind(project_id)
         .fetch_one(&self.pool)
@@ -8501,9 +8502,10 @@ impl Database {
 
                     let authority = match mode {
                         ConvMode::Explore { .. } => AuthorityKind::RestrictedExplore,
-                        ConvMode::Direct | ConvMode::Work { .. } | ConvMode::Branch { .. } => {
-                            AuthorityKind::Work
-                        }
+                        ConvMode::Direct
+                        | ConvMode::Work { .. }
+                        | ConvMode::Branch { .. }
+                        | ConvMode::DetachedApprovedTask { .. } => AuthorityKind::Work,
                     };
                     sqlx::query(
                         "UPDATE work_scopes
@@ -8573,7 +8575,7 @@ impl Database {
              FROM conversations c
              LEFT JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id
              WHERE c.archived = 0
-               AND c.cm_kind IN ('work', 'branch')",
+                           AND c.cm_kind IN ('work', 'branch', 'detached_approved_task')",
         )
         .try_map(parse_conversation_row)
         .fetch_all(&self.pool)
@@ -11292,6 +11294,20 @@ fn conv_mode_columns(mode: &ConvMode) -> ConvModeCols<'_> {
             task_title: None,
             next_taskmd_id_hint: None,
         },
+        ConvMode::DetachedApprovedTask {
+            worktree_path,
+            base_branch,
+            task_id,
+            task_title,
+        } => ConvModeCols {
+            kind: "detached_approved_task",
+            branch_name: None,
+            worktree_path: Some(worktree_path.as_str()),
+            base_branch: Some(base_branch.as_str()),
+            task_id: Some(task_id.as_str()),
+            task_title: Some(task_title.as_str()),
+            next_taskmd_id_hint: None,
+        },
     }
 }
 
@@ -11346,6 +11362,24 @@ fn conv_mode_from_row(row: &SqliteRow, conv_id: &str) -> ConvMode {
                 }
             } else {
                 tracing::warn!(conv_id = %conv_id, "branch conv_mode row missing required fields, defaulting to Explore");
+                ConvMode::default()
+            }
+        }
+        Some("detached_approved_task") => {
+            if let (Some(worktree_path), Some(base_branch), Some(task_id), Some(task_title)) = (
+                ne_env("env_worktree_path"),
+                ne_env("env_base_branch"),
+                ne("cm_task_id"),
+                ne("cm_task_title"),
+            ) {
+                ConvMode::DetachedApprovedTask {
+                    worktree_path,
+                    base_branch,
+                    task_id,
+                    task_title,
+                }
+            } else {
+                tracing::warn!(conv_id = %conv_id, "detached approved task conv_mode row missing required fields, defaulting to Explore");
                 ConvMode::default()
             }
         }

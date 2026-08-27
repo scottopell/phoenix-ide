@@ -203,7 +203,10 @@ async fn resolve_viewer_work_scope(
         Ok(conv) => {
             let authority = match conv.conv_mode {
                 ConvMode::Explore { .. } => crate::work_scope::ResourceAuthority::Restricted,
-                ConvMode::Direct | ConvMode::Work { .. } | ConvMode::Branch { .. } => {
+                ConvMode::Direct
+                | ConvMode::Work { .. }
+                | ConvMode::Branch { .. }
+                | ConvMode::DetachedApprovedTask { .. } => {
                     crate::work_scope::ResourceAuthority::Work
                 }
             };
