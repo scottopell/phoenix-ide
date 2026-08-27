@@ -3,10 +3,10 @@
 
 use super::handlers::AppError;
 use super::types::{
-    ConfirmCloseLossRetirementRequest, ConflictErrorResponse, ForkDismissResponse,
-    ForkPromoteResponse, ForkProposalListResponse, ForkProposalSummary, ForkSpawnResponse,
-    RequestChangesRequest, SuccessResponse, TaskApprovalRequest, TaskApprovalResponse,
-    TaskFeedbackRequest,
+    CancelCloseBeforeRetirementRequest, ConfirmCloseLossRetirementRequest, ConflictErrorResponse,
+    ForkDismissResponse, ForkPromoteResponse, ForkProposalListResponse, ForkProposalSummary,
+    ForkSpawnResponse, RequestChangesRequest, SuccessResponse, TaskApprovalRequest,
+    TaskApprovalResponse, TaskFeedbackRequest,
 };
 use super::AppState;
 use crate::db::{ConvMode, Conversation};
@@ -388,6 +388,7 @@ pub(crate) async fn confirm_close_loss_retirement(
 pub(crate) async fn cancel_close_before_retirement(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Json(request): Json<CancelCloseBeforeRetirementRequest>,
 ) -> Result<Json<SuccessResponse>, AppError> {
     let admission = state.runtime.conversation_admission(&id).await;
     let _guard = admission.lock().await;
@@ -396,6 +397,22 @@ pub(crate) async fn cancel_close_before_retirement(
         .get_conversation(&id)
         .await
         .map_err(|error| AppError::NotFound(error.to_string()))?;
+    let aggregate = state
+        .db
+        .get_ordinary_product_conversation(&transcript.product_conversation_id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    if aggregate
+        .segments
+        .last()
+        .map(|segment| segment.transcript_row.conversation.id.as_str())
+        != Some(id.as_str())
+    {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Close cancellation is accepted only from the active aggregate transcript",
+            "inactive_close_transcript",
+        ))));
+    }
     let obligation = state
         .db
         .get_active_close_obligation_for_product(&transcript.product_conversation_id)
@@ -407,6 +424,12 @@ pub(crate) async fn cancel_close_before_retirement(
                 "close_attempt_not_active",
             )))
         })?;
+    if obligation.attempt_id().as_str() != request.attempt_id {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Close attempt changed; refresh before cancelling",
+            "stale_close_attempt",
+        ))));
+    }
     state
         .db
         .cancel_close_before_retirement(obligation.attempt_id().as_str())
@@ -566,10 +589,31 @@ async fn run_legacy_close_compat(state: &AppState, id: &str, action: &str) -> Re
                     )))
                 })?,
             ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement => {
-                return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                    "Close is settling active work",
-                    "close_settlement_in_progress",
-                ))));
+                state
+                    .runtime
+                    .resume_pending_close_settlements()
+                    .await
+                    .map_err(|error| {
+                        AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                            error,
+                            "close_settlement_in_progress",
+                        )))
+                    })?;
+                let advanced = state
+                    .db
+                    .get_close_obligation(obligation.attempt_id().as_str())
+                    .await
+                    .map_err(|error| AppError::Internal(error.to_string()))?;
+                if matches!(
+                    advanced.phase(),
+                    ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement
+                ) {
+                    return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                        "Close settlement remains in progress",
+                        "close_settlement_in_progress",
+                    ))));
+                }
+                advanced
             }
             ClosePhase::AwaitingRetirementInspection => {
                 if let Err(error) = state

@@ -2245,8 +2245,12 @@ export const api = {
     return resp.json();
   },
 
-  async cancelCloseBeforeRetirement(conversationId: string): Promise<{ success: boolean }> {
-    const resp = await fetch(`/api/conversations/${conversationId}/close/cancel-before-retirement`, { method: 'POST' });
+  async cancelCloseBeforeRetirement(conversationId: string, attemptId: string): Promise<{ success: boolean }> {
+    const resp = await fetch(`/api/conversations/${conversationId}/close/cancel-before-retirement`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ attempt_id: attemptId }),
+    });
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({})) as { error?: string; error_type?: string };
       throw new ApiResponseError(err.error ?? 'Failed to cancel Close', resp.status, err.error_type);

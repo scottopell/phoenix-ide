@@ -1597,8 +1597,15 @@ async fn remove_exact_worktree(identity: &WorktreeIdentity) -> Result<(), String
         return Err("captured worktree administrative incarnation changed".to_string());
     }
     let output = tokio::task::spawn_blocking(move || {
+        let status = phoenix_core::git::command()
+            .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+            .current_dir(&path)
+            .output()?;
+        if !status.status.success() || !status.stdout.is_empty() {
+            return Ok(status);
+        }
         phoenix_core::git::command()
-            .args(["worktree", "remove", "--force"])
+            .args(["worktree", "remove"])
             .arg(path)
             .current_dir(repo)
             .output()
@@ -1644,11 +1651,16 @@ fn parse_status_losses(status: &[u8]) -> Vec<CloseLossItem> {
             b"??" => losses.push(CloseLossItem::UntrackedNonIgnoredPath(path)),
             b"!!" => {}
             xy => {
-                if xy[0] != b' ' {
-                    losses.push(CloseLossItem::StagedTrackedPath(path.clone()));
-                }
-                if xy[1] != b' ' {
+                let unmerged = matches!(xy, b"DD" | b"AU" | b"UD" | b"UA" | b"DU" | b"AA" | b"UU");
+                if unmerged {
                     losses.push(CloseLossItem::UnstagedTrackedPath(path));
+                } else {
+                    if xy[0] != b' ' {
+                        losses.push(CloseLossItem::StagedTrackedPath(path.clone()));
+                    }
+                    if xy[1] != b' ' {
+                        losses.push(CloseLossItem::UnstagedTrackedPath(path));
+                    }
                 }
                 if matches!(xy[0], b'R' | b'C') || matches!(xy[1], b'R' | b'C') {
                     let _source_path = rows.next();

@@ -560,7 +560,9 @@ export function WorkControlBar({
     setError(null);
     setAbandoning(true);
     try {
-      await api.cancelCloseBeforeRetirement(conversationId);
+      const attemptId = closeSnapshot?.close?.attempt_id;
+      if (!attemptId) return;
+      await api.cancelCloseBeforeRetirement(conversationId, attemptId);
       setCloseSnapshot(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to cancel Close');

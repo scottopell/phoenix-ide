@@ -13358,13 +13358,10 @@ pub(crate) mod hard_delete_cascade_tests {
         (tmp, repo, worktree, branch)
     }
 
-    /// Chain archive must tear down the chain's shared worktree + branch
-    /// exactly once (from the leaf's cascade) and flip `archived = 1` on
-    /// every member. Verifies the correct-by-construction continuation
-    /// preservation: root + mid skip worktree cleanup, leaf actually
-    /// removes it. End state: shared resources gone, all rows archived.
+    /// Legacy Work-mode chain fixtures without a complete sealed Close inventory
+    /// fail closed without mutating their shared worktree or branch ref.
     #[tokio::test]
-    async fn archive_chain_cleans_shared_worktree_and_branch_once() {
+    async fn archive_chain_without_close_inventory_fails_closed() {
         let state = make_test_state().await;
         let ids = ["sc-a", "sc-a2", "sc-a3"];
         let (_tmp, repo, worktree, branch) =
@@ -13376,20 +13373,18 @@ pub(crate) mod hard_delete_cascade_tests {
             "precondition: branch must exist"
         );
 
-        let _ = crate::api::chains::archive_chain_handler(
+        let error = crate::api::chains::archive_chain_handler(
             axum::extract::State(state.clone()),
             axum::extract::Path("sc-a".to_string()),
         )
         .await
-        .expect("chain archive");
+        .expect_err("incomplete Close inventory must fail closed");
+        assert!(matches!(error, AppError::Conflict(_)));
 
+        assert!(worktree.exists(), "failed Close must preserve the worktree");
         assert!(
-            !worktree.exists(),
-            "shared worktree must be removed after chain archive"
-        );
-        assert!(
-            crate::git_ops::run_git(&repo, &["rev-parse", "--verify", &branch]).is_err(),
-            "shared task branch must be deleted after chain archive (Work mode)"
+            crate::git_ops::run_git(&repo, &["rev-parse", "--verify", &branch]).is_ok(),
+            "Close must preserve the shared task branch"
         );
         for id in ids {
             let conv = state
@@ -13397,7 +13392,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 .get_conversation(id)
                 .await
                 .unwrap_or_else(|_| panic!("{id} row preserved"));
-            assert!(conv.archived, "{id} must be archived");
+            assert!(!conv.archived, "{id} must remain active after failed Close");
         }
     }
 
