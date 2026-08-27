@@ -647,6 +647,6 @@ AND SHALL correlate that browser timeline with the server stream-open timeline t
 WHEN a stream reconnects without a new route-render start
 THE SYSTEM SHALL record the available stream milestones without fabricating route milestones
 
-The conversation-open telemetry SHALL contain only bounded cumulative milestone offsets, outcome, retry attempt, page visibility, coarse network effective type, and the opaque open identifier. It SHALL NOT contain a conversation identifier, route slug, title, message text, transcript content, working directory, or other user content.
+The conversation-open telemetry SHALL contain only bounded cumulative milestone offsets, outcome, retry attempt, continuous paint eligibility, coarse network effective type, and the opaque open identifier. A connected report's visibility value SHALL be true only when the document remained visible from route-render start through the first transcript paint opportunity. Each retry after a completed route-resolution failure SHALL use a new opaque open identifier and timeline. It SHALL NOT contain a conversation identifier, route slug, title, message text, transcript content, working directory, or other user content.
 
 **Rationale:** A correlated route-to-paint timeline distinguishes browser, route, transport, validation, and rendering delays while preserving conversation confidentiality.

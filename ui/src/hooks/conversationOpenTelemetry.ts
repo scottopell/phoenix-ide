@@ -1,20 +1,32 @@
-interface ConversationOpenTelemetryBase {
+interface ConversationOpenTelemetryCommon {
   open_id: string;
   route_resolved_ms: number | null;
-  event_source_created_ms: number | null;
   native_open_ms: number | null;
-  init_received_ms: number | null;
-  init_handled_ms: number | null;
-  first_paint_ms: number | null;
   total_ms: number;
   retry_attempt: number;
   visible: boolean;
   effective_type: string | null;
 }
 
-export type ConversationOpenTelemetryPayload = ConversationOpenTelemetryBase & {
-  outcome: 'connected' | 'error' | 'canceled';
-};
+interface ConnectedConversationOpenTelemetry extends ConversationOpenTelemetryCommon {
+  outcome: 'connected';
+  event_source_created_ms: number;
+  init_received_ms: number;
+  init_handled_ms: number;
+  first_paint_ms: number;
+}
+
+interface UnfinishedConversationOpenTelemetry extends ConversationOpenTelemetryCommon {
+  outcome: 'error' | 'canceled';
+  event_source_created_ms: number | null;
+  init_received_ms: number | null;
+  init_handled_ms: number | null;
+  first_paint_ms: null;
+}
+
+export type ConversationOpenTelemetryPayload =
+  | ConnectedConversationOpenTelemetry
+  | UnfinishedConversationOpenTelemetry;
 
 type Clock = () => number;
 
@@ -26,6 +38,7 @@ export class ConversationOpenMeasurement {
   private initReceivedAt: number | null = null;
   private initHandledAt: number | null = null;
   private completed = false;
+  private remainedVisible = document.visibilityState === 'visible';
 
   constructor(
     readonly openId: string,
@@ -34,6 +47,14 @@ export class ConversationOpenMeasurement {
     startedAt?: number,
   ) {
     this.startedAt = startedAt ?? clock();
+  }
+
+  isCompleted(): boolean {
+    return this.completed;
+  }
+
+  documentHidden(): void {
+    this.remainedVisible = false;
   }
 
   routeResolved(): void {
@@ -57,7 +78,11 @@ export class ConversationOpenMeasurement {
   }
 
   firstPaint(): ConversationOpenTelemetryPayload | null {
-    if (this.initHandledAt === null) return this.finish('error');
+    if (
+      this.eventSourceCreatedAt === null
+      || this.initReceivedAt === null
+      || this.initHandledAt === null
+    ) return this.finish('error');
     return this.finish('connected');
   }
 
@@ -73,19 +98,32 @@ export class ConversationOpenMeasurement {
     if (this.completed) return null;
     this.completed = true;
     const finishedAt = this.clock();
-    return {
+    const common: ConversationOpenTelemetryCommon = {
       open_id: this.openId,
-      outcome,
       route_resolved_ms: elapsed(this.routeResolvedAt, this.startedAt),
-      event_source_created_ms: elapsed(this.eventSourceCreatedAt, this.startedAt),
       native_open_ms: elapsed(this.nativeOpenedAt, this.startedAt),
-      init_received_ms: elapsed(this.initReceivedAt, this.startedAt),
-      init_handled_ms: elapsed(this.initHandledAt, this.startedAt),
-      first_paint_ms: outcome === 'connected' ? boundedMs(finishedAt - this.startedAt) : null,
       total_ms: boundedMs(finishedAt - this.startedAt),
       retry_attempt: Math.min(this.retryAttempt, 10_000),
-      visible: document.visibilityState === 'visible',
+      visible: this.remainedVisible && document.visibilityState === 'visible',
       effective_type: networkEffectiveType(),
+    };
+    if (outcome === 'connected') {
+      return {
+        ...common,
+        outcome,
+        event_source_created_ms: elapsed(this.eventSourceCreatedAt, this.startedAt)!,
+        init_received_ms: elapsed(this.initReceivedAt, this.startedAt)!,
+        init_handled_ms: elapsed(this.initHandledAt, this.startedAt)!,
+        first_paint_ms: boundedMs(finishedAt - this.startedAt),
+      };
+    }
+    return {
+      ...common,
+      outcome,
+      event_source_created_ms: elapsed(this.eventSourceCreatedAt, this.startedAt),
+      init_received_ms: elapsed(this.initReceivedAt, this.startedAt),
+      init_handled_ms: elapsed(this.initHandledAt, this.startedAt),
+      first_paint_ms: null,
     };
   }
 }

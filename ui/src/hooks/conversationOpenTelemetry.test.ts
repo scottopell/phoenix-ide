@@ -61,12 +61,13 @@ describe('ConversationOpenMeasurement', () => {
   });
 
   it('bounds the cumulative timeline and retry count', () => {
-    const times = [0, 299_999, 299_999, 400_000];
+    const times = [0, 299_999, 299_999, 299_999, 400_000];
     const measurement = new ConversationOpenMeasurement(
       'open-saturated',
       20_000,
       () => times.shift()!,
     );
+    measurement.eventSourceCreated();
     measurement.initReceived();
     measurement.initHandled();
 
@@ -77,6 +78,39 @@ describe('ConversationOpenMeasurement', () => {
       total_ms: 300_000,
       retry_attempt: 10_000,
     });
+  });
+
+  it('marks a timeline non-visible after any hidden interval', () => {
+    const visibility = vi.spyOn(document, 'visibilityState', 'get');
+    visibility.mockReturnValue('visible');
+    const times = [0, 1, 2, 3, 4];
+    const measurement = new ConversationOpenMeasurement('open-hidden', 0, () => times.shift()!);
+    measurement.eventSourceCreated();
+    measurement.initReceived();
+    visibility.mockReturnValue('hidden');
+    measurement.documentHidden();
+    visibility.mockReturnValue('visible');
+    measurement.initHandled();
+
+    expect(measurement.firstPaint()).toMatchObject({
+      outcome: 'connected',
+      visible: false,
+    });
+  });
+
+  it('makes invalid connected payloads unrepresentable', () => {
+    // @ts-expect-error connected reports structurally require all completion milestones
+    const invalid: import('./conversationOpenTelemetry').ConversationOpenTelemetryPayload = {
+      open_id: 'invalid',
+      outcome: 'connected',
+      route_resolved_ms: null,
+      native_open_ms: null,
+      total_ms: 1,
+      retry_attempt: 0,
+      visible: true,
+      effective_type: null,
+    };
+    expect(invalid.outcome).toBe('connected');
   });
 
   it('posts a bounded content-free payload with keepalive', () => {

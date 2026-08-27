@@ -227,6 +227,9 @@ describe('useConnection epoch stamping (task 08683)', () => {
   });
 
   it('uses the route-owned open ID and waits for first paint before reporting once', () => {
+    const clock = vi.spyOn(performance, 'now');
+    clock.mockReturnValueOnce(0);
+    clock.mockReturnValue(10);
     const dispatch = vi.fn<(a: SSEAction) => void>();
     const initialMeasurement = new ConversationOpenMeasurement('route-open-id', 0);
     initialMeasurement.routeResolved();
@@ -237,7 +240,9 @@ describe('useConnection epoch stamping (task 08683)', () => {
       dispatch,
       initialOpenMeasurement: initialMeasurement,
       onValidatedInit: (_payload, report) => {
+        clock.mockReturnValue(20);
         reportFirstPaint = report;
+        clock.mockReturnValue(30);
       },
     }));
     const stream = FakeEventSource.instances[0]!;
@@ -257,11 +262,17 @@ describe('useConnection epoch stamping (task 08683)', () => {
     expect(fetch).toHaveBeenCalledTimes(1);
     const body = JSON.parse(
       (vi.mocked(fetch).mock.calls[0]![1] as RequestInit).body as string,
-    ) as { open_id: string; outcome: string; route_resolved_ms: number | null };
+    ) as {
+      open_id: string;
+      outcome: string;
+      route_resolved_ms: number | null;
+      init_handled_ms: number;
+    };
     expect(body).toMatchObject({
       open_id: 'route-open-id',
       outcome: 'connected',
       route_resolved_ms: expect.any(Number),
+      init_handled_ms: 30,
     });
   });
 

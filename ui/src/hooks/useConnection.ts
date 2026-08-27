@@ -331,6 +331,16 @@ export function useConnection({
   }, []);
 
   useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.visibilityState !== 'visible') {
+        openMeasurementRef.current?.documentHidden();
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+  }, []);
+
+  useEffect(() => {
     const flushPendingCancellation = () => {
       const pending = pendingCancellationsRef.current;
       pendingCancellationsRef.current = [];
@@ -453,13 +463,20 @@ export function useConnection({
               type: 'sse_init',
               payload,
             });
-            measurement.initHandled();
+            let initHandlerFinished = false;
+            let paintReportedEarly = false;
             const reportFirstPaint = () => {
+              if (!initHandlerFinished) {
+                paintReportedEarly = true;
+                return;
+              }
               const telemetry = measurement.firstPaint();
               if (telemetry) reportConversationOpen(telemetry);
             };
             onValidatedInitRef.current?.(payload, reportFirstPaint);
-            if (!onValidatedInitRef.current) reportFirstPaint();
+            measurement.initHandled();
+            initHandlerFinished = true;
+            if (!onValidatedInitRef.current || paintReportedEarly) reportFirstPaint();
           }, () => measurement.initReceived());
 
           on('message', (e) => {

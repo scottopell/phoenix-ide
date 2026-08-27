@@ -299,6 +299,7 @@ function ConversationPageContent({
   suppressMessageViewerOwner: boolean;
   suppressTaskApprovalOwner: boolean;
 }) {
+  const routeRenderStartedAt = performance.now();
   const { setConversationReadiness } = useConversationReadiness();
   const navigate = useNavigate();
   const location = useLocation();
@@ -713,6 +714,7 @@ function ConversationPageContent({
     measurement: ConversationOpenMeasurement;
   } | null>(null);
   const expectedCanonicalSlugRef = useRef<string | null>(null);
+  const routeRetryAttemptRef = useRef(0);
   if (initialOpenJourneyRef.current?.slug !== slug) {
     if (expectedCanonicalSlugRef.current === slug && initialOpenJourneyRef.current) {
       initialOpenJourneyRef.current.slug = slug;
@@ -720,7 +722,7 @@ function ConversationPageContent({
     } else {
       initialOpenJourneyRef.current = {
         slug,
-        measurement: new ConversationOpenMeasurement(generateUUID(), 0),
+        measurement: new ConversationOpenMeasurement(generateUUID(), 0, undefined, routeRenderStartedAt),
       };
     }
   }
@@ -729,6 +731,22 @@ function ConversationPageContent({
     measurement: ConversationOpenMeasurement;
     timeout: number;
   } | null>(null);
+  useEffect(() => {
+    const currentRouteMeasurement = () => initialOpenJourneyRef.current?.measurement;
+    const reportRouteOwnedCancellation = () => {
+      const telemetry = currentRouteMeasurement()?.canceled();
+      if (telemetry) reportConversationOpen(telemetry);
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState !== 'visible') currentRouteMeasurement()?.documentHidden();
+    };
+    window.addEventListener('pagehide', reportRouteOwnedCancellation);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      window.removeEventListener('pagehide', reportRouteOwnedCancellation);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, []);
   const locationRef = useRef(location);
   locationRef.current = location;
   const conversationRouteIdentity = `${slug ?? ''}\u0000${conversationId ?? ''}`;
@@ -952,10 +970,12 @@ function ConversationPageContent({
 
     let cancelled = false;
 
-    const resolveAuthoritativeRoute = async () => {
+    const resolveAuthoritativeRoute = async (
+      measurement = initialOpenMeasurement,
+    ) => {
       const route = await resolveConversationRoute(slug);
       if (cancelled) return;
-      initialOpenMeasurement.routeResolved();
+      measurement.routeResolved();
       setResolvedRouteConversationId(route.id);
       const preserveTranscriptRouteId = (
         locationRef.current.state as { preserveTranscriptRouteId?: boolean } | null
@@ -998,21 +1018,35 @@ function ConversationPageContent({
     };
 
     const handleOnline = () => {
+      const currentMeasurement = initialOpenJourneyRef.current?.measurement
+        ?? initialOpenMeasurement;
+      const retryMeasurement = currentMeasurement.isCompleted()
+        ? new ConversationOpenMeasurement(generateUUID(), ++routeRetryAttemptRef.current)
+        : currentMeasurement;
+      initialOpenJourneyRef.current = { slug, measurement: retryMeasurement };
       setResolvedRouteConversationId(null);
       setArchiveStatusConfirmedConversationId(null);
       setError(null);
-      const retryRouteResolution = async () => {
+      const retryRouteResolution = async (measurement: ConversationOpenMeasurement) => {
         try {
-          await resolveAuthoritativeRoute();
+          await resolveAuthoritativeRoute(measurement);
         } catch (err) {
           if (cancelled) return;
+          const telemetry = measurement.error();
+          if (telemetry) reportConversationOpen(telemetry);
           console.warn('Failed to resolve conversation route after reconnect; retrying', err);
           window.setTimeout(() => {
-            if (!cancelled) void retryRouteResolution();
+            if (cancelled) return;
+            const nextMeasurement = new ConversationOpenMeasurement(
+              generateUUID(),
+              ++routeRetryAttemptRef.current,
+            );
+            initialOpenJourneyRef.current = { slug, measurement: nextMeasurement };
+            void retryRouteResolution(nextMeasurement);
           }, 1_000);
         }
       };
-      void retryRouteResolution();
+      void retryRouteResolution(retryMeasurement);
     };
     window.addEventListener('online', handleOnline);
     void loadConversation();
