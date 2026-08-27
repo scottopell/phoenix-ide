@@ -98,6 +98,7 @@ pub struct ProductCreationRepositoryAttachment {
     pub repository_id: Option<String>,
     pub exact_checkout_oid: String,
     pub repository_root: String,
+    pub git_common_dir: String,
 }
 
 #[derive(Debug, Clone)]
@@ -767,15 +768,16 @@ impl Database {
         insert_conversation_tx(&mut tx, &input.conversation).await?;
         if let Some(attachment) = input.repository_attachment.as_ref() {
             let repository_root = attachment.repository_root.as_str();
+            let git_common_dir = attachment.git_common_dir.as_str();
             let repository_id: String = if let Some(id) = attachment.repository_id.clone() {
                 id
             } else {
                 sqlx::query_scalar(
                     "SELECT repository_id FROM git_repository_locator_observations
-                     WHERE locator_kind = 'management_root' AND status = 'present' AND path = ?1
+                     WHERE locator_kind = 'common_dir' AND status = 'present' AND path = ?1
                      LIMIT 1",
                 )
-                .bind(repository_root)
+                .bind(git_common_dir)
                 .fetch_optional(&mut *tx)
                 .await?
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
@@ -792,19 +794,25 @@ impl Database {
             .bind(&repository_id)
             .execute(&mut *tx)
             .await?;
-            sqlx::query(
-                "INSERT INTO git_repository_locator_observations (
-                    repository_id, locator_kind, status, path, observed_at_unix_micros
-                 ) VALUES (?1, 'management_root', 'present', ?2, ?3)
-                 ON CONFLICT(repository_id, locator_kind)
-                 DO UPDATE SET status = excluded.status, path = excluded.path,
-                               observed_at_unix_micros = excluded.observed_at_unix_micros",
-            )
-            .bind(&repository_id)
-            .bind(repository_root)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
+            for (locator_kind, path) in [
+                ("management_root", repository_root),
+                ("common_dir", git_common_dir),
+            ] {
+                sqlx::query(
+                    "INSERT INTO git_repository_locator_observations (
+                        repository_id, locator_kind, status, path, observed_at_unix_micros
+                     ) VALUES (?1, ?2, 'present', ?3, ?4)
+                     ON CONFLICT(repository_id, locator_kind)
+                     DO UPDATE SET status = excluded.status, path = excluded.path,
+                                   observed_at_unix_micros = excluded.observed_at_unix_micros",
+                )
+                .bind(&repository_id)
+                .bind(locator_kind)
+                .bind(path)
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+            }
         }
         sqlx::query(
             "INSERT INTO product_conversation_work_scopes (product_conversation_id, work_scope_id)
@@ -1395,6 +1403,7 @@ mod product_creation_tests {
                 repository_id: None,
                 exact_checkout_oid: "repo-id".to_string(),
                 repository_root: "/repo/a".to_string(),
+                git_common_dir: "/repo/a/.git".to_string(),
             }),
         })
         .await
@@ -1717,6 +1726,7 @@ mod product_creation_tests {
                     repository_id: Some("repo-hidden-id".to_string()),
                     exact_checkout_oid: "0123456789abcdef".to_string(),
                     repository_root: "/repo/hidden".to_string(),
+                    git_common_dir: "/repo/hidden/.git".to_string(),
                 }),
             })
             .await
@@ -1730,14 +1740,20 @@ mod product_creation_tests {
         .unwrap();
         assert_eq!(attached.0, scope.as_str());
         assert_eq!(attached.1, "repo-hidden-id");
-        let locator: (String, String) = sqlx::query_as(
-            "SELECT locator_kind, path FROM git_repository_locator_observations WHERE repository_id = 'repo-hidden-id'",
+        let locators: Vec<(String, String)> = sqlx::query_as(
+            "SELECT locator_kind, path FROM git_repository_locator_observations
+             WHERE repository_id = 'repo-hidden-id' ORDER BY locator_kind",
         )
-        .fetch_one(db.pool())
+        .fetch_all(db.pool())
         .await
         .unwrap();
-        assert_eq!(locator.0, "management_root");
-        assert_eq!(locator.1, "/repo/hidden");
+        assert_eq!(
+            locators,
+            vec![
+                ("common_dir".to_string(), "/repo/hidden/.git".to_string()),
+                ("management_root".to_string(), "/repo/hidden".to_string()),
+            ]
+        );
         sqlx::query("DELETE FROM product_conversations WHERE id = ?1")
             .bind(product_id.as_str())
             .execute(db.pool())
@@ -1859,6 +1875,7 @@ mod product_creation_tests {
                     repository_id: Some(format!("repo-{idx}")),
                     exact_checkout_oid: format!("oid-{idx}"),
                     repository_root: cwd.to_string(),
+                    git_common_dir: format!("{cwd}/.git"),
                 }),
             })
             .await

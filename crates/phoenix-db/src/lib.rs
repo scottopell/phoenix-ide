@@ -7204,7 +7204,26 @@ impl Database {
             return Err(DbError::ConversationNotFound(parent_id.to_string()));
         }
 
-        let continuation_work_scope_id = if matches!(parent.conv_mode, ConvMode::Direct) {
+        let mapped_product_work_scope_id: Option<String> = sqlx::query_scalar(
+            "SELECT work_scope_id FROM product_conversation_work_scopes WHERE product_conversation_id = ?1",
+        )
+        .bind(parent.product_conversation_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let mapped_product_work_scope_id = mapped_product_work_scope_id
+            .map(|scope_id| {
+                scope_id.parse::<WorkScopeId>().map_err(|error| {
+                    DbError::Serialization(format!(
+                        "invalid mapped work scope for product conversation {}: {error}",
+                        parent.product_conversation_id
+                    ))
+                })
+            })
+            .transpose()?;
+        let continuation_work_scope_id = if let Some(mapped_scope_id) = mapped_product_work_scope_id
+        {
+            Some(mapped_scope_id)
+        } else if matches!(parent.conv_mode, ConvMode::Direct) {
             let (scope_id, authority_kind, environment) =
                 Self::new_scope_for_conversation(&parent.cwd, &cm);
             Self::insert_work_scope_tx(&mut tx, &scope_id, authority_kind, environment, &now_str)

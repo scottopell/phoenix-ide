@@ -290,15 +290,19 @@ async fn process_claimed_product_creation(
             conversation,
             authority_kind,
             environment,
-            repository_attachment: staging_repo.zip(staging_oid).map(
-                |(repository_root, exact_checkout_oid)| {
-                    crate::db::ProductCreationRepositoryAttachment {
+            repository_attachment: staging_repo
+                .zip(staging_oid)
+                .map(|(repository_root, exact_checkout_oid)| {
+                    let git_common_dir =
+                        git_common_dir_for_repository_root(Path::new(&repository_root))?;
+                    Ok::<_, String>(crate::db::ProductCreationRepositoryAttachment {
                         repository_id: None,
                         exact_checkout_oid,
                         repository_root,
-                    }
-                },
-            ),
+                        git_common_dir,
+                    })
+                })
+                .transpose()?,
         })
         .await
         .map_err(|error| error.to_string())?;
@@ -589,10 +593,37 @@ fn run_git_with_timeout(
 
 fn discover_product_repository(cwd: &Path) -> Result<Option<String>, String> {
     match crate::git_ops::run_git(cwd, &["rev-parse", "--show-toplevel"]) {
-        Ok(root) => Ok(Some(root)),
+        Ok(root) => normalize_management_root(Path::new(root.trim())).map(Some),
         Err(error) if error.contains("not a git repository") => Ok(None),
         Err(error) => Err(format!("could not determine repository context: {error}")),
     }
+}
+
+fn normalize_management_root(repo_root: &Path) -> Result<String, String> {
+    let common_dir = git_common_dir_for_repository_root(repo_root)?;
+    let common_dir_path = Path::new(&common_dir);
+    let management_root = if common_dir_path
+        .file_name()
+        .is_some_and(|name| name == ".git")
+    {
+        common_dir_path
+            .parent()
+            .ok_or_else(|| format!("git common dir has no parent: {common_dir}"))?
+    } else {
+        common_dir_path
+    };
+    management_root
+        .canonicalize()
+        .map(|path| path.to_string_lossy().to_string())
+        .map_err(|error| format!("could not canonicalize repository management root: {error}"))
+}
+
+fn git_common_dir_for_repository_root(repo_root: &Path) -> Result<String, String> {
+    crate::git_ops::run_git(
+        repo_root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .map(|value| value.trim().to_string())
 }
 
 fn ensure_phoenix_staging_ignored(repo_root: &Path) -> Result<(), String> {
