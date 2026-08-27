@@ -9,6 +9,11 @@
 
 Close retirement establishes the destructive boundary for a ProductConversation. The next product increment needs only a durable successful completion and a read-only History view. Search indexing, deletion, restoration, retention, and bulk lifecycle controls add independent durable authorities and recovery contracts without advancing that immediate outcome.
 
+## Options considered
+
+1. Include search, deletion, restoration, retention, and bulk lifecycle in the initial History finalizer.
+2. Persist an atomic successful Close outcome and History transition only, then add later lifecycle capabilities behind their own authority.
+
 ## Decision
 
 After successful Close retirement, one exact-attempt transaction records one successful Close outcome and transitions the ordinary ProductConversation to History. Replaying the same finalizer is idempotent. History is read-only and derives from the aggregate lifecycle authority.
