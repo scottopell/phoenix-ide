@@ -7032,7 +7032,7 @@ impl Database {
                      user_initiated, state, state_kind, state_updated_at, created_at, updated_at,
                      archived, model, effort, project_id, desired_base_branch, seed_parent_id,
                      seed_label, llm_language, cm_kind, runtime_role, work_scope_id, service_tier
-                 ) VALUES (?1, ?2, ?3, ?4, NULL, 1, ?5, ?6, ?7, ?7, ?7, 0, ?8, ?9, ?10, ?11,
+                 ) VALUES (?1, ?2, ?3, ?4, NULL, 1, ?5, ?6, ?7, ?7, ?7, 1, ?8, ?9, ?10, ?11,
                            NULL, ?12, ?13, 'direct', 'user', ?14, ?15)",
             )
             .bind(&new_id)
@@ -12518,7 +12518,8 @@ async fn update_creation_runtime_state(
 ) -> DbResult<()> {
     let result = sqlx::query(
         "UPDATE conversations
-         SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4
+         SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4,
+             archived = 0
          WHERE id = ?5",
     )
     .bind(state_json)

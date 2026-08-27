@@ -1929,6 +1929,10 @@ async fn retry_product_conversation_delivery(
     State(state): State<AppState>,
     Path(request_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let _authority = state
+        .runtime
+        .acquire_local_authority_pass()
+        .map_err(|()| AppError::Internal("local authority is closed".to_string()))?;
     let retried = state
         .db
         .retry_failed_product_creation_delivery(&request_id)
@@ -1976,6 +1980,11 @@ async fn create_product_conversation(
     })?;
     uuid::Uuid::parse_str(&req.request_id)
         .map_err(|_| AppError::BadRequest("request_id must be a UUID".to_string()))?;
+    let existing_job = state
+        .db
+        .get_product_creation_job(&req.request_id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
     if req.objective.trim().is_empty() && req.images.is_empty() {
         return Err(AppError::BadRequest(
             "Product creation requires objective text or an image".to_string(),
@@ -1993,14 +2002,14 @@ async fn create_product_conversation(
             "Product creation images exceed the request limit".to_string(),
         ));
     }
-    if state.llm_registry.get(&req.model).is_none() {
+    if existing_job.is_none() && state.llm_registry.get(&req.model).is_none() {
         return Err(AppError::BadRequest(format!(
             "Unknown or unavailable model '{}'",
             req.model
         )));
     }
     if let Some(effort) = req.effort {
-        if !state.llm_registry.supports_effort(&req.model, effort) {
+        if existing_job.is_none() && !state.llm_registry.supports_effort(&req.model, effort) {
             return Err(AppError::BadRequest(format!(
                 "Model '{}' does not support effort '{effort:?}'",
                 req.model
@@ -2012,12 +2021,7 @@ async fn create_product_conversation(
         state.runtime_env.home(),
     )
     .map_err(|error| AppError::BadRequest(error.to_string()))?;
-    let selected_llm_language = match state
-        .db
-        .get_product_creation_job(&req.request_id)
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?
-    {
+    let selected_llm_language = match existing_job {
         Some(existing) => existing.intent.llm_language,
         None => state
             .runtime
