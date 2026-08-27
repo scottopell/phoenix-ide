@@ -10,9 +10,9 @@ use sha2::{Digest, Sha256};
 
 use phoenix_core::domain::close::{
     CapturedWorktreeIdentity, CloseAttemptId, CloseLossItem, CloseOwnedResourceInventory,
-    ClosePhase, CloseRetirementSnapshot, GitPathIdentity, LossItemIdentity, OpaqueIdentity,
-    RetiredResourceIdentity, RetiredResourceKind, RetirementFailureReason, RetirementOutcome,
-    WorktreeIdentity,
+    ClosePhase, CloseRetirementSnapshot, GitOidIdentity, GitPathIdentity, LossItemIdentity,
+    OpaqueIdentity, RetiredResourceIdentity, RetiredResourceKind, RetirementFailureReason,
+    RetirementOutcome, WorktreeIdentity,
 };
 use phoenix_core::work_scope::{
     ResourceScopeKey, WorkScopeId, WorkScopeRetirementOutcome, WorkScopeRetirementPrecondition,
@@ -835,6 +835,7 @@ async fn inspect_worktree(
     identity: &WorktreeIdentity,
 ) -> Result<(CloseRetirementSnapshot, Vec<CloseLossItem>), String> {
     let path = worktree_path(identity);
+    let status_path = path.clone();
     let output = tokio::task::spawn_blocking(move || {
         phoenix_core::git::command()
             .args([
@@ -844,7 +845,7 @@ async fn inspect_worktree(
                 "--ignored",
                 "--untracked-files=all",
             ])
-            .current_dir(path)
+            .current_dir(status_path)
             .output()
     })
     .await
@@ -853,10 +854,102 @@ async fn inspect_worktree(
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
-    Ok((
-        snapshot_for(&output.stdout),
-        parse_status_losses(&output.stdout),
-    ))
+    let mut observation = output.stdout;
+    let mut losses = parse_status_losses(&observation);
+    observe_detached_head_and_submodules(&path, &mut observation, &mut losses).await?;
+    Ok((snapshot_for(&observation), losses))
+}
+
+async fn observe_detached_head_and_submodules(
+    path: &Path,
+    observation: &mut Vec<u8>,
+    losses: &mut Vec<CloseLossItem>,
+) -> Result<(), String> {
+    let path = path.to_path_buf();
+    let observed =
+        tokio::task::spawn_blocking(move || -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+            let head = phoenix_core::git::command()
+                .args(["rev-parse", "--verify", "HEAD"])
+                .current_dir(&path)
+                .output()
+                .map_err(|error| error.to_string())?;
+            if !head.status.success() {
+                return Err(String::from_utf8_lossy(&head.stderr).trim().to_string());
+            }
+            let head_oid = head.stdout.trim_ascii().to_vec();
+            let detached = !phoenix_core::git::command()
+                .args(["symbolic-ref", "-q", "HEAD"])
+                .current_dir(&path)
+                .status()
+                .map_err(|error| error.to_string())?
+                .success();
+            let mut result = Vec::new();
+            result.push((b"HEAD".to_vec(), head_oid.clone()));
+            if detached {
+                let reachable = phoenix_core::git::command()
+                    .args([
+                        "for-each-ref",
+                        "--contains",
+                        std::str::from_utf8(&head_oid).map_err(|error| error.to_string())?,
+                        "--format=%(refname)",
+                        "refs/heads",
+                        "refs/remotes",
+                        "refs/tags",
+                    ])
+                    .current_dir(&path)
+                    .output()
+                    .map_err(|error| error.to_string())?;
+                if !reachable.status.success() {
+                    return Err(String::from_utf8_lossy(&reachable.stderr)
+                        .trim()
+                        .to_string());
+                }
+                result.push((b"DETACHED".to_vec(), reachable.stdout));
+            }
+            let modules = phoenix_core::git::command()
+                .args(["submodule", "status", "--recursive"])
+                .current_dir(&path)
+                .output()
+                .map_err(|error| error.to_string())?;
+            if modules.status.success() {
+                result.push((b"SUBMODULES".to_vec(), modules.stdout));
+            }
+            Ok(result)
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+    let head_oid = observed
+        .iter()
+        .find_map(|(tag, value)| (tag == b"HEAD").then_some(value.clone()));
+    for (tag, value) in observed {
+        observation.extend_from_slice(&tag);
+        observation.push(0);
+        observation.extend_from_slice(&value);
+        observation.push(0);
+        if tag == b"DETACHED" && value.is_empty() {
+            let head = head_oid
+                .as_ref()
+                .ok_or_else(|| "detached worktree has no resolved HEAD".to_string())?;
+            losses.push(CloseLossItem::DetachedUnreachableCommit(
+                GitOidIdentity::parse_hex(String::from_utf8_lossy(head).trim())
+                    .map_err(|error| error.to_string())?,
+            ));
+        }
+        if tag == b"SUBMODULES" {
+            for line in value.split(|byte| *byte == b'\n') {
+                if line
+                    .first()
+                    .is_some_and(|prefix| matches!(prefix, b'+' | b'-' | b'U'))
+                {
+                    let path = line.split(|byte| *byte == b' ').nth(2).unwrap_or_default();
+                    losses.push(CloseLossItem::InitializedSubmoduleState(
+                        GitPathIdentity::from_bytes(path.to_vec()),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn remove_exact_worktree(identity: &WorktreeIdentity) -> Result<(), String> {
