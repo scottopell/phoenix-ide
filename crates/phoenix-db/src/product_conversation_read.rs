@@ -281,6 +281,11 @@ impl Database {
                        WHERE creation.published_conversation_id = root.id
                          AND creation.status <> 'published'
                    )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM conversation_creation_jobs creation
+                       WHERE creation.conversation_id = root.id
+                         AND creation.status <> 'completed'
+                   )
                    AND NOT (root.archived = 1 AND EXISTS (
                        SELECT 1 FROM conversation_creation_jobs job
                        WHERE job.conversation_id = root.id AND job.status = 'deletion_pending'
