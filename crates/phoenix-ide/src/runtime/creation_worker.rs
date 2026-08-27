@@ -37,6 +37,15 @@ pub(crate) async fn process_product_creation_request(
         .map_err(|e| e.to_string())?
     {
         if job.status == "delivery_pending" {
+            if job
+                .delivery_retry_at
+                .is_some_and(|retry_at| retry_at > chrono::Utc::now())
+            {
+                return Err(
+                    "product creation objective delivery is awaiting its retry deadline"
+                        .to_string(),
+                );
+            }
             return deliver_product_creation_objective(manager, &job).await;
         }
         if job.status == "delivery_failed" {
@@ -410,6 +419,14 @@ async fn cleanup_and_retry_unpublished_product_creation(
     } else {
         fallback_job
     };
+    if !manager
+        .db()
+        .product_creation_claim_is_live(request_id, claim, chrono::Utc::now())
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        return Ok(());
+    }
     let cleaned = cleanup_unpublished_product_staging(manager, cleanup_job).await;
     if !cleaned {
         return Ok(());

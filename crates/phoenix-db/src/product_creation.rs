@@ -512,6 +512,28 @@ impl Database {
         }
     }
 
+    pub async fn product_creation_claim_is_live(
+        &self,
+        request_id: &str,
+        claim: &ProductCreationClaim,
+        now: DateTime<Utc>,
+    ) -> DbResult<bool> {
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM product_creation_jobs
+             WHERE request_id = ?1 AND status = 'claimed' AND claim_generation = ?2
+               AND claim_worker_id = ?3 AND claim_token = ?4
+               AND claim_lease_until_unix_micros > ?5",
+        )
+        .bind(request_id)
+        .bind(claim.generation)
+        .bind(&claim.worker_id)
+        .bind(&claim.token)
+        .bind(datetime_to_unix_micros(now))
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists == 1)
+    }
+
     pub async fn schedule_product_creation_retry(
         &self,
         request_id: &str,
@@ -1269,6 +1291,10 @@ mod product_creation_tests {
             .unwrap()
             .unwrap();
         assert!(db
+            .product_creation_claim_is_live("req-renew", &claim.claim, now)
+            .await
+            .unwrap());
+        assert!(db
             .renew_product_creation_claim(
                 "req-renew",
                 &claim.claim,
@@ -1294,6 +1320,14 @@ mod product_creation_tests {
                 &claim.claim,
                 now + chrono::Duration::seconds(36),
                 chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap());
+        assert!(!db
+            .product_creation_claim_is_live(
+                "req-renew",
+                &claim.claim,
+                now + chrono::Duration::seconds(36),
             )
             .await
             .unwrap());
