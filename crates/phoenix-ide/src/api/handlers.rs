@@ -162,6 +162,14 @@ pub fn create_router(state: AppState) -> Router {
                 .layer(DefaultBodyLimit::max(MAX_MULTIPART_BODY_BYTES)),
         )
         .route(
+            "/api/product-conversations/creation/{request_id}/cancel",
+            post(cancel_product_conversation_creation),
+        )
+        .route(
+            "/api/product-conversations/creation/{request_id}",
+            delete(delete_product_conversation_creation),
+        )
+        .route(
             "/api/recent-management-root-suggestions",
             get(list_recent_management_roots),
         )
@@ -1889,6 +1897,50 @@ async fn read_multipart_attachments(
 // ============================================================
 // Conversation Creation (REQ-API-002)
 // ============================================================
+
+async fn cancel_product_conversation_creation(
+    State(state): State<AppState>,
+    Path(request_id): Path<String>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    let _authority = state
+        .runtime
+        .acquire_local_authority_pass()
+        .map_err(|()| AppError::Internal("local authority is closed".to_string()))?;
+    if !state
+        .db
+        .cancel_product_creation(&request_id, chrono::Utc::now())
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+    {
+        return Err(AppError::NotFound(
+            "pending product creation not found".to_string(),
+        ));
+    }
+    state.runtime.kick_creation_worker();
+    Ok(Json(SuccessResponse { success: true }))
+}
+
+async fn delete_product_conversation_creation(
+    State(state): State<AppState>,
+    Path(request_id): Path<String>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    let _authority = state
+        .runtime
+        .acquire_local_authority_pass()
+        .map_err(|()| AppError::Internal("local authority is closed".to_string()))?;
+    if !state
+        .db
+        .request_product_creation_deletion(&request_id, chrono::Utc::now())
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+    {
+        return Err(AppError::NotFound(
+            "pending product creation not found".to_string(),
+        ));
+    }
+    state.runtime.kick_creation_worker();
+    Ok(Json(SuccessResponse { success: true }))
+}
 
 #[allow(clippy::too_many_lines)]
 async fn create_product_conversation(
