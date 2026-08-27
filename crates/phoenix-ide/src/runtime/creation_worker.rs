@@ -536,6 +536,7 @@ async fn cleanup_and_retry_unpublished_product_creation(
         .schedule_product_creation_retry(request_id, claim, provisioning_error, chrono::Utc::now())
         .await
         .map_err(|error| error.to_string())?;
+    manager.kick_creation_worker();
     Ok(())
 }
 
@@ -1547,6 +1548,10 @@ async fn provision_conversation(
                 let _lock = RepositoryMutationLock::acquire(&repo_for_blocking)?;
                 if reconcile_owned_worktree_path(&repo_for_blocking, &path_for_blocking)? {
                     if approved_task_creation {
+                        validate_worktree_belongs_to_repository(
+                            &repo_for_blocking,
+                            &path_for_blocking,
+                        )?;
                         validate_detached_task_worktree(
                             &path_for_blocking,
                             approved_commit_oid_for_blocking

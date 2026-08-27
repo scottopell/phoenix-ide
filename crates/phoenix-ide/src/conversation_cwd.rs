@@ -114,6 +114,14 @@ pub(crate) fn ensure_product_creation_cwd(
 ) -> Result<ValidConversationCwd, ConversationCwdError> {
     let raw = cwd.as_ref();
     let path = Path::new(raw);
+    if path
+        .symlink_metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(ConversationCwdError::NotAcceptable(
+            "directory path contains a symlink".to_string(),
+        ));
+    }
     if path.exists() {
         return validate_conversation_cwd(raw);
     }
@@ -146,6 +154,14 @@ pub(crate) fn ensure_product_creation_cwd(
     let mut current = canonical_ancestor;
     for component in suffix.components() {
         current.push(component);
+        if current
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            return Err(ConversationCwdError::NotAcceptable(
+                "directory path contains a symlink".to_string(),
+            ));
+        }
         match std::fs::create_dir(&current) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -270,6 +286,23 @@ mod tests {
         assert!(requested.is_dir());
         assert_eq!(valid.raw(), normalized);
         assert_eq!(replayed, valid);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_rejects_symlink_at_final_missing_component() {
+        let home = tempfile::tempdir().expect("home");
+        let target = tempfile::tempdir().expect("target");
+        let requested = home.path().join("new-project");
+        let normalized =
+            normalize_product_creation_cwd_intent(requested.to_string_lossy(), home.path())
+                .expect("missing leaf accepted");
+        std::os::unix::fs::symlink(target.path(), &requested).expect("insert final symlink");
+
+        let error = ensure_product_creation_cwd(&normalized, home.path())
+            .expect_err("final symlink rejected");
+
+        assert!(error.to_string().contains("symlink"));
     }
 
     #[test]

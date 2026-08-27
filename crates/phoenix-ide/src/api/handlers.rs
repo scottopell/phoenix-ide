@@ -1980,12 +1980,20 @@ async fn create_product_conversation(
         state.runtime_env.home(),
     )
     .map_err(|error| AppError::BadRequest(error.to_string()))?;
-    let selected_llm_language = state
-        .runtime
-        .db()
-        .get_default_llm_language()
+    let selected_llm_language = match state
+        .db
+        .get_product_creation_job(&req.request_id)
         .await
-        .map_err(|error| AppError::Internal(error.to_string()))?;
+        .map_err(|error| AppError::Internal(error.to_string()))?
+    {
+        Some(existing) => existing.intent.llm_language,
+        None => state
+            .runtime
+            .db()
+            .get_default_llm_language()
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?,
+    };
     let intent = crate::db::ProductCreationIntent {
         cwd: canonical_cwd,
         objective: req.objective,
