@@ -1611,7 +1611,18 @@ fn observe_worktree_fingerprint(path: &Path) -> Option<String> {
         ))
     }
     #[cfg(not(unix))]
-    Some(format!("git_admin_incarnation_v1:portable:{encoded}"))
+    {
+        let created_nanos = metadata
+            .created()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos();
+        Some(format!(
+            "git_admin_incarnation_v1:portable:{}:{created_nanos}",
+            metadata.len()
+        ))
+    }
 }
 
 fn worktree_path(identity: &WorktreeIdentity) -> PathBuf {

@@ -1503,8 +1503,19 @@ impl TmuxRegistry {
 
         let existing = self.get_existing(work_scope).await;
         if existing.is_none() {
+            let socket_path = self.derived_socket_path(work_scope);
+            if matches!(probe(&socket_path).await, Ok(ProbeResult::Live)) {
+                return CascadeReport {
+                    socket_path,
+                    kill_server_error: Some(
+                        "live tmux socket has no registry token; refusing destructive cascade"
+                            .to_string(),
+                    ),
+                    unlink_error: None,
+                };
+            }
             return CascadeReport {
-                socket_path: self.derived_socket_path(work_scope),
+                socket_path,
                 kill_server_error: None,
                 unlink_error: None,
             };
@@ -1706,9 +1717,10 @@ async fn read_server_token(socket_path: &Path) -> Option<String> {
 /// `tmux show-environment -g VAR` prints `VAR=value` when set and `-VAR` when
 /// not.
 async fn tmux_global_env(socket_path: &Path, var: &str) -> Option<String> {
-    let sock = socket_path.to_string_lossy().into_owned();
     let out = tokio::process::Command::new("tmux")
-        .args(["-S", &sock, "show-environment", "-g", var])
+        .arg("-S")
+        .arg(socket_path)
+        .args(["show-environment", "-g", var])
         .env_remove("TMUX")
         .stdin(Stdio::null())
         .stderr(Stdio::null())

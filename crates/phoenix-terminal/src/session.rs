@@ -472,6 +472,15 @@ impl ActiveTerminals {
             if !Self::matches_exact_instance(&map, permit) {
                 return Self::verify_exact_absence(&map, permit);
             }
+            let Some(handle) = map.handles.get(&permit.work_scope) else {
+                return Self::verify_exact_absence(&map, permit);
+            };
+            if handle.attach_permit.available_permits() == 0 {
+                return TerminalRetirementOutcome::Residual {
+                    reason: "terminal relay remains attached; retry after relay teardown"
+                        .to_string(),
+                };
+            }
             map.handles.remove(&permit.work_scope)
         };
 
