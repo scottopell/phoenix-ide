@@ -1773,6 +1773,14 @@ impl Database {
                     base_branch: Some(base_branch.to_string()),
                 }
             }
+            ("detached_approved_task", Some(worktree_path), _, Some(base_branch)) => {
+                EnvironmentContext::AllocatedWorktree {
+                    cwd: cwd.to_string(),
+                    worktree_path: worktree_path.to_string(),
+                    branch_name: None,
+                    base_branch: Some(base_branch.to_string()),
+                }
+            }
             ("explore", Some(worktree_path), _, _) => EnvironmentContext::AllocatedWorktree {
                 cwd: worktree_path.to_string(),
                 worktree_path: worktree_path.to_string(),

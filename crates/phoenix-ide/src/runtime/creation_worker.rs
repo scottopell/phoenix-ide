@@ -2963,10 +2963,19 @@ fn validate_existing_worktree(path: &Path) -> Result<(), (String, ErrorKind)> {
 }
 
 fn deterministic_worktree_path(repo_root: &str, conv_id: &str) -> std::path::PathBuf {
-    Path::new(repo_root)
-        .join(".phoenix")
-        .join("worktrees")
-        .join(conv_id)
+    let root = Path::new(repo_root);
+    let anchor = git_common_dir_for_repository_root(root)
+        .ok()
+        .and_then(|common_dir| {
+            let common = PathBuf::from(common_dir);
+            if common.file_name().is_some_and(|name| name == ".git") {
+                common.parent().map(Path::to_path_buf)
+            } else {
+                Some(common)
+            }
+        })
+        .unwrap_or_else(|| root.to_path_buf());
+    anchor.join(".phoenix").join("worktrees").join(conv_id)
 }
 
 fn creation_error_is_retryable(kind: &ErrorKind) -> bool {
