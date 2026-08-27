@@ -109,10 +109,28 @@ impl RuntimeManager {
         }
         let key = ResourceScopeKey::Work(scope.clone());
         let bash = self.bash_handles().begin_retirement(&key).await;
-        let tmux = self
+        let tmux = if let Some(identity) = self
             .tmux_registry()
-            .begin_retirement(&key, None, None)
-            .await;
+            .discover_persistent_identity(&key)
+            .await
+        {
+            match self
+                .tmux_registry()
+                .rehydrate_retirement(&key, &identity)
+                .await
+            {
+                Ok(TmuxRetirementRehydration::Permit(permit)) => permit,
+                _ => {
+                    self.tmux_registry()
+                        .begin_retirement(&key, None, None)
+                        .await
+                }
+            }
+        } else {
+            self.tmux_registry()
+                .begin_retirement(&key, None, None)
+                .await
+        };
         let terminal = self.terminals.begin_retirement(&key);
         let browser = self.browser_sessions().begin_retirement(&key).await;
         let mut resources = Vec::new();
@@ -126,15 +144,6 @@ impl RuntimeManager {
             resources.push(opaque_resource(
                 RetiredResourceKind::TmuxServer,
                 tmux.instance.stable_identity(),
-            ));
-        } else if let Some(identity) = self
-            .tmux_registry()
-            .discover_persistent_identity(&key)
-            .await
-        {
-            resources.push(opaque_resource(
-                RetiredResourceKind::TmuxServer,
-                identity.stable_identity(),
             ));
         }
         if let Some(instance) = &terminal.instance {
@@ -452,12 +461,18 @@ impl RuntimeManager {
             {
                 Ok(resources) => resources,
                 Err(reason) => {
+                    let Some(resource) = expected.first().cloned() else {
+                        self.cancel_close_resource_lease(&attempt_id, &scope).await;
+                        return Err(format!(
+                            "process-epoch Close teardown failed for sealed scope {scope}: {reason}"
+                        ));
+                    };
                     return self
                         .record_close_residual(
                             &attempt_id,
                             &snapshot,
                             &scope,
-                            expected[0].clone(),
+                            resource,
                             RetirementFailureReason::RemovalFailed,
                             &reason,
                         )
