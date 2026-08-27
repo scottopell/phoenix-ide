@@ -432,7 +432,6 @@ describe('directory-first resolution query encoding', () => {
       expect(url.searchParams.has('exact_checkout_oid')).toBe(false);
       expect(url.searchParams.has('logical_base')).toBe(false);
       expect(url.searchParams.has('freshness')).toBe(false);
-      expect(url.searchParams.has('root_reservation')).toBe(false);
     }
   });
 });

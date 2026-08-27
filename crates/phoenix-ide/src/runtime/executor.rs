@@ -8137,7 +8137,7 @@ where
         // Run blocking git/fs operations on a blocking thread.
         let blocking_admission = admitted.reborrow();
         let result =
-            crate::runtime::creation_worker::run_admitted_blocking(blocking_admission, move |_| {
+            crate::runtime::creation_worker::run_admitted_blocking(blocking_admission, move || {
                 execute_approve_task_blocking(
                     &cwd,
                     &repo_root,
@@ -8336,7 +8336,7 @@ where
         let mut authority = authority;
         let blocking_admission = authority.reborrow();
         let result =
-            crate::runtime::creation_worker::run_admitted_blocking(blocking_admission, move |_| {
+            crate::runtime::creation_worker::run_admitted_blocking(blocking_admission, move || {
                 execute_approve_task_blocking(
                     &cwd,
                     &repo_root,

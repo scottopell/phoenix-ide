@@ -7,7 +7,6 @@ use ts_rs::TS;
 
 /// Request to create a new conversation with initial message
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CreateConversationRequest {
     #[serde(default)]
     pub conversation_id: Option<String>,
@@ -34,8 +33,6 @@ pub struct CreateConversationRequest {
     pub base_branch: Option<String>,
     #[serde(default)]
     pub checkout_ref: Option<String>,
-    #[serde(default)]
-    pub root_reservation: Option<ProductRootReservation>,
     /// Seed parent conversation id (REQ-SEED-003). Decorative link only; the
     /// spawned conversation runs independently.
     #[serde(default)]
@@ -49,133 +46,31 @@ pub struct CreateConversationRequest {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateProductConversationRequest {
-    #[serde(default)]
-    pub conversation_id: Option<String>,
+    pub request_id: String,
+    pub cwd: String,
     pub model: String,
     #[serde(default)]
     pub effort: Option<phoenix_core::domain::llm_types::ModelEffort>,
     pub objective: String,
-    pub message_id: String,
     #[serde(default)]
     pub images: Vec<ImageAttachment>,
-    pub root_reservation: ProductRootReservation,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
-#[ts(export, export_to = "../../../ui/src/generated/")]
-#[serde(rename_all = "snake_case")]
-pub enum ProductRootReservationFreshness {
-    Fresh,
-    StaleCached,
-    Unresolved,
+#[derive(Debug, Serialize)]
+pub struct ProductConversationCreateAcceptedResponse {
+    pub canonical_route: String,
+    pub product_conversation_id: String,
+    pub transcript_row_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
-#[ts(export, export_to = "../../../ui/src/generated/")]
-pub struct ProductRootReservation {
-    pub id: String,
-    pub cwd: String,
-    #[ts(type = "'direct' | 'exact_committed_tree' | 'unresolved_exact_committed_tree'")]
-    pub kind: String,
-    #[serde(default)]
-    pub repo_root: Option<String>,
-    #[serde(default)]
-    pub exact_checkout_oid: Option<String>,
-    #[serde(default)]
-    pub logical_base: Option<String>,
-    #[serde(default)]
-    pub freshness: Option<ProductRootReservationFreshness>,
-    #[serde(default)]
-    pub unresolved_reason: Option<String>,
-    #[serde(default)]
-    pub repository_id: Option<String>,
+#[derive(Debug, Serialize)]
+pub struct RecentManagementRootSuggestion {
+    pub path: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, TS)]
-#[ts(export, export_to = "../../../ui/src/generated/")]
-pub struct ReserveProductRootRequest {
-    pub cwd: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, TS)]
-#[ts(export, export_to = "../../../ui/src/generated/")]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ReserveProductRootResponse {
-    Direct {
-        root_reservation: ProductRootReservation,
-    },
-    ExactCommittedTree {
-        root_reservation: ProductRootReservation,
-        exact_checkout_oid: String,
-        logical_base: String,
-        freshness: ProductRootReservationFreshness,
-    },
-    UnresolvedExactCommittedTree {
-        root_reservation: ProductRootReservation,
-    },
-}
-
-#[derive(Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ProductCreationResolutionKind {
-    Direct,
-    ExactReservedCommittedTree,
-    UnresolvedExactReservedCommittedTree,
-}
-
-#[derive(Debug, Deserialize, PartialEq, Eq)]
-pub struct ProductCreationResolutionQuery {
-    pub kind: ProductCreationResolutionKind,
-    #[serde(default)]
-    pub reservation_id: Option<String>,
-    #[serde(default)]
-    pub cwd: Option<String>,
-    #[serde(default)]
-    pub repo_root: Option<String>,
-    #[serde(default)]
-    pub exact_checkout_oid: Option<String>,
-    #[serde(default)]
-    pub logical_base: Option<String>,
-    #[serde(default)]
-    pub freshness: Option<ProductRootReservationFreshness>,
-}
-
-#[cfg(test)]
-impl ProductCreationResolutionQuery {
-    pub const DIRECT: Self = Self {
-        kind: ProductCreationResolutionKind::Direct,
-        reservation_id: None,
-        cwd: None,
-        repo_root: None,
-        exact_checkout_oid: None,
-        logical_base: None,
-        freshness: None,
-    };
-}
-
-impl From<CreateProductConversationRequest> for CreateConversationRequest {
-    fn from(value: CreateProductConversationRequest) -> Self {
-        let root = value.root_reservation;
-        let is_git = root.kind == "exact_committed_tree";
-        let cwd = root.cwd.clone();
-        let base_branch = root.logical_base.clone();
-        Self {
-            conversation_id: value.conversation_id,
-            cwd,
-            model: value.model,
-            effort: value.effort,
-            text: value.objective,
-            message_id: value.message_id,
-            images: value.images,
-            files: Vec::new(),
-            mode: is_git.then_some("managed".to_string()),
-            base_branch,
-            checkout_ref: root.exact_checkout_oid.clone(),
-            root_reservation: Some(root),
-            seed_parent_id: None,
-            seed_label: None,
-        }
-    }
+#[derive(Debug, Serialize)]
+pub struct RecentManagementRootSuggestionsResponse {
+    pub suggestions: Vec<RecentManagementRootSuggestion>,
 }
 
 /// Request body for one-shot shell-command suggestion (`POST /api/suggest`).
@@ -511,141 +406,6 @@ pub struct ProductConversationRouteResponse {
     pub transcript_row_id: String,
 }
 
-#[derive(Debug, Serialize)]
-pub struct ProductConversationCreateAcceptedResponse {
-    pub product_conversation_id: String,
-    pub canonical_route: String,
-    pub transcript_row_id: String,
-}
-
-#[derive(Debug)]
-pub(crate) struct InternalCreateConversationAcceptedResponse {
-    pub conversation: serde_json::Value,
-    pub product_conversation_id: Option<String>,
-}
-
-#[cfg(test)]
-mod create_product_conversation_request_tests {
-    use super::CreateProductConversationRequest;
-
-    #[test]
-    fn rejects_legacy_creation_fields() {
-        for field in [
-            "mode",
-            "base_branch",
-            "checkout_ref",
-            "project_id",
-            "branch_name",
-        ] {
-            let payload = format!(
-                r#"{{
-                    "conversation_id":"11111111-1111-1111-1111-111111111111",
-                    "model":"claude-sonnet-4-5",
-                    "objective":"Ship it",
-                    "message_id":"msg-1",
-                    "images":[],
-                    "root_reservation":{{"id":"reservation-test","cwd":"/tmp/project","kind":"direct"}},
-                    "{field}":"legacy"
-                }}"#
-            );
-            let err = serde_json::from_str::<CreateProductConversationRequest>(&payload)
-                .expect_err("legacy field must be rejected");
-            assert!(
-                err.to_string().contains(field),
-                "missing field name in error: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_unsupported_settings_field() {
-        let payload = r#"{
-            "conversation_id":"11111111-1111-1111-1111-111111111111",
-            "model":"claude-sonnet-4-5",
-            "objective":"Ship it",
-            "message_id":"msg-1",
-            "images":[],
-            "root_reservation":{"id":"reservation-test","cwd":"/tmp/project","kind":"direct"},
-            "settings":{}
-        }"#;
-        let err = serde_json::from_str::<CreateProductConversationRequest>(payload)
-            .expect_err("settings field must be rejected");
-        assert!(
-            err.to_string().contains("settings"),
-            "missing field name in error: {err}"
-        );
-    }
-
-    #[test]
-    fn deserializes_direct_resolution_query() {
-        let resolution = serde_json::from_value::<super::ProductCreationResolutionQuery>(
-            serde_json::json!({ "kind": "direct" }),
-        )
-        .expect("direct query parses");
-        assert_eq!(
-            resolution,
-            super::ProductCreationResolutionQuery {
-                kind: super::ProductCreationResolutionKind::Direct,
-                reservation_id: None,
-                cwd: None,
-                repo_root: None,
-                exact_checkout_oid: None,
-                logical_base: None,
-                freshness: None,
-            }
-        );
-    }
-
-    #[test]
-    fn deserializes_exact_reserved_committed_tree_resolution_query() {
-        let resolution =
-            serde_json::from_value::<super::ProductCreationResolutionQuery>(serde_json::json!({
-                "kind": "exact_reserved_committed_tree",
-                "cwd": "/tmp/project",
-                "reservation_id": "reservation-1",
-                "repo_root": "/tmp/project",
-                "exact_checkout_oid": "abc123",
-                "logical_base": "main",
-                "freshness": "fresh"
-            }))
-            .expect("exact reserved committed tree query parses");
-        assert_eq!(
-            resolution,
-            super::ProductCreationResolutionQuery {
-                kind: super::ProductCreationResolutionKind::ExactReservedCommittedTree,
-                reservation_id: Some("reservation-1".to_string()),
-                cwd: Some("/tmp/project".to_string()),
-                repo_root: Some("/tmp/project".to_string()),
-                exact_checkout_oid: Some("abc123".to_string()),
-                logical_base: Some("main".to_string()),
-                freshness: Some(super::ProductRootReservationFreshness::Fresh),
-            }
-        );
-    }
-    #[test]
-    fn deserializes_unresolved_exact_reserved_committed_tree_resolution_query() {
-        let resolution =
-            serde_json::from_value::<super::ProductCreationResolutionQuery>(serde_json::json!({
-                "kind": "unresolved_exact_reserved_committed_tree",
-                "cwd": "/tmp/project",
-                "reservation_id": "reservation-2"
-            }))
-            .expect("unresolved reserved committed tree query parses");
-        assert_eq!(
-            resolution,
-            super::ProductCreationResolutionQuery {
-                kind: super::ProductCreationResolutionKind::UnresolvedExactReservedCommittedTree,
-                reservation_id: Some("reservation-2".to_string()),
-                cwd: Some("/tmp/project".to_string()),
-                repo_root: None,
-                exact_checkout_oid: None,
-                logical_base: None,
-                freshness: None,
-            }
-        );
-    }
-}
-
 /// Response with conversation and messages
 #[derive(Debug, Serialize)]
 pub struct ConversationWithMessagesResponse {
@@ -821,17 +581,6 @@ pub struct MkdirResponse {
 pub struct DirectoryEntry {
     pub name: String,
     pub is_dir: bool,
-}
-
-#[derive(Debug, Serialize, TS)]
-#[ts(export, export_to = "../../../ui/src/generated/")]
-pub struct RecentManagementRootSuggestion {
-    pub path: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct RecentManagementRootSuggestionsResponse {
-    pub suggestions: Vec<RecentManagementRootSuggestion>,
 }
 
 /// Refines a text file for icon and syntax-highlight selection. These are
@@ -1038,8 +787,14 @@ pub struct ProjectFileSearchQuery {
     pub q: String,
     /// Maximum number of results (default 50)
     pub limit: Option<usize>,
-    #[serde(flatten)]
-    pub resolution: ProductCreationResolutionQuery,
+    /// Resolved creation mode (`direct`/`managed`/`branch`). Together with
+    /// `base_branch` this selects the resolution root: branch/managed modes
+    /// search the chosen branch's committed tree (what the conversation's fresh
+    /// worktree will hold), so suggestions match create-time expansion.
+    /// Absent ⇒ Direct (search `cwd`).
+    pub mode: Option<String>,
+    /// Branch the conversation will be created on, for branch/managed modes.
+    pub base_branch: Option<String>,
 }
 
 /// A single code content search result.
@@ -1102,8 +857,13 @@ pub struct SkillsResponse {
 pub struct ProjectSkillsQuery {
     /// Working directory to discover skills from.
     pub cwd: String,
-    #[serde(flatten)]
-    pub resolution: ProductCreationResolutionQuery,
+    /// Resolved creation mode (`direct`/`managed`/`branch`). With `base_branch`,
+    /// branch/managed modes discover skills from the chosen branch's committed
+    /// `.claude/skills` / `.agents/skills` (plus global + built-in), matching
+    /// what the conversation's worktree will expose. Absent ⇒ Direct (`cwd`).
+    pub mode: Option<String>,
+    /// Branch the conversation will be created on, for branch/managed modes.
+    pub base_branch: Option<String>,
 }
 
 /// A task file entry returned by the tasks list endpoint.
@@ -1280,11 +1040,6 @@ pub struct ConflictErrorResponse {
     /// the parent has been continued (`error_type = "continuation_exists"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub continuation_id: Option<String>,
-    /// Exact idempotency fingerprint that currently owns the rejected resource,
-    /// when the server can prove it. Used by create endpoints to distinguish an
-    /// exact replay from a divergent duplicate.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub conflict_fingerprint: Option<String>,
 }
 
 impl ConflictErrorResponse {
@@ -1296,7 +1051,6 @@ impl ConflictErrorResponse {
             can_auto_stash: false,
             conflict_slug: None,
             continuation_id: None,
-            conflict_fingerprint: None,
         }
     }
 
@@ -1307,11 +1061,6 @@ impl ConflictErrorResponse {
 
     pub fn with_continuation_id(mut self, id: impl Into<String>) -> Self {
         self.continuation_id = Some(id.into());
-        self
-    }
-
-    pub fn with_conflict_fingerprint(mut self, fingerprint: impl Into<String>) -> Self {
-        self.conflict_fingerprint = Some(fingerprint.into());
         self
     }
 }

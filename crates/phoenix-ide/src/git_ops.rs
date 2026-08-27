@@ -6,18 +6,6 @@
 
 use std::path::Path;
 
-pub(crate) fn git_common_dir_path(path: &Path) -> Option<std::path::PathBuf> {
-    let output = phoenix_core::git::command()
-        .current_dir(path)
-        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
-        .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()))
-}
-
 /// Walks back from `end` until the byte slice `bytes[..end]` is on a
 /// valid UTF-8 character boundary. Used by `run_git_capped` so the
 /// truncated buffer is always parseable as UTF-8 (any incomplete
@@ -610,49 +598,6 @@ pub(crate) enum PhoenixIgnoreStrategy {
     LocalExclude,
 }
 
-fn install_phoenix_ignore(cwd: &Path, ignore_strategy: PhoenixIgnoreStrategy) {
-    let result = match ignore_strategy {
-        PhoenixIgnoreStrategy::StageGitignore => ensure_gitignore_has_phoenix(cwd),
-        PhoenixIgnoreStrategy::LocalExclude => ensure_local_exclude_has_phoenix(cwd),
-    };
-    if let Err(e) = result {
-        tracing::warn!(error = %e, ?ignore_strategy, "Failed to ignore .phoenix/ (non-fatal)");
-    }
-}
-
-pub(crate) fn create_detached_worktree(
-    cwd: &Path,
-    target_path: &Path,
-    checkout_ref: &str,
-    ignore_strategy: PhoenixIgnoreStrategy,
-) -> Result<String, GitOpError> {
-    install_phoenix_ignore(cwd, ignore_strategy);
-    let parent = target_path.parent().ok_or_else(|| {
-        GitOpError::Io("detached worktree target has no parent directory".to_string())
-    })?;
-    std::fs::create_dir_all(parent)
-        .map_err(|error| GitOpError::Io(format!("Failed to create worktree parent: {error}")))?;
-    run_git(
-        cwd,
-        &[
-            "worktree",
-            "add",
-            "--detach",
-            target_path.to_string_lossy().as_ref(),
-            checkout_ref,
-        ],
-    )
-    .map_err(|e| {
-        cleanup_failed_worktree(cwd, target_path, None);
-        GitOpError::Git(format!(
-            "Failed to create detached worktree from '{checkout_ref}': {e}"
-        ))
-    })?;
-    prewarm_new_worktree(cwd, target_path);
-    Ok(target_path.to_string_lossy().to_string())
-}
-
-/// Create a git worktree at `.phoenix/worktrees/{conv_id}`.
 /// Create a git worktree at `.phoenix/worktrees/{conv_id}`.
 ///
 /// If `create_branch` is `Some((new_branch, start_point))`, creates a new branch
@@ -677,7 +622,9 @@ pub(crate) fn create_worktree(
     // below (staging a tracked file before the worktree exists has no benefit and
     // would dirty the index on a failed add).
     if ignore_strategy == PhoenixIgnoreStrategy::LocalExclude {
-        install_phoenix_ignore(cwd, ignore_strategy);
+        if let Err(e) = ensure_local_exclude_has_phoenix(cwd) {
+            tracing::warn!(error = %e, "Failed to ignore .phoenix/ via local exclude before worktree add (non-fatal)");
+        }
     }
 
     // 1. Create .phoenix/worktrees/ directory
@@ -734,7 +681,9 @@ pub(crate) fn create_worktree(
     //    LocalExclude already wrote its exclude entry BEFORE the add (above), so
     //    `.phoenix/` is ignored even if the add failed; nothing to do here.
     if ignore_strategy == PhoenixIgnoreStrategy::StageGitignore {
-        install_phoenix_ignore(cwd, ignore_strategy);
+        if let Err(e) = ensure_gitignore_has_phoenix(cwd) {
+            tracing::warn!(error = %e, "Failed to ignore .phoenix/ (non-fatal)");
+        }
     }
 
     Ok(worktree_path_str)
@@ -940,8 +889,8 @@ fn phoenix_is_already_ignored(dir: &Path) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-/// Ensure `.phoenix/` is ignored in the given directory, appending to the
-/// tracked `.gitignore` without modifying the index when it is not already ignored by another
+/// Ensure `.phoenix/` is ignored in the given directory, appending + staging the
+/// tracked `.gitignore` only when it is NOT already ignored by some other
 /// mechanism. Creates `.gitignore` if it doesn't exist.
 ///
 /// No-op when `git check-ignore` already reports `.phoenix/` ignored — e.g. a
@@ -982,10 +931,8 @@ pub(crate) fn ensure_gitignore_has_phoenix(dir: &Path) -> Result<(), String> {
             writeln!(f).map_err(|e| format!("Failed to write .gitignore: {e}"))?;
         }
         writeln!(f, ".phoenix/").map_err(|e| format!("Failed to write .gitignore: {e}"))?;
-        // Keep creation observational with respect to the user's index. The
-        // working-tree rule is sufficient while provisioning; later owned
-        // commits may stage it together with their own metadata.
-        tracing::info!(dir = %dir.display(), "Added .phoenix/ to working-tree .gitignore without staging");
+        run_git(dir, &["add", ".gitignore"])?;
+        tracing::info!(dir = %dir.display(), "Added .phoenix/ to .gitignore");
     }
 
     Ok(())
@@ -1707,8 +1654,11 @@ mod tests {
         );
     }
 
+    /// Bug 2 complement: when `.phoenix/` is NOT yet ignored (a plain
+    /// Explore/Branch worktree), `ensure_gitignore_has_phoenix` keeps its
+    /// append + stage behaviour.
     #[test]
-    fn ensure_gitignore_appends_without_mutating_index() {
+    fn ensure_gitignore_appends_and_stages_when_not_yet_ignored() {
         let tmp = TempDir::new().unwrap();
         init_repo(tmp.path());
 
@@ -1720,9 +1670,10 @@ mod tests {
             "`.phoenix/` must be appended: {content:?}"
         );
         let staged = run_git(tmp.path(), &["diff", "--cached", "--name-only"]).unwrap();
-        assert!(
-            staged.trim().is_empty(),
-            "creation must preserve the user's index exactly: {staged:?}"
+        assert_eq!(
+            staged.trim(),
+            ".gitignore",
+            "the new `.gitignore` must be staged: {staged:?}"
         );
     }
 

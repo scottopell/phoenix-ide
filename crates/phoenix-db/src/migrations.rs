@@ -397,7 +397,7 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 76,
-        name: "normalize_product_root_reservations",
+        name: "persist_product_creation_jobs",
         sql: MIGRATION_076,
     },
 ];
@@ -2089,47 +2089,104 @@ CREATE UNIQUE INDEX close_obligations_one_active_per_product ON close_obligation
 ";
 
 const MIGRATION_076: &str = r"
-DROP TRIGGER conversations_role_scope_insert;
-DROP TRIGGER conversations_role_scope_update;
-CREATE TRIGGER conversations_role_scope_insert
-BEFORE INSERT ON conversations
-WHEN NEW.runtime_role NOT IN ('user', 'sub_agent', 'coordinator')
-  OR (NEW.runtime_role = 'coordinator' AND NEW.work_scope_id IS NOT NULL)
-  OR (NEW.runtime_role = 'user' AND NEW.work_scope_id IS NULL AND NEW.state_kind NOT IN ('provisioning', 'creation_failed', 'creation_cancelled'))
-BEGIN
-    SELECT RAISE(ABORT, 'invalid conversation runtime role/work scope');
-END;
-CREATE TRIGGER conversations_role_scope_update
-BEFORE UPDATE OF runtime_role, work_scope_id, state_kind ON conversations
-WHEN NEW.runtime_role NOT IN ('user', 'sub_agent', 'coordinator')
-  OR (NEW.runtime_role = 'coordinator' AND NEW.work_scope_id IS NOT NULL)
-  OR (NEW.runtime_role = 'user' AND NEW.work_scope_id IS NULL AND NEW.state_kind NOT IN ('provisioning', 'creation_failed', 'creation_cancelled'))
-BEGIN
-    SELECT RAISE(ABORT, 'invalid conversation runtime role/work scope');
-END;
-
-CREATE TABLE product_root_reservations (
-    id TEXT PRIMARY KEY CHECK (typeof(id) = 'text' AND id <> ''),
-    cwd TEXT NOT NULL CHECK (typeof(cwd) = 'text' AND cwd <> '' AND instr(cwd, char(0)) = 0),
-    kind TEXT NOT NULL CHECK (kind IN ('direct', 'exact_committed_tree', 'unresolved_exact_committed_tree')),
-    repo_root TEXT CHECK (repo_root IS NULL OR (typeof(repo_root) = 'text' AND repo_root <> '' AND instr(repo_root, char(0)) = 0)),
-    repository_id TEXT CHECK (repository_id IS NULL OR (typeof(repository_id) = 'text' AND repository_id <> '')),
-    exact_checkout_oid TEXT CHECK (exact_checkout_oid IS NULL OR (typeof(exact_checkout_oid) = 'text' AND exact_checkout_oid <> '')),
-    logical_base TEXT CHECK (logical_base IS NULL OR (typeof(logical_base) = 'text' AND logical_base <> '')),
-    freshness TEXT CHECK (freshness IS NULL OR freshness IN ('fresh', 'stale_cached', 'unresolved')),
-    unresolved_reason TEXT CHECK (unresolved_reason IS NULL OR (typeof(unresolved_reason) = 'text' AND unresolved_reason <> '')),
-    status TEXT NOT NULL CHECK (status IN ('reserved', 'consumed')),
-    consumed_by_conversation_id TEXT,
-    created_at_unix_micros INTEGER NOT NULL CHECK (typeof(created_at_unix_micros) = 'integer' AND created_at_unix_micros >= 0),
-    consumed_at_unix_micros INTEGER CHECK (consumed_at_unix_micros IS NULL OR (typeof(consumed_at_unix_micros) = 'integer' AND consumed_at_unix_micros >= 0)),
-    CHECK ((kind = 'direct' AND repo_root IS NULL AND repository_id IS NULL AND exact_checkout_oid IS NULL AND logical_base IS NULL AND freshness IS NULL AND unresolved_reason IS NULL)
-        OR (kind = 'exact_committed_tree' AND repo_root IS NOT NULL AND exact_checkout_oid IS NOT NULL AND logical_base IS NOT NULL AND freshness IN ('fresh', 'stale_cached') AND unresolved_reason IS NULL)
-        OR (kind = 'unresolved_exact_committed_tree' AND repo_root IS NOT NULL AND exact_checkout_oid IS NULL AND logical_base IS NULL AND freshness = 'unresolved' AND unresolved_reason IS NOT NULL)),
-    CHECK ((status = 'reserved' AND consumed_by_conversation_id IS NULL AND consumed_at_unix_micros IS NULL)
-        OR (status = 'consumed' AND consumed_by_conversation_id IS NOT NULL AND consumed_at_unix_micros IS NOT NULL))
+CREATE TABLE product_creation_jobs (
+    request_id TEXT PRIMARY KEY CHECK (typeof(request_id) = 'text' AND trim(request_id) <> ''),
+    cwd TEXT NOT NULL CHECK (typeof(cwd) = 'text' AND trim(cwd) <> '' AND instr(cwd, char(0)) = 0),
+    objective TEXT NOT NULL CHECK (typeof(objective) = 'text' AND trim(objective) <> ''),
+    model TEXT CHECK (model IS NULL OR (typeof(model) = 'text' AND trim(model) <> '')),
+    effort TEXT CHECK (effort IS NULL OR (typeof(effort) = 'text' AND trim(effort) <> '')),
+    status TEXT NOT NULL CHECK (status IN ('accepted', 'claimed', 'retry_scheduled', 'delivery_pending', 'published', 'failed', 'cleanup_ambiguous')),
+    accepted_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    claim_generation INTEGER NOT NULL DEFAULT 0 CHECK (typeof(claim_generation) = 'integer' AND claim_generation >= 0),
+    claim_worker_id TEXT CHECK (claim_worker_id IS NULL OR (typeof(claim_worker_id) = 'text' AND trim(claim_worker_id) <> '')),
+    claim_token TEXT CHECK (claim_token IS NULL OR (typeof(claim_token) = 'text' AND trim(claim_token) <> '')),
+    claim_lease_until TEXT,
+    retry_at TEXT,
+    pin_exact_checkout_oid TEXT CHECK (pin_exact_checkout_oid IS NULL OR (typeof(pin_exact_checkout_oid) = 'text' AND trim(pin_exact_checkout_oid) <> '')),
+    pin_logical_base TEXT CHECK (pin_logical_base IS NULL OR (typeof(pin_logical_base) = 'text' AND trim(pin_logical_base) <> '')),
+    pin_freshness TEXT CHECK (pin_freshness IS NULL OR pin_freshness = 'fresh'),
+    staging_path TEXT CHECK (staging_path IS NULL OR (typeof(staging_path) = 'text' AND trim(staging_path) <> '' AND instr(staging_path, char(0)) = 0)),
+    staging_repo_root TEXT CHECK (staging_repo_root IS NULL OR (typeof(staging_repo_root) = 'text' AND trim(staging_repo_root) <> '' AND instr(staging_repo_root, char(0)) = 0)),
+    staging_exact_oid TEXT CHECK (staging_exact_oid IS NULL OR (typeof(staging_exact_oid) = 'text' AND trim(staging_exact_oid) <> '')),
+    published_product_id TEXT UNIQUE REFERENCES product_conversations(id) ON DELETE SET NULL,
+    published_conversation_id TEXT UNIQUE REFERENCES conversations(id) ON DELETE SET NULL,
+    CHECK ((status = 'accepted' AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until IS NULL AND retry_at IS NULL AND published_product_id IS NULL AND published_conversation_id IS NULL)
+        OR (status = 'claimed' AND claim_worker_id IS NOT NULL AND claim_token IS NOT NULL AND claim_lease_until IS NOT NULL AND retry_at IS NULL AND published_product_id IS NULL AND published_conversation_id IS NULL)
+        OR (status = 'retry_scheduled' AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until IS NULL AND retry_at IS NOT NULL AND published_product_id IS NULL AND published_conversation_id IS NULL)
+        OR (status = 'delivery_pending' AND claim_worker_id IS NOT NULL AND claim_token IS NOT NULL AND claim_lease_until IS NOT NULL AND retry_at IS NULL AND published_product_id IS NOT NULL AND published_conversation_id IS NOT NULL)
+        OR (status = 'published' AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until IS NULL AND retry_at IS NULL AND published_product_id IS NOT NULL AND published_conversation_id IS NOT NULL)
+        OR (status IN ('failed', 'cleanup_ambiguous') AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until IS NULL AND published_product_id IS NULL AND published_conversation_id IS NULL))
 );
-CREATE INDEX product_root_reservations_cwd_created_at
-    ON product_root_reservations(cwd, created_at_unix_micros DESC);
+CREATE INDEX product_creation_jobs_claim_order
+    ON product_creation_jobs(status, accepted_at, request_id);
+CREATE INDEX product_creation_jobs_retry_order
+    ON product_creation_jobs(status, retry_at, accepted_at, request_id);
+CREATE INDEX product_creation_jobs_published_cwd
+    ON product_creation_jobs(status, cwd, updated_at DESC, request_id DESC);
+
+CREATE TABLE product_creation_job_images (
+    request_id TEXT NOT NULL REFERENCES product_creation_jobs(request_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (typeof(ordinal) = 'integer' AND ordinal >= 0),
+    media_type TEXT NOT NULL CHECK (typeof(media_type) = 'text' AND trim(media_type) <> ''),
+    data TEXT NOT NULL CHECK (typeof(data) = 'text' AND trim(data) <> ''),
+    PRIMARY KEY (request_id, ordinal)
+);
+
+CREATE TABLE product_conversation_work_scopes (
+    product_conversation_id TEXT PRIMARY KEY REFERENCES product_conversations(id) ON DELETE CASCADE,
+    work_scope_id TEXT NOT NULL UNIQUE REFERENCES work_scopes(id) ON DELETE RESTRICT
+);
+INSERT OR IGNORE INTO product_conversation_work_scopes (product_conversation_id, work_scope_id)
+SELECT DISTINCT c.product_conversation_id, c.work_scope_id
+FROM conversations c
+WHERE c.product_conversation_id IS NOT NULL
+  AND c.work_scope_id IS NOT NULL
+  AND c.runtime_role = 'user';
+
+CREATE TRIGGER product_conversation_work_scopes_insert_conversation_owner_match
+BEFORE INSERT ON product_conversation_work_scopes
+WHEN EXISTS (
+    SELECT 1 FROM conversations c
+    WHERE c.work_scope_id = NEW.work_scope_id
+      AND c.product_conversation_id <> NEW.product_conversation_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'work scope already belongs to another product');
+END;
+CREATE TRIGGER product_conversation_work_scopes_insert_subagent_owner_match
+BEFORE INSERT ON product_conversation_work_scopes
+WHEN EXISTS (
+    SELECT 1
+    FROM conversations child
+    JOIN conversations parent ON parent.id = child.parent_conversation_id
+    WHERE child.work_scope_id = NEW.work_scope_id
+      AND child.runtime_role = 'sub_agent'
+      AND parent.product_conversation_id <> NEW.product_conversation_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'sub-agent scope belongs to another product');
+END;
+CREATE TRIGGER conversations_product_scope_insert_enforce
+BEFORE INSERT ON conversations
+WHEN NEW.work_scope_id IS NOT NULL AND EXISTS (
+    SELECT 1 FROM product_conversation_work_scopes owner
+    WHERE owner.work_scope_id = NEW.work_scope_id
+      AND owner.product_conversation_id <> NEW.product_conversation_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'conversation work scope belongs to another product');
+END;
+CREATE TRIGGER conversations_product_scope_update_enforce
+BEFORE UPDATE OF product_conversation_id, work_scope_id ON conversations
+WHEN NEW.work_scope_id IS NOT NULL AND EXISTS (
+    SELECT 1 FROM product_conversation_work_scopes owner
+    WHERE owner.work_scope_id = NEW.work_scope_id
+      AND owner.product_conversation_id <> NEW.product_conversation_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'conversation work scope belongs to another product');
+END;
 ";
 
 const MIGRATION_075: &str = r"
@@ -12331,7 +12388,8 @@ mod tests {
                     (71, 'temporarily_skip_product_conversation_lifecycle_correction'),
                     (72, 'temporarily_skip_product_conversation_lifecycle_retention'),
                     (73, 'temporarily_skip_recursive_subordinate_parent_invariant'),
-                    (74, 'temporarily_skip_completed_continuation_handoffs')",
+                    (74, 'temporarily_skip_completed_continuation_handoffs'),
+                    (76, 'temporarily_skip_product_creation_publication')",
         )
         .execute(&pool)
         .await
@@ -13219,7 +13277,8 @@ mod tests {
                     (71, 'temporarily_skip_product_conversation_lifecycle_correction'),
                     (72, 'temporarily_skip_product_conversation_lifecycle_retention'),
                     (73, 'temporarily_skip_recursive_subordinate_parent_invariant'),
-                    (74, 'temporarily_skip_completed_continuation_handoffs')",
+                    (74, 'temporarily_skip_completed_continuation_handoffs'),
+                    (76, 'temporarily_skip_product_creation_publication')",
         )
         .execute(pool)
         .await

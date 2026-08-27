@@ -7,6 +7,8 @@ mod coordinator_query;
 mod ddl;
 mod git_repository_reconciliation;
 mod migrations;
+mod product_creation;
+pub use product_creation::*;
 mod product_conversation_read;
 pub mod retrieval;
 mod sqlite_native_statement;
@@ -223,58 +225,6 @@ pub enum DbError {
 }
 
 pub type DbResult<T> = Result<T, DbError>;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProductRootReservationRecord {
-    pub id: String,
-    pub cwd: String,
-    pub kind: String,
-    pub repo_root: Option<String>,
-    pub repository_id: Option<String>,
-    pub exact_checkout_oid: Option<String>,
-    pub logical_base: Option<String>,
-    pub freshness: Option<String>,
-    pub unresolved_reason: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RecentHiddenRepositoryManagementRoot {
-    pub repository_id: phoenix_core::git_repository::GitRepositoryId,
-    pub management_root: String,
-    pub observed_at: chrono::DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GitRepositoryDefaultBranchObservation {
-    Resolved { branch: String, provenance: String },
-    Unresolved,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AttachHiddenGitRepositoryInput {
-    pub conversation_id: String,
-    pub common_dir: String,
-    pub management_root: String,
-    pub materialized_worktree: String,
-    pub default_branch: GitRepositoryDefaultBranchObservation,
-    pub observed_at: chrono::DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ApprovedTaskRootReservationInput {
-    pub repository_id: phoenix_core::git_repository::GitRepositoryId,
-    pub repository_root: String,
-    pub exact_checkout_oid: String,
-    pub logical_base: String,
-}
-
-const PRODUCT_ROOT_RESERVATION_RECLAIM_AFTER: chrono::Duration = chrono::Duration::days(7);
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AttachedHiddenGitRepository {
-    pub work_scope_id: WorkScopeId,
-    pub repository_id: phoenix_core::git_repository::GitRepositoryId,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SteeringDrainMessageStatus {
@@ -1213,10 +1163,6 @@ fn row_work_scope_id(row: &SqliteRow) -> phoenix_core::work_scope::WorkScopeId {
     let raw: String = row.get("work_scope_id");
     phoenix_core::work_scope::WorkScopeId::parse(raw)
         .expect("database CHECK enforces non-empty work_scope_id")
-}
-
-fn product_root_reservation_reclaim_before(now: chrono::DateTime<Utc>) -> i64 {
-    (now - PRODUCT_ROOT_RESERVATION_RECLAIM_AFTER).timestamp_micros()
 }
 
 /// Thread-safe database handle
@@ -4457,437 +4403,6 @@ impl Database {
         .map_err(DbError::Sqlx)
     }
 
-    async fn reclaim_abandoned_product_root_reservations_tx(
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-        now: chrono::DateTime<Utc>,
-    ) -> DbResult<()> {
-        sqlx::query(
-            "DELETE FROM product_root_reservations
-             WHERE status = 'reserved'
-               AND created_at_unix_micros < ?1",
-        )
-        .bind(product_root_reservation_reclaim_before(now))
-        .execute(&mut **tx)
-        .await?;
-        Ok(())
-    }
-
-    /// Persist one server-owned pre-creation root reservation.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DbError`] when persistence fails.
-    pub async fn insert_product_root_reservation(
-        &self,
-        reservation: &ProductRootReservationRecord,
-    ) -> DbResult<()> {
-        let now = Utc::now();
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        Self::reclaim_abandoned_product_root_reservations_tx(&mut tx, now).await?;
-        sqlx::query(
-            "INSERT INTO product_root_reservations
-             (id, cwd, kind, repo_root, repository_id, exact_checkout_oid, logical_base, freshness, unresolved_reason, status, created_at_unix_micros)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'reserved', ?10)",
-        )
-        .bind(&reservation.id)
-        .bind(&reservation.cwd)
-        .bind(&reservation.kind)
-        .bind(&reservation.repo_root)
-        .bind(&reservation.repository_id)
-        .bind(&reservation.exact_checkout_oid)
-        .bind(&reservation.logical_base)
-        .bind(&reservation.freshness)
-        .bind(&reservation.unresolved_reason)
-        .bind(now.timestamp_micros())
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(())
-    }
-
-    /// Load one server-owned reservation by its opaque identity and canonical cwd.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DbError`] when the reservation query fails.
-    pub async fn get_product_root_reservation(
-        &self,
-        reservation_id: &str,
-        cwd: &str,
-    ) -> DbResult<Option<ProductRootReservationRecord>> {
-        let now = Utc::now();
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        Self::reclaim_abandoned_product_root_reservations_tx(&mut tx, now).await?;
-        let reservation = sqlx::query(
-            "SELECT id, cwd, kind, repo_root, repository_id, exact_checkout_oid, logical_base, freshness, unresolved_reason
-               FROM product_root_reservations
-              WHERE id = ?1 AND cwd = ?2",
-        )
-        .bind(reservation_id)
-        .bind(cwd)
-        .try_map(|row| {
-            Ok(ProductRootReservationRecord {
-                id: row.get("id"),
-                cwd: row.get("cwd"),
-                kind: row.get("kind"),
-                repo_root: row.get("repo_root"),
-                repository_id: row.get("repository_id"),
-                exact_checkout_oid: row.get("exact_checkout_oid"),
-                logical_base: row.get("logical_base"),
-                freshness: row.get("freshness"),
-                unresolved_reason: row.get("unresolved_reason"),
-            })
-        })
-        .fetch_optional(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(reservation)
-    }
-
-    /// Attach normalized hidden repository authority to an existing conversation `WorkScope`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DbError`] when attachment validation or the transaction fails.
-    #[allow(clippy::too_many_lines)]
-    pub async fn attach_hidden_git_repository_to_conversation_work_scope(
-        &self,
-        input: &AttachHiddenGitRepositoryInput,
-        job_id: &str,
-        claim: &CreationClaim,
-    ) -> DbResult<(CreationCasOutcome, Option<AttachedHiddenGitRepository>)> {
-        let normalized_common_dir = normalize_hidden_git_repository_path(&input.common_dir)?;
-        let normalized_management_root =
-            normalize_hidden_git_repository_path(&input.management_root)?;
-        let observed_at_unix_micros = datetime_to_unix_micros(input.observed_at);
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let owns_claim: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM conversation_creation_jobs
-             WHERE id = ?1 AND status = 'claimed' AND generation = ?2
-               AND claim_worker_id = ?3 AND claim_token = ?4 AND lease_until > ?5",
-        )
-        .bind(job_id)
-        .bind(claim_generation_i64(claim)?)
-        .bind(&claim.worker_id.0)
-        .bind(&claim.token.0)
-        .bind(Utc::now().to_rfc3339())
-        .fetch_one(&mut *tx)
-        .await?;
-        if owns_claim == 0 {
-            tx.rollback().await?;
-            return Ok((CreationCasOutcome::ClaimLost, None));
-        }
-        let row = sqlx::query(
-            "SELECT c.cm_kind, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
-                    c.work_scope_id,
-                    e.branch_name AS env_branch_name,
-                    e.worktree_path AS env_worktree_path,
-                    e.base_branch AS env_base_branch
-               FROM conversations c
-               LEFT JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id
-              WHERE c.id = ?1",
-        )
-        .bind(&input.conversation_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        let work_scope_id =
-            if let Some(existing_scope_id) = row.get::<Option<String>, _>("work_scope_id") {
-                WorkScopeId::parse(existing_scope_id)
-                    .map_err(|error| DbError::Serialization(error.to_string()))?
-            } else {
-                let cm_kind = row.get::<String, _>("cm_kind");
-                let cm_task_id = row.get::<Option<String>, _>("cm_task_id");
-                let cm_task_title = row.get::<Option<String>, _>("cm_task_title");
-                let cm_next_hint = row
-                    .get::<Option<i64>, _>("cm_next_taskmd_id_hint")
-                    .map(|value| value.to_string());
-                let env_worktree_path = row.get::<Option<String>, _>("env_worktree_path");
-                let env_branch_name = row.get::<Option<String>, _>("env_branch_name");
-                let env_base_branch = row.get::<Option<String>, _>("env_base_branch");
-                let cm = ConvModeCols {
-                    kind: match cm_kind.as_str() {
-                        "direct" => "direct",
-                        "work" => "work",
-                        "explore" => "explore",
-                        other => {
-                            return Err(DbError::Serialization(format!(
-                                "invalid deferred scope mode {other}"
-                            )))
-                        }
-                    },
-                    task_id: cm_task_id.as_deref(),
-                    task_title: cm_task_title.as_deref(),
-                    next_taskmd_id_hint: cm_next_hint.as_deref(),
-                    worktree_path: env_worktree_path.as_deref(),
-                    branch_name: env_branch_name.as_deref(),
-                    base_branch: env_base_branch.as_deref(),
-                };
-                let (scope_id, authority_kind, environment) =
-                    Self::new_scope_for_conversation(&input.materialized_worktree, &cm);
-                let now = Utc::now().to_rfc3339();
-                Self::insert_work_scope_tx(&mut tx, &scope_id, authority_kind, environment, &now)
-                    .await?;
-                sqlx::query(
-                    "UPDATE conversations
-                    SET work_scope_id = ?1,
-                        updated_at = ?3
-                  WHERE id = ?2
-                    AND work_scope_id IS NULL",
-                )
-                .bind(scope_id.as_str())
-                .bind(&input.conversation_id)
-                .bind(&now)
-                .execute(&mut *tx)
-                .await?;
-                scope_id
-            };
-
-        let repository_id = if let Some(existing_id) = sqlx::query_scalar::<_, String>(
-            "SELECT wr.repository_id
-               FROM conversation_creation_jobs job
-               JOIN conversations c ON c.id = job.conversation_id
-               JOIN work_scope_git_repositories wr ON wr.work_scope_id = c.work_scope_id
-              WHERE job.id = ?1 AND job.status = 'claimed' AND job.generation = ?2
-                AND job.claim_worker_id = ?3 AND job.claim_token = ?4 AND job.lease_until > ?5",
-        )
-        .bind(job_id)
-        .bind(claim_generation_i64(claim)?)
-        .bind(&claim.worker_id.0)
-        .bind(&claim.token.0)
-        .bind(Utc::now().to_rfc3339())
-        .fetch_optional(&mut *tx)
-        .await?
-        {
-            phoenix_core::git_repository::GitRepositoryId::parse(existing_id)
-                .map_err(|error| DbError::Serialization(error.to_string()))?
-        } else {
-            let repository_id = phoenix_core::git_repository::GitRepositoryId::parse(
-                uuid::Uuid::new_v4().to_string(),
-            )
-            .map_err(|error| DbError::Serialization(error.to_string()))?;
-            sqlx::query("INSERT INTO git_repositories (id) VALUES (?1)")
-                .bind(repository_id.as_str())
-                .execute(&mut *tx)
-                .await?;
-            repository_id
-        };
-
-        for (locator_kind, path) in [
-            ("common_dir", normalized_common_dir.as_str()),
-            ("management_root", normalized_management_root.as_str()),
-        ] {
-            sqlx::query(
-                "INSERT INTO git_repository_locator_observations (
-                    repository_id, locator_kind, status, path, observed_at_unix_micros
-                 ) VALUES (?1, ?2, 'present', ?3, ?4)
-                 ON CONFLICT(repository_id, locator_kind)
-                 DO UPDATE SET status = excluded.status,
-                               path = excluded.path,
-                               observed_at_unix_micros = excluded.observed_at_unix_micros",
-            )
-            .bind(repository_id.as_str())
-            .bind(locator_kind)
-            .bind(path)
-            .bind(observed_at_unix_micros)
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        let next_default_branch_generation: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(generation, 0) + 1
-               FROM git_repository_default_branch_observations
-              WHERE repository_id = ?1",
-        )
-        .bind(repository_id.as_str())
-        .fetch_optional(&mut *tx)
-        .await?
-        .unwrap_or(1);
-
-        let (status, branch, provenance) = match &input.default_branch {
-            GitRepositoryDefaultBranchObservation::Resolved { branch, provenance } => {
-                ("resolved", Some(branch.as_str()), Some(provenance.as_str()))
-            }
-            GitRepositoryDefaultBranchObservation::Unresolved => ("unresolved", None, None),
-        };
-        sqlx::query(
-            "INSERT INTO git_repository_default_branch_observations (
-                repository_id, generation, status, branch, provenance, observed_at_unix_micros
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(repository_id)
-             DO UPDATE SET generation = excluded.generation,
-                           status = excluded.status,
-                           branch = excluded.branch,
-                           provenance = excluded.provenance,
-                           observed_at_unix_micros = excluded.observed_at_unix_micros
-                   WHERE excluded.observed_at_unix_micros > git_repository_default_branch_observations.observed_at_unix_micros
-                      OR (
-                          excluded.observed_at_unix_micros = git_repository_default_branch_observations.observed_at_unix_micros
-                          AND excluded.status = git_repository_default_branch_observations.status
-                          AND excluded.branch IS git_repository_default_branch_observations.branch
-                          AND excluded.provenance IS git_repository_default_branch_observations.provenance
-                      )",
-        )
-        .bind(repository_id.as_str())
-        .bind(next_default_branch_generation)
-        .bind(status)
-        .bind(branch)
-        .bind(provenance)
-        .bind(observed_at_unix_micros)
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query(
-            "INSERT INTO work_scope_git_repositories (work_scope_id, repository_id)
-             VALUES (?1, ?2)
-             ON CONFLICT(work_scope_id)
-             DO UPDATE SET repository_id = excluded.repository_id",
-        )
-        .bind(work_scope_id.as_str())
-        .bind(repository_id.as_str())
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok((
-            CreationCasOutcome::Applied,
-            Some(AttachedHiddenGitRepository {
-                work_scope_id,
-                repository_id,
-            }),
-        ))
-    }
-
-    /// Resolve retained hidden-repository identity evidence for a repository management root.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DbError`] when the locator lookup fails or the retained repository id is invalid.
-    pub async fn retained_hidden_repository_id_for_management_root(
-        &self,
-        management_root: &str,
-    ) -> DbResult<Option<phoenix_core::git_repository::GitRepositoryId>> {
-        let normalized_management_root = normalize_hidden_git_repository_path(management_root)?;
-        let row = sqlx::query(
-            "SELECT repository_id
-               FROM git_repository_locator_observations
-              WHERE locator_kind = 'management_root'
-                AND status = 'present'
-                AND path = ?1
-              ORDER BY observed_at_unix_micros DESC, repository_id DESC
-              LIMIT 1",
-        )
-        .bind(normalized_management_root)
-        .fetch_optional(&self.pool)
-        .await?;
-        row.map(|row| {
-            phoenix_core::git_repository::GitRepositoryId::parse(
-                row.get::<String, _>("repository_id"),
-            )
-            .map_err(|error| DbError::Serialization(error.to_string()))
-        })
-        .transpose()
-    }
-
-    /// List one present management-root observation per hidden repository by recency.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DbError`] when the query or timestamp conversion fails.
-    pub async fn list_recent_hidden_repository_management_roots(
-        &self,
-    ) -> DbResult<Vec<RecentHiddenRepositoryManagementRoot>> {
-        let rows = sqlx::query(
-            "WITH latest_management_root AS (
-                 SELECT repository_id, path, observed_at_unix_micros,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY repository_id
-                            ORDER BY observed_at_unix_micros DESC, path DESC
-                        ) AS row_num
-                   FROM git_repository_locator_observations
-                  WHERE locator_kind = 'management_root' AND status = 'present'
-             ),
-             active_repository_evidence AS (
-                 SELECT DISTINCT wr.repository_id,
-                        c.product_conversation_id,
-                        MAX(MAX(c.updated_at, c.state_updated_at)) AS updated_at
-                   FROM work_scope_git_repositories wr
-                   JOIN conversation_work_scope_attachments cwa
-                     ON cwa.work_scope_id = wr.work_scope_id
-                   JOIN conversations c ON c.id = cwa.conversation_id
-                   JOIN product_conversations pc ON pc.id = c.product_conversation_id
-                  WHERE pc.kind = 'ordinary'
-                    AND pc.ordinary_lifecycle IN ('open', 'history')
-                  GROUP BY wr.repository_id, c.product_conversation_id
-                 UNION
-                 SELECT DISTINCT wr.repository_id,
-                        c.product_conversation_id,
-                        MAX(MAX(c.updated_at, c.state_updated_at)) AS updated_at
-                   FROM work_scope_git_repositories wr
-                   JOIN conversations c ON c.id = (
-                        SELECT reservation.consumed_by_conversation_id
-                          FROM product_root_reservations reservation
-                         WHERE reservation.status = 'consumed'
-                           AND reservation.unresolved_reason IS NOT NULL
-                           AND reservation.repo_root IS NOT NULL
-                           AND reservation.repo_root = (
-                               SELECT management.path
-                                 FROM git_repository_locator_observations management
-                                WHERE management.repository_id = wr.repository_id
-                                  AND management.locator_kind = 'management_root'
-                                  AND management.status = 'present'
-                                ORDER BY management.observed_at_unix_micros DESC, management.path DESC
-                                LIMIT 1
-                           )
-                         ORDER BY reservation.consumed_at_unix_micros DESC, reservation.id DESC
-                         LIMIT 1
-                   )
-                   JOIN product_conversations pc ON pc.id = c.product_conversation_id
-                  WHERE pc.kind = 'ordinary'
-                    AND pc.ordinary_lifecycle IN ('open', 'history')
-                  GROUP BY wr.repository_id, c.product_conversation_id
-
-             )
-             SELECT repository_id, path, observed_at_unix_micros
-               FROM latest_management_root roots
-              WHERE row_num = 1
-                AND EXISTS (
-                    SELECT 1
-                      FROM active_repository_evidence evidence
-                     WHERE evidence.repository_id = roots.repository_id
-                )
-              ORDER BY (
-                    SELECT COUNT(*)
-                      FROM active_repository_evidence evidence
-                     WHERE evidence.repository_id = roots.repository_id
-                ) DESC,
-                (
-                    SELECT MAX(evidence.updated_at)
-                      FROM active_repository_evidence evidence
-                     WHERE evidence.repository_id = roots.repository_id
-                ) DESC,
-                observed_at_unix_micros DESC, repository_id",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        rows.into_iter()
-            .map(|row| {
-                let repository_id = phoenix_core::git_repository::GitRepositoryId::parse(
-                    row.get::<String, _>("repository_id"),
-                )
-                .map_err(|error| DbError::Serialization(error.to_string()))?;
-                let management_root = row.get::<String, _>("path");
-                let observed_at = unix_micros_to_datetime(
-                    row.get::<i64, _>("observed_at_unix_micros"),
-                    "observed_at_unix_micros",
-                )?;
-                Ok(RecentHiddenRepositoryManagementRoot {
-                    repository_id,
-                    management_root,
-                    observed_at,
-                })
-            })
-            .collect()
-    }
-
     /// Conversations with persisted Phoenix-created worktree paths, including
     /// archived and terminal rows for disk disposition.
     ///
@@ -5029,7 +4544,6 @@ impl Database {
         seed_label: Option<&str>,
         llm_language: phoenix_core::llm_language::LlmLanguage,
         job: &InsertConversationCreationJob,
-        root_reservation_id: Option<&str>,
     ) -> DbResult<Conversation> {
         let now = Utc::now();
         let creation_state = ConvState::Provisioning {
@@ -5042,29 +4556,8 @@ impl Database {
         let intent_json = serde_json::to_string(&job.intent)
             .map_err(|e| DbError::Serialization(e.to_string()))?;
         let mut tx = self.pool.begin().await?;
-        if let Some(reservation_id) = root_reservation_id {
-            let consumed = sqlx::query(
-                "UPDATE product_root_reservations
-                 SET status = 'consumed', consumed_by_conversation_id = ?1,
-                     consumed_at_unix_micros = ?2
-                 WHERE id = ?3
-                   AND (status = 'reserved'
-                        OR (status = 'consumed' AND consumed_by_conversation_id = ?1))",
-            )
-            .bind(id)
-            .bind(now.timestamp_micros())
-            .bind(reservation_id)
-            .execute(&mut *tx)
-            .await?;
-            if consumed.rows_affected() != 1 {
-                return Err(DbError::Serialization(
-                    "product root reservation is missing or belongs to another conversation"
-                        .to_string(),
-                ));
-            }
-        }
-        let deferred_scope = root_reservation_id.is_some();
-        let scope = (!deferred_scope).then(|| Self::new_scope_for_conversation(cwd, &cm));
+        let (created_work_scope_id, authority_kind, environment) =
+            Self::new_scope_for_conversation(cwd, &cm);
         let product_conversation_id =
             phoenix_core::domain::product_conversation::ProductConversationId::new();
         sqlx::query(
@@ -5074,16 +4567,14 @@ impl Database {
         .bind(product_conversation_id.as_str())
         .execute(&mut *tx)
         .await?;
-        if let Some((scope_id, authority_kind, environment)) = scope.as_ref() {
-            Self::insert_work_scope_tx(
-                &mut tx,
-                scope_id,
-                *authority_kind,
-                environment.clone(),
-                &now_str,
-            )
-            .await?;
-        }
+        Self::insert_work_scope_tx(
+            &mut tx,
+            &created_work_scope_id,
+            authority_kind,
+            environment,
+            &now_str,
+        )
+        .await?;
 
         let mut actual_slug = slug.to_string();
         let mut attempts = 0u8;
@@ -5110,7 +4601,7 @@ impl Database {
             .bind(cm.task_id)
             .bind(cm.task_title)
             .bind(cm.next_taskmd_id_hint)
-            .bind(scope.as_ref().map(|(scope_id, _, _)| scope_id.as_str()))
+            .bind(created_work_scope_id.as_str())
             .bind(product_conversation_id.as_str())
             .execute(&mut *tx)
             .await;
@@ -5176,7 +4667,7 @@ impl Database {
             runtime_role: RuntimeRole::User,
             effort: job.intent.effort,
             service_tier: ServiceTier::Standard,
-            attached_work_scope_id: scope.map(|(scope_id, _, _)| scope_id),
+            attached_work_scope_id: Some(created_work_scope_id),
             desired_base_branch: desired_base_branch.map(String::from),
             message_count: 0,
             seed_parent_id: seed_parent_id.map(String::from),
@@ -5566,65 +5057,6 @@ impl Database {
         .await?;
         tx.commit().await?;
         Ok(())
-    }
-
-    /// Persist a claimed creation's resolved intent before external materialization.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DbError`] if serialization or the update fails.
-    pub async fn update_conversation_creation_job_intent(
-        &self,
-        job_id: &str,
-        claim: &CreationClaim,
-        intent: &ConversationCreationIntent,
-        now: DateTime<Utc>,
-    ) -> DbResult<CreationCasOutcome> {
-        let intent_json = serde_json::to_string(intent)
-            .map_err(|error| DbError::Serialization(error.to_string()))?;
-        let now_micros = now.timestamp_micros();
-        let now = now.to_rfc3339();
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let updated = sqlx::query(
-            "UPDATE conversation_creation_jobs
-             SET intent_json = ?1, updated_at = ?2
-             WHERE id = ?3 AND status = 'claimed' AND generation = ?4
-               AND claim_worker_id = ?5 AND claim_token = ?6 AND lease_until > ?2",
-        )
-        .bind(intent_json)
-        .bind(&now)
-        .bind(job_id)
-        .bind(claim_generation_i64(claim)?)
-        .bind(&claim.worker_id.0)
-        .bind(&claim.token.0)
-        .execute(&mut *tx)
-        .await?;
-        if updated.rows_affected() != 1 {
-            tx.rollback().await?;
-            return Ok(CreationCasOutcome::ClaimLost);
-        }
-        if let (Some(oid), Some(branch)) = (
-            intent.reserved_checkout_oid.as_deref(),
-            intent.base_branch.as_deref(),
-        ) {
-            sqlx::query(
-                "UPDATE product_root_reservations
-                 SET kind = 'exact_committed_tree', exact_checkout_oid = ?1,
-                     logical_base = ?2, freshness = ?3, unresolved_reason = NULL, consumed_at_unix_micros = ?4
-                 WHERE consumed_by_conversation_id = (
-                     SELECT conversation_id FROM conversation_creation_jobs WHERE id = ?5
-                 ) AND status = 'consumed'",
-            )
-            .bind(oid)
-            .bind(branch)
-            .bind(intent.reserved_root_freshness.as_deref().unwrap_or("stale_cached"))
-            .bind(now_micros)
-            .bind(job_id)
-            .execute(&mut *tx)
-            .await?;
-        }
-        tx.commit().await?;
-        Ok(CreationCasOutcome::Applied)
     }
 
     /// Atomically transition a seeded-empty creation to Idle and ready.
@@ -6257,39 +5689,6 @@ impl Database {
             if conversation_updated.rows_affected() != 1 {
                 tx.rollback().await?;
                 return Err(DbError::ConversationNotFound(job_id.to_string()));
-            }
-            let cleanup_required: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM conversation_creation_resource_reservations
-                 WHERE job_id = ?1 AND status = 'cleanup_required'",
-            )
-            .bind(job_id)
-            .fetch_one(&mut *tx)
-            .await?;
-            if cleanup_required > 0 {
-                let stale_scope_id: Option<String> = sqlx::query_scalar(
-                    "SELECT work_scope_id FROM conversations WHERE id = (
-                         SELECT conversation_id FROM conversation_creation_jobs WHERE id = ?1
-                     )",
-                )
-                .bind(job_id)
-                .fetch_optional(&mut *tx)
-                .await?
-                .flatten();
-                sqlx::query(
-                    "UPDATE conversations
-                     SET work_scope_id = NULL, cm_kind = 'direct', cm_task_id = NULL,
-                         cm_task_title = NULL, cm_next_taskmd_id_hint = NULL
-                     WHERE id = (SELECT conversation_id FROM conversation_creation_jobs WHERE id = ?1)",
-                )
-                .bind(job_id)
-                .execute(&mut *tx)
-                .await?;
-                if let Some(scope_id) = stale_scope_id {
-                    sqlx::query("DELETE FROM work_scopes WHERE id = ?1")
-                        .bind(scope_id)
-                        .execute(&mut *tx)
-                        .await?;
-                }
             }
             tx.commit().await?;
             Ok(CreationCasOutcome::Applied)
@@ -7453,112 +6852,6 @@ impl Database {
         Ok(())
     }
 
-    /// Return the normalized hidden repository attached to the conversation's current `WorkScope`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DbError`] when the attachment query or identity decoding fails.
-    pub async fn current_work_scope_hidden_repository_attachment(
-        &self,
-        conversation_id: &str,
-    ) -> DbResult<Option<AttachedHiddenGitRepository>> {
-        let row = sqlx::query(
-            "SELECT c.work_scope_id, wr.repository_id
-               FROM conversations c
-               JOIN work_scope_git_repositories wr ON wr.work_scope_id = c.work_scope_id
-              WHERE c.id = ?1",
-        )
-        .bind(conversation_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let work_scope_id = WorkScopeId::parse(row.get::<String, _>("work_scope_id"))
-            .map_err(|error| DbError::Serialization(error.to_string()))?;
-        let repository_id = phoenix_core::git_repository::GitRepositoryId::parse(
-            row.get::<String, _>("repository_id"),
-        )
-        .map_err(|error| DbError::Serialization(error.to_string()))?;
-        Ok(Some(AttachedHiddenGitRepository {
-            work_scope_id,
-            repository_id,
-        }))
-    }
-
-    /// Derive the approved-task immutable root from normalized `WorkScope` repository evidence.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DbError`] when repository evidence cannot be queried or decoded.
-    pub async fn root_reservation_for_attached_hidden_repository(
-        &self,
-        conversation_id: &str,
-    ) -> DbResult<Option<ApprovedTaskRootReservationInput>> {
-        let row = sqlx::query(
-            "SELECT reservation.repository_id AS repository_id,
-                    reservation.repo_root AS repository_root,
-                    reservation.logical_base AS logical_base,
-                    reservation.exact_checkout_oid AS exact_checkout_oid
-               FROM conversations needle
-               JOIN product_root_reservations reservation
-                 ON reservation.status = 'consumed'
-                AND reservation.kind = 'exact_committed_tree'
-               JOIN conversations c ON c.id = reservation.consumed_by_conversation_id
-              WHERE needle.id = ?1
-                AND c.product_conversation_id = needle.product_conversation_id
-              ORDER BY c.created_at ASC, c.id ASC
-              LIMIT 1",
-        )
-        .bind(conversation_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        let row = if let Some(row) = row {
-            row
-        } else {
-            let retained = sqlx::query(
-                "SELECT wr.repository_id,
-                        management.path AS repository_root,
-                        branch.branch AS logical_base,
-                        observed.last_observed_head_oid AS exact_checkout_oid
-                   FROM conversations needle
-                   JOIN conversations c
-                     ON c.product_conversation_id = needle.product_conversation_id
-                   JOIN work_scope_git_repositories wr ON wr.work_scope_id = c.work_scope_id
-                   JOIN git_repository_locator_observations management
-                     ON management.repository_id = wr.repository_id
-                    AND management.locator_kind = 'management_root'
-                    AND management.status = 'present'
-                   JOIN git_repository_default_branch_observations branch
-                     ON branch.repository_id = wr.repository_id
-                    AND branch.status = 'resolved'
-                   JOIN work_scope_observed_branches observed
-                     ON observed.work_scope_id = c.work_scope_id
-                    AND observed.repository_identity = wr.repository_id
-                    AND observed.branch_name = branch.branch
-                  WHERE needle.id = ?1
-                  ORDER BY observed.last_observed_at DESC, c.created_at ASC
-                  LIMIT 1",
-            )
-            .bind(conversation_id)
-            .fetch_optional(&self.pool)
-            .await?;
-            let Some(retained) = retained else {
-                return Ok(None);
-            };
-            retained
-        };
-        Ok(Some(ApprovedTaskRootReservationInput {
-            repository_id: phoenix_core::git_repository::GitRepositoryId::parse(
-                row.get::<String, _>("repository_id"),
-            )
-            .map_err(|error| DbError::Serialization(error.to_string()))?,
-            repository_root: row.get("repository_root"),
-            exact_checkout_oid: row.get("exact_checkout_oid"),
-            logical_base: row.get("logical_base"),
-        }))
-    }
-
     /// Create a fresh Work conversation and `ProductConversation` for an approved task.
     ///
     /// # Errors
@@ -7583,9 +6876,6 @@ impl Database {
         );
         let parent = self.get_conversation(parent_id).await?;
         let snapshot = phoenix_core::task_handoff::ApprovedTaskSnapshot::from(approval);
-        let approved_root_reservation = self
-            .root_reservation_for_attached_hidden_repository(parent_id)
-            .await?;
         let new_id = uuid::Uuid::new_v4().to_string();
         let job_id = uuid::Uuid::new_v4().to_string();
         let message_id = uuid::Uuid::new_v4().to_string();
@@ -7598,7 +6888,6 @@ impl Database {
         let state_json = serde_json::to_string(&state).unwrap();
         let intent = ConversationCreationIntent {
             cwd: parent.cwd.clone(),
-            profile: None,
             model: parent.model.clone(),
             effort: parent.effort,
             text: snapshot.seed_message(),
@@ -7611,16 +6900,6 @@ impl Database {
             mode: Some("approved_task".to_string()),
             base_branch: Some(snapshot.base_branch.clone()),
             checkout_ref: Some(snapshot.branch_name.clone()),
-            reserved_checkout_oid: approved_root_reservation
-                .as_ref()
-                .map(|reservation| reservation.exact_checkout_oid.clone()),
-            reserved_repo_root: approved_root_reservation
-                .as_ref()
-                .map(|reservation| reservation.repository_root.clone()),
-            reserved_root_freshness: approved_root_reservation
-                .as_ref()
-                .map(|_| "fresh".to_string()),
-            reserved_root_failure: None,
             seed_parent_id: None,
             seed_label: Some(snapshot.title.clone()),
             approved_task: Some(snapshot.clone()),
@@ -7635,6 +6914,9 @@ impl Database {
                 slug
             }
         };
+        let (scope_id, authority_kind, environment) =
+            Self::new_scope_for_conversation(&parent.cwd, &conv_mode_columns(&ConvMode::Direct));
+
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let existing: Option<(String, String)> = sqlx::query_as(
             "SELECT target.id, job.intent_json
@@ -7675,6 +6957,8 @@ impl Database {
             .bind(product_id.as_str())
             .execute(&mut *tx)
             .await?;
+        Self::insert_work_scope_tx(&mut tx, &scope_id, authority_kind, environment, &now_str)
+            .await?;
         sqlx::query(
             "INSERT INTO product_conversation_sources (
                  target_product_conversation_id, source_product_conversation_id,
@@ -7699,8 +6983,7 @@ impl Database {
                      archived, model, effort, project_id, desired_base_branch, seed_parent_id,
                      seed_label, llm_language, cm_kind, runtime_role, work_scope_id, service_tier
                  ) VALUES (?1, ?2, ?3, ?4, NULL, 1, ?5, ?6, ?7, ?7, ?7, 0, ?8, ?9, ?10, ?11,
-                           NULL, ?12, ?13, 'direct', 'user', NULL, ?14)
-",
+                           NULL, ?12, ?13, 'direct', 'user', ?14, ?15)",
             )
             .bind(&new_id)
             .bind(product_id.as_str())
@@ -7715,6 +6998,7 @@ impl Database {
             .bind(&snapshot.base_branch)
             .bind(&snapshot.title)
             .bind(parent.llm_language.as_str())
+            .bind(scope_id.as_str())
             .bind(parent.service_tier.as_wire_name())
             .execute(&mut *tx)
             .await
@@ -9173,59 +8457,28 @@ impl Database {
                         tx.rollback().await?;
                         return Ok(CreationCasOutcome::ClaimLost);
                     }
-                    let conversation_row = sqlx::query(
-                        "SELECT c.work_scope_id
+                    let environment_row = sqlx::query(
+                        "SELECT e.cwd, c.work_scope_id
                          FROM conversations c
+                         JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id
                          WHERE c.id = ?1",
                     )
                     .bind(id)
                     .fetch_one(&mut *tx)
                     .await?;
-                    let environment_scope = if let Some(raw_scope_id) =
-                        conversation_row.get::<Option<String>, _>("work_scope_id")
-                    {
-                        let environment_scope = WorkScopeId::parse(raw_scope_id)
+                    let persisted_environment_cwd: String = environment_row.get("cwd");
+                    let environment_cwd =
+                        update.cwd.as_deref().unwrap_or(&persisted_environment_cwd);
+                    let environment_scope =
+                        WorkScopeId::parse(environment_row.get::<String, _>("work_scope_id"))
                             .map_err(|error| DbError::Serialization(error.to_string()))?;
-                        let environment_row = sqlx::query(
-                            "SELECT cwd FROM work_scope_environments WHERE work_scope_id = ?1",
-                        )
-                        .bind(environment_scope.as_str())
-                        .fetch_one(&mut *tx)
-                        .await?;
-                        let persisted_environment_cwd: String = environment_row.get("cwd");
-                        let environment_cwd =
-                            update.cwd.as_deref().unwrap_or(&persisted_environment_cwd);
-                        Self::update_work_scope_environment_tx(
-                            &mut tx,
-                            &environment_scope,
-                            Self::environment_for_mode(environment_cwd, &cm),
-                            &now,
-                        )
-                        .await?;
-                        environment_scope
-                    } else {
-                        let environment_cwd = update.cwd.as_deref().ok_or_else(|| {
-                            DbError::Serialization(
-                                "cannot allocate work scope without a persisted cwd".to_string(),
-                            )
-                        })?;
-                        let (scope_id, authority_kind, environment) =
-                            Self::new_scope_for_conversation(environment_cwd, &cm);
-                        Self::insert_work_scope_tx(
-                            &mut tx,
-                            &scope_id,
-                            authority_kind,
-                            environment,
-                            &now,
-                        )
-                        .await?;
-                        sqlx::query("UPDATE conversations SET work_scope_id = ?1 WHERE id = ?2")
-                            .bind(scope_id.as_str())
-                            .bind(id)
-                            .execute(&mut *tx)
-                            .await?;
-                        scope_id
-                    };
+                    Self::update_work_scope_environment_tx(
+                        &mut tx,
+                        &environment_scope,
+                        Self::environment_for_mode(environment_cwd, &cm),
+                        &now,
+                    )
+                    .await?;
 
                     let authority = match mode {
                         ConvMode::Explore { .. } => AuthorityKind::RestrictedExplore,
@@ -9492,13 +8745,6 @@ impl Database {
             conversation_id,
             observer,
         )
-        .await?;
-        sqlx::query(
-            "DELETE FROM product_root_reservations
-             WHERE consumed_by_conversation_id = ?1",
-        )
-        .bind(conversation_id)
-        .execute(&mut *connection)
         .await?;
         Self::delete_product_conversation_if_empty(connection, &product_conversation_id).await?;
         Ok(true)
@@ -12208,36 +11454,6 @@ fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
     })
 }
 
-fn normalize_hidden_git_repository_path(raw: &str) -> DbResult<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(DbError::Serialization(
-            "hidden git repository path must not be empty".to_string(),
-        ));
-    }
-    let path = std::path::Path::new(trimmed);
-    if !path.is_absolute() {
-        return Err(DbError::Serialization(format!(
-            "hidden git repository path must be absolute: {trimmed}"
-        )));
-    }
-    let normalized = if trimmed == "/" {
-        "/".to_string()
-    } else {
-        trimmed.trim_end_matches('/').to_string()
-    };
-    Ok(normalized)
-}
-
-fn datetime_to_unix_micros(value: chrono::DateTime<Utc>) -> i64 {
-    value.timestamp_micros()
-}
-
-fn unix_micros_to_datetime(value: i64, field: &str) -> DbResult<chrono::DateTime<Utc>> {
-    chrono::DateTime::<Utc>::from_timestamp_micros(value)
-        .ok_or_else(|| DbError::Serialization(format!("invalid {field}: {value}")))
-}
-
 fn claim_generation_i64(claim: &CreationClaim) -> DbResult<i64> {
     i64::try_from(claim.generation).map_err(|_| {
         DbError::Serialization("creation generation exceeds SQLite integer".to_string())
@@ -13156,7 +12372,6 @@ fn cleared_creation_intent_json() -> String {
         "mode": null,
         "base_branch": null,
         "checkout_ref": null,
-        "reserved_checkout_oid": null,
         "seed_parent_id": null,
         "seed_label": null
     })
@@ -13612,109 +12827,6 @@ mod tests {
         assert_eq!(identity.1.as_deref(), Some("retired-fingerprint"));
     }
 
-    fn test_creation_intent(cwd: &str, message_id: &str) -> ConversationCreationIntent {
-        ConversationCreationIntent {
-            cwd: cwd.to_string(),
-            profile: None,
-            model: None,
-            effort: None,
-            text: "test creation".to_string(),
-            expansion_preflighted: false,
-            llm_text: None,
-            skill_invocation: None,
-            message_id: message_id.to_string(),
-            images: Vec::new(),
-            files: Vec::new(),
-            mode: None,
-            base_branch: None,
-            checkout_ref: None,
-            reserved_checkout_oid: None,
-            reserved_repo_root: None,
-            reserved_root_freshness: None,
-            seed_parent_id: None,
-            reserved_root_failure: None,
-            seed_label: None,
-            approved_task: None,
-        }
-    }
-
-    async fn attach_hidden_repository_for_test(
-        db: &Database,
-        conversation_id: &str,
-        common_dir: &str,
-        management_root: &str,
-        default_branch: GitRepositoryDefaultBranchObservation,
-        observed_at: chrono::DateTime<Utc>,
-    ) -> AttachedHiddenGitRepository {
-        let message_id = format!(
-            "message-{conversation_id}-{}",
-            observed_at.timestamp_micros()
-        );
-        let existing_job = db
-            .get_conversation_creation_job_for_conversation(conversation_id)
-            .await
-            .unwrap();
-        let job_id = if let Some(job) = existing_job {
-            sqlx::query(
-                "UPDATE conversation_creation_jobs
-                    SET status = 'accepted', stage = 'validate_intent', claim_worker_id = NULL,
-                        claim_token = NULL, lease_until = NULL, next_attempt_at = NULL,
-                        updated_at = ?2, intent_json = ?3, message_id = ?4
-                  WHERE id = ?1",
-            )
-            .bind(&job.id)
-            .bind(Utc::now().to_rfc3339())
-            .bind(
-                serde_json::to_string(&test_creation_intent(management_root, &message_id)).unwrap(),
-            )
-            .bind(&message_id)
-            .execute(db.pool())
-            .await
-            .unwrap();
-            job.id
-        } else {
-            let job = InsertConversationCreationJob {
-                id: format!("job-{conversation_id}"),
-                conversation_id: conversation_id.to_string(),
-                message_id: Some(message_id.clone()),
-                intent: test_creation_intent(management_root, &message_id),
-            };
-            db.insert_conversation_creation_job(&job).await.unwrap();
-            job.id
-        };
-        let claim = db
-            .claim_next_conversation_creation_job(
-                &CreationWorkerId("worker".into()),
-                &CreationClaimToken("token".into()),
-                Utc::now(),
-                chrono::Duration::minutes(5),
-            )
-            .await
-            .unwrap();
-        let CreationClaimOutcome::Claimed(claimed_job) = claim else {
-            panic!("creation claim");
-        };
-        let CreationStatus::Claimed(claim) = claimed_job.protocol.status else {
-            panic!("creation claim authority");
-        };
-        let (_, attachment) = db
-            .attach_hidden_git_repository_to_conversation_work_scope(
-                &AttachHiddenGitRepositoryInput {
-                    conversation_id: conversation_id.to_string(),
-                    common_dir: common_dir.to_string(),
-                    management_root: management_root.to_string(),
-                    materialized_worktree: management_root.to_string(),
-                    default_branch,
-                    observed_at,
-                },
-                &job_id,
-                &claim,
-            )
-            .await
-            .unwrap();
-        attachment.expect("hidden repository attached")
-    }
-
     async fn insert_test_creation_job(db: &Database, job_id: &str, conversation_id: &str) {
         db.create_conversation(conversation_id, conversation_id, "/tmp", true, None, None)
             .await
@@ -13723,7 +12835,24 @@ mod tests {
             id: job_id.to_string(),
             conversation_id: conversation_id.to_string(),
             message_id: Some(format!("message-{job_id}")),
-            intent: test_creation_intent("/tmp", &format!("message-{job_id}")),
+            intent: ConversationCreationIntent {
+                cwd: "/tmp".to_string(),
+                model: None,
+                effort: None,
+                text: "test creation".to_string(),
+                expansion_preflighted: false,
+                llm_text: None,
+                skill_invocation: None,
+                message_id: format!("message-{job_id}"),
+                images: Vec::new(),
+                files: Vec::new(),
+                mode: None,
+                base_branch: None,
+                checkout_ref: None,
+                seed_parent_id: None,
+                seed_label: None,
+                approved_task: None,
+            },
         })
         .await
         .unwrap();
@@ -14137,874 +13266,6 @@ mod tests {
                 .state,
             ConvState::Provisioning { .. }
         ));
-    }
-
-    #[tokio::test]
-    async fn hidden_repository_default_branch_observation_fences_stale_updates_and_bumps_generation(
-    ) {
-        let db = Database::open_in_memory().await.unwrap();
-        db.create_conversation(
-            "conv-branch-fence",
-            "conv-branch-fence",
-            "/tmp",
-            true,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        let first_observed = Utc::now() - chrono::Duration::minutes(5);
-        let attachment = attach_hidden_repository_for_test(
-            &db,
-            "conv-branch-fence",
-            "/tmp/.git/worktrees/fence",
-            "/tmp/.git/worktrees/fence",
-            GitRepositoryDefaultBranchObservation::Resolved {
-                branch: "main".to_string(),
-                provenance: "remote_head_cache".to_string(),
-            },
-            first_observed,
-        )
-        .await;
-        let initial: (i64, String, i64) = sqlx::query_as(
-            "SELECT generation, branch, observed_at_unix_micros
-             FROM git_repository_default_branch_observations WHERE repository_id = ?1",
-        )
-        .bind(attachment.repository_id.as_str())
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-        assert_eq!(initial.0, 1);
-        assert_eq!(initial.1, "main");
-
-        let stale = attach_hidden_repository_for_test(
-            &db,
-            "conv-branch-fence",
-            "/tmp/.git/worktrees/fence",
-            "/tmp/.git/worktrees/fence",
-            GitRepositoryDefaultBranchObservation::Resolved {
-                branch: "stale-branch".to_string(),
-                provenance: "user_selected".to_string(),
-            },
-            first_observed - chrono::Duration::minutes(1),
-        )
-        .await;
-        assert_eq!(stale.repository_id, attachment.repository_id);
-        let after_stale: (i64, String, String, i64) = sqlx::query_as(
-            "SELECT generation, branch, provenance, observed_at_unix_micros
-             FROM git_repository_default_branch_observations WHERE repository_id = ?1",
-        )
-        .bind(attachment.repository_id.as_str())
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-        assert_eq!(after_stale.0, 1);
-        assert_eq!(after_stale.1, "main");
-        assert_eq!(after_stale.2, "remote_head_cache");
-        assert_eq!(after_stale.3, initial.2);
-
-        attach_hidden_repository_for_test(
-            &db,
-            "conv-branch-fence",
-            "/tmp/.git/worktrees/fence",
-            "/tmp/.git/worktrees/fence",
-            GitRepositoryDefaultBranchObservation::Resolved {
-                branch: "develop".to_string(),
-                provenance: "user_selected".to_string(),
-            },
-            first_observed + chrono::Duration::minutes(1),
-        )
-        .await;
-        let updated: (i64, String, String, i64) = sqlx::query_as(
-            "SELECT generation, branch, provenance, observed_at_unix_micros
-             FROM git_repository_default_branch_observations WHERE repository_id = ?1",
-        )
-        .bind(attachment.repository_id.as_str())
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-        assert_eq!(updated.0, 2);
-        assert_eq!(updated.1, "develop");
-        assert_eq!(updated.2, "user_selected");
-        assert!(updated.3 > initial.2);
-    }
-
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn hidden_repository_management_roots_break_ties_by_latest_ordinary_activity() {
-        let db = Database::open_in_memory().await.unwrap();
-        db.create_conversation("repo-a-open", "repo-a-open", "/tmp/a", true, None, None)
-            .await
-            .unwrap();
-        db.create_conversation(
-            "repo-a-history",
-            "repo-a-history",
-            "/tmp/a2",
-            true,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        db.create_conversation("repo-b-open", "repo-b-open", "/tmp/b", true, None, None)
-            .await
-            .unwrap();
-        db.create_conversation(
-            "repo-b-history",
-            "repo-b-history",
-            "/tmp/b2",
-            true,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        attach_hidden_repository_for_test(
-            &db,
-            "repo-a-open",
-            "/tmp/.git/worktrees/repo-a",
-            "/tmp/.git/worktrees/repo-a",
-            GitRepositoryDefaultBranchObservation::Resolved {
-                branch: "main".to_string(),
-                provenance: "remote_head_cache".to_string(),
-            },
-            Utc::now() - chrono::Duration::minutes(10),
-        )
-        .await;
-        let repo_a = attach_hidden_repository_for_test(
-            &db,
-            "repo-a-history",
-            "/tmp/.git/worktrees/repo-a",
-            "/tmp/.git/worktrees/repo-a",
-            GitRepositoryDefaultBranchObservation::Resolved {
-                branch: "main".to_string(),
-                provenance: "remote_head_cache".to_string(),
-            },
-            Utc::now() - chrono::Duration::minutes(10),
-        )
-        .await;
-        attach_hidden_repository_for_test(
-            &db,
-            "repo-b-open",
-            "/tmp/.git/worktrees/repo-b",
-            "/tmp/.git/worktrees/repo-b",
-            GitRepositoryDefaultBranchObservation::Resolved {
-                branch: "main".to_string(),
-                provenance: "remote_head_cache".to_string(),
-            },
-            Utc::now() - chrono::Duration::minutes(10),
-        )
-        .await;
-        let repo_b = attach_hidden_repository_for_test(
-            &db,
-            "repo-b-history",
-            "/tmp/.git/worktrees/repo-b",
-            "/tmp/.git/worktrees/repo-b",
-            GitRepositoryDefaultBranchObservation::Resolved {
-                branch: "main".to_string(),
-                provenance: "remote_head_cache".to_string(),
-            },
-            Utc::now() - chrono::Duration::minutes(10),
-        )
-        .await;
-        assert_ne!(repo_a.repository_id, repo_b.repository_id);
-
-        sqlx::query("UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = (SELECT product_conversation_id FROM conversations WHERE id = 'repo-a-history')")
-            .execute(db.pool())
-            .await
-            .unwrap();
-        sqlx::query("UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = (SELECT product_conversation_id FROM conversations WHERE id = 'repo-b-history')")
-            .execute(db.pool())
-            .await
-            .unwrap();
-        sqlx::query("UPDATE conversations SET updated_at = '2026-01-01T00:00:00Z', state_updated_at = '2026-01-01T00:00:00Z' WHERE id IN ('repo-a-open', 'repo-a-history')")
-            .execute(db.pool())
-            .await
-            .unwrap();
-        sqlx::query("UPDATE conversations SET updated_at = '2026-02-01T00:00:00Z', state_updated_at = '2026-02-01T00:00:00Z' WHERE id IN ('repo-b-open', 'repo-b-history')")
-            .execute(db.pool())
-            .await
-            .unwrap();
-
-        let roots = db
-            .list_recent_hidden_repository_management_roots()
-            .await
-            .unwrap();
-        let ranked: Vec<_> = roots
-            .iter()
-            .filter(|root| {
-                root.repository_id == repo_a.repository_id
-                    || root.repository_id == repo_b.repository_id
-            })
-            .collect();
-        assert_eq!(ranked.len(), 2);
-        assert_eq!(ranked[0].repository_id, repo_b.repository_id);
-        assert_eq!(ranked[1].repository_id, repo_a.repository_id);
-    }
-
-    #[tokio::test]
-    async fn recent_hidden_repository_roots_include_unresolved_consumed_pre_scope_reservations() {
-        let db = Database::open_in_memory().await.unwrap();
-        let reservation = ProductRootReservationRecord {
-            id: "reservation-unresolved-recent-root".to_string(),
-            cwd: "/tmp/unresolved-recent-root".to_string(),
-            kind: "unresolved_exact_committed_tree".to_string(),
-            repo_root: Some("/repo/unresolved-recent-root".to_string()),
-            repository_id: Some("repo-id-unresolved-recent-root".to_string()),
-            exact_checkout_oid: None,
-            logical_base: None,
-            freshness: Some("unresolved".to_string()),
-            unresolved_reason: Some("no_merge_base".to_string()),
-        };
-        db.insert_product_root_reservation(&reservation)
-            .await
-            .unwrap();
-        let job = InsertConversationCreationJob {
-            id: "job-unresolved-recent-root".to_string(),
-            conversation_id: "conv-unresolved-recent-root".to_string(),
-            message_id: Some("message-unresolved-recent-root".to_string()),
-            intent: test_creation_intent(
-                "/tmp/unresolved-recent-root",
-                "message-unresolved-recent-root",
-            ),
-        };
-        db.create_conversation_with_creation_job(
-            "conv-unresolved-recent-root",
-            "conv-unresolved-recent-root",
-            "/tmp/unresolved-recent-root",
-            true,
-            None,
-            &ConvMode::Direct,
-            None,
-            None,
-            None,
-            phoenix_core::llm_language::LlmLanguage::default(),
-            &job,
-            Some(&reservation.id),
-        )
-        .await
-        .unwrap();
-        let repo = attach_hidden_repository_for_test(
-            &db,
-            "conv-unresolved-recent-root",
-            "/tmp/.git/worktrees/unresolved-recent-root",
-            "/repo/unresolved-recent-root",
-            GitRepositoryDefaultBranchObservation::Resolved {
-                branch: "main".to_string(),
-                provenance: "remote_head_cache".to_string(),
-            },
-            Utc::now(),
-        )
-        .await;
-        sqlx::query("UPDATE conversations SET work_scope_id = NULL, updated_at = '2026-03-01T00:00:00Z', state_updated_at = '2026-03-01T00:00:00Z' WHERE id = 'conv-unresolved-recent-root'")
-            .execute(db.pool())
-            .await
-            .unwrap();
-
-        let roots = db
-            .list_recent_hidden_repository_management_roots()
-            .await
-            .unwrap();
-        assert!(roots
-            .iter()
-            .any(|root| root.repository_id == repo.repository_id
-                && root.management_root == "/repo/unresolved-recent-root"));
-    }
-
-    #[tokio::test]
-    async fn product_root_reservation_reclaims_abandoned_reserved_rows_on_read_and_write() {
-        let db = Database::open_in_memory().await.unwrap();
-        let reclaim_before = product_root_reservation_reclaim_before(Utc::now()) - 1;
-        sqlx::query(
-            "INSERT INTO product_root_reservations (
-                id, cwd, kind, repo_root, exact_checkout_oid, logical_base, freshness, status,
-                consumed_by_conversation_id, created_at_unix_micros, consumed_at_unix_micros
-             ) VALUES (?1, ?2, 'direct', NULL, NULL, NULL, NULL, 'reserved', NULL, ?3, NULL)",
-        )
-        .bind("stale-reservation")
-        .bind("/tmp/stale-reservation")
-        .bind(reclaim_before)
-        .execute(db.pool())
-        .await
-        .unwrap();
-        assert!(db
-            .get_product_root_reservation("stale-reservation", "/tmp/stale-reservation")
-            .await
-            .unwrap()
-            .is_none());
-        let count_after_read: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM product_root_reservations WHERE id = 'stale-reservation'",
-        )
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-        assert_eq!(count_after_read, 0);
-
-        sqlx::query(
-            "INSERT INTO product_root_reservations (
-                id, cwd, kind, repo_root, exact_checkout_oid, logical_base, freshness, status,
-                consumed_by_conversation_id, created_at_unix_micros, consumed_at_unix_micros
-             ) VALUES (?1, ?2, 'direct', NULL, NULL, NULL, NULL, 'reserved', NULL, ?3, NULL)",
-        )
-        .bind("stale-reservation-write")
-        .bind("/tmp/stale-reservation-write")
-        .bind(reclaim_before)
-        .execute(db.pool())
-        .await
-        .unwrap();
-        db.insert_product_root_reservation(&ProductRootReservationRecord {
-            id: "fresh-reservation".to_string(),
-            cwd: "/tmp/fresh-reservation".to_string(),
-            kind: "direct".to_string(),
-            repo_root: None,
-            repository_id: None,
-            exact_checkout_oid: None,
-            logical_base: None,
-            freshness: None,
-            unresolved_reason: None,
-        })
-        .await
-        .unwrap();
-        let count_after_write: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM product_root_reservations WHERE id = 'stale-reservation-write'",
-        )
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-        assert_eq!(count_after_write, 0);
-    }
-
-    #[tokio::test]
-    async fn consumed_product_root_reservation_is_deleted_with_hard_deleted_conversation() {
-        let db = Database::open_in_memory().await.unwrap();
-        let reservation = ProductRootReservationRecord {
-            id: "reservation-delete".to_string(),
-            cwd: "/tmp/reservation-delete".to_string(),
-            kind: "direct".to_string(),
-            repo_root: None,
-            repository_id: None,
-            exact_checkout_oid: None,
-            logical_base: None,
-            freshness: None,
-            unresolved_reason: None,
-        };
-        db.insert_product_root_reservation(&reservation)
-            .await
-            .unwrap();
-        let job = InsertConversationCreationJob {
-            id: "job-reservation-delete".to_string(),
-            conversation_id: "conv-reservation-delete".to_string(),
-            message_id: Some("message-reservation-delete".to_string()),
-            intent: test_creation_intent("/tmp/reservation-delete", "message-reservation-delete"),
-        };
-        db.create_conversation_with_creation_job(
-            "conv-reservation-delete",
-            "conv-reservation-delete",
-            "/tmp/reservation-delete",
-            true,
-            None,
-            &ConvMode::Direct,
-            None,
-            None,
-            None,
-            phoenix_core::llm_language::LlmLanguage::default(),
-            &job,
-            Some(&reservation.id),
-        )
-        .await
-        .unwrap();
-        db.delete_conversation("conv-reservation-delete")
-            .await
-            .unwrap();
-        let remaining: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM product_root_reservations WHERE id = ?1")
-                .bind(&reservation.id)
-                .fetch_one(db.pool())
-                .await
-                .unwrap();
-        assert_eq!(remaining, 0);
-    }
-
-    #[tokio::test]
-    async fn attach_hidden_repository_allocates_deferred_work_scope_atomically() {
-        let db = Database::open_in_memory().await.unwrap();
-        let reservation = ProductRootReservationRecord {
-            id: "reservation-deferred-scope".to_string(),
-            cwd: "/tmp/deferred-scope".to_string(),
-            kind: "exact_committed_tree".to_string(),
-            repo_root: Some("/repo/deferred-scope".to_string()),
-            repository_id: Some("repo-id-deferred-scope".to_string()),
-            exact_checkout_oid: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()),
-            logical_base: Some("main".to_string()),
-            freshness: Some("fresh".to_string()),
-            unresolved_reason: None,
-        };
-        db.insert_product_root_reservation(&reservation)
-            .await
-            .unwrap();
-        let job = InsertConversationCreationJob {
-            id: "job-deferred-scope".to_string(),
-            conversation_id: "conv-deferred-scope".to_string(),
-            message_id: Some("message-deferred-scope".to_string()),
-            intent: test_creation_intent("/tmp/deferred-scope", "message-deferred-scope"),
-        };
-        let created = db
-            .create_conversation_with_creation_job(
-                "conv-deferred-scope",
-                "conv-deferred-scope",
-                "/tmp/deferred-scope",
-                true,
-                None,
-                &ConvMode::Direct,
-                None,
-                None,
-                None,
-                phoenix_core::llm_language::LlmLanguage::default(),
-                &job,
-                Some(&reservation.id),
-            )
-            .await
-            .unwrap();
-        assert_eq!(created.attached_work_scope_id, None);
-
-        let attachment = attach_hidden_repository_for_test(
-            &db,
-            "conv-deferred-scope",
-            "/tmp/.git/worktrees/deferred-scope",
-            "/repo/deferred-scope",
-            GitRepositoryDefaultBranchObservation::Resolved {
-                branch: "main".to_string(),
-                provenance: "remote_head_cache".to_string(),
-            },
-            Utc::now(),
-        )
-        .await;
-        let conversation = db.get_conversation("conv-deferred-scope").await.unwrap();
-        let scope_id = conversation
-            .attached_work_scope_id
-            .clone()
-            .expect("scope allocated at attachment time");
-        assert_eq!(scope_id, attachment.work_scope_id);
-        let attachments = db
-            .conversation_work_scope_attachments(&scope_id)
-            .await
-            .unwrap();
-        assert_eq!(attachments.len(), 1);
-        assert_eq!(attachments[0].id, "conv-deferred-scope");
-    }
-
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn approval_handoff_uses_consumed_reservation_as_immutable_root_evidence() {
-        let db = Database::open_in_memory().await.unwrap();
-        let reservation = ProductRootReservationRecord {
-            id: "reservation-immutable-root".to_string(),
-            cwd: "/tmp/immutable-root".to_string(),
-            kind: "exact_committed_tree".to_string(),
-            repo_root: Some("/repo/from-reservation".to_string()),
-            repository_id: Some("repo-id-from-reservation".to_string()),
-            exact_checkout_oid: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
-            logical_base: Some("main".to_string()),
-            freshness: Some("fresh".to_string()),
-            unresolved_reason: None,
-        };
-        db.insert_product_root_reservation(&reservation)
-            .await
-            .unwrap();
-        let job = InsertConversationCreationJob {
-            id: "job-immutable-root".to_string(),
-            conversation_id: "conv-immutable-root".to_string(),
-            message_id: Some("message-immutable-root".to_string()),
-            intent: test_creation_intent("/tmp/immutable-root", "message-immutable-root"),
-        };
-        db.create_conversation_with_creation_job(
-            "conv-immutable-root",
-            "conv-immutable-root",
-            "/tmp/immutable-root",
-            true,
-            None,
-            &ConvMode::Direct,
-            None,
-            None,
-            None,
-            phoenix_core::llm_language::LlmLanguage::default(),
-            &job,
-            Some(&reservation.id),
-        )
-        .await
-        .unwrap();
-        let claimed = db
-            .claim_next_conversation_creation_job(
-                &CreationWorkerId("worker-immutable-root".into()),
-                &CreationClaimToken("token-immutable-root".into()),
-                Utc::now(),
-                chrono::Duration::seconds(30),
-            )
-            .await
-            .unwrap();
-        let CreationClaimOutcome::Claimed(claimed_job) = claimed else {
-            panic!("claim immutable-root job");
-        };
-        let CreationStatus::Claimed(claim) = claimed_job.protocol.status else {
-            panic!("creation claim authority");
-        };
-        db.update_conversation_creation_metadata_and_mode(
-            &job.id,
-            &claim,
-            "conv-immutable-root",
-            &ConversationCreationMetadataUpdate {
-                cwd: Some("/tmp/immutable-root".to_string()),
-                ..Default::default()
-            },
-            &ConvMode::Direct,
-            "test-model",
-            CreationStage::ValidateIntent,
-            CreationStage::ResolveRepository,
-        )
-        .await
-        .unwrap();
-
-        let attachment = attach_hidden_repository_for_test(
-            &db,
-            "conv-immutable-root",
-            "/tmp/.git/worktrees/immutable",
-            "/repo/current-management-root",
-            GitRepositoryDefaultBranchObservation::Resolved {
-                branch: "main".to_string(),
-                provenance: "remote_head_cache".to_string(),
-            },
-            Utc::now() - chrono::Duration::minutes(1),
-        )
-        .await;
-        sqlx::query(
-            "UPDATE git_repository_default_branch_observations
-                SET branch = 'drifted-base', provenance = 'user_selected'
-              WHERE repository_id = ?1",
-        )
-        .bind(attachment.repository_id.as_str())
-        .execute(db.pool())
-        .await
-        .unwrap();
-        sqlx::query(
-            "UPDATE git_repository_locator_observations
-                SET path = '/repo/drifted-management-root'
-              WHERE repository_id = ?1 AND locator_kind = 'management_root'",
-        )
-        .bind(attachment.repository_id.as_str())
-        .execute(db.pool())
-        .await
-        .unwrap();
-
-        let root = db
-            .root_reservation_for_attached_hidden_repository("conv-immutable-root")
-            .await
-            .unwrap()
-            .expect("consumed reservation evidence");
-        assert_eq!(root.repository_id.as_str(), "repo-id-from-reservation");
-        assert_eq!(root.repository_root, "/repo/from-reservation");
-        assert_eq!(root.logical_base, "main");
-        assert_eq!(
-            root.exact_checkout_oid,
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        );
-    }
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn approval_handoff_from_continuation_transcript_uses_shared_product_evidence() {
-        let db = Database::open_in_memory().await.unwrap();
-        let reservation = ProductRootReservationRecord {
-            id: "reservation-continuation-approval".to_string(),
-            cwd: "/tmp/continuation-approval".to_string(),
-            kind: "exact_committed_tree".to_string(),
-            repo_root: Some("/repo/continuation-approval".to_string()),
-            repository_id: Some("repo-id-continuation-approval".to_string()),
-            exact_checkout_oid: Some("cccccccccccccccccccccccccccccccccccccccc".to_string()),
-            logical_base: Some("main".to_string()),
-            freshness: Some("fresh".to_string()),
-            unresolved_reason: None,
-        };
-        db.insert_product_root_reservation(&reservation)
-            .await
-            .unwrap();
-        let job = InsertConversationCreationJob {
-            id: "job-continuation-approval".to_string(),
-            conversation_id: "conv-continuation-root".to_string(),
-            message_id: Some("message-continuation-approval".to_string()),
-            intent: test_creation_intent(
-                "/tmp/continuation-approval",
-                "message-continuation-approval",
-            ),
-        };
-        db.create_conversation_with_creation_job(
-            "conv-continuation-root",
-            "conv-continuation-root",
-            "/tmp/continuation-approval",
-            true,
-            None,
-            &ConvMode::Direct,
-            None,
-            None,
-            None,
-            phoenix_core::llm_language::LlmLanguage::default(),
-            &job,
-            Some(&reservation.id),
-        )
-        .await
-        .unwrap();
-        attach_hidden_repository_for_test(
-            &db,
-            "conv-continuation-root",
-            "/tmp/.git/worktrees/continuation-approval",
-            "/repo/continuation-approval",
-            GitRepositoryDefaultBranchObservation::Resolved {
-                branch: "main".to_string(),
-                provenance: "remote_head_cache".to_string(),
-            },
-            Utc::now(),
-        )
-        .await;
-
-        db.update_conversation_state(
-            "conv-continuation-root",
-            &ConvState::ContextExhausted {
-                summary: "continued approval evidence".to_string(),
-            },
-        )
-        .await
-        .unwrap();
-
-        let (outcome, _) = db
-            .continue_conversation_with_intent(
-                "conv-continuation-root",
-                NewContinuationDispatchIntent {
-                    message_id: "message-continuation-successor".to_string(),
-                    handoff: "continued approval".to_string(),
-                    user_agent: Some("test-agent".to_string()),
-                },
-            )
-            .await
-            .unwrap();
-        let ContinueOutcome::Created(successor) = outcome else {
-            panic!("expected created continuation");
-        };
-        let approval = phoenix_core::task_handoff::TaskApprovalHandoffData {
-            task_id: "27099".to_string(),
-            task_title: "Continued Approval".to_string(),
-            branch_name: "task-27099-continued-approval".to_string(),
-            approved_commit_oid: "cccccccccccccccccccccccccccccccccccccccc".to_string(),
-            worktree_path: "/ignored".to_string(),
-            base_branch: "main".to_string(),
-            title: "Continued Approval".to_string(),
-            priority: phoenix_core::task_source::Priority::P1,
-            plan: "reviewed plan from continuation".to_string(),
-            task_file: "tasks/27099-p1-ready--continued-approval.md".to_string(),
-        };
-
-        let handoff = db
-            .create_task_approval_handoff_creation_job(&successor.id, &approval)
-            .await
-            .unwrap();
-        let job = db
-            .get_conversation_creation_job_for_conversation(&handoff.id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            job.intent.reserved_repo_root.as_deref(),
-            Some("/repo/continuation-approval")
-        );
-        assert_eq!(
-            job.intent.reserved_checkout_oid.as_deref(),
-            Some("cccccccccccccccccccccccccccccccccccccccc")
-        );
-        assert_eq!(
-            job.intent.approved_task.as_ref().map(|s| s.plan.as_str()),
-            Some("reviewed plan from continuation")
-        );
-    }
-
-    #[tokio::test]
-    async fn root_reservation_consumption_rolls_back_when_conversation_insert_fails() {
-        let db = Database::open_in_memory().await.unwrap();
-        let reservation = ProductRootReservationRecord {
-            id: "reservation-rollback".to_string(),
-            cwd: "/tmp/reservation-rollback".to_string(),
-            kind: "direct".to_string(),
-            repo_root: None,
-            repository_id: None,
-            exact_checkout_oid: None,
-            logical_base: None,
-            freshness: None,
-            unresolved_reason: None,
-        };
-        db.insert_product_root_reservation(&reservation)
-            .await
-            .unwrap();
-        insert_test_creation_job(&db, "job-existing-conv", "existing-conv").await;
-
-        let duplicate = InsertConversationCreationJob {
-            id: "job-duplicate-conversation".to_string(),
-            conversation_id: "existing-conv".to_string(),
-            message_id: Some("message-duplicate-conversation".to_string()),
-            intent: test_creation_intent(
-                "/tmp/reservation-rollback",
-                "message-duplicate-conversation",
-            ),
-        };
-        let error = db
-            .create_conversation_with_creation_job(
-                "existing-conv",
-                "existing-conv",
-                "/tmp/reservation-rollback",
-                true,
-                None,
-                &ConvMode::Direct,
-                None,
-                None,
-                None,
-                phoenix_core::llm_language::LlmLanguage::default(),
-                &duplicate,
-                Some(&reservation.id),
-            )
-            .await
-            .expect_err("duplicate conversation id must abort the transaction");
-        assert!(matches!(error, DbError::ConversationAlreadyExists(_)));
-
-        let status: (String, Option<String>) = sqlx::query_as(
-            "SELECT status, consumed_by_conversation_id
-             FROM product_root_reservations WHERE id = ?1",
-        )
-        .bind(&reservation.id)
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-        assert_eq!(status, ("reserved".to_string(), None));
-    }
-
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn root_reservation_accepts_same_conversation_idempotently_but_rejects_another() {
-        let db = Database::open_in_memory().await.unwrap();
-        let reservation = ProductRootReservationRecord {
-            id: "reservation-idempotent".to_string(),
-            cwd: "/tmp/reservation-idempotent".to_string(),
-            kind: "direct".to_string(),
-            repo_root: None,
-            repository_id: None,
-            exact_checkout_oid: None,
-            logical_base: None,
-            freshness: None,
-            unresolved_reason: None,
-        };
-        db.insert_product_root_reservation(&reservation)
-            .await
-            .unwrap();
-
-        let duplicate_job = InsertConversationCreationJob {
-            id: "job-idempotent".to_string(),
-            conversation_id: "conv-idempotent".to_string(),
-            message_id: Some("message-idempotent".to_string()),
-            intent: test_creation_intent("/tmp/reservation-idempotent", "message-idempotent"),
-        };
-        let duplicate_conversation = db
-            .create_conversation_with_creation_job(
-                "conv-idempotent",
-                "idempotent",
-                "/tmp/reservation-idempotent",
-                true,
-                None,
-                &ConvMode::Direct,
-                None,
-                None,
-                None,
-                phoenix_core::llm_language::LlmLanguage::default(),
-                &duplicate_job,
-                Some(&reservation.id),
-            )
-            .await
-            .unwrap();
-        assert_eq!(duplicate_conversation.id, "conv-idempotent");
-
-        let consumed_at_before: Option<i64> = sqlx::query_scalar(
-            "SELECT consumed_at_unix_micros FROM product_root_reservations WHERE id = ?1",
-        )
-        .bind(&reservation.id)
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-        assert!(consumed_at_before.is_some());
-
-        sqlx::query(
-            "UPDATE product_root_reservations
-             SET consumed_at_unix_micros = 42
-             WHERE id = ?1",
-        )
-        .bind(&reservation.id)
-        .execute(db.pool())
-        .await
-        .unwrap();
-
-        let duplicate_error = db
-            .create_conversation_with_creation_job(
-                "conv-idempotent",
-                "idempotent",
-                "/tmp/reservation-idempotent",
-                true,
-                None,
-                &ConvMode::Direct,
-                None,
-                None,
-                None,
-                phoenix_core::llm_language::LlmLanguage::default(),
-                &duplicate_job,
-                Some(&reservation.id),
-            )
-            .await
-            .expect_err("same conversation id re-create still conflicts after idempotent reservation acceptance");
-        assert!(matches!(
-            duplicate_error,
-            DbError::ConversationAlreadyExists(_)
-        ));
-
-        let consumed_at_after: i64 = sqlx::query_scalar(
-            "SELECT consumed_at_unix_micros FROM product_root_reservations WHERE id = ?1",
-        )
-        .bind(&reservation.id)
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-        assert_eq!(
-            consumed_at_after, 42,
-            "same-conversation acceptance must not rewrite consumption metadata"
-        );
-
-        let another_job = InsertConversationCreationJob {
-            id: "job-other-conversation".to_string(),
-            conversation_id: "conv-other".to_string(),
-            message_id: Some("message-other".to_string()),
-            intent: test_creation_intent("/tmp/reservation-idempotent", "message-other"),
-        };
-        let another_error = db
-            .create_conversation_with_creation_job(
-                "conv-other",
-                "other",
-                "/tmp/reservation-idempotent",
-                true,
-                None,
-                &ConvMode::Direct,
-                None,
-                None,
-                None,
-                phoenix_core::llm_language::LlmLanguage::default(),
-                &another_job,
-                Some(&reservation.id),
-            )
-            .await
-            .expect_err("different conversation must not reuse consumed reservation");
-        let DbError::Serialization(message) = another_error else {
-            panic!("expected reservation ownership error");
-        };
-        assert!(message.contains("belongs to another conversation"));
     }
 
     #[tokio::test]
@@ -22338,10 +20599,10 @@ mod tests {
             .create_task_approval_handoff_creation_job("handoff-parent", &approval)
             .await
             .unwrap();
+        let successor_scope = successor.attached_work_scope_id.clone().unwrap();
+        assert_ne!(successor_scope, parent.attached_work_scope_id.unwrap());
         assert!(matches!(successor.state, ConvState::Provisioning { .. }));
         assert_eq!(successor.conv_mode, ConvMode::Direct);
-        assert_eq!(successor.attached_work_scope_id, None);
-        assert!(parent.attached_work_scope_id.is_some());
         let job = db
             .get_conversation_creation_job_for_conversation(&successor.id)
             .await

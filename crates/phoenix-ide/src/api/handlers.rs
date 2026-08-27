@@ -33,17 +33,15 @@ use super::types::{
     ConversationSearchQuery, ConversationSearchResponse, ConversationWithMessagesResponse,
     CreateConversationRequest, CreateProductConversationRequest, CredentialStatusApi,
     DirectoryEntry, ErrorResponse, ExpansionErrorResponse, FileEntry, FileSearchEntry,
-    FileSearchQuery, FileSearchResponse, FileViewerKind,
-    InternalCreateConversationAcceptedResponse, ListDirectoryResponse, ListFilesResponse,
+    FileSearchQuery, FileSearchResponse, FileViewerKind, ListDirectoryResponse, ListFilesResponse,
     MkdirResponse, ModelsResponse, NotificationSettingsRequest,
     ProductConversationCreateAcceptedResponse, ProductConversationRouteResponse,
-    ProductRootReservation, ProductRootReservationFreshness, ProjectFileSearchQuery,
-    ProjectSkillsQuery, ProjectTasksQuery, ReadFileResponse, RecentManagementRootSuggestion,
-    RecentManagementRootSuggestionsResponse, ReconcileAcceptedMessagesRequest,
-    ReconcileAcceptedMessagesResponse, RenameRequest, ReserveProductRootRequest,
-    ReserveProductRootResponse, SkillEntry, SkillsResponse, SuccessResponse, SuggestRequest,
-    SuggestResponse, SystemPromptResponse, TaskCountQuery, TaskCountResponse, TaskEntry,
-    TasksResponse, UpgradeModelRequest, ValidateCwdResponse,
+    ProjectFileSearchQuery, ProjectSkillsQuery, ProjectTasksQuery, ReadFileResponse,
+    RecentManagementRootSuggestion, RecentManagementRootSuggestionsResponse,
+    ReconcileAcceptedMessagesRequest, ReconcileAcceptedMessagesResponse, RenameRequest, SkillEntry,
+    SkillsResponse, SuccessResponse, SuggestRequest, SuggestResponse, SystemPromptResponse,
+    TaskCountQuery, TaskCountResponse, TaskEntry, TasksResponse, UpgradeModelRequest,
+    ValidateCwdResponse,
 };
 use super::AppState;
 use crate::api::terminal_ws::{terminal_ws_global_handler, terminal_ws_handler};
@@ -51,8 +49,8 @@ use crate::db::{
     ConvMode, ConversationUsage, DbError, ImageData, NotificationSettings, RetrievalRequest,
 };
 use crate::git_ops::{
-    check_branch_conflict, create_detached_worktree, create_worktree, materialize_branch, run_git,
-    BranchConflict, GitOpError, PhoenixIgnoreStrategy,
+    check_branch_conflict, create_worktree, materialize_branch, run_git, BranchConflict,
+    GitOpError, PhoenixIgnoreStrategy,
 };
 use crate::runtime::SseEvent;
 use crate::state_machine::{ConvState, Event};
@@ -73,7 +71,6 @@ use futures::future::BoxFuture;
 use rand::seq::IndexedRandom;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::Digest as _;
 use sqlx::Row;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -146,14 +143,6 @@ pub fn create_router(state: AppState) -> Router {
             get(get_product_conversation_route),
         )
         .route(
-            "/api/product-conversations/new",
-            post(create_product_conversation),
-        )
-        .route(
-            "/api/product-conversations/reserve-root",
-            post(reserve_product_root),
-        )
-        .route(
             "/api/global/coordinator",
             get(get_existing_coordinator).post(ensure_coordinator),
         )
@@ -168,6 +157,14 @@ pub fn create_router(state: AppState) -> Router {
         )
         // Conversation creation (REQ-API-002)
         .route("/api/conversations/new", post(create_conversation))
+        .route(
+            "/api/product-conversations/new",
+            post(create_product_conversation),
+        )
+        .route(
+            "/api/recent-management-root-suggestions",
+            get(list_recent_management_roots),
+        )
         .route(
             "/api/conversations/new/with-attachments",
             post(create_conversation_with_attachments)
@@ -340,10 +337,6 @@ pub fn create_router(state: AppState) -> Router {
         // Directory browser (REQ-API-008)
         .route("/api/validate-cwd", get(validate_cwd))
         .route("/api/list-directory", get(list_directory))
-        .route(
-            "/api/recent-management-root-suggestions",
-            get(list_recent_management_root_suggestions),
-        )
         .route("/api/mkdir", post(mkdir))
         // File browser API (REQ-PF-001 through REQ-PF-004)
         .route("/api/files/list", get(list_files))
@@ -837,15 +830,6 @@ fn conversation_resource_scope(
             crate::work_scope::ResourceScopeKey::Coordinator
         }
         None if conv.runtime_role == crate::work_scope::RuntimeRole::SubAgent => {
-            crate::work_scope::ResourceScopeKey::Unattached(conv.id.clone())
-        }
-        None if matches!(
-            conv.state,
-            ConvState::Provisioning { .. }
-                | ConvState::CreationCancelled { .. }
-                | ConvState::CreationFailed { .. }
-        ) =>
-        {
             crate::work_scope::ResourceScopeKey::Unattached(conv.id.clone())
         }
         None => panic!("ordinary persisted conversation is missing its work scope"),
@@ -1908,6 +1892,74 @@ async fn read_multipart_attachments(
 // ============================================================
 
 #[allow(clippy::too_many_lines)]
+async fn create_product_conversation(
+    State(state): State<AppState>,
+    Json(req): Json<CreateProductConversationRequest>,
+) -> Result<Json<ProductConversationCreateAcceptedResponse>, AppError> {
+    let canonical_cwd = crate::conversation_cwd::validate_conversation_cwd(&req.cwd)
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    let intent = crate::db::ProductCreationIntent {
+        cwd: canonical_cwd.raw().to_string(),
+        objective: req.objective,
+        model: Some(req.model),
+        effort: req.effort,
+        images: req
+            .images
+            .into_iter()
+            .map(|image| crate::db::ProductCreationImage {
+                media_type: image.media_type,
+                data: image.data,
+            })
+            .collect(),
+    };
+    match state
+        .db
+        .accept_product_creation(&req.request_id, &intent)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+    {
+        crate::db::ProductCreationAcceptOutcome::Conflict(_) => {
+            return Err(AppError::BadRequest(
+                "request_id conflicts with immutable creation intent".to_string(),
+            ));
+        }
+        crate::db::ProductCreationAcceptOutcome::Accepted(_)
+        | crate::db::ProductCreationAcceptOutcome::Replayed(_) => {}
+    }
+    state.runtime.kick_creation_worker();
+    let published = crate::runtime::creation_worker::process_product_creation_request(
+        &state.runtime,
+        &req.request_id,
+    )
+    .await
+    .map_err(AppError::Internal)?;
+    Ok(Json(ProductConversationCreateAcceptedResponse {
+        canonical_route: format!(
+            "/product-conversations/{}",
+            published.product_conversation_id
+        ),
+        product_conversation_id: published.product_conversation_id,
+        transcript_row_id: published.transcript_row_id,
+    }))
+}
+
+async fn list_recent_management_roots(
+    State(state): State<AppState>,
+) -> Result<Json<RecentManagementRootSuggestionsResponse>, AppError> {
+    let suggestions = state
+        .db
+        .recent_distinct_published_product_creation_cwds(20)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+        .into_iter()
+        .filter(|path| std::path::Path::new(path).is_dir())
+        .map(|path| RecentManagementRootSuggestion { path })
+        .collect();
+    Ok(Json(RecentManagementRootSuggestionsResponse {
+        suggestions,
+    }))
+}
+
 async fn create_conversation(
     State(state): State<AppState>,
     Json(req): Json<CreateConversationRequest>,
@@ -1916,249 +1968,11 @@ async fn create_conversation(
 }
 
 #[allow(clippy::too_many_lines)]
-async fn reserve_product_root(
-    State(state): State<AppState>,
-    Json(req): Json<ReserveProductRootRequest>,
-) -> Result<Json<ReserveProductRootResponse>, AppError> {
-    let canonical_cwd = crate::conversation_cwd::validate_conversation_cwd(&req.cwd)
-        .map_err(|error| AppError::BadRequest(error.to_string()))?;
-    let cwd = canonical_cwd.raw().to_string();
-    let reservation_id = uuid::Uuid::new_v4().to_string();
-    let cwd_path = std::path::PathBuf::from(&cwd);
-    let persist = |root: &ProductRootReservation| phoenix_db::ProductRootReservationRecord {
-        id: root.id.clone(),
-        repository_id: root.repository_id.clone(),
-        cwd: root.cwd.clone(),
-        kind: root.kind.clone(),
-        repo_root: root.repo_root.clone(),
-        exact_checkout_oid: root.exact_checkout_oid.clone(),
-        logical_base: root.logical_base.clone(),
-        freshness: root.freshness.as_ref().map(|value| match value {
-            ProductRootReservationFreshness::Fresh => "fresh".to_string(),
-            ProductRootReservationFreshness::StaleCached => "stale_cached".to_string(),
-            ProductRootReservationFreshness::Unresolved => "unresolved".to_string(),
-        }),
-        unresolved_reason: root.unresolved_reason.clone(),
-    };
-    let Some(repo_root) = phoenix_core::git::detect_git_repo_root(&cwd_path) else {
-        let root = ProductRootReservation {
-            id: reservation_id,
-            cwd,
-            kind: "direct".to_string(),
-            repo_root: None,
-            exact_checkout_oid: None,
-            logical_base: None,
-            freshness: None,
-            unresolved_reason: None,
-            repository_id: None,
-        };
-        state
-            .db
-            .insert_product_root_reservation(&persist(&root))
-            .await
-            .map_err(|error| AppError::Internal(error.to_string()))?;
-        return Ok(Json(ReserveProductRootResponse::Direct {
-            root_reservation: root,
-        }));
-    };
-    let repo_path = std::path::PathBuf::from(&repo_root);
-    let retained_repository_id = state
-        .db
-        .retained_hidden_repository_id_for_management_root(&repo_root)
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?
-        .map(|id| id.as_str().to_string());
-    let cached = crate::git_start::GitStartPoint::cached_default_task_start(&repo_path);
-    let (start, freshness) = if let Some(start) = cached {
-        (start, ProductRootReservationFreshness::StaleCached)
-    } else {
-        let root = ProductRootReservation {
-            id: reservation_id,
-            cwd,
-            kind: "unresolved_exact_committed_tree".to_string(),
-            repo_root: Some(repo_root),
-            exact_checkout_oid: None,
-            logical_base: None,
-            freshness: Some(ProductRootReservationFreshness::Unresolved),
-            unresolved_reason: Some("canonical_default_unresolved".to_string()),
-            repository_id: retained_repository_id,
-        };
-        state
-            .db
-            .insert_product_root_reservation(&persist(&root))
-            .await
-            .map_err(|error| AppError::Internal(error.to_string()))?;
-        return Ok(Json(
-            ReserveProductRootResponse::UnresolvedExactCommittedTree {
-                root_reservation: root,
-            },
-        ));
-    };
-    let exact_checkout_oid = start
-        .reserved_oid()
-        .unwrap_or(start.checkout_ref())
-        .to_string();
-    let default_branch = start.logical_base().to_string();
-    let root = ProductRootReservation {
-        id: reservation_id,
-        cwd,
-        kind: "exact_committed_tree".to_string(),
-        repo_root: Some(repo_root),
-        exact_checkout_oid: Some(exact_checkout_oid.clone()),
-        logical_base: Some(default_branch.clone()),
-        freshness: Some(freshness.clone()),
-        unresolved_reason: None,
-        repository_id: retained_repository_id,
-    };
-    state
-        .db
-        .insert_product_root_reservation(&persist(&root))
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?;
-    Ok(Json(ReserveProductRootResponse::ExactCommittedTree {
-        root_reservation: root,
-        exact_checkout_oid,
-        logical_base: default_branch,
-        freshness,
-    }))
-}
-
-async fn create_product_conversation(
-    State(state): State<AppState>,
-    Json(req): Json<CreateProductConversationRequest>,
-) -> Result<Json<ProductConversationCreateAcceptedResponse>, AppError> {
-    Ok(Json(
-        Box::pin(create_product_conversation_with_id(state, req)).await?,
-    ))
-}
-
-async fn create_product_conversation_with_id(
-    state: AppState,
-    req: CreateProductConversationRequest,
-) -> Result<ProductConversationCreateAcceptedResponse, AppError> {
-    let conversation_id = req
-        .conversation_id
-        .clone()
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let reservation_id = req.root_reservation.id.clone();
-    let mut req = req;
-    req.conversation_id = Some(conversation_id.clone());
-    let canonical_cwd =
-        crate::conversation_cwd::validate_conversation_cwd(&req.root_reservation.cwd)
-            .map_err(|error| AppError::BadRequest(error.to_string()))?;
-    req.root_reservation.cwd = canonical_cwd.raw().to_string();
-    let authenticated_reservation = state
-        .db
-        .get_product_root_reservation(&reservation_id, &req.root_reservation.cwd)
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?
-        .ok_or_else(|| AppError::BadRequest("invalid product root reservation".to_string()))?;
-    req.root_reservation.cwd = authenticated_reservation.cwd.clone();
-    req.root_reservation.kind = authenticated_reservation.kind.clone();
-    req.root_reservation.repo_root = authenticated_reservation.repo_root.clone();
-    req.root_reservation.exact_checkout_oid = authenticated_reservation.exact_checkout_oid.clone();
-    req.root_reservation.logical_base = authenticated_reservation.logical_base.clone();
-    req.root_reservation.freshness =
-        authenticated_reservation
-            .freshness
-            .as_deref()
-            .map(|value| match value {
-                "fresh" => ProductRootReservationFreshness::Fresh,
-                "stale_cached" => ProductRootReservationFreshness::StaleCached,
-                _ => ProductRootReservationFreshness::Unresolved,
-            });
-    req.root_reservation.unresolved_reason = authenticated_reservation.unresolved_reason.clone();
-    req.root_reservation.repository_id = authenticated_reservation.repository_id.clone();
-    let response = create_conversation_from_request(
-        state.clone(),
-        req.into(),
-        Vec::new(),
-        Some(phoenix_core::domain::db_schema::ConversationCreationProfile::DirectoryFirstProduct),
-        Some(reservation_id),
-    )
-    .await?;
-    let transcript_row_id = response.conversation["id"]
-        .as_str()
-        .ok_or_else(|| AppError::Internal("conversation response lacked id".to_string()))?
-        .to_string();
-    let product_conversation_id = response.product_conversation_id.ok_or_else(|| {
-        AppError::Internal("product conversation create lacked product conversation id".to_string())
-    })?;
-    Ok(ProductConversationCreateAcceptedResponse {
-        canonical_route: format!("/product-conversations/{product_conversation_id}"),
-        product_conversation_id,
-        transcript_row_id,
-    })
-}
-
-fn create_conversation_with_id(
-    state: AppState,
-    req: CreateConversationRequest,
-    raw_files: Vec<RawAttachmentPart>,
-) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<Json<ConversationResponse>, AppError>> + Send>,
-> {
-    Box::pin(create_conversation_with_id_impl(state, req, raw_files))
-}
-
-#[allow(clippy::too_many_lines)]
-async fn create_conversation_with_id_impl(
-    state: AppState,
-    req: CreateConversationRequest,
-    raw_files: Vec<RawAttachmentPart>,
-) -> Result<Json<ConversationResponse>, AppError> {
-    let response = create_conversation_from_request(state, req, raw_files, None, None).await?;
-    Ok(Json(ConversationResponse {
-        conversation: response.conversation,
-    }))
-}
-
-#[allow(clippy::too_many_lines)]
-fn create_request_fingerprint(req: &CreateConversationRequest) -> Result<String, AppError> {
-    let canonical = serde_json::to_vec(&serde_json::json!({
-        "cwd": req.cwd,
-        "model": req.model,
-        "effort": req.effort,
-        "text": req.text,
-        "images": req.images.iter().map(|image| serde_json::json!({
-            "data": image.data,
-            "media_type": image.media_type,
-        })).collect::<Vec<_>>(),
-        "files": req.files,
-        "mode": req.mode,
-        "base_branch": req.base_branch,
-        "checkout_ref": req.checkout_ref,
-        "root_reservation": req.root_reservation,
-        "seed_parent_id": req.seed_parent_id,
-        "seed_label": req.seed_label,
-    }))
-    .map_err(|error| AppError::Internal(error.to_string()))?;
-    Ok(sha2::Sha256::digest(canonical).iter().fold(
-        String::with_capacity(64),
-        |mut output, byte| {
-            use std::fmt::Write as _;
-            write!(output, "{byte:02x}").expect("writing to String cannot fail");
-            output
-        },
-    ))
-}
-
-fn conflict_fingerprint_response(
-    req: &CreateConversationRequest,
-    message: &str,
-) -> Result<ConflictErrorResponse, AppError> {
-    Ok(ConflictErrorResponse::new(message, "message_id_conflict")
-        .with_conflict_fingerprint(create_request_fingerprint(req)?))
-}
-
-#[allow(clippy::too_many_lines)]
-async fn create_conversation_from_request(
+async fn create_conversation_with_id(
     state: AppState,
     mut req: CreateConversationRequest,
     raw_files: Vec<RawAttachmentPart>,
-    profile: Option<phoenix_core::domain::db_schema::ConversationCreationProfile>,
-    root_reservation_id: Option<String>,
-) -> Result<InternalCreateConversationAcceptedResponse, AppError> {
+) -> Result<Json<ConversationResponse>, AppError> {
     let _owner = state.runtime.acquire_local_authority_pass().map_err(|()| {
         AppError::Internal("runtime admission closed after fatal local authority loss".to_string())
     })?;
@@ -2217,10 +2031,9 @@ async fn create_conversation_from_request(
             let mut conversation_json = conversation_to_json(&state, &conv, None);
             inject_creation_job_state_fields(&state, &conv, &mut conversation_json).await;
             state.runtime.kick_creation_worker();
-            return Ok(InternalCreateConversationAcceptedResponse {
+            return Ok(Json(ConversationResponse {
                 conversation: conversation_json,
-                product_conversation_id: Some(conv.product_conversation_id.as_str().to_string()),
-            });
+            }));
         }
         return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
             "conversation_id already belongs to an existing conversation",
@@ -2234,28 +2047,6 @@ async fn create_conversation_from_request(
         .get_conversation_creation_job_for_message(&req.message_id)
         .await
     {
-        let requested_fingerprint = create_request_fingerprint(&req)?;
-        let existing_fingerprint = serde_json::to_vec(&existing_job.intent)
-            .map(|bytes| {
-                sha2::Sha256::digest(bytes).iter().fold(
-                    String::with_capacity(64),
-                    |mut output, byte| {
-                        use std::fmt::Write as _;
-                        let _ = write!(output, "{byte:02x}");
-                        output
-                    },
-                )
-            })
-            .map_err(|error| AppError::Internal(error.to_string()))?;
-        if existing_fingerprint != requested_fingerprint {
-            return Err(AppError::Conflict(Box::new(
-                ConflictErrorResponse::new(
-                    "message_id was already used for a different create payload",
-                    "message_id_conflict",
-                )
-                .with_conflict_fingerprint(existing_fingerprint),
-            )));
-        }
         if let Ok(conv) = state
             .runtime
             .db()
@@ -2266,10 +2057,9 @@ async fn create_conversation_from_request(
             let mut conversation_json = conversation_to_json(&state, &conv, None);
             inject_creation_job_state_fields(&state, &conv, &mut conversation_json).await;
             state.runtime.kick_creation_worker();
-            return Ok(InternalCreateConversationAcceptedResponse {
+            return Ok(Json(ConversationResponse {
                 conversation: conversation_json,
-                product_conversation_id: Some(conv.product_conversation_id.as_str().to_string()),
-            });
+            }));
         }
     }
 
@@ -2284,16 +2074,15 @@ async fn create_conversation_from_request(
             "Duplicate create request detected, returning existing conversation"
         );
         if let Ok(msg) = state.db.get_message_by_id(&req.message_id).await {
-            if let Ok(_conv) = state
+            if let Ok(conv) = state
                 .runtime
                 .db()
                 .get_conversation(&msg.conversation_id)
                 .await
             {
-                return Err(AppError::Conflict(Box::new(conflict_fingerprint_response(
-                    &req,
-                    "message_id was already used by an existing transcript message",
-                )?)));
+                return Ok(Json(ConversationResponse {
+                    conversation: conversation_to_json(&state, &conv, None),
+                }));
             }
         }
     }
@@ -2378,7 +2167,6 @@ async fn create_conversation_from_request(
 
     let intent = crate::db::ConversationCreationIntent {
         cwd: effective_cwd.clone(),
-        profile,
         model: intent_model,
         effort: req.effort,
         text: persisted_prompt_text,
@@ -2399,27 +2187,6 @@ async fn create_conversation_from_request(
         mode: resolved_mode_for_intent,
         base_branch: req.base_branch.clone(),
         checkout_ref: req.checkout_ref.clone(),
-        reserved_repo_root: req
-            .root_reservation
-            .as_ref()
-            .and_then(|reservation| reservation.repo_root.clone()),
-        reserved_root_freshness: req
-            .root_reservation
-            .as_ref()
-            .and_then(|reservation| reservation.freshness.as_ref())
-            .map(|freshness| match freshness {
-                ProductRootReservationFreshness::Fresh => "fresh".to_string(),
-                ProductRootReservationFreshness::StaleCached => "stale_cached".to_string(),
-                ProductRootReservationFreshness::Unresolved => "unresolved".to_string(),
-            }),
-        reserved_root_failure: req
-            .root_reservation
-            .as_ref()
-            .and_then(|reservation| reservation.unresolved_reason.clone()),
-        reserved_checkout_oid: req
-            .root_reservation
-            .as_ref()
-            .and_then(|reservation| reservation.exact_checkout_oid.clone()),
         seed_parent_id: req.seed_parent_id.clone(),
         seed_label: req.seed_label.clone(),
         approved_task: None,
@@ -2447,7 +2214,6 @@ async fn create_conversation_from_request(
             req.seed_label.as_deref(),
             default_language,
             &creation_job,
-            root_reservation_id.as_deref(),
         )
         .await
     {
@@ -2477,15 +2243,9 @@ async fn create_conversation_from_request(
                 )
                 .await;
                 state.runtime.kick_creation_worker();
-                return Ok(InternalCreateConversationAcceptedResponse {
+                return Ok(Json(ConversationResponse {
                     conversation: conversation_json,
-                    product_conversation_id: Some(
-                        existing_conversation
-                            .product_conversation_id
-                            .as_str()
-                            .to_string(),
-                    ),
-                });
+                }));
             }
             return Err(AppError::Internal(
                 "failed to create conversation shell".to_string(),
@@ -2519,15 +2279,9 @@ async fn create_conversation_from_request(
                 )
                 .await;
                 state.runtime.kick_creation_worker();
-                return Ok(InternalCreateConversationAcceptedResponse {
+                return Ok(Json(ConversationResponse {
                     conversation: conversation_json,
-                    product_conversation_id: Some(
-                        existing_conversation
-                            .product_conversation_id
-                            .as_str()
-                            .to_string(),
-                    ),
-                });
+                }));
             }
             return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
                 "conversation_id already belongs to an existing conversation",
@@ -2544,10 +2298,9 @@ async fn create_conversation_from_request(
 
     let mut conversation_json = conversation_to_json(&state, &conversation, None);
     inject_creation_job_state_fields(&state, &conversation, &mut conversation_json).await;
-    Ok(InternalCreateConversationAcceptedResponse {
+    Ok(Json(ConversationResponse {
         conversation: conversation_json,
-        product_conversation_id: Some(conversation.product_conversation_id.as_str().to_string()),
-    })
+    }))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2612,13 +2365,22 @@ pub(crate) fn create_detached_task_worktree_blocking(
     approved_branch: &str,
 ) -> Result<String, BranchWorktreeError> {
     let repo = std::path::Path::new(repo_root);
-    create_detached_worktree(
+    let parent = target_path.parent().ok_or_else(|| {
+        BranchWorktreeError::Git("detached worktree target has no parent directory".to_string())
+    })?;
+    std::fs::create_dir_all(parent).map_err(|error| BranchWorktreeError::Git(error.to_string()))?;
+    run_git(
         repo,
-        target_path,
-        approved_branch,
-        PhoenixIgnoreStrategy::StageGitignore,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            target_path.to_string_lossy().as_ref(),
+            approved_branch,
+        ],
     )
-    .map_err(|error| BranchWorktreeError::Git(error.to_string()))
+    .map_err(|error| BranchWorktreeError::Git(error.clone()))?;
+    Ok(target_path.to_string_lossy().to_string())
 }
 
 /// Create a git worktree for an existing branch. Runs on a blocking thread.
@@ -6405,7 +6167,7 @@ async fn cascade_projects_on_delete(
     };
     let outcome = crate::runtime::creation_worker::run_admitted_blocking(
         cleanup_admission,
-        move |_| -> Result<(), String> {
+        move || -> Result<(), String> {
             let worktree_dir = PathBuf::from(&worktree_path);
 
             if let Some(repo) = repo_root.as_ref() {
@@ -6763,28 +6525,6 @@ async fn validate_cwd(Query(query): Query<PathQuery>) -> Json<ValidateCwdRespons
             is_git: false,
         }),
     }
-}
-
-async fn list_recent_management_root_suggestions(
-    State(state): State<AppState>,
-) -> Result<Json<RecentManagementRootSuggestionsResponse>, AppError> {
-    let suggestions = state
-        .runtime
-        .db()
-        .list_recent_hidden_repository_management_roots()
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?
-        .into_iter()
-        .filter_map(|entry| {
-            let path = PathBuf::from(&entry.management_root);
-            path.is_dir().then_some(RecentManagementRootSuggestion {
-                path: entry.management_root,
-            })
-        })
-        .collect();
-    Ok(Json(RecentManagementRootSuggestionsResponse {
-        suggestions,
-    }))
 }
 
 async fn list_directory(
@@ -7381,11 +7121,14 @@ async fn search_conversation_files(
 async fn search_project_files(
     Query(query): Query<ProjectFileSearchQuery>,
 ) -> Result<Json<FileSearchResponse>, AppError> {
-    let canonical_cwd = crate::conversation_cwd::validate_conversation_cwd(&query.cwd)
-        .map_err(|error| AppError::BadRequest(error.to_string()))?;
-    let root = crate::resolution_root::ResolutionRoot::for_product_create_query(
-        canonical_cwd.raw(),
-        &query.resolution,
+    let cwd = std::path::PathBuf::from(&query.cwd);
+    if !cwd.exists() || !cwd.is_dir() {
+        return Err(AppError::BadRequest("Directory does not exist".to_string()));
+    }
+    let root = crate::resolution_root::ResolutionRoot::for_create(
+        &query.cwd,
+        query.mode.as_deref().unwrap_or("direct"),
+        query.base_branch.as_deref(),
     );
     let limit = query.limit.unwrap_or(50);
     Ok(Json(FileSearchResponse {
@@ -7704,11 +7447,14 @@ async fn list_conversation_skills(
 async fn list_project_skills(
     Query(query): Query<ProjectSkillsQuery>,
 ) -> Result<Json<SkillsResponse>, AppError> {
-    let canonical_cwd = crate::conversation_cwd::validate_conversation_cwd(&query.cwd)
-        .map_err(|error| AppError::BadRequest(error.to_string()))?;
-    let root = crate::resolution_root::ResolutionRoot::for_product_create_query(
-        canonical_cwd.raw(),
-        &query.resolution,
+    let cwd = std::path::PathBuf::from(&query.cwd);
+    if !cwd.exists() || !cwd.is_dir() {
+        return Err(AppError::BadRequest("Directory does not exist".to_string()));
+    }
+    let root = crate::resolution_root::ResolutionRoot::for_create(
+        &query.cwd,
+        query.mode.as_deref().unwrap_or("direct"),
+        query.base_branch.as_deref(),
     );
     // The view owns a temp materialization for a GitTree root; it must outlive
     // the discovery walk below. `strip` rewrites the temp paths back to
@@ -8635,7 +8381,6 @@ mod conversation_cwd_validation_tests {
             base_branch: None,
             seed_parent_id: None,
             checkout_ref: None,
-            root_reservation: None,
             seed_label: None,
         }
     }
@@ -8825,7 +8570,6 @@ mod conversation_cwd_validation_tests {
                 message_id: Some("msg-existing-shell".to_string()),
                 intent: crate::db::ConversationCreationIntent {
                     cwd: tmp.path().to_string_lossy().to_string(),
-                    profile: None,
                     model: None,
                     effort: None,
                     text: "retry".to_string(),
@@ -8838,10 +8582,6 @@ mod conversation_cwd_validation_tests {
                     mode: Some("branch".to_string()),
                     base_branch: Some("does-not-exist".to_string()),
                     checkout_ref: None,
-                    reserved_checkout_oid: None,
-                    reserved_repo_root: None,
-                    reserved_root_freshness: None,
-                    reserved_root_failure: None,
                     seed_parent_id: None,
                     seed_label: None,
                     approved_task: None,
@@ -8933,7 +8673,6 @@ mod conversation_cwd_validation_tests {
                 message_id: Some("msg-original".to_string()),
                 intent: crate::db::ConversationCreationIntent {
                     cwd: "/tmp".to_string(),
-                    profile: None,
                     model: None,
                     effort: None,
                     text: "original".to_string(),
@@ -8946,10 +8685,6 @@ mod conversation_cwd_validation_tests {
                     mode: None,
                     base_branch: None,
                     checkout_ref: None,
-                    reserved_checkout_oid: None,
-                    reserved_repo_root: None,
-                    reserved_root_freshness: None,
-                    reserved_root_failure: None,
                     seed_parent_id: None,
                     seed_label: None,
                     approved_task: None,
@@ -12684,15 +12419,8 @@ pub(crate) mod hard_delete_cascade_tests {
             cwd: cwd.to_string_lossy().to_string(),
             q: "project".to_string(),
             limit: Some(10),
-            resolution: crate::api::ProductCreationResolutionQuery {
-                kind: crate::api::ProductCreationResolutionKind::Direct,
-                reservation_id: None,
-                cwd: None,
-                repo_root: None,
-                exact_checkout_oid: None,
-                logical_base: None,
-                freshness: None,
-            },
+            mode: None,
+            base_branch: None,
         }))
         .await
         .expect("search");
@@ -12707,15 +12435,8 @@ pub(crate) mod hard_delete_cascade_tests {
             cwd: "/nonexistent/phoenix/test/dir".to_string(),
             q: String::new(),
             limit: None,
-            resolution: crate::api::ProductCreationResolutionQuery {
-                kind: crate::api::ProductCreationResolutionKind::Direct,
-                reservation_id: None,
-                cwd: None,
-                repo_root: None,
-                exact_checkout_oid: None,
-                logical_base: None,
-                freshness: None,
-            },
+            mode: None,
+            base_branch: None,
         }))
         .await
         .expect_err("missing dir rejected");
@@ -14658,83 +14379,6 @@ mod regenerate_conversation_name_tests {
     }
 }
 
-#[cfg(test)]
-mod product_conversation_creation_tests {
-    use super::*;
-    use crate::api::types::{CreateProductConversationRequest, ImageAttachment};
-
-    #[tokio::test]
-    async fn accepted_response_uses_product_route_and_identity() {
-        let state = hard_delete_cascade_tests::make_test_state().await;
-        let temp_dir = tempfile::tempdir().expect("temp directory");
-        let conversation_id = uuid::Uuid::new_v4().to_string();
-        let request = CreateProductConversationRequest {
-            conversation_id: Some(conversation_id.clone()),
-            root_reservation: ProductRootReservation {
-                cwd: temp_dir.path().to_string_lossy().to_string(),
-                id: "test-reservation".to_string(),
-                kind: "direct".to_string(),
-                repository_id: None,
-                repo_root: None,
-                exact_checkout_oid: None,
-                logical_base: None,
-                freshness: None,
-                unresolved_reason: None,
-            },
-            model: "claude-sonnet-5".to_string(),
-            effort: None,
-            objective: "Build the feature".to_string(),
-            message_id: "msg-product-1".to_string(),
-            images: vec![ImageAttachment {
-                data: "Zm9v".to_string(),
-                media_type: "image/png".to_string(),
-            }],
-        };
-
-        state
-            .db
-            .insert_product_root_reservation(&phoenix_db::ProductRootReservationRecord {
-                id: "test-reservation".to_string(),
-                repository_id: None,
-                cwd: crate::conversation_cwd::validate_conversation_cwd(
-                    temp_dir.path().to_string_lossy(),
-                )
-                .expect("canonical test cwd")
-                .into_raw(),
-                kind: "direct".to_string(),
-                repo_root: None,
-                exact_checkout_oid: None,
-                logical_base: None,
-                freshness: None,
-                unresolved_reason: None,
-            })
-            .await
-            .expect("persist reservation");
-
-        let response = Box::pin(create_product_conversation_with_id(state.clone(), request))
-            .await
-            .expect("accepted response");
-        assert_eq!(response.transcript_row_id, conversation_id);
-        assert_eq!(
-            response.canonical_route,
-            format!(
-                "/product-conversations/{}",
-                response.product_conversation_id
-            )
-        );
-
-        let persisted = state
-            .db
-            .get_conversation(&response.transcript_row_id)
-            .await
-            .expect("persisted conversation");
-        assert_eq!(
-            response.product_conversation_id,
-            persisted.product_conversation_id.as_str()
-        );
-    }
-}
-
 /// Task 02713: `upgrade_conversation_model` must accept the change from
 /// `Idle` and `Error`, and reject it while an operation is in flight.
 /// Exercises the real axum handler end to end against an in-memory DB.
@@ -15636,7 +15280,6 @@ mod attachment_storage_tests {
         let stored_path = "/tmp/phoenix-creation-job-attachment.txt".to_string();
         let intent = crate::db::ConversationCreationIntent {
             cwd: "/tmp".to_string(),
-            profile: None,
             model: Some("mock".to_string()),
             effort: None,
             text: "with attachment".to_string(),
@@ -15654,10 +15297,6 @@ mod attachment_storage_tests {
             mode: None,
             base_branch: None,
             checkout_ref: None,
-            reserved_checkout_oid: None,
-            reserved_repo_root: None,
-            reserved_root_freshness: None,
-            reserved_root_failure: None,
             seed_parent_id: None,
             seed_label: None,
             approved_task: None,

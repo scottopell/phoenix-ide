@@ -112,7 +112,6 @@ describe('/new directory-first product conversation', () => {
     expect(firstRequest).toHaveProperty('request_id');
     expect(firstRequest).not.toHaveProperty('conversation_id');
     expect(firstRequest).not.toHaveProperty('message_id');
-    expect(firstRequest).not.toHaveProperty('root_reservation');
     expect(firstRequest).not.toHaveProperty('mode');
     expect(firstRequest).not.toHaveProperty('base_branch');
     expect(firstRequest).not.toHaveProperty('branch');

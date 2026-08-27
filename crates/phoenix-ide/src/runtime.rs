@@ -3291,18 +3291,27 @@ impl RuntimeManager {
         tokio::spawn(async move {
             let _ = ready_tx.send(());
             loop {
-                if let Err(error) =
-                    crate::runtime::creation_worker::drain_pending_jobs(&manager).await
+                if let Err(error) = Box::pin(crate::runtime::creation_worker::drain_pending_jobs(
+                    &manager,
+                ))
+                .await
                 {
                     tracing::error!(error = %error, "conversation creation worker drain failed");
                 }
                 if manager.local_authority_is_closed() {
                     break;
                 }
-                let next_deadline = match manager.db().next_conversation_creation_deadline().await {
-                    Ok(deadline) => deadline,
-                    Err(error) => {
-                        tracing::error!(error = %error, "failed to read conversation creation deadline");
+                let next_deadline = match (
+                    manager.db().next_conversation_creation_deadline().await,
+                    manager.db().next_product_creation_deadline().await,
+                ) {
+                    (Ok(legacy), Ok(product)) => match (legacy, product) {
+                        (Some(left), Some(right)) => Some(left.min(right)),
+                        (left @ Some(_), None) => left,
+                        (None, right) => right,
+                    },
+                    (legacy, product) => {
+                        tracing::error!(?legacy, ?product, "failed to read creation deadline");
                         Some(chrono::Utc::now() + chrono::Duration::seconds(1))
                     }
                 };

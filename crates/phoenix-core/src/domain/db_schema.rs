@@ -363,17 +363,8 @@ impl ConversationCreationPhase {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum ConversationCreationProfile {
-    DirectoryFirstProduct,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConversationCreationIntent {
     pub cwd: String,
-    // owned: pre-directory-first-product rows had no profile; None is correct.
-    #[serde(default)]
-    pub profile: Option<ConversationCreationProfile>,
     #[serde(default)]
     pub model: Option<String>,
     // owned: pre-feature creation jobs had no effort; None correctly follows the model default.
@@ -401,16 +392,6 @@ pub struct ConversationCreationIntent {
     pub base_branch: Option<String>,
     #[serde(default)]
     pub checkout_ref: Option<String>,
-    #[serde(default)]
-    pub reserved_repo_root: Option<String>,
-    #[serde(default)]
-    pub reserved_root_freshness: Option<String>,
-    // owned: pre-unresolved-reservation rows had no canonical failure; None is correct.
-    #[serde(default)]
-    pub reserved_root_failure: Option<String>,
-    // owned: pre-reservation rows had no durable reserved checkout OID; None correctly re-resolves.
-    #[serde(default)]
-    pub reserved_checkout_oid: Option<String>,
     #[serde(default)]
     pub seed_parent_id: Option<String>,
     #[serde(default)]

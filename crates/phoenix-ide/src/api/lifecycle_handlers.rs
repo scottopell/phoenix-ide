@@ -89,17 +89,9 @@ pub(crate) async fn approve_task(
         ));
     }
 
-    if state
-        .runtime
-        .db()
-        .root_reservation_for_attached_hidden_repository(&id)
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?
-        .is_none()
-    {
+    if conv.attached_work_scope_id.is_none() {
         return Err(AppError::BadRequest(
-            "Task approval requires immutable repository evidence from the attached WorkScope"
-                .to_string(),
+            "Task approval requires the attached WorkScope".to_string(),
         ));
     }
 

@@ -77,23 +77,16 @@ impl ResolutionRoot {
         Self::git_tree(repo_root, start.tree_ref())
     }
 
-    pub fn for_product_create_query(
-        cwd: &str,
-        resolution: &crate::api::ProductCreationResolutionQuery,
-    ) -> Self {
+    pub fn for_create(cwd: &str, mode: &str, base_branch: Option<&str>) -> Self {
         let cwd_path = PathBuf::from(cwd);
-        match resolution.kind {
-            crate::api::ProductCreationResolutionKind::Direct => Self::WorkingDir(cwd_path),
-            crate::api::ProductCreationResolutionKind::ExactReservedCommittedTree => {
-                Self::git_tree(
-                    resolution.repo_root.as_deref().unwrap_or(cwd),
-                    resolution.exact_checkout_oid.as_deref().unwrap_or(cwd),
-                )
-            }
-            crate::api::ProductCreationResolutionKind::UnresolvedExactReservedCommittedTree => {
-                Self::WorkingDir(cwd_path)
+        if let Some(start) =
+            crate::git_start::GitStartPoint::for_inline_discovery(&cwd_path, mode, base_branch)
+        {
+            if let Some(repo_root) = phoenix_core::git::detect_git_repo_root(&cwd_path) {
+                return Self::from_start_point(repo_root, &start);
             }
         }
+        Self::WorkingDir(cwd_path)
     }
 
     /// Fuzzy-search files at this root, returning paths relative to the root.
@@ -800,10 +793,7 @@ mod tests {
 
     #[test]
     fn for_create_direct_is_working_dir() {
-        let root = ResolutionRoot::for_product_create_query(
-            "/tmp/x",
-            &crate::api::ProductCreationResolutionQuery::DIRECT,
-        );
+        let root = ResolutionRoot::for_create("/tmp/x", "direct", None);
         assert!(matches!(root, ResolutionRoot::WorkingDir(_)));
     }
 
@@ -811,10 +801,7 @@ mod tests {
     fn for_create_branch_without_repo_degrades_to_working_dir() {
         // /tmp is (almost certainly) not a git repo, so a branch mode with no
         // resolvable repo root falls back to the working directory.
-        let root = ResolutionRoot::for_product_create_query(
-            "/tmp",
-            &crate::api::ProductCreationResolutionQuery::DIRECT,
-        );
+        let root = ResolutionRoot::for_create("/tmp", "branch", Some("main"));
         assert!(matches!(root, ResolutionRoot::WorkingDir(_)));
     }
 
