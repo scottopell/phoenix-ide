@@ -1823,12 +1823,22 @@ impl Database {
                 tx.commit().await?;
                 return Ok(());
             }
-            return Err(close_precondition(format!(
-                "attempt {} inspection replacement replay differs from persisted inspection",
-                request.attempt_id
-            )));
+            if obligation.phase() != ClosePhase::AwaitingLossConfirmation {
+                return Err(close_precondition(format!(
+                    "attempt {} inspection replacement replay differs from persisted inspection",
+                    request.attempt_id
+                )));
+            }
         }
 
+        if obligation.phase() == ClosePhase::AwaitingLossConfirmation {
+            set_close_phase_tx(
+                &mut tx,
+                request.attempt_id.as_str(),
+                ClosePhase::AwaitingRetirementInspection,
+            )
+            .await?;
+        }
         self.ensure_inspection_replacement_allowed(&mut tx, &request)
             .await?;
         self.clear_retirement_inspection_rows(&mut tx, request.attempt_id.as_str())
@@ -5479,6 +5489,87 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn changed_loss_confirmation_inspection_replaces_evidence_and_token_atomically() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let scope = allocate_scope_worktree(&db, "root").await;
+        db.begin_close_foundation(&product_id("root"), "attempt-changed-confirmation")
+            .await
+            .unwrap();
+        set_close_phase(
+            &db,
+            "attempt-changed-confirmation",
+            ClosePhase::AwaitingRetirementInspection,
+        )
+        .await;
+
+        let first_loss = CloseLossItem::UntrackedNonIgnoredPath(GitPathIdentity::from_bytes(
+            b"first-path".to_vec(),
+        ));
+        db.replace_close_inspection(ReplaceCloseInspectionRequest {
+            attempt_id: CloseAttemptId::parse("attempt-changed-confirmation").unwrap(),
+            scopes: vec![ReplaceCloseInspectionScopeRequest {
+                scope: scope.clone(),
+                snapshot: CloseRetirementSnapshot::parse("first-generation", "first-fingerprint")
+                    .unwrap(),
+                losses: vec![first_loss],
+            }],
+        })
+        .await
+        .unwrap();
+        let first_token = db
+            .get_close_obligation("attempt-changed-confirmation")
+            .await
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .clone();
+
+        let second_loss =
+            CloseLossItem::StagedTrackedPath(GitPathIdentity::from_bytes(b"second-path".to_vec()));
+        db.replace_close_inspection(ReplaceCloseInspectionRequest {
+            attempt_id: CloseAttemptId::parse("attempt-changed-confirmation").unwrap(),
+            scopes: vec![ReplaceCloseInspectionScopeRequest {
+                scope,
+                snapshot: CloseRetirementSnapshot::parse("second-generation", "second-fingerprint")
+                    .unwrap(),
+                losses: vec![second_loss.clone()],
+            }],
+        })
+        .await
+        .unwrap();
+
+        let refreshed = db
+            .get_close_obligation("attempt-changed-confirmation")
+            .await
+            .unwrap();
+        assert_eq!(refreshed.phase(), ClosePhase::AwaitingLossConfirmation);
+        let second_token = refreshed.snapshot().unwrap().clone();
+        assert_ne!(first_token, second_token);
+        assert_eq!(
+            db.list_close_retirement_losses("attempt-changed-confirmation")
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|loss| loss.item)
+                .collect::<Vec<_>>(),
+            vec![second_loss]
+        );
+
+        let attempt_id = CloseAttemptId::parse("attempt-changed-confirmation").unwrap();
+        let stale = db
+            .confirm_close_loss_retirement(&attempt_id, &first_token)
+            .await
+            .unwrap_err();
+        assert!(stale.to_string().contains("snapshot is stale"));
+        let confirmed = db
+            .confirm_close_loss_retirement(&attempt_id, &second_token)
+            .await
+            .unwrap();
+        assert_eq!(confirmed.phase(), ClosePhase::RetirementRequested);
     }
 
     #[tokio::test]
