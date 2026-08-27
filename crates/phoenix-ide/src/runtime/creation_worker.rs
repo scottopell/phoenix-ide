@@ -99,7 +99,7 @@ async fn process_claimed_product_creation(
         let home = manager.runtime_home().to_path_buf();
         move || {
             crate::conversation_cwd::ensure_product_creation_cwd(&cwd, &home)
-                .map(|valid| valid.into_raw())
+                .map(crate::conversation_cwd::ValidConversationCwd::into_raw)
                 .map_err(|error| error.to_string())
         }
     })
@@ -522,16 +522,16 @@ fn run_git_with_timeout(
         .stderr(Stdio::piped());
     let mut child = child
         .spawn()
-        .map_err(|error| format!("failed to spawn git {:?}: {error}", args))?;
+        .map_err(|error| format!("failed to spawn git {args:?}: {error}"))?;
     let start = std::time::Instant::now();
     loop {
         if let Some(status) = child
             .try_wait()
-            .map_err(|error| format!("failed waiting for git {:?}: {error}", args))?
+            .map_err(|error| format!("failed waiting for git {args:?}: {error}"))?
         {
             let output = child
                 .wait_with_output()
-                .map_err(|error| format!("failed collecting git {:?}: {error}", args))?;
+                .map_err(|error| format!("failed collecting git {args:?}: {error}"))?;
             if status.success() {
                 return Ok(String::from_utf8_lossy(&output.stdout).to_string());
             }
