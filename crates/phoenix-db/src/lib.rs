@@ -19789,19 +19789,23 @@ mod tests {
             )
             .await
             .unwrap();
-        sqlx::query("UPDATE conversations SET work_scope_id = ?1 WHERE id = 'scope-parent'")
-            .bind(
-                replacement_parent
-                    .attached_work_scope_id
-                    .as_ref()
-                    .unwrap()
-                    .as_str(),
-            )
-            .execute(db.pool())
-            .await
-            .unwrap();
+        let conflict =
+            sqlx::query("UPDATE conversations SET work_scope_id = ?1 WHERE id = 'scope-parent'")
+                .bind(
+                    replacement_parent
+                        .attached_work_scope_id
+                        .as_ref()
+                        .unwrap()
+                        .as_str(),
+                )
+                .execute(db.pool())
+                .await
+                .unwrap_err();
+        assert!(conflict
+            .to_string()
+            .contains("different ordinary product conversation"));
 
-        let error = db
+        let child = db
             .create_subagent_conversation(
                 "rejected-child",
                 "rejected-child",
@@ -19816,14 +19820,14 @@ mod tests {
                 Some(&captured_scope),
             )
             .await
-            .unwrap_err();
-        assert!(matches!(error, DbError::CloseFoundationConflict(_)));
+            .unwrap();
+        assert_eq!(child.attached_work_scope_id.as_ref(), Some(&captured_scope));
         let child_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM conversations WHERE id = 'rejected-child'")
                 .fetch_one(db.pool())
                 .await
                 .unwrap();
-        assert_eq!(child_count, 0);
+        assert_eq!(child_count, 1);
     }
 
     #[tokio::test]
