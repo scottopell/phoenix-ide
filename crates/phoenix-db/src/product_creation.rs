@@ -1387,6 +1387,32 @@ impl Database {
         }))
     }
 
+    pub async fn mark_claimed_product_creation_cleanup_ambiguous(
+        &self,
+        cleanup: &ProductCreationCleanupJob,
+        now: DateTime<Utc>,
+    ) -> DbResult<bool> {
+        let result = sqlx::query(
+            "UPDATE product_creation_jobs
+             SET status = 'cleanup_ambiguous', retry_at_unix_micros = NULL,
+                 cleanup_worker_id = NULL, cleanup_token = NULL,
+                 cleanup_lease_until_unix_micros = NULL,
+                 updated_at_unix_micros = ?1
+             WHERE request_id = ?2 AND claim_generation = ?3
+               AND status IN ('cancelling', 'deletion_pending')
+               AND cleanup_worker_id = ?4 AND cleanup_token = ?5
+               AND cleanup_lease_until_unix_micros > ?1",
+        )
+        .bind(datetime_to_unix_micros(now))
+        .bind(&cleanup.job.request_id)
+        .bind(cleanup.claim.generation)
+        .bind(&cleanup.claim.worker_id)
+        .bind(&cleanup.claim.token)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     pub async fn schedule_product_creation_cleanup_retry(
         &self,
         cleanup: &ProductCreationCleanupJob,
@@ -1610,8 +1636,8 @@ impl Database {
                    WHERE job.published_conversation_id = conversation.id
                      AND job.status <> 'published'
                )
-             GROUP BY attachment.repository_id, locator.path
-             ORDER BY COUNT(DISTINCT conversation.id) DESC,
+             GROUP BY locator.path
+             ORDER BY COUNT(DISTINCT conversation.product_conversation_id) DESC,
                       MAX(conversation.updated_at) DESC,
                       locator.path DESC
              LIMIT ?1",

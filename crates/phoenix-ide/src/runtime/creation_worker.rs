@@ -639,7 +639,12 @@ async fn reconcile_product_creation_cleanup(
         .await
         .map_err(|error| error.to_string())??;
         if !cleaned {
-            return Err("product creation cleanup could not prove staging ownership".to_string());
+            manager
+                .db()
+                .mark_claimed_product_creation_cleanup_ambiguous(cleanup, chrono::Utc::now())
+                .await
+                .map_err(|error| error.to_string())?;
+            return Ok(());
         }
         let released = manager
             .db()

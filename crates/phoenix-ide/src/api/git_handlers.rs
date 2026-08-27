@@ -2163,7 +2163,7 @@ pub(crate) async fn get_conversation_diff(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    let (worktree_path, base_branch) = match &conv.conv_mode {
+    let (worktree_path, comparator) = match &conv.conv_mode {
         ConvMode::Work {
             worktree_path,
             base_branch,
@@ -2173,12 +2173,10 @@ pub(crate) async fn get_conversation_diff(
             worktree_path,
             base_branch,
             ..
-        }
-        | ConvMode::DetachedApprovedTask {
-            worktree_path,
-            base_branch,
-            ..
         } => (worktree_path.to_string(), base_branch.to_string()),
+        ConvMode::DetachedApprovedTask { worktree_path, .. } => {
+            (worktree_path.to_string(), "HEAD".to_string())
+        }
         _ => {
             return Err(AppError::BadRequest(
                 "Conversation has no worktree to diff".to_string(),
@@ -2195,7 +2193,7 @@ pub(crate) async fn get_conversation_diff(
         }
 
         let (captured, checkout_status) = capture_with_stable_checkout(&wt, || {
-            Ok(capture_branch_diff(&wt, &base_branch, MAX_DIFF_BYTES))
+            Ok(capture_branch_diff(&wt, &comparator, MAX_DIFF_BYTES))
         })?;
 
         Ok(build_diff_response(
