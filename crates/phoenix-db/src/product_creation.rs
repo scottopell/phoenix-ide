@@ -3,6 +3,27 @@
 use super::*;
 use phoenix_core::domain::product_conversation::ProductConversationId;
 
+const PRODUCT_CREATION_MAX_ATTEMPTS: i64 = 4;
+const PRODUCT_CREATION_RETRY_DELAYS_SECONDS: [i64; 3] = [2, 10, 30];
+const PRODUCT_CREATION_MAX_DELIVERY_ATTEMPTS: i64 = 4;
+
+fn unix_micros_now() -> i64 {
+    Utc::now().timestamp_micros()
+}
+
+fn datetime_to_unix_micros(value: DateTime<Utc>) -> i64 {
+    value.timestamp_micros()
+}
+
+fn unix_micros_to_datetime(value: i64) -> Result<DateTime<Utc>, sqlx::Error> {
+    DateTime::<Utc>::from_timestamp_micros(value).ok_or_else(|| {
+        sqlx::Error::Decode(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid unix micros timestamp: {value}"),
+        )))
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProductCreationImage {
     pub media_type: String,
@@ -21,15 +42,19 @@ pub struct ProductCreationIntent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProductCreationJobRecord {
     pub request_id: String,
+    pub product_conversation_id: ProductConversationId,
     pub intent: ProductCreationIntent,
     pub status: String,
     pub accepted_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub attempt_count: i64,
     pub claim_generation: i64,
     pub claim_worker_id: Option<String>,
     pub claim_token: Option<String>,
     pub claim_lease_until: Option<DateTime<Utc>>,
     pub retry_at: Option<DateTime<Utc>>,
+    pub delivery_attempt_count: i64,
+    pub delivery_retry_at: Option<DateTime<Utc>>,
     pub pin_exact_checkout_oid: Option<String>,
     pub pin_logical_base: Option<String>,
     pub pin_freshness: Option<String>,
@@ -76,6 +101,7 @@ pub struct ProductCreationPublishInput {
     pub authority_kind: AuthorityKind,
     pub environment: EnvironmentContext,
     pub repository_id: Option<String>,
+    pub exact_checkout_oid: Option<String>,
     pub repository_root: Option<String>,
 }
 
@@ -85,12 +111,18 @@ fn normalize_product_creation_intent(intent: &ProductCreationIntent) -> DbResult
             "product creation cwd must not be empty".to_string(),
         ));
     }
-    if intent.objective.trim().is_empty() {
+    if intent.objective.trim().is_empty() && intent.images.is_empty() {
         return Err(DbError::Serialization(
-            "product creation objective must not be empty".to_string(),
+            "product creation objective must not be empty unless images are provided".to_string(),
         ));
     }
     Ok(())
+}
+
+fn next_product_creation_retry_at(attempt_count: i64, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    PRODUCT_CREATION_RETRY_DELAYS_SECONDS
+        .get(usize::try_from(attempt_count.saturating_sub(1)).ok()?)
+        .map(|seconds| now + chrono::Duration::seconds(*seconds))
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -101,6 +133,10 @@ fn parse_product_creation_job_row(row: SqliteRow) -> Result<ProductCreationJobRe
         serde_json::from_str(&images_json).map_err(|error| sqlx::Error::Decode(Box::new(error)))?;
     Ok(ProductCreationJobRecord {
         request_id,
+        product_conversation_id: ProductConversationId::parse(
+            &row.try_get::<String, _>("product_conversation_id")?,
+        )
+        .map_err(|error| sqlx::Error::Decode(Box::new(error)))?,
         intent: ProductCreationIntent {
             cwd: row.try_get("cwd")?,
             objective: row.try_get("objective")?,
@@ -114,19 +150,25 @@ fn parse_product_creation_job_row(row: SqliteRow) -> Result<ProductCreationJobRe
             images,
         },
         status: row.try_get("status")?,
-        accepted_at: parse_datetime(&row.try_get::<String, _>("accepted_at")?),
-        updated_at: parse_datetime(&row.try_get::<String, _>("updated_at")?),
+        accepted_at: unix_micros_to_datetime(row.try_get("accepted_at_unix_micros")?)?,
+        updated_at: unix_micros_to_datetime(row.try_get("updated_at_unix_micros")?)?,
+        attempt_count: row.try_get("attempt_count")?,
         claim_generation: row.try_get("claim_generation")?,
         claim_worker_id: row.try_get("claim_worker_id")?,
         claim_token: row.try_get("claim_token")?,
         claim_lease_until: row
-            .try_get::<Option<String>, _>("claim_lease_until")?
-            .as_deref()
-            .map(parse_datetime),
+            .try_get::<Option<i64>, _>("claim_lease_until_unix_micros")?
+            .map(unix_micros_to_datetime)
+            .transpose()?,
         retry_at: row
-            .try_get::<Option<String>, _>("retry_at")?
-            .as_deref()
-            .map(parse_datetime),
+            .try_get::<Option<i64>, _>("retry_at_unix_micros")?
+            .map(unix_micros_to_datetime)
+            .transpose()?,
+        delivery_attempt_count: row.try_get("delivery_attempt_count")?,
+        delivery_retry_at: row
+            .try_get::<Option<i64>, _>("delivery_retry_at_unix_micros")?
+            .map(unix_micros_to_datetime)
+            .transpose()?,
         pin_exact_checkout_oid: row.try_get("pin_exact_checkout_oid")?,
         pin_logical_base: row.try_get("pin_logical_base")?,
         pin_freshness: row.try_get("pin_freshness")?,
@@ -143,14 +185,32 @@ fn parse_product_creation_job_row(row: SqliteRow) -> Result<ProductCreationJobRe
 }
 
 impl Database {
+    pub async fn product_creation_objective_already_durably_accepted(
+        &self,
+        request_id: &str,
+        steering_fingerprint: Option<&SteeringAcceptanceFingerprint>,
+        intent: &ProductCreationIntent,
+    ) -> DbResult<bool> {
+        normalize_product_creation_intent(intent)?;
+        let Some(record) = self.get_product_creation_job(request_id).await? else {
+            return Ok(false);
+        };
+        Ok(match steering_fingerprint {
+            Some(SteeringAcceptanceFingerprint::LegacyUnknown) => false,
+            Some(SteeringAcceptanceFingerprint::Exact(_)) | None => record.intent == *intent,
+        })
+    }
+
     pub async fn get_product_creation_job(
         &self,
         request_id: &str,
     ) -> DbResult<Option<ProductCreationJobRecord>> {
         sqlx::query(
-            "SELECT j.request_id, j.cwd, j.objective, j.model, j.effort, j.status,
-                    j.accepted_at, j.updated_at, j.claim_generation, j.claim_worker_id,
-                    j.claim_token, j.claim_lease_until, j.retry_at,
+            "SELECT j.request_id, j.product_conversation_id, j.cwd, j.objective, j.model, j.effort, j.status,
+                    j.accepted_at_unix_micros, j.updated_at_unix_micros, j.attempt_count,
+                    j.claim_generation, j.claim_worker_id, j.claim_token,
+                    j.claim_lease_until_unix_micros, j.retry_at_unix_micros,
+                    j.delivery_attempt_count, j.delivery_retry_at_unix_micros,
                     j.pin_exact_checkout_oid, j.pin_logical_base, j.pin_freshness,
                     j.staging_path, j.staging_repo_root, j.staging_exact_oid,
                     j.published_product_id, j.published_conversation_id,
@@ -176,12 +236,15 @@ impl Database {
         intent: &ProductCreationIntent,
     ) -> DbResult<ProductCreationAcceptOutcome> {
         normalize_product_creation_intent(intent)?;
-        let now = Utc::now().to_rfc3339();
+        let accepted_product_conversation_id = ProductConversationId::new();
+        let now = unix_micros_now();
         let mut tx = self.pool.begin().await?;
         let existing = sqlx::query(
-            "SELECT request_id, cwd, objective, model, effort, status,
-                    accepted_at, updated_at, claim_generation, claim_worker_id,
-                    claim_token, claim_lease_until, retry_at,
+            "SELECT request_id, product_conversation_id, cwd, objective, model, effort, status,
+                    accepted_at_unix_micros, updated_at_unix_micros, attempt_count,
+                    claim_generation, claim_worker_id, claim_token,
+                    claim_lease_until_unix_micros, retry_at_unix_micros,
+                    delivery_attempt_count, delivery_retry_at_unix_micros,
                     pin_exact_checkout_oid, pin_logical_base, pin_freshness,
                     staging_path, staging_repo_root, staging_exact_oid,
                     published_product_id, published_conversation_id,
@@ -208,15 +271,17 @@ impl Database {
         }
         let inserted = sqlx::query(
             "INSERT OR IGNORE INTO product_creation_jobs (
-                request_id, cwd, objective, model, effort, status, accepted_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, 'accepted', ?6, ?6)",
+                request_id, product_conversation_id, cwd, objective, model, effort, status,
+                accepted_at_unix_micros, updated_at_unix_micros
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'accepted', ?7, ?7)",
         )
         .bind(request_id)
+        .bind(accepted_product_conversation_id.as_str())
         .bind(&intent.cwd)
         .bind(&intent.objective)
         .bind(&intent.model)
         .bind(intent.effort.map(ModelEffort::as_wire_name))
-        .bind(&now)
+        .bind(now)
         .execute(&mut *tx)
         .await?;
         if inserted.rows_affected() == 0 {
@@ -266,23 +331,23 @@ impl Database {
         now: DateTime<Utc>,
         lease_duration: chrono::Duration,
     ) -> DbResult<Option<ClaimedProductCreationJob>> {
-        let now_str = now.to_rfc3339();
-        let lease_until = (now + lease_duration).to_rfc3339();
+        let now_str = datetime_to_unix_micros(now);
+        let lease_until = datetime_to_unix_micros(now + lease_duration);
         let updated = sqlx::query(
             "UPDATE product_creation_jobs
              SET status = 'claimed', claim_generation = claim_generation + 1,
-                 claim_worker_id = ?2, claim_token = ?3, claim_lease_until = ?4,
-                 retry_at = NULL, updated_at = ?1
+                 claim_worker_id = ?2, claim_token = ?3, claim_lease_until_unix_micros = ?4,
+                 retry_at_unix_micros = NULL, updated_at_unix_micros = ?1
              WHERE request_id = ?5 AND (
                  status = 'accepted'
-                 OR (status = 'retry_scheduled' AND retry_at <= ?1)
-                 OR (status = 'claimed' AND claim_lease_until <= ?1)
+                 OR (status = 'retry_scheduled' AND retry_at_unix_micros <= ?1)
+                 OR (status = 'claimed' AND claim_lease_until_unix_micros <= ?1)
              )",
         )
-        .bind(&now_str)
+        .bind(now_str)
         .bind(worker_id)
         .bind(token)
-        .bind(&lease_until)
+        .bind(lease_until)
         .bind(request_id)
         .execute(&self.pool)
         .await?;
@@ -300,7 +365,7 @@ impl Database {
                 worker_id: worker_id.to_string(),
                 token: token.to_string(),
                 generation: job.claim_generation,
-                lease_until: parse_datetime(&lease_until),
+                lease_until: unix_micros_to_datetime(lease_until)?,
             },
             job,
         }))
@@ -313,19 +378,19 @@ impl Database {
         now: DateTime<Utc>,
         lease_duration: chrono::Duration,
     ) -> DbResult<Option<ClaimedProductCreationJob>> {
-        let now_str = now.to_rfc3339();
-        let lease_until = (now + lease_duration).to_rfc3339();
+        let now_str = datetime_to_unix_micros(now);
+        let lease_until = datetime_to_unix_micros(now + lease_duration);
         let mut tx = self.pool.begin().await?;
         let candidate: Option<(String, String)> = sqlx::query_as(
             "SELECT request_id, status
              FROM product_creation_jobs
              WHERE status = 'accepted'
-                OR (status = 'retry_scheduled' AND retry_at <= ?1)
-                OR (status = 'claimed' AND claim_lease_until <= ?1)
-             ORDER BY CASE status WHEN 'accepted' THEN accepted_at ELSE retry_at END ASC, accepted_at ASC, request_id ASC
+                OR (status = 'retry_scheduled' AND retry_at_unix_micros <= ?1)
+                OR (status = 'claimed' AND claim_lease_until_unix_micros <= ?1)
+             ORDER BY CASE status WHEN 'accepted' THEN accepted_at_unix_micros ELSE retry_at_unix_micros END ASC, accepted_at_unix_micros ASC, request_id ASC
              LIMIT 1",
         )
-        .bind(&now_str)
+        .bind(now_str)
         .fetch_optional(&mut *tx)
         .await?;
         let Some((request_id, status)) = candidate else {
@@ -338,20 +403,20 @@ impl Database {
                  claim_generation = claim_generation + 1,
                  claim_worker_id = ?1,
                  claim_token = ?2,
-                 claim_lease_until = ?3,
-                 retry_at = NULL,
-                 updated_at = ?4
+                 claim_lease_until_unix_micros = ?3,
+                 retry_at_unix_micros = NULL,
+                 updated_at_unix_micros = ?4
              WHERE request_id = ?5 AND status = ?6
                AND (
                     status = 'accepted'
-                    OR (status = 'retry_scheduled' AND retry_at <= ?4)
-                    OR (status = 'claimed' AND claim_lease_until <= ?4)
+                    OR (status = 'retry_scheduled' AND retry_at_unix_micros <= ?4)
+                    OR (status = 'claimed' AND claim_lease_until_unix_micros <= ?4)
                )",
         )
         .bind(worker_id)
         .bind(token)
-        .bind(&lease_until)
-        .bind(&now_str)
+        .bind(lease_until)
+        .bind(now_str)
         .bind(&request_id)
         .bind(&status)
         .execute(&mut *tx)
@@ -372,7 +437,7 @@ impl Database {
                 worker_id: worker_id.to_string(),
                 token: token.to_string(),
                 generation: job.claim_generation,
-                lease_until: parse_datetime(&lease_until),
+                lease_until: unix_micros_to_datetime(lease_until)?,
             },
             job,
         }))
@@ -401,13 +466,13 @@ impl Database {
             }
             return Ok(ProductCreationPinOutcome::Conflict(existing));
         }
-        let now = Utc::now().to_rfc3339();
+        let now = unix_micros_now();
         sqlx::query(
             "UPDATE product_creation_jobs
              SET pin_exact_checkout_oid = ?2,
                  pin_logical_base = ?3,
                  pin_freshness = ?4,
-                 updated_at = ?5
+                 updated_at_unix_micros = ?5
              WHERE request_id = ?1
                AND pin_exact_checkout_oid IS NULL
                AND pin_logical_base IS NULL
@@ -417,7 +482,7 @@ impl Database {
         .bind(exact_checkout_oid)
         .bind(logical_base)
         .bind(freshness)
-        .bind(&now)
+        .bind(now)
         .execute(&self.pool)
         .await?;
         let current = self
@@ -433,21 +498,83 @@ impl Database {
         &self,
         request_id: &str,
         claim: &ProductCreationClaim,
-        retry_at: DateTime<Utc>,
+        now: DateTime<Utc>,
     ) -> DbResult<bool> {
+        let Some(retry_at) = next_product_creation_retry_at(claim.generation, now) else {
+            let updated = sqlx::query(
+                "UPDATE product_creation_jobs
+                 SET status = 'failed', claim_worker_id = NULL, claim_token = NULL,
+                     claim_lease_until_unix_micros = NULL, retry_at_unix_micros = NULL,
+                     updated_at_unix_micros = ?4
+                 WHERE request_id = ?1 AND status = 'claimed' AND claim_generation = ?2
+                   AND claim_worker_id = ?3 AND claim_token = ?5",
+            )
+            .bind(request_id)
+            .bind(claim.generation)
+            .bind(&claim.worker_id)
+            .bind(datetime_to_unix_micros(now))
+            .bind(&claim.token)
+            .execute(&self.pool)
+            .await?;
+            return Ok(updated.rows_affected() == 1);
+        };
         let updated = sqlx::query(
             "UPDATE product_creation_jobs
-             SET status = 'retry_scheduled', claim_worker_id = NULL, claim_token = NULL,
-                 claim_lease_until = NULL, retry_at = ?4, updated_at = ?5
+             SET status = 'retry_scheduled', attempt_count = attempt_count + 1,
+                 claim_worker_id = NULL, claim_token = NULL,
+                 claim_lease_until_unix_micros = NULL, retry_at_unix_micros = ?4,
+                 updated_at_unix_micros = ?5
              WHERE request_id = ?1 AND status = 'claimed' AND claim_generation = ?2
-               AND claim_worker_id = ?3 AND claim_token = ?6",
+               AND claim_worker_id = ?3 AND claim_token = ?6 AND attempt_count < ?7",
         )
         .bind(request_id)
         .bind(claim.generation)
         .bind(&claim.worker_id)
-        .bind(retry_at.to_rfc3339())
-        .bind(Utc::now().to_rfc3339())
+        .bind(datetime_to_unix_micros(retry_at))
+        .bind(datetime_to_unix_micros(now))
         .bind(&claim.token)
+        .bind(PRODUCT_CREATION_MAX_ATTEMPTS)
+        .execute(&self.pool)
+        .await?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    pub async fn schedule_product_creation_delivery_retry(
+        &self,
+        request_id: &str,
+        now: DateTime<Utc>,
+    ) -> DbResult<bool> {
+        let Some(record) = self.get_product_creation_job(request_id).await? else {
+            return Ok(false);
+        };
+        if record.status != "delivery_pending" {
+            return Ok(false);
+        }
+        let next_attempt = record.delivery_attempt_count + 1;
+        let exhausted = next_attempt >= PRODUCT_CREATION_MAX_DELIVERY_ATTEMPTS;
+        let delay_seconds = match next_attempt {
+            2 => 2,
+            3 => 10,
+            _ => 30,
+        };
+        let updated = sqlx::query(
+            "UPDATE product_creation_jobs
+             SET delivery_attempt_count = ?2,
+                 status = CASE WHEN ?3 THEN 'delivery_failed' ELSE status END,
+                 delivery_retry_at_unix_micros = CASE WHEN ?3 THEN NULL ELSE ?4 END,
+                 claim_worker_id = CASE WHEN ?3 THEN NULL ELSE claim_worker_id END,
+                 claim_token = CASE WHEN ?3 THEN NULL ELSE claim_token END,
+                 claim_lease_until_unix_micros = CASE WHEN ?3 THEN NULL ELSE claim_lease_until_unix_micros END,
+                 updated_at_unix_micros = ?5
+             WHERE request_id = ?1 AND status = 'delivery_pending'
+               AND delivery_attempt_count = ?6",
+        )
+        .bind(request_id)
+        .bind(next_attempt)
+        .bind(exhausted)
+        .bind(datetime_to_unix_micros(now + chrono::Duration::seconds(delay_seconds)))
+        .bind(datetime_to_unix_micros(now))
+        .bind(record.delivery_attempt_count)
         .execute(&self.pool)
         .await?;
         Ok(updated.rows_affected() == 1)
@@ -461,28 +588,30 @@ impl Database {
         let updated = sqlx::query(
             "UPDATE product_creation_jobs
              SET status = 'cleanup_ambiguous', claim_worker_id = NULL, claim_token = NULL,
-                 claim_lease_until = NULL, retry_at = NULL, updated_at = ?4
+                 claim_lease_until_unix_micros = NULL, retry_at_unix_micros = NULL,
+                 updated_at_unix_micros = ?4
              WHERE request_id = ?1 AND status = 'claimed' AND claim_generation = ?2
                AND claim_worker_id = ?3 AND claim_token = ?5",
         )
         .bind(request_id)
         .bind(claim.generation)
         .bind(&claim.worker_id)
-        .bind(Utc::now().to_rfc3339())
+        .bind(unix_micros_now())
         .bind(&claim.token)
         .execute(&self.pool)
         .await?;
         Ok(updated.rows_affected() == 1)
     }
 
+    #[allow(clippy::too_many_lines)]
     pub async fn publish_product_creation_atomically(
         &self,
         input: &ProductCreationPublishInput,
     ) -> DbResult<bool> {
-        let now = Utc::now().to_rfc3339();
+        let now = unix_micros_now();
         let mut tx = self.pool.begin().await?;
-        let claimed: Option<(String,)> = sqlx::query_as(
-            "SELECT request_id FROM product_creation_jobs
+        let claimed: Option<(String, String)> = sqlx::query_as(
+            "SELECT request_id, product_conversation_id FROM product_creation_jobs
              WHERE request_id = ?1 AND status = 'claimed' AND claim_generation = ?2
                AND claim_worker_id = ?3 AND claim_token = ?4",
         )
@@ -492,9 +621,16 @@ impl Database {
         .bind(&input.claim.token)
         .fetch_optional(&mut *tx)
         .await?;
-        if claimed.is_none() {
+        let Some((_, stored_product_conversation_id)) = claimed else {
             tx.rollback().await?;
             return Ok(false);
+        };
+        if input.conversation.product_conversation_id.as_str() != stored_product_conversation_id {
+            tx.rollback().await?;
+            return Err(DbError::Serialization(
+                "published conversation product id must match accepted product creation job"
+                    .to_string(),
+            ));
         }
         let conversation_exists: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM conversations WHERE id = ?1")
@@ -518,10 +654,50 @@ impl Database {
             scope_id,
             input.authority_kind,
             input.environment.clone(),
-            &now,
+            &unix_micros_to_datetime(now)?.to_rfc3339(),
         )
         .await?;
         insert_conversation_tx(&mut tx, &input.conversation).await?;
+        if let Some(repository_root) = input.repository_root.as_deref() {
+            let repository_id: String = if let Some(id) = input.repository_id.clone() {
+                id
+            } else {
+                sqlx::query_scalar(
+                    "SELECT repository_id FROM git_repository_locator_observations
+                     WHERE locator_kind = 'management_root' AND status = 'present' AND path = ?1
+                     LIMIT 1",
+                )
+                .bind(repository_root)
+                .fetch_optional(&mut *tx)
+                .await?
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+            };
+            sqlx::query("INSERT OR IGNORE INTO git_repositories (id) VALUES (?1)")
+                .bind(&repository_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                "INSERT INTO work_scope_git_repositories (work_scope_id, repository_id)
+                 VALUES (?1, ?2)",
+            )
+            .bind(scope_id.as_str())
+            .bind(&repository_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO git_repository_locator_observations (
+                    repository_id, locator_kind, status, path, observed_at_unix_micros
+                 ) VALUES (?1, 'management_root', 'present', ?2, ?3)
+                 ON CONFLICT(repository_id, locator_kind)
+                 DO UPDATE SET status = excluded.status, path = excluded.path,
+                               observed_at_unix_micros = excluded.observed_at_unix_micros",
+            )
+            .bind(&repository_id)
+            .bind(repository_root)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
         sqlx::query(
             "INSERT INTO product_conversation_work_scopes (product_conversation_id, work_scope_id)
              VALUES (?1, ?2)",
@@ -532,11 +708,12 @@ impl Database {
         .await?;
         let updated = sqlx::query(
             "UPDATE product_creation_jobs
-             SET status = 'delivery_pending', retry_at = NULL, staging_path = ?2,
+             SET status = 'delivery_pending', retry_at_unix_micros = NULL, staging_path = ?2,
                  staging_repo_root = ?3, staging_exact_oid = ?4,
-                 published_product_id = ?5, published_conversation_id = ?6, updated_at = ?7
-             WHERE request_id = ?1 AND status = 'claimed' AND claim_generation = ?8
-               AND claim_worker_id = ?9 AND claim_token = ?10",
+                 published_product_id = ?5, published_conversation_id = ?6,
+                 delivery_retry_at_unix_micros = ?7, updated_at_unix_micros = ?8
+             WHERE request_id = ?1 AND status = 'claimed' AND claim_generation = ?9
+               AND claim_worker_id = ?10 AND claim_token = ?11",
         )
         .bind(&input.request_id)
         .bind(match &input.environment {
@@ -547,10 +724,11 @@ impl Database {
             EnvironmentContext::None => None,
         })
         .bind(input.repository_root.as_deref())
-        .bind(input.repository_id.as_deref())
+        .bind(input.exact_checkout_oid.as_deref())
         .bind(input.conversation.product_conversation_id.as_str())
         .bind(&input.conversation.id)
-        .bind(&now)
+        .bind(now + 2_000_000)
+        .bind(now)
         .bind(input.claim.generation)
         .bind(&input.claim.worker_id)
         .bind(&input.claim.token)
@@ -574,14 +752,15 @@ impl Database {
     ) -> DbResult<bool> {
         let updated = sqlx::query(
             "UPDATE product_creation_jobs
-             SET staging_path = ?1, staging_repo_root = ?2, staging_exact_oid = ?3, updated_at = ?4
+             SET staging_path = ?1, staging_repo_root = ?2, staging_exact_oid = ?3,
+                 updated_at_unix_micros = ?4
              WHERE request_id = ?5 AND status = 'claimed' AND claim_generation = ?6
                AND claim_worker_id = ?7 AND claim_token = ?8",
         )
         .bind(staging_path)
         .bind(repo_root)
         .bind(exact_oid)
-        .bind(Utc::now().to_rfc3339())
+        .bind(unix_micros_now())
         .bind(request_id)
         .bind(claim.generation)
         .bind(&claim.worker_id)
@@ -595,18 +774,23 @@ impl Database {
         &self,
     ) -> DbResult<Option<ProductCreationJobRecord>> {
         sqlx::query(
-            "SELECT j.request_id, j.cwd, j.objective, j.model, j.effort, j.status,
-                    j.accepted_at, j.updated_at, j.claim_generation, j.claim_worker_id,
-                    j.claim_token, j.claim_lease_until, j.retry_at,
+            "SELECT j.request_id, j.product_conversation_id, j.cwd, j.objective, j.model, j.effort, j.status,
+                    j.accepted_at_unix_micros, j.updated_at_unix_micros, j.attempt_count,
+                    j.claim_generation, j.claim_worker_id, j.claim_token,
+                    j.claim_lease_until_unix_micros, j.retry_at_unix_micros,
+                    j.delivery_attempt_count, j.delivery_retry_at_unix_micros,
                     j.pin_exact_checkout_oid, j.pin_logical_base, j.pin_freshness,
                     j.staging_path, j.staging_repo_root, j.staging_exact_oid,
                     j.published_product_id, j.published_conversation_id,
                     COALESCE((SELECT json_group_array(json_object('media_type', i.media_type, 'data', i.data))
                               FROM product_creation_job_images i WHERE i.request_id = j.request_id
                               ORDER BY i.ordinal), '[]') AS images_json
-             FROM product_creation_jobs j WHERE j.status = 'delivery_pending'
-             ORDER BY j.updated_at, j.request_id LIMIT 1",
+             FROM product_creation_jobs j
+             WHERE j.status = 'delivery_pending'
+               AND (j.delivery_retry_at_unix_micros IS NULL OR j.delivery_retry_at_unix_micros <= ?1)
+             ORDER BY j.delivery_retry_at_unix_micros, j.updated_at_unix_micros, j.request_id LIMIT 1",
         )
+        .bind(unix_micros_now())
         .try_map(parse_product_creation_job_row)
         .fetch_optional(&self.pool)
         .await
@@ -617,10 +801,11 @@ impl Database {
         let updated = sqlx::query(
             "UPDATE product_creation_jobs
              SET status = 'published', claim_worker_id = NULL, claim_token = NULL,
-                 claim_lease_until = NULL, updated_at = ?1
+                 claim_lease_until_unix_micros = NULL, delivery_retry_at_unix_micros = NULL,
+                 updated_at_unix_micros = ?1
              WHERE request_id = ?2 AND status = 'delivery_pending'",
         )
-        .bind(Utc::now().to_rfc3339())
+        .bind(unix_micros_now())
         .bind(request_id)
         .execute(&self.pool)
         .await?;
@@ -628,16 +813,47 @@ impl Database {
     }
 
     pub async fn next_product_creation_deadline(&self) -> DbResult<Option<DateTime<Utc>>> {
-        let deadline: Option<String> = sqlx::query_scalar(
+        let deadline: Option<i64> = sqlx::query_scalar(
             "SELECT MIN(deadline) FROM (
-                 SELECT retry_at AS deadline FROM product_creation_jobs WHERE status = 'retry_scheduled'
-                 UNION ALL SELECT claim_lease_until FROM product_creation_jobs WHERE status = 'claimed'
-                 UNION ALL SELECT updated_at FROM product_creation_jobs WHERE status = 'delivery_pending'
+                 SELECT retry_at_unix_micros AS deadline FROM product_creation_jobs WHERE status = 'retry_scheduled'
+                 UNION ALL SELECT claim_lease_until_unix_micros FROM product_creation_jobs WHERE status = 'claimed'
+                 UNION ALL SELECT delivery_retry_at_unix_micros FROM product_creation_jobs WHERE status = 'delivery_pending'
              )",
         )
         .fetch_one(&self.pool)
         .await?;
-        Ok(deadline.as_deref().map(parse_datetime))
+        Ok(deadline.map(unix_micros_to_datetime).transpose()?)
+    }
+
+    pub async fn repository_management_root_for_work_scope(
+        &self,
+        work_scope_id: &WorkScopeId,
+    ) -> DbResult<Option<String>> {
+        sqlx::query_scalar(
+            "SELECT locator.path
+             FROM work_scope_git_repositories attachment
+             JOIN git_repository_locator_observations locator
+               ON locator.repository_id = attachment.repository_id
+              AND locator.locator_kind = 'management_root' AND locator.status = 'present'
+             WHERE attachment.work_scope_id = ?1",
+        )
+        .bind(work_scope_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(DbError::from)
+    }
+
+    pub async fn work_scope_has_git_repository(
+        &self,
+        work_scope_id: &WorkScopeId,
+    ) -> DbResult<bool> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM work_scope_git_repositories WHERE work_scope_id = ?1",
+        )
+        .bind(work_scope_id.as_str())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count == 1)
     }
 
     pub async fn recent_distinct_published_product_creation_cwds(
@@ -645,14 +861,17 @@ impl Database {
         limit: usize,
     ) -> DbResult<Vec<String>> {
         let rows = sqlx::query_scalar::<_, String>(
-            "SELECT cwd
-             FROM (
-                SELECT cwd, MAX(updated_at) AS latest_updated_at
-                FROM product_creation_jobs
-                WHERE status IN ('delivery_pending', 'published')
-                GROUP BY cwd
-             ) ranked
-             ORDER BY latest_updated_at DESC, cwd DESC
+            "SELECT locator.path
+             FROM product_creation_jobs job
+             JOIN conversations conversation ON conversation.id = job.published_conversation_id
+             JOIN work_scope_git_repositories attachment
+               ON attachment.work_scope_id = conversation.work_scope_id
+             JOIN git_repository_locator_observations locator
+               ON locator.repository_id = attachment.repository_id
+              AND locator.locator_kind = 'management_root' AND locator.status = 'present'
+             WHERE job.status IN ('delivery_pending', 'published')
+             GROUP BY locator.path
+             ORDER BY MAX(job.updated_at_unix_micros) DESC, locator.path DESC
              LIMIT ?1",
         )
         .bind(
@@ -745,6 +964,233 @@ mod product_creation_tests {
     }
 
     #[tokio::test]
+    async fn product_creation_accept_allocates_server_owned_product_id_and_allows_image_only() {
+        let db = Database::open_in_memory().await.unwrap();
+        let image_only = ProductCreationIntent {
+            cwd: "/repo/img".to_string(),
+            objective: "   ".to_string(),
+            model: None,
+            effort: None,
+            images: vec![ProductCreationImage {
+                media_type: "image/png".to_string(),
+                data: "abc123".to_string(),
+            }],
+        };
+        let accepted = match db
+            .accept_product_creation("req-img", &image_only)
+            .await
+            .unwrap()
+        {
+            ProductCreationAcceptOutcome::Accepted(job) => job,
+            other @ (ProductCreationAcceptOutcome::Replayed(_)
+            | ProductCreationAcceptOutcome::Conflict(_)) => {
+                panic!("expected accepted, got {other:?}")
+            }
+        };
+        assert_eq!(accepted.intent, image_only);
+        assert_eq!(accepted.attempt_count, 1);
+        assert!(!accepted.product_conversation_id.as_str().is_empty());
+
+        let replay = match db
+            .accept_product_creation("req-img", &image_only)
+            .await
+            .unwrap()
+        {
+            ProductCreationAcceptOutcome::Replayed(job) => job,
+            other @ (ProductCreationAcceptOutcome::Accepted(_)
+            | ProductCreationAcceptOutcome::Conflict(_)) => {
+                panic!("expected replay, got {other:?}")
+            }
+        };
+        assert_eq!(
+            replay.product_conversation_id,
+            accepted.product_conversation_id
+        );
+
+        let err = db
+            .accept_product_creation(
+                "req-empty",
+                &ProductCreationIntent {
+                    cwd: "/repo/empty".to_string(),
+                    objective: " ".to_string(),
+                    model: None,
+                    effort: None,
+                    images: vec![],
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DbError::Serialization(_)));
+    }
+
+    #[tokio::test]
+    async fn product_creation_initial_objective_replay_classification_respects_fingerprint_authority(
+    ) {
+        let db = Database::open_in_memory().await.unwrap();
+        let accepted_intent = intent("/repo/a", "ship it");
+        db.accept_product_creation("req-replay", &accepted_intent)
+            .await
+            .unwrap();
+        assert!(db
+            .product_creation_objective_already_durably_accepted(
+                "req-replay",
+                Some(&SteeringAcceptanceFingerprint::Exact("fp".to_string())),
+                &accepted_intent,
+            )
+            .await
+            .unwrap());
+        assert!(!db
+            .product_creation_objective_already_durably_accepted(
+                "req-replay",
+                Some(&SteeringAcceptanceFingerprint::LegacyUnknown),
+                &accepted_intent,
+            )
+            .await
+            .unwrap());
+        assert!(!db
+            .product_creation_objective_already_durably_accepted(
+                "req-replay",
+                Some(&SteeringAcceptanceFingerprint::Exact("fp".to_string())),
+                &intent("/repo/a", "different"),
+            )
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn product_creation_retry_schedule_is_bounded_to_2_10_30_then_failed() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.accept_product_creation("req-retry", &intent("/repo/a", "retry"))
+            .await
+            .unwrap();
+        let now = Utc::now();
+        let mut claim = db
+            .claim_next_product_creation("worker", "token-1", now, chrono::Duration::minutes(5))
+            .await
+            .unwrap()
+            .unwrap();
+        for (expected_attempt_count, expected_delay_secs) in [(2, 2), (3, 10), (4, 30)] {
+            assert!(db
+                .schedule_product_creation_retry("req-retry", &claim.claim, now)
+                .await
+                .unwrap());
+            let job = db
+                .get_product_creation_job("req-retry")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(job.status, "retry_scheduled");
+            assert_eq!(job.attempt_count, expected_attempt_count);
+            let delta = job.retry_at.unwrap() - now;
+            assert_eq!(delta.num_seconds(), expected_delay_secs);
+            claim = db
+                .claim_product_creation(
+                    "req-retry",
+                    "worker",
+                    &format!("reclaim-{expected_attempt_count}"),
+                    job.retry_at.unwrap(),
+                    chrono::Duration::minutes(5),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let final_claim = claim;
+        assert!(db
+            .schedule_product_creation_retry("req-retry", &final_claim.claim, now)
+            .await
+            .unwrap());
+        let final_job = db
+            .get_product_creation_job("req-retry")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_job.status, "failed");
+        assert_eq!(final_job.attempt_count, 4);
+        assert!(final_job.retry_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn product_creation_delivery_retry_is_bounded_and_not_immediately_requeued() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.accept_product_creation("req-delivery", &intent("/repo/a", "delivery"))
+            .await
+            .unwrap();
+        let claim = db
+            .claim_next_product_creation(
+                "worker",
+                "token",
+                Utc::now(),
+                chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let accepted = db
+            .get_product_creation_job("req-delivery")
+            .await
+            .unwrap()
+            .unwrap();
+        let conv = published_conversation(
+            "conv-delivery",
+            accepted.product_conversation_id,
+            WorkScopeId::new(),
+            "/repo/a",
+        );
+        db.publish_product_creation_atomically(&ProductCreationPublishInput {
+            request_id: "req-delivery".to_string(),
+            claim: claim.claim,
+            conversation: conv,
+            authority_kind: AuthorityKind::Work,
+            environment: EnvironmentContext::UnownedCwd {
+                cwd: "/repo/a".to_string(),
+            },
+            repository_id: None,
+            exact_checkout_oid: Some("repo-id".to_string()),
+            repository_root: Some("/repo/a".to_string()),
+        })
+        .await
+        .unwrap();
+        assert!(db.next_product_creation_delivery().await.unwrap().is_none());
+        let now = Utc::now();
+        assert!(db
+            .schedule_product_creation_delivery_retry("req-delivery", now)
+            .await
+            .unwrap());
+        let pending = db
+            .get_product_creation_job("req-delivery")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.delivery_attempt_count, 2);
+        assert_eq!(
+            pending.delivery_retry_at,
+            Some(now + chrono::Duration::seconds(2))
+        );
+        assert!(db.next_product_creation_delivery().await.unwrap().is_none());
+        assert!(db
+            .schedule_product_creation_delivery_retry("req-delivery", now)
+            .await
+            .unwrap());
+        assert!(db
+            .schedule_product_creation_delivery_retry("req-delivery", now)
+            .await
+            .unwrap());
+        let exhausted = db
+            .get_product_creation_job("req-delivery")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(exhausted.delivery_attempt_count, 4);
+        assert_eq!(exhausted.status, "delivery_failed");
+        assert!(exhausted.delivery_retry_at.is_none());
+        assert!(!db
+            .schedule_product_creation_delivery_retry("req-delivery", now)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
     async fn product_creation_pin_once() {
         let db = Database::open_in_memory().await.unwrap();
         db.accept_product_creation("req-2", &intent("/repo/a", "pin"))
@@ -786,9 +1232,14 @@ mod product_creation_tests {
             .await
             .unwrap()
             .unwrap();
-        let product_id = ProductConversationId::new();
+        let accepted = db.get_product_creation_job("req-3").await.unwrap().unwrap();
         let scope = WorkScopeId::new();
-        let conv = published_conversation("conv-dup", product_id, scope, "/repo/a");
+        let conv = published_conversation(
+            "conv-dup",
+            accepted.product_conversation_id,
+            scope,
+            "/repo/a",
+        );
         db.create_conversation("conv-dup", "conv-dup", "/repo/original", true, None, None)
             .await
             .unwrap();
@@ -802,6 +1253,7 @@ mod product_creation_tests {
                     cwd: "/repo/a".to_string(),
                 },
                 repository_id: None,
+                exact_checkout_oid: None,
                 repository_root: None,
             })
             .await;
@@ -837,7 +1289,8 @@ mod product_creation_tests {
             .await
             .unwrap()
             .unwrap();
-        let product_id = ProductConversationId::new();
+        let accepted = db.get_product_creation_job("req-4").await.unwrap().unwrap();
+        let product_id = accepted.product_conversation_id.clone();
         let scope = WorkScopeId::new();
         let conv =
             published_conversation("conv-owner", product_id.clone(), scope.clone(), "/repo/a");
@@ -851,6 +1304,7 @@ mod product_creation_tests {
                     cwd: "/repo/a".to_string(),
                 },
                 repository_id: None,
+                exact_checkout_oid: None,
                 repository_root: None,
             })
             .await
@@ -866,26 +1320,92 @@ mod product_creation_tests {
     }
 
     #[tokio::test]
+    async fn product_creation_publish_attaches_hidden_repository_and_cascade_delete_clears_job() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.accept_product_creation("req-cascade", &intent("/repo/hidden", "owner"))
+            .await
+            .unwrap();
+        let claim = db
+            .claim_next_product_creation(
+                "worker",
+                "token",
+                Utc::now(),
+                chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let accepted = db
+            .get_product_creation_job("req-cascade")
+            .await
+            .unwrap()
+            .unwrap();
+        let scope = WorkScopeId::new();
+        let product_id = accepted.product_conversation_id.clone();
+        let conv = published_conversation(
+            "conv-cascade",
+            product_id.clone(),
+            scope.clone(),
+            "/repo/hidden",
+        );
+        assert!(db
+            .publish_product_creation_atomically(&ProductCreationPublishInput {
+                request_id: "req-cascade".to_string(),
+                claim: claim.claim,
+                conversation: conv,
+                authority_kind: AuthorityKind::Work,
+                environment: EnvironmentContext::UnownedCwd {
+                    cwd: "/repo/hidden".to_string(),
+                },
+                repository_id: Some("repo-hidden-id".to_string()),
+                exact_checkout_oid: Some("0123456789abcdef".to_string()),
+                repository_root: Some("/repo/hidden".to_string()),
+            })
+            .await
+            .unwrap());
+        let attached: (String, String) = sqlx::query_as(
+            "SELECT work_scope_id, repository_id FROM work_scope_git_repositories WHERE work_scope_id = ?1",
+        )
+        .bind(scope.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(attached.0, scope.as_str());
+        assert_eq!(attached.1, "repo-hidden-id");
+        let locator: (String, String) = sqlx::query_as(
+            "SELECT locator_kind, path FROM git_repository_locator_observations WHERE repository_id = 'repo-hidden-id'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(locator.0, "management_root");
+        assert_eq!(locator.1, "/repo/hidden");
+        sqlx::query("DELETE FROM product_conversations WHERE id = ?1")
+            .bind(product_id.as_str())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(db
+            .get_product_creation_job("req-cascade")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn product_creation_cross_owner_rejected() {
         let db = Database::open_in_memory().await.unwrap();
         let shared_scope = WorkScopeId::new();
-        let product_a = ProductConversationId::new();
-        let product_b = ProductConversationId::new();
-        let conv_a = published_conversation(
-            "conv-a-owner",
-            product_a.clone(),
-            shared_scope.clone(),
-            "/repo/a",
-        );
-        let conv_b = published_conversation(
-            "conv-b-owner",
-            product_b.clone(),
-            shared_scope.clone(),
-            "/repo/b",
-        );
         db.accept_product_creation("req-a", &intent("/repo/a", "a"))
             .await
             .unwrap();
+        let accepted_a = db.get_product_creation_job("req-a").await.unwrap().unwrap();
+        let conv_a = published_conversation(
+            "conv-a-owner",
+            accepted_a.product_conversation_id.clone(),
+            shared_scope.clone(),
+            "/repo/a",
+        );
         let claim_a = db
             .claim_next_product_creation(
                 "worker-a",
@@ -905,6 +1425,7 @@ mod product_creation_tests {
                 cwd: "/repo/a".to_string(),
             },
             repository_id: None,
+            exact_checkout_oid: None,
             repository_root: None,
         })
         .await
@@ -922,6 +1443,13 @@ mod product_creation_tests {
             .await
             .unwrap()
             .unwrap();
+        let accepted_b = db.get_product_creation_job("req-b").await.unwrap().unwrap();
+        let conv_b = published_conversation(
+            "conv-b-owner",
+            accepted_b.product_conversation_id.clone(),
+            shared_scope.clone(),
+            "/repo/b",
+        );
         let err = db
             .publish_product_creation_atomically(&ProductCreationPublishInput {
                 request_id: "req-b".to_string(),
@@ -932,6 +1460,7 @@ mod product_creation_tests {
                     cwd: "/repo/b".to_string(),
                 },
                 repository_id: None,
+                exact_checkout_oid: None,
                 repository_root: None,
             })
             .await
@@ -957,9 +1486,10 @@ mod product_creation_tests {
                 .await
                 .unwrap()
                 .unwrap();
+            let accepted = db.get_product_creation_job(&req).await.unwrap().unwrap();
             let conv = published_conversation(
                 &format!("conv-rec-{idx}"),
-                ProductConversationId::new(),
+                accepted.product_conversation_id,
                 WorkScopeId::new(),
                 cwd,
             );
@@ -971,8 +1501,9 @@ mod product_creation_tests {
                 environment: EnvironmentContext::UnownedCwd {
                     cwd: cwd.to_string(),
                 },
-                repository_id: None,
-                repository_root: None,
+                repository_id: Some(format!("repo-{idx}")),
+                exact_checkout_oid: Some(format!("oid-{idx}")),
+                repository_root: Some(cwd.to_string()),
             })
             .await
             .unwrap();

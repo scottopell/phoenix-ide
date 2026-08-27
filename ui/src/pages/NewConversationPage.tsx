@@ -6,7 +6,7 @@ import { VoiceRecorder } from '../components/VoiceInput/VoiceRecorder';
 import { PaneDivider } from '../components/PaneDivider';
 import { SUPPORTED_IMAGE_TYPES } from '../utils/images';
 import { ExpansionError } from '../api';
-import { beginNewProductConversationIntent, useCreateConversation } from '../hooks/useCreateConversation';
+import { useCreateConversation } from '../hooks/useCreateConversation';
 import { useResizablePane } from '../hooks/useResizablePane';
 import { useIsDesktop } from '../hooks/useMediaQuery';
 import { useInlineReferences } from '../hooks';
@@ -57,10 +57,6 @@ interface NewConversationPageProps {
 }
 
 export function NewConversationPage({ desktopMode }: NewConversationPageProps = {}) {
-  useEffect(() => {
-    beginNewProductConversationIntent();
-  }, []);
-
   const navigate = useNavigate();
   const conv = useCreateConversation(navigate);
   const textareaRef = useRef<HTMLTextAreaElement>(null);

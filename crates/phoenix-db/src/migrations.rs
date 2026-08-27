@@ -2091,39 +2091,47 @@ CREATE UNIQUE INDEX close_obligations_one_active_per_product ON close_obligation
 const MIGRATION_076: &str = r"
 CREATE TABLE product_creation_jobs (
     request_id TEXT PRIMARY KEY CHECK (typeof(request_id) = 'text' AND trim(request_id) <> ''),
+    product_conversation_id TEXT NOT NULL UNIQUE
+        CHECK (typeof(product_conversation_id) = 'text' AND trim(product_conversation_id) <> ''),
     cwd TEXT NOT NULL CHECK (typeof(cwd) = 'text' AND trim(cwd) <> '' AND instr(cwd, char(0)) = 0),
-    objective TEXT NOT NULL CHECK (typeof(objective) = 'text' AND trim(objective) <> ''),
+    objective TEXT NOT NULL CHECK (typeof(objective) = 'text'),
     model TEXT CHECK (model IS NULL OR (typeof(model) = 'text' AND trim(model) <> '')),
     effort TEXT CHECK (effort IS NULL OR (typeof(effort) = 'text' AND trim(effort) <> '')),
-    status TEXT NOT NULL CHECK (status IN ('accepted', 'claimed', 'retry_scheduled', 'delivery_pending', 'published', 'failed', 'cleanup_ambiguous')),
-    accepted_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('accepted', 'claimed', 'retry_scheduled', 'delivery_pending', 'delivery_failed', 'published', 'failed', 'cleanup_ambiguous')),
+    accepted_at_unix_micros INTEGER NOT NULL CHECK (typeof(accepted_at_unix_micros) = 'integer' AND accepted_at_unix_micros >= 0),
+    updated_at_unix_micros INTEGER NOT NULL CHECK (typeof(updated_at_unix_micros) = 'integer' AND updated_at_unix_micros >= 0),
+    attempt_count INTEGER NOT NULL DEFAULT 1 CHECK (typeof(attempt_count) = 'integer' AND attempt_count >= 1 AND attempt_count <= 4),
     claim_generation INTEGER NOT NULL DEFAULT 0 CHECK (typeof(claim_generation) = 'integer' AND claim_generation >= 0),
     claim_worker_id TEXT CHECK (claim_worker_id IS NULL OR (typeof(claim_worker_id) = 'text' AND trim(claim_worker_id) <> '')),
     claim_token TEXT CHECK (claim_token IS NULL OR (typeof(claim_token) = 'text' AND trim(claim_token) <> '')),
-    claim_lease_until TEXT,
-    retry_at TEXT,
+    claim_lease_until_unix_micros INTEGER CHECK (claim_lease_until_unix_micros IS NULL OR (typeof(claim_lease_until_unix_micros) = 'integer' AND claim_lease_until_unix_micros >= 0)),
+    retry_at_unix_micros INTEGER CHECK (retry_at_unix_micros IS NULL OR (typeof(retry_at_unix_micros) = 'integer' AND retry_at_unix_micros >= 0)),
+    delivery_attempt_count INTEGER NOT NULL DEFAULT 1 CHECK (typeof(delivery_attempt_count) = 'integer' AND delivery_attempt_count >= 1 AND delivery_attempt_count <= 4),
+    delivery_retry_at_unix_micros INTEGER CHECK (delivery_retry_at_unix_micros IS NULL OR (typeof(delivery_retry_at_unix_micros) = 'integer' AND delivery_retry_at_unix_micros >= 0)),
     pin_exact_checkout_oid TEXT CHECK (pin_exact_checkout_oid IS NULL OR (typeof(pin_exact_checkout_oid) = 'text' AND trim(pin_exact_checkout_oid) <> '')),
     pin_logical_base TEXT CHECK (pin_logical_base IS NULL OR (typeof(pin_logical_base) = 'text' AND trim(pin_logical_base) <> '')),
     pin_freshness TEXT CHECK (pin_freshness IS NULL OR pin_freshness = 'fresh'),
     staging_path TEXT CHECK (staging_path IS NULL OR (typeof(staging_path) = 'text' AND trim(staging_path) <> '' AND instr(staging_path, char(0)) = 0)),
     staging_repo_root TEXT CHECK (staging_repo_root IS NULL OR (typeof(staging_repo_root) = 'text' AND trim(staging_repo_root) <> '' AND instr(staging_repo_root, char(0)) = 0)),
     staging_exact_oid TEXT CHECK (staging_exact_oid IS NULL OR (typeof(staging_exact_oid) = 'text' AND trim(staging_exact_oid) <> '')),
-    published_product_id TEXT UNIQUE REFERENCES product_conversations(id) ON DELETE SET NULL,
-    published_conversation_id TEXT UNIQUE REFERENCES conversations(id) ON DELETE SET NULL,
-    CHECK ((status = 'accepted' AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until IS NULL AND retry_at IS NULL AND published_product_id IS NULL AND published_conversation_id IS NULL)
-        OR (status = 'claimed' AND claim_worker_id IS NOT NULL AND claim_token IS NOT NULL AND claim_lease_until IS NOT NULL AND retry_at IS NULL AND published_product_id IS NULL AND published_conversation_id IS NULL)
-        OR (status = 'retry_scheduled' AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until IS NULL AND retry_at IS NOT NULL AND published_product_id IS NULL AND published_conversation_id IS NULL)
-        OR (status = 'delivery_pending' AND claim_worker_id IS NOT NULL AND claim_token IS NOT NULL AND claim_lease_until IS NOT NULL AND retry_at IS NULL AND published_product_id IS NOT NULL AND published_conversation_id IS NOT NULL)
-        OR (status = 'published' AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until IS NULL AND retry_at IS NULL AND published_product_id IS NOT NULL AND published_conversation_id IS NOT NULL)
-        OR (status IN ('failed', 'cleanup_ambiguous') AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until IS NULL AND published_product_id IS NULL AND published_conversation_id IS NULL))
+    published_product_id TEXT UNIQUE REFERENCES product_conversations(id) ON DELETE CASCADE,
+    published_conversation_id TEXT UNIQUE REFERENCES conversations(id) ON DELETE CASCADE,
+    CHECK ((status = 'accepted' AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until_unix_micros IS NULL AND retry_at_unix_micros IS NULL AND published_product_id IS NULL AND published_conversation_id IS NULL)
+        OR (status = 'claimed' AND claim_worker_id IS NOT NULL AND claim_token IS NOT NULL AND claim_lease_until_unix_micros IS NOT NULL AND retry_at_unix_micros IS NULL AND published_product_id IS NULL AND published_conversation_id IS NULL)
+        OR (status = 'retry_scheduled' AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until_unix_micros IS NULL AND retry_at_unix_micros IS NOT NULL AND published_product_id IS NULL AND published_conversation_id IS NULL)
+        OR (status = 'delivery_pending' AND claim_worker_id IS NOT NULL AND claim_token IS NOT NULL AND claim_lease_until_unix_micros IS NOT NULL AND retry_at_unix_micros IS NULL AND published_product_id IS NOT NULL AND published_conversation_id IS NOT NULL)
+        OR (status = 'delivery_failed' AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until_unix_micros IS NULL AND retry_at_unix_micros IS NULL AND delivery_retry_at_unix_micros IS NULL AND published_product_id IS NOT NULL AND published_conversation_id IS NOT NULL)
+        OR (status = 'published' AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until_unix_micros IS NULL AND retry_at_unix_micros IS NULL AND published_product_id IS NOT NULL AND published_conversation_id IS NOT NULL)
+        OR (status IN ('failed', 'cleanup_ambiguous') AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until_unix_micros IS NULL AND retry_at_unix_micros IS NULL AND published_product_id IS NULL AND published_conversation_id IS NULL))
 );
 CREATE INDEX product_creation_jobs_claim_order
-    ON product_creation_jobs(status, accepted_at, request_id);
+    ON product_creation_jobs(status, accepted_at_unix_micros, request_id);
 CREATE INDEX product_creation_jobs_retry_order
-    ON product_creation_jobs(status, retry_at, accepted_at, request_id);
+    ON product_creation_jobs(status, retry_at_unix_micros, accepted_at_unix_micros, request_id);
+CREATE INDEX product_creation_jobs_delivery_order
+    ON product_creation_jobs(status, delivery_retry_at_unix_micros, updated_at_unix_micros, request_id);
 CREATE INDEX product_creation_jobs_published_cwd
-    ON product_creation_jobs(status, cwd, updated_at DESC, request_id DESC);
+    ON product_creation_jobs(status, cwd, updated_at_unix_micros DESC, request_id DESC);
 
 CREATE TABLE product_creation_job_images (
     request_id TEXT NOT NULL REFERENCES product_creation_jobs(request_id) ON DELETE CASCADE,

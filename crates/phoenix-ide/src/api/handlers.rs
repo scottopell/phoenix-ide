@@ -1896,6 +1896,34 @@ async fn create_product_conversation(
     State(state): State<AppState>,
     Json(req): Json<CreateProductConversationRequest>,
 ) -> Result<Json<ProductConversationCreateAcceptedResponse>, AppError> {
+    let _owner = state.runtime.acquire_local_authority_pass().map_err(|()| {
+        AppError::Internal("runtime admission closed after fatal local authority loss".to_string())
+    })?;
+    uuid::Uuid::parse_str(&req.request_id)
+        .map_err(|_| AppError::BadRequest("request_id must be a UUID".to_string()))?;
+    if req.objective.trim().is_empty() && req.images.is_empty() {
+        return Err(AppError::BadRequest(
+            "Product creation requires objective text or an image".to_string(),
+        ));
+    }
+    if req.images.len() > 20
+        || req
+            .images
+            .iter()
+            .map(|image| image.data.len())
+            .sum::<usize>()
+            > 35_000_000
+    {
+        return Err(AppError::BadRequest(
+            "Product creation images exceed the request limit".to_string(),
+        ));
+    }
+    if state.llm_registry.get(&req.model).is_none() {
+        return Err(AppError::BadRequest(format!(
+            "Unknown or unavailable model '{}'",
+            req.model
+        )));
+    }
     let canonical_cwd = crate::conversation_cwd::validate_conversation_cwd(&req.cwd)
         .map_err(|error| AppError::BadRequest(error.to_string()))?;
     let intent = crate::db::ProductCreationIntent {
@@ -1926,13 +1954,15 @@ async fn create_product_conversation(
         crate::db::ProductCreationAcceptOutcome::Accepted(_)
         | crate::db::ProductCreationAcceptOutcome::Replayed(_) => {}
     }
-    state.runtime.kick_creation_worker();
     let published = crate::runtime::creation_worker::process_product_creation_request(
         &state.runtime,
         &req.request_id,
     )
     .await
-    .map_err(AppError::Internal)?;
+    .map_err(|message| AppError::TypedInternal {
+        message,
+        error_type: "product_creation_retry_scheduled".to_string(),
+    })?;
     Ok(Json(ProductConversationCreateAcceptedResponse {
         canonical_route: format!(
             "/product-conversations/{}",

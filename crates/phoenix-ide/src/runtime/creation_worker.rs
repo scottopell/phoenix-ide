@@ -89,10 +89,10 @@ async fn process_claimed_product_creation(
     let cwd = job.intent.cwd.clone();
     let repo_root = tokio::task::spawn_blocking({
         let cwd = cwd.clone();
-        move || crate::git_ops::run_git(Path::new(&cwd), &["rev-parse", "--show-toplevel"]).ok()
+        move || discover_product_repository(Path::new(&cwd))
     })
     .await
-    .map_err(|error| format!("repository discovery join failed: {error}"))?;
+    .map_err(|error| format!("repository discovery join failed: {error}"))??;
 
     let (
         effective_cwd,
@@ -134,7 +134,8 @@ async fn process_claimed_product_creation(
                 ),
             }
         };
-        let planned_path = deterministic_worktree_path(&repo_root, &job.request_id);
+        let planned_path =
+            deterministic_worktree_path(&repo_root, job.product_conversation_id.as_str());
         if !manager
             .db()
             .record_product_creation_staging(
@@ -152,9 +153,10 @@ async fn process_claimed_product_creation(
         let worktree = tokio::task::spawn_blocking({
             let repo_root = repo_root.clone();
             let oid = oid.clone();
-            let key = job.request_id.clone();
+            let key = job.product_conversation_id.to_string();
             move || {
                 let _lock = RepositoryMutationLock::acquire(&repo_root).map_err(|e| e.0)?;
+                ensure_phoenix_staging_ignored(Path::new(&repo_root))?;
                 let path = deterministic_worktree_path(&repo_root, &key);
                 if reconcile_owned_worktree_path(&repo_root, &path).map_err(|e| e.0)? {
                     crate::api::handlers::validate_detached_task_worktree(&path, &oid)?;
@@ -212,7 +214,7 @@ async fn process_claimed_product_creation(
         )
     };
 
-    let product_id = phoenix_core::domain::product_conversation::ProductConversationId::new();
+    let product_id = job.product_conversation_id.clone();
     let conversation_id = uuid::Uuid::new_v4().to_string();
     let scope_id = phoenix_core::work_scope::WorkScopeId::new();
     let now = chrono::Utc::now();
@@ -254,7 +256,8 @@ async fn process_claimed_product_creation(
             conversation,
             authority_kind,
             environment,
-            repository_id: staging_oid,
+            repository_id: None,
+            exact_checkout_oid: staging_oid,
             repository_root: staging_repo,
         })
         .await
@@ -283,6 +286,32 @@ async fn deliver_product_creation_objective(
         .published_conversation_id
         .clone()
         .ok_or_else(|| "delivery obligation lacked conversation id".to_string())?;
+    let steering_fingerprint = manager
+        .db()
+        .get_steering_acceptance_fingerprint(&conversation_id, &job.request_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    if manager
+        .db()
+        .product_creation_objective_already_durably_accepted(
+            &job.request_id,
+            steering_fingerprint.as_ref(),
+            &job.intent,
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        && steering_fingerprint.is_some()
+    {
+        manager
+            .db()
+            .complete_product_creation_delivery(&job.request_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        return Ok(PublishedProductCreation {
+            product_conversation_id: product_id.to_string(),
+            transcript_row_id: conversation_id,
+        });
+    }
     let images = job
         .intent
         .images
@@ -292,7 +321,7 @@ async fn deliver_product_creation_objective(
             media_type: image.media_type.clone(),
         })
         .collect();
-    manager
+    if let Err(error) = manager
         .enqueue_steer_message(
             &conversation_id,
             Event::SteerMessage {
@@ -307,7 +336,16 @@ async fn deliver_product_creation_objective(
             &format!("product-create:{}", job.request_id),
         )
         .await
-        .map_err(|error| error.to_string())?;
+    {
+        manager
+            .db()
+            .schedule_product_creation_delivery_retry(&job.request_id, chrono::Utc::now())
+            .await
+            .map_err(|db_error| {
+                format!("{error}; delivery retry persistence failed: {db_error}")
+            })?;
+        return Err(error.to_string());
+    }
     manager
         .db()
         .complete_product_creation_delivery(&job.request_id)
@@ -338,6 +376,7 @@ async fn cleanup_unpublished_product_staging(
         }
         let actual_oid = crate::git_ops::run_git(&path, &["rev-parse", "HEAD^{commit}"])?;
         let actual_root = crate::git_ops::run_git(&path, &["rev-parse", "--show-toplevel"])?;
+        validate_worktree_belongs_to_repository(&repo_root, &path).map_err(|error| error.0)?;
         if actual_oid.trim() != expected_oid || Path::new(actual_root.trim()) != path {
             return Ok::<bool, String>(false);
         }
@@ -367,6 +406,42 @@ async fn cleanup_unpublished_product_staging(
             )
             .await;
     }
+}
+
+fn discover_product_repository(cwd: &Path) -> Result<Option<String>, String> {
+    match crate::git_ops::run_git(cwd, &["rev-parse", "--show-toplevel"]) {
+        Ok(root) => Ok(Some(root)),
+        Err(error) if error.contains("not a git repository") => Ok(None),
+        Err(error) => Err(format!("could not determine repository context: {error}")),
+    }
+}
+
+fn ensure_phoenix_staging_ignored(repo_root: &Path) -> Result<(), String> {
+    let common_dir = crate::git_ops::run_git(repo_root, &["rev-parse", "--git-common-dir"])?;
+    let common_dir = PathBuf::from(common_dir.trim());
+    let common_dir = if common_dir.is_absolute() {
+        common_dir
+    } else {
+        repo_root.join(common_dir)
+    };
+    let exclude_path = common_dir.join("info").join("exclude");
+    std::fs::create_dir_all(
+        exclude_path
+            .parent()
+            .ok_or_else(|| "git exclude path had no parent".to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let existing = std::fs::read_to_string(&exclude_path).unwrap_or_default();
+    if !existing.lines().any(|line| line.trim() == "/.phoenix/") {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&exclude_path)
+            .map_err(|error| error.to_string())?;
+        writeln!(file, "/.phoenix/").map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn strict_product_creation_pin(repo_root: &Path) -> Result<(String, String), String> {

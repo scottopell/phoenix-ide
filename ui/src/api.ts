@@ -1566,7 +1566,12 @@ export const api = {
       body: JSON.stringify(request),
     });
     if (!resp.ok) {
-      const err = await resp.json().catch(() => ({})) as { error?: string };
+      const err = await resp.json().catch(() => ({})) as { error?: string; error_type?: string };
+      if (err.error_type === 'product_creation_retry_scheduled') {
+        const retryable = new Error(err.error || 'Product creation will retry') as Error & { retryable?: boolean };
+        retryable.retryable = true;
+        throw retryable;
+      }
       if (resp.status === 422) {
         throw new ExpansionError(err as ExpansionErrorDetail);
       }

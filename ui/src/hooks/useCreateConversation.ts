@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { api, ExpansionError } from '../api';
 import { subscribeModels } from '../modelsPoller';
 import type { CreateProductConversationRequest, ImageData, ModelEffort, ModelsResponse, RecentManagementRootSuggestion } from '../api';
@@ -10,41 +10,13 @@ import { generateUUID } from '../utils/uuid';
 const LAST_CWD_KEY = 'phoenix-last-cwd';
 const LAST_MODEL_KEY = 'phoenix-last-model';
 const NEW_CONVERSATION_DRAFT_KEY = 'phoenix-new-conversation-draft';
-const PENDING_CREATE_REQUEST_KEY = 'phoenix-pending-product-create-request';
-
-type PendingCreateRequest = {
-  scope: string;
-  requestId: string;
-};
-
-function pendingCreateScope(
-  cwd: string,
-  objective: string,
-  model: string | null,
-  effort: ModelEffort | null,
-): string {
-  return JSON.stringify([cwd.trim(), objective, model, effort]);
-}
-
-function getOrCreatePendingRequestId(scope: string): string {
-  try {
-    const raw = localStorage.getItem(PENDING_CREATE_REQUEST_KEY);
-    if (raw) {
-      const parsed = JSON.parse(raw) as PendingCreateRequest;
-      if (parsed.scope === scope && parsed.requestId) return parsed.requestId;
-    }
-  } catch { /* replace malformed/unavailable state below */ }
-  const pendingRequest = { scope, requestId: generateUUID() };
-  try { localStorage.setItem(PENDING_CREATE_REQUEST_KEY, JSON.stringify(pendingRequest)); } catch { /* retry remains stable in-memory only */ }
-  return pendingRequest.requestId;
-}
-
-function clearPendingCreateRequestId(): void {
-  try { localStorage.removeItem(PENDING_CREATE_REQUEST_KEY); } catch { /* best effort after success */ }
-}
+const REPLAY_CREATE_REQUEST_KEY = 'phoenix-replay-product-create-request';
 
 export function beginNewProductConversationIntent(): void {
-  clearPendingCreateRequestId();
+  try {
+    localStorage.removeItem(REPLAY_CREATE_REQUEST_KEY);
+    localStorage.removeItem('phoenix-pending-product-create-request');
+  } catch { /* best effort */ }
 }
 
 function effortSupportedByModel(models: ModelsResponse | null, modelId: string | null, effort: ModelEffort | null): boolean {
@@ -101,6 +73,13 @@ function clearNewConversationDraft(): void {
 }
 
 export function useCreateConversation(navigate: (path: string) => void) {
+  const requestId = useMemo(() => {
+    try {
+      const replay = localStorage.getItem(REPLAY_CREATE_REQUEST_KEY);
+      if (replay) return replay;
+    } catch { /* use a fresh in-memory identity */ }
+    return generateUUID();
+  }, []);
   const [homeDir, setHomeDir] = useState<string>('');
   const [cwd, setCwd] = useState(() => localStorage.getItem(LAST_CWD_KEY) || '');
   const [dirStatus, setDirStatus] = useState<DirStatus>(() =>
@@ -255,9 +234,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
         }
       }
 
-      const requestId = getOrCreatePendingRequestId(
-        pendingCreateScope(trimmedCwd, trimmed, selectedModel, selectedEffort),
-      );
+      try { localStorage.setItem(REPLAY_CREATE_REQUEST_KEY, requestId); } catch { /* in-memory identity remains stable */ }
       if (files.length > 0) {
         setError('File attachments are not available for this conversation flow yet.');
         setCreating(false);
@@ -281,7 +258,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
       setImages([]);
       setFiles([]);
       clearNewConversationDraft();
-      clearPendingCreateRequestId();
+      try { localStorage.removeItem(REPLAY_CREATE_REQUEST_KEY); } catch { /* best effort after success */ }
       navigate(response.canonical_route);
     } catch (err) {
       setCreating(false);
