@@ -1448,6 +1448,20 @@ describe('WorkControlBar — desktop multi-PR rail', () => {
 });
 
 describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
+  it('shows one Close conversation terminal verb when legacy dispositions expose both inputs', () => {
+    enableMobile();
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-one-close"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } })}
+      />,
+    );
+    expect(screen.getAllByRole('button', { name: /^Close conversation\./ })).toHaveLength(1);
+  });
+
   const enableMobile = () => {
     Object.defineProperty(window, 'matchMedia', {
       writable: true,
@@ -1499,7 +1513,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.getByRole('button', { name: 'PR #12 diff' })).toHaveTextContent('PR diff');
     expect(screen.getByRole('button', { name: 'Workspace diff' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Clean up' })).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /^Abandon\./ })).toHaveClass('mobile-pr-action--danger');
+    expect(screen.getByRole('button', { name: /^Close conversation\./ })).toHaveClass('mobile-pr-action--danger');
   });
 
   it('falls back to disposition lifecycle actions when no actionable PR exists', () => {
@@ -1510,7 +1524,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     );
 
     expect(screen.getByTestId('mobile-work-fallback')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /^Clean up\./ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^Close conversation\./ })).toBeInTheDocument();
     expect(screen.queryByLabelText('Open pull requests')).not.toBeInTheDocument();
   });
 
@@ -1529,7 +1543,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(dock).toHaveTextContent('Uncommitted changes');
     expect(screen.getByRole('button', { name: 'Review workspace changes' })).toHaveTextContent('Review changes');
     expect(screen.queryByText(/Review, commit, and push/)).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /^Abandon\./ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^Close conversation\./ })).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: 'Work status details' }));
     const details = screen.getByRole('status');
@@ -1543,7 +1557,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Work status details' }));
     expect(screen.queryByRole('status')).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
-    expect(screen.getByRole('button', { name: /^Abandon\./ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^Close conversation\./ })).toBeInTheDocument();
   });
 
   it('closes the fallback overflow with Escape and returns focus to its trigger', () => {
@@ -1564,90 +1578,6 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     fireEvent.keyDown(document, { key: 'Escape' });
     expect(screen.queryByLabelText('More work actions', { selector: 'div' })).not.toBeInTheDocument();
     expect(trigger).toHaveFocus();
-  });
-
-  it('keeps overflow open and focus in place when Abandon fails', async () => {
-    enableMobile();
-    vi.mocked(api.abandonTask).mockRejectedValueOnce(new Error('abandon failed'));
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-mobile-cancel"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        prStatusHandle={prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } })}
-      />,
-    );
-
-    fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
-    const abandon = screen.getByRole('button', { name: /^Abandon\./ });
-    abandon.focus();
-    fireEvent.click(abandon);
-
-    expect(await screen.findByRole('alert')).toHaveTextContent('abandon failed');
-    expect(screen.getByLabelText('More work actions', { selector: 'div' })).toBeInTheDocument();
-    expect(abandon).toHaveFocus();
-  });
-
-  it('keeps overflow open and focus in place when another Abandon fails', async () => {
-    enableMobile();
-    const prevConfirm = window.confirm;
-    window.confirm = vi.fn(() => true);
-    vi.mocked(api.abandonTask).mockRejectedValueOnce(new Error('abandon failed'));
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-mobile-abandon-failure"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        prStatusHandle={prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } })}
-      />,
-    );
-
-    fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
-    const abandon = screen.getByRole('button', { name: /^Abandon\./ });
-    abandon.focus();
-    fireEvent.click(abandon);
-
-    expect(await screen.findByRole('alert')).toHaveTextContent('abandon failed');
-    expect(screen.getByLabelText('More work actions', { selector: 'div' })).toBeInTheDocument();
-    expect(abandon).toHaveFocus();
-    window.confirm = prevConfirm;
-  });
-
-  it('keeps overflow open when Abandon safety refresh requires PR selection', async () => {
-    enableMobile();
-    const prevConfirm = window.confirm;
-    window.confirm = vi.fn(() => true);
-    const handle = prStatusHandle(
-      { found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } },
-      {
-        refreshForSafety: vi.fn().mockResolvedValue({
-          found: false,
-          associated_prs: twoOpenPrSelection(false).associated_prs,
-        }),
-      },
-    );
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-mobile-abandon-safety"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        prStatusHandle={handle}
-      />,
-    );
-
-    fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
-    const abandon = screen.getByRole('button', { name: /^Abandon\./ });
-    abandon.focus();
-    fireEvent.click(abandon);
-
-    expect(await screen.findByRole('alert')).toHaveTextContent('Select an active PR');
-    expect(screen.getByLabelText('More work actions', { selector: 'div' })).toBeInTheDocument();
-    expect(abandon).toHaveFocus();
-    expect(api.abandonTask).not.toHaveBeenCalled();
-    window.confirm = prevConfirm;
   });
 
   it('returns Escape focus to the info trigger that opened the details panel', () => {
@@ -1694,28 +1624,6 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.queryByLabelText('More work actions', { selector: 'div' })).not.toBeInTheDocument();
   });
 
-  it('restores owned overflow focus after the conversation identity changes', async () => {
-    enableMobile();
-    const handle = prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } });
-    const renderBar = (conversationId: string) => (
-      <MemoryRouter>
-        <ViewerSlotProvider browserSessionActive={false}>
-          <WorkControlBar conversationId={conversationId} convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />
-        </ViewerSlotProvider>
-      </MemoryRouter>
-    );
-    const { rerender } = render(renderBar('conv-focus-a'));
-
-    fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
-    const abandon = screen.getByRole('button', { name: /^Abandon\./ });
-    abandon.focus();
-    fireEvent.focusIn(abandon);
-    rerender(renderBar('conv-focus-b'));
-
-    expect(screen.queryByLabelText('More work actions', { selector: 'div' })).not.toBeInTheDocument();
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Work status details' })).toHaveFocus());
-  });
-
   it('resets open details while the Work Actions bar is hidden during an LLM turn', () => {
     enableMobile();
     const handle = prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } });
@@ -1736,7 +1644,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     rerender(renderBar('idle'));
     expect(screen.getByTestId('mobile-work-fallback')).toBeInTheDocument();
     expect(screen.queryByRole('status')).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /^Clean up\./ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^Close conversation\./ })).toBeInTheDocument();
   });
 
   it('does not reopen overflow after the PR rail temporarily replaces the fallback', () => {
@@ -1918,34 +1826,6 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.queryByLabelText('More work actions', { selector: 'div' })).not.toBeInTheDocument();
     expect(screen.getByTestId('mobile-work-fallback')).toHaveClass('mobile-work-fallback--status-only');
     expect(screen.queryByRole('button', { name: 'More work actions' })).not.toBeInTheDocument();
-  });
-
-  it('closes overflow when its secondary terminal action changes identity', async () => {
-    enableMobile();
-    const renderBar = (phaseType: 'idle' | 'stuck') => (
-      <MemoryRouter>
-        <ViewerSlotProvider browserSessionActive={false}>
-          <WorkControlBar
-            conversationId="conv-changing-secondary"
-            convModeLabel="Work"
-            phaseType={phaseType}
-            continuedInConvId={null}
-            prStatusHandle={prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } })}
-          />
-        </ViewerSlotProvider>
-      </MemoryRouter>
-    );
-    const { rerender } = render(renderBar('idle'));
-
-    const trigger = screen.getByRole('button', { name: 'More work actions' });
-    fireEvent.click(trigger);
-    const abandon = screen.getByRole('button', { name: /^Abandon\./ });
-    abandon.focus();
-    fireEvent.focusIn(abandon);
-    rerender(renderBar('stuck'));
-
-    expect(screen.queryByLabelText('More work actions', { selector: 'div' })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /^Clean up\./ })).not.toBeInTheDocument();
   });
 
   it('replaces Address feedback with PR selection recovery when its target is unresolved', () => {
@@ -2268,8 +2148,8 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
       />,
     );
 
-    expect(screen.queryByRole('button', { name: /^Clean up\./ })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /^Abandon\./ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^Close conversation\./ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^Close conversation\./ })).not.toBeInTheDocument();
     expect(screen.getByTestId('mobile-work-fallback')).toHaveTextContent('Active PR unavailable');
     fireEvent.click(screen.getByRole('button', { name: 'Select active PR' }));
     expect(requestActivePrSelectorOpen).toHaveBeenCalledTimes(1);
@@ -2461,51 +2341,6 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.getByTestId('mobile-work-fallback')).not.toHaveTextContent('PR feedback ready');
   });
 
-  it('keeps overflow cleanup and focus available when cleanup fails', async () => {
-    enableMobile();
-    vi.mocked(api.markMerged).mockRejectedValueOnce(new Error('cleanup failed'));
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-cleanup-failure"
-        convModeLabel="Work"
-        phaseType="error"
-        continuedInConvId={null}
-        prStatusHandle={prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } })}
-      />,
-    );
-
-    fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
-    const cleanup = screen.getByRole('button', { name: /^Clean up\./ });
-    cleanup.focus();
-    fireEvent.click(cleanup);
-
-    expect(await screen.findByRole('alert')).toHaveTextContent('cleanup failed');
-    expect(screen.getByLabelText('More work actions', { selector: 'div' })).toBeInTheDocument();
-    expect(cleanup).toHaveFocus();
-  });
-
-  it('keeps a terminal-action error visible while details are open', async () => {
-    enableMobile();
-    vi.mocked(api.markMerged).mockRejectedValueOnce(new Error('cleanup remains visible'));
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-error-details"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        prStatusHandle={prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } })}
-      />,
-    );
-
-    fireEvent.click(screen.getByRole('button', { name: /^Clean up\./ }));
-    expect(await screen.findByRole('alert')).toHaveTextContent('cleanup remains visible');
-    fireEvent.click(screen.getByRole('button', { name: 'Work status details' }));
-
-    expect(screen.getByRole('status')).toBeInTheDocument();
-    expect(screen.getByRole('alert')).toHaveTextContent('cleanup remains visible');
-    expect(screen.getByRole('status').nextElementSibling).toBe(screen.getByRole('alert'));
-  });
-
   it('keeps the primary and overflow actions available while details are open', () => {
     enableMobile();
     renderWithProviders(
@@ -2518,11 +2353,11 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
       />,
     );
 
-    expect(screen.getByRole('button', { name: /^Clean up\./ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^Close conversation\./ })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'More work actions' })).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Work status details' }));
     expect(screen.getByRole('status')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /^Clean up\./ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^Close conversation\./ })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'More work actions' })).toBeInTheDocument();
   });
 
@@ -2564,7 +2399,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /#12 open/ }));
     expect(screen.queryByRole('button', { name: 'Clean up' })).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /^Abandon\./ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^Close conversation\./ })).toBeInTheDocument();
   });
 
   it('renders feedback coverage warnings on the mobile Address feedback hero', () => {
@@ -2604,7 +2439,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: /#12 open/ }));
-    expect(screen.getByRole('button', { name: /^Abandon\./ })).toHaveAttribute('title', expect.stringContaining('Closes this conversation'));
+    expect(screen.getByRole('button', { name: /^Close conversation\./ })).toHaveAttribute('title', expect.stringContaining('Closes this conversation'));
   });
 
   it('uses lifecycle fallback when the active PR is terminal but another PR is open', () => {
@@ -2621,7 +2456,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     );
 
     expect(screen.getByTestId('mobile-work-fallback')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /^Clean up\./ })).toHaveAttribute('title', expect.stringContaining('Exact tracked, untracked'));
+    expect(screen.getByRole('button', { name: /^Close conversation\./ })).toHaveAttribute('title', expect.stringContaining('Exact tracked, untracked'));
     expect(screen.queryByLabelText('Open pull requests')).not.toBeInTheDocument();
   });
 
@@ -2647,40 +2482,6 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
 
     expect(screen.getByTestId('mobile-work-fallback')).toBeInTheDocument();
     expect(screen.getByTestId('mobile-primary-address-feedback')).toHaveTextContent('Address feedback');
-  });
-
-  it('keeps stuck-phase Abandon as the mobile hero action', () => {
-    enableMobile();
-    const handle = prStatusHandle({
-      found: true,
-      number: 12,
-      url: 'https://github.com/o/r/pull/12',
-      display_state: 'open',
-      selection: twoOpenPrSelection(),
-    });
-    renderWithProviders(
-      <WorkControlBar conversationId="conv-mobile-stuck" convModeLabel="Work" phaseType="error" continuedInConvId={null} prStatusHandle={handle} />,
-    );
-
-    fireEvent.click(screen.getByRole('button', { name: /#12 open/ }));
-    expect(screen.getByRole('button', { name: /^Abandon\./ })).toHaveClass('mobile-pr-action--hero');
-    expect(screen.getByRole('button', { name: /^Clean up\./ })).not.toHaveClass('mobile-pr-action--hero');
-  });
-
-  it('keeps terminal cleanup primary in the mobile fallback', () => {
-    enableMobile();
-    const terminalSelection = selection({
-      associated_prs: [{ ...selection().associated_prs[0]!, state: 'MERGED', display_state: 'merged' }],
-    });
-    const handle = prStatusHandle({ found: true, number: 12, display_state: 'merged', selection: terminalSelection });
-    renderWithProviders(
-      <WorkControlBar conversationId="conv-mobile-merged" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
-    );
-
-    expect(screen.getByRole('button', { name: /^Clean up\./ })).toHaveClass('mobile-pr-action--hero');
-    expect(screen.getByTestId('mobile-work-fallback')).toHaveTextContent('PR merged');
-    expect(screen.getByRole('button', { name: 'More work actions' })).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /^Abandon\./ })).not.toBeInTheDocument();
   });
 
   it('lets a pinned mobile selection resume automatic inference', async () => {

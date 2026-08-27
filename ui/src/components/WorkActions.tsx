@@ -407,7 +407,7 @@ export function WorkControlBar({
 
   const fallbackOverflowAction = !cleanupBlockedByAmbiguity && disposition.showCleanUp && disposition.primary !== 'clean_up'
     ? 'clean_up'
-    : !cleanupBlockedByAmbiguity && disposition.showAbandon && !disposition.showCleanUp && disposition.primary !== 'abandon'
+    : !cleanupBlockedByAmbiguity && disposition.showAbandon && disposition.primary !== 'abandon'
       ? 'abandon'
       : null;
   const fallbackHasOverflowActions = fallbackOverflowAction !== null;
@@ -877,7 +877,7 @@ export function WorkControlBar({
                 Close conversation
               </button>
             )}
-            {disposition.showAbandon && !disposition.showCleanUp && disposition.primary !== 'abandon' && !cleanupBlockedByAmbiguity && (
+            {disposition.showAbandon && disposition.primary !== 'abandon' && !cleanupBlockedByAmbiguity && (
               <button
                 type="button"
                 className="mobile-pr-action mobile-pr-action--danger"
@@ -982,7 +982,7 @@ export function WorkControlBar({
                   <span className="mobile-pr-action-icon" aria-hidden="true">—</span><span>Close conversation</span>
                 </button>
               )}
-              {!cleanupBlockedByAmbiguity && disposition.showAbandon && !disposition.showCleanUp && disposition.primary !== 'abandon' && (
+              {!cleanupBlockedByAmbiguity && disposition.showAbandon && disposition.primary !== 'abandon' && (
                 <button
                   type="button"
                   className="mobile-pr-action mobile-pr-action--danger"
@@ -1135,7 +1135,7 @@ export function WorkControlBar({
             <InfoHint text={closeHintText()} />
           </div>
         )}
-        {!cleanupBlockedByAmbiguity && disposition.showAbandon && !disposition.showCleanUp && (
+        {!cleanupBlockedByAmbiguity && disposition.showAbandon && (
           <div className="desktop-work-actions-terminal">
             <button
               className={`work-actions-btn work-actions-abandon${primaryClass('abandon')}`}
