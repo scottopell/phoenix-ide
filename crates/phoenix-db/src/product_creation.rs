@@ -886,7 +886,8 @@ impl Database {
              SET status = 'delivery_pending', retry_at_unix_micros = NULL, staging_path = ?2,
                  staging_repo_root = ?3, staging_exact_oid = ?4,
                  published_product_id = ?5, published_conversation_id = ?6,
-                 delivery_retry_at_unix_micros = ?7, updated_at_unix_micros = ?8
+                 delivery_retry_at_unix_micros = ?7, updated_at_unix_micros = ?8,
+                 claim_worker_id = NULL, claim_token = NULL, claim_lease_until_unix_micros = NULL
              WHERE request_id = ?1 AND status = 'claimed' AND claim_generation = ?9
                AND claim_worker_id = ?10 AND claim_token = ?11",
         )
@@ -957,32 +958,72 @@ impl Database {
         Ok(updated.rows_affected() == 1)
     }
 
-    pub async fn next_product_creation_delivery(
+    pub async fn claim_next_product_creation_delivery(
         &self,
-    ) -> DbResult<Option<ProductCreationJobRecord>> {
-        sqlx::query(
-            "SELECT j.request_id, j.product_conversation_id, j.cwd, j.objective, j.model, j.effort, j.llm_language, j.status,
-                    j.accepted_at_unix_micros, j.updated_at_unix_micros, j.attempt_count,
-                    j.claim_generation, j.claim_worker_id, j.claim_token,
-                    j.claim_lease_until_unix_micros, j.retry_at_unix_micros,
-                    j.delivery_attempt_count, j.delivery_retry_at_unix_micros,
-                    j.pin_exact_checkout_oid, j.pin_logical_base, j.pin_freshness,
-                    j.staging_path, j.staging_repo_root, j.staging_exact_oid,
-                    j.published_product_id, j.published_conversation_id, j.last_error,
-                    j.cancelled_at_unix_micros, j.deletion_requested_at_unix_micros,
-                    COALESCE((SELECT json_group_array(json_object('media_type', i.media_type, 'data', i.data))
-                              FROM product_creation_job_images i WHERE i.request_id = j.request_id
-                              ORDER BY i.ordinal), '[]') AS images_json
-             FROM product_creation_jobs j
-             WHERE j.status = 'delivery_pending'
-               AND (j.delivery_retry_at_unix_micros IS NULL OR j.delivery_retry_at_unix_micros <= ?1)
-             ORDER BY j.delivery_retry_at_unix_micros, j.updated_at_unix_micros, j.request_id LIMIT 1",
+        worker_id: &str,
+        token: &str,
+        now: DateTime<Utc>,
+        lease_duration: chrono::Duration,
+    ) -> DbResult<Option<ClaimedProductCreationJob>> {
+        let now_micros = datetime_to_unix_micros(now);
+        let lease_until = datetime_to_unix_micros(now + lease_duration);
+        let mut tx = self.pool.begin().await?;
+        let candidate: Option<(String, i64)> = sqlx::query_as(
+            "SELECT request_id, delivery_attempt_count
+             FROM product_creation_jobs
+             WHERE status = 'delivery_pending'
+               AND (delivery_retry_at_unix_micros IS NULL OR delivery_retry_at_unix_micros <= ?1)
+               AND (claim_lease_until_unix_micros IS NULL OR claim_lease_until_unix_micros <= ?1)
+             ORDER BY delivery_retry_at_unix_micros, updated_at_unix_micros, request_id
+             LIMIT 1",
         )
-        .bind(unix_micros_now())
-        .try_map(parse_product_creation_job_row)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(DbError::from)
+        .bind(now_micros)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((request_id, delivery_attempt_count)) = candidate else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let updated = sqlx::query(
+            "UPDATE product_creation_jobs
+             SET claim_generation = claim_generation + 1,
+                 claim_worker_id = ?1,
+                 claim_token = ?2,
+                 claim_lease_until_unix_micros = ?3,
+                 updated_at_unix_micros = ?4
+             WHERE request_id = ?5 AND status = 'delivery_pending'
+               AND (delivery_retry_at_unix_micros IS NULL OR delivery_retry_at_unix_micros <= ?4)
+               AND (claim_lease_until_unix_micros IS NULL OR claim_lease_until_unix_micros <= ?4)
+               AND delivery_attempt_count = ?6",
+        )
+        .bind(worker_id)
+        .bind(token)
+        .bind(lease_until)
+        .bind(now_micros)
+        .bind(&request_id)
+        .bind(delivery_attempt_count)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        tx.commit().await?;
+        let job = self
+            .get_product_creation_job(&request_id)
+            .await?
+            .ok_or_else(|| {
+                DbError::Serialization("claimed product creation delivery job missing".to_string())
+            })?;
+        Ok(Some(ClaimedProductCreationJob {
+            claim: ProductCreationClaim {
+                worker_id: worker_id.to_string(),
+                token: token.to_string(),
+                generation: job.claim_generation,
+                lease_until: unix_micros_to_datetime(lease_until)?,
+            },
+            job,
+        }))
     }
 
     pub async fn retry_failed_product_creation_delivery(&self, request_id: &str) -> DbResult<bool> {
@@ -1000,16 +1041,37 @@ impl Database {
         Ok(updated.rows_affected() == 1)
     }
 
-    pub async fn complete_product_creation_delivery(&self, request_id: &str) -> DbResult<bool> {
+    pub async fn complete_product_creation_delivery(
+        &self,
+        request_id: &str,
+        claim: &ProductCreationClaim,
+        steering_fingerprint: &SteeringAcceptanceFingerprint,
+        intent: &ProductCreationIntent,
+    ) -> DbResult<bool> {
+        if !self
+            .product_creation_objective_already_durably_accepted(
+                request_id,
+                Some(steering_fingerprint),
+                intent,
+            )
+            .await?
+        {
+            return Ok(false);
+        }
         let updated = sqlx::query(
             "UPDATE product_creation_jobs
              SET status = 'published', claim_worker_id = NULL, claim_token = NULL,
                  claim_lease_until_unix_micros = NULL, delivery_retry_at_unix_micros = NULL,
                  updated_at_unix_micros = ?1
-             WHERE request_id = ?2 AND status = 'delivery_pending'",
+             WHERE request_id = ?2 AND status = 'delivery_pending'
+               AND claim_generation = ?3 AND claim_worker_id = ?4 AND claim_token = ?5
+               AND claim_lease_until_unix_micros > ?1",
         )
         .bind(unix_micros_now())
         .bind(request_id)
+        .bind(claim.generation)
+        .bind(&claim.worker_id)
+        .bind(&claim.token)
         .execute(&self.pool)
         .await?;
         Ok(updated.rows_affected() == 1)
@@ -1924,6 +1986,7 @@ mod product_creation_tests {
             .unwrap());
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn product_creation_delivery_retry_is_bounded_and_not_immediately_requeued() {
         let db = Database::open_in_memory().await.unwrap();
@@ -1968,7 +2031,16 @@ mod product_creation_tests {
         })
         .await
         .unwrap();
-        assert!(db.next_product_creation_delivery().await.unwrap().is_none());
+        assert!(db
+            .claim_next_product_creation_delivery(
+                "delivery-worker-early",
+                "delivery-token-early",
+                Utc::now(),
+                chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap()
+            .is_none());
         let now = Utc::now();
         assert!(db
             .schedule_product_creation_delivery_retry("req-delivery", now)
@@ -1986,7 +2058,16 @@ mod product_creation_tests {
                 (now + chrono::Duration::seconds(2)).timestamp_micros()
             )
         );
-        assert!(db.next_product_creation_delivery().await.unwrap().is_none());
+        assert!(db
+            .claim_next_product_creation_delivery(
+                "delivery-worker-mid",
+                "delivery-token-mid",
+                Utc::now(),
+                chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap()
+            .is_none());
         assert!(db
             .schedule_product_creation_delivery_retry("req-delivery", now)
             .await
@@ -2120,6 +2201,195 @@ mod product_creation_tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn delivery_claim_is_exclusive_across_two_database_handles() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("product-delivery-claim.sqlite");
+        let path = path.to_string_lossy().to_string();
+        let db1 = Database::open(&path).await.unwrap();
+        crate::migrations::run_pending_migrations(db1.pool())
+            .await
+            .unwrap();
+        let db2 = Database::open(&path).await.unwrap();
+        crate::migrations::run_pending_migrations(db2.pool())
+            .await
+            .unwrap();
+
+        db1.accept_product_creation("req-delivery-claim", &intent("/repo/a", "delivery"))
+            .await
+            .unwrap();
+        let claim = db1
+            .claim_next_product_creation(
+                "worker",
+                "token",
+                Utc::now(),
+                chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let accepted = db1
+            .get_product_creation_job("req-delivery-claim")
+            .await
+            .unwrap()
+            .unwrap();
+        let conv = published_conversation(
+            "conv-delivery-claim",
+            accepted.product_conversation_id,
+            WorkScopeId::new(),
+            "/repo/a",
+        );
+        let delivery_claim_at = claim.claim.lease_until + chrono::Duration::seconds(1);
+        db1.publish_product_creation_atomically(&ProductCreationPublishInput {
+            request_id: "req-delivery-claim".to_string(),
+            claim: claim.claim,
+            conversation: conv,
+            authority_kind: AuthorityKind::Work,
+            environment: EnvironmentContext::UnownedCwd {
+                cwd: "/repo/a".to_string(),
+            },
+            repository_attachment: Some(ProductCreationRepositoryAttachment {
+                repository_id: None,
+                exact_checkout_oid: "repo-id".to_string(),
+                repository_root: "/repo/a".to_string(),
+                git_common_dir: "/repo/a/.git".to_string(),
+            }),
+        })
+        .await
+        .unwrap();
+
+        let now = delivery_claim_at;
+        let first = db1
+            .claim_next_product_creation_delivery(
+                "delivery-worker-a",
+                "delivery-token-a",
+                now,
+                chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap();
+        let second = db2
+            .claim_next_product_creation_delivery(
+                "delivery-worker-b",
+                "delivery-token-b",
+                now,
+                chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap();
+        assert!(first.is_some());
+        assert!(second.is_none());
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn delivery_completion_requires_current_claim_and_exact_acceptance() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.accept_product_creation("req-delivery-complete", &intent("/repo/a", "delivery"))
+            .await
+            .unwrap();
+        let claim = db
+            .claim_next_product_creation(
+                "worker",
+                "token",
+                Utc::now(),
+                chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let accepted = db
+            .get_product_creation_job("req-delivery-complete")
+            .await
+            .unwrap()
+            .unwrap();
+        let conv = published_conversation(
+            "conv-delivery-complete",
+            accepted.product_conversation_id,
+            WorkScopeId::new(),
+            "/repo/a",
+        );
+        db.publish_product_creation_atomically(&ProductCreationPublishInput {
+            request_id: "req-delivery-complete".to_string(),
+            claim: claim.claim.clone(),
+            conversation: conv,
+            authority_kind: AuthorityKind::Work,
+            environment: EnvironmentContext::UnownedCwd {
+                cwd: "/repo/a".to_string(),
+            },
+            repository_attachment: Some(ProductCreationRepositoryAttachment {
+                repository_id: None,
+                exact_checkout_oid: "repo-id".to_string(),
+                repository_root: "/repo/a".to_string(),
+                git_common_dir: "/repo/a/.git".to_string(),
+            }),
+        })
+        .await
+        .unwrap();
+        let delivery = db
+            .claim_next_product_creation_delivery(
+                "delivery-worker",
+                "delivery-token",
+                claim.claim.lease_until + chrono::Duration::seconds(1),
+                chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!db
+            .complete_product_creation_delivery(
+                "req-delivery-complete",
+                &delivery.claim,
+                &SteeringAcceptanceFingerprint::Exact("wrong-fingerprint".to_string()),
+                &delivery.job.intent,
+            )
+            .await
+            .unwrap());
+        db.append_steering_entry(
+            "conv-delivery-complete",
+            &phoenix_core::domain::sm_event::SteerEntry {
+                text: delivery.job.intent.objective.clone(),
+                llm_text: None,
+                images: Vec::new(),
+                files: Vec::new(),
+                message_id: "req-delivery-complete".to_string(),
+                user_agent: None,
+                skill_invocation: None,
+            },
+            "product-create:req-delivery-complete",
+        )
+        .await
+        .unwrap();
+        let stale_claim = ProductCreationClaim {
+            worker_id: delivery.claim.worker_id.clone(),
+            token: "stale-token".to_string(),
+            generation: delivery.claim.generation,
+            lease_until: delivery.claim.lease_until,
+        };
+        assert!(!db
+            .complete_product_creation_delivery(
+                "req-delivery-complete",
+                &stale_claim,
+                &SteeringAcceptanceFingerprint::Exact(
+                    "product-create:req-delivery-complete".to_string(),
+                ),
+                &delivery.job.intent,
+            )
+            .await
+            .unwrap());
+        assert!(db
+            .complete_product_creation_delivery(
+                "req-delivery-complete",
+                &delivery.claim,
+                &SteeringAcceptanceFingerprint::Exact(
+                    "product-create:req-delivery-complete".to_string(),
+                ),
+                &delivery.job.intent,
+            )
+            .await
+            .unwrap());
     }
 
     #[tokio::test]

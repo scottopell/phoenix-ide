@@ -16,7 +16,6 @@ use phoenix_core::domain::creation_protocol::{
 use phoenix_llm::ModelRegistry;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,7 +45,25 @@ pub(crate) async fn process_product_creation_request(
                         .to_string(),
                 );
             }
-            return deliver_product_creation_objective(manager, &job).await;
+            let claim = crate::db::ProductCreationClaim {
+                worker_id: job
+                    .claim_worker_id
+                    .clone()
+                    .ok_or_else(|| "delivery_pending job missing claim worker id".to_string())?,
+                token: job
+                    .claim_token
+                    .clone()
+                    .ok_or_else(|| "delivery_pending job missing claim token".to_string())?,
+                generation: job.claim_generation,
+                lease_until: job
+                    .claim_lease_until
+                    .ok_or_else(|| "delivery_pending job missing claim lease".to_string())?,
+            };
+            let claimed = crate::db::ClaimedProductCreationJob {
+                claim,
+                job: job.clone(),
+            };
+            return deliver_product_creation_objective(manager, &claimed).await;
         }
         if job.status == "delivery_failed" {
             return Err(
@@ -345,13 +362,19 @@ async fn process_claimed_product_creation(
         .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "published product creation job disappeared".to_string())?;
-    deliver_product_creation_objective(manager, &delivery).await
+    let claimed = crate::db::ClaimedProductCreationJob {
+        claim: claimed.claim.clone(),
+        job: delivery,
+    };
+    deliver_product_creation_objective(manager, &claimed).await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn deliver_product_creation_objective(
     manager: &Arc<RuntimeManager>,
-    job: &crate::db::ProductCreationJobRecord,
+    claimed: &crate::db::ClaimedProductCreationJob,
 ) -> Result<PublishedProductCreation, String> {
+    let job = &claimed.job;
     let product_id = job
         .published_product_id
         .clone()
@@ -365,26 +388,37 @@ async fn deliver_product_creation_objective(
         .get_steering_acceptance_fingerprint(&conversation_id, &job.request_id)
         .await
         .map_err(|error| error.to_string())?;
-    if manager
-        .db()
-        .product_creation_objective_already_durably_accepted(
-            &job.request_id,
-            steering_fingerprint.as_ref(),
-            &job.intent,
+    if let Some(exact_fingerprint) = steering_fingerprint.as_ref().filter(|fingerprint| {
+        matches!(
+            fingerprint,
+            phoenix_db::SteeringAcceptanceFingerprint::Exact(_)
         )
-        .await
-        .map_err(|error| error.to_string())?
-        && steering_fingerprint.is_some()
-    {
-        manager
+    }) {
+        if manager
             .db()
-            .complete_product_creation_delivery(&job.request_id)
+            .product_creation_objective_already_durably_accepted(
+                &job.request_id,
+                Some(exact_fingerprint),
+                &job.intent,
+            )
             .await
-            .map_err(|error| error.to_string())?;
-        return Ok(PublishedProductCreation {
-            product_conversation_id: product_id.to_string(),
-            transcript_row_id: conversation_id,
-        });
+            .map_err(|error| error.to_string())?
+        {
+            manager
+                .db()
+                .complete_product_creation_delivery(
+                    &job.request_id,
+                    &claimed.claim,
+                    exact_fingerprint,
+                    &job.intent,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            return Ok(PublishedProductCreation {
+                product_conversation_id: product_id.to_string(),
+                transcript_row_id: conversation_id,
+            });
+        }
     }
     let images = job
         .intent
@@ -395,8 +429,9 @@ async fn deliver_product_creation_objective(
             media_type: image.media_type.clone(),
         })
         .collect();
-    if let Err(error) = manager
-        .enqueue_steer_message(
+    let enqueue_result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        manager.enqueue_steer_message(
             &conversation_id,
             Event::SteerMessage {
                 text: job.intent.objective.clone(),
@@ -408,9 +443,24 @@ async fn deliver_product_creation_objective(
                 skill_invocation: None,
             },
             &format!("product-create:{}", job.request_id),
-        )
-        .await
-    {
+        ),
+    )
+    .await;
+    if let Err(error) = enqueue_result {
+        manager
+            .db()
+            .schedule_product_creation_delivery_retry(&job.request_id, chrono::Utc::now())
+            .await
+            .map_err(|db_error| {
+                format!(
+                    "delivery acceptance timed out; delivery retry persistence failed: {db_error}"
+                )
+            })?;
+        return Err(format!(
+            "product creation objective delivery timed out after 30 seconds: {error}"
+        ));
+    }
+    if let Err(error) = enqueue_result.expect("checked timeout above") {
         manager
             .db()
             .schedule_product_creation_delivery_retry(&job.request_id, chrono::Utc::now())
@@ -422,7 +472,15 @@ async fn deliver_product_creation_objective(
     }
     manager
         .db()
-        .complete_product_creation_delivery(&job.request_id)
+        .complete_product_creation_delivery(
+            &job.request_id,
+            &claimed.claim,
+            &crate::db::SteeringAcceptanceFingerprint::Exact(format!(
+                "product-create:{}",
+                job.request_id
+            )),
+            &job.intent,
+        )
         .await
         .map_err(|error| error.to_string())?;
     Ok(PublishedProductCreation {
@@ -652,40 +710,7 @@ fn run_git_with_timeout(
     args: &[&str],
     timeout: Duration,
 ) -> Result<String, String> {
-    let mut child = phoenix_core::git::command();
-    child
-        .current_dir(repo_root)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = child
-        .spawn()
-        .map_err(|error| format!("failed to spawn git {args:?}: {error}"))?;
-    let start = std::time::Instant::now();
-    loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|error| format!("failed waiting for git {args:?}: {error}"))?
-        {
-            let output = child
-                .wait_with_output()
-                .map_err(|error| format!("failed collecting git {args:?}: {error}"))?;
-            if status.success() {
-                return Ok(String::from_utf8_lossy(&output.stdout).to_string());
-            }
-            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
-        }
-        if start.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!(
-                "git {:?} timed out after {} seconds",
-                args,
-                timeout.as_secs()
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    crate::git_ops::run_git_bounded(repo_root, args, timeout)
 }
 
 fn discover_product_repository(cwd: &Path) -> Result<Option<String>, String> {
@@ -868,7 +893,12 @@ pub(crate) async fn drain_pending_jobs(manager: &Arc<RuntimeManager>) -> Result<
     };
     while let Some(delivery) = manager
         .db()
-        .next_product_creation_delivery()
+        .claim_next_product_creation_delivery(
+            &worker_id.0,
+            &uuid::Uuid::new_v4().to_string(),
+            chrono::Utc::now(),
+            chrono::Duration::seconds(30),
+        )
         .await
         .map_err(|error| error.to_string())?
     {
