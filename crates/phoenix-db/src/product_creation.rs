@@ -200,9 +200,13 @@ impl Database {
         let Some(record) = self.get_product_creation_job(request_id).await? else {
             return Ok(false);
         };
+        let expected_fingerprint = format!("product-create:{request_id}");
         Ok(match steering_fingerprint {
             Some(SteeringAcceptanceFingerprint::LegacyUnknown) => false,
-            Some(SteeringAcceptanceFingerprint::Exact(_)) | None => record.intent == *intent,
+            Some(SteeringAcceptanceFingerprint::Exact(exact)) => {
+                exact == &expected_fingerprint && record.intent == *intent
+            }
+            None => record.intent == *intent,
         })
     }
 
@@ -1167,7 +1171,9 @@ mod product_creation_tests {
         assert!(db
             .product_creation_objective_already_durably_accepted(
                 "req-replay",
-                Some(&SteeringAcceptanceFingerprint::Exact("fp".to_string())),
+                Some(&SteeringAcceptanceFingerprint::Exact(
+                    "product-create:req-replay".to_string(),
+                )),
                 &accepted_intent,
             )
             .await
@@ -1183,7 +1189,19 @@ mod product_creation_tests {
         assert!(!db
             .product_creation_objective_already_durably_accepted(
                 "req-replay",
-                Some(&SteeringAcceptanceFingerprint::Exact("fp".to_string())),
+                Some(&SteeringAcceptanceFingerprint::Exact(
+                    "different-payload".to_string(),
+                )),
+                &accepted_intent,
+            )
+            .await
+            .unwrap());
+        assert!(!db
+            .product_creation_objective_already_durably_accepted(
+                "req-replay",
+                Some(&SteeringAcceptanceFingerprint::Exact(
+                    "product-create:req-replay".to_string(),
+                )),
                 &intent("/repo/a", "different"),
             )
             .await
