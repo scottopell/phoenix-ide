@@ -25,7 +25,6 @@ vi.mock('../api', () => {
       listProjectSkills: vi.fn(),
       searchProjectFiles: vi.fn(),
       createProductConversation: vi.fn(),
-      reserveProductRoot: vi.fn(),
       listRecentManagementRootSuggestions: vi.fn(),
       mkdir: vi.fn(),
       listConversations: vi.fn().mockResolvedValue([]),
@@ -85,16 +84,6 @@ describe('/new directory-first product conversation', () => {
     vi.mocked(api.listProjectSkills).mockResolvedValue({ skills: [] });
     vi.mocked(api.searchProjectFiles).mockResolvedValue({ items: [] });
     vi.mocked(api.listRecentManagementRootSuggestions).mockResolvedValue({ suggestions: [] });
-    vi.mocked(api.reserveProductRoot).mockResolvedValue({
-      kind: 'exact_committed_tree',
-      exact_checkout_oid: 'abc123',
-      logical_base: 'main',
-      freshness: 'fresh',
-      root_reservation: {
-        repository_id: null, id: 'reservation-git', cwd: '/repo', kind: 'exact_committed_tree', repo_root: '/repo', exact_checkout_oid: 'abc123',
-        logical_base: 'main', freshness: 'fresh', unresolved_reason: null,
-      },
-    });
     vi.mocked(api.mkdir).mockResolvedValue({ created: true });
     vi.mocked(api.createProductConversation).mockResolvedValue({
       product_conversation_id: 'pc-1',
@@ -116,13 +105,14 @@ describe('/new directory-first product conversation', () => {
     await waitFor(() => expect(api.createProductConversation).toHaveBeenCalledTimes(1));
     const firstRequest = vi.mocked(api.createProductConversation).mock.calls[0]![0];
     expect(firstRequest).toMatchObject({
-      root_reservation: expect.objectContaining({ cwd: '/repo', exact_checkout_oid: 'abc123' }),
+      cwd: '/repo',
       objective: 'Ship it',
       model: 'claude-3-5-sonnet',
-      images: [],
     });
-    expect(firstRequest).toHaveProperty('message_id');
-    expect(firstRequest).toHaveProperty('conversation_id');
+    expect(firstRequest).toHaveProperty('request_id');
+    expect(firstRequest).not.toHaveProperty('conversation_id');
+    expect(firstRequest).not.toHaveProperty('message_id');
+    expect(firstRequest).not.toHaveProperty('root_reservation');
     expect(firstRequest).not.toHaveProperty('mode');
     expect(firstRequest).not.toHaveProperty('base_branch');
     expect(firstRequest).not.toHaveProperty('branch');
@@ -134,13 +124,6 @@ describe('/new directory-first product conversation', () => {
     vi.mocked(api.createProductConversation).mockClear();
     firstPage.unmount();
     vi.mocked(api.validateCwd).mockResolvedValue({ valid: true, is_git: false });
-    vi.mocked(api.reserveProductRoot).mockResolvedValue({
-      kind: 'direct',
-      root_reservation: {
-        repository_id: null, id: 'reservation-direct', cwd: '/plain-dir', kind: 'direct', repo_root: null, exact_checkout_oid: null,
-        logical_base: null, freshness: null, unresolved_reason: null,
-      },
-    });
     localStorage.setItem('phoenix-last-cwd', '/plain-dir');
     renderPage();
 
@@ -151,40 +134,22 @@ describe('/new directory-first product conversation', () => {
     await waitFor(() => expect(api.createProductConversation).toHaveBeenCalledTimes(1));
     const secondRequest = vi.mocked(api.createProductConversation).mock.calls[0]![0];
     expect(secondRequest).toMatchObject({
-      root_reservation: expect.objectContaining({ cwd: '/plain-dir', kind: 'direct' }),
+      cwd: '/plain-dir',
       objective: 'Ship it',
       model: 'claude-3-5-sonnet',
-      images: [],
     });
     expect(Object.keys(secondRequest).sort()).toEqual(Object.keys(firstRequest).sort());
   });
 
-  it('creates a missing directory before reserving and submitting its canonical root', async () => {
+  it('creates a missing directory before submitting with direct cwd', async () => {
     localStorage.setItem('phoenix-last-cwd', '/new-dir');
     vi.mocked(api.validateCwd).mockImplementation(async (path) => (
       path === '/new-dir'
         ? { valid: false } as never
         : { valid: true, is_git: false }
     ));
-    vi.mocked(api.reserveProductRoot).mockResolvedValue({
-      kind: 'direct',
-      root_reservation: {
-        repository_id: null, id: 'reservation-created', cwd: '/new-dir', kind: 'direct', repo_root: null,
-        exact_checkout_oid: null, logical_base: null, freshness: null, unresolved_reason: null,
-      },
-    });
     const order: string[] = [];
     vi.mocked(api.mkdir).mockImplementation(async () => { order.push('mkdir'); return { created: true }; });
-    vi.mocked(api.reserveProductRoot).mockImplementation(async () => {
-      order.push('reserve');
-      return {
-        kind: 'direct',
-        root_reservation: {
-          repository_id: null, id: 'reservation-created', cwd: '/new-dir', kind: 'direct', repo_root: null,
-          exact_checkout_oid: null, logical_base: null, freshness: null, unresolved_reason: null,
-        },
-      };
-    });
     vi.mocked(api.createProductConversation).mockImplementation(async () => {
       order.push('create');
       return { product_conversation_id: 'pc-created', canonical_route: '/product-conversations/pc-created' } as never;
@@ -197,44 +162,12 @@ describe('/new directory-first product conversation', () => {
     fireEvent.click(sendButton());
 
     await waitFor(() => expect(api.createProductConversation).toHaveBeenCalledTimes(1));
-    expect(order.slice(-3)).toEqual(['mkdir', 'reserve', 'create']);
-    expect(vi.mocked(api.createProductConversation).mock.calls[0]![0].root_reservation.id)
-      .toBe('reservation-created');
+    expect(order.slice(-2)).toEqual(['mkdir', 'create']);
+    expect(vi.mocked(api.createProductConversation).mock.calls[0]![0].cwd)
+      .toBe('/new-dir');
   });
 
-  it('reacquires an expired reservation while preserving create identities', async () => {
-    vi.mocked(api.createProductConversation)
-      .mockRejectedValueOnce(new Error('invalid product root reservation'))
-      .mockResolvedValueOnce({ product_conversation_id: 'pc-refreshed', canonical_route: '/product-conversations/pc-refreshed' } as never);
-    vi.mocked(api.reserveProductRoot)
-      .mockResolvedValueOnce({
-        kind: 'exact_committed_tree', exact_checkout_oid: 'abc123', logical_base: 'main', freshness: 'fresh',
-        root_reservation: {
-          repository_id: null, id: 'reservation-expired', cwd: '/repo', kind: 'exact_committed_tree', repo_root: '/repo',
-          exact_checkout_oid: 'abc123', logical_base: 'main', freshness: 'fresh', unresolved_reason: null,
-        },
-      })
-      .mockResolvedValueOnce({
-        kind: 'exact_committed_tree', exact_checkout_oid: 'def456', logical_base: 'main', freshness: 'fresh',
-        root_reservation: {
-          repository_id: null, id: 'reservation-refreshed', cwd: '/repo', kind: 'exact_committed_tree', repo_root: '/repo',
-          exact_checkout_oid: 'def456', logical_base: 'main', freshness: 'fresh', unresolved_reason: null,
-        },
-      });
-
-    renderPage();
-    await screen.findAllByPlaceholderText('What would you like to work on?');
-    fireEvent.change(composerTextarea(), { target: { value: 'Retry expired root' } });
-    fireEvent.click(sendButton());
-    await waitFor(() => expect(api.createProductConversation).toHaveBeenCalledTimes(2));
-    const first = vi.mocked(api.createProductConversation).mock.calls[0]![0];
-    const second = vi.mocked(api.createProductConversation).mock.calls[1]![0];
-    expect(second.root_reservation.id).toBe('reservation-refreshed');
-    expect(second.conversation_id).toBe(first.conversation_id);
-    expect(second.message_id).toBe(first.message_id);
-  });
-
-  it('reuses create identities after an uncertain response', async () => {
+  it('reuses request ids after an uncertain response', async () => {
     vi.mocked(api.createProductConversation)
       .mockRejectedValueOnce(new Error('network response lost'))
       .mockResolvedValueOnce({ product_conversation_id: 'pc-reused', canonical_route: '/product-conversations/pc-reused' } as never);
@@ -249,8 +182,30 @@ describe('/new directory-first product conversation', () => {
 
     const first = vi.mocked(api.createProductConversation).mock.calls[0]![0];
     const second = vi.mocked(api.createProductConversation).mock.calls[1]![0];
-    expect(second.conversation_id).toBe(first.conversation_id);
-    expect(second.message_id).toBe(first.message_id);
+    expect(second.request_id).toBe(first.request_id);
+  });
+
+  it('starts a later deliberate create with a new request id after terminal failure', async () => {
+    vi.mocked(api.createProductConversation).mockRejectedValue(new Error('boom'));
+
+    const firstPage = renderPage();
+    await screen.findAllByPlaceholderText('What would you like to work on?');
+    fireEvent.change(composerTextarea(), { target: { value: 'Try once' } });
+    fireEvent.click(sendButton());
+    await waitFor(() => expect(api.createProductConversation).toHaveBeenCalledTimes(1));
+    const firstRequestId = vi.mocked(api.createProductConversation).mock.calls[0]![0].request_id;
+
+    firstPage.unmount();
+    vi.mocked(api.createProductConversation).mockClear();
+
+    renderPage();
+    await screen.findAllByPlaceholderText('What would you like to work on?');
+    fireEvent.change(composerTextarea(), { target: { value: 'Try again deliberately' } });
+    fireEvent.click(sendButton());
+    await waitFor(() => expect(api.createProductConversation).toHaveBeenCalledTimes(1));
+    const secondRequestId = vi.mocked(api.createProductConversation).mock.calls[0]![0].request_id;
+
+    expect(secondRequestId).not.toBe(firstRequestId);
   });
 
   it('keeps the draft on failure so retry is truthful', async () => {

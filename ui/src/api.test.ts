@@ -419,31 +419,19 @@ describe('directory-first resolution query encoding', () => {
   beforeEach(() => vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => ({ skills: [], items: [] }) })));
   afterEach(() => vi.unstubAllGlobals());
 
-  it('encodes reserved roots as scalar form-decodable fields for skills and files', async () => {
-    const rootReservation = {
-      repository_id: null, id: 'reservation-1',
-      cwd: '/repo',
-      kind: 'exact_committed_tree' as const,
-      repo_root: '/repo',
-      exact_checkout_oid: 'abc123',
-      logical_base: 'main',
-      freshness: 'fresh' as const,
-      unresolved_reason: null,
-    };
-    const resolution = { kind: 'exact_reserved_committed_tree' as const, rootReservation };
-
-    await api.listProjectSkills('/repo', resolution);
-    await api.searchProjectFiles('/repo', 'src', 20, resolution);
+  it('encodes direct resolution for skills and files without reservation fields', async () => {
+    await api.listProjectSkills('/repo', { kind: 'direct' });
+    await api.searchProjectFiles('/repo', 'src', 20, { kind: 'direct' });
 
     const urls = vi.mocked(fetch).mock.calls.map(([url]) => new URL(String(url), 'http://phoenix.test'));
     for (const url of urls) {
-      expect(url.searchParams.get('kind')).toBe('exact_reserved_committed_tree');
-      expect(url.searchParams.get('reservation_id')).toBe('reservation-1');
+      expect(url.searchParams.get('kind')).toBe('direct');
       expect(url.searchParams.get('cwd')).toBe('/repo');
-      expect(url.searchParams.get('repo_root')).toBe('/repo');
-      expect(url.searchParams.get('exact_checkout_oid')).toBe('abc123');
-      expect(url.searchParams.get('logical_base')).toBe('main');
-      expect(url.searchParams.get('freshness')).toBe('fresh');
+      expect(url.searchParams.has('reservation_id')).toBe(false);
+      expect(url.searchParams.has('repo_root')).toBe(false);
+      expect(url.searchParams.has('exact_checkout_oid')).toBe(false);
+      expect(url.searchParams.has('logical_base')).toBe(false);
+      expect(url.searchParams.has('freshness')).toBe(false);
       expect(url.searchParams.has('root_reservation')).toBe(false);
     }
   });

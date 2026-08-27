@@ -13,10 +13,6 @@ import type { FileViewerKind } from './generated/FileViewerKind';
 import type { UsageOverview } from './generated/UsageOverview';
 import type { ConversationUsageDetail } from './generated/ConversationUsageDetail';
 import type { QuotaDetails } from './generated/QuotaDetails';
-import type { ProductRootReservation } from './generated/ProductRootReservation';
-import type { ProductRootReservationFreshness } from './generated/ProductRootReservationFreshness';
-import type { ReserveProductRootResponse } from './generated/ReserveProductRootResponse';
-export type { ProductRootReservation, ProductRootReservationFreshness, ReserveProductRootResponse };
 // Phoenix API Client
 
 export class ApiResponseError extends Error {
@@ -716,14 +712,19 @@ export interface ImageData {
   media_type: string;
 }
 
+export type ProductCreationResolution = { kind: 'direct' };
+
+function applyResolutionOpts(params: URLSearchParams, opts?: ProductCreationResolution): void {
+  params.set('kind', opts?.kind ?? 'direct');
+}
+
 export interface CreateProductConversationRequest {
-  root_reservation: ProductRootReservation;
+  request_id: string;
+  cwd: string;
   objective: string;
-  message_id: string;
-  conversation_id: string;
   model: string;
   effort?: ModelEffort | null;
-  images: ImageData[];
+  images?: ImageData[];
 }
 
 export interface CreateProductConversationResponse {
@@ -1143,23 +1144,6 @@ export type CodexLoginStatus =
   | { kind: 'success'; account_id: string | null; auth_path: string }
   | { kind: 'error'; message: string };
 
-export type ProductCreationResolution =
-  | { kind: 'direct' }
-  | { kind: 'exact_reserved_committed_tree'; rootReservation: ProductRootReservation }
-  | { kind: 'unresolved_exact_reserved_committed_tree'; rootReservation: ProductRootReservation };
-
-function applyResolutionOpts(params: URLSearchParams, opts?: ProductCreationResolution): void {
-  params.set('kind', opts?.kind ?? 'direct');
-  if (opts && opts.kind !== 'direct') {
-    const root = opts.rootReservation;
-    params.set('reservation_id', root.id);
-    params.set('cwd', root.cwd);
-    if (root.repo_root) params.set('repo_root', root.repo_root);
-    if (root.exact_checkout_oid) params.set('exact_checkout_oid', root.exact_checkout_oid);
-    if (root.logical_base) params.set('logical_base', root.logical_base);
-    if (root.freshness) params.set('freshness', root.freshness);
-  }
-}
 
 export type ServiceStatus = 'healthy' | 'stale';
 export type DiscoveryConfidence = 'explicit_api_catalog';
@@ -1571,16 +1555,6 @@ export const api = {
     const resp = await fetch('/api/conversations');
     if (!resp.ok) throw new Error('Failed to list conversations');
     return (await resp.json()).conversations;
-  },
-
-  async reserveProductRoot(cwd: string): Promise<ReserveProductRootResponse> {
-    const resp = await fetch('/api/product-conversations/reserve-root', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ cwd }),
-    });
-    if (!resp.ok) throw new Error('Failed to reserve product conversation root');
-    return resp.json();
   },
 
   async createProductConversation(

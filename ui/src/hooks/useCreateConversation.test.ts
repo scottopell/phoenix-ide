@@ -1,9 +1,14 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 import {
+  beginNewProductConversationIntent,
   reconcileSubscribedModelSelection,
 } from './useCreateConversation';
 
 describe('reconcileSubscribedModelSelection', () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
   it('retains effort when the resolved replacement model supports it', () => {
     const next = reconcileSubscribedModelSelection(
       {
@@ -46,5 +51,19 @@ describe('reconcileSubscribedModelSelection', () => {
     );
 
     expect(next).toEqual({ selectedModel: 'gpt-5', selectedEffort: null });
+  });
+
+  it('clears any pending product create request id when a new intent begins', () => {
+    localStorage.setItem(
+      'phoenix-pending-product-create-request',
+      JSON.stringify({
+        scope: JSON.stringify(['/repo', 'Retry safely', 'claude-3-5-sonnet', null]),
+        requestId: 'req-stale',
+      }),
+    );
+
+    beginNewProductConversationIntent();
+
+    expect(localStorage.getItem('phoenix-pending-product-create-request')).toBeNull();
   });
 });

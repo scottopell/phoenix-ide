@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { api, ExpansionError } from '../api';
 import { subscribeModels } from '../modelsPoller';
-import type { ImageData, ModelEffort, ModelsResponse, ProductRootReservation, RecentManagementRootSuggestion } from '../api';
+import type { CreateProductConversationRequest, ImageData, ModelEffort, ModelsResponse, RecentManagementRootSuggestion } from '../api';
 import type { DirStatus } from '../components/SettingsFields';
 import { SUPPORTED_IMAGE_TYPES, processImageFiles } from '../utils/images';
 import { isWebSpeechSupported } from '../components/VoiceInput/VoiceRecorder';
@@ -10,12 +10,11 @@ import { generateUUID } from '../utils/uuid';
 const LAST_CWD_KEY = 'phoenix-last-cwd';
 const LAST_MODEL_KEY = 'phoenix-last-model';
 const NEW_CONVERSATION_DRAFT_KEY = 'phoenix-new-conversation-draft';
-const PENDING_CREATE_IDENTITY_KEY = 'phoenix-pending-product-create-identity';
+const PENDING_CREATE_REQUEST_KEY = 'phoenix-pending-product-create-request';
 
-type PendingCreateIdentity = {
+type PendingCreateRequest = {
   scope: string;
-  conversationId: string;
-  messageId: string;
+  requestId: string;
 };
 
 function pendingCreateScope(
@@ -27,21 +26,25 @@ function pendingCreateScope(
   return JSON.stringify([cwd.trim(), objective, model, effort]);
 }
 
-function getOrCreatePendingIdentity(scope: string): PendingCreateIdentity {
+function getOrCreatePendingRequestId(scope: string): string {
   try {
-    const raw = localStorage.getItem(PENDING_CREATE_IDENTITY_KEY);
+    const raw = localStorage.getItem(PENDING_CREATE_REQUEST_KEY);
     if (raw) {
-      const parsed = JSON.parse(raw) as PendingCreateIdentity;
-      if (parsed.scope === scope && parsed.conversationId && parsed.messageId) return parsed;
+      const parsed = JSON.parse(raw) as PendingCreateRequest;
+      if (parsed.scope === scope && parsed.requestId) return parsed.requestId;
     }
   } catch { /* replace malformed/unavailable state below */ }
-  const identity = { scope, conversationId: generateUUID(), messageId: generateUUID() };
-  try { localStorage.setItem(PENDING_CREATE_IDENTITY_KEY, JSON.stringify(identity)); } catch { /* retry remains stable in-memory only */ }
-  return identity;
+  const pendingRequest = { scope, requestId: generateUUID() };
+  try { localStorage.setItem(PENDING_CREATE_REQUEST_KEY, JSON.stringify(pendingRequest)); } catch { /* retry remains stable in-memory only */ }
+  return pendingRequest.requestId;
 }
 
-function clearPendingCreateIdentity(): void {
-  try { localStorage.removeItem(PENDING_CREATE_IDENTITY_KEY); } catch { /* best effort after success */ }
+function clearPendingCreateRequestId(): void {
+  try { localStorage.removeItem(PENDING_CREATE_REQUEST_KEY); } catch { /* best effort after success */ }
+}
+
+export function beginNewProductConversationIntent(): void {
+  clearPendingCreateRequestId();
 }
 
 function effortSupportedByModel(models: ModelsResponse | null, modelId: string | null, effort: ModelEffort | null): boolean {
@@ -115,8 +118,6 @@ export function useCreateConversation(navigate: (path: string) => void) {
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [recentManagementRootSuggestions, setRecentManagementRootSuggestions] = useState<RecentManagementRootSuggestion[]>([]);
-  const [rootReservation, setRootReservation] = useState<ProductRootReservation | null>(null);
-  const reservationGenerationRef = useRef(0);
 
   const voiceSupported = isWebSpeechSupported();
   const [interimText, setInterimText] = useState('');
@@ -162,24 +163,6 @@ export function useCreateConversation(navigate: (path: string) => void) {
     return () => { unsub(); };
   }, [selectEffort, selectModel]);
 
-  useEffect(() => {
-    const trimmedCwd = cwd.trim();
-    const generation = ++reservationGenerationRef.current;
-    setRootReservation(null);
-    if (dirStatus !== 'exists' || !trimmedCwd) return;
-    api.reserveProductRoot(trimmedCwd)
-      .then((response) => {
-        if (reservationGenerationRef.current === generation && cwd.trim() === trimmedCwd) {
-          setRootReservation(response.root_reservation);
-        }
-      })
-      .catch((reservationError) => {
-        if (reservationGenerationRef.current === generation) {
-          setError(reservationError instanceof Error ? reservationError.message : 'Failed to reserve creation root');
-        }
-      });
-  }, [cwd, dirStatus]);
-
   useEffect(() => { localStorage.setItem(LAST_CWD_KEY, cwd); }, [cwd]);
   useEffect(() => { if (selectedModel) localStorage.setItem(LAST_MODEL_KEY, selectedModel); }, [selectedModel]);
   useEffect(() => {
@@ -194,8 +177,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
   const canSend = hasMessageContent
     && !creating
     && dirStatus !== 'invalid'
-    && dirStatus !== 'checking'
-    && (rootReservation !== null || dirStatus === 'will-create');
+    && dirStatus !== 'checking';
 
   const addImages = async (files: File[]) => {
     try {
@@ -263,21 +245,18 @@ export function useCreateConversation(navigate: (path: string) => void) {
     setCreating(true);
 
     try {
-      let acceptedRoot = rootReservation;
+      const trimmedCwd = cwd.trim();
       if (dirStatus === 'will-create') {
-        const mkdirResult = await api.mkdir(cwd.trim());
+        const mkdirResult = await api.mkdir(trimmedCwd);
         if (!mkdirResult.created) {
           setError(mkdirResult.error || 'Failed to create directory');
           setCreating(false);
           return;
         }
-        acceptedRoot = (await api.reserveProductRoot(cwd.trim())).root_reservation;
-        setRootReservation(acceptedRoot);
       }
-      if (!acceptedRoot) throw new Error('Creation root is not reserved yet');
 
-      const pendingIdentity = getOrCreatePendingIdentity(
-        pendingCreateScope(cwd, trimmed, selectedModel, selectedEffort),
+      const requestId = getOrCreatePendingRequestId(
+        pendingCreateScope(trimmedCwd, trimmed, selectedModel, selectedEffort),
       );
       if (files.length > 0) {
         setError('File attachments are not available for this conversation flow yet.');
@@ -289,29 +268,20 @@ export function useCreateConversation(navigate: (path: string) => void) {
         setCreating(false);
         return;
       }
-      const createRequest = (root: ProductRootReservation) => ({
-        root_reservation: root,
+      const createRequest: CreateProductConversationRequest = {
+        request_id: requestId,
+        cwd: trimmedCwd,
         objective: trimmed,
-        message_id: pendingIdentity.messageId,
-        conversation_id: pendingIdentity.conversationId,
         model: selectedModel,
         effort: selectedEffort,
-        images,
-      });
-      let response;
-      try {
-        response = await api.createProductConversation(createRequest(acceptedRoot));
-      } catch (error) {
-        if (!(error instanceof Error) || !error.message.includes('invalid product root reservation')) throw error;
-        acceptedRoot = (await api.reserveProductRoot(cwd.trim())).root_reservation;
-        setRootReservation(acceptedRoot);
-        response = await api.createProductConversation(createRequest(acceptedRoot));
-      }
+        ...(images.length > 0 ? { images } : {}),
+      };
+      const response = await api.createProductConversation(createRequest);
       setDraft('');
       setImages([]);
       setFiles([]);
       clearNewConversationDraft();
-      clearPendingCreateIdentity();
+      clearPendingCreateRequestId();
       navigate(response.canonical_route);
     } catch (err) {
       setCreating(false);
@@ -346,7 +316,6 @@ export function useCreateConversation(navigate: (path: string) => void) {
     error,
     creating,
     recentManagementRootSuggestions,
-    rootReservation,
     canSend,
     genericFilesEnabled,
     addImages,

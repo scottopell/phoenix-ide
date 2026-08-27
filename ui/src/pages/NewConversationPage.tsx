@@ -6,7 +6,7 @@ import { VoiceRecorder } from '../components/VoiceInput/VoiceRecorder';
 import { PaneDivider } from '../components/PaneDivider';
 import { SUPPORTED_IMAGE_TYPES } from '../utils/images';
 import { ExpansionError } from '../api';
-import { useCreateConversation } from '../hooks/useCreateConversation';
+import { beginNewProductConversationIntent, useCreateConversation } from '../hooks/useCreateConversation';
 import { useResizablePane } from '../hooks/useResizablePane';
 import { useIsDesktop } from '../hooks/useMediaQuery';
 import { useInlineReferences } from '../hooks';
@@ -56,6 +56,10 @@ interface NewConversationPageProps {
 }
 
 export function NewConversationPage({ desktopMode }: NewConversationPageProps = {}) {
+  useEffect(() => {
+    beginNewProductConversationIntent();
+  }, []);
+
   const navigate = useNavigate();
   const conv = useCreateConversation(navigate);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -69,14 +73,8 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   const inlineReferenceRootReady = conv.dirStatus === 'exists' && conv.isGitDir !== null;
   const ir = useInlineReferences({
     cwd: conv.cwd,
-    discoveryReady: inlineReferenceRootReady
-      && conv.rootReservation !== null
-      && conv.rootReservation.kind !== 'unresolved_exact_committed_tree',
-    resolution: conv.rootReservation?.kind === 'exact_committed_tree'
-      ? { kind: 'exact_reserved_committed_tree', rootReservation: conv.rootReservation }
-      : conv.rootReservation?.kind === 'unresolved_exact_committed_tree'
-        ? { kind: 'unresolved_exact_reserved_committed_tree', rootReservation: conv.rootReservation }
-        : { kind: 'direct' },
+    discoveryReady: inlineReferenceRootReady,
+    resolution: { kind: 'direct' },
     // The new-conversation composer's identity is its directory: switching the
     // chosen directory resets the dropdown / inline error.
     scopeKey: conv.cwd,
@@ -255,7 +253,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
             setShowAllModels={conv.setShowAllModels}
             error={conv.error}
             recentPaths={conv.recentManagementRootSuggestions.map((suggestion) => suggestion.path)}
-            rootFreshness={conv.rootReservation?.freshness ?? null}
+            rootFreshness={null}
           />
 
           {/* Main input — hidden until an LLM is configured */}
@@ -326,7 +324,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
             setShowAllModels={conv.setShowAllModels}
             error={conv.error}
             recentPaths={conv.recentManagementRootSuggestions.map((suggestion) => suggestion.path)}
-            rootFreshness={conv.rootReservation?.freshness ?? null}
+            rootFreshness={null}
           />
         </div>
       </main>
