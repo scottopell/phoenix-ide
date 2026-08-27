@@ -3139,9 +3139,13 @@ mod lifecycle_hook_tests {
             return;
         }
 
-        let manager = BrowserSessionManager::new();
         let scope = ResourceScopeKey::Work(WorkScopeId::new());
-        let profile = super::user_data_dir_for_key(&manager.tmp_root, &scope.stable_key());
+        let profile = super::user_data_dir_for_key(
+            phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect().tmp_root(),
+            &scope.stable_key(),
+        );
+        let _ = std::fs::remove_dir_all(&profile);
+        let manager = BrowserSessionManager::new();
         let session = manager.get_session(&scope).await.expect("launch browser");
 
         manager.shutdown_all().await.expect("browser shutdown");
