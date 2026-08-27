@@ -119,6 +119,7 @@ impl TmuxServerInstanceIdentity {
         )
     }
 
+    #[must_use]
     pub fn parse_stable_identity(value: &str) -> Option<Self> {
         let value = value.strip_prefix("socket:")?;
         let (socket_path, server_token) = value.rsplit_once(":token:")?;

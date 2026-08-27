@@ -5864,12 +5864,15 @@ mod tests {
             .attached_work_scope_id
             .unwrap();
         create_root(&db, "other-root").await;
-        sqlx::query("UPDATE conversations SET work_scope_id = ?2 WHERE id = ?1")
+        let conflict = sqlx::query("UPDATE conversations SET work_scope_id = ?2 WHERE id = ?1")
             .bind("other-root")
             .bind(scope.as_str())
             .execute(db.pool())
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(conflict
+            .to_string()
+            .contains("different ordinary product conversation"));
         set_state(&db, "other-root", ConvState::Terminal).await;
         db.begin_close_foundation(&product_id("root"), "attempt-terminal-owner")
             .await
@@ -6266,17 +6269,21 @@ mod tests {
             .attached_work_scope_id
             .unwrap();
         create_root(&db, "other-root").await;
-        sqlx::query("UPDATE conversations SET work_scope_id = ?1 WHERE id = 'other-root'")
-            .bind(scope.as_str())
-            .execute(db.pool())
-            .await
-            .unwrap();
+        let conflict =
+            sqlx::query("UPDATE conversations SET work_scope_id = ?1 WHERE id = 'other-root'")
+                .bind(scope.as_str())
+                .execute(db.pool())
+                .await
+                .unwrap_err();
+        assert!(conflict
+            .to_string()
+            .contains("different ordinary product conversation"));
         db.begin_close_foundation(&product_id("root"), "attempt-shared")
             .await
             .unwrap();
         set_close_phase(&db, "attempt-shared", ClosePhase::RetirementRequested).await;
 
-        let error = db
+        let result = db
             .capture_close_retirement_inventory(CaptureCloseRetirementInventoryRequest {
                 attempt_id: CloseAttemptId::parse("attempt-shared").unwrap(),
                 snapshot: current_test_snapshot(&db, "attempt-shared").await,
@@ -6293,9 +6300,8 @@ mod tests {
                     },
                 }],
             })
-            .await
-            .unwrap_err();
-        assert!(matches!(error, DbError::CloseFoundationPrecondition(_)));
+            .await;
+        assert!(result.is_ok());
     }
 
     #[tokio::test]

@@ -7535,7 +7535,7 @@ WHERE resource_kind IN ('bash_process_group', 'pty_session', 'browser_session');
 
 CREATE TABLE product_conversation_work_scopes (
     work_scope_id TEXT PRIMARY KEY REFERENCES work_scopes(id) ON DELETE RESTRICT,
-    product_conversation_id TEXT NOT NULL REFERENCES product_conversations(id) ON DELETE RESTRICT,
+    product_conversation_id TEXT NOT NULL REFERENCES product_conversations(id) ON DELETE CASCADE,
     UNIQUE (product_conversation_id, work_scope_id)
 );
 
@@ -7904,6 +7904,19 @@ async fn migration_080_preflight(tx: &mut Transaction<'_, Sqlite>) -> DbResult<(
     Ok(())
 }
 
+async fn migration_080_prepare(tx: &mut Transaction<'_, Sqlite>) -> DbResult<bool> {
+    let has_product_conversation: bool = sqlx::query_scalar(
+        "SELECT EXISTS(\n            SELECT 1 FROM pragma_table_info('conversations')\n            WHERE name = 'product_conversation_id'\n        )",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    if !has_product_conversation {
+        return Ok(false);
+    }
+    migration_080_preflight(tx).await?;
+    Ok(true)
+}
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -7975,23 +7988,15 @@ pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
             migration_065_preflight(&mut tx).await?;
         }
 
-        if migration.version == 80 {
-            let product_conversation_column_exists: bool = sqlx::query_scalar(
-                "SELECT EXISTS(\n                    SELECT 1 FROM pragma_table_info('conversations')\n                    WHERE name = 'product_conversation_id'\n                )",
-            )
-            .fetch_one(&mut *tx)
-            .await?;
-            if !product_conversation_column_exists {
-                sqlx::query("INSERT INTO _migrations (version, name) VALUES (?, ?)")
-                    .bind(migration.version)
-                    .bind(migration.name)
-                    .execute(&mut *tx)
-                    .await?;
-                tx.commit().await?;
-                applied += 1;
-                continue;
-            }
-            migration_080_preflight(&mut tx).await?;
+        if migration.version == 80 && !migration_080_prepare(&mut tx).await? {
+            sqlx::query("INSERT INTO _migrations (version, name) VALUES (?, ?)")
+                .bind(migration.version)
+                .bind(migration.name)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            applied += 1;
+            continue;
         }
 
         if migration.version == 59 {
