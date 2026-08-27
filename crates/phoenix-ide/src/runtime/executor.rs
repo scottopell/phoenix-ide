@@ -8333,18 +8333,10 @@ where
             .map_err(|error| format!("Failed to load attached repository root: {error}"))?
             .map(std::path::PathBuf::from);
         #[cfg(not(test))]
-        let repo_root = attached_repo_root
+        attached_repo_root
             .ok_or_else(|| "Task approval requires attached GitRepository authority".to_string())?;
         #[cfg(test)]
-        let repo_root = attached_repo_root.unwrap_or_else(|| {
-            crate::git_ops::repo_root_from_phoenix_worktree(&cwd).unwrap_or_else(|| cwd.clone())
-        });
-        let worktree_identity = self
-            .storage
-            .get_product_conversation_id(&self.context.conversation_id)
-            .await
-            .map_err(|error| format!("Failed to load ProductConversation identity: {error}"))?;
-        let desired_base_branch = self.context.desired_base_branch.clone();
+        let _ = attached_repo_root;
         let tasks_dir_name = self.context.tasks_dir_name.clone();
 
         let task_file_backup = task_file.clone();
@@ -8356,23 +8348,23 @@ where
         let blocking_admission = authority.reborrow();
         let result =
             crate::runtime::creation_worker::run_admitted_blocking(blocking_admission, move || {
-                execute_approve_task_blocking(
+                reread_reviewed_task_handoff_snapshot(
                     &cwd,
-                    &repo_root,
-                    &worktree_identity,
+                    &cwd,
                     &tasks_dir_name,
                     &task_file,
                     &title,
-                    desired_base_branch.as_deref(),
+                    priority,
+                    &plan,
                 )
             })
             .await
             .map_err(|e| format!("Task approval join error: {e}"))?;
 
-        let approval_result = match result {
+        let approval = match result {
             Ok(result) => result,
             Err(e) => {
-                tracing::error!(error = %e, "Fresh task approval git operations failed");
+                tracing::error!(error = %e, "Fresh task approval artifact verification failed");
                 self.install_live_state(
                     ConvState::AwaitingTaskApproval {
                         task_file: task_file_backup,
@@ -8383,8 +8375,6 @@ where
                     Utc::now(),
                     true,
                 )?;
-                // Direct state write bypasses apply_transition_result, so
-                // close any turn span opened by the brief LlmRequesting here.
                 self.settle_turn_span();
                 let _ = self.broadcast_tx.send_seq(|seq| SseEvent::Error {
                     sequence_id: seq,
@@ -8409,16 +8399,13 @@ where
         let request = TaskApprovalHandoffRequest {
             parent_conversation_id: self.context.conversation_id.clone(),
             approval: TaskApprovalHandoffData {
-                task_id: approval_result.task_id,
-                task_title: approval_result.task_title,
-                branch_name: approval_result.branch_name,
-                approved_commit_oid: approval_result.approved_commit_oid,
-                worktree_path: approval_result.worktree_path,
-                base_branch: approval_result.base_branch,
+                task_id: approval.task_id,
+                task_title: approval.task_title,
                 title: title_backup,
                 priority: priority_backup,
                 plan: plan_backup,
-                task_file: approval_result.task_file,
+                task_file: approval.task_file,
+                artifact_body: approval.artifact_body,
             },
             authority,
             response_tx,
@@ -8454,13 +8441,75 @@ struct TaskApprovalResult {
     task_id: String,
     task_title: String,
     branch_name: String,
-    approved_commit_oid: String,
     first_task: bool,
-    task_file: String,
     /// Absolute path to the git worktree created for this conversation
     worktree_path: String,
     /// The branch that was checked out when the task was approved (merge target)
     base_branch: String,
+}
+
+#[derive(Debug)]
+struct ReviewedTaskHandoffSnapshot {
+    task_id: String,
+    task_title: String,
+    task_file: String,
+    artifact_body: String,
+}
+
+fn reread_reviewed_task_handoff_snapshot(
+    cwd: &std::path::Path,
+    _repo_root: &std::path::Path,
+    tasks_dir_name: &str,
+    task_file: &str,
+    expected_title: &str,
+    expected_priority: crate::task_source::Priority,
+    expected_plan: &str,
+) -> Result<ReviewedTaskHandoffSnapshot, String> {
+    let path = cwd.join(task_file);
+    let body = std::fs::read_to_string(&path)
+        .map_err(|error| format!("Failed to read reviewed task file '{task_file}': {error}"))?;
+    if body.trim() != expected_plan.trim() {
+        return Err(format!(
+            "Reviewed task file '{task_file}' no longer matches the approved plan. Reject and re-approve the updated artifact."
+        ));
+    }
+    if let Some(stem) = detect_plain_markdown_task_stem(task_file) {
+        let source = crate::task_source::TaskSource::PlainMarkdown { stem: stem.clone() };
+        let task_id = source.branch_and_id("handoff").1;
+        return Ok(ReviewedTaskHandoffSnapshot {
+            task_id,
+            task_title: expected_title.to_string(),
+            task_file: task_file.to_string(),
+            artifact_body: body,
+        });
+    }
+
+    let filename = std::path::Path::new(task_file)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .ok_or_else(|| format!("task_file has no filename component: '{task_file}'"))?;
+    let parsed = taskmd_core::filename::parse_filename(filename).ok_or_else(|| {
+        format!(
+            "task_file '{filename}' does not match the taskmd filename pattern (NNNNN-pX-status--slug.md)"
+        )
+    })?;
+    if !task_file.starts_with(&format!("{tasks_dir_name}/")) {
+        return Err(format!(
+            "taskmd-named task files must be under {tasks_dir_name}/ (got '{task_file}')"
+        ));
+    }
+    let derived_priority = phoenix_core::task_source::Priority(parsed.priority);
+    if derived_priority != expected_priority {
+        return Err(format!(
+            "Reviewed task file '{task_file}' priority changed from the approved snapshot. Reject and re-approve the updated artifact."
+        ));
+    }
+    Ok(ReviewedTaskHandoffSnapshot {
+        task_id: parsed.id,
+        task_title: expected_title.to_string(),
+        artifact_body: body,
+        task_file: task_file.to_string(),
+    })
 }
 
 /// Per-block character cap when flattening tool blocks for the continuation
@@ -10368,16 +10417,11 @@ fn execute_approve_task_blocking(
         tracing::info!(branch = %branch_name, "Task file already on the branch unchanged — no commit needed");
     }
 
-    let approved_commit_oid = run_git(&worktree_path, &["rev-parse", "HEAD"])?
-        .trim()
-        .to_string();
     Ok(TaskApprovalResult {
         task_id,
         task_title: title.to_string(),
         branch_name,
-        approved_commit_oid,
         first_task: false,
-        task_file: format!("{tasks_dir_name}/{final_filename}"),
         worktree_path: worktree_path_str,
         base_branch,
     })
@@ -10464,16 +10508,11 @@ fn execute_approve_plain_markdown_blocking(
         tracing::info!(branch = %branch_name, worktree = %worktree_path_str, "Plain-markdown task approved — temp branch renamed; task file already on the branch unchanged, no commit needed");
     }
 
-    let approved_commit_oid = run_git(&worktree_path, &["rev-parse", "HEAD"])?
-        .trim()
-        .to_string();
     Ok(TaskApprovalResult {
         task_id,
         task_title: title.to_string(),
         branch_name,
-        approved_commit_oid,
         first_task: false,
-        task_file: task_file.to_string(),
         worktree_path: worktree_path_str,
         base_branch,
     })
@@ -14487,7 +14526,6 @@ mod approve_task_promoted_filename_tests {
         .expect("retry should recover the already-promoted in-progress filename");
 
         assert_eq!(result.branch_name, target_branch);
-        assert_eq!(result.task_file, format!("tasks/{in_progress_filename}"));
         assert!(explore_wt.join("tasks").join(in_progress_filename).exists());
     }
 
@@ -14544,7 +14582,7 @@ mod approve_task_failure_effect_tests {
         let tasks_dir = explore_wt.join("tasks");
         std::fs::create_dir_all(&tasks_dir).unwrap();
         let task_filename = "12345-p2-ready--fresh-handoff.md";
-        std::fs::write(tasks_dir.join(task_filename), "# Fix\n").unwrap();
+        std::fs::write(tasks_dir.join(task_filename), "Plan\n").unwrap();
 
         let mut context = ConvContext::new(conv_id, explore_wt.clone(), "test-model", 200_000);
         context.desired_base_branch = Some(base_branch.to_string());
@@ -15029,9 +15067,7 @@ mod runtime_context_promotion_tests {
             task_id: "123".to_string(),
             task_title: "Approved task".to_string(),
             branch_name: "task-123-approved".to_string(),
-            approved_commit_oid: "0123456789abcdef0123456789abcdef01234567".to_string(),
             first_task: true,
-            task_file: "tasks/123-p1-ready--approved.md".to_string(),
             worktree_path: "/repo/.phoenix/worktrees/conv".to_string(),
             base_branch: "main".to_string(),
         };

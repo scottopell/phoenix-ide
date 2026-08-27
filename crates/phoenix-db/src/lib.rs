@@ -6898,8 +6898,8 @@ impl Database {
             images: Vec::new(),
             files: Vec::new(),
             mode: Some("approved_task".to_string()),
-            base_branch: Some(snapshot.base_branch.clone()),
-            checkout_ref: Some(snapshot.branch_name.clone()),
+            base_branch: None,
+            checkout_ref: None,
             seed_parent_id: None,
             seed_label: Some(snapshot.title.clone()),
             approved_task: Some(snapshot.clone()),
@@ -6995,7 +6995,7 @@ impl Database {
             .bind(parent.model.as_deref())
             .bind(parent.effort.map(ModelEffort::as_wire_name))
             .bind(parent.project_id.as_deref())
-            .bind(&snapshot.base_branch)
+            .bind(None::<&str>)
             .bind(&snapshot.title)
             .bind(parent.llm_language.as_str())
             .bind(scope_id.as_str())
@@ -20716,14 +20716,11 @@ mod tests {
         let approval = phoenix_core::task_handoff::TaskApprovalHandoffData {
             task_id: "27002".to_string(),
             task_title: "Approve Fresh".to_string(),
-            branch_name: "task-27002-approve-fresh".to_string(),
-            approved_commit_oid: "0123456789abcdef0123456789abcdef01234567".to_string(),
-            worktree_path: "/source-worktree-must-not-transfer".to_string(),
-            base_branch: "main".to_string(),
             title: "Approve Fresh".to_string(),
             priority: phoenix_core::task_source::Priority::P1,
             plan: "immutable approved plan".to_string(),
             task_file: "tasks/27002-p1-ready--approve-fresh.md".to_string(),
+            artifact_body: "# Approve Fresh\n\nimmutable approved plan\n".to_string(),
         };
         let successor = db
             .create_task_approval_handoff_creation_job("handoff-parent", &approval)
@@ -20741,8 +20738,11 @@ mod tests {
         let snapshot = job.intent.approved_task.expect("durable approved snapshot");
         assert_eq!(snapshot.task_id, approval.task_id);
         assert_eq!(snapshot.plan, approval.plan);
-        assert_eq!(snapshot.branch_name, approval.branch_name);
-        assert!(!job.intent.text.contains(&approval.worktree_path));
+        assert_eq!(snapshot.task_file, approval.task_file);
+        assert!(!job
+            .intent
+            .text
+            .contains("/source-worktree-must-not-transfer"));
         let replayed = db
             .create_task_approval_handoff_creation_job("handoff-parent", &approval)
             .await
@@ -20793,14 +20793,11 @@ mod tests {
         let approval = phoenix_core::task_handoff::TaskApprovalHandoffData {
             task_id: "27004".to_string(),
             task_title: "Rollback".to_string(),
-            branch_name: "task-27004-rollback".to_string(),
-            approved_commit_oid: "0123456789abcdef0123456789abcdef01234567".to_string(),
-            worktree_path: "/ignored".to_string(),
-            base_branch: "main".to_string(),
             title: "Rollback".to_string(),
             priority: phoenix_core::task_source::Priority::P1,
             plan: "reviewed".to_string(),
             task_file: "tasks/27004-p1-ready--rollback.md".to_string(),
+            artifact_body: "# Rollback\n\nreviewed\n".to_string(),
         };
         sqlx::query("DROP TABLE conversation_creation_jobs")
             .execute(&db.pool)
@@ -20831,14 +20828,11 @@ mod tests {
         let approval = phoenix_core::task_handoff::TaskApprovalHandoffData {
             task_id: "27003".to_string(),
             task_title: "Concurrent".to_string(),
-            branch_name: "task-27003-concurrent".to_string(),
-            approved_commit_oid: "0123456789abcdef0123456789abcdef01234567".to_string(),
-            worktree_path: "/ignored".to_string(),
-            base_branch: "main".to_string(),
             title: "Concurrent".to_string(),
             priority: phoenix_core::task_source::Priority::P1,
             plan: "reviewed immutable plan".to_string(),
             task_file: "tasks/27003-p1-ready--concurrent.md".to_string(),
+            artifact_body: "# Concurrent\n\nreviewed immutable plan\n".to_string(),
         };
         let (first, second) = tokio::join!(
             db.create_task_approval_handoff_creation_job("handoff-parent", &approval),

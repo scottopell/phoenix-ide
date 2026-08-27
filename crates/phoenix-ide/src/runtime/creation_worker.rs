@@ -819,6 +819,21 @@ fn strict_product_creation_pin(repo_root: &Path) -> Result<(String, String), Str
     Ok((oid.trim().to_string(), "main".to_string()))
 }
 
+fn materialize_approved_task_snapshot(
+    worktree_path: &Path,
+    snapshot: &phoenix_core::task_handoff::ApprovedTaskSnapshot,
+) -> Result<(), String> {
+    let path = worktree_path.join(&snapshot.task_file);
+    std::fs::create_dir_all(
+        path.parent()
+            .ok_or_else(|| "approved task artifact path lacked parent directory".to_string())?,
+    )
+    .map_err(|error| format!("failed to create approved task artifact parent: {error}"))?;
+    std::fs::write(&path, &snapshot.artifact_body)
+        .map_err(|error| format!("failed to materialize approved task artifact: {error}"))?;
+    Ok(())
+}
+
 pub(crate) fn resolve_creation_model(
     registry: &ModelRegistry,
     explicit_model: Option<&str>,
@@ -1410,20 +1425,56 @@ async fn provision_conversation(
                     ErrorKind::InvalidRequest,
                 )
             })?;
-            let branch_name = if requested_mode == "approved_task" {
-                intent.checkout_ref.clone().ok_or_else(|| {
+            let approved_snapshot = if requested_mode == "approved_task" {
+                Some(intent.approved_task.clone().ok_or_else(|| {
                     (
-                        "Approved-task creation requires the approved branch".to_string(),
+                        "Approved-task creation requires the reviewed task artifact snapshot"
+                            .to_string(),
                         ErrorKind::InvalidRequest,
                     )
-                })?
+                })?)
             } else {
-                desired_base_branch.clone().ok_or_else(|| {
+                None
+            };
+            let (branch_name, approved_commit_oid, approved_base_branch) = if let Some(snapshot) =
+                approved_snapshot.as_ref()
+            {
+                let (oid, base_branch) = run_admitted_blocking(
+                    acquire_creation_admission(
+                        manager,
+                        "approved-task pin resolution rejected after fatal local authority closure",
+                    )?,
+                    {
+                        let repo_root = repo_root.clone();
+                        move || strict_product_creation_pin(Path::new(&repo_root))
+                    },
+                )
+                .await
+                .map_err(|error| {
+                    (
+                        format!("approved-task pin resolution join failed: {error}"),
+                        ErrorKind::ServerError,
+                    )
+                })?
+                .map_err(|error| (error, ErrorKind::ServerError))?;
+                (
+                    format!(
+                        "task-{}-{}",
+                        snapshot.task_id,
+                        slugify_label(&snapshot.task_title)
+                    ),
+                    Some(oid),
+                    Some(base_branch),
+                )
+            } else {
+                let branch_name = desired_base_branch.clone().ok_or_else(|| {
                     (
                         "Branch mode requires base_branch naming the existing branch".to_string(),
                         ErrorKind::InvalidRequest,
                     )
-                })?
+                })?;
+                validate_user_ref(&branch_name).map_err(app_error_to_kind)?;
+                (branch_name, None, None)
             };
             validate_user_ref(&branch_name).map_err(app_error_to_kind)?;
             let existing_path = deterministic_worktree_path(&repo_root, &job.conversation_id);
@@ -1446,10 +1497,9 @@ async fn provision_conversation(
             let conv_id = job.conversation_id.clone();
             let repo_for_blocking = repo_root.clone();
             let path_for_blocking = existing_path.clone();
-            let base_branch_for_blocking = desired_base_branch
-                .clone()
-                .unwrap_or_else(|| branch_name.clone());
-            let approved_task_snapshot = intent.approved_task.clone();
+            let approved_task_snapshot = approved_snapshot.clone();
+            let approved_commit_oid_for_blocking = approved_commit_oid.clone();
+            let approved_base_branch_for_blocking = approved_base_branch.clone();
             let worktree_admission = acquire_creation_admission(
                 manager,
                 "branch worktree mutation rejected after fatal local authority closure",
@@ -1460,11 +1510,17 @@ async fn provision_conversation(
                     if approved_task_creation {
                         validate_detached_task_worktree(
                             &path_for_blocking,
+                            approved_commit_oid_for_blocking
+                                .as_ref()
+                                .expect("approved_task mode has strict pin")
+                                .as_str(),
+                        )
+                        .map_err(|error| (error, ErrorKind::InvalidRequest))?;
+                        materialize_approved_task_snapshot(
+                            &path_for_blocking,
                             approved_task_snapshot
                                 .as_ref()
-                                .expect("approved_task mode has reviewed snapshot")
-                                .approved_commit_oid
-                                .as_str(),
+                                .expect("approved_task mode has reviewed snapshot"),
                         )
                         .map_err(|error| (error, ErrorKind::InvalidRequest))?;
                     } else {
@@ -1472,7 +1528,9 @@ async fn provision_conversation(
                     }
                     let worktree_path = path_for_blocking.to_string_lossy().to_string();
                     let base_branch = if approved_task_creation {
-                        base_branch_for_blocking
+                        approved_base_branch_for_blocking
+                            .clone()
+                            .expect("approved_task mode has strict base branch")
                     } else {
                         crate::git_ops::run_git(
                             Path::new(&repo_for_blocking),
@@ -1503,17 +1561,24 @@ async fn provision_conversation(
                     let worktree_path = create_detached_task_worktree_blocking(
                         &repo_for_blocking,
                         &path_for_blocking,
-                        approved_task_snapshot
+                        approved_commit_oid_for_blocking
                             .as_ref()
-                            .expect("approved_task mode has reviewed snapshot")
-                            .approved_commit_oid
+                            .expect("approved_task mode has strict pin")
                             .as_str(),
                     )
                     .map_err(branch_worktree_error_to_kind)?;
+                    materialize_approved_task_snapshot(
+                        Path::new(&worktree_path),
+                        approved_task_snapshot
+                            .as_ref()
+                            .expect("approved_task mode has reviewed snapshot"),
+                    )
+                    .map_err(|error| (error, ErrorKind::InvalidRequest))?;
                     Ok(BranchWorktreeInfo {
                         branch_name,
                         worktree_path,
-                        base_branch: base_branch_for_blocking,
+                        base_branch: approved_base_branch_for_blocking
+                            .expect("approved_task mode has strict base branch"),
                     })
                 } else {
                     create_branch_worktree_blocking(&repo_for_blocking, &conv_id, &branch_name, &db)
