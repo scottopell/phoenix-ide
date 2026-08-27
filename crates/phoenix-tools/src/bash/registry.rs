@@ -17,6 +17,7 @@
 //! concurrent spawns from both observing `count == cap - 1` and racing past
 //! the cap.
 
+use phoenix_core::process_identity::process_identity_matches;
 use phoenix_core::work_scope::EffectiveResourceAccess;
 use std::collections::HashMap;
 use std::sync::{
@@ -880,6 +881,27 @@ impl BashHandleRegistry {
                 record_retirement_target_in_report(&mut report, target);
                 #[cfg(unix)]
                 {
+                    if target.pgid <= 0 || target.pgid as u32 != target.launch_identity.process.pid
+                    {
+                        report.kill_failures.push((
+                            target.pgid,
+                            "bash process group is not anchored by its leader".to_string(),
+                        ));
+                        continue;
+                    }
+                    if !process_identity_matches(target.launch_identity.process) {
+                        // A vanished group is an exact absence. A surviving group with an
+                        // unproven/reused leader is never safe to signal.
+                        let group_exists = unsafe { libc::kill(-target.pgid, 0) } == 0;
+                        if group_exists {
+                            report.kill_failures.push((
+                                target.pgid,
+                                "bash leader identity no longer proves the process group"
+                                    .to_string(),
+                            ));
+                        }
+                        continue;
+                    }
                     // SAFETY: kill(2) with negative pid signals the process group;
                     // no memory implications. ESRCH (group already gone) is expected.
                     let rc = unsafe { libc::kill(-target.pgid, libc::SIGKILL) };

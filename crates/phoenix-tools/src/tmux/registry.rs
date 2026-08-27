@@ -23,6 +23,10 @@
 //! serialises concurrent `ensure_live` calls on the same `ResourceScopeKey`;
 //! the second caller observes `Live` after the first one finishes.
 
+use base64::Engine;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -112,20 +116,30 @@ pub struct TmuxServerInstanceIdentity {
 impl TmuxServerInstanceIdentity {
     #[must_use]
     pub fn stable_identity(&self) -> String {
-        format!(
-            "socket:{}:token:{}",
-            self.socket_path.display(),
-            self.server_token
-        )
+        #[cfg(unix)]
+        let socket_path = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(self.socket_path.as_os_str().as_bytes());
+        #[cfg(not(unix))]
+        let socket_path = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(self.socket_path.to_string_lossy().as_bytes());
+        format!("tmux-v1:{socket_path}:{}", self.server_token)
     }
 
     #[must_use]
     pub fn parse_stable_identity(value: &str) -> Option<Self> {
-        let value = value.strip_prefix("socket:")?;
-        let (socket_path, server_token) = value.rsplit_once(":token:")?;
-        (!socket_path.is_empty() && !server_token.is_empty()).then(|| Self {
-            socket_path: PathBuf::from(socket_path),
-            server_token: server_token.to_string(),
+        let value = value.strip_prefix("tmux-v1:")?;
+        let (encoded_path, server_token) = value.rsplit_once(':')?;
+        let server_token = uuid::Uuid::parse_str(server_token).ok()?.to_string();
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded_path)
+            .ok()?;
+        #[cfg(unix)]
+        let socket_path = PathBuf::from(std::ffi::OsStr::from_bytes(&bytes));
+        #[cfg(not(unix))]
+        let socket_path = PathBuf::from(String::from_utf8(bytes).ok()?);
+        socket_path.is_absolute().then_some(Self {
+            socket_path,
+            server_token,
         })
     }
 }
@@ -1239,52 +1253,71 @@ impl TmuxRegistry {
             return self.verify_exact_absence(permit).await;
         };
 
-        let exact_owned = {
-            let server = entry.server.read().await;
-            Self::matches_exact_instance(&server, permit)
-        };
+        let server = entry.server.write().await;
+        let exact_owned = Self::matches_exact_instance(&server, permit);
         if !exact_owned {
             return self.verify_exact_absence(permit).await;
         }
-        if read_server_token(&permit.instance.socket_path)
-            .await
-            .as_deref()
-            != Some(permit.instance.server_token.as_str())
-        {
-            return Ok(TmuxRetirementOutcome::Residual {
-                reason: "tmux server token changed before exact teardown".to_string(),
-            });
-        }
-
         let kill_error = if self.binary_available {
+            let token_test = format!(
+                "#{{==:#{{E:{SERVER_TOKEN_VAR}}},{}}}",
+                permit.instance.server_token
+            );
             match tokio::process::Command::new("tmux")
                 .args([
                     "-f",
                     &self.config_path().to_string_lossy(),
                     "-S",
                     &permit.instance.socket_path.to_string_lossy(),
+                    "if-shell",
+                    "-F",
+                    &token_test,
                     "kill-server",
+                    "display-message -p PHOENIX_TOKEN_MISMATCH",
                 ])
                 .env_remove("TMUX")
                 .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
                 .await
             {
-                Ok(_) => None,
+                Ok(output) if output.status.success() => {
+                    if String::from_utf8_lossy(&output.stdout).contains("PHOENIX_TOKEN_MISMATCH") {
+                        Some("tmux server token changed before exact teardown".to_string())
+                    } else {
+                        None
+                    }
+                }
+                Ok(output) => Some(format!(
+                    "exact token-bound kill-server failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )),
                 Err(error) => Some(error.to_string()),
             }
         } else {
             None
         };
-        let unlink_error = match tokio::fs::remove_file(&permit.instance.socket_path).await {
-            Ok(()) => None,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => Some(error.to_string()),
-        };
+        drop(server);
 
         let verified = self.verify_exact_absence(permit).await?;
+        let unlink_error = if matches!(
+            probe(&permit.instance.socket_path)
+                .await
+                .map_err(|source| TmuxError::ProbeFailed {
+                    socket_path: permit.instance.socket_path.clone(),
+                    source,
+                })?,
+            ProbeResult::DeadSocket
+        ) {
+            tokio::fs::remove_file(&permit.instance.socket_path)
+                .await
+                .err()
+                .filter(|error| error.kind() != std::io::ErrorKind::NotFound)
+                .map(|error| error.to_string())
+        } else {
+            None
+        };
         if let Some(error) = kill_error {
             return Ok(TmuxRetirementOutcome::Residual {
                 reason: format!("kill-server failed: {error}"),
@@ -1292,7 +1325,7 @@ impl TmuxRegistry {
         }
         if let Some(error) = unlink_error {
             return Ok(TmuxRetirementOutcome::Residual {
-                reason: format!("socket unlink failed: {error}"),
+                reason: format!("dead socket unlink failed: {error}"),
             });
         }
 
