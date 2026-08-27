@@ -468,18 +468,34 @@ impl ActiveTerminals {
         permit: &TerminalRetirementPermit,
     ) -> TerminalRetirementOutcome {
         let handle = {
-            let mut map = self.0.lock().expect("terminal registry poisoned");
+            let map = self.0.lock().expect("terminal registry poisoned");
             if !Self::matches_exact_instance(&map, permit) {
                 return Self::verify_exact_absence(&map, permit);
             }
             let Some(handle) = map.handles.get(&permit.work_scope) else {
                 return Self::verify_exact_absence(&map, permit);
             };
-            if handle.attach_permit.available_permits() == 0 {
-                return TerminalRetirementOutcome::Residual {
-                    reason: "terminal relay remains attached; retry after relay teardown"
-                        .to_string(),
-                };
+            let handle = Arc::clone(handle);
+            let _ = handle.stop_tx.send(StopReason::TearDown);
+            handle
+        };
+
+        if handle.attach_permit.available_permits() == 0
+            && tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                Arc::clone(&handle.attach_permit).acquire_owned(),
+            )
+            .await
+            .is_err()
+        {
+            return TerminalRetirementOutcome::Residual {
+                reason: "terminal relay did not release after teardown request".to_string(),
+            };
+        }
+        let handle = {
+            let mut map = self.0.lock().expect("terminal registry poisoned");
+            if !Self::matches_exact_instance(&map, permit) {
+                return Self::verify_exact_absence(&map, permit);
             }
             map.handles.remove(&permit.work_scope)
         };

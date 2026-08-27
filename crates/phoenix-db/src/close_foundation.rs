@@ -2910,6 +2910,16 @@ impl Database {
         .bind(&now)
         .execute(&mut *tx)
         .await?;
+        sqlx::query(
+            "UPDATE product_conversations
+             SET ordinary_lifecycle = 'history', updated_at = ?2
+             WHERE id = (SELECT product_conversation_id FROM close_obligations WHERE attempt_id = ?1)
+               AND kind = 'ordinary'",
+        )
+        .bind(attempt_id.as_str())
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
         let completed = sqlx::query(
             "UPDATE close_obligations
              SET phase = 'completed', close_outcome = 'archived',
