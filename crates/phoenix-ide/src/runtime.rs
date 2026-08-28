@@ -7201,6 +7201,7 @@ mod scope_liveness_tests {
     use super::*;
     use crate::platform::PlatformCapability;
     use crate::tools::mcp::McpClientManager;
+    use phoenix_core::domain::close::CloseAttemptId;
     use phoenix_core::domain::db_schema::{ConvMode, NonEmptyString};
     use phoenix_core::domain::sm_state::ConvState;
     use phoenix_llm::ModelRegistry;
@@ -7346,6 +7347,232 @@ mod scope_liveness_tests {
             terminal_kind.is_none(),
             "Close must leave live runtime terminalization to its executor"
         );
+    }
+
+    async fn prepare_clean_close_with_tmux(
+        manager: &RuntimeManager,
+        owner: &phoenix_tools::tmux::test_server::TestTmuxServerOwner,
+        conversation_id: &str,
+        attempt: &str,
+    ) -> (
+        tempfile::TempDir,
+        CloseAttemptId,
+        WorkScopeId,
+        std::path::PathBuf,
+        String,
+    ) {
+        let repository = tempfile::tempdir().unwrap();
+        let output = phoenix_core::git::command()
+            .args(["init", "--quiet"])
+            .current_dir(repository.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        std::fs::write(repository.path().join("tracked"), "initial\n").unwrap();
+        let git = |arguments: &[&str]| {
+            let output = phoenix_core::git::command()
+                .args(arguments)
+                .current_dir(repository.path())
+                .env("GIT_AUTHOR_NAME", "Close Test")
+                .env("GIT_AUTHOR_EMAIL", "close@example.invalid")
+                .env("GIT_COMMITTER_NAME", "Close Test")
+                .env("GIT_COMMITTER_EMAIL", "close@example.invalid")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {arguments:?}: {output:?}");
+        };
+        git(&["add", "tracked"]);
+        git(&["commit", "--quiet", "-m", "initial"]);
+        let worktree = repository.path().join("worktree");
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            &format!("test-{conversation_id}"),
+            worktree.to_str().unwrap(),
+        ]);
+        let resource_scope =
+            create_handleless_work_conv(manager, conversation_id, worktree.to_str().unwrap(), None)
+                .await;
+        let ResourceScopeKey::Work(scope) = resource_scope else {
+            unreachable!()
+        };
+        let server = manager
+            .tmux_registry()
+            .ensure_live(
+                &ResourceScopeKey::Work(scope.clone()),
+                owner.path(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let socket = server.read().await.socket_path.clone();
+        let token = server.read().await.server_token.clone();
+        let conversation = manager
+            .db()
+            .get_conversation(conversation_id)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE conversations SET user_initiated = 1 WHERE id = ?1")
+            .bind(conversation_id)
+            .execute(manager.db().pool())
+            .await
+            .unwrap();
+        let attempt_id = CloseAttemptId::parse(attempt).unwrap();
+        manager
+            .db()
+            .begin_close_foundation(
+                &conversation.product_conversation_id,
+                &TranscriptConversationId::parse(conversation_id).unwrap(),
+                attempt_id.as_str(),
+            )
+            .await
+            .unwrap();
+        manager
+            .db()
+            .confirm_close_stop_work(attempt_id.as_str())
+            .await
+            .unwrap();
+        manager
+            .db()
+            .begin_close_active_work_settlement(attempt_id.as_str())
+            .await
+            .unwrap();
+        manager
+            .db()
+            .advance_close_settlement_when_quiescent(attempt_id.as_str())
+            .await
+            .unwrap();
+        let snapshot = manager
+            .inspect_close_retirement_only(attempt_id.clone())
+            .await
+            .unwrap();
+        manager
+            .capture_close_retirement_inventory(attempt_id.clone(), snapshot)
+            .await
+            .unwrap();
+        (repository, attempt_id, scope, socket, token)
+    }
+
+    async fn replace_tmux_server(
+        manager: &RuntimeManager,
+        owner: &phoenix_tools::tmux::test_server::TestTmuxServerOwner,
+        scope: &WorkScopeId,
+        socket: &std::path::Path,
+        stale_token: &str,
+    ) -> String {
+        manager
+            .tmux_registry()
+            .reopen_after_repair(&ResourceScopeKey::Work(scope.clone()))
+            .await;
+        let output = tokio::process::Command::new("tmux")
+            .args(["-S", &socket.to_string_lossy(), "kill-server"])
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success(), "kill stale server: {output:?}");
+        let replacement = manager
+            .tmux_registry()
+            .ensure_live(
+                &ResourceScopeKey::Work(scope.clone()),
+                owner.path(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let replacement_token = replacement.read().await.server_token.clone();
+        assert_ne!(replacement_token, stale_token);
+        replacement_token
+    }
+
+    async fn assert_tmux_absence_proof(manager: &RuntimeManager, attempt_id: &CloseAttemptId) {
+        let proof_kind: String = sqlx::query_scalar(
+            "SELECT proof_kind FROM close_retirement_resources
+             WHERE attempt_id = ?1 AND resource_kind = 'tmux_server'",
+        )
+        .bind(attempt_id.as_str())
+        .fetch_one(manager.db().pool())
+        .await
+        .unwrap();
+        assert_eq!(proof_kind, "absence_adopted");
+    }
+
+    #[tokio::test]
+    async fn live_tmux_replacement_persists_absence_proof_and_survives() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let owner = phoenix_tools::tmux::test_server::TestTmuxServerOwner::new();
+        let mut manager = test_manager().await;
+        manager.tmux_registry = Arc::new(owner.registry());
+        let (_repository, attempt_id, scope, socket, stale_token) =
+            prepare_clean_close_with_tmux(&manager, &owner, "live-tmux-close", "live-tmux-attempt")
+                .await;
+        let replacement_token =
+            replace_tmux_server(&manager, &owner, &scope, &socket, &stale_token).await;
+
+        manager
+            .retire_close_runtime_resources(attempt_id.clone())
+            .await
+            .unwrap();
+
+        assert_tmux_absence_proof(&manager, &attempt_id).await;
+        assert_eq!(
+            manager
+                .tmux_registry()
+                .get_existing(&ResourceScopeKey::Work(scope))
+                .await
+                .unwrap()
+                .read()
+                .await
+                .server_token,
+            replacement_token
+        );
+        owner.shutdown();
+    }
+
+    #[tokio::test]
+    async fn restarted_tmux_rehydration_persists_absence_proof_and_leaves_replacement_untouched() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let owner = phoenix_tools::tmux::test_server::TestTmuxServerOwner::new();
+        let mut manager = test_manager().await;
+        manager.tmux_registry = Arc::new(owner.registry());
+        let (_repository, attempt_id, scope, socket, stale_token) = prepare_clean_close_with_tmux(
+            &manager,
+            &owner,
+            "restart-tmux-close",
+            "restart-tmux-attempt",
+        )
+        .await;
+        replace_tmux_server(&manager, &owner, &scope, &socket, &stale_token).await;
+        manager
+            .close_retirement_leases
+            .lock()
+            .await
+            .retain(|(lease_attempt, _), _| lease_attempt != attempt_id.as_str());
+        manager.tmux_registry = Arc::new(owner.registry());
+
+        manager
+            .retire_close_runtime_resources(attempt_id.clone())
+            .await
+            .unwrap();
+
+        assert_tmux_absence_proof(&manager, &attempt_id).await;
+        let output = tokio::process::Command::new("tmux")
+            .args(["-S", &socket.to_string_lossy(), "list-sessions"])
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "replacement was retired: {output:?}"
+        );
+        owner.shutdown();
     }
 
     #[tokio::test]

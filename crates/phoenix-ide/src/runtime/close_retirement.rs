@@ -46,6 +46,11 @@ pub(crate) struct CloseResourceLease {
     resources: Vec<RetiredResourceIdentity>,
 }
 
+struct CompletedCloseResource {
+    identity: RetiredResourceIdentity,
+    outcome: RetirementOutcome,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum CloseLeaseFailure {
     ProcessEpoch {
@@ -702,34 +707,49 @@ impl RuntimeManager {
                                 .complete_retirement(&permit)
                                 .await
                                 .map_err(|error| error.to_string())?;
-                            if let Err((reason, detail)) = require_tmux_absent(outcome) {
-                                return self
-                                    .record_close_residual(
+                            match tmux_retirement_outcome(outcome) {
+                                Ok(RetirementOutcome::Retired) => {
+                                    self.record_close_retired(
                                         &attempt_id,
                                         &snapshot,
                                         &scope,
                                         resource.clone(),
-                                        reason,
-                                        &detail,
+                                        "exact durable tmux rehydration",
                                     )
-                                    .await;
+                                    .await?;
+                                }
+                                Ok(RetirementOutcome::AbsenceAdopted { .. }) => {
+                                    self.record_close_absence_adopted(
+                                        &attempt_id,
+                                        &snapshot,
+                                        &scope,
+                                        resource.clone(),
+                                        "exact durable tmux absence after dispatch",
+                                    )
+                                    .await?;
+                                }
+                                Ok(RetirementOutcome::Residual { .. }) => unreachable!(),
+                                Err((reason, detail)) => {
+                                    return self
+                                        .record_close_residual(
+                                            &attempt_id,
+                                            &snapshot,
+                                            &scope,
+                                            resource.clone(),
+                                            reason,
+                                            &detail,
+                                        )
+                                        .await;
+                                }
                             }
-                            self.record_close_retired(
-                                &attempt_id,
-                                &snapshot,
-                                &scope,
-                                resource.clone(),
-                                "exact durable tmux rehydration",
-                            )
-                            .await?;
                         }
                         Ok(TmuxRetirementRehydration::AbsenceVerified) => {
-                            self.record_close_retired(
+                            self.record_close_absence_adopted(
                                 &attempt_id,
                                 &snapshot,
                                 &scope,
                                 resource.clone(),
-                                "exact durable tmux absence",
+                                "exact durable tmux absence after dispatch",
                             )
                             .await?;
                         }
@@ -829,11 +849,11 @@ impl RuntimeManager {
                 .collect::<std::collections::BTreeSet<_>>();
             let resources = resources
                 .into_iter()
-                .filter(|resource| expected_keys.contains(&resource_key(resource)))
+                .filter(|resource| expected_keys.contains(&resource_key(&resource.identity)))
                 .collect::<Vec<_>>();
             let retired_keys = resources
                 .iter()
-                .map(resource_key)
+                .map(|resource| resource_key(&resource.identity))
                 .collect::<std::collections::BTreeSet<_>>();
             if expected_keys != retired_keys {
                 return self
@@ -848,14 +868,29 @@ impl RuntimeManager {
                     .await;
             }
             for resource in resources {
-                self.record_close_retired(
-                    &attempt_id,
-                    &snapshot,
-                    &scope,
-                    resource,
-                    "exact registry permit retirement",
-                )
-                .await?;
+                match resource.outcome {
+                    RetirementOutcome::Retired => {
+                        self.record_close_retired(
+                            &attempt_id,
+                            &snapshot,
+                            &scope,
+                            resource.identity,
+                            "exact registry permit retirement",
+                        )
+                        .await?;
+                    }
+                    RetirementOutcome::AbsenceAdopted { .. } => {
+                        self.record_close_absence_adopted(
+                            &attempt_id,
+                            &snapshot,
+                            &scope,
+                            resource.identity,
+                            "exact registry permit absence after dispatch",
+                        )
+                        .await?;
+                    }
+                    RetirementOutcome::Residual { .. } => unreachable!(),
+                }
             }
         }
         self.retire_close_worktrees_and_scopes(&attempt_id, &snapshot)
@@ -1455,7 +1490,7 @@ impl RuntimeManager {
         &self,
         attempt_id: &CloseAttemptId,
         scope: &WorkScopeId,
-    ) -> Result<Vec<RetiredResourceIdentity>, CloseLeaseFailure> {
+    ) -> Result<Vec<CompletedCloseResource>, CloseLeaseFailure> {
         let key = (attempt_id.as_str().to_string(), scope.clone());
         let lease = self.close_retirement_leases.lock().await.remove(&key);
         let Some(lease) = lease else {
@@ -1479,7 +1514,7 @@ impl RuntimeManager {
                     reason: RetirementFailureReason::IdentityNotProven,
                     detail: error.to_string(),
                 })?;
-            require_tmux_absent(tmux_outcome)
+            let tmux_outcome = tmux_retirement_outcome(tmux_outcome)
                 .map_err(|(reason, detail)| CloseLeaseFailure::Tmux { reason, detail })?;
             require_terminal_absent(self.terminals.complete_retirement(&lease.terminal).await)
                 .map_err(|reason| CloseLeaseFailure::ProcessEpoch {
@@ -1495,7 +1530,19 @@ impl RuntimeManager {
                 kind: RetiredResourceKind::BrowserSession,
                 reason,
             })?;
-            Ok(lease.resources.clone())
+            Ok(lease
+                .resources
+                .iter()
+                .cloned()
+                .map(|identity| CompletedCloseResource {
+                    outcome: if identity.kind() == RetiredResourceKind::TmuxServer {
+                        tmux_outcome.clone()
+                    } else {
+                        RetirementOutcome::Retired
+                    },
+                    identity,
+                })
+                .collect())
         }
         .await;
         self.close_retirement_leases.lock().await.insert(key, lease);
@@ -3025,11 +3072,14 @@ fn require_absent(outcome: BashRetirementOutcome) -> Result<(), String> {
     }
 }
 
-fn require_tmux_absent(
+fn tmux_retirement_outcome(
     outcome: TmuxRetirementOutcome,
-) -> Result<(), (RetirementFailureReason, String)> {
+) -> Result<RetirementOutcome, (RetirementFailureReason, String)> {
     match outcome {
-        TmuxRetirementOutcome::Retired | TmuxRetirementOutcome::AbsenceVerified => Ok(()),
+        TmuxRetirementOutcome::Retired => Ok(RetirementOutcome::Retired),
+        TmuxRetirementOutcome::AbsenceVerified => Ok(RetirementOutcome::AbsenceAdopted {
+            absence_basis: AbsenceBasis::SameAttemptPriorRetirement,
+        }),
         TmuxRetirementOutcome::IdentityNotProven { reason } => {
             Err((RetirementFailureReason::IdentityNotProven, reason))
         }
