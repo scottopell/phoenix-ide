@@ -1146,6 +1146,7 @@ async fn inspect_worktree(
                 "-z",
                 "--ignored",
                 "--untracked-files=all",
+                "--ignore-submodules=all",
             ])
             .current_dir(status_path)
             .output()
@@ -1423,6 +1424,7 @@ fn observe_initialized_submodules(
                 "-z",
                 "--ignored",
                 "--untracked-files=all",
+                "--ignore-submodules=all",
             ])
             .current_dir(&submodule_path)
             .output()
@@ -1633,23 +1635,29 @@ async fn remove_exact_worktree(identity: &WorktreeIdentity) -> Result<(), String
             .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
             .current_dir(&path)
             .output()?;
-        if !status.status.success() || !status.stdout.is_empty() {
-            return Ok(status);
+        if !status.status.success() {
+            return Ok::<_, std::io::Error>(Err(String::from_utf8_lossy(&status.stderr)
+                .trim()
+                .to_string()));
         }
-        phoenix_core::git::command()
+        if !status.stdout.is_empty() {
+            return Ok(Err("worktree changed after confirmation".to_string()));
+        }
+        let removal = phoenix_core::git::command()
             .args(["worktree", "remove"])
             .arg(path)
             .current_dir(repo)
-            .output()
+            .output()?;
+        Ok(if removal.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&removal.stderr).trim().to_string())
+        })
     })
     .await
     .map_err(|error| error.to_string())?
-    .map_err(|error| error.to_string())?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
-    }
+    .map_err(|error| error.to_string());
+    output?
 }
 
 fn canonical_status_observation(status: &[u8]) -> Vec<u8> {

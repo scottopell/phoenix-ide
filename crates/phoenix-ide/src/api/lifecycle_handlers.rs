@@ -5,8 +5,8 @@ use super::handlers::AppError;
 use super::types::{
     CancelCloseBeforeRetirementRequest, ConfirmCloseLossRetirementRequest, ConflictErrorResponse,
     ForkDismissResponse, ForkPromoteResponse, ForkProposalListResponse, ForkProposalSummary,
-    ForkSpawnResponse, RequestChangesRequest, SuccessResponse, TaskApprovalRequest,
-    TaskApprovalResponse, TaskFeedbackRequest,
+    ForkSpawnResponse, RequestChangesRequest, RetryCloseRetirementRequest, SuccessResponse,
+    TaskApprovalRequest, TaskApprovalResponse, TaskFeedbackRequest,
 };
 use super::AppState;
 use crate::db::{ConvMode, Conversation};
@@ -446,6 +446,7 @@ pub(crate) async fn cancel_close_before_retirement(
 pub(crate) async fn retry_close_retirement(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Json(request): Json<RetryCloseRetirementRequest>,
 ) -> Result<Json<SuccessResponse>, AppError> {
     let transcript = state
         .db
@@ -483,6 +484,12 @@ pub(crate) async fn retry_close_retirement(
             "close_retry_unavailable",
         )))
     })?;
+    if attempt.attempt_id().as_str() != request.attempt_id {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Close attempt changed; refresh before retrying",
+            "stale_close_attempt",
+        ))));
+    }
     let retried = state
         .db
         .retry_close_retirement(attempt.attempt_id())

@@ -2258,8 +2258,12 @@ export const api = {
     return resp.json();
   },
 
-  async retryCloseRetirement(conversationId: string): Promise<{ success: boolean }> {
-    const resp = await fetch(`/api/conversations/${conversationId}/close/retry-retirement`, { method: 'POST' });
+  async retryCloseRetirement(conversationId: string, attemptId: string): Promise<{ success: boolean }> {
+    const resp = await fetch(`/api/conversations/${conversationId}/close/retry-retirement`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ attempt_id: attemptId }),
+    });
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({})) as { error?: string; error_type?: string };
       throw new ApiResponseError(err.error ?? 'Failed to retry Close retirement', resp.status, err.error_type);

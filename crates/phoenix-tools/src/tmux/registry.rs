@@ -752,9 +752,14 @@ impl TmuxRegistry {
             }
             ProbeResult::NoSocket => {
                 self.spawn_owned_session(&server.socket_path, cwd).await?;
-                server.server_token = read_server_token(&server.socket_path)
-                    .await
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                server.server_token =
+                    read_server_token(&server.socket_path)
+                        .await
+                        .ok_or_else(|| TmuxError::SpawnFailed {
+                            socket_path: server.socket_path.clone(),
+                            reason: "spawned tmux server did not publish its identity token"
+                                .to_string(),
+                        })?;
                 server.status = ServerStatus::Live;
             }
             ProbeResult::DeadSocket => {
@@ -767,9 +772,14 @@ impl TmuxRegistry {
                 );
                 let _ = tokio::fs::remove_file(&server.socket_path).await;
                 self.spawn_owned_session(&server.socket_path, cwd).await?;
-                server.server_token = read_server_token(&server.socket_path)
-                    .await
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                server.server_token =
+                    read_server_token(&server.socket_path)
+                        .await
+                        .ok_or_else(|| TmuxError::SpawnFailed {
+                            socket_path: server.socket_path.clone(),
+                            reason: "spawned tmux server did not publish its identity token"
+                                .to_string(),
+                        })?;
                 server.status = ServerStatus::Live;
             }
         }

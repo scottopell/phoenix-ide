@@ -243,6 +243,11 @@ pub struct CancelCloseBeforeRetirementRequest {
     pub attempt_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RetryCloseRetirementRequest {
+    pub attempt_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct ProductConversationCloseView {

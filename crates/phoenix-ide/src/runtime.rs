@@ -3180,6 +3180,13 @@ impl RuntimeManager {
                 ) {
                     return Ok(false);
                 }
+                if obligation.phase() == phoenix_core::domain::close::ClosePhase::NeedsRepair {
+                    manager
+                        .db
+                        .retry_close_retirement(obligation.attempt_id())
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
                 match manager
                     .retire_close_runtime_resources(obligation.attempt_id().clone())
                     .await

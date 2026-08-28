@@ -575,7 +575,9 @@ export function WorkControlBar({
     setError(null);
     setMarkingMerged(true);
     try {
-      await api.retryCloseRetirement(conversationId);
+      const attemptId = closeSnapshot?.close?.attempt_id;
+      if (!attemptId) return;
+      await api.retryCloseRetirement(conversationId, attemptId);
       setCloseSnapshot(null);
       onCloseCompleted?.();
     } catch (err) {
