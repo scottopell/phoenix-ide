@@ -1232,6 +1232,10 @@ async fn observe_detached_head_and_submodules(
                 b"unstaged" => CloseLossItem::UnstagedTrackedPath(path),
                 b"untracked" => CloseLossItem::UntrackedNonIgnoredPath(path),
                 b"submodule" => CloseLossItem::InitializedSubmoduleState(path),
+                b"detached" => CloseLossItem::DetachedUnreachableCommit(
+                    GitOidIdentity::parse_hex(String::from_utf8_lossy(path.as_bytes()).trim())
+                        .map_err(|error| error.to_string())?,
+                ),
                 _ => return Err("unknown submodule loss category".to_string()),
             });
         }
@@ -1364,6 +1368,37 @@ fn detached_reachability_evidence(repository: &Path, head_oid: &[u8]) -> Result<
     Ok(Vec::new())
 }
 
+fn run_bounded_git_status(repository: &Path) -> Result<std::process::Output, String> {
+    let mut child = phoenix_core::git::command()
+        .args([
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--ignored",
+            "--untracked-files=all",
+            "--ignore-submodules=all",
+        ])
+        .current_dir(repository)
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if child
+            .try_wait()
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return child.wait_with_output().map_err(|error| error.to_string());
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Git submodule inspection exceeded its deadline".to_string());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn observe_initialized_submodules(
     repository: &Path,
@@ -1417,18 +1452,7 @@ fn observe_initialized_submodules(
             continue;
         }
 
-        let status = phoenix_core::git::command()
-            .args([
-                "status",
-                "--porcelain=v1",
-                "-z",
-                "--ignored",
-                "--untracked-files=all",
-                "--ignore-submodules=all",
-            ])
-            .current_dir(&submodule_path)
-            .output()
-            .map_err(|error| error.to_string())?;
+        let status = run_bounded_git_status(&submodule_path)?;
         if !status.status.success() {
             return Err(format!(
                 "cannot inspect initialized submodule {}: {}",
@@ -1464,7 +1488,7 @@ fn observe_initialized_submodules(
             .stdout
             .first()
             .is_some_and(|prefix| matches!(prefix, b'+' | b'U'));
-        if gitlink_changed || detached_loss {
+        if gitlink_changed {
             observation.push((
                 [
                     b"SUBMODULE_LOSS\0submodule\0".as_slice(),
@@ -1473,6 +1497,23 @@ fn observe_initialized_submodules(
                 .concat(),
                 Vec::new(),
             ));
+        }
+        if detached_loss {
+            let submodule_head = phoenix_core::git::command()
+                .args(["rev-parse", "--verify", "HEAD"])
+                .current_dir(&submodule_path)
+                .output()
+                .map_err(|error| error.to_string())?;
+            let submodule_head = submodule_head
+                .stdout
+                .strip_suffix(b"\n")
+                .unwrap_or(&submodule_head.stdout);
+            for oid in detached_unreachable_commits(&submodule_path, submodule_head)? {
+                observation.push((
+                    [b"SUBMODULE_LOSS\0detached\0".as_slice(), oid.as_slice()].concat(),
+                    Vec::new(),
+                ));
+            }
         }
         for loss in parse_status_losses(&status.stdout) {
             let (category, nested_path) = match loss {

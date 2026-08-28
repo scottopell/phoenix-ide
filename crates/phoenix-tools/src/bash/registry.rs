@@ -903,15 +903,10 @@ impl BashHandleRegistry {
                         }
                         continue;
                     }
-                    // SAFETY: kill(2) with negative pid signals the process group;
-                    // no memory implications. ESRCH (group already gone) is expected.
-                    let rc = unsafe { libc::kill(-target.pgid, libc::SIGKILL) };
-                    if rc != 0 {
-                        let err = std::io::Error::last_os_error();
-                        if err.raw_os_error() != Some(libc::ESRCH) {
-                            report.kill_failures.push((target.pgid, err.to_string()));
-                        }
-                    }
+                    report.kill_failures.push((
+                        target.pgid,
+                        "refusing check-then-signal process-group teardown; terminate the tracked child through its owned handle before retry".to_string(),
+                    ));
                 }
             }
         }
