@@ -2187,6 +2187,7 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<bool, String> {
     Ok(false)
 }
 
+#[cfg(target_os = "macos")]
 fn descriptor_inventory_may_be_truncated(returned_bytes: usize, capacity_bytes: usize) -> bool {
     returned_bytes >= capacity_bytes
 }
@@ -2726,8 +2727,7 @@ fn require_browser_absent(outcome: BrowserRetirementOutcome) -> Result<(), Strin
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_status_observation, descriptor_inventory_may_be_truncated,
-        exact_worktree_administrative_dir, git_path_from_observation,
+        canonical_status_observation, exact_worktree_administrative_dir, git_path_from_observation,
         inspect_and_remove_exact_worktree_with_hook, inspect_worktree, parse_status_losses,
         quarantine_and_remove_exact_worktree, rotate_inspection_generation,
         run_bounded_git_status_until, snapshot_for, staged_index_entries_by_path,
@@ -2739,11 +2739,12 @@ mod tests {
     };
     use std::path::Path;
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn full_descriptor_buffer_requires_larger_inventory() {
-        assert!(descriptor_inventory_may_be_truncated(4096, 4096));
-        assert!(descriptor_inventory_may_be_truncated(8192, 4096));
-        assert!(!descriptor_inventory_may_be_truncated(4080, 4096));
+        assert!(super::descriptor_inventory_may_be_truncated(4096, 4096));
+        assert!(super::descriptor_inventory_may_be_truncated(8192, 4096));
+        assert!(!super::descriptor_inventory_may_be_truncated(4080, 4096));
     }
 
     fn run_git(repository: &Path, arguments: &[&str]) {
