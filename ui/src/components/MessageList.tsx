@@ -963,14 +963,17 @@ function MessageListImpl({
       // gone longer than the bound without an event of its own. An empty set
       // was previously a reason to skip, which is backwards: it is the
       // strongest evidence there is that no observable finger is driving.
-      const abandonStaleGesture = abandonStaleGestureRef.current = () => {
-        if (scrollerTouchIdsRef.current.size > 0
-          && Date.now() - lastTouchAtMs.current <= GESTURE_STALE_MS) return;
+      const endUnobservedGesture = () => {
         window.clearTimeout(staleGestureTimerRef.current);
         staleGestureTimerRef.current = 0;
         scrollerTouchIdsRef.current.clear();
         touchStartYRef.current.clear();
         dispatchScrollEvent({ type: 'gestureAbandoned' });
+      };
+      const abandonStaleGesture = abandonStaleGestureRef.current = () => {
+        if (scrollerTouchIdsRef.current.size > 0
+          && Date.now() - lastTouchAtMs.current <= GESTURE_STALE_MS) return;
+        endUnobservedGesture();
       };
       // The bound has to expire on its own. Checking it only when some later
       // input arrives means a reader who simply stops touching the screen
@@ -992,16 +995,25 @@ function MessageListImpl({
       const ownedTouches = (e: TouchEvent): Touch[] =>
         Array.from(e.touches).filter((t) => scrollerTouchIdsRef.current.has(t.identifier));
       const onTouchStart = (e: TouchEvent) => {
-        lastTouchAtMs.current = Date.now();
         const live = new Set(Array.from(e.touches).map((touch) => touch.identifier));
         for (const id of Array.from(scrollerTouchIdsRef.current)) {
           if (!live.has(id)) scrollerTouchIdsRef.current.delete(id);
         }
+        // A touch that is already down cannot start again, so a touchstart
+        // naming an identifier this scroller still owns is proof the platform
+        // recycled it — the touch it belonged to ended without being seen.
+        // That is definite, where the staleness bound is only a guess, and it
+        // is checked before the timestamp is refreshed so the refresh cannot
+        // make the interaction it replaces look current.
+        const recycled = Array.from(e.changedTouches)
+          .some((touch) => scrollerTouchIdsRef.current.has(touch.identifier));
         // A new touch must not inherit the evidence of a gesture that already
         // ended, and that gesture cannot be resolved either: the position it
         // ended at was never observed, and the current one belongs to a later
         // moment.
-        abandonStaleGesture();
+        if (recycled) endUnobservedGesture();
+        else abandonStaleGesture();
+        lastTouchAtMs.current = Date.now();
         for (const touch of Array.from(e.changedTouches)) {
           scrollerTouchIdsRef.current.add(touch.identifier);
         }
@@ -1123,9 +1135,13 @@ function MessageListImpl({
       const UPWARD_KEYS = new Set(['ArrowUp', 'PageUp', 'Home']);
       const DOWNWARD_KEYS = new Set(['ArrowDown', 'PageDown', 'End', ' ']);
       const onKeyDown = (e: KeyboardEvent) => {
+        // The chat route locks its ancestors' overflow, so this scroller is the
+        // only scrollable box and it is a descendant of the body — a key
+        // arriving with the body as target scrolls nothing at all. Treating
+        // one as viewport movement cancels a positioning command and hands
+        // over ownership for a scroll that never happened.
         const target = e.target;
-        const readsTranscript = target === document.body || (target instanceof Node && ref.contains(target));
-        if (!readsTranscript) return;
+        if (!(target instanceof Node) || !ref.contains(target)) return;
         // A key only takes the viewport over when its default action is to
         // move it. Typing consumes these keys outright, and Space activates a
         // focused control rather than paging the transcript — treating either

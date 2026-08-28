@@ -3898,6 +3898,92 @@ describe('handleTotalListHeightChanged', () => {
     }
   });
 
+  it('a recycled touch identifier does not extend the interaction it replaced', () => {
+    const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={historical}
+          pendingMessages={[]}
+          convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-recycled-identifier"
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 600, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
+
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 300, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+    setupScroller(scroller, { scrollHeight: 1100, scrollTop: 300, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1100));
+    expect(container.querySelector('.jump-to-newest')).not.toBeNull();
+
+    // A drag that travels toward the tail, then loses its lift to a detached
+    // node. Its evidence is still held by the policy.
+    fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
+    fireEvent.touchMove(scroller, { touches: [{ identifier: 1 }] });
+    setupScroller(scroller, { scrollHeight: 1100, scrollTop: 690, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+
+    // Safari hands the same identifier to the next touch, immediately — too
+    // soon for the staleness bound to have any opinion. A touch that is down
+    // cannot start again, so this is the platform telling us the first one
+    // ended; a stationary tap must not inherit its travel and confirm.
+    fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
+    fireEvent.touchEnd(scroller, { touches: [], changedTouches: [{ identifier: 1 }] });
+
+    expect(container.querySelector('.jump-to-newest')).not.toBeNull();
+  });
+
+  it('a key that reaches only the body does not claim the viewport', async () => {
+    const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const listRef = createRef<React.ElementRef<typeof MessageList>>();
+    const onLoadOlderMessages = vi.fn();
+    virtualTranscriptMock.captureVisibleAnchor.mockReturnValue({ key: 'msg-1', index: 0, offset: 14 });
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          ref={listRef}
+          messages={historical}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-body-key"
+          hasOlderMessages
+          onLoadOlderMessages={onLoadOlderMessages}
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-body-key', generation: 1, transcriptGeneration: 1 } }}/>,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 0, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
+    act(() => virtualTranscriptMock.pinnedChanged?.(false));
+    act(() => listRef.current?.scrollToUnitIndex(2));
+
+    // The chat route locks its ancestors' overflow, so a key delivered with
+    // the body as target scrolls nothing. Claiming the viewport for it would
+    // cancel the jump still positioning and acquire history the reader never
+    // scrolled toward.
+    fireEvent.keyDown(document.body, { key: 'PageDown' });
+    act(() => virtualTranscriptMock.rangeChanged?.({
+      renderedRange: { startIndex: 0, endIndex: 2 },
+      visibleRange: { startIndex: 0, endIndex: 1 },
+      viewportTop: 0,
+      layoutRevision: 2,
+    }));
+
+    await act(async () => { await Promise.resolve(); });
+    expect(onLoadOlderMessages).not.toHaveBeenCalled();
+  });
+
   it('re-snaps when viewport shrinks while pinned', () => {
     const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
     const { container } = render(

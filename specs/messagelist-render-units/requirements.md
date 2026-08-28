@@ -362,14 +362,15 @@ scroll-to-tail command
 AND SHALL keep unread-tail state clear
 
 WHEN a key whose default action moves the transcript in either direction is
-pressed while it has focus
+pressed at a target within the transcript
 THE SYSTEM SHALL treat it as the user taking the viewport over
 AND SHALL NOT treat a key the focused element consumes for itself — text
 entry, or an activation key on a control that activates on it — as viewport
 movement
 SO THAT the test is what the key actually does from that element, not merely
 where focus happens to sit: a link inside the transcript activates on Enter
-and pages on Space, and pages the transcript accordingly
+and pages on Space, and pages the transcript accordingly, while a key
+delivered outside the transcript moves a box that is not this one
 SO THAT a positioning command in flight yields to a reader who keys their own
 way to the tail, in either direction
 
@@ -415,9 +416,13 @@ recursively acquire more of it, while a reader who drags there after such a
 jump is not left at a boundary that never expands
 
 WHEN a gesture the platform never reports as ended is discovered — at the
-next interaction, or when a finger reported down outlasts the
-gesture-staleness bound without an event of its own, which SHALL expire on
-its own rather than only when some later input happens to look
+next interaction, when the platform recycles an identifier the system still
+holds, or when a finger reported down outlasts the gesture-staleness bound
+without an event of its own, which SHALL expire on its own rather than only
+when some later input happens to look
+AND a touch beginning under an identifier already held SHALL end the prior
+interaction unconditionally, that being proof rather than inference: a touch
+already down cannot begin again
 THE SYSTEM SHALL end that gesture without confirming a tail return
 AND SHALL discard its travel evidence rather than carrying it into the next
 gesture
