@@ -98,14 +98,6 @@ const ChevronDown = () => (
 
 const RESTORE_OFFSET_TOLERANCE_PX = 2;
 
-/** The policy grants tail-following unless the user owns the viewport —
- *  either through a follow mode that holds position, or a touch that has
- *  moved, which takes ownership from the movement itself rather than from a
- *  scroll event (REQ-MLRU-014). */
-/** Whether the reader is the one who put the viewport where it is. Reading is
- *  one such state; so is a navigation they have taken over, which is what the
- *  user-returning phase records. A command still positioning is not — that
- *  movement is the command's own (REQ-MLRU-014). */
 function isTextEntry(element: HTMLElement): boolean {
   const tag = element.tagName;
   return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || element.isContentEditable;
@@ -119,6 +111,10 @@ function consumesSpace(element: HTMLElement): boolean {
   return element.closest(SPACE_ACTIVATED) !== null;
 }
 
+/** Whether the reader is the one who put the viewport where it is. Reading is
+ *  one such state; so is a navigation they have taken over, which is what the
+ *  user-returning phase records. A command still positioning is not — that
+ *  movement is the command's own (REQ-MLRU-014). */
 function readerMovedViewport(machine: ScrollMachineState): boolean {
   if (machine.kind !== 'live') return false;
   return machine.follow.kind === 'reading'
@@ -140,6 +136,9 @@ function snapshotOf(element: HTMLElement): ScrollSnapshot {
   };
 }
 
+/** Withheld while the user owns the viewport: a follow mode that holds
+ *  position, or a touch that has moved, which takes ownership from the
+ *  movement itself rather than from a scroll event (REQ-MLRU-014). */
 function tailFollowGranted(state: ScrollMachineState): boolean {
   if (state.kind !== 'live' && state.kind !== 'mount-rescue') return true;
   if (state.gesture.kind === 'touch' && state.gesture.moved) return false;

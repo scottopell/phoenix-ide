@@ -75,8 +75,9 @@ export interface VirtualTranscriptProps<T> {
   estimatedExtent: number | ((item: T, index: number) => number);
   className?: string;
   scrollerId?: string;
-  /** Names the scroll region. It is a focus stop, so it needs a name. */
-  ariaLabel?: string;
+  /** Names the scroll region. Required: it is a landmark and a focus stop, and
+   *  an unnamed one is an anonymous stop (REQ-VT-013). */
+  ariaLabel: string;
   scrollerRef?: (element: HTMLDivElement | null) => void;
   onRangeChange?: (snapshot: VirtualTranscriptRangeChange) => void;
   onTotalExtentChange?: (totalExtent: number) => void;

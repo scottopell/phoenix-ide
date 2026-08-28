@@ -120,6 +120,7 @@ describe('VirtualTranscript', () => {
 
     render(
       <VirtualTranscript
+        ariaLabel="Transcript"
         items={makeItems(100)}
         getKey={(item) => item.id}
         estimatedExtent={20}
@@ -178,6 +179,7 @@ describe('VirtualTranscript', () => {
 
     render(
       <VirtualTranscript
+        ariaLabel="Transcript"
         ref={ref}
         items={items}
         getKey={(item) => item.id}
@@ -219,6 +221,7 @@ describe('VirtualTranscript', () => {
 
     render(
       <VirtualTranscript
+        ariaLabel="Transcript"
         ref={ref}
         items={makeItems(20, 10)}
         getKey={(item) => item.id}
@@ -253,6 +256,7 @@ describe('VirtualTranscript', () => {
 
     render(
       <VirtualTranscript
+        ariaLabel="Transcript"
         ref={ref}
         items={[{ id: 'group', label: 'Group', height: 200 }]}
         getKey={(item) => item.id}
@@ -292,6 +296,7 @@ describe('VirtualTranscript', () => {
 
     const view = render(
       <VirtualTranscript
+        ariaLabel="Transcript"
         ref={ref}
         items={items}
         getKey={(item) => item.id}
@@ -313,6 +318,7 @@ describe('VirtualTranscript', () => {
     act(() => {
       view.rerender(
         <VirtualTranscript
+          ariaLabel="Transcript"
           ref={ref}
           items={resized}
           getKey={(item) => item.id}
@@ -349,6 +355,7 @@ describe('VirtualTranscript', () => {
 
       render(
         <VirtualTranscript
+          ariaLabel="Transcript"
           ref={ref}
           items={items}
           getKey={(item) => item.id}
@@ -410,6 +417,7 @@ describe('VirtualTranscript', () => {
 
       render(
         <VirtualTranscript
+          ariaLabel="Transcript"
           ref={ref}
           items={makeItems(30, 20)}
           getKey={(item) => item.id}
@@ -458,6 +466,7 @@ describe('VirtualTranscript', () => {
 
       render(
         <VirtualTranscript
+          ariaLabel="Transcript"
           ref={ref}
           items={makeItems(30, 20)}
           getKey={(item) => item.id}
@@ -517,6 +526,7 @@ describe('VirtualTranscript', () => {
 
       render(
         <VirtualTranscript
+          ariaLabel="Transcript"
           ref={ref}
           items={makeItems(30, 20)}
           getKey={(item) => item.id}
@@ -566,6 +576,7 @@ describe('VirtualTranscript', () => {
 
     render(
       <VirtualTranscript
+        ariaLabel="Transcript"
         ref={ref}
         items={makeItems(30, 20)}
         getKey={(item) => item.id}
@@ -623,6 +634,7 @@ describe('VirtualTranscript', () => {
 
       render(
         <VirtualTranscript
+          ariaLabel="Transcript"
           ref={ref}
           items={makeItems(30, 50)}
           getKey={(item) => item.id}
@@ -681,6 +693,7 @@ describe('VirtualTranscript', () => {
 
       render(
         <VirtualTranscript
+          ariaLabel="Transcript"
           ref={ref}
           items={makeItems(30, 50)}
           getKey={(item) => item.id}
@@ -732,6 +745,7 @@ describe('VirtualTranscript', () => {
 
       render(
         <VirtualTranscript
+          ariaLabel="Transcript"
           ref={ref}
           items={makeItems(30, 50)}
           getKey={(item) => item.id}
@@ -783,6 +797,7 @@ describe('VirtualTranscript', () => {
 
       render(
         <VirtualTranscript
+          ariaLabel="Transcript"
           ref={ref}
           items={makeItems(30, 50)}
           getKey={(item) => item.id}
@@ -838,6 +853,7 @@ describe('VirtualTranscript', () => {
 
       render(
         <VirtualTranscript
+          ariaLabel="Transcript"
           ref={ref}
           items={makeItems(30, 50)}
           getKey={(item) => item.id}
@@ -891,6 +907,7 @@ describe('VirtualTranscript', () => {
 
       render(
         <VirtualTranscript
+          ariaLabel="Transcript"
           ref={ref}
           items={makeItems(30, 20)}
           getKey={(item) => item.id}
@@ -938,6 +955,7 @@ describe('VirtualTranscript', () => {
 
     render(
       <VirtualTranscript
+        ariaLabel="Transcript"
         ref={ref}
         items={makeItems(20, 10)}
         getKey={(item) => item.id}
@@ -963,6 +981,7 @@ describe('VirtualTranscript', () => {
 
     render(
       <VirtualTranscript
+        ariaLabel="Transcript"
         items={makeItems(20, 20)}
         getKey={(item) => item.id}
         estimatedExtent={20}
@@ -987,6 +1006,7 @@ describe('VirtualTranscript', () => {
   it('uses one shared ResizeObserver for scroller, header, and every mounted row, with cleanup', () => {
     const { unmount } = render(
       <VirtualTranscript
+        ariaLabel="Transcript"
         items={makeItems(3, 20)}
         getKey={(item) => item.id}
         estimatedExtent={20}
@@ -1016,6 +1036,7 @@ describe('VirtualTranscript', () => {
 
     render(
       <VirtualTranscript
+        ariaLabel="Transcript"
         ref={ref}
         items={makeItems(20, 20)}
         getKey={(item) => item.id}
@@ -1045,6 +1066,7 @@ describe('VirtualTranscript', () => {
 
     render(
       <VirtualTranscript
+        ariaLabel="Transcript"
         ref={ref}
         items={makeItems(20, 10)}
         getKey={(item) => item.id}
@@ -1085,6 +1107,7 @@ describe('VirtualTranscript', () => {
 
     render(
       <VirtualTranscript
+        ariaLabel="Transcript"
         ref={ref}
         items={makeItems(5, 20)}
         getKey={(item) => item.id}
@@ -1109,6 +1132,7 @@ describe('VirtualTranscript', () => {
 
     render(
       <VirtualTranscript
+        ariaLabel="Transcript"
         ref={ref}
         items={makeItems(5, 20)}
         getKey={(item) => item.id}
@@ -1138,6 +1162,7 @@ describe('VirtualTranscript', () => {
 
     render(
       <VirtualTranscript
+        ariaLabel="Transcript"
         items={[]}
         getKey={(item: TestItem) => item.id}
         estimatedExtent={20}
@@ -1164,6 +1189,7 @@ describe('VirtualTranscript', () => {
     const initial = makeItems(20, 20);
     const view = render(
       <VirtualTranscript
+        ariaLabel="Transcript"
         ref={ref}
         items={initial}
         getKey={(item) => item.id}
@@ -1183,6 +1209,7 @@ describe('VirtualTranscript', () => {
     act(() => {
       view.rerender(
         <VirtualTranscript
+          ariaLabel="Transcript"
           ref={ref}
           items={unrelatedTailUpdate}
           getKey={(item) => item.id}
@@ -1199,6 +1226,7 @@ describe('VirtualTranscript', () => {
     act(() => {
       view.rerender(
         <VirtualTranscript
+          ariaLabel="Transcript"
           ref={ref}
           items={[...makeItems(5, 20).map((item) => ({ ...item, id: `older-${item.id}` })), ...unrelatedTailUpdate]}
           getKey={(item) => item.id}
@@ -1224,6 +1252,7 @@ describe('VirtualTranscript', () => {
     ];
     const view = render(
       <VirtualTranscript
+        ariaLabel="Transcript"
         ref={ref}
         items={initial}
         getKey={(item) => item.id}
@@ -1242,6 +1271,7 @@ describe('VirtualTranscript', () => {
     act(() => {
       view.rerender(
         <VirtualTranscript
+          ariaLabel="Transcript"
           ref={ref}
           items={[{ id: 'z', label: 'Item Z', height: 20 }, ...initial]}
           getKey={(item) => item.id}
@@ -1259,6 +1289,7 @@ describe('VirtualTranscript', () => {
     act(() => {
       view.rerender(
         <VirtualTranscript
+          ariaLabel="Transcript"
           ref={ref}
           items={[initial[0]!, initial[2]!]}
           getKey={(item) => item.id}
@@ -1286,6 +1317,7 @@ describe('VirtualTranscript', () => {
     ];
     const view = render(
       <VirtualTranscript
+        ariaLabel="Transcript"
         items={initial}
         getKey={(item) => item.id}
         estimatedExtent={20}
@@ -1301,6 +1333,7 @@ describe('VirtualTranscript', () => {
     act(() => {
       view.rerender(
         <VirtualTranscript
+          ariaLabel="Transcript"
           items={[{ id: 'z', label: 'Item Z', height: 20 }, ...initial]}
           getKey={(item) => item.id}
           estimatedExtent={20}
