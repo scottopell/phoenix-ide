@@ -25,3 +25,8 @@
 .virtual-transcript__empty {
   min-height: 100%;
 }
+
+.virtual-transcript:focus-visible {
+  outline: 2px solid var(--accent-blue);
+  outline-offset: -2px;
+}

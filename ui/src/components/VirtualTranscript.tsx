@@ -75,6 +75,8 @@ export interface VirtualTranscriptProps<T> {
   estimatedExtent: number | ((item: T, index: number) => number);
   className?: string;
   scrollerId?: string;
+  /** Names the scroll region. It is a focus stop, so it needs a name. */
+  ariaLabel?: string;
   scrollerRef?: (element: HTMLDivElement | null) => void;
   onRangeChange?: (snapshot: VirtualTranscriptRangeChange) => void;
   onTotalExtentChange?: (totalExtent: number) => void;
@@ -541,6 +543,7 @@ function VirtualTranscriptInner<T>(
     estimatedExtent,
     className,
     scrollerId,
+    ariaLabel,
     scrollerRef,
     onRangeChange,
     onTotalExtentChange,
@@ -954,12 +957,18 @@ function VirtualTranscriptInner<T>(
     : Math.max(0, totalPhysicalExtent(store) - store.headerExtent);
   const rootClassName = className ? `virtual-transcript ${className}` : 'virtual-transcript';
 
+  // tabIndex: keys scroll the nearest scrollable ancestor of the focused
+  // element, so without a tab stop here the transcript is unreachable from the
+  // keyboard (REQ-VT-013).
   return (
     <div
       ref={scrollerCallback}
       id={scrollerId}
       className={rootClassName}
       style={{ overflowAnchor: 'none' }}
+      role="region"
+      aria-label={ariaLabel}
+      tabIndex={0}
       onScroll={handleScroll}
     >
       <div className="virtual-transcript__inner" style={{ height: totalExtent }}>

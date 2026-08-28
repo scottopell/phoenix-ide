@@ -141,6 +141,29 @@ describe('VirtualTranscript', () => {
     expect(getComputedStyle(scroller as Element).overflowAnchor).toBe('none');
   });
 
+  it('exposes the scroll port as a named region a keyboard can reach', () => {
+    render(
+      <VirtualTranscript
+        items={makeItems(100)}
+        getKey={(item) => item.id}
+        estimatedExtent={20}
+        overscan={20}
+        initialTail={false}
+        ariaLabel="Conversation transcript"
+        renderItem={renderRow}
+      />,
+    );
+
+    const scroller = screen.getByRole('region', { name: 'Conversation transcript' });
+    expect(scroller).toHaveClass('virtual-transcript');
+    // Sequential focusability, not merely programmatic: tabIndex -1 would leave
+    // the port unreachable for a keyboard reader (REQ-VT-013).
+    expect(scroller.tabIndex).toBe(0);
+
+    scroller.focus();
+    expect(document.activeElement).toBe(scroller);
+  });
+
   it('quarantines duplicate semantic keys into independent physical rows', () => {
     const error = vi.spyOn(console, 'error').mockImplementation(() => {});
     const ref = { current: null as VirtualTranscriptHandle | null };

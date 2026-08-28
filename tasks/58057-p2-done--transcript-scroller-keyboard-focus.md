@@ -37,3 +37,16 @@ Open questions for whoever picks this up:
 - Whether a visible focus ring on the scroller is wanted or should be suppressed.
 
 Raised while reviewing PR #700's container structure.
+
+Resolved:
+- `tabIndex={0}`, declared on `.virtual-transcript` in VirtualTranscript. `-1`
+  would only permit programmatic focus, leaving a keyboard reader with no way to
+  reach the port — which is the gap.
+- No focus on route entry. The tab stop is enough, and auto-focus would take the
+  composer's focus, which is the more common thing to want focused.
+- Visible ring, `outline-offset: -2px` so the clipping ancestors cannot hide it.
+- `role="region"` + `ariaLabel` so the new stop is not anonymous.
+- The imperative `tabindex="-1"` stamp in the find restore-focus path is removed;
+  `focusOrigin` is always a former `document.activeElement`, so the stamp only
+  ever mattered for the scroller fallback.
+- REQ-VT-013 records the requirement.

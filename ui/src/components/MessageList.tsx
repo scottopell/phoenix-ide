@@ -636,7 +636,6 @@ function MessageListImpl({
             const focusTarget = command.focusOrigin?.isConnected
               ? command.focusOrigin
               : scrollerRef.current;
-            if (focusTarget && !focusTarget.hasAttribute('tabindex')) focusTarget.setAttribute('tabindex', '-1');
             focusTarget?.focus();
           });
           break;
@@ -1764,6 +1763,7 @@ function MessageListImpl({
           key={conversationId ?? '__empty__'}
           ref={transcriptRef}
           scrollerId="messages"
+          ariaLabel="Conversation transcript"
           scrollerRef={handleScrollerRef}
           items={allUnits}
           renderItem={itemContent}

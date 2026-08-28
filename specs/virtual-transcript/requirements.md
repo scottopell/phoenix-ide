@@ -140,3 +140,15 @@ Conformance SHALL include prefix insertion within a tall unit, dynamic resize ab
 The web implementation SHALL satisfy the Virtual Transcript postconditions in current stable Chromium, Safari, and Firefox.
 
 Geometric continuity SHALL be evaluated using measured viewport-start offsets. The web tolerance is two CSS pixels. Browser-specific event ordering shall not change command ownership or terminal results.
+
+### REQ-VT-013: Keyboard Reachability of the Scroll Port
+
+A keyboard scrolls the nearest scrollable ancestor of the focused element. The transcript's scroll port is nested inside non-scrolling shell containers, so a reader whose focus rests outside it has no scrollable ancestor to drive.
+
+THE SYSTEM SHALL expose the transcript scroll port as a named, sequentially focusable region
+AND the scroll port SHALL carry a discernible name and an accessible role.
+
+WHILE the scroll port holds keyboard focus
+THE SYSTEM SHALL render a visible focus indicator within the port's own bounds, so that clipping ancestors cannot hide it.
+
+THE SYSTEM SHALL NOT move focus to the scroll port on conversation entry, which would take focus from the message composer.

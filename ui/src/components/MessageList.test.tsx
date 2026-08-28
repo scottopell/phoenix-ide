@@ -234,6 +234,7 @@ vi.mock('./VirtualTranscript', async () => {
           data-testid="mock-virtual-transcript"
           id={scrollerId}
           ref={containerRef}
+          tabIndex={0}
           style={{ overflowY: 'auto', height: '100%' }}
         >
           {header}
