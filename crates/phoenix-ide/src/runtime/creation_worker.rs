@@ -462,8 +462,9 @@ async fn deliver_product_creation_objective(
                     "delivery acceptance timed out; delivery retry persistence failed: {db_error}"
                 )
             })?;
+        manager.kick_creation_worker();
         return Err(format!(
-            "product creation objective delivery timed out after 30 seconds: {error}"
+            "product creation objective delivery timed out after 15 seconds: {error}"
         ));
     }
     if let Err(error) = enqueue_result.expect("checked timeout above") {
@@ -478,6 +479,7 @@ async fn deliver_product_creation_objective(
             .map_err(|db_error| {
                 format!("{error}; delivery retry persistence failed: {db_error}")
             })?;
+        manager.kick_creation_worker();
         return Err(error.to_string());
     }
     manager

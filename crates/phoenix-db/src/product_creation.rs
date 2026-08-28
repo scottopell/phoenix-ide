@@ -280,9 +280,12 @@ impl Database {
                     j.cancelled_at_unix_micros, j.deletion_requested_at_unix_micros,
                     COALESCE((
                         SELECT json_group_array(json_object('media_type', i.media_type, 'data', i.data))
-                        FROM product_creation_job_images i
-                        WHERE i.request_id = j.request_id
-                        ORDER BY i.ordinal
+                        FROM (
+                            SELECT media_type, data
+                            FROM product_creation_job_images
+                            WHERE request_id = j.request_id
+                            ORDER BY ordinal
+                        ) i
                     ), '[]') AS images_json
              FROM product_creation_jobs j
              WHERE j.request_id = ?1",
@@ -335,9 +338,12 @@ impl Database {
                     cancelled_at_unix_micros, deletion_requested_at_unix_micros,
                     COALESCE((
                         SELECT json_group_array(json_object('media_type', i.media_type, 'data', i.data))
-                        FROM product_creation_job_images i
-                        WHERE i.request_id = j.request_id
-                        ORDER BY i.ordinal
+                        FROM (
+                            SELECT media_type, data
+                            FROM product_creation_job_images
+                            WHERE request_id = j.request_id
+                            ORDER BY ordinal
+                        ) i
                     ), '[]') AS images_json
              FROM product_creation_jobs j
              WHERE j.request_id = ?1",
@@ -1699,15 +1705,11 @@ impl Database {
              ORDER BY COUNT(DISTINCT conversation.product_conversation_id) DESC,
                       MAX(conversation.updated_at) DESC,
                       locator.path DESC
-             LIMIT ?1",
-        )
-        .bind(
-            i64::try_from(limit.saturating_mul(10))
-                .map_err(|_| DbError::Serialization("limit overflow".to_string()))?,
+             ",
         )
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows)
+        Ok(rows.into_iter().take(limit).collect())
     }
 }
 
