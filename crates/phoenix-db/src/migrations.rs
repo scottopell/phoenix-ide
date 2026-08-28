@@ -455,6 +455,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "require_worktree_cleanup_plan_for_adopted_absence",
         sql: MIGRATION_087,
     },
+    Migration {
+        version: 88,
+        name: "bind_worktree_cleanup_plan_to_admin_incarnation",
+        sql: MIGRATION_088,
+    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -8440,6 +8445,12 @@ BEGIN
 END;
 ";
 
+const MIGRATION_088: &str = r"
+ALTER TABLE close_worktree_cleanup_plans
+ADD COLUMN administrative_dir_incarnation TEXT NOT NULL DEFAULT 'legacy_unknown'
+CHECK (length(administrative_dir_incarnation) > 0);
+";
+
 const MIGRATION_087: &str = r"
 CREATE TRIGGER close_worktree_absence_requires_cleanup_plan_on_insert
 BEFORE INSERT ON close_retirement_resources
@@ -8611,6 +8622,53 @@ mod tests {
             .connect_with(opts)
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn migration_088_backfills_and_requires_admin_incarnation() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE close_worktree_cleanup_plans (
+                 attempt_id TEXT PRIMARY KEY,
+                 administrative_dir_value TEXT NOT NULL
+             );
+             INSERT INTO close_worktree_cleanup_plans (
+                 attempt_id, administrative_dir_value
+             ) VALUES ('legacy-attempt', '2f746d70');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(MIGRATION_088).execute(&pool).await.unwrap();
+
+        let legacy_incarnation: String = sqlx::query_scalar(
+            "SELECT administrative_dir_incarnation
+             FROM close_worktree_cleanup_plans
+             WHERE attempt_id = 'legacy-attempt'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(legacy_incarnation, "legacy_unknown");
+
+        assert!(sqlx::query(
+            "INSERT INTO close_worktree_cleanup_plans (
+                 attempt_id, administrative_dir_value, administrative_dir_incarnation
+             ) VALUES ('empty-incarnation', '2f746d70', '')",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+
+        sqlx::query(
+            "INSERT INTO close_worktree_cleanup_plans (
+                 attempt_id, administrative_dir_value, administrative_dir_incarnation
+             ) VALUES ('bound-incarnation', '2f746d70', 'git_admin_dir_v1:1:2')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
     }
 
     async fn setup_legacy_conversations_table(pool: &SqlitePool) {

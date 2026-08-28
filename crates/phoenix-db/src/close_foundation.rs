@@ -712,7 +712,14 @@ pub struct RecordCloseWorktreeCleanupPlanRequest {
     pub scope: WorkScopeId,
     pub snapshot: CloseRetirementSnapshot,
     pub resource: RetiredResourceIdentity,
+    pub administrative_dir_incarnation: String,
     pub administrative_dir: std::path::PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseWorktreeCleanupPlan {
+    pub administrative_dir: std::path::PathBuf,
+    pub administrative_dir_incarnation: String,
 }
 
 async fn close_obligation_for_update(
@@ -2751,11 +2758,13 @@ impl Database {
             "INSERT INTO close_worktree_cleanup_plans (
                  attempt_id, scope, inspection_generation, inspection_fingerprint,
                  resource_kind, identity_kind, identity_codec, identity_value,
-                 administrative_dir_codec, administrative_dir_value, planned_at
+                 administrative_dir_codec, administrative_dir_value,
+                 administrative_dir_incarnation, planned_at
              )
              SELECT plan.attempt_id, plan.scope, ?3, ?4, plan.resource_kind,
                     plan.identity_kind, plan.identity_codec, plan.identity_value,
-                    plan.administrative_dir_codec, plan.administrative_dir_value, plan.planned_at
+                    plan.administrative_dir_codec, plan.administrative_dir_value,
+                    plan.administrative_dir_incarnation, plan.planned_at
              FROM close_worktree_cleanup_plans plan
              WHERE plan.attempt_id = ?1
                AND plan.inspection_generation = ?2
@@ -3069,8 +3078,9 @@ impl Database {
             "INSERT INTO close_worktree_cleanup_plans (
                  attempt_id, scope, inspection_generation, inspection_fingerprint,
                  resource_kind, identity_kind, identity_codec, identity_value,
-                 administrative_dir_codec, administrative_dir_value, planned_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 administrative_dir_codec, administrative_dir_value,
+                 administrative_dir_incarnation, planned_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT DO NOTHING",
         )
         .bind(request.attempt_id.as_str())
@@ -3083,12 +3093,14 @@ impl Database {
         .bind(identity.value())
         .bind("hex_path_v1")
         .bind(&administrative_dir_value)
+        .bind(&request.administrative_dir_incarnation)
         .bind(Utc::now().to_rfc3339())
         .execute(&self.pool)
         .await?;
         if result.rows_affected() == 0 {
-            let prior: Option<(String, String)> = sqlx::query_as(
-                "SELECT administrative_dir_codec, administrative_dir_value
+            let prior: Option<(String, String, String)> = sqlx::query_as(
+                "SELECT administrative_dir_codec, administrative_dir_value,
+                        administrative_dir_incarnation
                  FROM close_worktree_cleanup_plans
                  WHERE attempt_id = ?1 AND scope = ?2
                    AND inspection_generation = ?3 AND inspection_fingerprint = ?4
@@ -3105,11 +3117,13 @@ impl Database {
             .bind(identity.value())
             .fetch_optional(&self.pool)
             .await?;
-            if prior
-                .as_ref()
-                .map(|(codec, value)| (codec.as_str(), value.as_str()))
-                != Some(("hex_path_v1", administrative_dir_value.as_str()))
-            {
+            if prior.as_ref().map(|(codec, value, incarnation)| {
+                (codec.as_str(), value.as_str(), incarnation.as_str())
+            }) != Some((
+                "hex_path_v1",
+                administrative_dir_value.as_str(),
+                request.administrative_dir_incarnation.as_str(),
+            )) {
                 return Err(close_precondition(
                     "exact worktree cleanup plan conflicts with durable plan",
                 ));
@@ -3128,10 +3142,11 @@ impl Database {
         scope: &WorkScopeId,
         snapshot: &CloseRetirementSnapshot,
         resource: &RetiredResourceIdentity,
-    ) -> DbResult<Option<std::path::PathBuf>> {
+    ) -> DbResult<Option<CloseWorktreeCleanupPlan>> {
         let identity = resource.identity();
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT DISTINCT administrative_dir_codec, administrative_dir_value
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT DISTINCT administrative_dir_codec, administrative_dir_value,
+                             administrative_dir_incarnation
              FROM close_worktree_cleanup_plans
              WHERE attempt_id = ?1 AND scope = ?2
                AND resource_kind = ?3 AND identity_kind = ?4
@@ -3150,7 +3165,10 @@ impl Database {
         .await?;
         match rows.as_slice() {
             [] => Ok(None),
-            [(codec, value)] => decode_host_path(codec, value).map(Some),
+            [(codec, value, incarnation)] => Ok(Some(CloseWorktreeCleanupPlan {
+                administrative_dir: decode_host_path(codec, value)?,
+                administrative_dir_incarnation: incarnation.clone(),
+            })),
             _ => Err(close_precondition(
                 "exact worktree cleanup authority has conflicting plans",
             )),
@@ -7904,6 +7922,7 @@ mod tests {
             snapshot: snapshot.clone(),
             resource: resource.clone(),
             administrative_dir: administrative_dir.clone(),
+            administrative_dir_incarnation: "admin-v1".to_string(),
         };
         db.record_close_worktree_cleanup_plan(request.clone())
             .await
@@ -7915,7 +7934,10 @@ mod tests {
             db.close_worktree_cleanup_plan(&attempt_id, &scope, &snapshot, &resource)
                 .await
                 .unwrap(),
-            Some(administrative_dir)
+            Some(CloseWorktreeCleanupPlan {
+                administrative_dir,
+                administrative_dir_incarnation: "admin-v1".to_string(),
+            })
         );
         let divergent = db
             .record_close_worktree_cleanup_plan(RecordCloseWorktreeCleanupPlanRequest {
@@ -7924,6 +7946,7 @@ mod tests {
                 snapshot,
                 resource,
                 administrative_dir: std::path::PathBuf::from("/tmp/git/worktrees/replacement"),
+                administrative_dir_incarnation: "admin-v2".to_string(),
             })
             .await
             .unwrap_err();
@@ -7997,6 +8020,7 @@ mod tests {
             snapshot: snapshot.clone(),
             resource: resource.clone(),
             administrative_dir: std::path::PathBuf::from("/tmp/crash-boundary-admin"),
+            administrative_dir_incarnation: "admin-crash-v1".to_string(),
         })
         .await
         .unwrap();
@@ -8881,6 +8905,7 @@ mod tests {
         assert_eq!(retried.snapshot(), Some(&snapshot));
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn dispatched_absence_retry_resumes_retirement_with_retained_snapshot() {
         let db = Database::open_in_memory().await.unwrap();
@@ -8934,6 +8959,7 @@ mod tests {
             scope: scope.clone(),
             resource: worktree.resource.clone(),
             administrative_dir: cleanup_dir.clone(),
+            administrative_dir_incarnation: "admin-cleanup-v1".to_string(),
         })
         .await
         .unwrap();
@@ -8975,7 +9001,10 @@ mod tests {
             db.close_worktree_cleanup_plan(&attempt, &scope, &replacement, &worktree.resource,)
                 .await
                 .unwrap(),
-            Some(cleanup_dir),
+            Some(CloseWorktreeCleanupPlan {
+                administrative_dir: cleanup_dir,
+                administrative_dir_incarnation: "admin-cleanup-v1".to_string(),
+            }),
         );
         assert!(db
             .close_retirement_inventory_is_complete(attempt.as_str())

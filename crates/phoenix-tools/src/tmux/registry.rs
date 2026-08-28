@@ -47,6 +47,42 @@ use super::{
     probe::{probe, ProbeResult},
 };
 
+fn ambiguous_socket_probe(path: &Path) -> TmuxError {
+    TmuxError::AmbiguousSocketIdentity {
+        reason: format!(
+            "endpoint {} exists but its server liveness probe failed",
+            path.display()
+        ),
+    }
+}
+
+fn endpoint_is_definitely_not_socket(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt as _;
+        std::fs::symlink_metadata(path)
+            .map(|metadata| !metadata.file_type().is_socket())
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+fn select_socket_from_probes(
+    current: PathBuf,
+    legacy: PathBuf,
+    legacy_probe: ProbeResult,
+) -> Result<PathBuf, TmuxError> {
+    match legacy_probe {
+        ProbeResult::Live => Ok(legacy),
+        ProbeResult::NoSocket | ProbeResult::NoServer => Ok(current),
+        ProbeResult::DeadSocket => Err(ambiguous_socket_probe(&legacy)),
+    }
+}
+
 /// Default session name created on lazy spawn (REQ-TMUX-002 /
 /// `TMUX_DEFAULT_SESSION`).
 pub const TMUX_DEFAULT_SESSION: &str = "main";
@@ -105,6 +141,9 @@ pub enum TmuxError {
         #[source]
         source: std::io::Error,
     },
+
+    #[error("tmux socket identity is ambiguous: {reason}")]
+    AmbiguousSocketIdentity { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -563,6 +602,37 @@ impl TmuxRegistry {
         Ok(())
     }
 
+    async fn select_current_or_legacy_socket(
+        &self,
+        current: PathBuf,
+        legacy: Option<PathBuf>,
+    ) -> Result<PathBuf, TmuxError> {
+        let current_probe = probe(&current)
+            .await
+            .map_err(|source| TmuxError::ProbeFailed {
+                socket_path: current.clone(),
+                source,
+            })?;
+        match current_probe {
+            ProbeResult::Live => Ok(current),
+            ProbeResult::DeadSocket if endpoint_is_definitely_not_socket(&current) => Ok(current),
+            ProbeResult::DeadSocket => Err(ambiguous_socket_probe(&current)),
+            ProbeResult::NoSocket | ProbeResult::NoServer => {
+                let Some(legacy) = legacy.filter(|legacy| *legacy != current) else {
+                    return Ok(current);
+                };
+                let legacy_probe =
+                    probe(&legacy)
+                        .await
+                        .map_err(|source| TmuxError::ProbeFailed {
+                            socket_path: legacy.clone(),
+                            source,
+                        })?;
+                select_socket_from_probes(current, legacy, legacy_probe)
+            }
+        }
+    }
+
     /// Get-or-create the per-`ResourceScopeKey` `Arc<RwLock<TmuxServer>>` and
     /// drive the probe-and-act sequence (REQ-TMUX-002 / REQ-TMUX-005 /
     /// REQ-TMUX-006, REQ-TMUX-WS-001).
@@ -609,21 +679,9 @@ impl TmuxRegistry {
         let legacy_socket = legacy_worktree_path
             .map(|path| socket_path_for_worktree(&self.socket_dir, path))
             .or_else(|| legacy_conversation_id.map(|id| socket_path_for(&self.socket_dir, id)));
-        let socket_path = if let Some(legacy) = legacy_socket {
-            if legacy != current_socket
-                && matches!(
-                    probe(&current_socket).await,
-                    Ok(ProbeResult::NoSocket | ProbeResult::NoServer | ProbeResult::DeadSocket)
-                )
-                && matches!(probe(&legacy).await, Ok(ProbeResult::Live))
-            {
-                legacy
-            } else {
-                current_socket
-            }
-        } else {
-            current_socket
-        };
+        let socket_path = self
+            .select_current_or_legacy_socket(current_socket, legacy_socket)
+            .await?;
         match probe(&socket_path)
             .await
             .map_err(|source| TmuxError::ProbeFailed {
@@ -689,26 +747,17 @@ impl TmuxRegistry {
         let legacy_socket = legacy_worktree_path
             .map(|path| socket_path_for_worktree(&self.socket_dir, path))
             .or_else(|| legacy_conversation_id.map(|id| socket_path_for(&self.socket_dir, id)));
-        let socket_path = if let Some(legacy) = legacy_socket {
-            if legacy != socket_path
-                && matches!(
-                    probe(&socket_path).await,
-                    Ok(ProbeResult::NoSocket | ProbeResult::NoServer | ProbeResult::DeadSocket)
-                )
-                && matches!(probe(&legacy).await, Ok(ProbeResult::Live))
-            {
-                tracing::info!(
-                    scope = %work_scope,
-                    socket = %legacy.display(),
-                    "tmux: adopting live pre-opaque-scope socket"
-                );
-                legacy
-            } else {
-                socket_path
-            }
-        } else {
-            socket_path
-        };
+        let selected_socket = self
+            .select_current_or_legacy_socket(socket_path.clone(), legacy_socket)
+            .await?;
+        if selected_socket != socket_path {
+            tracing::info!(
+                scope = %work_scope,
+                socket = %selected_socket.display(),
+                "tmux: adopting live pre-opaque-scope socket"
+            );
+        }
+        let socket_path = selected_socket;
 
         if let Some(existing) = self.get_existing(work_scope).await {
             if existing.read().await.retirement_fenced {
@@ -775,13 +824,10 @@ impl TmuxRegistry {
                         })?;
                 server.status = ServerStatus::Live;
             }
-            ProbeResult::NoServer | ProbeResult::DeadSocket => {
-                // Post-system-reboot: file present, server gone. Unlink
-                // and recreate. No breadcrumb (see design.md §"No Stale-
-                // Recovery Breadcrumb").
+            ProbeResult::NoServer => {
                 tracing::debug!(
                     socket = %server.socket_path.display(),
-                    "tmux: stale socket detected, unlinking and respawning"
+                    "tmux: server absence proven, unlinking stale socket and respawning"
                 );
                 let _ = tokio::fs::remove_file(&server.socket_path).await;
                 self.spawn_owned_session(&server.socket_path, cwd).await?;
@@ -795,6 +841,21 @@ impl TmuxRegistry {
                         })?;
                 server.status = ServerStatus::Live;
             }
+            ProbeResult::DeadSocket if endpoint_is_definitely_not_socket(&server.socket_path) => {
+                tracing::debug!(
+                    socket = %server.socket_path.display(),
+                    "tmux: non-socket endpoint detected, unlinking and respawning"
+                );
+                tokio::fs::remove_file(&server.socket_path)
+                    .await
+                    .map_err(|source| TmuxError::ProbeFailed {
+                        socket_path: server.socket_path.clone(),
+                        source,
+                    })?;
+                self.spawn_owned_session(&server.socket_path, cwd).await?;
+                server.status = ServerStatus::Live;
+            }
+            ProbeResult::DeadSocket => return Err(ambiguous_socket_probe(&server.socket_path)),
         }
         let status_changed = server.status != prev_status;
         let socket_path = server.socket_path.clone();
@@ -2824,6 +2885,36 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
         reg.emit_lifecycle(&scope("conv-X"));
+    }
+
+    #[test]
+    fn current_and_legacy_probe_matrix_fails_closed() {
+        let current = PathBuf::from("/current.sock");
+        let legacy = PathBuf::from("/legacy.sock");
+        for legacy_probe in [
+            ProbeResult::NoSocket,
+            ProbeResult::NoServer,
+            ProbeResult::Live,
+            ProbeResult::DeadSocket,
+        ] {
+            let selected = select_socket_from_probes(current.clone(), legacy.clone(), legacy_probe);
+            match legacy_probe {
+                ProbeResult::Live => assert_eq!(selected.unwrap(), legacy),
+                ProbeResult::NoSocket | ProbeResult::NoServer => {
+                    assert_eq!(selected.unwrap(), current);
+                }
+                ProbeResult::DeadSocket => {
+                    assert!(matches!(
+                        selected,
+                        Err(TmuxError::AmbiguousSocketIdentity { .. })
+                    ));
+                }
+            }
+        }
+        assert!(matches!(
+            ambiguous_socket_probe(&current),
+            TmuxError::AmbiguousSocketIdentity { .. }
+        ));
     }
 
     #[tokio::test]
