@@ -2520,6 +2520,16 @@ impl BrowserSessionManager {
         }
     }
 
+    async fn reopen_after_permit(&self, permit: &BrowserRetirementPermit) {
+        let mut state = self.state.write().await;
+        let key = Self::permit_fence_key(permit);
+        if state.retirements.get(&key).is_some_and(|retirement| {
+            retirement.fenced && retirement.generation == permit.generation.get()
+        }) {
+            state.retirements.remove(&key);
+        }
+    }
+
     pub async fn reopen_after_repair(&self, work_scope: &ResourceScopeKey) {
         let mut state = self.state.write().await;
         state
@@ -2546,12 +2556,9 @@ impl BrowserSessionManager {
         let permit = self.begin_retirement_for_actor(work_scope, actor).await;
         let manager = Arc::clone(self);
         let work_scope = work_scope.clone();
-        let actor = actor.clone();
         tokio::spawn(async move {
             let outcome = manager.complete_retirement(&permit).await;
-            manager
-                .reopen_after_repair_for_actor(&work_scope, &actor)
-                .await;
+            manager.reopen_after_permit(&permit).await;
             if let BrowserRetirementOutcome::Residual { reason } = outcome {
                 tracing::warn!(%work_scope, %reason, "requested browser teardown failed");
             }
@@ -2568,7 +2575,7 @@ impl BrowserSessionManager {
         let work_scope = work_scope.clone();
         tokio::spawn(async move {
             let outcome = manager.complete_retirement(&permit).await;
-            manager.reopen_after_repair(&work_scope).await;
+            manager.reopen_after_permit(&permit).await;
             if let BrowserRetirementOutcome::Residual { reason } = outcome {
                 tracing::warn!(%work_scope, %reason, "requested browser teardown failed");
             }
@@ -2587,7 +2594,7 @@ impl BrowserSessionManager {
     ) -> Result<(), BrowserError> {
         let permit = self.begin_retirement_for_actor(work_scope, actor).await;
         let outcome = self.complete_retirement(&permit).await;
-        self.reopen_after_repair_for_actor(work_scope, actor).await;
+        self.reopen_after_permit(&permit).await;
         match outcome {
             BrowserRetirementOutcome::Retired | BrowserRetirementOutcome::AbsenceVerified => Ok(()),
             BrowserRetirementOutcome::Residual { reason } => {
@@ -2611,7 +2618,7 @@ impl BrowserSessionManager {
     ) -> Result<(), BrowserError> {
         let permit = self.begin_retirement(work_scope).await;
         let outcome = self.complete_retirement(&permit).await;
-        self.reopen_after_repair(work_scope).await;
+        self.reopen_after_permit(&permit).await;
         match outcome {
             BrowserRetirementOutcome::Retired | BrowserRetirementOutcome::AbsenceVerified => Ok(()),
             BrowserRetirementOutcome::Residual { reason } => Err(BrowserError::OperationFailed(
@@ -3155,6 +3162,23 @@ mod lifecycle_hook_tests {
             manager.complete_retirement(&stale).await,
             super::BrowserRetirementOutcome::AbsenceVerified
         );
+        assert!(manager.is_retirement_fenced(&scope).await);
+        assert!(matches!(
+            manager.get_session(&scope).await,
+            Err(super::BrowserError::RetirementFenced { work_scope }) if work_scope == scope
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_teardown_reopen_must_not_clear_newer_fence() {
+        let manager = Arc::new(BrowserSessionManager::default());
+        let scope = scope("browser-stale-teardown-reopen");
+        let stale = manager.begin_retirement(&scope).await;
+        let current = manager.begin_retirement(&scope).await;
+
+        manager.reopen_after_permit(&stale).await;
+
+        assert_eq!(current.generation().get(), 2);
         assert!(manager.is_retirement_fenced(&scope).await);
         assert!(matches!(
             manager.get_session(&scope).await,

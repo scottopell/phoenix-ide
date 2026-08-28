@@ -130,7 +130,16 @@ impl RuntimeManager {
                                 return Err("captured worktree administrative incarnation changed"
                                     .to_string());
                             }
-                            let (snapshot, losses) = inspect_worktree(&identity).await?;
+                            let (snapshot, losses) = match inspect_worktree(&identity).await {
+                                Ok(inspection) => inspection,
+                                Err(error) => {
+                                    self.db()
+                                        .route_close_attempt_to_repair(&attempt_id)
+                                        .await
+                                        .map_err(|db_error| db_error.to_string())?;
+                                    return Err(error);
+                                }
+                            };
                             (
                                 rotate_inspection_generation(
                                     snapshot,
@@ -155,7 +164,16 @@ impl RuntimeManager {
                                     .to_string());
                             }
                             let (snapshot, losses) =
-                                inspect_worktree_at(&identity, quarantine).await?;
+                                match inspect_worktree_at(&identity, quarantine).await {
+                                    Ok(inspection) => inspection,
+                                    Err(error) => {
+                                        self.db()
+                                            .route_close_attempt_to_repair(&attempt_id)
+                                            .await
+                                            .map_err(|db_error| db_error.to_string())?;
+                                        return Err(error);
+                                    }
+                                };
                             (
                                 rotate_inspection_generation(
                                     snapshot,
@@ -2120,10 +2138,105 @@ fn quarantine_has_writable_mappings(path: &Path) -> Result<bool, String> {
     Ok(false)
 }
 
-#[cfg(not(target_os = "linux"))]
-#[allow(clippy::unnecessary_wraps)]
-fn quarantine_has_writable_mappings(_path: &Path) -> Result<bool, String> {
+#[cfg(target_os = "macos")]
+fn quarantine_has_writable_mappings(path: &Path) -> Result<bool, String> {
+    use std::ffi::CStr;
+    use std::mem::{size_of, MaybeUninit};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    #[repr(C)]
+    struct ProcRegionInfo {
+        protection: u32,
+        max_protection: u32,
+        inheritance: u32,
+        flags: u32,
+        offset: u64,
+        behavior: u32,
+        user_wired_count: u32,
+        user_tag: u32,
+        pages_resident: u32,
+        pages_shared_now_private: u32,
+        pages_swapped_out: u32,
+        pages_dirtied: u32,
+        ref_count: u32,
+        shadow_depth: u32,
+        share_mode: u32,
+        private_pages_resident: u32,
+        shared_pages_resident: u32,
+        object_id: u32,
+        depth: u32,
+        address: u64,
+        size: u64,
+    }
+
+    #[repr(C)]
+    struct ProcRegionWithPathInfo {
+        region: ProcRegionInfo,
+        vnode: libc::vnode_info_path,
+    }
+
+    const PROC_PIDREGIONPATHINFO: i32 = 8;
+    const SM_SHARED: u32 = 4;
+    const SM_TRUESHARED: u32 = 5;
+    const SM_SHARED_ALIASED: u32 = 7;
+    let canonical = std::fs::canonicalize(path).map_err(|error| {
+        format!("cannot canonicalize quarantine before mapping inspection: {error}")
+    })?;
+    for pid in macos_all_pids()?.into_iter().filter(|pid| *pid > 0) {
+        let mut address = 0_u64;
+        loop {
+            let mut info = MaybeUninit::<ProcRegionWithPathInfo>::zeroed();
+            let bytes = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    PROC_PIDREGIONPATHINFO,
+                    address,
+                    info.as_mut_ptr().cast(),
+                    i32::try_from(size_of::<ProcRegionWithPathInfo>())
+                        .expect("region path info fits i32"),
+                )
+            };
+            if bytes == 0 {
+                break;
+            }
+            if bytes
+                != i32::try_from(size_of::<ProcRegionWithPathInfo>())
+                    .expect("region path info size fits i32")
+            {
+                return Err(format!("cannot inspect process {pid} memory mappings"));
+            }
+            let info = unsafe { info.assume_init() };
+            let next = info
+                .region
+                .address
+                .checked_add(info.region.size)
+                .ok_or_else(|| format!("process {pid} mapping address overflowed"))?;
+            if next <= address {
+                return Err(format!("process {pid} mapping inventory did not advance"));
+            }
+            address = next;
+            let path_bytes = info.vnode.vip_path.as_flattened();
+            let mapped_path = unsafe { CStr::from_ptr(path_bytes.as_ptr()) };
+            if info.region.protection & u32::try_from(libc::VM_PROT_WRITE).unwrap() != 0
+                && matches!(
+                    info.region.share_mode,
+                    SM_SHARED | SM_TRUESHARED | SM_SHARED_ALIASED
+                )
+                && path_is_within(
+                    Path::new(std::ffi::OsStr::from_bytes(mapped_path.to_bytes())),
+                    &canonical,
+                )
+            {
+                return Ok(true);
+            }
+        }
+    }
     Ok(false)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn quarantine_has_writable_mappings(_path: &Path) -> Result<bool, String> {
+    Err("writable memory-mapping inspection is unsupported on this platform".to_string())
 }
 
 #[cfg(target_os = "linux")]
@@ -2244,7 +2357,8 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<bool, String> {
     })?;
     let processes = std::fs::read_dir("/proc")
         .map_err(|error| format!("cannot enumerate process descriptors: {error}"))?;
-    for process in processes.flatten() {
+    for process in processes {
+        let process = process.map_err(|error| format!("cannot inspect process entry: {error}"))?;
         if !process
             .file_name()
             .as_encoded_bytes()
@@ -2253,14 +2367,26 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<bool, String> {
         {
             continue;
         }
-        let Ok(descriptors) = std::fs::read_dir(process.path().join("fd")) else {
-            continue;
+        let descriptors = match std::fs::read_dir(process.path().join("fd")) {
+            Ok(descriptors) => descriptors,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect process {} descriptor table: {error}",
+                    process.file_name().to_string_lossy()
+                ));
+            }
         };
-        for descriptor in descriptors.flatten() {
-            if std::fs::read_link(descriptor.path())
-                .is_ok_and(|candidate| path_is_within(&candidate, &canonical))
-            {
-                return Ok(true);
+        for descriptor in descriptors {
+            let descriptor = descriptor
+                .map_err(|error| format!("cannot inspect process descriptor entry: {error}"))?;
+            match std::fs::read_link(descriptor.path()) {
+                Ok(candidate) if path_is_within(&candidate, &canonical) => return Ok(true),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!("cannot inspect process descriptor target: {error}"));
+                }
             }
         }
     }

@@ -2577,6 +2577,7 @@ impl Database {
 
     /// Advances retained same-attempt dispatch authority after retry observes the
     /// already-dispatched worktree absent.
+    #[allow(clippy::too_many_lines)]
     pub async fn resume_close_retirement_after_dispatched_absence(
         &self,
         attempt_id: &CloseAttemptId,
@@ -2655,6 +2656,100 @@ impl Database {
         .bind(replacement_snapshot.generation())
         .bind(replacement_snapshot.fingerprint())
         .bind(Utc::now().to_rfc3339())
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO close_retirement_inventories (
+                 attempt_id, scope, inspection_generation, inspection_fingerprint,
+                 sealed, captured_at
+             )
+             SELECT attempt_id, scope, ?2, ?3, 0, captured_at
+             FROM close_retirement_inventories
+             WHERE attempt_id = ?1
+               AND inspection_generation = ?4
+               AND inspection_fingerprint = ?3",
+        )
+        .bind(attempt_id.as_str())
+        .bind(replacement_snapshot.generation())
+        .bind(replacement_snapshot.fingerprint())
+        .bind(retained_snapshot.generation())
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO close_expected_retirement_resources (
+                 attempt_id, scope, inspection_generation, inspection_fingerprint,
+                 resource_kind, identity_kind, identity_codec, identity_value
+             )
+             SELECT attempt_id, scope, ?2, ?3, resource_kind, identity_kind,
+                    identity_codec, identity_value
+             FROM close_expected_retirement_resources
+             WHERE attempt_id = ?1
+               AND inspection_generation = ?4
+               AND inspection_fingerprint = ?3",
+        )
+        .bind(attempt_id.as_str())
+        .bind(replacement_snapshot.generation())
+        .bind(replacement_snapshot.fingerprint())
+        .bind(retained_snapshot.generation())
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE close_retirement_inventories SET sealed = 1
+             WHERE attempt_id = ?1
+               AND inspection_generation = ?2
+               AND inspection_fingerprint = ?3",
+        )
+        .bind(attempt_id.as_str())
+        .bind(replacement_snapshot.generation())
+        .bind(replacement_snapshot.fingerprint())
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO close_retirement_resource_dispatches (
+                 attempt_id, scope, inspection_generation, inspection_fingerprint,
+                 resource_kind, identity_kind, identity_codec, identity_value, dispatched_at
+             )
+             SELECT dispatch.attempt_id, dispatch.scope, ?3, ?4,
+                    dispatch.resource_kind, dispatch.identity_kind, dispatch.identity_codec,
+                    dispatch.identity_value, dispatch.dispatched_at
+             FROM close_retirement_resource_dispatches dispatch
+             JOIN close_expected_retirement_resources expected
+               ON expected.attempt_id = dispatch.attempt_id
+              AND expected.scope = dispatch.scope
+              AND expected.inspection_generation = ?3
+              AND expected.inspection_fingerprint = ?4
+              AND expected.resource_kind = dispatch.resource_kind
+              AND expected.identity_kind = dispatch.identity_kind
+              AND expected.identity_codec = dispatch.identity_codec
+              AND expected.identity_value = dispatch.identity_value
+             WHERE dispatch.attempt_id = ?1
+               AND dispatch.inspection_generation = ?2
+               AND dispatch.inspection_fingerprint = ?4",
+        )
+        .bind(attempt_id.as_str())
+        .bind(retained_snapshot.generation())
+        .bind(replacement_snapshot.generation())
+        .bind(replacement_snapshot.fingerprint())
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO close_worktree_cleanup_plans (
+                 attempt_id, scope, inspection_generation, inspection_fingerprint,
+                 resource_kind, identity_kind, identity_codec, identity_value,
+                 administrative_dir_codec, administrative_dir_value, planned_at
+             )
+             SELECT plan.attempt_id, plan.scope, ?3, ?4, plan.resource_kind,
+                    plan.identity_kind, plan.identity_codec, plan.identity_value,
+                    plan.administrative_dir_codec, plan.administrative_dir_value, plan.planned_at
+             FROM close_worktree_cleanup_plans plan
+             WHERE plan.attempt_id = ?1
+               AND plan.inspection_generation = ?2
+               AND plan.inspection_fingerprint = ?4",
+        )
+        .bind(attempt_id.as_str())
+        .bind(retained_snapshot.generation())
+        .bind(replacement_snapshot.generation())
+        .bind(replacement_snapshot.fingerprint())
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -8722,11 +8817,29 @@ mod tests {
             .into_iter()
             .find(|resource| resource.resource.kind() == RetiredResourceKind::Worktree)
             .unwrap();
+        db.record_close_retirement_dispatch(RecordCloseRetirementDispatchRequest {
+            attempt_id: attempt.clone(),
+            snapshot: snapshot.clone(),
+            scope: scope.clone(),
+            resource: worktree.resource.clone(),
+        })
+        .await
+        .unwrap();
+        let cleanup_dir = std::path::PathBuf::from("/tmp/dispatched-absence-admin");
+        db.record_close_worktree_cleanup_plan(RecordCloseWorktreeCleanupPlanRequest {
+            attempt_id: attempt.clone(),
+            snapshot: snapshot.clone(),
+            scope: scope.clone(),
+            resource: worktree.resource.clone(),
+            administrative_dir: cleanup_dir.clone(),
+        })
+        .await
+        .unwrap();
         db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
             attempt_id: attempt.clone(),
             snapshot: snapshot.clone(),
-            scope,
-            resource: worktree.resource,
+            scope: scope.clone(),
+            resource: worktree.resource.clone(),
             outcome: RetirementOutcome::Residual {
                 residual_reason: RetirementFailureReason::RemovalFailed,
             },
@@ -8747,7 +8860,22 @@ mod tests {
         let resumed = db.get_close_obligation(attempt.as_str()).await.unwrap();
         assert_eq!(resumed.phase(), ClosePhase::RetirementRequested);
         assert_eq!(resumed.snapshot(), Some(&replacement));
-        assert!(!db
+        assert!(db
+            .close_retirement_resource_was_dispatched(
+                &attempt,
+                &scope,
+                &replacement,
+                &worktree.resource,
+            )
+            .await
+            .unwrap());
+        assert_eq!(
+            db.close_worktree_cleanup_plan(&attempt, &scope, &replacement, &worktree.resource,)
+                .await
+                .unwrap(),
+            Some(cleanup_dir),
+        );
+        assert!(db
             .close_retirement_inventory_is_complete(attempt.as_str())
             .await
             .unwrap());

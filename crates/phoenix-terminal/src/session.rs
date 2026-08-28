@@ -587,22 +587,8 @@ impl ActiveTerminals {
                 reason: "terminal relay did not release after teardown request".to_string(),
             };
         }
-        let handle = {
-            let mut map = self.0.lock().expect("terminal registry poisoned");
-            if !Self::matches_exact_instance(&map, permit) {
-                return Self::verify_exact_absence(&map, permit);
-            }
-            map.handles.remove(&permit.work_scope)
-        };
-
-        let Some(handle) = handle else {
-            let map = self.0.lock().expect("terminal registry poisoned");
-            return Self::verify_exact_absence(&map, permit);
-        };
-
         let child_pid = handle.child_pid;
         let _ = handle.stop_tx.send(StopReason::TearDown);
-        drop(handle);
 
         let wait_outcome = tokio::task::spawn_blocking(move || {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -620,31 +606,23 @@ impl ActiveTerminals {
             }
         })
         .await;
-        let wait_outcome = if matches!(wait_outcome, Ok(None)) {
-            let exact_child_live = permit.instance.as_ref().is_some_and(|instance| {
-                phoenix_core::process_identity::process_identity_matches(
-                    instance.process_identity(),
-                )
-            });
-            if exact_child_live {
-                let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGKILL);
-                tokio::task::spawn_blocking(move || nix::sys::wait::waitpid(child_pid, None))
-                    .await
-                    .map(Some)
-            } else {
-                Ok(Some(Ok(nix::sys::wait::WaitStatus::StillAlive)))
-            }
-        } else {
-            wait_outcome
-        };
         let identity_absent = permit.instance.as_ref().is_none_or(|instance| {
             !phoenix_core::process_identity::process_identity_matches(instance.process_identity())
         });
         if !matches!(wait_outcome, Ok(Some(Ok(_)))) && !identity_absent {
             return TerminalRetirementOutcome::Residual {
-                reason: "terminal child exit observation failed".to_string(),
+                reason: "terminal child exit was not authoritatively observed; exact handle retained for retry"
+                    .to_string(),
             };
         }
+        {
+            let mut map = self.0.lock().expect("terminal registry poisoned");
+            if !Self::matches_exact_instance(&map, permit) {
+                return Self::verify_exact_absence(&map, permit);
+            }
+            map.handles.remove(&permit.work_scope);
+        }
+        drop(handle);
         let map = self.0.lock().expect("terminal registry poisoned");
         match Self::verify_exact_absence(&map, permit) {
             TerminalRetirementOutcome::AbsenceVerified if permit.had_entry => {

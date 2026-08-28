@@ -696,7 +696,7 @@ export function WorkControlBar({
     }
   };
 
-  if (!disposition.visible && !closeSnapshot) return null;
+  if (!disposition.visible && !closeSnapshot && !error) return null;
 
   const primaryClass = (role: 'review' | 'resolve' | 'clean_up' | 'abandon') =>
     !explicitSelectionUnresolved && disposition.primary === role ? ' work-actions-btn--primary' : '';
@@ -723,7 +723,14 @@ export function WorkControlBar({
     />
   ) : null;
 
-  if (!disposition.visible) return closePanel;
+  if (!disposition.visible) {
+    return (
+      <>
+        {closePanel}
+        {error && <div className="work-actions-error" role="alert">{error}</div>}
+      </>
+    );
+  }
 
   if (usesCompactLayout && !canRepresentActiveSelection) {
     const status = compactFallbackStatus(disposition, prStatus, explicitSelectionUnresolved, activePr);

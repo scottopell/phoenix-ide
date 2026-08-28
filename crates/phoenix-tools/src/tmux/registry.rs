@@ -630,7 +630,13 @@ impl TmuxRegistry {
                 socket_path: socket_path.clone(),
                 source,
             })? {
-            ProbeResult::NoSocket | ProbeResult::DeadSocket => Ok(PersistentTmuxDiscovery::Absent),
+            ProbeResult::NoSocket => Ok(PersistentTmuxDiscovery::Absent),
+            ProbeResult::DeadSocket => Ok(PersistentTmuxDiscovery::Ambiguous {
+                reason: format!(
+                    "tmux endpoint {} exists but its server liveness probe failed",
+                    socket_path.display()
+                ),
+            }),
             ProbeResult::Live => match read_server_token(&socket_path).await {
                 Some(server_token) => {
                     Ok(PersistentTmuxDiscovery::Exact(TmuxServerInstanceIdentity {

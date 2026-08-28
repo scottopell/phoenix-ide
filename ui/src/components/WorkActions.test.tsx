@@ -364,6 +364,35 @@ describe('WorkControlBar — visibility (REQ-WAB-001)', () => {
     expect(screen.queryByTestId('abandon-button')).not.toBeInTheDocument();
   });
 
+  it('keeps an in-flight action error visible if the action rail becomes hidden', async () => {
+    let rejectClose!: (reason: Error) => void;
+    vi.mocked(api.markMerged).mockReturnValueOnce(new Promise((_, reject) => {
+      rejectClose = reject;
+    }));
+    const handle = prStatusHandle();
+    const tree = (phaseType: 'idle' | 'running') => (
+      <MemoryRouter>
+        <ViewerSlotProvider browserSessionActive={false}>
+          <WorkControlBar
+            conversationId="conv-hidden-error"
+            convModeLabel="Work"
+            phaseType={phaseType}
+            continuedInConvId={null}
+            prStatusHandle={handle}
+          />
+        </ViewerSlotProvider>
+      </MemoryRouter>
+    );
+    const { rerender } = render(tree('idle'));
+
+    fireEvent.click(screen.getByTestId('clean-up-button'));
+    await waitFor(() => expect(api.markMerged).toHaveBeenCalledWith('conv-hidden-error'));
+    rerender(tree('running'));
+    rejectClose(new Error('Close failed after the phase changed'));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Close failed after the phase changed');
+  });
+
   it.each(['idle', 'error'] as const)(
     'is visible for a %s phase on Work',
     (phaseType) => {
