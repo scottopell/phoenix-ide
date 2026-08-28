@@ -2397,6 +2397,16 @@ function ConversationPageContent({
           </button>
         </div>
       )}
+      {!isArchived && <WorkControlBar
+        conversationId={conversation.id}
+        convModeLabel={conversation.conv_mode_label}
+        phaseType={convStateForChildren.type}
+        continuedInConvId={conversation.continued_in_conv_id}
+        {...(ordinaryComposerEnabled && ordinaryComposerEligible ? { onSendMessage: handleSendTextOnly } : {})}
+        showError={showError}
+        prStatusHandle={prStatusHandle}
+        {...(onCloseCompleted ? { onCloseCompleted } : {})}
+      />}
       {convStateForChildren.type === 'awaiting_recovery' && isArchived ? (
         <RecoveryBanner message={convStateForChildren.message} recoveryKind={convStateForChildren.recovery_kind} />
       ) : convStateForChildren.type === 'awaiting_recovery' ? (
@@ -2434,14 +2444,6 @@ function ConversationPageContent({
         </>
       ) : convStateForChildren.type === 'error' ? (
         <>
-        {!isArchived && <WorkControlBar
-          conversationId={conversation.id}
-          convModeLabel={conversation.conv_mode_label}
-          phaseType={convStateForChildren.type}
-          continuedInConvId={conversation.continued_in_conv_id}
-          showError={showError}
-          prStatusHandle={prStatusHandle}
-        />}
         <ErrorBanner
           message={convStateForChildren.message}
           error={convStateForChildren.error}
@@ -2496,18 +2498,6 @@ function ConversationPageContent({
         />
       ) : ordinaryComposerEnabled && ordinaryComposerEligible ? (
         <>
-        {conversationId && (
-          <WorkControlBar
-            conversationId={conversationId}
-            convModeLabel={conversation.conv_mode_label}
-            phaseType={convStateForChildren.type}
-            continuedInConvId={conversation.continued_in_conv_id}
-            onSendMessage={handleSendTextOnly}
-            showError={showError}
-            prStatusHandle={prStatusHandle}
-            {...(onCloseCompleted ? { onCloseCompleted } : {})}
-          />
-        )}
         {credentialStatus && credentialStatus !== 'not_configured' && credentialStatus !== 'valid' && (
           <Suspense fallback={null}>
             <CredentialHelperPanel

@@ -1797,6 +1797,20 @@ impl Database {
         .collect()
     }
 
+    pub async fn close_attempt_latest_was_busy(&self, attempt_id: &str) -> DbResult<bool> {
+        let captured_state: String = sqlx::query_scalar(
+            "SELECT captured_state_kind
+             FROM close_attempt_members
+             WHERE attempt_id = ?1 AND member_role IN ('latest', 'root_latest')",
+        )
+        .bind(attempt_id)
+        .fetch_one(&self.pool)
+        .await?;
+        let captured_state = CapturedConversationStateKind::from_db_str(&captured_state)
+            .ok_or_else(|| DbError::Serialization("unknown captured state kind".to_string()))?;
+        Ok(captured_state.is_busy())
+    }
+
     pub async fn list_close_attempt_scopes(
         &self,
         attempt_id: &str,
@@ -5438,6 +5452,24 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn close_busy_classification_uses_the_transactional_admission_snapshot() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        set_state(&db, "root", ConvState::LlmRequesting { attempt: 1 }).await;
+        let obligation = db
+            .begin_close_foundation(&product_id("root"), &transcript_id("root"), "attempt-busy")
+            .await
+            .unwrap();
+
+        set_state(&db, "root", ConvState::Idle).await;
+
+        assert!(db
+            .close_attempt_latest_was_busy(obligation.attempt_id().as_str())
+            .await
+            .unwrap());
     }
 
     #[tokio::test]

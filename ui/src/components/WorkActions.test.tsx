@@ -229,6 +229,28 @@ describe('WorkControlBar — persisted Close recovery', () => {
   });
 
   it.each([
+    ['Explore', 'idle'],
+    ['Work', 'llm_requesting'],
+  ])('renders active Close controls outside disposition gating for %s/%s', async (convModeLabel, phaseType) => {
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(
+      closeSnapshot('awaiting_stop_work_confirmation') as never,
+    );
+
+    renderWithProviders(
+      <WorkControlBar
+        conversationId={`conv-${convModeLabel}-${phaseType}`}
+        convModeLabel={convModeLabel}
+        phaseType={phaseType}
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle()}
+      />,
+    );
+
+    expect(await screen.findByRole('button', { name: 'Stop work and continue closing' })).toBeVisible();
+    expect(screen.queryByTestId('view-diff-button')).not.toBeInTheDocument();
+  });
+
+  it.each([
     'awaiting_blocker_resolution',
     'settling_active_work',
     'cancel_requested_during_settlement',

@@ -468,17 +468,22 @@ pub(crate) async fn confirm_close_stop_work(
         .get_close_obligation(obligation.attempt_id().as_str())
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?;
-    if matches!(
-        refreshed.phase(),
+    match refreshed.phase() {
         phoenix_core::domain::close::ClosePhase::SettlingActiveWork
-            | phoenix_core::domain::close::ClosePhase::CancelRequestedDuringSettlement
-    ) {
-        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-            "Close settlement remains in progress",
-            "close_settlement_in_progress",
-        ))));
+        | phoenix_core::domain::close::ClosePhase::CancelRequestedDuringSettlement => {
+            Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                "Close settlement remains in progress",
+                "close_settlement_in_progress",
+            ))))
+        }
+        phoenix_core::domain::close::ClosePhase::AwaitingLossConfirmation => {
+            Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                "Close requires confirmation of the freshly inspected loss inventory",
+                "close_loss_confirmation_required",
+            ))))
+        }
+        _ => Ok(Json(SuccessResponse { success: true })),
     }
-    Ok(Json(SuccessResponse { success: true }))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -708,7 +713,12 @@ async fn run_legacy_close_compat(state: &AppState, id: &str, action: &str) -> Re
     loop {
         obligation = match obligation.phase() {
             ClosePhase::AwaitingBlockerResolution => {
-                if transcript.state.is_busy() {
+                if state
+                    .db
+                    .close_attempt_latest_was_busy(obligation.attempt_id().as_str())
+                    .await
+                    .map_err(|error| AppError::Internal(error.to_string()))?
+                {
                     let awaiting_confirmation = state
                         .db
                         .confirm_close_stop_work(obligation.attempt_id().as_str())

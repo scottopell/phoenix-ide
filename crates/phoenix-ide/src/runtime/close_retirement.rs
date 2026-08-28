@@ -108,8 +108,16 @@ impl RuntimeManager {
                 None => continue,
                 Some(CapturedWorktreeIdentity::Resolved(identity)) => {
                     let path = worktree_path(&identity);
+                    let quarantine = worktree_quarantine_path(&identity)?;
                     match path.try_exists() {
                         Ok(true) => inspect_worktree(&identity).await?,
+                        Ok(false)
+                            if quarantine.try_exists().map_err(|error| {
+                                format!("cannot observe quarantined worktree path: {error}")
+                            })? =>
+                        {
+                            inspect_worktree_at(&identity, quarantine).await?
+                        }
                         Ok(false) => {
                             let obligation = self
                                 .db()
@@ -1888,8 +1896,12 @@ where
             .try_exists()
             .map_err(|error| format!("cannot observe quarantined worktree path: {error}"))?
     {
-        remove_exact_worktree_administrative_dir(administrative_dir)?;
-        return Ok(ExactWorktreeRemoval::Retired);
+        return Ok(ExactWorktreeRemoval::Residual {
+            detail: format!(
+                "captured worktree and quarantine are absent; refusing to delete unverified Git registration {}",
+                administrative_dir.display()
+            ),
+        });
     }
     let _repository_lock =
         RepositoryMutationLock::acquire(if path.exists() { &path } else { &quarantine })
@@ -2744,7 +2756,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn absent_quarantine_finishes_durable_administrative_cleanup() {
+    async fn absent_quarantine_refuses_unverified_administrative_cleanup() {
         let temp = tempfile::tempdir().unwrap();
         let repository = temp.path().join("repository");
         let linked = temp.path().join("linked");
@@ -2784,8 +2796,11 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert!(matches!(outcome, ExactWorktreeRemoval::Retired));
-        assert!(!administrative_dir.exists());
+        let ExactWorktreeRemoval::Residual { detail } = outcome else {
+            panic!("unverifiable registration must route to repair");
+        };
+        assert!(detail.contains("refusing to delete unverified Git registration"));
+        assert!(administrative_dir.exists());
     }
 
     #[tokio::test(flavor = "multi_thread")]

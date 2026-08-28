@@ -758,6 +758,20 @@ impl CapturedConversationStateKind {
             _ => return None,
         })
     }
+
+    #[must_use]
+    pub const fn is_busy(self) -> bool {
+        matches!(
+            self,
+            Self::LlmRequesting
+                | Self::SeededLlmRequesting
+                | Self::Provisioning
+                | Self::ToolExecuting
+                | Self::CancellingTool
+                | Self::AwaitingSubAgents
+                | Self::CancellingSubAgents
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

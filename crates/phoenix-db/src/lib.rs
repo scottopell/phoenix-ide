@@ -1910,6 +1910,10 @@ impl Database {
                 "SELECT NOT EXISTS(
                      SELECT 1
                      FROM close_expected_retirement_resources expected
+                     JOIN close_obligations obligation
+                       ON obligation.attempt_id = expected.attempt_id
+                      AND obligation.inspection_generation = expected.inspection_generation
+                      AND obligation.inspection_fingerprint = expected.inspection_fingerprint
                      WHERE expected.attempt_id = ?1
                        AND expected.scope = ?2
                        AND expected.resource_kind <> 'work_scope'

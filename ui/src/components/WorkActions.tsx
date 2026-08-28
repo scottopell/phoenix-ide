@@ -682,7 +682,7 @@ export function WorkControlBar({
     }
   };
 
-  if (!disposition.visible) return null;
+  if (!disposition.visible && !closeSnapshot) return null;
 
   const primaryClass = (role: 'review' | 'resolve' | 'clean_up' | 'abandon') =>
     !explicitSelectionUnresolved && disposition.primary === role ? ' work-actions-btn--primary' : '';
@@ -708,6 +708,8 @@ export function WorkControlBar({
       onRetry={() => { void retryClose(); }}
     />
   ) : null;
+
+  if (!disposition.visible) return closePanel;
 
   if (usesCompactLayout && !canRepresentActiveSelection) {
     const status = compactFallbackStatus(disposition, prStatus, explicitSelectionUnresolved, activePr);

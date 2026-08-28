@@ -538,20 +538,23 @@ impl ActiveTerminals {
         let _ = handle.stop_tx.send(StopReason::TearDown);
         drop(handle);
 
-        let wait_outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            tokio::task::spawn_blocking(move || loop {
+        let wait_outcome = tokio::task::spawn_blocking(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
                 match nix::sys::wait::waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG))
                 {
-                    Ok(nix::sys::wait::WaitStatus::StillAlive) => {
+                    Ok(nix::sys::wait::WaitStatus::StillAlive)
+                        if std::time::Instant::now() < deadline =>
+                    {
                         std::thread::sleep(std::time::Duration::from_millis(20));
                     }
-                    outcome => return outcome,
+                    Ok(nix::sys::wait::WaitStatus::StillAlive) => return None,
+                    outcome => return Some(outcome),
                 }
-            }),
-        )
+            }
+        })
         .await;
-        if wait_outcome.is_err() {
+        if matches!(wait_outcome, Ok(None)) {
             return TerminalRetirementOutcome::Residual {
                 reason: "terminal child did not exit before retirement deadline".to_string(),
             };
@@ -559,7 +562,7 @@ impl ActiveTerminals {
         let identity_absent = permit.instance.as_ref().is_none_or(|instance| {
             !phoenix_core::process_identity::process_identity_matches(instance.process_identity())
         });
-        if !matches!(wait_outcome, Ok(Ok(Ok(_)))) && !identity_absent {
+        if !matches!(wait_outcome, Ok(Some(Ok(_)))) && !identity_absent {
             return TerminalRetirementOutcome::Residual {
                 reason: "terminal child exit observation failed".to_string(),
             };
