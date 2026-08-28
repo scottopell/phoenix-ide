@@ -691,6 +691,15 @@ pub struct RecordCloseRetirementDispatchRequest {
     pub resource: RetiredResourceIdentity,
 }
 
+#[derive(Debug, Clone)]
+pub struct RecordCloseWorktreeCleanupPlanRequest {
+    pub attempt_id: CloseAttemptId,
+    pub scope: WorkScopeId,
+    pub snapshot: CloseRetirementSnapshot,
+    pub resource: RetiredResourceIdentity,
+    pub administrative_dir: std::path::PathBuf,
+}
+
 async fn close_obligation_for_update(
     tx: &mut Transaction<'_, Sqlite>,
     attempt_id: &str,
@@ -2676,6 +2685,50 @@ async fn list_close_expected_retirement_resources_tx(
         .collect()
 }
 
+fn encode_host_path(path: &std::path::Path) -> String {
+    #[cfg(unix)]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt as _;
+        path.as_os_str().as_bytes()
+    };
+    #[cfg(not(unix))]
+    let bytes = path.to_string_lossy().as_bytes();
+    bytes.iter().fold(String::new(), |mut encoded, byte| {
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+        encoded
+    })
+}
+
+fn decode_host_path(codec: &str, value: &str) -> DbResult<std::path::PathBuf> {
+    if codec != "hex_path_v1" || !value.len().is_multiple_of(2) {
+        return Err(DbError::Serialization(
+            "invalid durable host path".to_string(),
+        ));
+    }
+    let bytes = value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let text = std::str::from_utf8(pair)
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+            u8::from_str_radix(text, 16).map_err(|error| DbError::Serialization(error.to_string()))
+        })
+        .collect::<DbResult<Vec<_>>>()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt as _;
+        Ok(std::path::PathBuf::from(std::ffi::OsString::from_vec(
+            bytes,
+        )))
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8(bytes)
+            .map(std::path::PathBuf::from)
+            .map_err(|error| DbError::Serialization(error.to_string()))
+    }
+}
+
 impl Database {
     /// Durably records intent to remove one exact sealed resource before external
     /// teardown begins. A restart can adopt absence only from this same-attempt
@@ -2747,6 +2800,110 @@ impl Database {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Durably binds the validated Git administrative directory to an exact
+    /// dispatched worktree retirement before either filesystem location is deleted.
+    ///
+    /// # Errors
+    /// Returns a database error unless the exact dispatch exists and the plan is
+    /// either new or byte-for-byte identical to the prior plan.
+    pub async fn record_close_worktree_cleanup_plan(
+        &self,
+        request: RecordCloseWorktreeCleanupPlanRequest,
+    ) -> DbResult<()> {
+        if request.resource.kind() != RetiredResourceKind::Worktree {
+            return Err(close_precondition(
+                "cleanup plan resource is not a worktree",
+            ));
+        }
+        let identity = request.resource.identity();
+        let administrative_dir_value = encode_host_path(&request.administrative_dir);
+        let result = sqlx::query(
+            "INSERT INTO close_worktree_cleanup_plans (
+                 attempt_id, scope, inspection_generation, inspection_fingerprint,
+                 resource_kind, identity_kind, identity_codec, identity_value,
+                 administrative_dir_codec, administrative_dir_value, planned_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(request.attempt_id.as_str())
+        .bind(request.scope.as_str())
+        .bind(request.snapshot.generation())
+        .bind(request.snapshot.fingerprint())
+        .bind(request.resource.kind().as_str())
+        .bind(identity.identity_kind())
+        .bind(identity.codec())
+        .bind(identity.value())
+        .bind("hex_path_v1")
+        .bind(&administrative_dir_value)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            let prior: Option<(String, String)> = sqlx::query_as(
+                "SELECT administrative_dir_codec, administrative_dir_value
+                 FROM close_worktree_cleanup_plans
+                 WHERE attempt_id = ?1 AND scope = ?2
+                   AND inspection_generation = ?3 AND inspection_fingerprint = ?4
+                   AND resource_kind = ?5 AND identity_kind = ?6
+                   AND identity_codec = ?7 AND identity_value = ?8",
+            )
+            .bind(request.attempt_id.as_str())
+            .bind(request.scope.as_str())
+            .bind(request.snapshot.generation())
+            .bind(request.snapshot.fingerprint())
+            .bind(request.resource.kind().as_str())
+            .bind(identity.identity_kind())
+            .bind(identity.codec())
+            .bind(identity.value())
+            .fetch_optional(&self.pool)
+            .await?;
+            if prior
+                .as_ref()
+                .map(|(codec, value)| (codec.as_str(), value.as_str()))
+                != Some(("hex_path_v1", administrative_dir_value.as_str()))
+            {
+                return Err(close_precondition(
+                    "exact worktree cleanup plan conflicts with durable plan",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the administrative directory from an exact durable worktree cleanup plan.
+    ///
+    /// # Errors
+    /// Returns a database or identity-decoding error when the plan cannot be read.
+    pub async fn close_worktree_cleanup_plan(
+        &self,
+        attempt_id: &CloseAttemptId,
+        scope: &WorkScopeId,
+        snapshot: &CloseRetirementSnapshot,
+        resource: &RetiredResourceIdentity,
+    ) -> DbResult<Option<std::path::PathBuf>> {
+        let identity = resource.identity();
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT administrative_dir_codec, administrative_dir_value
+             FROM close_worktree_cleanup_plans
+             WHERE attempt_id = ?1 AND scope = ?2
+               AND inspection_generation = ?3 AND inspection_fingerprint = ?4
+               AND resource_kind = ?5 AND identity_kind = ?6
+               AND identity_codec = ?7 AND identity_value = ?8",
+        )
+        .bind(attempt_id.as_str())
+        .bind(scope.as_str())
+        .bind(snapshot.generation())
+        .bind(snapshot.fingerprint())
+        .bind(resource.kind().as_str())
+        .bind(identity.identity_kind())
+        .bind(identity.codec())
+        .bind(identity.value())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|(codec, value)| decode_host_path(&codec, &value))
+            .transpose()
     }
 
     /// Returns whether the current exact attempt dispatched this resource before
@@ -7429,6 +7586,65 @@ mod tests {
                 residual_reason: RetirementFailureReason::ManualRepairRequired
             }
         ) && item.detail.as_deref() == Some("manual cleanup")));
+    }
+
+    #[tokio::test]
+    async fn worktree_cleanup_plan_round_trips_exact_path_and_rejects_divergence() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let scope = allocate_scope_worktree(&db, "root").await;
+        db.begin_close_foundation(&product_id("root"), &transcript_id("root"), "attempt-1")
+            .await
+            .unwrap();
+        set_close_phase(&db, "attempt-1", ClosePhase::RetirementRequested).await;
+        let snapshot = current_test_snapshot(&db, "attempt-1").await;
+        let worktree = current_test_worktree(&db, &scope).await;
+        let resource = RetiredResourceIdentity::parse(
+            RetiredResourceKind::Worktree,
+            LossItemIdentity::Worktree(worktree),
+        )
+        .unwrap();
+        capture_test_inventory(&db, "attempt-1", &scope, &snapshot, vec![resource.clone()]).await;
+        let attempt_id = CloseAttemptId::parse("attempt-1").unwrap();
+        db.record_close_retirement_dispatch(RecordCloseRetirementDispatchRequest {
+            attempt_id: attempt_id.clone(),
+            scope: scope.clone(),
+            snapshot: snapshot.clone(),
+            resource: resource.clone(),
+        })
+        .await
+        .unwrap();
+        let administrative_dir = std::path::PathBuf::from("/tmp/git/worktrees/exact");
+        let request = RecordCloseWorktreeCleanupPlanRequest {
+            attempt_id: attempt_id.clone(),
+            scope: scope.clone(),
+            snapshot: snapshot.clone(),
+            resource: resource.clone(),
+            administrative_dir: administrative_dir.clone(),
+        };
+        db.record_close_worktree_cleanup_plan(request.clone())
+            .await
+            .unwrap();
+        db.record_close_worktree_cleanup_plan(request)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.close_worktree_cleanup_plan(&attempt_id, &scope, &snapshot, &resource)
+                .await
+                .unwrap(),
+            Some(administrative_dir)
+        );
+        let divergent = db
+            .record_close_worktree_cleanup_plan(RecordCloseWorktreeCleanupPlanRequest {
+                attempt_id,
+                scope,
+                snapshot,
+                resource,
+                administrative_dir: std::path::PathBuf::from("/tmp/git/worktrees/replacement"),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(divergent, DbError::CloseFoundationPrecondition(_)));
     }
 
     #[tokio::test]

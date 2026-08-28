@@ -9,9 +9,9 @@ use std::{
 use sha2::{Digest, Sha256};
 
 use phoenix_core::domain::close::{
-    AbsenceBasis, CapturedWorktreeIdentity, CloseAttemptId, CloseExpectedRetirementResource,
-    CloseLossItem, CloseOwnedResourceInventory, ClosePhase, CloseRetirementSnapshot,
-    GitOidIdentity, GitPathIdentity, LossItemIdentity, OpaqueIdentity, RetiredResourceIdentity,
+    CapturedWorktreeIdentity, CloseAttemptId, CloseExpectedRetirementResource, CloseLossItem,
+    CloseOwnedResourceInventory, ClosePhase, CloseRetirementSnapshot, GitOidIdentity,
+    GitPathIdentity, LossItemIdentity, OpaqueIdentity, RetiredResourceIdentity,
     RetiredResourceKind, RetirementFailureReason, RetirementOutcome, WorktreeIdentity,
 };
 use phoenix_core::work_scope::{
@@ -32,7 +32,8 @@ use super::RuntimeManager;
 use crate::db::{
     CaptureCloseRetirementInventoryRequest, CaptureCloseRetirementInventoryScopeRequest,
     RecordCloseRetirementDispatchRequest, RecordCloseRetirementEvidenceRequest,
-    ReplaceCloseInspectionRequest, ReplaceCloseInspectionScopeRequest,
+    RecordCloseWorktreeCleanupPlanRequest, ReplaceCloseInspectionRequest,
+    ReplaceCloseInspectionScopeRequest,
 };
 
 /// Process-local capability retained from inventory sealing through per-resource
@@ -1001,11 +1002,48 @@ impl RuntimeManager {
                                 .await;
                         }
                     }
+                    let administrative_dir = if let Some(path) = self
+                        .db()
+                        .close_worktree_cleanup_plan(attempt_id, &scope, snapshot, &target.resource)
+                        .await
+                        .map_err(|error| error.to_string())?
+                    {
+                        path
+                    } else {
+                        let identity = identity.clone();
+                        let discovered = tokio::task::spawn_blocking(move || {
+                            let path = worktree_path(&identity);
+                            let quarantine = worktree_quarantine_path(&identity)?;
+                            let inspection_path = if path.exists() { &path } else { &quarantine };
+                            let common = exact_worktree_common_git_dir(inspection_path)?;
+                            exact_worktree_administrative_dir(inspection_path, &common)
+                        })
+                        .await
+                        .map_err(|error| error.to_string())??;
+                        self.db()
+                            .record_close_worktree_cleanup_plan(
+                                RecordCloseWorktreeCleanupPlanRequest {
+                                    attempt_id: attempt_id.clone(),
+                                    scope: scope.clone(),
+                                    snapshot: snapshot.clone(),
+                                    resource: target.resource.clone(),
+                                    administrative_dir: discovered.clone(),
+                                },
+                            )
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        discovered
+                    };
                     let identity = identity.clone();
                     let confirmed_snapshot = confirmed.snapshot.clone();
                     let runtime = tokio::runtime::Handle::current();
                     let final_removal = tokio::task::spawn_blocking(move || {
-                        inspect_and_remove_exact_worktree(&runtime, &identity, &confirmed_snapshot)
+                        inspect_and_remove_exact_worktree(
+                            &runtime,
+                            &identity,
+                            &confirmed_snapshot,
+                            &administrative_dir,
+                        )
                     })
                     .await
                     .map_err(|error| error.to_string())?;
@@ -1020,44 +1058,6 @@ impl RuntimeManager {
                             )
                             .await?;
                             None
-                        }
-                        Ok(ExactWorktreeRemoval::Missing { reason }) => {
-                            let absence_basis = AbsenceBasis::SameAttemptPriorRetirement;
-                            let adopted = self
-                                .db()
-                                .record_close_retirement_evidence(
-                                    RecordCloseRetirementEvidenceRequest {
-                                        attempt_id: attempt_id.clone(),
-                                        snapshot: snapshot.clone(),
-                                        scope: scope.clone(),
-                                        resource: target.resource.clone(),
-                                        outcome: RetirementOutcome::AbsenceAdopted {
-                                            absence_basis,
-                                        },
-                                        detail: Some(
-                                            "exact prior close evidence adopted missing worktree"
-                                                .to_string(),
-                                        ),
-                                    },
-                                )
-                                .await;
-                            match adopted {
-                                Ok(()) => None,
-                                Err(_) => {
-                                    return self
-                                        .record_close_residual(
-                                            attempt_id,
-                                            snapshot,
-                                            &scope,
-                                            target.resource.clone(),
-                                            RetirementFailureReason::IdentityNotProven,
-                                            &format!(
-                                                "worktree is absent without adoptable exact identity evidence: {reason}"
-                                            ),
-                                        )
-                                        .await;
-                                }
-                            }
                         }
                         Ok(ExactWorktreeRemoval::ReinspectionRequired { detail }) => {
                             self.db()
@@ -1274,7 +1274,16 @@ impl RuntimeManager {
 async fn inspect_worktree(
     identity: &WorktreeIdentity,
 ) -> Result<(CloseRetirementSnapshot, Vec<CloseLossItem>), String> {
-    let path = worktree_path(identity);
+    inspect_worktree_at(identity, worktree_path(identity)).await
+}
+
+async fn inspect_worktree_at(
+    identity: &WorktreeIdentity,
+    path: PathBuf,
+) -> Result<(CloseRetirementSnapshot, Vec<CloseLossItem>), String> {
+    if observe_worktree_fingerprint(&path).as_deref() != Some(identity.fingerprint().as_str()) {
+        return Err("captured worktree administrative incarnation changed".to_string());
+    }
     let status_path = path.clone();
     let output = tokio::task::spawn_blocking(move || run_bounded_git_status(&status_path))
         .await
@@ -1817,7 +1826,6 @@ fn worktree_quarantine_path(identity: &WorktreeIdentity) -> Result<PathBuf, Stri
 
 enum ExactWorktreeRemoval {
     Retired,
-    Missing { reason: String },
     ReinspectionRequired { detail: String },
     Residual { detail: String },
 }
@@ -1826,14 +1834,46 @@ fn inspect_and_remove_exact_worktree(
     runtime: &tokio::runtime::Handle,
     identity: &WorktreeIdentity,
     confirmed_snapshot: &CloseRetirementSnapshot,
+    administrative_dir: &Path,
 ) -> Result<ExactWorktreeRemoval, String> {
-    inspect_and_remove_exact_worktree_with_hook(runtime, identity, confirmed_snapshot, |_| {})
+    inspect_and_remove_exact_worktree_with_hook_and_plan(
+        runtime,
+        identity,
+        confirmed_snapshot,
+        administrative_dir,
+        |_| {},
+    )
 }
 
+#[cfg(test)]
 fn inspect_and_remove_exact_worktree_with_hook<F>(
     runtime: &tokio::runtime::Handle,
     identity: &WorktreeIdentity,
     confirmed_snapshot: &CloseRetirementSnapshot,
+    after_quarantine: F,
+) -> Result<ExactWorktreeRemoval, String>
+where
+    F: FnOnce(&Path) + Send + 'static,
+{
+    let path = worktree_path(identity);
+    let quarantine = worktree_quarantine_path(identity)?;
+    let inspection_path = if path.exists() { &path } else { &quarantine };
+    let common = exact_worktree_common_git_dir(inspection_path)?;
+    let administrative_dir = exact_worktree_administrative_dir(inspection_path, &common)?;
+    inspect_and_remove_exact_worktree_with_hook_and_plan(
+        runtime,
+        identity,
+        confirmed_snapshot,
+        &administrative_dir,
+        after_quarantine,
+    )
+}
+
+fn inspect_and_remove_exact_worktree_with_hook_and_plan<F>(
+    runtime: &tokio::runtime::Handle,
+    identity: &WorktreeIdentity,
+    confirmed_snapshot: &CloseRetirementSnapshot,
+    administrative_dir: &Path,
     after_quarantine: F,
 ) -> Result<ExactWorktreeRemoval, String>
 where
@@ -1848,30 +1888,53 @@ where
             .try_exists()
             .map_err(|error| format!("cannot observe quarantined worktree path: {error}"))?
     {
-        return Ok(ExactWorktreeRemoval::Missing {
-            reason: "captured worktree path is absent".to_string(),
-        });
+        remove_exact_worktree_administrative_dir(administrative_dir)?;
+        return Ok(ExactWorktreeRemoval::Retired);
     }
     let _repository_lock =
         RepositoryMutationLock::acquire(if path.exists() { &path } else { &quarantine })
             .map_err(|(message, _)| message)?;
-    if path.exists() {
-        let (fresh_snapshot, _) = runtime.block_on(inspect_worktree(identity))?;
-        if &fresh_snapshot != confirmed_snapshot {
-            return Ok(ExactWorktreeRemoval::ReinspectionRequired {
-                detail: "worktree changed after Close inspection confirmation; fresh confirmation is required"
-                    .to_string(),
-            });
-        }
+    let inspection_path = if path.exists() { &path } else { &quarantine };
+    let (fresh_snapshot, _) =
+        runtime.block_on(inspect_worktree_at(identity, inspection_path.clone()))?;
+    if &fresh_snapshot != confirmed_snapshot {
+        return Ok(ExactWorktreeRemoval::ReinspectionRequired {
+            detail: "worktree changed after Close inspection confirmation; fresh confirmation is required"
+                .to_string(),
+        });
     }
     runtime.block_on(quarantine_and_remove_exact_worktree(
         identity,
+        administrative_dir.to_path_buf(),
         after_quarantine,
     ))
 }
 
 fn path_is_within(candidate: &Path, directory: &Path) -> bool {
     candidate == directory || candidate.starts_with(directory)
+}
+
+fn exact_worktree_common_git_dir(worktree: &Path) -> Result<PathBuf, String> {
+    let output = phoenix_core::git::command()
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .current_dir(worktree)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err("captured worktree is not server-owned Git worktree".to_string());
+    }
+    Ok(path_buf_from_git_bytes(output.stdout.trim_ascii()))
+}
+
+fn remove_exact_worktree_administrative_dir(administrative_dir: &Path) -> Result<(), String> {
+    match std::fs::remove_dir_all(administrative_dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "cannot remove exact retired worktree registration {}: {error}",
+            administrative_dir.display()
+        )),
+    }
 }
 
 fn exact_worktree_administrative_dir(
@@ -2130,6 +2193,7 @@ fn quarantine_has_open_descriptors(_path: &Path) -> Result<bool, String> {
 #[allow(clippy::too_many_lines)]
 async fn quarantine_and_remove_exact_worktree<F>(
     identity: &WorktreeIdentity,
+    planned_administrative_dir: PathBuf,
     after_quarantine: F,
 ) -> Result<ExactWorktreeRemoval, String>
 where
@@ -2237,14 +2301,15 @@ where
             });
         }
         let administrative_dir = exact_worktree_administrative_dir(&quarantine, &common)?;
+        if administrative_dir != planned_administrative_dir {
+            return Err(
+                "exact worktree administrative directory differs from durable cleanup plan"
+                    .to_string(),
+            );
+        }
         std::fs::remove_dir_all(&quarantine)
             .map_err(|error| format!("cannot remove quarantined worktree: {error}"))?;
-        std::fs::remove_dir_all(&administrative_dir).map_err(|error| {
-            format!(
-                "cannot remove exact retired worktree registration {}: {error}",
-                administrative_dir.display()
-            )
-        })?;
+        remove_exact_worktree_administrative_dir(&administrative_dir)?;
         Ok(ExactWorktreeRemoval::Retired)
     })
     .await
@@ -2513,8 +2578,9 @@ mod tests {
         );
         let unrelated_admin = exact_worktree_administrative_dir(&unrelated, &bare).unwrap();
         std::fs::remove_dir_all(&unrelated).unwrap();
+        let administrative_dir = exact_worktree_administrative_dir(&linked, &bare).unwrap();
 
-        let outcome = quarantine_and_remove_exact_worktree(&identity, |_| {})
+        let outcome = quarantine_and_remove_exact_worktree(&identity, administrative_dir, |_| {})
             .await
             .unwrap();
         assert!(matches!(outcome, ExactWorktreeRemoval::Retired));
@@ -2634,6 +2700,92 @@ mod tests {
         .unwrap();
         assert!(matches!(retry, ExactWorktreeRemoval::Retired));
         assert!(!retry_quarantine.exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resumed_quarantine_change_requests_reinspection_without_deleting_loss() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repository");
+        let linked = temp.path().join("linked");
+        initialize_repository(&repository);
+        run_git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                linked.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let identity = inspection_identity(&linked);
+        let (confirmed, _) = inspect_worktree(&identity).await.unwrap();
+        let quarantine = worktree_quarantine_path(&identity).unwrap();
+        std::fs::rename(&linked, &quarantine).unwrap();
+        std::fs::write(quarantine.join("write-after-crash"), "preserve\n").unwrap();
+        let runtime = tokio::runtime::Handle::current();
+
+        let outcome = tokio::task::spawn_blocking(move || {
+            inspect_and_remove_exact_worktree_with_hook(&runtime, &identity, &confirmed, |_| {})
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            ExactWorktreeRemoval::ReinspectionRequired { .. }
+        ));
+        assert_eq!(
+            std::fs::read_to_string(quarantine.join("write-after-crash")).unwrap(),
+            "preserve\n"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn absent_quarantine_finishes_durable_administrative_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repository");
+        let linked = temp.path().join("linked");
+        initialize_repository(&repository);
+        run_git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                linked.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let identity = inspection_identity(&linked);
+        let (confirmed, _) = inspect_worktree(&identity).await.unwrap();
+        let common = super::exact_worktree_common_git_dir(&linked).unwrap();
+        let administrative_dir = exact_worktree_administrative_dir(&linked, &common).unwrap();
+        let quarantine = worktree_quarantine_path(&identity).unwrap();
+        let planned_administrative_dir = administrative_dir.clone();
+        std::fs::rename(&linked, &quarantine).unwrap();
+        std::fs::remove_dir_all(&quarantine).unwrap();
+        assert!(administrative_dir.exists());
+        let runtime = tokio::runtime::Handle::current();
+
+        let outcome = tokio::task::spawn_blocking(move || {
+            super::inspect_and_remove_exact_worktree_with_hook_and_plan(
+                &runtime,
+                &identity,
+                &confirmed,
+                &planned_administrative_dir,
+                |_| {},
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(matches!(outcome, ExactWorktreeRemoval::Retired));
+        assert!(!administrative_dir.exists());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2851,7 +3003,9 @@ mod tests {
         assert!(losses
             .iter()
             .any(|loss| matches!(loss, CloseLossItem::DetachedUnreachableCommit(_))));
-        let outcome = quarantine_and_remove_exact_worktree(&identity, |_| {})
+        let common = super::exact_worktree_common_git_dir(&closing).unwrap();
+        let administrative_dir = exact_worktree_administrative_dir(&closing, &common).unwrap();
+        let outcome = quarantine_and_remove_exact_worktree(&identity, administrative_dir, |_| {})
             .await
             .unwrap();
         assert!(matches!(outcome, ExactWorktreeRemoval::Retired));
@@ -2897,13 +3051,15 @@ mod tests {
             .open(&tracked)
             .unwrap();
 
-        let outcome = quarantine_and_remove_exact_worktree(&identity, move |_| {
-            descriptor.write_all(b"after\n").unwrap();
-            descriptor.flush().unwrap();
-            std::mem::forget(descriptor);
-        })
-        .await
-        .unwrap();
+        let administrative_dir = temp.path().join("unused-residual-plan");
+        let outcome =
+            quarantine_and_remove_exact_worktree(&identity, administrative_dir, move |_| {
+                descriptor.write_all(b"after\n").unwrap();
+                descriptor.flush().unwrap();
+                std::mem::forget(descriptor);
+            })
+            .await
+            .unwrap();
 
         let ExactWorktreeRemoval::Residual { detail } = outcome else {
             panic!("open descriptor must preserve quarantine");

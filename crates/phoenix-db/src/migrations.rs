@@ -435,6 +435,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "retry_preinspection_close_repair_via_reinspection",
         sql: MIGRATION_083,
     },
+    Migration {
+        version: 84,
+        name: "persist_close_worktree_cleanup_plans",
+        sql: MIGRATION_084,
+    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -8355,6 +8360,33 @@ WHEN NOT (
 BEGIN
     SELECT RAISE(ABORT, 'invalid close obligation phase transition');
 END;
+";
+
+const MIGRATION_084: &str = r"
+CREATE TABLE close_worktree_cleanup_plans (
+    attempt_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    inspection_generation TEXT NOT NULL,
+    inspection_fingerprint TEXT NOT NULL,
+    resource_kind TEXT NOT NULL CHECK (resource_kind = 'worktree'),
+    identity_kind TEXT NOT NULL CHECK (identity_kind = 'worktree'),
+    identity_codec TEXT NOT NULL,
+    identity_value TEXT NOT NULL,
+    administrative_dir_codec TEXT NOT NULL CHECK (administrative_dir_codec = 'hex_path_v1'),
+    administrative_dir_value TEXT NOT NULL CHECK (length(administrative_dir_value) > 0),
+    planned_at TEXT NOT NULL,
+    PRIMARY KEY (
+        attempt_id, scope, inspection_generation, inspection_fingerprint,
+        resource_kind, identity_kind, identity_value
+    ),
+    FOREIGN KEY (
+        attempt_id, scope, inspection_generation, inspection_fingerprint,
+        resource_kind, identity_kind, identity_value
+    ) REFERENCES close_retirement_resource_dispatches (
+        attempt_id, scope, inspection_generation, inspection_fingerprint,
+        resource_kind, identity_kind, identity_value
+    ) ON DELETE RESTRICT
+);
 ";
 
 const MIGRATION_083: &str = r"
