@@ -4726,7 +4726,8 @@ impl Database {
             "UPDATE conversation_creation_jobs
              SET exact_checkout_oid = ?1, updated_at = ?2
              WHERE conversation_id = ?3 AND generation = ?4
-               AND status = 'provisioning' AND exact_checkout_oid IS NULL",
+               AND status = 'provisioning'
+               AND (exact_checkout_oid IS NULL OR exact_checkout_oid = ?1)",
         )
         .bind(oid)
         .bind(chrono::Utc::now().to_rfc3339())

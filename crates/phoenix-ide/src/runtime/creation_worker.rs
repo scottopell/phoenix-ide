@@ -798,6 +798,18 @@ fn ensure_phoenix_staging_ignored(repo_root: &Path) -> Result<(), String> {
             .map_err(|error| error.to_string())?;
         writeln!(file, "/.phoenix/").map_err(|error| error.to_string())?;
     }
+    let gitignore = repo_root.join(".gitignore");
+    let mut contents = std::fs::read_to_string(&gitignore).unwrap_or_default();
+    if !contents
+        .lines()
+        .any(|line| line.trim() == ".phoenix/worktrees/")
+    {
+        if !contents.is_empty() && !contents.ends_with('\n') {
+            contents.push('\n');
+        }
+        contents.push_str(".phoenix/worktrees/\n");
+        std::fs::write(&gitignore, contents).map_err(|error| error.to_string())?;
+    }
     Ok(())
 }
 
@@ -878,8 +890,23 @@ fn materialize_approved_task_snapshot(
         .canonicalize()
         .map_err(|error| format!("failed to canonicalize detached worktree: {error}"))?;
     let target_parent = canonical_worktree.join(parent);
-    std::fs::create_dir_all(&target_parent)
-        .map_err(|error| format!("failed to create approved task artifact parent: {error}"))?;
+    let mut verified_parent = canonical_worktree.clone();
+    for component in parent.components() {
+        verified_parent.push(component);
+        if verified_parent.exists() {
+            if std::fs::symlink_metadata(&verified_parent)
+                .map_err(|error| format!("failed to inspect approved task parent: {error}"))?
+                .file_type()
+                .is_symlink()
+            {
+                return Err("approved task artifact parent must not contain symlinks".to_string());
+            }
+        } else {
+            std::fs::create_dir(&verified_parent).map_err(|error| {
+                format!("failed to create approved task artifact parent: {error}")
+            })?;
+        }
+    }
     let canonical_parent = target_parent
         .canonicalize()
         .map_err(|error| format!("failed to canonicalize approved task parent: {error}"))?;
