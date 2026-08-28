@@ -102,7 +102,7 @@ pub struct ChainWorkIdentity {
     /// conversation the UI keys PR-status off.
     pub work_conv_id: String,
     pub worktree_path: String,
-    pub branch_name: String,
+    pub branch_name: Option<String>,
     pub base_branch: String,
     /// Task id + title when the chain is doing Managed (Work-mode) work; both
     /// absent for a plain Branch worktree, which carries no task.
@@ -678,7 +678,7 @@ fn resolve_work_identity(members: &[Conversation]) -> Option<ChainWorkIdentity> 
     Some(ChainWorkIdentity {
         work_conv_id: work_member.id.clone(),
         worktree_path: mode.worktree_path()?.to_string(),
-        branch_name: mode.branch_name()?.to_string(),
+        branch_name: Some(mode.branch_name()?.to_string()),
         base_branch: mode.base_branch()?.to_string(),
         task_id: mode.task_id().map(str::to_string),
         task_title: mode.task_title().map(str::to_string),
@@ -1014,7 +1014,7 @@ mod tests {
 
         let wi = view.work_identity.expect("work identity present");
         assert_eq!(wi.work_conv_id, "wi-b");
-        assert_eq!(wi.branch_name, "feat-x");
+        assert_eq!(wi.branch_name.as_deref(), Some("feat-x"));
         assert_eq!(wi.base_branch, "main");
         assert_eq!(wi.worktree_path, "/tmp/wt-x");
         assert_eq!(wi.task_id.as_deref(), Some("42"));

@@ -1579,12 +1579,7 @@ async fn provision_conversation(
                     .db()
                     .persist_conversation_creation_checkout_pin(
                         &job.conversation_id,
-                        i64::try_from(claim.generation).map_err(|_| {
-                            (
-                                "approved-task claim generation exceeds SQLite range".to_string(),
-                                ErrorKind::InvalidRequest,
-                            )
-                        })?,
+                        &claim,
                         oid,
                         approved_base_branch
                             .as_deref()

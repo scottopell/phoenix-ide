@@ -4720,7 +4720,7 @@ impl Database {
     pub async fn persist_conversation_creation_checkout_pin(
         &self,
         conversation_id: &str,
-        generation: i64,
+        claim: &CreationClaim,
         oid: &str,
         logical_base: &str,
     ) -> DbResult<bool> {
@@ -4728,7 +4728,8 @@ impl Database {
             "UPDATE conversation_creation_jobs
              SET exact_checkout_oid = ?1, exact_checkout_logical_base = ?2, updated_at = ?3
              WHERE conversation_id = ?4 AND generation = ?5
-               AND status = 'provisioning'
+               AND status = 'claimed' AND claim_worker_id = ?6 AND claim_token = ?7
+               AND lease_until > ?3
                AND ((exact_checkout_oid IS NULL AND exact_checkout_logical_base IS NULL)
                     OR (exact_checkout_oid = ?1 AND exact_checkout_logical_base = ?2))",
         )
@@ -4736,7 +4737,9 @@ impl Database {
         .bind(logical_base)
         .bind(chrono::Utc::now().to_rfc3339())
         .bind(conversation_id)
-        .bind(generation)
+        .bind(claim_generation_i64(claim)?)
+        .bind(&claim.worker_id.0)
+        .bind(&claim.token.0)
         .execute(&self.pool)
         .await?;
         Ok(updated.rows_affected() == 1)

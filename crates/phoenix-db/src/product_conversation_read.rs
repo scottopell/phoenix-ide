@@ -70,7 +70,7 @@ pub struct ProductConversationTranscriptRow {
 #[derive(Debug, Clone)]
 pub struct ProductConversationWorkIdentity {
     pub worktree_path: String,
-    pub branch_name: String,
+    pub branch_name: Option<String>,
     pub base_branch: String,
     pub task_id: Option<String>,
     pub task_title: Option<String>,
@@ -180,7 +180,7 @@ fn work_identity_from_row(
             Some(_),
             Some("allocated_worktree"),
             Some(worktree_path),
-            Some(branch_name),
+            branch_name,
             Some(base_branch),
         ) => Ok(Some(ProductConversationWorkIdentity {
             worktree_path,

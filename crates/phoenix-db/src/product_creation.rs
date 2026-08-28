@@ -334,7 +334,7 @@ impl Database {
         normalize_product_creation_intent(intent)?;
         let accepted_product_conversation_id = ProductConversationId::new();
         let now = unix_micros_now();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let existing = sqlx::query(
             "SELECT request_id, product_conversation_id, cwd, objective, model, effort, llm_language, status,
                     accepted_at_unix_micros, updated_at_unix_micros, attempt_count,
@@ -492,24 +492,7 @@ impl Database {
     ) -> DbResult<Option<ClaimedProductCreationJob>> {
         let now_str = datetime_to_unix_micros(now);
         let lease_until = datetime_to_unix_micros(now + lease_duration);
-        let mut tx = self.pool.begin().await?;
-        let candidate: Option<(String, String)> = sqlx::query_as(
-            "SELECT request_id, status
-             FROM product_creation_jobs
-             WHERE status = 'accepted'
-                OR (status = 'retry_scheduled' AND retry_at_unix_micros <= ?1)
-                OR (status = 'claimed' AND claim_lease_until_unix_micros <= ?1)
-             ORDER BY CASE status WHEN 'accepted' THEN accepted_at_unix_micros ELSE retry_at_unix_micros END ASC, accepted_at_unix_micros ASC, request_id ASC
-             LIMIT 1",
-        )
-        .bind(now_str)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some((request_id, status)) = candidate else {
-            tx.rollback().await?;
-            return Ok(None);
-        };
-        let updated = sqlx::query(
+        let job = sqlx::query(
             "UPDATE product_creation_jobs
              SET status = 'claimed',
                  claim_generation = claim_generation + 1,
@@ -518,32 +501,42 @@ impl Database {
                  claim_lease_until_unix_micros = ?3,
                  retry_at_unix_micros = NULL,
                  updated_at_unix_micros = ?4
-             WHERE request_id = ?5 AND status = ?6
-               AND (
-                    status = 'accepted'
+             WHERE request_id = (
+                 SELECT request_id FROM product_creation_jobs
+                 WHERE status = 'accepted'
                     OR (status = 'retry_scheduled' AND retry_at_unix_micros <= ?4)
                     OR (status = 'claimed' AND claim_lease_until_unix_micros <= ?4)
-               )",
+                 ORDER BY CASE status WHEN 'accepted' THEN accepted_at_unix_micros ELSE retry_at_unix_micros END ASC,
+                          accepted_at_unix_micros ASC, request_id ASC
+                 LIMIT 1
+             )
+             RETURNING request_id, product_conversation_id, cwd, objective, model, effort,
+                 llm_language, status, accepted_at_unix_micros, updated_at_unix_micros,
+                 attempt_count, claim_generation, claim_worker_id, claim_token,
+                 claim_lease_until_unix_micros, retry_at_unix_micros, delivery_attempt_count,
+                 delivery_retry_at_unix_micros, pin_exact_checkout_oid, pin_logical_base,
+                 pin_freshness, staging_path, staging_repo_root, staging_exact_oid,
+                 published_product_id, published_conversation_id, last_error,
+                 cancelled_at_unix_micros, deletion_requested_at_unix_micros,
+                 COALESCE((
+                     SELECT json_group_array(json_object('media_type', image.media_type, 'data', image.data))
+                     FROM (
+                         SELECT media_type, data FROM product_creation_job_images
+                         WHERE product_creation_job_images.request_id = product_creation_jobs.request_id
+                         ORDER BY ordinal
+                     ) image
+                 ), '[]') AS images_json",
         )
         .bind(worker_id)
         .bind(token)
         .bind(lease_until)
         .bind(now_str)
-        .bind(&request_id)
-        .bind(&status)
-        .execute(&mut *tx)
+        .try_map(parse_product_creation_job_row)
+        .fetch_optional(&self.pool)
         .await?;
-        if updated.rows_affected() != 1 {
-            tx.rollback().await?;
+        let Some(job) = job else {
             return Ok(None);
-        }
-        tx.commit().await?;
-        let job = self
-            .get_product_creation_job(&request_id)
-            .await?
-            .ok_or_else(|| {
-                DbError::Serialization("claimed product creation job missing".to_string())
-            })?;
+        };
         Ok(Some(ClaimedProductCreationJob {
             claim: ProductCreationClaim {
                 worker_id: worker_id.to_string(),

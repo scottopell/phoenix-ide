@@ -321,7 +321,7 @@ pub enum ProductConversationPresentationView {
 pub struct ProductConversationWorkIdentityView {
     pub work_transcript_row_id: String,
     pub worktree_path: String,
-    pub branch_name: String,
+    pub branch_name: Option<String>,
     pub base_branch: String,
     pub task_id: Option<String>,
     pub task_title: Option<String>,
