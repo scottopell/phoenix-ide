@@ -123,6 +123,18 @@ pub(crate) fn ensure_product_creation_cwd(
         ));
     }
     if path.exists() {
+        let mut current = PathBuf::new();
+        for component in path.components() {
+            current.push(component);
+            if current
+                .symlink_metadata()
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            {
+                return Err(ConversationCwdError::NotAcceptable(
+                    "directory path contains a symlink".to_string(),
+                ));
+            }
+        }
         return validate_conversation_cwd(raw);
     }
     let ancestor = path
@@ -317,6 +329,25 @@ mod tests {
             valid.as_path(),
             existing.canonicalize().expect("canonical cwd")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_rejects_intermediate_symlink_after_target_was_created() {
+        let home = tempfile::tempdir().expect("home");
+        let outside = tempfile::tempdir().expect("outside");
+        let requested = home.path().join("new/project");
+        let normalized =
+            normalize_product_creation_cwd_intent(requested.to_string_lossy(), home.path())
+                .expect("missing leaf accepted");
+        std::os::unix::fs::symlink(outside.path(), home.path().join("new"))
+            .expect("insert intermediate symlink");
+        std::fs::create_dir(outside.path().join("project")).expect("raced target exists");
+
+        let error = ensure_product_creation_cwd(&normalized, home.path())
+            .expect_err("existing target reached through an intermediate symlink is rejected");
+
+        assert!(error.to_string().contains("symlink"));
     }
 
     #[cfg(unix)]

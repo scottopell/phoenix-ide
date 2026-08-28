@@ -418,8 +418,13 @@ BEFORE UPDATE OF exact_checkout_oid, exact_checkout_logical_base ON conversation
 WHEN (NEW.exact_checkout_oid IS NULL) <> (NEW.exact_checkout_logical_base IS NULL)
   OR (NEW.exact_checkout_oid IS NOT NULL AND trim(NEW.exact_checkout_oid) = '')
   OR (NEW.exact_checkout_logical_base IS NOT NULL AND trim(NEW.exact_checkout_logical_base) = '')
+  OR (OLD.exact_checkout_oid IS NOT NULL AND (
+        NEW.exact_checkout_oid IS NULL
+        OR NEW.exact_checkout_oid <> OLD.exact_checkout_oid
+        OR NEW.exact_checkout_logical_base <> OLD.exact_checkout_logical_base
+      ))
 BEGIN
-    SELECT RAISE(ABORT, 'conversation creation checkout pin must be a non-empty pair');
+    SELECT RAISE(ABORT, 'conversation creation checkout pin must be a non-empty immutable pair');
 END;
 ALTER TABLE product_conversation_sources ADD COLUMN approved_title TEXT;
 ALTER TABLE product_conversation_sources ADD COLUMN approved_priority TEXT;
@@ -430,7 +435,7 @@ ALTER TABLE product_conversation_sources ADD COLUMN approved_task_file TEXT;
 CREATE TABLE approved_task_creation_bindings (
     job_id TEXT PRIMARY KEY REFERENCES conversation_creation_jobs(id) ON DELETE CASCADE,
     source_product_conversation_id TEXT NOT NULL REFERENCES product_conversations(id),
-    source_conversation_id TEXT NOT NULL REFERENCES conversations(id),
+    source_conversation_id TEXT NOT NULL CHECK (trim(source_conversation_id) <> ''),
     task_id TEXT NOT NULL CHECK (trim(task_id) <> ''),
     task_title TEXT NOT NULL CHECK (trim(task_title) <> ''),
     approved_title TEXT NOT NULL CHECK (trim(approved_title) <> ''),

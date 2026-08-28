@@ -6927,13 +6927,15 @@ impl Database {
                  conversation_id, task_id, task_title, approved_title, approved_priority,
                  approved_plan, approved_task_file, approved_artifact_body, created_at_us
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-             ON CONFLICT(conversation_id) DO UPDATE SET conversation_id = excluded.conversation_id
-             WHERE task_id = excluded.task_id AND task_title = excluded.task_title
-               AND approved_title = excluded.approved_title
-               AND approved_priority = excluded.approved_priority
-               AND approved_plan = excluded.approved_plan
-               AND approved_task_file = excluded.approved_task_file
-               AND approved_artifact_body = excluded.approved_artifact_body",
+             ON CONFLICT(conversation_id) DO UPDATE SET
+                 task_id = excluded.task_id,
+                 task_title = excluded.task_title,
+                 approved_title = excluded.approved_title,
+                 approved_priority = excluded.approved_priority,
+                 approved_plan = excluded.approved_plan,
+                 approved_task_file = excluded.approved_task_file,
+                 approved_artifact_body = excluded.approved_artifact_body,
+                 created_at_us = excluded.created_at_us",
         )
         .bind(conversation_id)
         .bind(&snapshot.task_id)
@@ -6946,23 +6948,13 @@ impl Database {
         .bind(now_us)
         .execute(&mut *tx)
         .await?;
-        let persisted: Option<String> = sqlx::query_scalar(
-            "SELECT task_id FROM conversation_approved_task_objectives WHERE conversation_id = ?1",
-        )
-        .bind(conversation_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if persisted.as_deref() != Some(snapshot.task_id.as_str()) {
-            return Err(DbError::ContinuationPrecondition(
-                "approved task conflicts with the committed objective".to_string(),
-            ));
-        }
         sqlx::query(
             "INSERT INTO work_scope_approved_task_authorities (
                  work_scope_id, objective_conversation_id, created_at_us
              ) VALUES (?1, ?2, ?3)
-             ON CONFLICT(work_scope_id) DO UPDATE SET work_scope_id = excluded.work_scope_id
-             WHERE objective_conversation_id = excluded.objective_conversation_id",
+             ON CONFLICT(work_scope_id) DO UPDATE SET
+                 objective_conversation_id = excluded.objective_conversation_id,
+                 created_at_us = excluded.created_at_us",
         )
         .bind(&work_scope_id)
         .bind(conversation_id)
@@ -6978,6 +6970,44 @@ impl Database {
         .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Create a fresh Work conversation and `ProductConversation` for an approved task.
+    /// Load the typed approved-task objective that currently grants this conversation write authority.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] if the persisted snapshot cannot be decoded.
+    pub async fn get_approved_task_objective(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<Option<phoenix_core::task_handoff::ApprovedTaskSnapshot>> {
+        let row = sqlx::query(
+            "SELECT objective.task_id, objective.task_title, objective.approved_title,
+                    objective.approved_priority, objective.approved_plan,
+                    objective.approved_task_file, objective.approved_artifact_body
+             FROM conversation_approved_task_objectives objective
+             JOIN work_scope_approved_task_authorities authority
+               ON authority.objective_conversation_id = objective.conversation_id
+             JOIN conversations conversation
+               ON conversation.work_scope_id = authority.work_scope_id
+             WHERE conversation.id = ?1",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            Ok(phoenix_core::task_handoff::ApprovedTaskSnapshot {
+                task_id: row.get("task_id"),
+                task_title: row.get("task_title"),
+                title: row.get("approved_title"),
+                priority: serde_json::from_str(&row.get::<String, _>("approved_priority"))
+                    .map_err(|error| DbError::Serialization(error.to_string()))?,
+                plan: row.get("approved_plan"),
+                task_file: row.get("approved_task_file"),
+                artifact_body: row.get("approved_artifact_body"),
+            })
+        })
+        .transpose()
     }
 
     /// Create a fresh Work conversation and `ProductConversation` for an approved task.

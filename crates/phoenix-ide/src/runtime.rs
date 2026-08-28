@@ -4750,6 +4750,11 @@ impl RuntimeManager {
             .unwrap_or_else(|| self.llm_registry.default_model_id());
         let model_id = self.llm_registry.resolve_model_id(&stored_model_id);
         let context_window = self.llm_registry.context_window(&model_id);
+        let approved_task_objective = self
+            .db
+            .get_approved_task_objective(conversation_id)
+            .await
+            .map_err(|error| format!("Failed to load approved-task objective: {error}"))?;
         let mode_context = conv_mode_to_context(&conv.conv_mode);
         let mut context = if is_sub_agent {
             let root_id = find_root_conversation_id(&self.db, conversation_id).await;
@@ -4787,8 +4792,11 @@ impl RuntimeManager {
             None => return Err("ordinary conversation is missing its work scope".to_string()),
         };
         context.resource_authority = match conv.conv_mode {
-            ConvMode::Explore { .. } => crate::work_scope::ResourceAuthority::Restricted,
-            ConvMode::Direct
+            ConvMode::Explore { .. } if approved_task_objective.is_none() => {
+                crate::work_scope::ResourceAuthority::Restricted
+            }
+            ConvMode::Explore { .. }
+            | ConvMode::Direct
             | ConvMode::Work { .. }
             | ConvMode::Branch { .. }
             | ConvMode::DetachedApprovedTask { .. } => crate::work_scope::ResourceAuthority::Work,
@@ -4920,6 +4928,12 @@ impl RuntimeManager {
                     ));
                 let writing_tools = crate::coordinator_tools::writing_tools(global_read, send_chat);
                 let (registry, upgrade_writing_tools) = match conv.conv_mode {
+                    ConvMode::Explore { .. } if approved_task_objective.is_some() => (
+                        ToolRegistry::direct(agent_catalog.to_vec(), available_model_ids.clone())
+                            .try_with_writing_conversation_tools(writing_tools)
+                            .map_err(|error| error.clone())?,
+                        None,
+                    ),
                     ConvMode::Explore { .. } => (
                         ToolRegistry::explore(
                             &context.tasks_dir_name,

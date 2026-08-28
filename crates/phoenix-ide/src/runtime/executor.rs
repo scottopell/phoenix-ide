@@ -6641,6 +6641,11 @@ where
         let tasks_dir_name = self.context.tasks_dir_name.clone();
         let is_sub_agent = self.context.is_sub_agent;
         let mode_context = self.context.mode_context.clone();
+        let has_approved_task_write_authority =
+            matches!(
+                self.context.resource_authority,
+                crate::work_scope::ResourceAuthority::Work
+            ) && matches!(mode_context, Some(ModeContext::Explore { .. }));
         let llm_language = self.context.llm_language;
         let persona = self.context.persona.clone();
         let is_coordinator = self.context.is_coordinator;
@@ -6771,7 +6776,7 @@ where
 
             // Build system prompt with AGENTS.md content + mode context
             // TODO(task 61006): snapshot system prompt per conversation to stop mid-session cache busts
-            let system_prompt = if is_coordinator {
+            let mut system_prompt = if is_coordinator {
                 crate::system_prompt::build_coordinator_system_prompt(llm_language, explore_bash)
             } else {
                 build_system_prompt(
@@ -6784,6 +6789,12 @@ where
                     explore_bash_capability,
                 )
             };
+
+            if has_approved_task_write_authority {
+                system_prompt.push_str(
+                    "\n\nThe conversation mode remains Explore, but the approved-task objective on its attached WorkScope grants full write authority. Execute that approved task with the available write tools; do not propose another plan merely because the mode label is Explore.",
+                );
+            }
 
             let tools = request_tool_surface.callable_tools(available_tools);
             let callable_tool_names: std::collections::HashSet<&str> =
@@ -8384,8 +8395,7 @@ where
         let blocking_admission = authority.reborrow();
         let result =
             crate::runtime::creation_worker::run_admitted_blocking(blocking_admission, move || {
-                reread_reviewed_task_handoff_snapshot(
-                    &cwd,
+                persist_fresh_approved_task_artifact_blocking(
                     &cwd,
                     &tasks_dir_name,
                     &task_file,
@@ -8478,6 +8488,60 @@ struct ReviewedTaskHandoffSnapshot {
     task_title: String,
     task_file: String,
     artifact_body: String,
+}
+
+fn persist_fresh_approved_task_artifact_blocking(
+    cwd: &std::path::Path,
+    tasks_dir_name: &str,
+    task_file: &str,
+    expected_title: &str,
+    expected_priority: crate::task_source::Priority,
+    expected_plan: &str,
+) -> Result<ReviewedTaskHandoffSnapshot, String> {
+    let _guard = TASK_APPROVAL_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut snapshot = reread_reviewed_task_handoff_snapshot(
+        cwd,
+        cwd,
+        tasks_dir_name,
+        task_file,
+        expected_title,
+        expected_priority,
+        expected_plan,
+    )?;
+    if detect_plain_markdown_task_stem(task_file).is_none() {
+        let filename = Path::new(task_file)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| format!("task_file has no filename component: '{task_file}'"))?;
+        let parsed = taskmd_core::filename::parse_filename(filename)
+            .ok_or_else(|| format!("invalid taskmd filename: '{filename}'"))?;
+        let promoted = promote_task_status_to_in_progress(
+            &cwd.join(tasks_dir_name),
+            &parsed.id,
+            parsed.status,
+            filename,
+        )?;
+        if promoted != filename {
+            let _ = run_git(cwd, &["add", "--", task_file]);
+            snapshot.task_file = format!("{tasks_dir_name}/{promoted}");
+        }
+    }
+    ensure_gitignore_has_phoenix(cwd)?;
+    run_git(cwd, &["add", "--", &snapshot.task_file])?;
+    if run_git(cwd, &["diff", "--cached", "--quiet"]).is_err() {
+        run_git(
+            cwd,
+            &[
+                "commit",
+                "-m",
+                &format!("task {}: {}", snapshot.task_id, expected_title),
+            ],
+        )
+        .map_err(|error| format!("Failed to commit approved task artifact: {error}"))?;
+    }
+    Ok(snapshot)
 }
 
 fn reread_reviewed_task_handoff_snapshot(

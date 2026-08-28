@@ -186,8 +186,8 @@ fn work_identity_from_row(
             worktree_path,
             branch_name,
             base_branch,
-            task_id: row.try_get("cm_task_id")?,
-            task_title: row.try_get("cm_task_title")?,
+            task_id: row.try_get("objective_task_id")?,
+            task_title: row.try_get("objective_task_title")?,
         })),
         _ => Ok(None),
     }
@@ -427,11 +427,16 @@ impl Database {
                      LIMIT 1) AS tail_message_id,
                     conversation.work_scope_id, environment.environment_kind,
                     environment.worktree_path, environment.branch_name, environment.base_branch,
-                    conversation.cm_task_id, conversation.cm_task_title
+                    COALESCE(objective.task_id, conversation.cm_task_id) AS objective_task_id,
+                    COALESCE(objective.task_title, conversation.cm_task_title) AS objective_task_title
              FROM transcript
              JOIN conversations conversation ON conversation.id = transcript.id
              LEFT JOIN work_scope_environments environment
                ON environment.work_scope_id = conversation.work_scope_id
+             LEFT JOIN work_scope_approved_task_authorities authority
+               ON authority.work_scope_id = conversation.work_scope_id
+             LEFT JOIN conversation_approved_task_objectives objective
+               ON objective.conversation_id = authority.objective_conversation_id
              ORDER BY ordinal",
         )
         .bind(product_conversation_id.as_str())
@@ -611,11 +616,16 @@ impl Database {
                      ORDER BY message.sequence_id DESC, message.message_id DESC LIMIT 1) AS tail_message_id,
                     conversation.work_scope_id, environment.environment_kind,
                     environment.worktree_path, environment.branch_name, environment.base_branch,
-                    conversation.cm_task_id, conversation.cm_task_title
+                    COALESCE(objective.task_id, conversation.cm_task_id) AS objective_task_id,
+                    COALESCE(objective.task_title, conversation.cm_task_title) AS objective_task_title
              FROM transcript
              JOIN conversations conversation ON conversation.id = transcript.id
              LEFT JOIN work_scope_environments environment
                ON environment.work_scope_id = conversation.work_scope_id
+             LEFT JOIN work_scope_approved_task_authorities authority
+               ON authority.work_scope_id = conversation.work_scope_id
+             LEFT JOIN conversation_approved_task_objectives objective
+               ON objective.conversation_id = authority.objective_conversation_id
              ORDER BY ordinal",
         ).bind(product_conversation_id.as_str()).fetch_all(&mut *connection).await?;
         let mut transcript_rows = Vec::with_capacity(rows.len());
