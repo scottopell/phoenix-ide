@@ -613,7 +613,7 @@ impl TmuxRegistry {
             if legacy != current_socket
                 && matches!(
                     probe(&current_socket).await,
-                    Ok(ProbeResult::NoSocket | ProbeResult::DeadSocket)
+                    Ok(ProbeResult::NoSocket | ProbeResult::NoServer | ProbeResult::DeadSocket)
                 )
                 && matches!(probe(&legacy).await, Ok(ProbeResult::Live))
             {
@@ -630,7 +630,7 @@ impl TmuxRegistry {
                 socket_path: socket_path.clone(),
                 source,
             })? {
-            ProbeResult::NoSocket => Ok(PersistentTmuxDiscovery::Absent),
+            ProbeResult::NoSocket | ProbeResult::NoServer => Ok(PersistentTmuxDiscovery::Absent),
             ProbeResult::DeadSocket => Ok(PersistentTmuxDiscovery::Ambiguous {
                 reason: format!(
                     "tmux endpoint {} exists but its server liveness probe failed",
@@ -693,7 +693,7 @@ impl TmuxRegistry {
             if legacy != socket_path
                 && matches!(
                     probe(&socket_path).await,
-                    Ok(ProbeResult::NoSocket | ProbeResult::DeadSocket)
+                    Ok(ProbeResult::NoSocket | ProbeResult::NoServer | ProbeResult::DeadSocket)
                 )
                 && matches!(probe(&legacy).await, Ok(ProbeResult::Live))
             {
@@ -775,7 +775,7 @@ impl TmuxRegistry {
                         })?;
                 server.status = ServerStatus::Live;
             }
-            ProbeResult::DeadSocket => {
+            ProbeResult::NoServer | ProbeResult::DeadSocket => {
                 // Post-system-reboot: file present, server gone. Unlink
                 // and recreate. No breadcrumb (see design.md §"No Stale-
                 // Recovery Breadcrumb").
@@ -880,13 +880,29 @@ impl TmuxRegistry {
         &self,
         identity: &TmuxServerInstanceIdentity,
     ) -> Result<ExactTmuxIdentityState, TmuxError> {
-        match probe(&identity.socket_path)
-            .await
-            .map_err(|source| TmuxError::ProbeFailed {
-                socket_path: identity.socket_path.clone(),
-                source,
-            })? {
-            ProbeResult::NoSocket | ProbeResult::DeadSocket => Ok(ExactTmuxIdentityState::Absent),
+        let result =
+            probe(&identity.socket_path)
+                .await
+                .map_err(|source| TmuxError::ProbeFailed {
+                    socket_path: identity.socket_path.clone(),
+                    source,
+                })?;
+        Self::exact_identity_state_from_probe(identity, result).await
+    }
+
+    async fn exact_identity_state_from_probe(
+        identity: &TmuxServerInstanceIdentity,
+        result: ProbeResult,
+    ) -> Result<ExactTmuxIdentityState, TmuxError> {
+        match result {
+            ProbeResult::NoSocket | ProbeResult::NoServer => Ok(ExactTmuxIdentityState::Absent),
+            ProbeResult::DeadSocket => Ok(ExactTmuxIdentityState::Ambiguous {
+                reason: format!(
+                    "tmux probe failed for existing socket {}; cannot prove whether {} is absent",
+                    identity.socket_path.display(),
+                    identity.stable_identity()
+                ),
+            }),
             ProbeResult::Live => match read_server_token(&identity.socket_path).await {
                 Some(token) if token == identity.server_token => Ok(ExactTmuxIdentityState::Live),
                 Some(_) => Ok(ExactTmuxIdentityState::Absent),
@@ -1248,7 +1264,7 @@ impl TmuxRegistry {
             if legacy != current
                 && matches!(
                     probe(&current).await,
-                    Ok(ProbeResult::NoSocket | ProbeResult::DeadSocket)
+                    Ok(ProbeResult::NoSocket | ProbeResult::NoServer | ProbeResult::DeadSocket)
                 )
                 && matches!(probe(&legacy).await, Ok(ProbeResult::Live))
             {
@@ -1281,15 +1297,29 @@ impl TmuxRegistry {
         &self,
         permit: &TmuxRetirementPermit,
     ) -> Result<TmuxRetirementOutcome, TmuxError> {
-        match probe(&permit.instance.socket_path)
+        let result = probe(&permit.instance.socket_path)
             .await
             .map_err(|source| TmuxError::ProbeFailed {
                 socket_path: permit.instance.socket_path.clone(),
                 source,
-            })? {
-            ProbeResult::NoSocket | ProbeResult::DeadSocket => {
+            })?;
+        Self::verify_exact_absence_from_probe(permit, result).await
+    }
+
+    async fn verify_exact_absence_from_probe(
+        permit: &TmuxRetirementPermit,
+        result: ProbeResult,
+    ) -> Result<TmuxRetirementOutcome, TmuxError> {
+        match result {
+            ProbeResult::NoSocket | ProbeResult::NoServer => {
                 Ok(TmuxRetirementOutcome::AbsenceVerified)
             }
+            ProbeResult::DeadSocket => Ok(TmuxRetirementOutcome::IdentityNotProven {
+                reason: format!(
+                    "tmux probe failed for existing socket {}; exact server absence is not proven",
+                    permit.instance.socket_path.display()
+                ),
+            }),
             ProbeResult::Live => match read_server_token(&permit.instance.socket_path).await {
                 Some(token) if token == permit.instance.server_token => {
                     Ok(TmuxRetirementOutcome::RemovalFailed {
@@ -2321,6 +2351,84 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nonzero_probe_for_live_token_bound_endpoint_does_not_prove_absence() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let owner = TestTmuxServerOwner::new();
+        let work_scope = scope("nonzero-live-token-bound");
+        let registry = owner.registry();
+        let live = registry
+            .ensure_live(&work_scope, owner.path(), None, None)
+            .await
+            .expect("live token-bound server");
+        let identity = live.read().await.exact_identity();
+
+        let fake_tmux = owner.path().join("tmux-probe-fails");
+        std::fs::write(&fake_tmux, "#!/bin/sh\nexit 1\n").unwrap();
+        let mut permissions = std::fs::metadata(&fake_tmux).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&fake_tmux, permissions).unwrap();
+        let result = crate::tmux::probe::probe_with_binary(&identity.socket_path, &fake_tmux)
+            .await
+            .expect("probe process runs");
+        assert_eq!(result, ProbeResult::DeadSocket);
+
+        assert!(matches!(
+            TmuxRegistry::exact_identity_state_from_probe(&identity, result)
+                .await
+                .unwrap(),
+            ExactTmuxIdentityState::Ambiguous { .. }
+        ));
+        let permit = TmuxRetirementPermit {
+            work_scope,
+            instance: identity,
+            generation: TmuxRetirementGeneration(1),
+            had_entry: true,
+        };
+        assert!(matches!(
+            TmuxRegistry::verify_exact_absence_from_probe(&permit, result)
+                .await
+                .unwrap(),
+            TmuxRetirementOutcome::IdentityNotProven { .. }
+        ));
+        owner.shutdown();
+    }
+
+    #[tokio::test]
+    async fn missing_socket_still_proves_exact_absence() {
+        let tmp = TempDir::new().unwrap();
+        let work_scope = scope("missing-proves-absence");
+        let identity = TmuxServerInstanceIdentity {
+            socket_path: tmp.path().join("missing.sock"),
+            server_token: "persisted-token".to_string(),
+        };
+        let result = probe(&identity.socket_path).await.unwrap();
+        assert_eq!(result, ProbeResult::NoSocket);
+        assert_eq!(
+            TmuxRegistry::exact_identity_state_from_probe(&identity, result)
+                .await
+                .unwrap(),
+            ExactTmuxIdentityState::Absent
+        );
+        let permit = TmuxRetirementPermit {
+            work_scope,
+            instance: identity,
+            generation: TmuxRetirementGeneration(1),
+            had_entry: true,
+        };
+        assert_eq!(
+            TmuxRegistry::verify_exact_absence_from_probe(&permit, result)
+                .await
+                .unwrap(),
+            TmuxRetirementOutcome::AbsenceVerified
+        );
+    }
+
     #[tokio::test]
     async fn rehydrate_retirement_fresh_registry_reclaims_same_live_server() {
         if which::which("tmux").is_err() {
@@ -2360,7 +2468,7 @@ mod tests {
         assert_eq!(outcome, TmuxRetirementOutcome::Retired);
         assert!(matches!(
             probe(&persisted.socket_path).await.unwrap(),
-            ProbeResult::NoSocket | ProbeResult::DeadSocket
+            ProbeResult::NoSocket | ProbeResult::NoServer | ProbeResult::DeadSocket
         ));
         let _ = std::fs::remove_file(&persisted.socket_path);
         owner.shutdown();
@@ -2840,7 +2948,7 @@ mod tests {
         assert!(report.kill_server_error.is_none(), "{report:?}");
         assert!(matches!(
             probe(&socket_path).await.unwrap(),
-            ProbeResult::NoSocket | ProbeResult::DeadSocket
+            ProbeResult::NoSocket | ProbeResult::NoServer | ProbeResult::DeadSocket
         ));
         let _ = std::fs::remove_file(&socket_path);
         owner.shutdown();
@@ -2874,7 +2982,7 @@ mod tests {
         assert_eq!(report.socket_path, legacy_socket);
         assert!(matches!(
             probe(&report.socket_path).await.unwrap(),
-            ProbeResult::NoSocket | ProbeResult::DeadSocket
+            ProbeResult::NoSocket | ProbeResult::NoServer | ProbeResult::DeadSocket
         ));
         let _ = std::fs::remove_file(&report.socket_path);
         owner.shutdown();

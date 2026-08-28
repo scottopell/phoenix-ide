@@ -14,9 +14,9 @@ use std::process::Stdio;
 pub enum ProbeResult {
     /// Socket file exists and `tmux ls` succeeded.
     Live,
-    /// Socket file exists but `tmux ls` failed (typical post-system-
-    /// reboot state where the socket lingers but the server process is
-    /// gone).
+    /// Socket file exists and tmux explicitly reported that no server is running.
+    NoServer,
+    /// Socket file exists but `tmux ls` failed without proving server absence.
     DeadSocket,
     /// Socket file does not exist on disk.
     NoSocket,
@@ -24,31 +24,47 @@ pub enum ProbeResult {
 
 /// Probe a socket path. The function is best-effort: an I/O failure
 /// while invoking tmux is propagated as `Err` so the caller can decide
-/// whether to retry or surface the error. A non-zero exit from `tmux
-/// ls` is mapped to `DeadSocket`, never `Err`, because the process
-/// running fine but reporting "no server" is the typical stale-socket
-/// signal.
+/// whether to retry or surface the error. A non-zero exit is classified
+/// as [`ProbeResult::NoServer`] only when tmux explicitly reports that
+/// no server is running; every other non-zero result remains ambiguous as
+/// [`ProbeResult::DeadSocket`].
 ///
 /// # Errors
 /// Returns an [`std::io::Error`] when invoking the `tmux` process itself
-/// fails (spawn/IO error). A non-zero exit from `tmux ls` maps to
-/// [`ProbeResult::DeadSocket`], not an error.
+/// fails (spawn/IO error). A non-zero exit from `tmux ls` returns a typed
+/// non-live probe result, not an I/O error.
 pub async fn probe(socket_path: &Path) -> std::io::Result<ProbeResult> {
+    probe_with_binary(socket_path, Path::new("tmux")).await
+}
+
+pub(crate) async fn probe_with_binary(
+    socket_path: &Path,
+    binary: &Path,
+) -> std::io::Result<ProbeResult> {
     if !socket_path.exists() {
         return Ok(ProbeResult::NoSocket);
     }
-    let status = tokio::process::Command::new("tmux")
+    let output = tokio::process::Command::new(binary)
         .args(["-S", &socket_path.to_string_lossy(), "ls"])
         .env_remove("TMUX")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .stderr(Stdio::piped())
+        .output()
         .await?;
-    if status.success() {
-        Ok(ProbeResult::Live)
+    Ok(classify_output(
+        output.status.success(),
+        &String::from_utf8_lossy(&output.stderr),
+    ))
+}
+
+fn classify_output(success: bool, stderr: &str) -> ProbeResult {
+    if success {
+        ProbeResult::Live
+    } else if stderr.trim_start().starts_with("no server running on ") {
+        ProbeResult::NoServer
     } else {
-        Ok(ProbeResult::DeadSocket)
+        ProbeResult::DeadSocket
     }
 }
 
@@ -57,16 +73,19 @@ pub(crate) fn probe_sync(socket_path: &Path) -> ProbeResult {
     if !socket_path.exists() {
         return ProbeResult::NoSocket;
     }
-    let status = std::process::Command::new("tmux")
+    let output = std::process::Command::new("tmux")
         .args(["-S", &socket_path.to_string_lossy(), "ls"])
         .env_remove("TMUX")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    match status {
-        Ok(status) if status.success() => ProbeResult::Live,
-        _ => ProbeResult::DeadSocket,
+        .stderr(Stdio::piped())
+        .output();
+    match output {
+        Ok(output) => classify_output(
+            output.status.success(),
+            &String::from_utf8_lossy(&output.stderr),
+        ),
+        Err(_) => ProbeResult::DeadSocket,
     }
 }
 
@@ -82,11 +101,26 @@ mod tests {
         assert_eq!(probe(&path).await.unwrap(), ProbeResult::NoSocket);
     }
 
+    #[test]
+    fn nonzero_without_explicit_absence_is_ambiguous() {
+        assert_eq!(
+            classify_output(false, "permission denied"),
+            ProbeResult::DeadSocket
+        );
+    }
+
+    #[test]
+    fn explicit_no_server_response_proves_absence() {
+        assert_eq!(
+            classify_output(false, "no server running on /tmp/example.sock\n"),
+            ProbeResult::NoServer
+        );
+    }
+
     #[tokio::test]
-    async fn probe_returns_dead_socket_for_orphan_file() {
-        // A regular file existing at the socket path that is not a real
-        // tmux socket: `tmux ls` should fail, and the probe surfaces
-        // `DeadSocket`.
+    async fn probe_returns_ambiguous_for_orphan_file() {
+        // A regular file existing at the socket path is not proof that the
+        // token-bound endpoint is absent.
         if which::which("tmux").is_err() {
             return;
         }
