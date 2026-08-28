@@ -403,7 +403,8 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 77,
         name: "persist_conversation_creation_exact_checkout_oid",
-        sql: "ALTER TABLE conversation_creation_jobs ADD COLUMN exact_checkout_oid TEXT;",
+        sql: "ALTER TABLE conversation_creation_jobs ADD COLUMN exact_checkout_oid TEXT;
+ALTER TABLE product_conversation_sources ADD COLUMN source_snapshot_json TEXT;",
     },
 ];
 
@@ -12452,7 +12453,8 @@ mod tests {
                     (72, 'temporarily_skip_product_conversation_lifecycle_retention'),
                     (73, 'temporarily_skip_recursive_subordinate_parent_invariant'),
                     (74, 'temporarily_skip_completed_continuation_handoffs'),
-                    (76, 'temporarily_skip_product_creation_publication')",
+                    (76, 'temporarily_skip_product_creation_publication'),
+                    (77, 'temporarily_skip_creation_authority_persistence')",
         )
         .execute(&pool)
         .await
@@ -13341,7 +13343,8 @@ mod tests {
                     (72, 'temporarily_skip_product_conversation_lifecycle_retention'),
                     (73, 'temporarily_skip_recursive_subordinate_parent_invariant'),
                     (74, 'temporarily_skip_completed_continuation_handoffs'),
-                    (76, 'temporarily_skip_product_creation_publication')",
+                    (76, 'temporarily_skip_product_creation_publication'),
+                    (77, 'temporarily_skip_creation_authority_persistence')",
         )
         .execute(pool)
         .await

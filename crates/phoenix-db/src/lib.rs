@@ -5764,7 +5764,6 @@ impl Database {
         let result = sqlx::query(
             "UPDATE conversation_creation_jobs
              SET status = 'ready', intent_json = ?1, updated_at = ?2, completed_at = ?2,
-                 exact_checkout_oid = NULL,
                  claim_worker_id = NULL, claim_token = NULL, lease_until = NULL
              WHERE id = ?3 AND status = 'claimed' AND generation = ?4
                AND claim_worker_id = ?5 AND claim_token = ?6 AND lease_until > ?2",
@@ -6956,10 +6955,9 @@ impl Database {
 
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let existing: Option<(String, String)> = sqlx::query_as(
-            "SELECT target.id, job.intent_json
+            "SELECT target.id, source.source_snapshot_json
              FROM product_conversation_sources source
              JOIN conversations target ON target.product_conversation_id = source.target_product_conversation_id
-             JOIN conversation_creation_jobs job ON job.conversation_id = target.id
              WHERE source.source_product_conversation_id = ?1
                AND source.relation_kind = 'approved_task' AND source.relation_key = ?2
                AND target.parent_conversation_id IS NULL
@@ -6970,11 +6968,11 @@ impl Database {
         .bind(&snapshot.task_id)
         .fetch_optional(&mut *tx)
         .await?;
-        if let Some((existing, existing_intent_json)) = existing {
-            let existing_intent: ConversationCreationIntent =
-                serde_json::from_str(&existing_intent_json)
+        if let Some((existing, existing_snapshot_json)) = existing {
+            let existing_snapshot: phoenix_core::task_handoff::ApprovedTaskSnapshot =
+                serde_json::from_str(&existing_snapshot_json)
                     .map_err(|error| DbError::Serialization(error.to_string()))?;
-            if existing_intent.approved_task.as_ref() != Some(&snapshot) {
+            if existing_snapshot != snapshot {
                 return Err(DbError::ContinuationPrecondition(format!(
                     "approved task handoff conflicts with committed reviewed snapshot {}",
                     snapshot.task_id
@@ -7014,13 +7012,18 @@ impl Database {
         sqlx::query(
             "INSERT INTO product_conversation_sources (
                  target_product_conversation_id, source_product_conversation_id,
-                 source_conversation_id, relation_kind, relation_key, created_at_us
-             ) VALUES (?1, ?2, ?3, 'approved_task', ?4, ?5)",
+                 source_conversation_id, relation_kind, relation_key, source_snapshot_json,
+                 created_at_us
+             ) VALUES (?1, ?2, ?3, 'approved_task', ?4, ?5, ?6)",
         )
         .bind(product_id.as_str())
         .bind(parent.product_conversation_id.as_str())
         .bind(parent_id)
         .bind(&snapshot.task_id)
+        .bind(
+            serde_json::to_string(&snapshot)
+                .map_err(|error| DbError::Serialization(error.to_string()))?,
+        )
         .bind(now.timestamp_micros())
         .execute(&mut *tx)
         .await?;
