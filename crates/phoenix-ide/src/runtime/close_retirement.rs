@@ -909,21 +909,7 @@ impl RuntimeManager {
                     let fresh_snapshot = match final_removal {
                         Ok(ExactWorktreeRemoval::Removed) => Some(confirmed.snapshot.clone()),
                         Ok(ExactWorktreeRemoval::Missing { reason }) => {
-                            let absence_basis = if self
-                                .db()
-                                .close_retirement_resource_was_dispatched(
-                                    attempt_id,
-                                    &scope,
-                                    snapshot,
-                                    &target.resource,
-                                )
-                                .await
-                                .map_err(|error| error.to_string())?
-                            {
-                                AbsenceBasis::SameAttemptPriorRetirement
-                            } else {
-                                AbsenceBasis::PreexistingExactIdentityEvidence
-                            };
+                            let absence_basis = AbsenceBasis::PreexistingExactIdentityEvidence;
                             let adopted = self
                                 .db()
                                 .record_close_retirement_evidence(
@@ -1320,7 +1306,7 @@ fn detached_unreachable_commits(
             "--branches",
             "--remotes",
             "--tags",
-            "--glob=refs/stash",
+            "--glob=refs/stash*",
         ])
         .current_dir(repository)
         .output()
@@ -2047,7 +2033,9 @@ mod tests {
         run_git(temp.path(), &["checkout", "--quiet", "--detach"]);
         std::fs::write(temp.path().join("tracked"), "detached\n").unwrap();
         run_git(temp.path(), &["commit", "--quiet", "-am", "detached"]);
-        let sibling = temp.path().with_file_name("close-inspection-sibling");
+        let sibling = temp
+            .path()
+            .with_file_name(format!("close-inspection-sibling-{}", uuid::Uuid::new_v4()));
         run_git(
             temp.path(),
             &[

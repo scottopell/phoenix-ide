@@ -704,6 +704,13 @@ impl TmuxRegistry {
             socket_path
         };
 
+        if let Some(existing) = self.get_existing(work_scope).await {
+            if existing.read().await.retirement_fenced {
+                return Err(TmuxError::RetirementFenced {
+                    work_scope: work_scope.clone(),
+                });
+            }
+        }
         let (entry, created) = self.get_or_insert(work_scope, socket_path).await;
         let server_arc = entry.server.clone();
 
