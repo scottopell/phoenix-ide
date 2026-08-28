@@ -305,6 +305,7 @@ export function WorkControlBar({
   const fallbackSelectorOriginRef = useRef(false);
   const fallbackWasVisibleRef = useRef(false);
   const fallbackOwnedFocusRef = useRef(false);
+  const closeSnapshotRequestRef = useRef(0);
   const usesCompactLayout = useIsCompactLayout();
   const isLoading = markingMerged || abandoning;
   const { openDiffFullscreen } = useViewerSlotCommands();
@@ -326,9 +327,12 @@ export function WorkControlBar({
   useEffect(() => {
     let cancelled = false;
     const refresh = () => {
+      const request = ++closeSnapshotRequestRef.current;
       void api.getProductConversationSnapshot(conversationId)
         .then((snapshot) => {
-          if (!cancelled) setCloseSnapshot(snapshot.close ? snapshot : null);
+          if (!cancelled && request === closeSnapshotRequestRef.current) {
+            setCloseSnapshot(snapshot.close ? snapshot : null);
+          }
         })
         .catch(() => undefined);
     };

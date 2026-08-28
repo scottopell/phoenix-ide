@@ -2883,10 +2883,7 @@ impl RuntimeManager {
     /// every live runtime handle whose conversation resolves to it. Factored
     /// out of [`Self::start_work_scope_bridge`] so the bash and browser signal
     /// arms share one routing path.
-    pub(crate) async fn broadcast_work_scope_update(
-        self: &Arc<Self>,
-        work_scope: &ResourceScopeKey,
-    ) {
+    pub(crate) async fn broadcast_work_scope_update(&self, work_scope: &ResourceScopeKey) {
         // Same resolution as the browser lifecycle bridge: enumerate live
         // runtime handles, resolve each conversation's scope, match.
         let conv_ids: Vec<String> = {

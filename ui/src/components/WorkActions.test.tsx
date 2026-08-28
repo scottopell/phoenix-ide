@@ -210,6 +210,24 @@ describe('WorkControlBar — persisted Close recovery', () => {
     expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2);
   });
 
+  it('ignores a stale snapshot response after a newer refresh completes', async () => {
+    let resolveInitial!: (value: unknown) => void;
+    const initial = new Promise((resolve) => { resolveInitial = resolve; });
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockReturnValueOnce(initial as never)
+      .mockResolvedValueOnce(closeSnapshot('awaiting_stop_work_confirmation') as never);
+
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-racing-close" convModeLabel="Explore" phaseType="idle" continuedInConvId={null} prStatusHandle={prStatusHandle()} />,
+    );
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(1));
+    notifyCloseSnapshotChanged('conv-racing-close');
+    expect(await screen.findByRole('button', { name: 'Stop work and continue closing' })).toBeVisible();
+
+    resolveInitial({ close: null });
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Stop work and continue closing' })).toBeVisible());
+  });
+
   it('renders exact residual repair evidence after reload', async () => {
     vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(closeSnapshot('needs_repair', [{
       scope: 'scope-1',

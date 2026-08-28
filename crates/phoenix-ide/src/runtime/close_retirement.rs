@@ -326,6 +326,13 @@ impl RuntimeManager {
         Ok(resources)
     }
 
+    async fn discard_close_resource_leases(&self, attempt_id: &CloseAttemptId) {
+        self.close_retirement_leases
+            .lock()
+            .await
+            .retain(|(candidate, _), _| candidate != attempt_id.as_str());
+    }
+
     async fn cancel_close_resource_lease(&self, attempt_id: &CloseAttemptId, scope: &WorkScopeId) {
         let lease = self
             .close_retirement_leases
@@ -772,6 +779,16 @@ impl RuntimeManager {
             .complete_close_retirement(&attempt_id)
             .await
             .map_err(|error| error.to_string())?;
+        self.discard_close_resource_leases(&attempt_id).await;
+        for captured in self
+            .db()
+            .list_close_attempt_scopes(attempt_id.as_str())
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            self.broadcast_work_scope_update(&ResourceScopeKey::Work(captured.scope))
+                .await;
+        }
         Ok(())
     }
 
@@ -1273,9 +1290,7 @@ impl RuntimeManager {
             Ok(lease.resources.clone())
         }
         .await;
-        if result.is_err() {
-            self.close_retirement_leases.lock().await.insert(key, lease);
-        }
+        self.close_retirement_leases.lock().await.insert(key, lease);
         result
     }
 }
@@ -1302,7 +1317,13 @@ async fn inspect_worktree_at(
     }
     let mut observation = canonical_status_observation(&output.stdout);
     let mut losses = parse_status_losses(&output.stdout);
-    observe_dirty_content(&path, &losses, &mut observation)?;
+    let content_path = path.clone();
+    let content_losses = losses.clone();
+    let content_observation =
+        tokio::task::spawn_blocking(move || observe_dirty_content(&content_path, &content_losses))
+            .await
+            .map_err(|error| error.to_string())??;
+    observation.extend_from_slice(&content_observation);
     observe_detached_head_and_submodules(&path, &mut observation, &mut losses).await?;
     Ok((snapshot_for(&observation), losses))
 }
@@ -1680,7 +1701,8 @@ fn observe_initialized_submodules(
         }
         let submodule_losses = parse_status_losses(&status.stdout);
         let mut submodule_status = canonical_status_observation(&status.stdout);
-        observe_dirty_content(&submodule_path, &submodule_losses, &mut submodule_status)?;
+        submodule_status
+            .extend_from_slice(&observe_dirty_content(&submodule_path, &submodule_losses)?);
         observation.push((
             [b"SUBMODULE_STATUS\0".as_slice(), relative_path.as_slice()].concat(),
             submodule_status,
@@ -2352,11 +2374,8 @@ fn canonical_status_observation(status: &[u8]) -> Vec<u8> {
     observation
 }
 
-fn observe_dirty_content(
-    repository: &Path,
-    losses: &[CloseLossItem],
-    observation: &mut Vec<u8>,
-) -> Result<(), String> {
+fn observe_dirty_content(repository: &Path, losses: &[CloseLossItem]) -> Result<Vec<u8>, String> {
+    let mut observation = Vec::new();
     let mut paths = losses
         .iter()
         .filter_map(|loss| match loss.identity() {
@@ -2395,11 +2414,22 @@ fn observe_dirty_content(
                 );
             }
             Ok(metadata) if metadata.is_file() => {
-                observation.extend_from_slice(b"FILE\0");
-                observation.extend_from_slice(
-                    &std::fs::read(&filesystem_path)
-                        .map_err(|error| format!("cannot read dirty file contents: {error}"))?,
-                );
+                observation.extend_from_slice(b"FILE_SHA256\0");
+                let mut file = std::fs::File::open(&filesystem_path)
+                    .map_err(|error| format!("cannot open dirty file contents: {error}"))?;
+                let mut digest = Sha256::new();
+                let mut buffer = vec![0_u8; 64 * 1024];
+                loop {
+                    use std::io::Read as _;
+                    let read = file
+                        .read(&mut buffer)
+                        .map_err(|error| format!("cannot hash dirty file contents: {error}"))?;
+                    if read == 0 {
+                        break;
+                    }
+                    digest.update(&buffer[..read]);
+                }
+                observation.extend_from_slice(&digest.finalize());
             }
             Ok(_) => observation.extend_from_slice(b"OTHER"),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -2408,8 +2438,29 @@ fn observe_dirty_content(
             Err(error) => return Err(format!("cannot inspect dirty path contents: {error}")),
         }
         observation.push(0);
+        observation.extend_from_slice(b"INDEX\0");
+        observation.extend_from_slice(&path);
+        observation.push(0);
+        let mut command = phoenix_core::git::command();
+        command.args(["ls-files", "--stage", "-z", "--"]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt as _;
+            command.arg(std::ffi::OsString::from_vec(path.clone()));
+        }
+        #[cfg(not(unix))]
+        command.arg(String::from_utf8_lossy(&path).as_ref());
+        let index = command
+            .current_dir(repository)
+            .output()
+            .map_err(|error| format!("cannot inspect dirty index entry: {error}"))?;
+        if !index.status.success() {
+            return Err(String::from_utf8_lossy(&index.stderr).trim().to_string());
+        }
+        observation.extend_from_slice(&index.stdout);
+        observation.push(0);
     }
-    Ok(())
+    Ok(observation)
 }
 
 fn parse_status_losses(status: &[u8]) -> Vec<CloseLossItem> {
@@ -3327,6 +3378,49 @@ mod tests {
             canonical_status_observation(b"R  new-name.txt\0old-name.txt\0!! ignored\0"),
             b"R  new-name.txt\0old-name.txt\0"
         );
+    }
+
+    #[tokio::test]
+    async fn snapshot_changes_when_only_the_staged_blob_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        initialize_repository(temp.path());
+        let tracked = temp.path().join("tracked");
+        std::fs::write(&tracked, "base").unwrap();
+        assert!(phoenix_core::git::command()
+            .args(["add", "tracked"])
+            .current_dir(temp.path())
+            .status()
+            .unwrap()
+            .success());
+        assert!(phoenix_core::git::command()
+            .args(["commit", "-m", "base"])
+            .current_dir(temp.path())
+            .status()
+            .unwrap()
+            .success());
+
+        std::fs::write(&tracked, "staged-one").unwrap();
+        assert!(phoenix_core::git::command()
+            .args(["add", "tracked"])
+            .current_dir(temp.path())
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(&tracked, "working-copy").unwrap();
+        let identity = inspection_identity(temp.path());
+        let (first, _) = inspect_worktree(&identity).await.unwrap();
+
+        std::fs::write(&tracked, "staged-two").unwrap();
+        assert!(phoenix_core::git::command()
+            .args(["add", "tracked"])
+            .current_dir(temp.path())
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(&tracked, "working-copy").unwrap();
+        let (second, _) = inspect_worktree(&identity).await.unwrap();
+
+        assert_ne!(first.fingerprint(), second.fingerprint());
     }
 
     #[test]

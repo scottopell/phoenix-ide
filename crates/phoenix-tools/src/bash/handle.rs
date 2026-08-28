@@ -557,6 +557,14 @@ impl Handle {
                 Err(error)
             };
         }
+        if current_process_identity(live.pid) != Some(live.launch_identity.process) {
+            let pidfd = i32::try_from(pidfd)
+                .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+            if unsafe { libc::close(pidfd) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            return Ok(None);
+        }
         let stopped = unsafe {
             libc::syscall(
                 libc::SYS_pidfd_send_signal,
@@ -596,10 +604,25 @@ impl Handle {
                         && unsafe { stop_state.si_status() } == libc::SIGSTOP
                     {
                         let rc = unsafe { libc::kill(-live.pgid, signal) };
-                        if rc == 0 {
-                            Ok(Some(live.pgid))
+                        let signal_error = (rc != 0).then(std::io::Error::last_os_error);
+                        let resumed = unsafe {
+                            libc::syscall(
+                                libc::SYS_pidfd_send_signal,
+                                pidfd,
+                                libc::SIGCONT,
+                                std::ptr::null::<libc::siginfo_t>(),
+                                0,
+                            )
+                        };
+                        if let Some(error) = signal_error {
+                            Err(error)
+                        } else if resumed != 0 {
+                            Err(std::io::Error::other(format!(
+                                "group signal succeeded but incarnation-bound resume failed: {}",
+                                std::io::Error::last_os_error()
+                            )))
                         } else {
-                            Err(std::io::Error::last_os_error())
+                            Ok(Some(live.pgid))
                         }
                     } else {
                         Ok(None)

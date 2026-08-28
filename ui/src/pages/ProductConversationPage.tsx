@@ -26,6 +26,7 @@ import { useViewerSlot } from '../contexts/ViewerSlotContext';
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
 import { EmbeddedConversationPage, type EmbeddedConversationProjection } from './ConversationPage';
 import { useIsDesktop } from '../hooks';
+import { subscribeCloseSnapshotChanged } from '../notifications';
 import './ProductConversationPage.css';
 
 const PAGE_SIZE = 100;
@@ -427,6 +428,14 @@ function ProductConversationPageInner() {
       });
     return () => { cancelled = true; };
   }, [productConversationId, snapshotRetry]);
+
+  useEffect(() => {
+    const notificationId = snapshot?.latest_transcript_row_id ?? productConversationId;
+    if (!notificationId) return;
+    return subscribeCloseSnapshotChanged(notificationId, () => {
+      setSnapshotRetry((retry) => retry + 1);
+    });
+  }, [productConversationId, snapshot?.latest_transcript_row_id]);
 
   const refreshChain = useCallback(async (rootId: string) => {
     try {

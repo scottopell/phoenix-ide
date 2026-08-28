@@ -8686,6 +8686,34 @@ impl Database {
         product_conversation_id: &str,
     ) -> DbResult<()> {
         sqlx::query(
+            "DELETE FROM close_worktree_cleanup_plans
+             WHERE attempt_id IN (
+                 SELECT attempt_id FROM close_obligations
+                 WHERE product_conversation_id = ?1
+             )
+               AND NOT EXISTS (
+                   SELECT 1 FROM conversations
+                   WHERE product_conversation_id = ?1
+               )",
+        )
+        .bind(product_conversation_id)
+        .execute(&mut *connection)
+        .await?;
+        sqlx::query(
+            "DELETE FROM close_retirement_resource_dispatches
+             WHERE attempt_id IN (
+                 SELECT attempt_id FROM close_obligations
+                 WHERE product_conversation_id = ?1
+             )
+               AND NOT EXISTS (
+                   SELECT 1 FROM conversations
+                   WHERE product_conversation_id = ?1
+               )",
+        )
+        .bind(product_conversation_id)
+        .execute(&mut *connection)
+        .await?;
+        sqlx::query(
             "DELETE FROM product_conversations
              WHERE id = ?1
                AND NOT EXISTS (
