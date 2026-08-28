@@ -404,7 +404,12 @@ const MIGRATIONS: &[Migration] = &[
         version: 77,
         name: "persist_conversation_creation_exact_checkout_oid",
         sql: "ALTER TABLE conversation_creation_jobs ADD COLUMN exact_checkout_oid TEXT;
-ALTER TABLE product_conversation_sources ADD COLUMN source_snapshot_json TEXT;",
+ALTER TABLE product_conversation_sources ADD COLUMN approved_title TEXT;
+ALTER TABLE product_conversation_sources ADD COLUMN approved_priority TEXT;
+ALTER TABLE product_conversation_sources ADD COLUMN approved_artifact_body TEXT;
+ALTER TABLE product_conversation_sources ADD COLUMN approved_task_title TEXT;
+ALTER TABLE product_conversation_sources ADD COLUMN approved_plan TEXT;
+ALTER TABLE product_conversation_sources ADD COLUMN approved_task_file TEXT;",
     },
 ];
 

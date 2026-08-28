@@ -723,6 +723,11 @@ async fn lookup_durable_steering_replay(
         if matches!(receipt, SteeringAcceptanceFingerprint::Exact(_)) {
             validate_steering_fingerprint(&receipt, request_fingerprint)?;
         }
+        if matches!(receipt, SteeringAcceptanceFingerprint::LegacyUnknown)
+            && req.expansion_policy != MessageExpansionPolicy::ExpandReferences
+        {
+            return Err(SendChatServiceError::IdempotencyConflict);
+        }
         return Ok(Some(SendChatOutcome::QueuedAsSteering));
     }
     if let Some(outcome) = lookup_persisted_message_replay(db, req).await? {

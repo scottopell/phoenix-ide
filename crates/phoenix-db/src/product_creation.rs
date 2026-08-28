@@ -449,9 +449,15 @@ impl Database {
         let job = self
             .get_product_creation_job(request_id)
             .await?
-            .ok_or_else(|| {
-                DbError::Serialization("claimed product creation job missing".to_string())
-            })?;
+            .filter(|job| {
+                job.status == "claimed"
+                    && job.claim_generation == generation
+                    && job.claim_worker_id.as_deref() == Some(worker_id)
+                    && job.claim_token.as_deref() == Some(token)
+            });
+        let Some(job) = job else {
+            return Ok(None);
+        };
         Ok(Some(ClaimedProductCreationJob {
             claim: ProductCreationClaim {
                 worker_id: worker_id.to_string(),

@@ -91,6 +91,24 @@ pub(crate) fn run_git_bounded(
     run_git_bounded_with_env(cwd, args, &[], timeout)
 }
 
+fn recv_git_pipe(
+    receiver: &std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    remaining: std::time::Duration,
+    process_group: i32,
+    stream: &str,
+    args: &[&str],
+) -> Result<Vec<u8>, String> {
+    receiver
+        .recv_timeout(remaining)
+        .map_err(|_| {
+            unsafe {
+                let _ = libc::kill(-process_group, libc::SIGKILL);
+            }
+            format!("{stream} drain timed out for git {}", args.join(" "))
+        })?
+        .map_err(|error| format!("failed reading git {stream}: {error}"))
+}
+
 pub(crate) fn run_git_bounded_with_env(
     cwd: &Path,
     args: &[&str],
@@ -178,15 +196,9 @@ pub(crate) fn run_git_bounded_with_env(
     };
 
     let remaining = timeout.saturating_sub(start.elapsed());
-    let stdout_bytes = stdout_rx
-        .recv_timeout(remaining)
-        .map_err(|_| format!("stdout drain timed out for git {}", args.join(" ")))?
-        .map_err(|error| format!("failed reading git stdout: {error}"))?;
+    let stdout_bytes = recv_git_pipe(&stdout_rx, remaining, process_group, "stdout", args)?;
     let remaining = timeout.saturating_sub(start.elapsed());
-    let stderr_bytes = stderr_rx
-        .recv_timeout(remaining)
-        .map_err(|_| format!("stderr drain timed out for git {}", args.join(" ")))?
-        .map_err(|error| format!("failed reading git stderr: {error}"))?;
+    let stderr_bytes = recv_git_pipe(&stderr_rx, remaining, process_group, "stderr", args)?;
     let _ = stdout_reader.join();
     let _ = stderr_reader.join();
 
