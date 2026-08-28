@@ -357,6 +357,23 @@ impl ActiveTerminals {
         map.handles.get(scope).cloned()
     }
 
+    /// Returns the current handle only while relay attachment admission is open.
+    ///
+    /// # Panics
+    /// Panics if the terminal registry mutex is poisoned.
+    #[must_use]
+    pub fn get_for_attach(&self, scope: &ResourceScopeKey) -> Option<Arc<TerminalHandle>> {
+        let map = self.0.lock().expect("terminal registry poisoned");
+        if map
+            .retirements
+            .get(scope)
+            .is_some_and(|retirement| retirement.fenced)
+        {
+            return None;
+        }
+        map.handles.get(scope).cloned()
+    }
+
     /// Read-only inspection of whether retirement admission is currently fenced.
     ///
     /// # Panics

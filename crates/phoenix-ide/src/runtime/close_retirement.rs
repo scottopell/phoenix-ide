@@ -1203,6 +1203,8 @@ async fn observe_detached_head_and_submodules(
     let path = path.to_path_buf();
     let loss_path = path.clone();
     let observed = tokio::task::spawn_blocking(move || -> Result<WorktreeObservation, String> {
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(path.canonicalize().map_err(|error| error.to_string())?);
         let head = phoenix_core::git::command()
             .args(["rev-parse", "--verify", "HEAD"])
             .current_dir(&path)
@@ -1227,7 +1229,7 @@ async fn observe_detached_head_and_submodules(
             ));
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        observe_initialized_submodules(&path, &[], &mut result, deadline)?;
+        observe_initialized_submodules(&path, &[], &mut result, deadline, &mut visited)?;
         Ok(result)
     })
     .await
@@ -1437,6 +1439,7 @@ fn observe_initialized_submodules(
     relative_prefix: &[u8],
     observation: &mut WorktreeObservation,
     deadline: std::time::Instant,
+    visited: &mut std::collections::HashSet<PathBuf>,
 ) -> Result<(), String> {
     if std::time::Instant::now() >= deadline {
         return Err("Git submodule inspection exceeded its aggregate deadline".to_string());
@@ -1489,6 +1492,12 @@ fn observe_initialized_submodules(
         let submodule_path = repository.join(path_buf_from_git_bytes(path_identity.as_bytes()));
         if !submodule_path.join(".git").exists() {
             continue;
+        }
+        let canonical = submodule_path
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        if !visited.insert(canonical) {
+            return Err("initialized submodule graph contains a cycle".to_string());
         }
 
         let status = run_bounded_git_status(&submodule_path)?;
@@ -1554,6 +1563,16 @@ fn observe_initialized_submodules(
                 ));
             }
         }
+        if !parse_status_losses(&status.stdout).is_empty() {
+            observation.push((
+                [
+                    b"SUBMODULE_LOSS\0submodule\0".as_slice(),
+                    relative_path.as_slice(),
+                ]
+                .concat(),
+                Vec::new(),
+            ));
+        }
         for loss in parse_status_losses(&status.stdout) {
             let (category, nested_path) = match loss {
                 CloseLossItem::StagedTrackedPath(path) => (b"staged".as_slice(), path),
@@ -1573,7 +1592,13 @@ fn observe_initialized_submodules(
                 Vec::new(),
             ));
         }
-        observe_initialized_submodules(&submodule_path, &relative_path, observation, deadline)?;
+        observe_initialized_submodules(
+            &submodule_path,
+            &relative_path,
+            observation,
+            deadline,
+            visited,
+        )?;
     }
     Ok(())
 }

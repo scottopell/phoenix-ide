@@ -343,7 +343,7 @@ async fn acquire_handle(
     // reclaim path does not consult the tmux registry because the existing
     // PTY is already running whatever it was originally given (tmux attach
     // or $SHELL); switching mid-session would require killing the child.
-    if let Some(existing) = terminals.get(scope) {
+    if let Some(existing) = terminals.get_for_attach(scope) {
         return reclaim(conversation_id, existing).await;
     }
 
@@ -389,7 +389,7 @@ async fn acquire_handle(
     })
     .await;
 
-    let Some(existing) = terminals.get(scope) else {
+    let Some(existing) = terminals.get_for_attach(scope) else {
         // Winner removed itself between try_insert and get. Report back to
         // the client and bail — retrying again could loop on edge-case timing.
         let _ = ws_sender
