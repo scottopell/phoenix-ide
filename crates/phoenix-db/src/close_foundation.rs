@@ -1830,19 +1830,33 @@ impl Database {
         .collect()
     }
 
-    #[allow(clippy::too_many_lines)]
     pub async fn replace_close_inspection(
         &self,
         request: ReplaceCloseInspectionRequest,
     ) -> DbResult<()> {
+        self.replace_close_inspection_with_empty_generation(request, None)
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub async fn replace_close_inspection_with_empty_generation(
+        &self,
+        request: ReplaceCloseInspectionRequest,
+        empty_generation: Option<&str>,
+    ) -> DbResult<()> {
         let mut ordered_scopes = request.scopes.iter().collect::<Vec<_>>();
         ordered_scopes.sort_by(|left, right| left.scope.cmp(&right.scope));
-        let aggregate_snapshot = CloseRetirementSnapshot::parse(
+        let aggregate_generation = if ordered_scopes.is_empty() {
+            empty_generation.unwrap_or("no-worktree").to_string()
+        } else {
             encode_aggregate_snapshot_component(
                 ordered_scopes
                     .iter()
                     .map(|scope| (&scope.scope, scope.snapshot.generation())),
-            ),
+            )
+        };
+        let aggregate_snapshot = CloseRetirementSnapshot::parse(
+            aggregate_generation,
             encode_aggregate_snapshot_component(
                 ordered_scopes
                     .iter()
@@ -2559,6 +2573,54 @@ impl Database {
         .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Advances retained same-attempt dispatch authority after retry observes the
+    /// already-dispatched worktree absent.
+    pub async fn resume_close_retirement_after_dispatched_absence(
+        &self,
+        attempt_id: &CloseAttemptId,
+        snapshot: &CloseRetirementSnapshot,
+    ) -> DbResult<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let obligation = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
+        if obligation.phase() != ClosePhase::AwaitingRetirementInspection
+            || obligation.snapshot() != Some(snapshot)
+        {
+            return Err(close_precondition(format!(
+                "attempt {attempt_id} dispatched absence requires retained retry inspection authority"
+            )));
+        }
+        set_close_phase_tx(
+            &mut tx,
+            attempt_id.as_str(),
+            ClosePhase::RetirementRequested,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Reports whether every captured scope has a sealed inventory for the active snapshot.
+    pub async fn close_retirement_inventory_is_complete(&self, attempt_id: &str) -> DbResult<bool> {
+        let status = sqlx::query(
+            "SELECT
+                 (SELECT COUNT(*) FROM close_attempt_scopes WHERE attempt_id = ?1) AS target_count,
+                 (SELECT COUNT(*) FROM close_retirement_inventories inventory
+                  JOIN close_obligations obligation ON obligation.attempt_id = inventory.attempt_id
+                  WHERE inventory.attempt_id = ?1 AND inventory.sealed = 1
+                    AND inventory.inspection_generation = obligation.inspection_generation
+                    AND inventory.inspection_fingerprint = obligation.inspection_fingerprint) AS sealed_count
+             WHERE EXISTS (SELECT 1 FROM close_obligations WHERE attempt_id = ?1)",
+        )
+        .bind(attempt_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| DbError::CloseFoundationNotFound(attempt_id.to_string()))?;
+        Ok(
+            status.try_get::<i64, _>("target_count")?
+                == status.try_get::<i64, _>("sealed_count")?,
+        )
     }
 
     /// Lists expected retirement resources for the current exact attempt snapshot.
@@ -6374,6 +6436,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retry_no_worktree_inspection_rotates_inventory_generation() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-empty-retry",
+        )
+        .await
+        .unwrap();
+        set_close_phase(
+            &db,
+            "attempt-empty-retry",
+            ClosePhase::AwaitingRetirementInspection,
+        )
+        .await;
+        db.replace_close_inspection_with_empty_generation(
+            ReplaceCloseInspectionRequest {
+                attempt_id: CloseAttemptId::parse("attempt-empty-retry").unwrap(),
+                scopes: Vec::new(),
+            },
+            Some("server_git_status_v2_retry_test"),
+        )
+        .await
+        .unwrap();
+
+        let obligation = db
+            .get_close_obligation("attempt-empty-retry")
+            .await
+            .unwrap();
+        let snapshot = obligation.snapshot().expect("rotated no-worktree snapshot");
+        assert_eq!(snapshot.generation(), "server_git_status_v2_retry_test");
+        assert_eq!(snapshot.fingerprint(), "no-worktree");
+    }
+
+    #[tokio::test]
     async fn replace_close_inspection_requires_only_allocated_worktree_scopes() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
@@ -8519,6 +8617,66 @@ mod tests {
         let retried = db.retry_close_retirement(&attempt).await.unwrap();
         assert_eq!(retried.phase(), ClosePhase::AwaitingRetirementInspection);
         assert_eq!(retried.snapshot(), Some(&snapshot));
+    }
+
+    #[tokio::test]
+    async fn dispatched_absence_retry_resumes_retirement_with_retained_snapshot() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let scope = allocate_scope_worktree(&db, "root").await;
+        let attempt = CloseAttemptId::parse("attempt-dispatched-absence-retry").unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            attempt.as_str(),
+        )
+        .await
+        .unwrap();
+        set_close_phase(&db, attempt.as_str(), ClosePhase::RetirementRequested).await;
+        let snapshot = current_test_snapshot(&db, attempt.as_str()).await;
+        let resources = db
+            .capture_close_retirement_inventory(CaptureCloseRetirementInventoryRequest {
+                attempt_id: attempt.clone(),
+                snapshot: snapshot.clone(),
+                scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
+                    scope: scope.clone(),
+                    inventory: CloseOwnedResourceInventory {
+                        worktree: Some(current_test_worktree(&db, &scope).await),
+                        work_scopes: std::collections::BTreeSet::default(),
+                        bash_process_groups: std::collections::BTreeSet::default(),
+                        tmux_servers: std::collections::BTreeSet::default(),
+                        pty_sessions: std::collections::BTreeSet::default(),
+                        browser_sessions: std::collections::BTreeSet::default(),
+                        equivalent_live_resources: std::collections::BTreeSet::default(),
+                    },
+                }],
+            })
+            .await
+            .unwrap();
+        let worktree = resources
+            .into_iter()
+            .find(|resource| resource.resource.kind() == RetiredResourceKind::Worktree)
+            .unwrap();
+        db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
+            attempt_id: attempt.clone(),
+            snapshot: snapshot.clone(),
+            scope,
+            resource: worktree.resource,
+            outcome: RetirementOutcome::Residual {
+                residual_reason: RetirementFailureReason::RemovalFailed,
+            },
+            detail: Some("later cleanup requires repair".to_string()),
+        })
+        .await
+        .unwrap();
+        db.retry_close_retirement(&attempt).await.unwrap();
+
+        db.resume_close_retirement_after_dispatched_absence(&attempt, &snapshot)
+            .await
+            .unwrap();
+        let resumed = db.get_close_obligation(attempt.as_str()).await.unwrap();
+        assert_eq!(resumed.phase(), ClosePhase::RetirementRequested);
+        assert_eq!(resumed.snapshot(), Some(&snapshot));
     }
 
     #[test]

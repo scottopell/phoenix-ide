@@ -445,6 +445,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "preserve_close_reinspection_authority",
         sql: MIGRATION_085,
     },
+    Migration {
+        version: 86,
+        name: "rotate_worktree_less_close_retry_inventory",
+        sql: MIGRATION_086,
+    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -8427,6 +8432,62 @@ BEGIN
     UPDATE close_obligations
     SET inspection_generation = NULL, inspection_fingerprint = NULL
     WHERE attempt_id = NEW.attempt_id;
+END;
+";
+
+const MIGRATION_086: &str = r"
+DROP TRIGGER close_obligations_snapshot_matches_inspection_aggregate;
+CREATE TRIGGER close_obligations_snapshot_matches_inspection_aggregate
+BEFORE UPDATE OF inspection_generation, inspection_fingerprint ON close_obligations
+FOR EACH ROW
+WHEN (
+    OLD.inspection_generation IS NOT NEW.inspection_generation
+    OR OLD.inspection_fingerprint IS NOT NEW.inspection_fingerprint
+) AND NOT (
+    NEW.phase = 'completed'
+    AND NEW.close_outcome = 'cancelled'
+    AND NEW.inspection_generation IS NULL
+    AND NEW.inspection_fingerprint IS NULL
+) AND (
+    OLD.phase <> 'awaiting_retirement_inspection'
+    OR NEW.inspection_generation <> CASE
+        WHEN EXISTS (
+            SELECT 1 FROM close_retirement_inspections
+            WHERE attempt_id = NEW.attempt_id
+        ) THEN (
+            SELECT 'v1' || COALESCE(GROUP_CONCAT(component, ''), '')
+            FROM (
+                SELECT generation,
+                       LENGTH(CAST(scope AS BLOB)) || ':' || scope ||
+                       LENGTH(CAST(generation AS BLOB)) || ':' || generation AS component
+                FROM close_retirement_inspections
+                WHERE attempt_id = NEW.attempt_id
+                ORDER BY scope
+            )
+        )
+        WHEN NEW.inspection_generation LIKE 'server_git_status_v2_retry_%'
+            THEN NEW.inspection_generation
+        ELSE 'no-worktree'
+    END
+    OR NEW.inspection_fingerprint <> CASE
+        WHEN EXISTS (
+            SELECT 1 FROM close_retirement_inspections
+            WHERE attempt_id = NEW.attempt_id
+        ) THEN (
+            SELECT 'v1' || COALESCE(GROUP_CONCAT(component, ''), '')
+            FROM (
+                SELECT fingerprint,
+                       LENGTH(CAST(scope AS BLOB)) || ':' || scope ||
+                       LENGTH(CAST(fingerprint AS BLOB)) || ':' || fingerprint AS component
+                FROM close_retirement_inspections
+                WHERE attempt_id = NEW.attempt_id
+                ORDER BY scope
+            )
+        ) ELSE 'no-worktree'
+    END
+)
+BEGIN
+    SELECT RAISE(ABORT, 'close obligation snapshot must match atomic inspection replacement');
 END;
 ";
 

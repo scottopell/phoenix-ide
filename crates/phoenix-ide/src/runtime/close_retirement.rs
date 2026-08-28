@@ -167,9 +167,18 @@ impl RuntimeManager {
                                     .await
                                     .map_err(|error| error.to_string())?
                                 {
-                                    if continue_clean_retirement
-                                        && obligation.phase() == ClosePhase::RetirementRequested
-                                    {
+                                    if continue_clean_retirement {
+                                        if obligation.phase()
+                                            == ClosePhase::AwaitingRetirementInspection
+                                        {
+                                            self.db()
+                                                .resume_close_retirement_after_dispatched_absence(
+                                                    &attempt_id,
+                                                    &prior_snapshot,
+                                                )
+                                                .await
+                                                .map_err(|error| error.to_string())?;
+                                        }
                                         self.retire_close_runtime_resources(attempt_id).await?;
                                     }
                                     return Ok(prior_snapshot);
@@ -214,10 +223,13 @@ impl RuntimeManager {
             });
         }
         self.db()
-            .replace_close_inspection(ReplaceCloseInspectionRequest {
-                attempt_id: attempt_id.clone(),
-                scopes: requests,
-            })
+            .replace_close_inspection_with_empty_generation(
+                ReplaceCloseInspectionRequest {
+                    attempt_id: attempt_id.clone(),
+                    scopes: requests,
+                },
+                reinspection_generation.as_deref(),
+            )
             .await
             .map_err(|error| error.to_string())?;
         let obligation = self
@@ -529,43 +541,24 @@ impl RuntimeManager {
             .snapshot()
             .cloned()
             .ok_or_else(|| "retirement requested without an inspection snapshot".to_string())?;
-        let existing_targets = self
+        let inventory_is_complete = self
+            .db()
+            .close_retirement_inventory_is_complete(attempt_id.as_str())
+            .await
+            .map_err(|error| error.to_string())?;
+        if !inventory_is_complete
+            && snapshot
+                .generation()
+                .contains("server_git_status_v2_retry_")
+        {
+            self.capture_close_retirement_inventory(attempt_id.clone(), snapshot.clone())
+                .await?;
+        }
+        let targets = self
             .db()
             .list_close_expected_retirement_resources(attempt_id.as_str())
             .await
             .map_err(|error| error.to_string())?;
-        if existing_targets.is_empty() {
-            let mut acquired_scopes = Vec::new();
-            for captured in self
-                .db()
-                .list_close_attempt_scopes(attempt_id.as_str())
-                .await
-                .map_err(|error| error.to_string())?
-            {
-                match self
-                    .acquire_close_resource_lease(&attempt_id, captured.scope.clone())
-                    .await
-                {
-                    Ok(_) => acquired_scopes.push(captured.scope),
-                    Err(error) => {
-                        for scope in &acquired_scopes {
-                            self.cancel_close_resource_lease(&attempt_id, scope).await;
-                        }
-                        return Err(error);
-                    }
-                }
-            }
-        }
-        let mut targets = existing_targets;
-        if targets.is_empty() {
-            self.capture_close_retirement_inventory(attempt_id.clone(), snapshot.clone())
-                .await?;
-            targets = self
-                .db()
-                .list_close_expected_retirement_resources(attempt_id.as_str())
-                .await
-                .map_err(|error| error.to_string())?;
-        }
         let evidence = self
             .db()
             .list_close_retirement_evidence(attempt_id.as_str())
