@@ -7349,6 +7349,136 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
+    async fn failed_pre_runtime_worktree_reinspection_persists_typed_residual() {
+        #![allow(clippy::too_many_lines)]
+        use phoenix_core::domain::close::{
+            CapturedWorktreeIdentity, CloseAttemptId, ClosePhase, RetiredResourceKind,
+            RetirementFailureReason, RetirementOutcome,
+        };
+
+        let manager = test_manager().await;
+        let repository = tempfile::tempdir().unwrap();
+        let git = |arguments: &[&str]| {
+            let output = phoenix_core::git::command()
+                .args(arguments)
+                .current_dir(repository.path())
+                .env("GIT_AUTHOR_NAME", "Close Test")
+                .env("GIT_AUTHOR_EMAIL", "close@example.invalid")
+                .env("GIT_COMMITTER_NAME", "Close Test")
+                .env("GIT_COMMITTER_EMAIL", "close@example.invalid")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {arguments:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--quiet"]);
+        std::fs::write(repository.path().join("tracked"), "initial\n").unwrap();
+        git(&["add", "tracked"]);
+        git(&["commit", "--quiet", "-m", "initial"]);
+
+        let conversation_id = "failed-close-reinspection";
+        create_handleless_work_conv(
+            &manager,
+            conversation_id,
+            repository.path().to_str().unwrap(),
+            None,
+        )
+        .await;
+        sqlx::query("UPDATE conversations SET user_initiated = 1 WHERE id = ?1")
+            .bind(conversation_id)
+            .execute(manager.db().pool())
+            .await
+            .unwrap();
+        let conversation = manager
+            .db()
+            .get_conversation(conversation_id)
+            .await
+            .unwrap();
+        let attempt_id = CloseAttemptId::parse("failed-close-reinspection-attempt").unwrap();
+        manager
+            .db()
+            .begin_close_foundation(
+                &conversation.product_conversation_id,
+                &TranscriptConversationId::parse(conversation_id).unwrap(),
+                attempt_id.as_str(),
+            )
+            .await
+            .unwrap();
+        manager
+            .db()
+            .confirm_close_stop_work(attempt_id.as_str())
+            .await
+            .unwrap();
+        manager
+            .db()
+            .begin_close_active_work_settlement(attempt_id.as_str())
+            .await
+            .unwrap();
+        manager
+            .db()
+            .advance_close_settlement_when_quiescent(attempt_id.as_str())
+            .await
+            .unwrap();
+        manager
+            .inspect_close_retirement_only(attempt_id.clone())
+            .await
+            .unwrap();
+        let captured = manager
+            .db()
+            .list_close_attempt_scopes(attempt_id.as_str())
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let CapturedWorktreeIdentity::Resolved(captured_worktree) =
+            captured.captured_worktree.unwrap()
+        else {
+            panic!("test worktree identity must be resolved");
+        };
+
+        std::fs::remove_dir_all(repository.path().join(".git")).unwrap();
+        let error = manager
+            .retire_close_runtime_resources(attempt_id.clone())
+            .await
+            .unwrap_err();
+        assert!(error.contains("worktree cannot be reinspected before live resource retirement"));
+
+        let obligation = manager
+            .db()
+            .get_close_obligation(attempt_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(obligation.phase(), ClosePhase::NeedsRepair);
+        let evidence = manager
+            .db()
+            .list_close_retirement_evidence(attempt_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(evidence.len(), 1);
+        let residual = &evidence[0];
+        assert_eq!(residual.scope, captured.scope);
+        assert_eq!(residual.resource.kind(), RetiredResourceKind::Worktree);
+        assert_eq!(
+            residual.resource.identity(),
+            &phoenix_core::domain::close::LossItemIdentity::Worktree(captured_worktree)
+        );
+        assert_eq!(
+            residual.outcome,
+            RetirementOutcome::Residual {
+                residual_reason: RetirementFailureReason::IdentityNotProven,
+            }
+        );
+        assert!(residual
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("worktree cannot be reinspected")));
+    }
+
+    #[tokio::test]
     async fn second_startup_worktree_scan_retires_top_level_fork_proposals() {
         use crate::db::{ForkProposal, ForkProposalStatus};
 

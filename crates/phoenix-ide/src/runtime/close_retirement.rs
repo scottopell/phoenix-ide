@@ -948,9 +948,23 @@ impl RuntimeManager {
                     )
                     .await;
             };
-            let (fresh_snapshot, _) = inspect_worktree(identity).await.map_err(|reason| {
-                format!("worktree cannot be reinspected before live resource retirement: {reason}")
-            })?;
+            let (fresh_snapshot, _) = match inspect_worktree(identity).await {
+                Ok(inspection) => inspection,
+                Err(reason) => {
+                    return self
+                        .record_close_residual(
+                            attempt_id,
+                            snapshot,
+                            &captured.scope,
+                            target.resource.clone(),
+                            RetirementFailureReason::IdentityNotProven,
+                            &format!(
+                                "worktree cannot be reinspected before live resource retirement: {reason}"
+                            ),
+                        )
+                        .await;
+                }
+            };
             if fresh_snapshot.fingerprint() != confirmed.snapshot.fingerprint() {
                 self.db()
                     .return_close_attempt_to_reinspection(attempt_id)
