@@ -3324,34 +3324,12 @@ impl Database {
                 "attempt {attempt_id} retry requires needs_repair"
             )));
         }
-        let has_complete_sealed_inventory: bool = sqlx::query_scalar(
-            "SELECT
-                 (SELECT COUNT(*) FROM close_attempt_scopes WHERE attempt_id = ?1) > 0
-                 AND (SELECT COUNT(*) FROM close_attempt_scopes WHERE attempt_id = ?1)
-                     = (SELECT COUNT(*) FROM close_retirement_inventories inventory
-                        WHERE inventory.attempt_id = ?1 AND inventory.sealed = 1
-                          AND inventory.inspection_generation = ?2
-                          AND inventory.inspection_fingerprint = ?3)",
+        set_close_phase_tx(
+            &mut tx,
+            attempt_id.as_str(),
+            ClosePhase::AwaitingRetirementInspection,
         )
-        .bind(attempt_id.as_str())
-        .bind(
-            obligation
-                .snapshot()
-                .map(CloseRetirementSnapshot::generation),
-        )
-        .bind(
-            obligation
-                .snapshot()
-                .map(CloseRetirementSnapshot::fingerprint),
-        )
-        .fetch_one(&mut *tx)
         .await?;
-        let next_phase = if has_complete_sealed_inventory {
-            ClosePhase::RetirementRequested
-        } else {
-            ClosePhase::AwaitingRetirementInspection
-        };
-        set_close_phase_tx(&mut tx, attempt_id.as_str(), next_phase).await?;
         let obligation = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
         tx.commit().await?;
         Ok(obligation)
@@ -8488,10 +8466,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_preinspection_repair_returns_to_reinspection() {
+    async fn retry_reopens_reinspection_so_resources_admitted_during_repair_are_resealed() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
-        let attempt = CloseAttemptId::parse("attempt-preinspection-repair").unwrap();
+        let scope = allocate_scope_worktree(&db, "root").await;
+        let attempt = CloseAttemptId::parse("attempt-reseal-after-repair").unwrap();
         db.begin_close_foundation(
             &product_id("root"),
             &transcript_id("root"),
@@ -8499,13 +8478,43 @@ mod tests {
         )
         .await
         .unwrap();
-        set_close_phase(
-            &db,
-            attempt.as_str(),
-            ClosePhase::AwaitingRetirementInspection,
-        )
-        .await;
-        db.route_close_attempt_to_repair(&attempt).await.unwrap();
+        set_close_phase(&db, attempt.as_str(), ClosePhase::RetirementRequested).await;
+        let snapshot = current_test_snapshot(&db, attempt.as_str()).await;
+        let resources = db
+            .capture_close_retirement_inventory(CaptureCloseRetirementInventoryRequest {
+                attempt_id: attempt.clone(),
+                snapshot: snapshot.clone(),
+                scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
+                    scope: scope.clone(),
+                    inventory: CloseOwnedResourceInventory {
+                        worktree: Some(current_test_worktree(&db, &scope).await),
+                        work_scopes: std::collections::BTreeSet::default(),
+                        bash_process_groups: std::collections::BTreeSet::default(),
+                        tmux_servers: std::collections::BTreeSet::default(),
+                        pty_sessions: std::collections::BTreeSet::default(),
+                        browser_sessions: std::collections::BTreeSet::default(),
+                        equivalent_live_resources: std::collections::BTreeSet::default(),
+                    },
+                }],
+            })
+            .await
+            .unwrap();
+        let worktree = resources
+            .into_iter()
+            .find(|resource| resource.resource.kind() == RetiredResourceKind::Worktree)
+            .unwrap();
+        db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
+            attempt_id: attempt.clone(),
+            snapshot,
+            scope,
+            resource: worktree.resource,
+            outcome: RetirementOutcome::Residual {
+                residual_reason: RetirementFailureReason::RemovalFailed,
+            },
+            detail: Some("repair remains required".to_string()),
+        })
+        .await
+        .unwrap();
 
         let retried = db.retry_close_retirement(&attempt).await.unwrap();
         assert_eq!(retried.phase(), ClosePhase::AwaitingRetirementInspection);

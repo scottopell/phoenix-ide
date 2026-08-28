@@ -503,6 +503,15 @@ impl RuntimeManager {
             .snapshot()
             .cloned()
             .ok_or_else(|| "retirement requested without an inspection snapshot".to_string())?;
+        for captured in self
+            .db()
+            .list_close_attempt_scopes(attempt_id.as_str())
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            self.acquire_close_resource_lease(&attempt_id, captured.scope)
+                .await?;
+        }
         let mut targets = self
             .db()
             .list_close_expected_retirement_resources(attempt_id.as_str())
@@ -2376,6 +2385,15 @@ fn canonical_status_observation(status: &[u8]) -> Vec<u8> {
 
 fn observe_dirty_content(repository: &Path, losses: &[CloseLossItem]) -> Result<Vec<u8>, String> {
     let mut observation = Vec::new();
+    let index = phoenix_core::git::command()
+        .args(["ls-files", "--stage", "-z"])
+        .current_dir(repository)
+        .output()
+        .map_err(|error| format!("cannot inspect dirty index: {error}"))?;
+    if !index.status.success() {
+        return Err(String::from_utf8_lossy(&index.stderr).trim().to_string());
+    }
+    let staged_entries = staged_index_entries_by_path(&index.stdout);
     let mut paths = losses
         .iter()
         .filter_map(|loss| match loss.identity() {
@@ -2441,26 +2459,32 @@ fn observe_dirty_content(repository: &Path, losses: &[CloseLossItem]) -> Result<
         observation.extend_from_slice(b"INDEX\0");
         observation.extend_from_slice(&path);
         observation.push(0);
-        let mut command = phoenix_core::git::command();
-        command.args(["ls-files", "--stage", "-z", "--"]);
-        #[cfg(unix)]
-        {
-            use std::os::unix::ffi::OsStringExt as _;
-            command.arg(std::ffi::OsString::from_vec(path.clone()));
+        if let Some(entries) = staged_entries.get(&path) {
+            for entry in entries {
+                observation.extend_from_slice(entry);
+                observation.push(0);
+            }
         }
-        #[cfg(not(unix))]
-        command.arg(String::from_utf8_lossy(&path).as_ref());
-        let index = command
-            .current_dir(repository)
-            .output()
-            .map_err(|error| format!("cannot inspect dirty index entry: {error}"))?;
-        if !index.status.success() {
-            return Err(String::from_utf8_lossy(&index.stderr).trim().to_string());
-        }
-        observation.extend_from_slice(&index.stdout);
         observation.push(0);
     }
     Ok(observation)
+}
+
+fn staged_index_entries_by_path(index: &[u8]) -> std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>> {
+    let mut entries = std::collections::BTreeMap::<Vec<u8>, Vec<Vec<u8>>>::new();
+    for entry in index
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let Some(tab) = entry.iter().position(|byte| *byte == b'\t') else {
+            continue;
+        };
+        entries
+            .entry(entry[tab + 1..].to_vec())
+            .or_default()
+            .push(entry.to_vec());
+    }
+    entries
 }
 
 fn parse_status_losses(status: &[u8]) -> Vec<CloseLossItem> {
@@ -2602,7 +2626,8 @@ mod tests {
         canonical_status_observation, exact_worktree_administrative_dir, git_path_from_observation,
         inspect_and_remove_exact_worktree_with_hook, inspect_worktree, parse_status_losses,
         quarantine_and_remove_exact_worktree, run_bounded_git_status_until, snapshot_for,
-        worktree_quarantine_path, CloseLeaseFailure, ExactWorktreeRemoval,
+        staged_index_entries_by_path, worktree_quarantine_path, CloseLeaseFailure,
+        ExactWorktreeRemoval,
     };
     use phoenix_core::domain::close::{
         CloseLossItem, GitPathIdentity, WorktreeFingerprint, WorktreeId, WorktreeIdentity,
@@ -3378,6 +3403,37 @@ mod tests {
             canonical_status_observation(b"R  new-name.txt\0old-name.txt\0!! ignored\0"),
             b"R  new-name.txt\0old-name.txt\0"
         );
+    }
+
+    #[test]
+    fn staged_index_entries_are_batched_and_preserve_pathspec_magic_literally() {
+        let index = b"100644 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0\t:(bad)file\0\
+                      100644 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 0\tordinary\0";
+        let entries = staged_index_entries_by_path(index);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[b":(bad)file".as_slice()],
+            vec![b"100644 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0\t:(bad)file".to_vec()]
+        );
+    }
+
+    #[tokio::test]
+    async fn dirty_pathspec_magic_filename_is_inspected_as_a_literal_path() {
+        let temp = tempfile::tempdir().unwrap();
+        initialize_repository(temp.path());
+        let path = temp.path().join(":(bad)file");
+        std::fs::write(&path, "base\n").unwrap();
+        run_git(temp.path(), &["add", ":(literal):(bad)file"]);
+        run_git(temp.path(), &["commit", "--quiet", "-m", "literal path"]);
+        std::fs::write(path, "dirty\n").unwrap();
+
+        let (_, losses) = inspect_worktree(&inspection_identity(temp.path()))
+            .await
+            .unwrap();
+        assert!(losses.iter().any(|loss| matches!(
+            loss,
+            CloseLossItem::UnstagedTrackedPath(path) if path.as_bytes() == b":(bad)file"
+        )));
     }
 
     #[tokio::test]

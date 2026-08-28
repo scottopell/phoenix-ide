@@ -238,6 +238,24 @@ impl std::fmt::Debug for Handle {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn successful_group_signal_outcome(
+    pgid: i32,
+    resume_result: libc::c_long,
+    resume_error: Option<std::io::Error>,
+) -> Result<Option<i32>, std::io::Error> {
+    match resume_error {
+        None if resume_result == 0 => Ok(Some(pgid)),
+        Some(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(Some(pgid)),
+        Some(error) => Err(std::io::Error::other(format!(
+            "group signal succeeded but incarnation-bound resume failed: {error}"
+        ))),
+        None => Err(std::io::Error::other(
+            "group signal succeeded but incarnation-bound resume failed without an OS error",
+        )),
+    }
+}
+
 impl Handle {
     /// Construct a fresh live handle for a freshly spawned child.
     ///
@@ -617,13 +635,12 @@ impl Handle {
                         };
                         if let Some(error) = signal_error {
                             Err(error)
-                        } else if resumed != 0 {
-                            Err(std::io::Error::other(format!(
-                                "group signal succeeded but incarnation-bound resume failed: {}",
-                                std::io::Error::last_os_error()
-                            )))
                         } else {
-                            Ok(Some(live.pgid))
+                            successful_group_signal_outcome(
+                                live.pgid,
+                                resumed,
+                                (resumed != 0).then(std::io::Error::last_os_error),
+                            )
                         }
                     } else {
                         Ok(None)
@@ -764,6 +781,18 @@ mod tests {
             12345,
             super::super::ring::RING_BUFFER_BYTES,
         )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn successful_group_signal_ignores_resume_esrch() {
+        let outcome = successful_group_signal_outcome(
+            42,
+            -1,
+            Some(std::io::Error::from_raw_os_error(libc::ESRCH)),
+        )
+        .unwrap();
+        assert_eq!(outcome, Some(42));
     }
 
     #[tokio::test]
