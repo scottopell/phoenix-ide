@@ -12,12 +12,12 @@ use super::handlers::AppError;
 use super::types::{
     OrdinaryProductConversationLifecycleView, ProductConversationChainQaCompatibilityView,
     ProductConversationCloseInspectionView, ProductConversationCloseLossView,
-    ProductConversationClosePhaseView, ProductConversationCloseView,
-    ProductConversationHandoffView, ProductConversationListResponse, ProductConversationListRow,
-    ProductConversationPresentationView, ProductConversationSegmentView,
-    ProductConversationSnapshotView, ProductConversationSourceRelationView,
-    ProductConversationSourceView, ProductConversationTranscriptRowView,
-    ProductConversationWorkIdentityView,
+    ProductConversationClosePhaseView, ProductConversationCloseResidualView,
+    ProductConversationCloseView, ProductConversationHandoffView, ProductConversationListResponse,
+    ProductConversationListRow, ProductConversationPresentationView,
+    ProductConversationSegmentView, ProductConversationSnapshotView,
+    ProductConversationSourceRelationView, ProductConversationSourceView,
+    ProductConversationTranscriptRowView, ProductConversationWorkIdentityView,
 };
 use super::AppState;
 use crate::db::{
@@ -601,6 +601,24 @@ fn close_view(projection: crate::db::CloseProjection) -> ProductConversationClos
                         format!("{identity:?}")
                     }
                 },
+            })
+            .collect(),
+        residuals: projection
+            .residuals
+            .into_iter()
+            .filter_map(|residual| {
+                let phoenix_core::domain::close::RetirementOutcome::Residual { residual_reason } =
+                    residual.outcome
+                else {
+                    return None;
+                };
+                Some(ProductConversationCloseResidualView {
+                    scope: residual.scope.as_str().to_string(),
+                    resource_kind: residual.resource.kind().as_str().to_string(),
+                    identity: residual.resource.identity().value(),
+                    reason: residual_reason.as_str().to_string(),
+                    detail: residual.detail,
+                })
             })
             .collect(),
     }

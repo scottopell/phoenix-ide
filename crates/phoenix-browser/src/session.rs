@@ -2070,6 +2070,13 @@ impl BrowserSessionManager {
     ) -> Result<Option<Arc<RwLock<BrowserSession>>>, BrowserError> {
         let key = session_key(work_scope, actor);
         let state = self.state.read().await;
+        if Self::scope_is_fenced(&state, work_scope).is_some()
+            || Self::actor_is_fenced(&state, work_scope, actor).is_some()
+        {
+            return Err(BrowserError::RetirementFenced {
+                work_scope: work_scope.clone(),
+            });
+        }
         let Some(entry) = state.sessions.get(&key) else {
             return Ok(None);
         };
@@ -3091,6 +3098,35 @@ mod lifecycle_hook_tests {
 
         manager.reopen_after_repair_for_actor(&scope, &actor).await;
         assert!(!manager.is_retirement_fenced_for_actor(&scope, &actor).await);
+    }
+
+    #[tokio::test]
+    async fn existing_actor_lookup_rejects_scope_and_actor_retirement_fences() {
+        let manager = BrowserSessionManager::default();
+        let scope = scope("browser-existing-retirement-fence");
+        let work_actor = EffectiveResourceAccess::new("owner", ResourceAuthority::Work);
+        let restricted_actor =
+            EffectiveResourceAccess::new("restricted", ResourceAuthority::Restricted);
+
+        let scope_permit = manager.begin_retirement(&scope).await;
+        assert!(matches!(
+            manager.get_existing_for_actor(&scope, &work_actor).await,
+            Err(super::BrowserError::RetirementFenced { work_scope }) if work_scope == scope
+        ));
+        manager.reopen_after_repair(&scope).await;
+
+        let actor_permit = manager
+            .begin_retirement_for_actor(&scope, &restricted_actor)
+            .await;
+        assert!(matches!(
+            manager
+                .get_existing_for_actor(&scope, &restricted_actor)
+                .await,
+            Err(super::BrowserError::RetirementFenced { work_scope }) if work_scope == scope
+        ));
+
+        assert_eq!(scope_permit.work_scope, scope);
+        assert_eq!(actor_permit.work_scope, scope);
     }
 
     #[tokio::test]

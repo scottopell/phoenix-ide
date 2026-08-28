@@ -89,8 +89,35 @@ function CloseStatusPanel({
       <section className="work-actions-close-status" aria-label="Close repair required">
         <strong>⚠ Close needs repair</strong>
         <p>Phoenix stopped before it could prove every owned resource was retired.</p>
+        <ul>
+          {close.residuals.map((residual) => (
+            <li key={`${residual.scope}:${residual.resource_kind}:${residual.identity}`}>
+              <code>{residual.scope}: {residual.resource_kind.replaceAll('_', ' ')} · {residual.identity}</code>
+              {' · '}{residual.reason.replaceAll('_', ' ')}
+              {residual.detail ? ` — ${residual.detail}` : ''}
+            </li>
+          ))}
+        </ul>
         <button type="button" className="work-actions-btn" disabled={busy} onClick={onRetry}>
           {busy ? 'Retrying…' : 'Retry exact Close attempt'}
+        </button>
+      </section>
+    );
+  }
+  const cancellablePhases = new Set([
+    'awaiting_blocker_resolution',
+    'awaiting_stop_work_confirmation',
+    'settling_active_work',
+    'cancel_requested_during_settlement',
+    'awaiting_retirement_inspection',
+  ]);
+  if (cancellablePhases.has(close.phase)) {
+    return (
+      <section className="work-actions-close-status" aria-label="Close in progress">
+        <strong>… Close in progress</strong>
+        <p>{close.phase.replaceAll('_', ' ')}</p>
+        <button type="button" className="work-actions-btn" disabled={busy} onClick={onCancel}>
+          Keep work and cancel Close
         </button>
       </section>
     );
@@ -283,7 +310,7 @@ export function WorkControlBar({
     let cancelled = false;
     void api.getProductConversationSnapshot(conversationId)
       .then((snapshot) => {
-        if (!cancelled && (snapshot.close?.phase === 'awaiting_loss_confirmation' || snapshot.close?.phase === 'needs_repair')) {
+        if (!cancelled && snapshot.close) {
           setCloseSnapshot(snapshot);
         }
       })

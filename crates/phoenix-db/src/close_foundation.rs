@@ -54,6 +54,7 @@ pub struct CloseProjection {
     pub obligation: CloseObligation,
     pub inspections: Vec<CloseInspection>,
     pub losses: Vec<CloseInspectionLoss>,
+    pub residuals: Vec<CloseRetiredResource>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1269,24 +1270,43 @@ impl Database {
     ) -> DbResult<CloseObligation> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let obligation = close_obligation_for_update(&mut tx, attempt_id).await?;
-        if obligation.phase() != ClosePhase::AwaitingLossConfirmation {
-            return Err(close_precondition(format!(
-                "attempt {attempt_id} phase {} does not admit pre-retirement cancellation",
-                obligation.phase().as_str()
-            )));
+        match obligation.phase() {
+            ClosePhase::SettlingActiveWork => {
+                set_close_phase_tx(
+                    &mut tx,
+                    attempt_id,
+                    ClosePhase::CancelRequestedDuringSettlement,
+                )
+                .await?;
+            }
+            ClosePhase::CancelRequestedDuringSettlement => {}
+            ClosePhase::AwaitingBlockerResolution
+            | ClosePhase::AwaitingStopWorkConfirmation
+            | ClosePhase::AwaitingRetirementInspection
+            | ClosePhase::AwaitingLossConfirmation => {
+                let now = Utc::now().to_rfc3339();
+                sqlx::query(
+                    "UPDATE close_obligations
+                     SET phase = 'completed', completed_at = ?2, updated_at = ?2,
+                         close_outcome = 'cancelled',
+                         inspection_generation = NULL, inspection_fingerprint = NULL
+                     WHERE attempt_id = ?1 AND phase = ?3",
+                )
+                .bind(attempt_id)
+                .bind(now)
+                .bind(obligation.phase().as_str())
+                .execute(&mut *tx)
+                .await?;
+            }
+            phase @ (ClosePhase::RetirementRequested
+            | ClosePhase::NeedsRepair
+            | ClosePhase::Completed) => {
+                return Err(close_precondition(format!(
+                    "attempt {attempt_id} phase {} does not admit pre-retirement cancellation",
+                    phase.as_str()
+                )));
+            }
         }
-        let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            "UPDATE close_obligations
-             SET phase = 'completed', completed_at = ?2, updated_at = ?2,
-                 close_outcome = 'cancelled',
-                 inspection_generation = NULL, inspection_fingerprint = NULL
-             WHERE attempt_id = ?1 AND phase = 'awaiting_loss_confirmation'",
-        )
-        .bind(attempt_id)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
         let obligation = close_obligation_for_update(&mut tx, attempt_id).await?;
         tx.commit().await?;
         Ok(obligation)
@@ -2015,11 +2035,44 @@ impl Database {
         .into_iter()
         .map(parse_close_inspection_loss_row)
         .collect::<DbResult<Vec<_>>>()?;
+        let residuals = sqlx::query(
+            "SELECT resource.attempt_id, resource.scope, resource.inspection_generation,
+                    resource.inspection_fingerprint, resource.resource_kind, resource.identity_kind,
+                    resource.identity_codec, resource.identity_value, resource.proof_kind,
+                    resource.absence_basis, resource.residual_reason, resource.detail,
+                    resource.created_at, resource.updated_at,
+                    captured.captured_worktree_fingerprint, captured.captured_worktree_locator
+             FROM close_retirement_resources resource
+             JOIN close_attempt_scopes captured
+               ON captured.attempt_id = resource.attempt_id AND captured.scope = resource.scope
+             WHERE resource.attempt_id = ?1
+               AND resource.proof_kind = 'residual'
+               AND resource.inspection_generation = ?2
+               AND resource.inspection_fingerprint = ?3
+             ORDER BY resource.scope, resource.resource_kind, resource.identity_value",
+        )
+        .bind(obligation.attempt_id().as_str())
+        .bind(
+            obligation
+                .snapshot()
+                .map(CloseRetirementSnapshot::generation),
+        )
+        .bind(
+            obligation
+                .snapshot()
+                .map(CloseRetirementSnapshot::fingerprint),
+        )
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(parse_close_retired_resource_row)
+        .collect::<DbResult<Vec<_>>>()?;
         tx.rollback().await?;
         Ok(Some(CloseProjection {
             obligation,
             inspections,
             losses,
+            residuals,
         }))
     }
 
@@ -7599,6 +7652,80 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(snapshot_columns, (None, None));
+    }
+
+    #[tokio::test]
+    async fn cancel_close_before_retirement_covers_every_pre_retirement_phase() {
+        for stop_work_confirmed in [false, true] {
+            let db = Database::open_in_memory().await.unwrap();
+            create_root(&db, "root").await;
+            let attempt_id = format!("attempt-cancel-stop-{stop_work_confirmed}");
+            db.begin_close_foundation(&product_id("root"), &transcript_id("root"), &attempt_id)
+                .await
+                .unwrap();
+            if stop_work_confirmed {
+                db.confirm_close_stop_work(&attempt_id).await.unwrap();
+            }
+            let cancelled = db
+                .cancel_close_before_retirement(&attempt_id)
+                .await
+                .unwrap();
+            assert_eq!(cancelled.phase(), ClosePhase::Completed);
+            assert_eq!(
+                cancelled.close_outcome(),
+                Some(CloseCompletionOutcome::Cancelled)
+            );
+        }
+
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let attempt_id = "attempt-cancel-settling-all-phases";
+        db.begin_close_foundation(&product_id("root"), &transcript_id("root"), attempt_id)
+            .await
+            .unwrap();
+        db.confirm_close_stop_work(attempt_id).await.unwrap();
+        db.begin_close_active_work_settlement(attempt_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.cancel_close_before_retirement(attempt_id)
+                .await
+                .unwrap()
+                .phase(),
+            ClosePhase::CancelRequestedDuringSettlement
+        );
+        assert_eq!(
+            db.cancel_close_before_retirement(attempt_id)
+                .await
+                .unwrap()
+                .phase(),
+            ClosePhase::CancelRequestedDuringSettlement
+        );
+
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let attempt_id = "attempt-cancel-inspection";
+        db.begin_close_foundation(&product_id("root"), &transcript_id("root"), attempt_id)
+            .await
+            .unwrap();
+        db.confirm_close_stop_work(attempt_id).await.unwrap();
+        db.begin_close_active_work_settlement(attempt_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.advance_close_settlement_when_quiescent(attempt_id)
+                .await
+                .unwrap()
+                .phase(),
+            ClosePhase::AwaitingRetirementInspection
+        );
+        assert_eq!(
+            db.cancel_close_before_retirement(attempt_id)
+                .await
+                .unwrap()
+                .phase(),
+            ClosePhase::Completed
+        );
     }
 
     #[tokio::test]

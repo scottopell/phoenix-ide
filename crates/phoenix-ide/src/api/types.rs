@@ -256,6 +256,7 @@ pub struct ProductConversationCloseView {
     pub confirmation_snapshot: Option<ProductConversationCloseInspectionView>,
     pub inspections: Vec<ProductConversationCloseInspectionView>,
     pub losses: Vec<ProductConversationCloseLossView>,
+    pub residuals: Vec<ProductConversationCloseResidualView>,
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
@@ -273,6 +274,16 @@ pub struct ProductConversationCloseLossView {
     pub generation: String,
     pub category: String,
     pub identity: String,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProductConversationCloseResidualView {
+    pub scope: String,
+    pub resource_kind: String,
+    pub identity: String,
+    pub reason: String,
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, TS)]

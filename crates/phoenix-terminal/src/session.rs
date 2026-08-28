@@ -540,13 +540,6 @@ impl ActiveTerminals {
         )
         .await;
         if wait_outcome.is_err() {
-            if permit.instance.as_ref().is_some_and(|instance| {
-                phoenix_core::process_identity::process_identity_matches(
-                    instance.process_identity(),
-                )
-            }) {
-                let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGKILL);
-            }
             return TerminalRetirementOutcome::Residual {
                 reason: "terminal child did not exit before retirement deadline".to_string(),
             };

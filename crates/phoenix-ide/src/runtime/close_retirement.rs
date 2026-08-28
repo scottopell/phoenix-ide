@@ -1724,6 +1724,35 @@ where
     ))
 }
 
+fn quarantine_has_open_descriptors(path: &Path) -> Result<bool, String> {
+    let canonical = std::fs::canonicalize(path).map_err(|error| {
+        format!("cannot canonicalize quarantined worktree before descriptor inspection: {error}")
+    })?;
+    let output = std::process::Command::new("lsof")
+        .args(["-n", "-P", "-F", "n"])
+        .output()
+        .map_err(|error| {
+            format!("cannot prove quarantined worktree has no open descriptors: {error}")
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "cannot prove quarantined worktree has no open descriptors: lsof exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let prefix = canonical.as_os_str().as_encoded_bytes();
+    Ok(output.stdout.split(|byte| *byte == b'\n').any(|field| {
+        let Some(name) = field.strip_prefix(b"n") else {
+            return false;
+        };
+        name == prefix
+            || name
+                .strip_prefix(prefix)
+                .is_some_and(|suffix| suffix.first() == Some(&b'/'))
+    }))
+}
+
 #[allow(clippy::too_many_lines)]
 async fn quarantine_and_remove_exact_worktree<F>(
     identity: &WorktreeIdentity,
@@ -1798,6 +1827,14 @@ where
         }
 
         after_quarantine(&path);
+        if quarantine_has_open_descriptors(&quarantine)? {
+            return Ok(ExactWorktreeRemoval::Changed {
+                detail: format!(
+                    "open descriptors can still modify the confirmed worktree; retained at {}",
+                    quarantine.display()
+                ),
+            });
+        }
         if path
             .try_exists()
             .map_err(|error| format!("cannot inspect original worktree path: {error}"))?
@@ -2014,7 +2051,7 @@ mod tests {
         canonical_status_observation, git_path_from_observation,
         inspect_and_remove_exact_worktree_with_hook, inspect_worktree, parse_status_losses,
         quarantine_and_remove_exact_worktree, run_bounded_git_status_until, snapshot_for,
-        CloseLeaseFailure, ExactWorktreeRemoval,
+        worktree_quarantine_path, CloseLeaseFailure, ExactWorktreeRemoval,
     };
     use phoenix_core::domain::close::{
         CloseLossItem, GitPathIdentity, WorktreeFingerprint, WorktreeId, WorktreeIdentity,
@@ -2391,6 +2428,44 @@ mod tests {
             ExactWorktreeRemoval::Removed
         ));
         assert!(!closing.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quarantine_preserves_worktree_with_open_file_descriptor() {
+        use std::io::Write as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let closing = temp.path().join("closing");
+        initialize_repository(&closing);
+        let tracked = closing.join("tracked");
+        std::fs::write(&tracked, "before\n").unwrap();
+        run_git(&closing, &["add", "tracked"]);
+        run_git(&closing, &["commit", "--quiet", "-m", "tracked"]);
+        let identity = inspection_identity(&closing);
+        let mut descriptor = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&tracked)
+            .unwrap();
+
+        let outcome = quarantine_and_remove_exact_worktree(&identity, move |_| {
+            descriptor.write_all(b"after\n").unwrap();
+            descriptor.flush().unwrap();
+            std::mem::forget(descriptor);
+        })
+        .await
+        .unwrap();
+
+        let ExactWorktreeRemoval::Changed { detail } = outcome else {
+            panic!("open descriptor must preserve quarantine");
+        };
+        assert!(detail.contains("open descriptors"));
+        assert!(!closing.exists());
+        let quarantine = worktree_quarantine_path(&identity).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(quarantine.join("tracked")).unwrap(),
+            "before\nafter\n"
+        );
     }
 
     #[cfg(unix)]

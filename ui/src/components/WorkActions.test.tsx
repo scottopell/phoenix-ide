@@ -178,6 +178,58 @@ beforeEach(() => {
   });
 });
 
+describe('WorkControlBar — persisted Close recovery', () => {
+  const closeSnapshot = (phase: string, residuals: Array<Record<string, string | null>> = []) => ({
+    close: {
+      attempt_id: 'attempt-close',
+      phase,
+      confirmation_snapshot: null,
+      inspections: [],
+      losses: [],
+      residuals,
+    },
+  });
+
+  it('renders exact residual repair evidence after reload', async () => {
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(closeSnapshot('needs_repair', [{
+      scope: 'scope-1',
+      resource_kind: 'tmux_server',
+      identity: 'server:owned',
+      reason: 'ownership_conflict',
+      detail: 'different server incarnation is live',
+    }]) as never);
+
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-repair" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={prStatusHandle()} />,
+    );
+
+    expect(await screen.findByLabelText('Close repair required')).toHaveTextContent(
+      'scope-1: tmux server · server:owned · ownership conflict — different server incarnation is live',
+    );
+  });
+
+  it.each([
+    'awaiting_blocker_resolution',
+    'awaiting_stop_work_confirmation',
+    'settling_active_work',
+    'cancel_requested_during_settlement',
+    'awaiting_retirement_inspection',
+  ])('offers attempt-bound cancellation in %s', async (phase) => {
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(closeSnapshot(phase) as never);
+
+    renderWithProviders(
+      <WorkControlBar conversationId={`conv-${phase}`} convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={prStatusHandle()} />,
+    );
+
+    const cancel = await screen.findByRole('button', { name: 'Keep work and cancel Close' });
+    fireEvent.click(cancel);
+    await waitFor(() => expect(api.cancelCloseBeforeRetirement).toHaveBeenCalledWith(
+      `conv-${phase}`,
+      'attempt-close',
+    ));
+  });
+});
+
 describe('WorkControlBar — visibility (REQ-WAB-001)', () => {
   it('is hidden in a non-Work/Branch mode (Direct)', () => {
     renderWithProviders(

@@ -17,7 +17,6 @@
 //! concurrent spawns from both observing `count == cap - 1` and racing past
 //! the cap.
 
-use phoenix_core::process_identity::process_identity_matches;
 use phoenix_core::work_scope::EffectiveResourceAccess;
 use std::collections::HashMap;
 use std::sync::{
@@ -879,35 +878,20 @@ impl BashHandleRegistry {
             }
             for target in &permit.exact_process_groups {
                 record_retirement_target_in_report(&mut report, target);
+            }
+            for handle in &permit.removed_handles {
+                let Some(pgid) = handle.live_pgid().await else {
+                    continue;
+                };
                 #[cfg(unix)]
                 {
-                    if target.pgid <= 0
-                        || target.pgid.cast_unsigned() != target.launch_identity.process.pid
-                    {
-                        report.kill_failures.push((
-                            target.pgid,
-                            "bash process group is not anchored by its leader".to_string(),
-                        ));
-                        continue;
-                    }
-                    if !process_identity_matches(target.launch_identity.process) {
-                        // A vanished group is an exact absence. A surviving group with an
-                        // unproven/reused leader is never safe to signal.
-                        let group_exists = unsafe { libc::kill(-target.pgid, 0) } == 0;
-                        if group_exists {
-                            report.kill_failures.push((
-                                target.pgid,
-                                "bash leader identity no longer proves the process group"
-                                    .to_string(),
-                            ));
+                    let rc = unsafe { libc::kill(-pgid, libc::SIGKILL) };
+                    if rc != 0 {
+                        let error = std::io::Error::last_os_error();
+                        if error.raw_os_error() != Some(libc::ESRCH) {
+                            report.kill_failures.push((pgid, error.to_string()));
                         }
-                        continue;
                     }
-                    report.kill_failures.push((
-                        target.pgid,
-                        "refusing non-atomic process-group signal; retirement remains residual"
-                            .to_string(),
-                    ));
                 }
             }
         }
@@ -2058,18 +2042,15 @@ mod tests {
             current_outcome,
             BashRetirementOutcome::Retired(_) | BashRetirementOutcome::AbsenceVerified(_)
         ));
-        assert!(
-            replacement_child
-                .try_wait()
-                .expect("try_wait replacement")
-                .is_none(),
-            "fail-closed current retirement must not issue a non-atomic group signal"
+        let replacement_status = replacement_child.wait().expect("wait replacement");
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&replacement_status),
+            Some(libc::SIGKILL),
+            "current permit must stop its exact removed handle"
         );
         unsafe {
-            let _ = libc::kill(replacement_pgid, libc::SIGKILL);
             let _ = libc::kill(stale_pgid, libc::SIGKILL);
         }
-        let _ = replacement_child.wait();
         let _ = stale_child.wait();
     }
 
