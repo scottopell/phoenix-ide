@@ -11,6 +11,8 @@ use super::{
 use crate::sqlite_telemetry::SqliteOperation;
 use crate::{admit_product_conversation_operation_tx, ProductConversationAdmission};
 use chrono::{DateTime, Utc};
+#[cfg(test)]
+use phoenix_core::domain::close::TranscriptConversationId;
 use phoenix_core::domain::{
     db_schema::{Message, MessageContent, UserContent},
     sm_state::ConvState,
@@ -5015,9 +5017,13 @@ mod tests {
             .await
             .unwrap()
             .product_conversation_id;
-        db.begin_close_foundation(&product_conversation_id, "wake-fence")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_conversation_id,
+            &TranscriptConversationId::parse("wake-fenced").unwrap(),
+            "wake-fence",
+        )
+        .await
+        .unwrap();
         let repo = WakeRepository::new(db.pool().clone());
         let mut input = intent();
         input.conversation_id = "wake-fenced".into();
@@ -6407,9 +6413,13 @@ mod tests {
             .await
             .unwrap()
             .product_conversation_id;
-        db.begin_close_foundation(&product_conversation_id, "wake-existing-fence")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_conversation_id,
+            &TranscriptConversationId::parse("conv-1").unwrap(),
+            "wake-existing-fence",
+        )
+        .await
+        .unwrap();
 
         assert!(matches!(
             repo.register(&input, "exact", Timestamp(10)).await.unwrap(),
@@ -6478,9 +6488,13 @@ mod tests {
             .await
             .unwrap()
             .product_conversation_id;
-        db.begin_close_foundation(&product_conversation_id, "wake-terminal-fence")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_conversation_id,
+            &TranscriptConversationId::parse("conv-1").unwrap(),
+            "wake-terminal-fence",
+        )
+        .await
+        .unwrap();
         sqlx::query("UPDATE workflows SET status = 'Completed' WHERE workflow_id = ?1")
             .bind(to_i64(workflow_id.0, "workflow_id").unwrap())
             .execute(db.pool())
@@ -6519,9 +6533,13 @@ mod tests {
                 .await
                 .unwrap()
                 .product_conversation_id;
-            db.begin_close_foundation(&product_conversation_id, "wake-registration-fence")
-                .await
-                .unwrap();
+            db.begin_close_foundation(
+                &product_conversation_id,
+                &TranscriptConversationId::parse("conv-1").unwrap(),
+                "wake-registration-fence",
+            )
+            .await
+            .unwrap();
             db.update_conversation_state("conv-1", &state)
                 .await
                 .unwrap();

@@ -15,6 +15,7 @@ use crate::db::Conversation;
 use crate::runtime::fork_resolve::ForkResolveError;
 use crate::state_machine::state::TaskApprovalOutcome;
 use crate::state_machine::{ConvState, Event};
+use phoenix_core::domain::close::TranscriptConversationId;
 
 use axum::{
     extract::{Path, State},
@@ -554,6 +555,8 @@ async fn run_legacy_close_compat(state: &AppState, id: &str, action: &str) -> Re
             "inactive_close_transcript",
         ))));
     }
+    let expected_latest_transcript = TranscriptConversationId::parse(id.to_string())
+        .map_err(|error| AppError::Internal(error.to_string()))?;
     let mut obligation = match state
         .db
         .get_active_close_obligation_for_product(&transcript.product_conversation_id)
@@ -566,7 +569,11 @@ async fn run_legacy_close_compat(state: &AppState, id: &str, action: &str) -> Re
                 .expect("UUID is a valid Close attempt id");
             state
                 .db
-                .begin_close_foundation(&transcript.product_conversation_id, attempt_id.as_str())
+                .begin_close_foundation(
+                    &transcript.product_conversation_id,
+                    &expected_latest_transcript,
+                    attempt_id.as_str(),
+                )
                 .await
                 .map_err(|error| {
                     AppError::Conflict(Box::new(ConflictErrorResponse::new(

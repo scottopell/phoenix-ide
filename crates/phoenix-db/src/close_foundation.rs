@@ -10,6 +10,7 @@ use phoenix_core::domain::close::{
     OpaqueIdentity, ProductConversationId, RetiredResourceIdentity, RetiredResourceKind,
     RetirementFailureReason, RetirementOutcome, TranscriptConversationId, WorktreeIdentity,
 };
+use phoenix_core::domain::db_schema::MessageContent;
 use phoenix_core::work_scope::{RuntimeRole, WorkScopeId};
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Connection, Row, Sqlite, Transaction};
@@ -987,6 +988,7 @@ impl Database {
     pub async fn begin_close_foundation(
         &self,
         product_conversation_id: &ProductConversationId,
+        expected_latest_transcript_id: &TranscriptConversationId,
         attempt_id: &str,
     ) -> DbResult<CloseObligation> {
         let mut conn = self.pool.acquire().await?;
@@ -1032,6 +1034,21 @@ impl Database {
                     "attempt {attempt_id} does not capture exactly one latest transcript"
                 )));
             }
+            let topology = read_topology_tx(&mut tx, product_conversation_id)
+                .await?
+                .ok_or_else(|| {
+                    DbError::CloseFoundationNotFound(product_conversation_id.to_string())
+                })?;
+            validate_begin_preconditions(&topology, expected_latest_transcript_id.as_str())?;
+            let captured_latest = parse_transcript_conversation_id(
+                captured_members[0].try_get("conversation_id")?,
+                "close_attempt_members.conversation_id",
+            )?;
+            if captured_latest != *expected_latest_transcript_id {
+                return Err(DbError::CloseFoundationConflict(format!(
+                    "attempt {attempt_id} captures latest transcript {captured_latest}, not {expected_latest_transcript_id}"
+                )));
+            }
 
             tx.commit().await?;
             return Ok(obligation);
@@ -1040,7 +1057,7 @@ impl Database {
         let topology = read_topology_tx(&mut tx, product_conversation_id)
             .await?
             .ok_or_else(|| DbError::CloseFoundationNotFound(product_conversation_id.to_string()))?;
-        validate_begin_preconditions(&topology, &topology.latest.id)?;
+        validate_begin_preconditions(&topology, expected_latest_transcript_id.as_str())?;
 
         if let Some(row) = sqlx::query(
             "SELECT attempt_id, product_conversation_id, phase, inspection_generation,
@@ -1250,7 +1267,7 @@ impl Database {
         &self,
         attempt_id: &str,
     ) -> DbResult<CloseObligation> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let obligation = close_obligation_for_update(&mut tx, attempt_id).await?;
         if obligation.phase() != ClosePhase::AwaitingLossConfirmation {
             return Err(close_precondition(format!(
@@ -1262,7 +1279,8 @@ impl Database {
         sqlx::query(
             "UPDATE close_obligations
              SET phase = 'completed', completed_at = ?2, updated_at = ?2,
-                 close_outcome = 'cancelled'
+                 close_outcome = 'cancelled',
+                 inspection_generation = NULL, inspection_fingerprint = NULL
              WHERE attempt_id = ?1 AND phase = 'awaiting_loss_confirmation'",
         )
         .bind(attempt_id)
@@ -2919,7 +2937,7 @@ impl Database {
         &self,
         attempt_id: &CloseAttemptId,
     ) -> DbResult<CloseObligation> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let obligation = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
         if obligation.phase() != ClosePhase::RetirementRequested {
             return Err(close_precondition(format!(
@@ -2927,6 +2945,37 @@ impl Database {
             )));
         }
         let now = Utc::now().to_rfc3339();
+        let aggregate_transcript_id: String = sqlx::query_scalar(
+            "SELECT conversation_id
+             FROM close_attempt_members
+             WHERE attempt_id = ?1 AND member_role IN ('latest', 'root_latest')",
+        )
+        .bind(attempt_id.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+        let persisted_sequence_max: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(sequence_id), 0) FROM messages WHERE conversation_id = ?1",
+        )
+        .bind(&aggregate_transcript_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let outcome_content = MessageContent::system(format!(
+            "Close attempt {attempt_id} completed; this conversation is now archived in History."
+        ));
+        let outcome_content_json = serde_json::to_string(&outcome_content.to_stored_json())
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        sqlx::query(
+            "INSERT INTO messages (
+                 message_id, conversation_id, sequence_id, message_type, content, created_at
+             ) VALUES (?1, ?2, ?3, 'system', ?4, ?5)",
+        )
+        .bind(format!("close-outcome:{attempt_id}"))
+        .bind(&aggregate_transcript_id)
+        .bind(persisted_sequence_max + 1)
+        .bind(outcome_content_json)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query(
             "UPDATE conversations
              SET archived = 1, updated_at = ?2
@@ -2940,12 +2989,11 @@ impl Database {
         .await?;
         sqlx::query(
             "UPDATE product_conversations
-             SET ordinary_lifecycle = 'history', updated_at = ?2
+             SET ordinary_lifecycle = 'history'
              WHERE id = (SELECT product_conversation_id FROM close_obligations WHERE attempt_id = ?1)
                AND kind = 'ordinary'",
         )
         .bind(attempt_id.as_str())
-        .bind(&now)
         .execute(&mut *tx)
         .await?;
         let completed = sqlx::query(
@@ -3215,6 +3263,10 @@ mod tests {
 
     fn product_id(id: &str) -> ProductConversationId {
         ProductConversationId::parse(id.to_string()).unwrap()
+    }
+
+    fn transcript_id(id: &str) -> TranscriptConversationId {
+        TranscriptConversationId::parse(id.to_string()).unwrap()
     }
 
     async fn create_root(db: &Database, id: &str) {
@@ -3892,7 +3944,11 @@ mod tests {
         let contender_db = db.clone();
         let contender = tokio::spawn(async move {
             contender_db
-                .begin_close_foundation(&product_id("race-root"), "loser")
+                .begin_close_foundation(
+                    &product_id("race-root"),
+                    &transcript_id("race-root"),
+                    "loser",
+                )
                 .await
         });
         tokio::task::yield_now().await;
@@ -3922,7 +3978,11 @@ mod tests {
         );
 
         let obligation = db
-            .begin_close_foundation(&conversation.product_conversation_id, "fresh-attempt")
+            .begin_close_foundation(
+                &conversation.product_conversation_id,
+                &transcript_id(&conversation.id),
+                "fresh-attempt",
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -3944,9 +4004,13 @@ mod tests {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "latest", "root").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-settlement")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("latest"),
+            "attempt-settlement",
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             db.confirm_close_stop_work("attempt-settlement")
@@ -4014,9 +4078,13 @@ mod tests {
             .await
             .unwrap();
         }
-        db.begin_close_foundation(&product_id("root"), "attempt-exact-receipt")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("latest"),
+            "attempt-exact-receipt",
+        )
+        .await
+        .unwrap();
         db.confirm_close_stop_work("attempt-exact-receipt")
             .await
             .unwrap();
@@ -4059,9 +4127,13 @@ mod tests {
     async fn active_work_settlement_requires_stop_work_confirmation() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-confirm")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-confirm",
+        )
+        .await
+        .unwrap();
 
         assert!(matches!(
             db.begin_close_active_work_settlement("attempt-confirm")
@@ -4112,9 +4184,13 @@ mod tests {
         .execute(db.pool())
         .await
         .unwrap();
-        db.begin_close_foundation(&product_conversation_id, "attempt-participant")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_conversation_id,
+            &transcript_id("participant"),
+            "attempt-participant",
+        )
+        .await
+        .unwrap();
         assert_eq!(
             db.list_close_settlement_conversation_ids("attempt-participant")
                 .await
@@ -4162,9 +4238,13 @@ mod tests {
         .execute(db.pool())
         .await
         .unwrap();
-        db.begin_close_foundation(&product_id("root"), "attempt-busy")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("latest"),
+            "attempt-busy",
+        )
+        .await
+        .unwrap();
         db.confirm_close_stop_work("attempt-busy").await.unwrap();
         db.begin_close_active_work_settlement("attempt-busy")
             .await
@@ -4220,9 +4300,13 @@ mod tests {
         .execute(db.pool())
         .await
         .unwrap();
-        db.begin_close_foundation(&product_id("root"), "attempt-creation")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-creation",
+        )
+        .await
+        .unwrap();
         db.confirm_close_stop_work("attempt-creation")
             .await
             .unwrap();
@@ -4257,9 +4341,13 @@ mod tests {
     async fn cancelled_active_work_settlement_completes_after_members_quiesce() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-cancel-settlement")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-cancel-settlement",
+        )
+        .await
+        .unwrap();
         db.confirm_close_stop_work("attempt-cancel-settlement")
             .await
             .unwrap();
@@ -4317,9 +4405,13 @@ mod tests {
         .execute(db.pool())
         .await
         .unwrap();
-        db.begin_close_foundation(&product_id("root"), "attempt-cancel-busy")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-cancel-busy",
+        )
+        .await
+        .unwrap();
         db.confirm_close_stop_work("attempt-cancel-busy")
             .await
             .unwrap();
@@ -4417,9 +4509,13 @@ mod tests {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "latest", "root").await;
-        db.begin_close_foundation(&product_id("root"), "admission-fence")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("latest"),
+            "admission-fence",
+        )
+        .await
+        .unwrap();
 
         for conversation_id in ["root", "latest"] {
             assert!(matches!(
@@ -4454,6 +4550,7 @@ mod tests {
         let scope = allocate_scope_worktree(&db, &conversation.id).await;
         db.begin_close_foundation(
             &conversation.product_conversation_id,
+            &transcript_id(&conversation.id),
             "fresh-retirement-attempt",
         )
         .await
@@ -4496,7 +4593,7 @@ mod tests {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         create_root(&db, "other").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-owned")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("root"), "attempt-owned")
             .await
             .unwrap();
 
@@ -4541,7 +4638,7 @@ mod tests {
         assert_eq!(topology.members[2].role, CloseMemberRole::Latest);
 
         let obligation = db
-            .begin_close_foundation(&product_id("root"), "attempt-1")
+            .begin_close_foundation(&product_id("root"), &transcript_id("leaf"), "attempt-1")
             .await
             .unwrap();
         assert_eq!(obligation.attempt_id().as_str(), "attempt-1");
@@ -4716,7 +4813,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(topology.member_ids(), vec!["a|b", "b"]);
-        db.begin_close_foundation(&product_id("a|b"), "attempt-delimiter")
+        db.begin_close_foundation(&product_id("a|b"), &transcript_id("b"), "attempt-delimiter")
             .await
             .unwrap();
         assert_eq!(
@@ -4740,7 +4837,7 @@ mod tests {
         assert_eq!(topology.member_ids(), vec!["root"]);
         assert_eq!(topology.members[0].role, CloseMemberRole::RootLatest);
 
-        db.begin_close_foundation(&product_id("root"), "attempt-1")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("root"), "attempt-1")
             .await
             .unwrap();
         let members = db.list_close_attempt_members("attempt-1").await.unwrap();
@@ -4754,9 +4851,13 @@ mod tests {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         allocate_scope_worktree(&db, "root").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-inspection-repair")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-inspection-repair",
+        )
+        .await
+        .unwrap();
         set_close_phase(
             &db,
             "attempt-inspection-repair",
@@ -4793,9 +4894,13 @@ mod tests {
         .await
         .unwrap();
 
-        db.begin_close_foundation(&product_id("root"), "attempt-unresolved")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-unresolved",
+        )
+        .await
+        .unwrap();
         let scopes = db
             .list_close_attempt_scopes("attempt-unresolved")
             .await
@@ -4897,7 +5002,7 @@ mod tests {
         create_child(&db, "leaf", "root").await;
 
         let obligation = db
-            .begin_close_foundation(&product_id("root"), "attempt-1")
+            .begin_close_foundation(&product_id("root"), &transcript_id("leaf"), "attempt-1")
             .await
             .unwrap();
         assert_eq!(obligation.product_conversation_id(), &product_id("root"));
@@ -4915,7 +5020,7 @@ mod tests {
         set_state(&db, "root", approval_state()).await;
 
         let err = db
-            .begin_close_foundation(&product_id("root"), "attempt-1")
+            .begin_close_foundation(&product_id("root"), &transcript_id("leaf"), "attempt-1")
             .await
             .unwrap_err();
         assert!(matches!(err, DbError::CloseFoundationPrecondition(_)));
@@ -4998,7 +5103,11 @@ mod tests {
             create_root(&db, id).await;
             set_state(&db, id, state).await;
             let obligation = db
-                .begin_close_foundation(&product_id(id), &format!("attempt-{id}"))
+                .begin_close_foundation(
+                    &product_id(id),
+                    &transcript_id(id),
+                    &format!("attempt-{id}"),
+                )
                 .await
                 .unwrap();
             assert_eq!(obligation.product_conversation_id().as_str(), id);
@@ -5025,7 +5134,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            db.begin_close_foundation(&product_id("root"), "attempt-1")
+            db.begin_close_foundation(&product_id("root"), &transcript_id("leaf"), "attempt-1")
                 .await
                 .unwrap_err(),
             DbError::CloseFoundationPrecondition(_)
@@ -5041,7 +5150,7 @@ mod tests {
         set_state(&db, "mid", awaiting_continuation_state()).await;
 
         let err = db
-            .begin_close_foundation(&product_id("root"), "attempt-1")
+            .begin_close_foundation(&product_id("root"), &transcript_id("leaf"), "attempt-1")
             .await
             .unwrap_err();
         assert!(matches!(err, DbError::CloseFoundationPrecondition(_)));
@@ -5079,7 +5188,11 @@ mod tests {
             create_root(&db, id).await;
             set_state(&db, id, state).await;
             let obligation = db
-                .begin_close_foundation(&product_id(id), &format!("attempt-{id}"))
+                .begin_close_foundation(
+                    &product_id(id),
+                    &transcript_id(id),
+                    &format!("attempt-{id}"),
+                )
                 .await
                 .unwrap();
             assert_eq!(obligation.product_conversation_id().as_str(), id);
@@ -5099,20 +5212,55 @@ mod tests {
         create_root(&db, "approval").await;
         set_state(&db, "approval", approval_state()).await;
         assert!(matches!(
-            db.begin_close_foundation(&product_id("approval"), "attempt-approval")
-                .await
-                .unwrap_err(),
+            db.begin_close_foundation(
+                &product_id("approval"),
+                &transcript_id("approval"),
+                "attempt-approval"
+            )
+            .await
+            .unwrap_err(),
             DbError::CloseFoundationPrecondition(_)
         ));
 
         create_root(&db, "awaiting").await;
         set_state(&db, "awaiting", awaiting_continuation_state()).await;
         assert!(matches!(
-            db.begin_close_foundation(&product_id("awaiting"), "attempt-awaiting")
-                .await
-                .unwrap_err(),
+            db.begin_close_foundation(
+                &product_id("awaiting"),
+                &transcript_id("awaiting"),
+                "attempt-awaiting"
+            )
+            .await
+            .unwrap_err(),
             DbError::CloseFoundationPrecondition(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn stale_latest_token_is_rejected_atomically_under_begin_immediate() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        create_child(&db, "latest", "root").await;
+
+        let stale = db
+            .begin_close_foundation(&product_id("root"), &transcript_id("root"), "attempt-stale")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            stale,
+            DbError::CloseFoundationPrecondition(message)
+                if message.contains("addressed conversation root is not latest latest")
+        ));
+
+        let obligation = db
+            .begin_close_foundation(
+                &product_id("root"),
+                &transcript_id("latest"),
+                "attempt-fresh",
+            )
+            .await
+            .unwrap();
+        assert_eq!(obligation.attempt_id().as_str(), "attempt-fresh");
     }
 
     #[tokio::test]
@@ -5122,14 +5270,14 @@ mod tests {
         create_child(&db, "latest", "root").await;
 
         let first = db
-            .begin_close_foundation(&product_id("root"), "attempt-1")
+            .begin_close_foundation(&product_id("root"), &transcript_id("latest"), "attempt-1")
             .await
             .unwrap();
 
         set_state(&db, "latest", ConvState::LlmRequesting { attempt: 2 }).await;
 
         let second = db
-            .begin_close_foundation(&product_id("root"), "attempt-1")
+            .begin_close_foundation(&product_id("root"), &transcript_id("latest"), "attempt-1")
             .await
             .unwrap();
         assert_eq!(first, second);
@@ -5181,13 +5329,13 @@ mod tests {
                 .is_err()
         );
         let third = db
-            .begin_close_foundation(&product_id("root"), "attempt-1")
+            .begin_close_foundation(&product_id("root"), &transcript_id("latest"), "attempt-1")
             .await
             .unwrap();
         assert_eq!(first, third);
 
         let err = db
-            .begin_close_foundation(&product_id("root"), "attempt-2")
+            .begin_close_foundation(&product_id("root"), &transcript_id("latest"), "attempt-2")
             .await
             .unwrap_err();
         assert!(matches!(err, DbError::CloseFoundationConflict(_)));
@@ -5226,7 +5374,11 @@ mod tests {
         .unwrap();
 
         let error = db
-            .begin_close_foundation(&product_id("root"), "attempt-partial")
+            .begin_close_foundation(
+                &product_id("root"),
+                &transcript_id("latest"),
+                "attempt-partial",
+            )
             .await
             .unwrap_err();
         assert!(matches!(
@@ -5262,7 +5414,7 @@ mod tests {
             .unwrap();
 
         let error = db
-            .begin_close_foundation(&product_id("root"), "attempt-nul")
+            .begin_close_foundation(&product_id("root"), &transcript_id("root"), "attempt-nul")
             .await
             .unwrap_err();
         assert!(matches!(
@@ -5310,7 +5462,7 @@ mod tests {
             .await
             .unwrap();
 
-        db.begin_close_foundation(&product_id("root"), "attempt-1")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("leaf"), "attempt-1")
             .await
             .unwrap();
         let members = db.list_close_attempt_members("attempt-1").await.unwrap();
@@ -5329,7 +5481,7 @@ mod tests {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "leaf", "root").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-1")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("leaf"), "attempt-1")
             .await
             .unwrap();
 
@@ -5360,7 +5512,11 @@ mod tests {
         create_child(&db, "latest", "root").await;
         set_archived(&db, "latest", true).await;
         let error = db
-            .begin_close_foundation(&product_id("root"), "attempt-archived-member")
+            .begin_close_foundation(
+                &product_id("root"),
+                &transcript_id("latest"),
+                "attempt-archived-member",
+            )
             .await
             .unwrap_err();
         assert!(matches!(error, DbError::CloseFoundationPrecondition(_)));
@@ -5372,9 +5528,13 @@ mod tests {
         create_root(&db, "archived").await;
         set_archived(&db, "archived", true).await;
         assert!(matches!(
-            db.begin_close_foundation(&product_id("archived"), "attempt-a")
-                .await
-                .unwrap_err(),
+            db.begin_close_foundation(
+                &product_id("archived"),
+                &transcript_id("archived"),
+                "attempt-a"
+            )
+            .await
+            .unwrap_err(),
             DbError::CloseFoundationPrecondition(_)
         ));
 
@@ -5400,7 +5560,11 @@ mod tests {
         .await
         .unwrap();
         assert!(db
-            .begin_close_foundation(&parent.product_conversation_id, "attempt-b")
+            .begin_close_foundation(
+                &parent.product_conversation_id,
+                &transcript_id(&parent.id),
+                "attempt-b"
+            )
             .await
             .is_ok());
         let member_ids: Vec<String> = db
@@ -5415,9 +5579,13 @@ mod tests {
         create_root(&db, "not-user-init").await;
         set_user_initiated(&db, "not-user-init", false).await;
         assert!(matches!(
-            db.begin_close_foundation(&product_id("not-user-init"), "attempt-c")
-                .await
-                .unwrap_err(),
+            db.begin_close_foundation(
+                &product_id("not-user-init"),
+                &transcript_id("not-user-init"),
+                "attempt-c"
+            )
+            .await
+            .unwrap_err(),
             DbError::CloseFoundationPrecondition(_)
         ));
     }
@@ -5478,7 +5646,7 @@ mod tests {
         create_root(&db, "root").await;
         create_child(&db, "leaf", "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-1")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("leaf"), "attempt-1")
             .await
             .unwrap();
         set_close_phase(&db, "attempt-1", ClosePhase::AwaitingRetirementInspection).await;
@@ -5537,9 +5705,13 @@ mod tests {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-concurrent-inspection")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-concurrent-inspection",
+        )
+        .await
+        .unwrap();
         set_close_phase(
             &db,
             "attempt-concurrent-inspection",
@@ -5583,7 +5755,7 @@ mod tests {
             .unwrap()
             .attached_work_scope_id
             .unwrap();
-        db.begin_close_foundation(&product_id("root"), "attempt-1")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("leaf"), "attempt-1")
             .await
             .unwrap();
         set_close_phase(&db, "attempt-1", ClosePhase::AwaitingRetirementInspection).await;
@@ -5609,14 +5781,19 @@ mod tests {
         assert!(err.to_string().contains("CHECK constraint failed"));
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn inspection_reentry_invalidates_prior_snapshot_and_rows() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-reentry")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-reentry",
+        )
+        .await
+        .unwrap();
         set_close_phase(
             &db,
             "attempt-reentry",
@@ -5722,9 +5899,13 @@ mod tests {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-changed-confirmation")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-changed-confirmation",
+        )
+        .await
+        .unwrap();
         set_close_phase(
             &db,
             "attempt-changed-confirmation",
@@ -5804,7 +5985,7 @@ mod tests {
         create_root(&db, "root").await;
         create_child(&db, "leaf", "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-clean")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("leaf"), "attempt-clean")
             .await
             .unwrap();
         set_close_phase(
@@ -5839,7 +6020,7 @@ mod tests {
     async fn replace_close_inspection_no_scopes_skip_loss_confirmation() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-empty")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("root"), "attempt-empty")
             .await
             .unwrap();
         set_close_phase(
@@ -5906,7 +6087,7 @@ mod tests {
             .unwrap();
         assert_eq!(leaf_scope, none_scope);
 
-        db.begin_close_foundation(&product_id("root"), "attempt-1")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("leaf"), "attempt-1")
             .await
             .unwrap();
         let captured = db.list_close_attempt_scopes("attempt-1").await.unwrap();
@@ -5966,7 +6147,7 @@ mod tests {
             .await
             .unwrap();
 
-        db.begin_close_foundation(&product_id("root"), "attempt-1")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("leaf"), "attempt-1")
             .await
             .unwrap();
         set_close_phase(&db, "attempt-1", ClosePhase::AwaitingRetirementInspection).await;
@@ -6104,7 +6285,7 @@ mod tests {
             .await
             .unwrap();
 
-        db.begin_close_foundation(&product_id("root"), "attempt-1")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("leaf"), "attempt-1")
             .await
             .unwrap();
         set_close_phase(&db, "attempt-1", ClosePhase::AwaitingRetirementInspection).await;
@@ -6145,7 +6326,7 @@ mod tests {
     async fn replace_close_inspection_rejects_untargeted_scope() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-1")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("root"), "attempt-1")
             .await
             .unwrap();
         set_close_phase(&db, "attempt-1", ClosePhase::AwaitingRetirementInspection).await;
@@ -6202,9 +6383,13 @@ mod tests {
             .to_string()
             .contains("different ordinary product conversation"));
         set_state(&db, "other-root", ConvState::Terminal).await;
-        db.begin_close_foundation(&product_id("root"), "attempt-terminal-owner")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-terminal-owner",
+        )
+        .await
+        .unwrap();
         set_close_phase(
             &db,
             "attempt-terminal-owner",
@@ -6245,9 +6430,13 @@ mod tests {
             .unwrap();
         create_root(&db, "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-concurrent-inventory")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-concurrent-inventory",
+        )
+        .await
+        .unwrap();
         set_close_phase(
             &db,
             "attempt-concurrent-inventory",
@@ -6283,7 +6472,7 @@ mod tests {
     async fn zero_scope_inventory_requires_exact_authorized_snapshot() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-zero")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("root"), "attempt-zero")
             .await
             .unwrap();
         let request = CaptureCloseRetirementInventoryRequest {
@@ -6313,7 +6502,7 @@ mod tests {
             .unwrap()
             .attached_work_scope_id
             .unwrap();
-        db.begin_close_foundation(&product_id("root"), "attempt-1")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("root"), "attempt-1")
             .await
             .unwrap();
         set_close_phase(&db, "attempt-1", ClosePhase::RetirementRequested).await;
@@ -6417,7 +6606,7 @@ mod tests {
             .unwrap()
             .attached_work_scope_id
             .unwrap();
-        db2.begin_close_foundation(&product_id("root-2"), "attempt-2")
+        db2.begin_close_foundation(&product_id("root-2"), &transcript_id("root-2"), "attempt-2")
             .await
             .unwrap();
         set_close_phase(&db2, "attempt-2", ClosePhase::RetirementRequested).await;
@@ -6467,9 +6656,13 @@ mod tests {
             .unwrap()
             .attached_work_scope_id
             .unwrap();
-        db.begin_close_foundation(&product_id("root"), "attempt-partial")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-partial",
+        )
+        .await
+        .unwrap();
         set_close_phase(&db, "attempt-partial", ClosePhase::RetirementRequested).await;
         let snapshot = current_test_snapshot(&db, "attempt-partial").await;
         sqlx::query(
@@ -6538,9 +6731,13 @@ mod tests {
             .unwrap()
             .attached_work_scope_id
             .unwrap();
-        db.begin_close_foundation(&product_id("root"), "attempt-incomplete")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-incomplete",
+        )
+        .await
+        .unwrap();
         set_close_phase(&db, "attempt-incomplete", ClosePhase::RetirementRequested).await;
         let snapshot = current_test_snapshot(&db, "attempt-incomplete").await;
         sqlx::query(
@@ -6606,9 +6803,13 @@ mod tests {
         assert!(conflict
             .to_string()
             .contains("different ordinary product conversation"));
-        db.begin_close_foundation(&product_id("root"), "attempt-shared")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-shared",
+        )
+        .await
+        .unwrap();
         set_close_phase(&db, "attempt-shared", ClosePhase::RetirementRequested).await;
 
         let result = db
@@ -6636,9 +6837,13 @@ mod tests {
     async fn cancelled_completion_round_trips_typed_outcome() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-cancelled")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-cancelled",
+        )
+        .await
+        .unwrap();
         sqlx::query(
             "UPDATE close_obligations
              SET phase = 'completed', completed_at = ?2, close_outcome = 'cancelled'
@@ -6658,6 +6863,85 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn retirement_completion_persists_outcome_before_history_transition() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let scope = allocate_scope_worktree(&db, "root").await;
+        create_child(&db, "latest", "root").await;
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("latest"),
+            "attempt-complete",
+        )
+        .await
+        .unwrap();
+        set_close_phase(
+            &db,
+            "attempt-complete",
+            ClosePhase::AwaitingRetirementInspection,
+        )
+        .await;
+        db.replace_close_inspection(ReplaceCloseInspectionRequest {
+            attempt_id: CloseAttemptId::parse("attempt-complete").unwrap(),
+            scopes: vec![ReplaceCloseInspectionScopeRequest {
+                scope: scope.clone(),
+                snapshot: CloseRetirementSnapshot::parse("complete-gen", "complete-fp").unwrap(),
+                losses: Vec::new(),
+            }],
+        })
+        .await
+        .unwrap();
+        let snapshot = current_test_snapshot(&db, "attempt-complete").await;
+        capture_test_inventory(&db, "attempt-complete", &scope, &snapshot, Vec::new()).await;
+        for expected in db
+            .list_close_expected_retirement_resources("attempt-complete")
+            .await
+            .unwrap()
+        {
+            db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
+                attempt_id: CloseAttemptId::parse("attempt-complete").unwrap(),
+                snapshot: snapshot.clone(),
+                scope: expected.scope,
+                resource: expected.resource,
+                outcome: RetirementOutcome::Retired,
+                detail: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        let completed = db
+            .complete_close_retirement(&CloseAttemptId::parse("attempt-complete").unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(completed.phase(), ClosePhase::Completed);
+        assert_eq!(
+            completed.close_outcome(),
+            Some(CloseCompletionOutcome::Archived)
+        );
+        let lifecycle: String = sqlx::query_scalar(
+            "SELECT ordinary_lifecycle FROM product_conversations WHERE id = ?1",
+        )
+        .bind("root")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(lifecycle, "history");
+        let outcome: (String, String, String) = sqlx::query_as(
+            "SELECT message_id, message_type, content
+             FROM messages WHERE conversation_id = ?1",
+        )
+        .bind("latest")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(outcome.0, "close-outcome:attempt-complete");
+        assert_eq!(outcome.1, "system");
+        assert!(outcome.2.contains("attempt-complete"));
+    }
+
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn retirement_evidence_round_trips_and_rejects_divergent_replay() {
@@ -6672,7 +6956,7 @@ mod tests {
             .unwrap()
             .attached_work_scope_id
             .unwrap();
-        db.begin_close_foundation(&product_id("root"), "attempt-1")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("leaf"), "attempt-1")
             .await
             .unwrap();
         set_close_phase(&db, "attempt-1", ClosePhase::RetirementRequested).await;
@@ -6868,7 +7152,7 @@ mod tests {
             .unwrap()
             .attached_work_scope_id
             .unwrap();
-        db.begin_close_foundation(&product_id("root"), "attempt-1")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("root"), "attempt-1")
             .await
             .unwrap();
         set_close_phase(&db, "attempt-1", ClosePhase::RetirementRequested).await;
@@ -6951,9 +7235,13 @@ mod tests {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-concurrent-evidence")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-concurrent-evidence",
+        )
+        .await
+        .unwrap();
         set_close_phase(
             &db,
             "attempt-concurrent-evidence",
@@ -7011,7 +7299,7 @@ mod tests {
             .unwrap()
             .attached_work_scope_id
             .unwrap();
-        db.begin_close_foundation(&product_id("root"), "attempt-1")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("leaf"), "attempt-1")
             .await
             .unwrap();
 
@@ -7075,7 +7363,7 @@ mod tests {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-1")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("root"), "attempt-1")
             .await
             .unwrap();
         set_close_phase(&db, "attempt-1", ClosePhase::RetirementRequested).await;
@@ -7155,7 +7443,7 @@ mod tests {
             .execute(db.pool())
             .await
             .unwrap();
-        db.begin_close_foundation(&product_id("root"), "attempt-1")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("leaf"), "attempt-1")
             .await
             .unwrap();
         set_close_phase(&db, "attempt-1", ClosePhase::AwaitingRetirementInspection).await;
@@ -7245,13 +7533,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancel_close_before_retirement_clears_snapshot_and_completes() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let scope = allocate_scope_worktree(&db, "root").await;
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-cancel-before-retirement",
+        )
+        .await
+        .unwrap();
+        set_close_phase(
+            &db,
+            "attempt-cancel-before-retirement",
+            ClosePhase::AwaitingRetirementInspection,
+        )
+        .await;
+        db.replace_close_inspection(ReplaceCloseInspectionRequest {
+            attempt_id: CloseAttemptId::parse("attempt-cancel-before-retirement").unwrap(),
+            scopes: vec![ReplaceCloseInspectionScopeRequest {
+                scope,
+                snapshot: CloseRetirementSnapshot::parse("scope-gen", "scope-fp").unwrap(),
+                losses: vec![CloseLossItem::UntrackedNonIgnoredPath(
+                    GitPathIdentity::from_bytes(b"dirty.txt".to_vec()),
+                )],
+            }],
+        })
+        .await
+        .unwrap();
+        let awaiting = db
+            .get_close_obligation("attempt-cancel-before-retirement")
+            .await
+            .unwrap();
+        assert_eq!(awaiting.phase(), ClosePhase::AwaitingLossConfirmation);
+        assert!(awaiting.snapshot().is_some());
+
+        let cancelled = db
+            .cancel_close_before_retirement("attempt-cancel-before-retirement")
+            .await
+            .unwrap();
+        assert_eq!(cancelled.phase(), ClosePhase::Completed);
+        assert_eq!(
+            cancelled.close_outcome(),
+            Some(CloseCompletionOutcome::Cancelled)
+        );
+        assert!(cancelled.snapshot().is_none());
+
+        let stored = db
+            .get_close_obligation("attempt-cancel-before-retirement")
+            .await
+            .unwrap();
+        assert_eq!(stored.phase(), ClosePhase::Completed);
+        assert_eq!(
+            stored.close_outcome(),
+            Some(CloseCompletionOutcome::Cancelled)
+        );
+        assert!(stored.snapshot().is_none());
+        let snapshot_columns: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT inspection_generation, inspection_fingerprint
+             FROM close_obligations WHERE attempt_id = ?1",
+        )
+        .bind("attempt-cancel-before-retirement")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(snapshot_columns, (None, None));
+    }
+
+    #[tokio::test]
     async fn loss_confirmation_requires_the_exact_persisted_snapshot() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-confirm-loss")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-confirm-loss",
+        )
+        .await
+        .unwrap();
         set_close_phase(
             &db,
             "attempt-confirm-loss",
@@ -7302,7 +7663,7 @@ mod tests {
         create_root(&db, "root").await;
         create_child(&db, "leaf", "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-lossy")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("leaf"), "attempt-lossy")
             .await
             .unwrap();
         set_close_phase(
@@ -7353,9 +7714,13 @@ mod tests {
         create_root(&db, "root").await;
         create_child(&db, "leaf", "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-clean-branch")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("leaf"),
+            "attempt-clean-branch",
+        )
+        .await
+        .unwrap();
         set_close_phase(
             &db,
             "attempt-clean-branch",
@@ -7522,7 +7887,7 @@ mod tests {
     async fn retirement_evidence_rejects_untargeted_scope() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-1")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("root"), "attempt-1")
             .await
             .unwrap();
         let other_scope = WorkScopeId::parse("close-scope-other").unwrap();

@@ -3,6 +3,8 @@ use axum::{
     Json,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+#[cfg(test)]
+use phoenix_core::domain::close::TranscriptConversationId;
 use phoenix_core::domain::product_conversation::OrdinaryProductConversationLifecycle;
 use serde::{Deserialize, Serialize};
 
@@ -751,7 +753,11 @@ mod tests {
 
         state
             .db
-            .begin_close_foundation(&root.product_conversation_id, "snapshot-close")
+            .begin_close_foundation(
+                &root.product_conversation_id,
+                &TranscriptConversationId::parse(successor.id.clone()).unwrap(),
+                "snapshot-close",
+            )
             .await
             .unwrap();
 

@@ -18,6 +18,8 @@ pub mod workflow;
 // cycle. Alias the module back as `schema` so the persistence logic in this
 // file and `phoenix_db::*` call sites resolve unchanged.
 use phoenix_core::domain::close::CloseAttemptId;
+#[cfg(test)]
+use phoenix_core::domain::close::TranscriptConversationId;
 use phoenix_core::domain::creation_protocol::{
     CreationClaim, CreationClaimToken, CreationError, CreationKind, CreationProtocolState,
     CreationStage, CreationStatus, CreationWorkerId,
@@ -17432,7 +17434,11 @@ mod tests {
         let close_writer = close_db.clone();
         let close = tokio::spawn(async move {
             close_writer
-                .begin_close_foundation(&product_conversation_id, "close-vs-steering")
+                .begin_close_foundation(
+                    &product_conversation_id,
+                    &TranscriptConversationId::parse("close-steering").unwrap(),
+                    "close-vs-steering",
+                )
                 .await
         });
         transaction_entered.await;
@@ -23050,9 +23056,13 @@ mod tests {
             retirement_fixture(&db, "close-owner", RuntimeRole::User, &ConvState::Idle).await;
         let owner = db.get_conversation("close-owner").await.unwrap();
         let attempt = CloseAttemptId::parse("close-owner-attempt").unwrap();
-        db.begin_close_foundation(&owner.product_conversation_id, attempt.as_str())
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &owner.product_conversation_id,
+            &TranscriptConversationId::parse(owner.id.clone()).unwrap(),
+            attempt.as_str(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             db.retire_work_scope_for_close_attempt(
@@ -23081,9 +23091,13 @@ mod tests {
             .await
             .unwrap();
         let attempt = CloseAttemptId::parse("captured-owner-attempt").unwrap();
-        db.begin_close_foundation(&owner.product_conversation_id, attempt.as_str())
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &owner.product_conversation_id,
+            &TranscriptConversationId::parse(owner.id.clone()).unwrap(),
+            attempt.as_str(),
+        )
+        .await
+        .unwrap();
         db.create_conversation_with_project(
             "uncaptured-active-child",
             "uncaptured-active-child",
@@ -23120,9 +23134,13 @@ mod tests {
             retirement_fixture(&db, "completed-owner", RuntimeRole::User, &ConvState::Idle).await;
         let owner = db.get_conversation("completed-owner").await.unwrap();
         let attempt = CloseAttemptId::parse("completed-attempt").unwrap();
-        db.begin_close_foundation(&owner.product_conversation_id, attempt.as_str())
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &owner.product_conversation_id,
+            &TranscriptConversationId::parse(owner.id.clone()).unwrap(),
+            attempt.as_str(),
+        )
+        .await
+        .unwrap();
         for phase in [
             "awaiting_stop_work_confirmation",
             "settling_active_work",
@@ -23176,9 +23194,13 @@ mod tests {
         .await;
         let owner = db.get_conversation("captured-scope-owner").await.unwrap();
         let attempt = CloseAttemptId::parse("single-scope-attempt").unwrap();
-        db.begin_close_foundation(&owner.product_conversation_id, attempt.as_str())
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &owner.product_conversation_id,
+            &TranscriptConversationId::parse(owner.id.clone()).unwrap(),
+            attempt.as_str(),
+        )
+        .await
+        .unwrap();
         assert_ne!(captured_scope, uncaptured_scope);
 
         let error = db

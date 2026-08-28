@@ -2,6 +2,8 @@ use super::WorkflowRepository;
 use crate::sqlite_telemetry::{SqliteOperation, SqlitePhase};
 use crate::{require_product_conversation_admission_tx, DbError, DbResult};
 use chrono::{DateTime, Utc};
+#[cfg(test)]
+use phoenix_core::domain::close::TranscriptConversationId;
 use phoenix_core::domain::db_schema::{
     ConvState, FileAttachment, ImageData, Message, MessageContent,
 };
@@ -3788,9 +3790,13 @@ mod tests {
             .await
             .unwrap()
             .product_conversation_id;
-        db.begin_close_foundation(&product_conversation_id, "direct-turn-fence")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_conversation_id,
+            &TranscriptConversationId::parse("conv-fenced").unwrap(),
+            "direct-turn-fence",
+        )
+        .await
+        .unwrap();
 
         let error = repo
             .accept_authoritative_turn(&input("conv-fenced", "refused", 2))

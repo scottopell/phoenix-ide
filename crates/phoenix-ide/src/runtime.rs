@@ -37,6 +37,8 @@ use crate::tools::{
     BashHandleRegistry, BashLifecycleEvent, BashTerminalEffect, BrowserSessionManager,
     ExploreToolPolicy, TmuxLifecycleEvent, TmuxRegistry, ToolRegistry, WakeRegistrar,
 };
+#[cfg(test)]
+use phoenix_core::domain::close::TranscriptConversationId;
 use phoenix_core::domain::llm_types::ServiceTier;
 use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
 
@@ -7287,7 +7289,11 @@ mod scope_liveness_tests {
         .expect("insert active turn");
         manager
             .db()
-            .begin_close_foundation(&conversation.product_conversation_id, "live-attempt")
+            .begin_close_foundation(
+                &conversation.product_conversation_id,
+                &TranscriptConversationId::parse(conversation_id).unwrap(),
+                "live-attempt",
+            )
             .await
             .expect("begin close");
         manager
