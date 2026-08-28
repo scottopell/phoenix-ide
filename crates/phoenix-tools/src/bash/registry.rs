@@ -796,11 +796,21 @@ impl BashHandleRegistry {
             for target in &permit.exact_process_groups {
                 record_retirement_target_in_report(&mut report, target);
             }
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             for target in &permit.exact_process_groups {
-                // `kill(-pgid, 0)` observes the exact process group without
-                // signaling it. A successful SIGKILL only proves delivery,
-                // not that every member has exited.
+                match linux_retirement_target_has_live_member(target) {
+                    Ok(true) => report.kill_failures.push((
+                        target.pgid,
+                        "exact process group remains live after retirement".to_string(),
+                    )),
+                    Ok(false) => {}
+                    Err(error) => report.kill_failures.push((target.pgid, error.to_string())),
+                }
+            }
+            #[cfg(all(unix, not(target_os = "linux")))]
+            for target in &permit.exact_process_groups {
+                // Unsupported Unix hosts cannot distinguish an exited but
+                // unreaped group leader from a signalable process group.
                 let rc = unsafe { libc::kill(-target.pgid, 0) };
                 if rc == 0 {
                     report.kill_failures.push((
@@ -1089,6 +1099,50 @@ fn record_handle_in_report(
             report.kill_pending_kernel_pids.push(p as i32);
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_retirement_target_has_live_member(
+    target: &BashRetirementTarget,
+) -> Result<bool, std::io::Error> {
+    if phoenix_core::process_identity::current_process_identity(target.launch_identity.process.pid)
+        != Some(target.launch_identity.process)
+    {
+        return Ok(false);
+    }
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => continue,
+            Err(error) => return Err(error),
+        };
+        let Some(close) = stat.rfind(')') else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("malformed /proc/{pid}/stat"),
+            ));
+        };
+        let mut fields = stat[close + 1..].split_whitespace();
+        let Some(state) = fields.next() else {
+            continue;
+        };
+        let Some(member_pgid) = fields.nth(1).and_then(|field| field.parse::<i32>().ok()) else {
+            continue;
+        };
+        if member_pgid == target.pgid && state != "Z" && state != "X" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn record_retirement_target_in_report(
@@ -1873,6 +1927,12 @@ mod tests {
             cascade_bash_on_delete(&registry, &scope("conv-1"), &work_actor("owner"), None).await;
         assert_eq!(report.live_handle_pgids.len(), 2);
         assert!(report.live_handle_pgids.iter().all(|&p| p == 12345));
+        #[cfg(target_os = "linux")]
+        assert!(
+            report.kill_failures.is_empty(),
+            "already-absent synthetic process identities are a verified absence: {report:?}"
+        );
+        #[cfg(not(target_os = "linux"))]
         assert_eq!(report.kill_failures.len(), 2);
         assert_eq!(registry.scope_count().await, 1);
     }
