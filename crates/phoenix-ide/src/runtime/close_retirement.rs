@@ -1150,34 +1150,7 @@ impl RuntimeManager {
                             )
                             .await
                             .map_err(|error| error.to_string())?;
-                        let cleanup_completed = match planned_administrative_dir {
-                            Some(path) => match planned_administrative_dir_is_absent(&path) {
-                                Ok(absent) => absent,
-                                Err(detail) => {
-                                    return self
-                                        .record_close_residual(
-                                            attempt_id,
-                                            snapshot,
-                                            &scope,
-                                            target.resource.clone(),
-                                            RetirementFailureReason::IdentityNotProven,
-                                            &detail,
-                                        )
-                                        .await;
-                                }
-                            },
-                            None => false,
-                        };
-                        if dispatched && cleanup_completed {
-                            self.record_close_absence_adopted(
-                                attempt_id,
-                                snapshot,
-                                &scope,
-                                target.resource.clone(),
-                                "durable exact worktree dispatch and cleanup plan are fully absent",
-                            )
-                            .await?;
-                        } else {
+                        let Some(planned_administrative_dir) = planned_administrative_dir else {
                             return self
                                 .record_close_residual(
                                     attempt_id,
@@ -1185,10 +1158,51 @@ impl RuntimeManager {
                                     &scope,
                                     target.resource.clone(),
                                     RetirementFailureReason::IdentityNotProven,
-                                    "absent worktree lacks a completed exact dispatch and cleanup plan",
+                                    "absent worktree lacks an exact durable cleanup plan",
+                                )
+                                .await;
+                        };
+                        if !dispatched {
+                            return self
+                                .record_close_residual(
+                                    attempt_id,
+                                    snapshot,
+                                    &scope,
+                                    target.resource.clone(),
+                                    RetirementFailureReason::IdentityNotProven,
+                                    "absent worktree lacks an exact durable retirement dispatch",
                                 )
                                 .await;
                         }
+                        let identity = identity.clone();
+                        let recovery = tokio::task::spawn_blocking(move || {
+                            complete_persisted_worktree_administrative_cleanup(
+                                &identity,
+                                &planned_administrative_dir,
+                            )
+                        })
+                        .await
+                        .map_err(|error| error.to_string())?;
+                        if let Err(detail) = recovery {
+                            return self
+                                .record_close_residual(
+                                    attempt_id,
+                                    snapshot,
+                                    &scope,
+                                    target.resource.clone(),
+                                    RetirementFailureReason::IdentityNotProven,
+                                    &detail,
+                                )
+                                .await;
+                        }
+                        self.record_close_absence_adopted(
+                            attempt_id,
+                            snapshot,
+                            &scope,
+                            target.resource.clone(),
+                            "validated exact persisted worktree cleanup plan; completed only its administrative-directory deletion",
+                        )
+                        .await?;
                     } else {
                         let inspections = self
                             .db()
@@ -2687,6 +2701,86 @@ fn planned_administrative_dir_is_absent(path: &Path) -> Result<bool, String> {
     })
 }
 
+fn complete_persisted_worktree_administrative_cleanup(
+    identity: &WorktreeIdentity,
+    planned_administrative_dir: &Path,
+) -> Result<(), String> {
+    validate_cleanup_plan_registration_incarnation(identity, planned_administrative_dir)?;
+    if planned_administrative_dir_is_absent(planned_administrative_dir)? {
+        return Ok(());
+    }
+    validate_live_persisted_worktree_registration(identity, planned_administrative_dir)?;
+    remove_exact_worktree_administrative_dir(planned_administrative_dir)
+}
+
+fn validate_cleanup_plan_registration_incarnation(
+    identity: &WorktreeIdentity,
+    planned_administrative_dir: &Path,
+) -> Result<(), String> {
+    let encoded_pointer = identity
+        .fingerprint()
+        .as_str()
+        .rsplit_once(':')
+        .filter(|(prefix, _)| prefix.starts_with("git_admin_incarnation_v2:"))
+        .map(|(_, encoded)| encoded)
+        .ok_or_else(|| "captured worktree registration incarnation is not decodable".to_string())?;
+    let pointer = decode_hex_bytes(encoded_pointer)
+        .ok_or_else(|| "captured worktree registration incarnation is malformed".to_string())?;
+    if path_buf_from_git_bytes(&pointer) != planned_administrative_dir {
+        return Err(
+            "persisted cleanup plan does not match the captured worktree registration incarnation"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_live_persisted_worktree_registration(
+    identity: &WorktreeIdentity,
+    planned_administrative_dir: &Path,
+) -> Result<(), String> {
+    let backlink = std::fs::read(planned_administrative_dir.join("gitdir"))
+        .map_err(|error| format!("cannot validate persisted worktree registration: {error}"))?;
+    let backlink = backlink
+        .strip_suffix(b"\r\n")
+        .or_else(|| backlink.strip_suffix(b"\n"))
+        .unwrap_or(&backlink);
+    let captured_path = worktree_path(identity);
+    let captured_parent = captured_path
+        .parent()
+        .ok_or_else(|| "captured worktree has no parent directory".to_string())?;
+    let expected_git_file = std::fs::canonicalize(captured_parent)
+        .map_err(|error| format!("cannot validate captured worktree parent: {error}"))?
+        .join(
+            captured_path
+                .file_name()
+                .ok_or_else(|| "captured worktree has no final path component".to_string())?,
+        )
+        .join(".git");
+    if path_buf_from_git_bytes(backlink) != expected_git_file {
+        return Err(
+            "persisted cleanup plan registration does not point to the captured worktree"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn decode_hex_bytes(encoded: &str) -> Option<Vec<u8>> {
+    if !encoded.len().is_multiple_of(2) {
+        return None;
+    }
+    encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = char::from(pair[0]).to_digit(16)?;
+            let low = char::from(pair[1]).to_digit(16)?;
+            u8::try_from((high << 4) | low).ok()
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_lines)]
 async fn quarantine_and_remove_exact_worktree<F>(
     identity: &WorktreeIdentity,
@@ -2804,13 +2898,25 @@ where
                     .to_string(),
             );
         }
-        std::fs::remove_dir_all(&quarantine)
-            .map_err(|error| format!("cannot remove quarantined worktree: {error}"))?;
-        remove_exact_worktree_administrative_dir(&administrative_dir)?;
+        remove_quarantine_then_administrative_dir(&quarantine, &administrative_dir, || {})?;
         Ok(ExactWorktreeRemoval::Retired)
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+fn remove_quarantine_then_administrative_dir<F>(
+    quarantine: &Path,
+    administrative_dir: &Path,
+    after_quarantine_removal: F,
+) -> Result<(), String>
+where
+    F: FnOnce(),
+{
+    std::fs::remove_dir_all(quarantine)
+        .map_err(|error| format!("cannot remove quarantined worktree: {error}"))?;
+    after_quarantine_removal();
+    remove_exact_worktree_administrative_dir(administrative_dir)
 }
 
 fn canonical_status_observation(status: &[u8]) -> Vec<u8> {
@@ -3107,9 +3213,10 @@ fn require_browser_absent(outcome: BrowserRetirementOutcome) -> Result<(), Strin
 mod tests {
     use super::{
         both_worktree_paths_absent, canonical_status_observation,
-        exact_worktree_administrative_dir, git_path_from_observation,
-        inspect_and_remove_exact_worktree_with_hook, inspect_worktree, parse_status_losses,
-        planned_administrative_dir_is_absent, quarantine_and_remove_exact_worktree,
+        complete_persisted_worktree_administrative_cleanup, exact_worktree_administrative_dir,
+        git_path_from_observation, inspect_and_remove_exact_worktree_with_hook, inspect_worktree,
+        parse_status_losses, planned_administrative_dir_is_absent,
+        quarantine_and_remove_exact_worktree, remove_quarantine_then_administrative_dir,
         rotate_inspection_generation, run_bounded_git_status_until, snapshot_for,
         staged_index_entries_by_path, staged_index_entries_for_paths, worktree_quarantine_path,
         CloseLeaseFailure, ExactWorktreeRemoval,
@@ -3407,6 +3514,87 @@ mod tests {
             std::fs::read_to_string(quarantine.join("write-after-crash")).unwrap(),
             "preserve\n"
         );
+    }
+
+    #[test]
+    fn restart_completes_only_exact_persisted_admin_cleanup_after_quarantine_removal() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repository");
+        let linked = temp.path().join("linked");
+        initialize_repository(&repository);
+        run_git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                linked.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let identity = inspection_identity(&linked);
+        let common = super::exact_worktree_common_git_dir(&linked).unwrap();
+        let administrative_dir = exact_worktree_administrative_dir(&linked, &common).unwrap();
+        let quarantine = worktree_quarantine_path(&identity).unwrap();
+
+        std::fs::rename(&linked, &quarantine).unwrap();
+        let injected_crash = std::panic::catch_unwind(|| {
+            remove_quarantine_then_administrative_dir(&quarantine, &administrative_dir, || {
+                panic!("injected crash after quarantine removal")
+            })
+            .unwrap();
+        });
+        assert!(injected_crash.is_err());
+        assert!(!linked.exists());
+        assert!(!quarantine.exists());
+        assert!(administrative_dir.exists());
+
+        complete_persisted_worktree_administrative_cleanup(&identity, &administrative_dir).unwrap();
+
+        assert!(!administrative_dir.exists());
+        assert!(!linked.exists());
+        assert!(!quarantine.exists());
+        assert!(repository.exists());
+    }
+
+    #[test]
+    fn restart_refuses_mismatched_persisted_admin_cleanup_plan() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repository");
+        let linked = temp.path().join("linked");
+        initialize_repository(&repository);
+        run_git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                linked.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let identity = inspection_identity(&linked);
+        let common = super::exact_worktree_common_git_dir(&linked).unwrap();
+        let administrative_dir = exact_worktree_administrative_dir(&linked, &common).unwrap();
+        let mismatched = common.join("worktrees").join("mismatched-plan");
+        std::fs::create_dir(&mismatched).unwrap();
+        std::fs::write(
+            mismatched.join("gitdir"),
+            linked.join(".git").as_os_str().as_encoded_bytes(),
+        )
+        .unwrap();
+        let quarantine = worktree_quarantine_path(&identity).unwrap();
+        std::fs::rename(&linked, &quarantine).unwrap();
+        std::fs::remove_dir_all(&quarantine).unwrap();
+
+        let error =
+            complete_persisted_worktree_administrative_cleanup(&identity, &mismatched).unwrap_err();
+
+        assert!(error.contains("does not match the captured worktree registration incarnation"));
+        assert!(mismatched.exists());
+        assert!(administrative_dir.exists());
     }
 
     #[tokio::test(flavor = "multi_thread")]
