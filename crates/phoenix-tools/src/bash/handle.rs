@@ -621,13 +621,10 @@ impl Handle {
                             "process incarnation did not reach stopped state before deadline",
                         ))
                     } else {
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!(
-                                "stop observation timed out and incarnation-bound resume failed: {}",
-                                std::io::Error::last_os_error()
-                            ),
-                        ))
+                        Err(std::io::Error::other(format!(
+                            "stop observation timed out and incarnation-bound resume failed: {}",
+                            std::io::Error::last_os_error()
+                        )))
                     };
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;

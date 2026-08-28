@@ -1148,13 +1148,7 @@ fn linux_retirement_target_has_live_member(
             ),
         ));
     }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::WouldBlock,
-        format!(
-            "process group {} still exists without a readable live member",
-            target.pgid
-        ),
-    ))
+    Ok(false)
 }
 
 #[cfg(target_os = "linux")]
@@ -1162,7 +1156,7 @@ fn parse_linux_proc_stat(stat: &[u8]) -> Option<(u8, i32)> {
     let close = stat.iter().rposition(|byte| *byte == b')')?;
     let mut fields = stat
         .get(close + 1..)?
-        .split(|byte| byte.is_ascii_whitespace())
+        .split(u8::is_ascii_whitespace)
         .filter(|field| !field.is_empty());
     let state = *fields.next()?.first()?;
     let pgid = std::str::from_utf8(fields.nth(1)?).ok()?.parse().ok()?;
