@@ -19,8 +19,9 @@ use super::git_handlers::{
 use super::global_read;
 use super::lifecycle_handlers::{
     abandon_task, approve_fork_proposal, approve_task, cancel_close_before_retirement,
-    confirm_close_loss_retirement, dismiss_fork_proposal, list_fork_proposals, mark_merged,
-    reject_task, request_changes_on_fork_proposal, retry_close_retirement, task_feedback,
+    confirm_close_loss_retirement, confirm_close_stop_work, dismiss_fork_proposal,
+    list_fork_proposals, mark_merged, reject_task, request_changes_on_fork_proposal,
+    retry_close_retirement, task_feedback,
 };
 use super::product_conversations::{get_product_conversation, list_product_conversations};
 use super::sse::{sse_stream, SseInitTrace};
@@ -264,6 +265,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/conversations/:id/abandon-task", post(abandon_task))
         // Mark as merged (REQ-PROJ-026)
         .route("/api/conversations/:id/mark-merged", post(mark_merged))
+        .route(
+            "/api/conversations/:id/close/confirm-stop-work",
+            post(confirm_close_stop_work),
+        )
         .route(
             "/api/conversations/:id/close/confirm-loss-retirement",
             post(confirm_close_loss_retirement),

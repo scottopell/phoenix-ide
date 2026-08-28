@@ -529,8 +529,8 @@ impl Handle {
     /// Signal the exact live leader incarnation through a kernel-owned PID handle.
     ///
     /// A raw PID or PGID can be reused after the waiter reaps the leader. Linux
-    /// `pidfd` first stops the captured incarnation, keeping its process-group
-    /// identity allocated while the group signal is delivered. Unsupported Unix
+    /// `pidfd` first stops the captured incarnation and observes that exact stopped
+    /// state without reaping it before the numeric group signal is delivered. Unsupported Unix
     /// platforms fail closed rather than signaling a potentially reused number.
     ///
     /// # Errors
@@ -569,11 +569,36 @@ impl Handle {
         let result = if stopped != 0 {
             Err(std::io::Error::last_os_error())
         } else {
-            let rc = unsafe { libc::kill(-live.pgid, signal) };
-            if rc == 0 {
-                Ok(Some(live.pgid))
+            let mut stop_state = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+            let observed = unsafe {
+                libc::waitid(
+                    libc::P_PIDFD,
+                    pidfd as libc::id_t,
+                    stop_state.as_mut_ptr(),
+                    libc::WSTOPPED | libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if observed != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ECHILD) {
+                    Ok(None)
+                } else {
+                    Err(error)
+                }
             } else {
-                Err(std::io::Error::last_os_error())
+                let stop_state = unsafe { stop_state.assume_init() };
+                if stop_state.si_code == libc::CLD_STOPPED
+                    && unsafe { stop_state.si_status() } == libc::SIGSTOP
+                {
+                    let rc = unsafe { libc::kill(-live.pgid, signal) };
+                    if rc == 0 {
+                        Ok(Some(live.pgid))
+                    } else {
+                        Err(std::io::Error::last_os_error())
+                    }
+                } else {
+                    Ok(None)
+                }
             }
         };
         let pidfd =

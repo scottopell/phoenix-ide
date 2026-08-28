@@ -244,6 +244,11 @@ pub struct CancelCloseBeforeRetirementRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct ConfirmCloseStopWorkRequest {
+    pub attempt_id: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct RetryCloseRetirementRequest {
     pub attempt_id: String,
 }

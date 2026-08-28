@@ -3,10 +3,11 @@
 
 use super::handlers::AppError;
 use super::types::{
-    CancelCloseBeforeRetirementRequest, ConfirmCloseLossRetirementRequest, ConflictErrorResponse,
-    ForkDismissResponse, ForkPromoteResponse, ForkProposalListResponse, ForkProposalSummary,
-    ForkSpawnResponse, RequestChangesRequest, RetryCloseRetirementRequest, SuccessResponse,
-    TaskApprovalRequest, TaskApprovalResponse, TaskFeedbackRequest,
+    CancelCloseBeforeRetirementRequest, ConfirmCloseLossRetirementRequest,
+    ConfirmCloseStopWorkRequest, ConflictErrorResponse, ForkDismissResponse, ForkPromoteResponse,
+    ForkProposalListResponse, ForkProposalSummary, ForkSpawnResponse, RequestChangesRequest,
+    RetryCloseRetirementRequest, SuccessResponse, TaskApprovalRequest, TaskApprovalResponse,
+    TaskFeedbackRequest,
 };
 use super::AppState;
 use crate::db::ConvMode;
@@ -398,6 +399,74 @@ pub(crate) async fn confirm_close_loss_retirement(
     Ok(Json(SuccessResponse { success: true }))
 }
 
+pub(crate) async fn confirm_close_stop_work(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<ConfirmCloseStopWorkRequest>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    let admission = state.runtime.conversation_admission(&id).await;
+    let _guard = admission.lock().await;
+    let transcript = state
+        .db
+        .get_conversation(&id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    let aggregate = state
+        .db
+        .get_ordinary_product_conversation(&transcript.product_conversation_id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    if aggregate
+        .segments
+        .last()
+        .map(|segment| segment.transcript_row.conversation.id.as_str())
+        != Some(id.as_str())
+    {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Stop-work confirmation is accepted only from the active aggregate transcript",
+            "inactive_close_transcript",
+        ))));
+    }
+    let obligation = state
+        .db
+        .get_active_close_obligation_for_product(&transcript.product_conversation_id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+        .ok_or_else(|| {
+            AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                "No active Close attempt",
+                "close_attempt_not_active",
+            )))
+        })?;
+    if obligation.attempt_id().as_str() != request.attempt_id {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Close attempt changed; refresh before confirming stop-work",
+            "stale_close_attempt",
+        ))));
+    }
+    state
+        .db
+        .begin_close_active_work_settlement(obligation.attempt_id().as_str())
+        .await
+        .map_err(|error| {
+            AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                error.to_string(),
+                "close_stop_work_confirmation_failed",
+            )))
+        })?;
+    state
+        .runtime
+        .resume_pending_close_settlements()
+        .await
+        .map_err(|error| {
+            AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                error,
+                "close_settlement_in_progress",
+            )))
+        })?;
+    Ok(Json(SuccessResponse { success: true }))
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn cancel_close_before_retirement(
     State(state): State<AppState>,
@@ -514,11 +583,21 @@ pub(crate) async fn retry_close_retirement(
                 "close_retry_unavailable",
             )))
         })?;
-    if let Err(error) = state
-        .runtime
-        .retire_close_runtime_resources(retried.attempt_id().clone())
-        .await
+    let retry_result = if retried.phase()
+        == phoenix_core::domain::close::ClosePhase::AwaitingRetirementInspection
     {
+        state
+            .runtime
+            .inspect_close_retirement(retried.attempt_id().clone())
+            .await
+            .map(|_| ())
+    } else {
+        state
+            .runtime
+            .retire_close_runtime_resources(retried.attempt_id().clone())
+            .await
+    };
+    if let Err(error) = retry_result {
         state
             .db
             .route_close_attempt_to_repair(retried.attempt_id())
@@ -613,16 +692,15 @@ async fn run_legacy_close_compat(state: &AppState, id: &str, action: &str) -> Re
                     "close_stop_work_confirmation_required",
                 ))));
             }
-            ClosePhase::AwaitingStopWorkConfirmation => state
-                .db
-                .begin_close_active_work_settlement(obligation.attempt_id().as_str())
-                .await
-                .map_err(|error| {
-                    AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                        error.to_string(),
-                        "close_start_failed",
-                    )))
-                })?,
+            ClosePhase::AwaitingStopWorkConfirmation => {
+                return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                    format!(
+                        "Close attempt {} still requires explicit stop-work confirmation",
+                        obligation.attempt_id()
+                    ),
+                    "close_stop_work_confirmation_required",
+                ))));
+            }
             ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement => {
                 state
                     .runtime

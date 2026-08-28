@@ -169,7 +169,10 @@ impl ClosePhase {
                 Self::AwaitingRetirementInspection | Self::RetirementRequested | Self::Completed
             ),
             Self::RetirementRequested => matches!(next, Self::NeedsRepair | Self::Completed),
-            Self::NeedsRepair => matches!(next, Self::RetirementRequested | Self::Completed),
+            Self::NeedsRepair => matches!(
+                next,
+                Self::AwaitingRetirementInspection | Self::RetirementRequested | Self::Completed
+            ),
             Self::Completed => false,
         }
     }
@@ -1297,9 +1300,12 @@ mod tests {
                     ClosePhase::RetirementRequested => {
                         matches!(to, ClosePhase::NeedsRepair | ClosePhase::Completed)
                     }
-                    ClosePhase::NeedsRepair => {
-                        matches!(to, ClosePhase::RetirementRequested | ClosePhase::Completed)
-                    }
+                    ClosePhase::NeedsRepair => matches!(
+                        to,
+                        ClosePhase::AwaitingRetirementInspection
+                            | ClosePhase::RetirementRequested
+                            | ClosePhase::Completed
+                    ),
                     ClosePhase::Completed => false,
                 };
                 assert_eq!(

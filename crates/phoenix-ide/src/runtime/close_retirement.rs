@@ -1009,8 +1009,7 @@ impl RuntimeManager {
                     })
                     .await
                     .map_err(|error| error.to_string())?;
-                    let fresh_snapshot = match final_removal {
-                        Ok(ExactWorktreeRemoval::Removed) => Some(confirmed.snapshot.clone()),
+                    let fresh_snapshot: Option<CloseRetirementSnapshot> = match final_removal {
                         Ok(ExactWorktreeRemoval::Missing { reason }) => {
                             let absence_basis = AbsenceBasis::PreexistingExactIdentityEvidence;
                             let adopted = self
@@ -1779,7 +1778,6 @@ fn worktree_quarantine_path(identity: &WorktreeIdentity) -> Result<PathBuf, Stri
 }
 
 enum ExactWorktreeRemoval {
-    Removed,
     Missing { reason: String },
     ReinspectionRequired { detail: String },
     Residual { detail: String },
@@ -2073,55 +2071,12 @@ where
                 ),
             });
         }
-        if quarantine_has_open_descriptors(&quarantine)? {
-            return Ok(ExactWorktreeRemoval::Residual {
-                detail: format!(
-                    "an open descriptor appeared at the deletion boundary; retained at {}",
-                    quarantine.display()
-                ),
-            });
-        }
-
-        if let Err(error) = std::fs::remove_dir_all(&quarantine) {
-            match path.try_exists() {
-                Ok(false) => {
-                    std::fs::rename(&quarantine, &path).map_err(|rollback_error| {
-                        format!(
-                            "cannot remove quarantined worktree ({error}) or restore it from {}: {rollback_error}",
-                            quarantine.display()
-                        )
-                    })?;
-                }
-                Ok(true) => {}
-                Err(observe_error) => {
-                    return Err(format!(
-                        "cannot remove quarantined worktree ({error}); retained at {}; original path cannot be observed: {observe_error}",
-                        quarantine.display()
-                    ));
-                }
-            }
-            return Err(format!("cannot remove quarantined worktree: {error}"));
-        }
-        if path
-            .try_exists()
-            .map_err(|error| format!("cannot inspect original worktree path: {error}"))?
-        {
-            return Ok(ExactWorktreeRemoval::Residual {
-                detail: format!("post-inspection write survived at {}", path.display()),
-            });
-        }
-
-        let removal = phoenix_core::git::command()
-            .args(["worktree", "remove"])
-            .arg(&path)
-            .current_dir(repo)
-            .output()
-            .map_err(|error| error.to_string())?;
-        if removal.status.success() {
-            Ok(ExactWorktreeRemoval::Removed)
-        } else {
-            Err(String::from_utf8_lossy(&removal.stderr).trim().to_string())
-        }
+        Ok(ExactWorktreeRemoval::Residual {
+            detail: format!(
+                "writer exclusion cannot be held through recursive deletion; confirmed worktree retained at {}",
+                quarantine.display()
+            ),
+        })
     })
     .await
     .map_err(|error| error.to_string())?
@@ -2376,21 +2331,22 @@ mod tests {
             locator,
         );
 
-        assert!(matches!(
-            quarantine_and_remove_exact_worktree(&identity, |_| {})
-                .await
-                .unwrap(),
-            ExactWorktreeRemoval::Removed
-        ));
-
+        let outcome = quarantine_and_remove_exact_worktree(&identity, |_| {})
+            .await
+            .unwrap();
+        let ExactWorktreeRemoval::Residual { detail } = outcome else {
+            panic!("worktree must remain quarantined without writer exclusion");
+        };
+        assert!(detail.contains("writer exclusion"));
         assert!(!linked.exists());
+        assert!(worktree_quarantine_path(&identity).unwrap().exists());
         let listing = phoenix_core::git::command()
             .args(["worktree", "list", "--porcelain"])
             .current_dir(&bare)
             .output()
             .unwrap();
         assert!(listing.status.success());
-        assert!(!String::from_utf8_lossy(&listing.stdout).contains(linked.to_str().unwrap()));
+        assert!(String::from_utf8_lossy(&listing.stdout).contains(linked.to_str().unwrap()));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2474,8 +2430,11 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        assert!(matches!(retry, ExactWorktreeRemoval::Removed));
-        assert!(!retry_quarantine.exists());
+        let ExactWorktreeRemoval::Residual { detail } = retry else {
+            panic!("retry must retain quarantine without writer exclusion");
+        };
+        assert!(detail.contains("writer exclusion"));
+        assert!(retry_quarantine.exists());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2693,13 +2652,15 @@ mod tests {
         assert!(losses
             .iter()
             .any(|loss| matches!(loss, CloseLossItem::DetachedUnreachableCommit(_))));
-        assert!(matches!(
-            quarantine_and_remove_exact_worktree(&identity, |_| {})
-                .await
-                .unwrap(),
-            ExactWorktreeRemoval::Removed
-        ));
+        let outcome = quarantine_and_remove_exact_worktree(&identity, |_| {})
+            .await
+            .unwrap();
+        let ExactWorktreeRemoval::Residual { detail } = outcome else {
+            panic!("submodule worktree must remain quarantined without writer exclusion");
+        };
+        assert!(detail.contains("writer exclusion"));
         assert!(!closing.exists());
+        assert!(worktree_quarantine_path(&identity).unwrap().exists());
     }
 
     #[test]

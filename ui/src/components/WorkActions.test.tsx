@@ -54,6 +54,7 @@ vi.mock('../api', () => ({
     abandonTask: vi.fn().mockResolvedValue({ success: true }),
     markMerged: vi.fn().mockResolvedValue({ success: true }),
     getProductConversationSnapshot: vi.fn().mockResolvedValue({ close: null }),
+    confirmCloseStopWork: vi.fn().mockResolvedValue({ success: true }),
     confirmCloseLossRetirement: vi.fn().mockResolvedValue({ success: true }),
     cancelCloseBeforeRetirement: vi.fn().mockResolvedValue({ success: true }),
     retryCloseRetirement: vi.fn().mockResolvedValue({ success: true }),
@@ -208,9 +209,27 @@ describe('WorkControlBar — persisted Close recovery', () => {
     );
   });
 
+  it('requires the attempt-bound stop-work action before settlement', async () => {
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(
+      closeSnapshot('awaiting_stop_work_confirmation') as never,
+    );
+
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-stop-work" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={prStatusHandle()} />,
+    );
+
+    const confirm = await screen.findByRole('button', { name: 'Stop work and continue closing' });
+    fireEvent.click(confirm);
+    await waitFor(() => expect(api.confirmCloseStopWork).toHaveBeenCalledWith(
+      'conv-stop-work',
+      'attempt-close',
+    ));
+    expect(api.markMerged).not.toHaveBeenCalled();
+    expect(api.abandonTask).not.toHaveBeenCalled();
+  });
+
   it.each([
     'awaiting_blocker_resolution',
-    'awaiting_stop_work_confirmation',
     'settling_active_work',
     'cancel_requested_during_settlement',
     'awaiting_retirement_inspection',

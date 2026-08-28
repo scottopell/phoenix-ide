@@ -1776,6 +1776,12 @@ impl Database {
                    FROM close_attempt_members captured
                    WHERE captured.attempt_id = ?2
                      AND captured.conversation_id = owner.id
+               )
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM close_obligations obligation
+                   WHERE obligation.attempt_id = ?2
+                     AND obligation.product_conversation_id = owner.product_conversation_id
                )",
         )
         .bind(scope_id.as_str())
@@ -23095,7 +23101,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_attempt_does_not_exempt_active_owner_absent_from_its_capture() {
+    async fn close_attempt_exempts_same_aggregate_active_subagent_absent_from_parent_capture() {
         let db = Database::open_in_memory().await.unwrap();
         let scope = retirement_fixture(
             &db,
@@ -23137,11 +23143,11 @@ mod tests {
             db.retire_work_scope_for_close_attempt(
                 &attempt,
                 no_live_resource(scope),
-                "Close cannot retire uncaptured owner scope",
+                "Close retires same-aggregate subordinate participant scope",
             )
             .await
             .unwrap(),
-            WorkScopeRetirementOutcome::Blocked(WorkScopeRetirementBlocker::ActiveSubAgent)
+            WorkScopeRetirementOutcome::Retired
         );
     }
 

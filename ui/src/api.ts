@@ -2229,6 +2229,19 @@ export const api = {
     return resp.json();
   },
 
+  async confirmCloseStopWork(conversationId: string, attemptId: string): Promise<{ success: boolean }> {
+    const resp = await fetch(`/api/conversations/${conversationId}/close/confirm-stop-work`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ attempt_id: attemptId }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({})) as { error?: string; error_type?: string };
+      throw new ApiResponseError(err.error ?? 'Failed to confirm stop-work', resp.status, err.error_type);
+    }
+    return resp.json();
+  },
+
   async confirmCloseLossRetirement(
     conversationId: string,
     request: { attempt_id: string; inspection_generation: string; inspection_fingerprint: string },

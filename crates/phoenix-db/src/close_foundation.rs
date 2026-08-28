@@ -3126,12 +3126,34 @@ impl Database {
                 "attempt {attempt_id} retry requires needs_repair"
             )));
         }
-        set_close_phase_tx(
-            &mut tx,
-            attempt_id.as_str(),
-            ClosePhase::RetirementRequested,
+        let has_complete_sealed_inventory: bool = sqlx::query_scalar(
+            "SELECT
+                 (SELECT COUNT(*) FROM close_attempt_scopes WHERE attempt_id = ?1) > 0
+                 AND (SELECT COUNT(*) FROM close_attempt_scopes WHERE attempt_id = ?1)
+                     = (SELECT COUNT(*) FROM close_retirement_inventories inventory
+                        WHERE inventory.attempt_id = ?1 AND inventory.sealed = 1
+                          AND inventory.inspection_generation = ?2
+                          AND inventory.inspection_fingerprint = ?3)",
         )
+        .bind(attempt_id.as_str())
+        .bind(
+            obligation
+                .snapshot()
+                .map(CloseRetirementSnapshot::generation),
+        )
+        .bind(
+            obligation
+                .snapshot()
+                .map(CloseRetirementSnapshot::fingerprint),
+        )
+        .fetch_one(&mut *tx)
         .await?;
+        let next_phase = if has_complete_sealed_inventory {
+            ClosePhase::RetirementRequested
+        } else {
+            ClosePhase::AwaitingRetirementInspection
+        };
+        set_close_phase_tx(&mut tx, attempt_id.as_str(), next_phase).await?;
         let obligation = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
         tx.commit().await?;
         Ok(obligation)
@@ -8169,6 +8191,31 @@ mod tests {
         }
         let pending = db.list_pending_close_obligations().await.unwrap();
         assert_eq!(pending[0].attempt_id().as_str(), "later-instant");
+    }
+
+    #[tokio::test]
+    async fn retry_preinspection_repair_returns_to_reinspection() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let attempt = CloseAttemptId::parse("attempt-preinspection-repair").unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            attempt.as_str(),
+        )
+        .await
+        .unwrap();
+        set_close_phase(
+            &db,
+            attempt.as_str(),
+            ClosePhase::AwaitingRetirementInspection,
+        )
+        .await;
+        db.route_close_attempt_to_repair(&attempt).await.unwrap();
+
+        let retried = db.retry_close_retirement(&attempt).await.unwrap();
+        assert_eq!(retried.phase(), ClosePhase::AwaitingRetirementInspection);
+        assert!(retried.snapshot().is_none());
     }
 
     #[test]

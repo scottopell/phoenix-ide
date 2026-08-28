@@ -51,13 +51,15 @@ function displayLossIdentity(identity: string): string {
 function CloseStatusPanel({
   snapshot,
   busy,
-  onConfirm,
+  onConfirmLosses,
+  onConfirmStopWork,
   onCancel,
   onRetry,
 }: {
   snapshot: ProductConversationSnapshotView;
   busy: boolean;
-  onConfirm: () => void;
+  onConfirmLosses: () => void;
+  onConfirmStopWork: () => void;
   onCancel: () => void;
   onRetry: () => void;
 }) {
@@ -75,8 +77,22 @@ function CloseStatusPanel({
           ))}
         </ul>
         <p>No patch, stash, commit, branch deletion, or PR mutation will be created.</p>
-        <button type="button" className="work-actions-btn work-actions-btn--danger" disabled={busy} onClick={onConfirm}>
+        <button type="button" className="work-actions-btn work-actions-btn--danger" disabled={busy} onClick={onConfirmLosses}>
           {busy ? 'Closing…' : 'Discard exact items and close'}
+        </button>
+        <button type="button" className="work-actions-btn" disabled={busy} onClick={onCancel}>
+          Keep work and cancel Close
+        </button>
+      </section>
+    );
+  }
+  if (close.phase === 'awaiting_stop_work_confirmation') {
+    return (
+      <section className="work-actions-close-status" aria-label="Close stop-work confirmation">
+        <strong>⚠ Active work must stop before closing</strong>
+        <p>Continuing will cancel the active turn for this exact Close attempt.</p>
+        <button type="button" className="work-actions-btn work-actions-btn--danger" disabled={busy} onClick={onConfirmStopWork}>
+          {busy ? 'Stopping…' : 'Stop work and continue closing'}
         </button>
         <button type="button" className="work-actions-btn" disabled={busy} onClick={onCancel}>
           Keep work and cancel Close
@@ -518,6 +534,7 @@ export function WorkControlBar({
     if (
       code === 'close_loss_confirmation_required'
       || code === 'close_retirement_needs_repair'
+      || code === 'close_stop_work_confirmation_required'
       || code === 'close_settlement_in_progress'
       || code === 'stale_close_inspection'
     ) {
@@ -558,6 +575,22 @@ export function WorkControlBar({
       return true;
     } catch (err) {
       return surfaceCloseConflict(err, 'Failed to close conversation');
+    } finally {
+      setAbandoning(false);
+    }
+  };
+
+  const confirmCloseStopWork = async () => {
+    const attemptId = closeSnapshot?.close?.attempt_id;
+    if (!attemptId) return;
+    setError(null);
+    setAbandoning(true);
+    try {
+      await api.confirmCloseStopWork(conversationId, attemptId);
+      setCloseSnapshot(null);
+      onCloseCompleted?.();
+    } catch (err) {
+      await surfaceCloseConflict(err, 'Failed to confirm stop-work');
     } finally {
       setAbandoning(false);
     }
@@ -669,7 +702,8 @@ export function WorkControlBar({
     <CloseStatusPanel
       snapshot={closeSnapshot}
       busy={isLoading}
-      onConfirm={() => { void confirmCloseLosses(); }}
+      onConfirmLosses={() => { void confirmCloseLosses(); }}
+      onConfirmStopWork={() => { void confirmCloseStopWork(); }}
       onCancel={() => { void cancelClose(); }}
       onRetry={() => { void retryClose(); }}
     />
