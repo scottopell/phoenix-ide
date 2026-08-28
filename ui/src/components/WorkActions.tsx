@@ -518,6 +518,7 @@ export function WorkControlBar({
     if (
       code === 'close_loss_confirmation_required'
       || code === 'close_retirement_needs_repair'
+      || code === 'close_settlement_in_progress'
       || code === 'stale_close_inspection'
     ) {
       try {

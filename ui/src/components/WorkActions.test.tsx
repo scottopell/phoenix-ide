@@ -736,6 +736,40 @@ describe('WorkControlBar — terminal cleanup actions', () => {
     expect(confirmSpy).not.toHaveBeenCalled();
     window.confirm = previousConfirm;
   });
+
+  it('reloads the Close snapshot when settlement remains in progress', async () => {
+    const settlementError = Object.assign(new Error('Close settlement is still in progress'), {
+      code: 'close_settlement_in_progress',
+    });
+    vi.mocked(api.abandonTask).mockRejectedValueOnce(settlementError);
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce({ close: null } as never)
+      .mockResolvedValueOnce({
+      close: {
+        attempt_id: 'attempt-settling',
+        phase: 'settling_active_work',
+        confirmation_snapshot: null,
+        inspections: [],
+        losses: [],
+        residuals: [],
+      },
+    } as never);
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-settling"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle({ found: false })}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId('abandon-button'));
+
+    expect(await screen.findByRole('button', { name: 'Keep work and cancel Close' })).toBeInTheDocument();
+    expect(api.getProductConversationSnapshot).toHaveBeenCalledWith('conv-settling');
+    expect(screen.queryByText('Close settlement is still in progress')).not.toBeInTheDocument();
+  });
 });
 
 describe('WorkControlBar — View Diff (View Browser gone)', () => {

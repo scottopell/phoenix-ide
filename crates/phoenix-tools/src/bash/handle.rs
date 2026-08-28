@@ -532,6 +532,11 @@ impl Handle {
     /// `pidfd` first stops the captured incarnation, keeping its process-group
     /// identity allocated while the group signal is delivered. Unsupported Unix
     /// platforms fail closed rather than signaling a potentially reused number.
+    ///
+    /// # Errors
+    ///
+    /// Returns an OS error when opening or signaling the exact process incarnation,
+    /// signaling its process group, or closing the kernel-owned PID handle fails.
     #[cfg(target_os = "linux")]
     pub async fn signal_live_incarnation(
         &self,
@@ -571,7 +576,11 @@ impl Handle {
                 Err(std::io::Error::last_os_error())
             }
         };
-        unsafe { libc::close(i32::try_from(pidfd).expect("pidfd fits file descriptor")) };
+        let pidfd =
+            i32::try_from(pidfd).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+        if unsafe { libc::close(pidfd) } != 0 && result.is_ok() {
+            return Err(std::io::Error::last_os_error());
+        }
         result
     }
 

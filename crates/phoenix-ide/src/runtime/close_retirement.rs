@@ -9,9 +9,9 @@ use std::{
 use sha2::{Digest, Sha256};
 
 use phoenix_core::domain::close::{
-    AbsenceBasis, CapturedWorktreeIdentity, CloseAttemptId, CloseLossItem,
-    CloseOwnedResourceInventory, ClosePhase, CloseRetirementSnapshot, GitOidIdentity,
-    GitPathIdentity, LossItemIdentity, OpaqueIdentity, RetiredResourceIdentity,
+    AbsenceBasis, CapturedWorktreeIdentity, CloseAttemptId, CloseExpectedRetirementResource,
+    CloseLossItem, CloseOwnedResourceInventory, ClosePhase, CloseRetirementSnapshot,
+    GitOidIdentity, GitPathIdentity, LossItemIdentity, OpaqueIdentity, RetiredResourceIdentity,
     RetiredResourceKind, RetirementFailureReason, RetirementOutcome, WorktreeIdentity,
 };
 use phoenix_core::work_scope::{
@@ -516,6 +516,13 @@ impl RuntimeManager {
             })
             .map(|evidence| (evidence.scope, resource_key(&evidence.resource)))
             .collect::<std::collections::BTreeSet<_>>();
+        self.validate_close_worktrees_before_runtime_retirement(
+            &attempt_id,
+            &snapshot,
+            &targets,
+            &retired,
+        )
+        .await?;
         let runtime_targets = targets
             .into_iter()
             .filter(|target| is_runtime_resource(target.resource.kind()))
@@ -756,6 +763,95 @@ impl RuntimeManager {
             .complete_close_retirement(&attempt_id)
             .await
             .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    async fn validate_close_worktrees_before_runtime_retirement(
+        &self,
+        attempt_id: &CloseAttemptId,
+        snapshot: &CloseRetirementSnapshot,
+        targets: &[CloseExpectedRetirementResource],
+        retired: &std::collections::BTreeSet<(WorkScopeId, (String, String))>,
+    ) -> Result<(), String> {
+        let scopes = self
+            .db()
+            .list_close_attempt_scopes(attempt_id.as_str())
+            .await
+            .map_err(|error| error.to_string())?;
+        let inspections = self
+            .db()
+            .list_close_retirement_inspections(attempt_id.as_str())
+            .await
+            .map_err(|error| error.to_string())?;
+        for captured in scopes {
+            let Some(target) = targets.iter().find(|target| {
+                target.scope == captured.scope
+                    && target.resource.kind() == RetiredResourceKind::Worktree
+                    && !retired.contains(&(captured.scope.clone(), resource_key(&target.resource)))
+            }) else {
+                continue;
+            };
+            let Some(CapturedWorktreeIdentity::Resolved(identity)) = &captured.captured_worktree
+            else {
+                return self
+                    .record_close_residual(
+                        attempt_id,
+                        snapshot,
+                        &captured.scope,
+                        target.resource.clone(),
+                        RetirementFailureReason::IdentityNotProven,
+                        "worktree cannot be validated before live resource retirement",
+                    )
+                    .await;
+            };
+            match worktree_path(identity).try_exists() {
+                Ok(false) => continue,
+                Ok(true) => {}
+                Err(error) => {
+                    return self
+                        .record_close_residual(
+                            attempt_id,
+                            snapshot,
+                            &captured.scope,
+                            target.resource.clone(),
+                            RetirementFailureReason::IdentityNotProven,
+                            &format!(
+                                "captured worktree is inaccessible before live resource retirement: {error}"
+                            ),
+                        )
+                        .await;
+                }
+            }
+            let Some(confirmed) = inspections
+                .iter()
+                .find(|inspection| inspection.target.scope == captured.scope)
+            else {
+                return self
+                    .record_close_residual(
+                        attempt_id,
+                        snapshot,
+                        &captured.scope,
+                        target.resource.clone(),
+                        RetirementFailureReason::IdentityNotProven,
+                        "worktree has no confirmed inspection before live resource retirement",
+                    )
+                    .await;
+            };
+            let (fresh_snapshot, _) = inspect_worktree(identity).await.map_err(|reason| {
+                format!("worktree cannot be reinspected before live resource retirement: {reason}")
+            })?;
+            if fresh_snapshot != confirmed.snapshot {
+                self.db()
+                    .return_close_attempt_to_reinspection(attempt_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Box::pin(self.inspect_close_retirement_only(attempt_id.clone())).await?;
+                return Err(
+                    "worktree changed after Close inspection confirmation; fresh confirmation is required"
+                        .to_string(),
+                );
+            }
+        }
         Ok(())
     }
 

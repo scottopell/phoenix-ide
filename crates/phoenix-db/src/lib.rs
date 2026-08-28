@@ -8695,13 +8695,23 @@ impl Database {
         sqlx::query(
             "DELETE FROM product_conversation_work_scope_repairs
              WHERE work_scope_id = ?1
-               AND NOT EXISTS (SELECT 1 FROM conversations WHERE work_scope_id = ?1);
-             DELETE FROM product_conversation_work_scope_missing_owners
+               AND NOT EXISTS (SELECT 1 FROM conversations WHERE work_scope_id = ?1)",
+        )
+        .bind(work_scope_id)
+        .execute(&mut *connection)
+        .await?;
+        sqlx::query(
+            "DELETE FROM product_conversation_work_scope_missing_owners
              WHERE work_scope_id = ?1
-               AND NOT EXISTS (SELECT 1 FROM conversations WHERE work_scope_id = ?1);
-             DELETE FROM product_conversation_work_scopes
+               AND NOT EXISTS (SELECT 1 FROM conversations WHERE work_scope_id = ?1)",
+        )
+        .bind(work_scope_id)
+        .execute(&mut *connection)
+        .await?;
+        sqlx::query(
+            "DELETE FROM product_conversation_work_scopes
              WHERE work_scope_id = ?1
-               AND NOT EXISTS (SELECT 1 FROM conversations WHERE work_scope_id = ?1);",
+               AND NOT EXISTS (SELECT 1 FROM conversations WHERE work_scope_id = ?1)",
         )
         .bind(work_scope_id)
         .execute(&mut *connection)
@@ -13719,6 +13729,14 @@ mod tests {
         assert!(db.get_conversation("conv-cancel").await.unwrap().archived);
         let deletion = claim_test_cleanup(&db).await;
         assert_eq!(deletion.status, "deletion_pending");
+        sqlx::query(
+            "INSERT INTO product_conversation_work_scope_missing_owners (work_scope_id, state)
+             VALUES (?1, 'needs_repair')",
+        )
+        .bind(work_scope_id.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
         db.finish_conversation_creation_cleanup(&deletion, now)
             .await
             .unwrap();
