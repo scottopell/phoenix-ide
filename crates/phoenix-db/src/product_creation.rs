@@ -425,7 +425,7 @@ impl Database {
     ) -> DbResult<Option<ClaimedProductCreationJob>> {
         let now_str = datetime_to_unix_micros(now);
         let lease_until = datetime_to_unix_micros(now + lease_duration);
-        let updated = sqlx::query(
+        let row: Option<(i64,)> = sqlx::query_as(
             "UPDATE product_creation_jobs
              SET status = 'claimed', claim_generation = claim_generation + 1,
                  claim_worker_id = ?2, claim_token = ?3, claim_lease_until_unix_micros = ?4,
@@ -434,18 +434,18 @@ impl Database {
                  status = 'accepted'
                  OR (status = 'retry_scheduled' AND retry_at_unix_micros <= ?1)
                  OR (status = 'claimed' AND claim_lease_until_unix_micros <= ?1)
-             )",
+             ) RETURNING claim_generation",
         )
         .bind(now_str)
         .bind(worker_id)
         .bind(token)
         .bind(lease_until)
         .bind(request_id)
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
-        if updated.rows_affected() == 0 {
+        let Some((generation,)) = row else {
             return Ok(None);
-        }
+        };
         let job = self
             .get_product_creation_job(request_id)
             .await?
@@ -456,7 +456,7 @@ impl Database {
             claim: ProductCreationClaim {
                 worker_id: worker_id.to_string(),
                 token: token.to_string(),
-                generation: job.claim_generation,
+                generation,
                 lease_until: unix_micros_to_datetime(lease_until)?,
             },
             job,

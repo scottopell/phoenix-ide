@@ -2017,8 +2017,8 @@ async fn create_product_conversation(
         }
     }
     let canonical_cwd = match existing_job.as_ref() {
-        Some(existing) => existing.intent.cwd.clone(),
-        None => crate::conversation_cwd::normalize_product_creation_cwd_intent(
+        Some(existing) if req.cwd == existing.intent.cwd => existing.intent.cwd.clone(),
+        _ => crate::conversation_cwd::normalize_product_creation_cwd_intent(
             &req.cwd,
             state.runtime_env.home(),
         )
