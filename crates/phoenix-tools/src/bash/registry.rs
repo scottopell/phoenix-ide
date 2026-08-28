@@ -2080,7 +2080,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     #[allow(clippy::similar_names)] // pgid/pid mirror spec field names
-    async fn cascade_bash_on_delete_actually_kills_a_real_subprocess() {
+    async fn cascade_bash_on_delete_refuses_unbound_process_group_signal() {
         // Spawn a real `sleep` in its own process group, register a
         // matching Handle, and verify the cascade SIGKILLs it. We then
         // `wait()` on the child (which reaps the zombie) and assert the
@@ -2088,7 +2088,6 @@ mod tests {
         // outliving the cascade would have it still in `Running` state
         // and `try_wait()` would return Ok(None).
         use std::os::unix::process::CommandExt as _;
-        use std::os::unix::process::ExitStatusExt as _;
         use std::process::Stdio;
         use tokio::time::{sleep, Duration};
 
@@ -2141,27 +2140,17 @@ mod tests {
         let report =
             cascade_bash_on_delete(&registry, &real_scope, &work_actor("owner"), None).await;
         assert!(report.live_handle_pgids.contains(&pgid));
-        assert!(report.kill_failures.is_empty());
+        assert_eq!(report.kill_failures.len(), 1);
         assert_eq!(registry.scope_count().await, 1);
-
-        // Wait briefly for the kernel to deliver SIGKILL, then reap the
-        // child. The exit status's `signal()` should be `Some(SIGKILL)`.
-        for _ in 0..20 {
-            if let Some(status) = child.try_wait().expect("try_wait") {
-                assert_eq!(
-                    status.signal(),
-                    Some(libc::SIGKILL),
-                    "subprocess must have been terminated by SIGKILL"
-                );
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-        // Best-effort cleanup if the kernel never delivered.
+        sleep(Duration::from_millis(50)).await;
+        assert!(
+            child.try_wait().expect("try_wait").is_none(),
+            "unbound persisted PGID must not be signaled"
+        );
+        // Best-effort cleanup of the test child.
         unsafe {
             let _ = libc::kill(pgid, libc::SIGKILL);
         }
         let _ = child.wait();
-        panic!("subprocess survived cascade SIGKILL within 1s");
     }
 }
