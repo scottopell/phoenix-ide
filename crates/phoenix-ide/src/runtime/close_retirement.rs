@@ -333,6 +333,20 @@ impl RuntimeManager {
         self.browser_sessions().reopen_after_repair(&key).await;
     }
 
+    pub(crate) async fn cancel_close_resource_leases(&self, attempt_id: &CloseAttemptId) {
+        let scopes = self
+            .close_retirement_leases
+            .lock()
+            .await
+            .keys()
+            .filter(|(candidate, _)| candidate == attempt_id.as_str())
+            .map(|(_, scope)| scope.clone())
+            .collect::<Vec<_>>();
+        for scope in scopes {
+            self.cancel_close_resource_lease(attempt_id, &scope).await;
+        }
+    }
+
     /// Acquires all scope fences, then seals the exact server-owned inventory.
     /// The fence stays held in `close_retirement_leases` through completion or repair.
     pub(crate) async fn capture_close_retirement_inventory(

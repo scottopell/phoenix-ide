@@ -440,6 +440,10 @@ pub(crate) async fn cancel_close_before_retirement(
                 "close_cancel_failed",
             )))
         })?;
+    state
+        .runtime
+        .cancel_close_resource_leases(obligation.attempt_id())
+        .await;
     Ok(Json(SuccessResponse { success: true }))
 }
 
