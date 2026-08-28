@@ -3942,6 +3942,58 @@ describe('handleTotalListHeightChanged', () => {
     expect(container.querySelector('.jump-to-newest')).not.toBeNull();
   });
 
+  it('keeps a still-down co-touch owned when a recycled identifier resets the gesture', () => {
+    const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={historical}
+          pendingMessages={[]}
+          convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-recycled-cotouch"
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 600, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
+
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 300, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+    setupScroller(scroller, { scrollHeight: 1100, scrollTop: 300, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1100));
+    expect(container.querySelector('.jump-to-newest')).not.toBeNull();
+
+    // Two fingers on the transcript. The first loses its lift to a detached
+    // node; the second stays down throughout.
+    fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
+    fireEvent.touchStart(scroller, {
+      touches: [{ identifier: 1 }, { identifier: 2 }],
+      changedTouches: [{ identifier: 2 }],
+    });
+
+    // Safari recycles identifier 1 for a new finger. Resetting the gesture
+    // must discard the ended touch's evidence without disowning finger 2,
+    // which is still down and still holding the viewport.
+    fireEvent.touchStart(scroller, {
+      touches: [{ identifier: 2 }, { identifier: 1 }],
+      changedTouches: [{ identifier: 1 }],
+    });
+    fireEvent.touchMove(scroller, { touches: [{ identifier: 2 }, { identifier: 1 }] });
+    setupScroller(scroller, { scrollHeight: 1100, scrollTop: 690, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+
+    // The replacement lifts having travelled toward the tail, but finger 2 is
+    // still down, so the gesture is not over and nothing may confirm on it.
+    fireEvent.touchEnd(scroller, { touches: [{ identifier: 2 }], changedTouches: [{ identifier: 1 }] });
+
+    expect(container.querySelector('.jump-to-newest')).not.toBeNull();
+  });
+
   it('a key that reaches only the body does not claim the viewport', async () => {
     const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
     const listRef = createRef<React.ElementRef<typeof MessageList>>();

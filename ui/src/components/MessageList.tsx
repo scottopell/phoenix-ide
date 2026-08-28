@@ -1006,6 +1006,15 @@ function MessageListImpl({
         // make the interaction it replaces look current.
         const recycled = Array.from(e.changedTouches)
           .some((touch) => scrollerTouchIdsRef.current.has(touch.identifier));
+        // Abandonment discards a gesture's evidence, not the record of which
+        // fingers are physically down. An identifier this scroller owns that
+        // the browser still reports as down, and that is not the one starting
+        // now, belongs to a finger that never lifted — it is a member of
+        // whatever gesture follows, and disowning it would let that gesture
+        // resolve at zero remaining touches while it is still dragging.
+        const starting = new Set(Array.from(e.changedTouches).map((touch) => touch.identifier));
+        const survivors = Array.from(scrollerTouchIdsRef.current)
+          .filter((id) => live.has(id) && !starting.has(id));
         // A new touch must not inherit the evidence of a gesture that already
         // ended, and that gesture cannot be resolved either: the position it
         // ended at was never observed, and the current one belongs to a later
@@ -1013,6 +1022,9 @@ function MessageListImpl({
         if (recycled) endUnobservedGesture();
         else abandonStaleGesture();
         lastTouchAtMs.current = Date.now();
+        for (const id of survivors) {
+          scrollerTouchIdsRef.current.add(id);
+        }
         for (const touch of Array.from(e.changedTouches)) {
           scrollerTouchIdsRef.current.add(touch.identifier);
         }

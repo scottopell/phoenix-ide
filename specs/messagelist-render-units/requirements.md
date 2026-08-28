@@ -426,10 +426,15 @@ already down cannot begin again
 THE SYSTEM SHALL end that gesture without confirming a tail return
 AND SHALL discard its travel evidence rather than carrying it into the next
 gesture
+AND SHALL keep every touch it holds that the platform still reports as down,
+those being fingers that never lifted rather than evidence of the gesture
+that ended
 AND SHALL leave viewport ownership where the interaction placed it
 SO THAT an interaction whose end position was never observed can neither
 confirm from geometry belonging to a later moment nor defer every subsequent
-confirmation to a lift that is not coming
+confirmation to a lift that is not coming, and a finger still dragging is not
+disowned by the ending of a gesture beside it, which would let the next lift
+resolve at zero remaining touches and move the viewport under it
 
 WHEN a touch moves
 THE SYSTEM SHALL measure each owned touch against where that same touch began
