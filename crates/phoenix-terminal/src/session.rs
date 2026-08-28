@@ -452,6 +452,18 @@ impl ActiveTerminals {
             map.handles.get(&permit.work_scope),
             permit.instance.as_ref(),
         ) {
+            (None, Some(expected))
+                if phoenix_core::process_identity::process_identity_matches(
+                    expected.process_identity(),
+                ) =>
+            {
+                TerminalRetirementOutcome::Residual {
+                    reason: format!(
+                        "exact terminal child {} remains live outside the registry",
+                        expected.stable_identity()
+                    ),
+                }
+            }
             (None, _) => TerminalRetirementOutcome::AbsenceVerified,
             (Some(current), Some(expected)) if !expected.matches_handle(current) => {
                 TerminalRetirementOutcome::AbsenceVerified

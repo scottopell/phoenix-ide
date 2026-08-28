@@ -526,6 +526,71 @@ impl Handle {
         }
     }
 
+    /// Signal the exact live leader incarnation through a kernel-owned PID handle.
+    ///
+    /// A raw PID or PGID can be reused after the waiter reaps the leader. Linux
+    /// `pidfd` first stops the captured incarnation, keeping its process-group
+    /// identity allocated while the group signal is delivered. Unsupported Unix
+    /// platforms fail closed rather than signaling a potentially reused number.
+    #[cfg(target_os = "linux")]
+    pub async fn signal_live_incarnation(
+        &self,
+        signal: i32,
+    ) -> Result<Option<i32>, std::io::Error> {
+        let state = self.state.read().await;
+        let HandleState::Live(live) = state.as_ref() else {
+            return Ok(None);
+        };
+        let pid =
+            i32::try_from(live.pid).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if pidfd < 0 {
+            let error = std::io::Error::last_os_error();
+            return if error.raw_os_error() == Some(libc::ESRCH) {
+                Ok(None)
+            } else {
+                Err(error)
+            };
+        }
+        let stopped = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                pidfd,
+                libc::SIGSTOP,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        let result = if stopped != 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            let rc = unsafe { libc::kill(-live.pgid, signal) };
+            if rc == 0 {
+                Ok(Some(live.pgid))
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        };
+        unsafe { libc::close(i32::try_from(pidfd).expect("pidfd fits file descriptor")) };
+        result
+    }
+
+    /// # Errors
+    ///
+    /// Always returns [`std::io::ErrorKind::Unsupported`] because this platform
+    /// has no incarnation-bound signaling primitive.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    pub async fn signal_live_incarnation(
+        &self,
+        _signal: i32,
+    ) -> Result<Option<i32>, std::io::Error> {
+        std::future::ready(Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "incarnation-bound process signaling is unavailable",
+        )))
+        .await
+    }
+
     /// Return the live `LiveData`'s native pid if the handle is currently
     /// live. Used by the hard-delete cascade's structured report — the
     /// pid is informational (the kill targets the pgid) but operators

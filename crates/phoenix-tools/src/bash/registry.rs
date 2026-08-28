@@ -880,18 +880,15 @@ impl BashHandleRegistry {
                 record_retirement_target_in_report(&mut report, target);
             }
             for handle in &permit.removed_handles {
-                let Some(pgid) = handle.live_pgid().await else {
+                if handle.live_pgid().await.is_none() {
                     continue;
-                };
+                }
                 #[cfg(unix)]
-                {
-                    let rc = unsafe { libc::kill(-pgid, libc::SIGKILL) };
-                    if rc != 0 {
-                        let error = std::io::Error::last_os_error();
-                        if error.raw_os_error() != Some(libc::ESRCH) {
-                            report.kill_failures.push((pgid, error.to_string()));
-                        }
-                    }
+                if let Err(error) = handle.signal_live_incarnation(libc::SIGKILL).await {
+                    report.kill_failures.push((
+                        i32::try_from(handle.launch_identity.process.pid).unwrap_or(i32::MAX),
+                        error.to_string(),
+                    ));
                 }
             }
         }
@@ -1864,11 +1861,6 @@ mod tests {
 
     #[tokio::test]
     async fn cascade_bash_on_delete_records_live_pgids_and_drops_entry() {
-        // The fake handle uses pgid 12345 (a process group that almost
-        // certainly does not exist on the test host). `kill(-12345, …)`
-        // will return ESRCH, which the cascade swallows — so this test
-        // verifies the bookkeeping side: the pgid is recorded in the
-        // report and the registry entry is removed.
         let registry = Arc::new(BashHandleRegistry::new());
         let handles_arc = registry.get_or_create(&scope("conv-1")).await;
         {
@@ -1881,7 +1873,7 @@ mod tests {
             cascade_bash_on_delete(&registry, &scope("conv-1"), &work_actor("owner"), None).await;
         assert_eq!(report.live_handle_pgids.len(), 2);
         assert!(report.live_handle_pgids.iter().all(|&p| p == 12345));
-        assert!(report.kill_failures.is_empty(), "ESRCH must be swallowed");
+        assert_eq!(report.kill_failures.len(), 2);
         assert_eq!(registry.scope_count().await, 1);
     }
 
@@ -2042,12 +2034,26 @@ mod tests {
             current_outcome,
             BashRetirementOutcome::Retired(_) | BashRetirementOutcome::AbsenceVerified(_)
         ));
-        let replacement_status = replacement_child.wait().expect("wait replacement");
-        assert_eq!(
-            std::os::unix::process::ExitStatusExt::signal(&replacement_status),
-            Some(libc::SIGKILL),
-            "current permit must stop its exact removed handle"
-        );
+        #[cfg(target_os = "linux")]
+        {
+            let replacement_status = replacement_child.wait().expect("wait replacement");
+            assert_eq!(
+                std::os::unix::process::ExitStatusExt::signal(&replacement_status),
+                Some(libc::SIGKILL),
+                "current permit must stop its exact removed handle"
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert!(replacement_child
+                .try_wait()
+                .expect("try_wait replacement")
+                .is_none());
+            unsafe {
+                let _ = libc::kill(replacement_pgid, libc::SIGKILL);
+            }
+            let _ = replacement_child.wait();
+        }
         unsafe {
             let _ = libc::kill(stale_pgid, libc::SIGKILL);
         }
@@ -2124,12 +2130,24 @@ mod tests {
         let report =
             cascade_bash_on_delete(&registry, &real_scope, &work_actor("owner"), None).await;
         assert!(report.live_handle_pgids.contains(&pgid));
-        assert!(!report.kill_failures.is_empty(), "{report:?}");
-        assert_eq!(registry.scope_count().await, 1);
-        assert!(child.try_wait().expect("try_wait").is_none());
-        unsafe {
-            let _ = libc::kill(pgid, libc::SIGKILL);
+        #[cfg(target_os = "linux")]
+        {
+            assert!(report.kill_failures.is_empty(), "{report:?}");
+            let status = child.wait().expect("reap signaled child");
+            assert_eq!(
+                std::os::unix::process::ExitStatusExt::signal(&status),
+                Some(libc::SIGKILL)
+            );
         }
-        let _ = child.wait();
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert!(!report.kill_failures.is_empty(), "{report:?}");
+            assert!(child.try_wait().expect("try_wait").is_none());
+            unsafe {
+                let _ = libc::kill(pgid, libc::SIGKILL);
+            }
+            let _ = child.wait();
+        }
+        assert_eq!(registry.scope_count().await, 1);
     }
 }

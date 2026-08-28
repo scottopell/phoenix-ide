@@ -594,16 +594,25 @@ async fn run_legacy_close_compat(state: &AppState, id: &str, action: &str) -> Re
     };
     loop {
         obligation = match obligation.phase() {
-            ClosePhase::AwaitingBlockerResolution => state
-                .db
-                .confirm_close_stop_work(obligation.attempt_id().as_str())
-                .await
-                .map_err(|error| {
-                    AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                        error.to_string(),
-                        "close_start_failed",
-                    )))
-                })?,
+            ClosePhase::AwaitingBlockerResolution => {
+                let awaiting_confirmation = state
+                    .db
+                    .confirm_close_stop_work(obligation.attempt_id().as_str())
+                    .await
+                    .map_err(|error| {
+                        AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                            error.to_string(),
+                            "close_start_failed",
+                        )))
+                    })?;
+                return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                    format!(
+                        "Close attempt {} requires explicit stop-work confirmation",
+                        awaiting_confirmation.attempt_id()
+                    ),
+                    "close_stop_work_confirmation_required",
+                ))));
+            }
             ClosePhase::AwaitingStopWorkConfirmation => state
                 .db
                 .begin_close_active_work_settlement(obligation.attempt_id().as_str())

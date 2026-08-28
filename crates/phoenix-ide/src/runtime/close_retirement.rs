@@ -1711,30 +1711,25 @@ where
     if !path
         .try_exists()
         .map_err(|error| format!("cannot observe captured worktree path: {error}"))?
-    {
-        if quarantine
+        && !quarantine
             .try_exists()
             .map_err(|error| format!("cannot observe quarantined worktree path: {error}"))?
-        {
-            return Ok(ExactWorktreeRemoval::Residual {
-                detail: format!(
-                    "confirmed worktree remains quarantined at {}",
-                    quarantine.display()
-                ),
-            });
-        }
+    {
         return Ok(ExactWorktreeRemoval::Missing {
             reason: "captured worktree path is absent".to_string(),
         });
     }
     let _repository_lock =
-        RepositoryMutationLock::acquire(&path).map_err(|(message, _)| message)?;
-    let (fresh_snapshot, _) = runtime.block_on(inspect_worktree(identity))?;
-    if &fresh_snapshot != confirmed_snapshot {
-        return Ok(ExactWorktreeRemoval::ReinspectionRequired {
-            detail: "worktree changed after Close inspection confirmation; fresh confirmation is required"
-                .to_string(),
-        });
+        RepositoryMutationLock::acquire(if path.exists() { &path } else { &quarantine })
+            .map_err(|(message, _)| message)?;
+    if path.exists() {
+        let (fresh_snapshot, _) = runtime.block_on(inspect_worktree(identity))?;
+        if &fresh_snapshot != confirmed_snapshot {
+            return Ok(ExactWorktreeRemoval::ReinspectionRequired {
+                detail: "worktree changed after Close inspection confirmation; fresh confirmation is required"
+                    .to_string(),
+            });
+        }
     }
     runtime.block_on(quarantine_and_remove_exact_worktree(
         identity,
@@ -1894,15 +1889,17 @@ where
     F: FnOnce(&Path) + Send + 'static,
 {
     let path = worktree_path(identity);
-    if !path.exists() {
+    let quarantine = worktree_quarantine_path(identity)?;
+    let resuming_quarantine = !path.exists() && quarantine.exists();
+    if !path.exists() && !resuming_quarantine {
         return Err("captured worktree path is absent without an exact prior receipt".to_string());
     }
     let expected = identity.fingerprint().as_str().to_string();
-    let identity = identity.clone();
     tokio::task::spawn_blocking(move || {
+        let inspection_path = if resuming_quarantine { &quarantine } else { &path };
         let common = phoenix_core::git::command()
             .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
-            .current_dir(&path)
+            .current_dir(inspection_path)
             .output()
             .map_err(|error| error.to_string())?;
         if !common.status.success() {
@@ -1917,7 +1914,7 @@ where
                 .map(Path::to_path_buf)
                 .ok_or_else(|| "captured worktree has no common repository root".to_string())?
         };
-        let target = std::fs::canonicalize(&path).map_err(|error| error.to_string())?;
+        let target = std::fs::canonicalize(inspection_path).map_err(|error| error.to_string())?;
         let listed = phoenix_core::git::command()
             .args(["worktree", "list", "--porcelain", "-z"])
             .current_dir(&repo)
@@ -1932,27 +1929,28 @@ where
                     .as_ref()
                     == Some(&target)
             });
-        if !registered {
+        if !registered && !resuming_quarantine {
             return Err("captured worktree is no longer Git registered".to_string());
         }
-        if observe_worktree_fingerprint(&path).as_deref() != Some(expected.as_str()) {
+        if observe_worktree_fingerprint(inspection_path).as_deref() != Some(expected.as_str()) {
             return Err("captured worktree administrative incarnation changed".to_string());
         }
 
-        let quarantine = worktree_quarantine_path(&identity)?;
-        if quarantine
-            .try_exists()
-            .map_err(|error| format!("cannot observe quarantined worktree path: {error}"))?
-        {
-            return Ok(ExactWorktreeRemoval::Residual {
-                detail: format!(
-                    "confirmed worktree remains quarantined at {}",
-                    quarantine.display()
-                ),
-            });
+        if !resuming_quarantine {
+            if quarantine
+                .try_exists()
+                .map_err(|error| format!("cannot observe quarantined worktree path: {error}"))?
+            {
+                return Ok(ExactWorktreeRemoval::Residual {
+                    detail: format!(
+                        "confirmed worktree remains quarantined at {}",
+                        quarantine.display()
+                    ),
+                });
+            }
+            std::fs::rename(&path, &quarantine)
+                .map_err(|error| format!("cannot quarantine captured worktree: {error}"))?;
         }
-        std::fs::rename(&path, &quarantine)
-            .map_err(|error| format!("cannot quarantine captured worktree: {error}"))?;
         if observe_worktree_fingerprint(&quarantine).as_deref() != Some(expected.as_str()) {
             let _ = std::fs::rename(&quarantine, &path);
             return Err("quarantined worktree administrative incarnation changed".to_string());
@@ -1975,6 +1973,14 @@ where
                 detail: format!(
                     "post-inspection write survived at {}; confirmed worktree is retained at {}",
                     path.display(),
+                    quarantine.display()
+                ),
+            });
+        }
+        if quarantine_has_open_descriptors(&quarantine)? {
+            return Ok(ExactWorktreeRemoval::Residual {
+                detail: format!(
+                    "an open descriptor appeared at the deletion boundary; retained at {}",
                     quarantine.display()
                 ),
             });
@@ -2360,6 +2366,7 @@ mod tests {
         assert!(String::from_utf8_lossy(&listing.stdout).contains(linked.to_str().unwrap()));
 
         std::fs::remove_dir_all(&linked).unwrap();
+        let retry_quarantine = worktree_quarantine_path(&retry_identity).unwrap();
         let retry = tokio::task::spawn_blocking(move || {
             inspect_and_remove_exact_worktree_with_hook(
                 &retry_runtime,
@@ -2371,10 +2378,8 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        let ExactWorktreeRemoval::Residual { detail } = retry else {
-            panic!("retry must retain the quarantined exact worktree");
-        };
-        assert!(detail.contains("remains quarantined at"));
+        assert!(matches!(retry, ExactWorktreeRemoval::Removed));
+        assert!(!retry_quarantine.exists());
     }
 
     #[tokio::test(flavor = "multi_thread")]

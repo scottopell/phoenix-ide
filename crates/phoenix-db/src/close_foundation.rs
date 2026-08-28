@@ -3030,6 +3030,10 @@ impl Database {
     ) -> DbResult<CloseObligation> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let obligation = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
+        if obligation.phase() == ClosePhase::Completed {
+            tx.commit().await?;
+            return Ok(obligation);
+        }
         if obligation.phase() != ClosePhase::RetirementRequested {
             return Err(close_precondition(format!(
                 "attempt {attempt_id} completion requires retirement_requested"
@@ -7092,6 +7096,73 @@ mod tests {
         assert_eq!(outcome.0, "close-outcome:attempt-complete");
         assert_eq!(outcome.1, "system");
         assert!(outcome.2.contains("attempt-complete"));
+    }
+
+    #[tokio::test]
+    async fn successful_retirement_completion_replay_is_idempotent() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let scope = allocate_scope_worktree(&db, "root").await;
+        create_child(&db, "latest", "root").await;
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("latest"),
+            "attempt-replay-complete",
+        )
+        .await
+        .unwrap();
+        set_close_phase(
+            &db,
+            "attempt-replay-complete",
+            ClosePhase::AwaitingRetirementInspection,
+        )
+        .await;
+        db.replace_close_inspection(ReplaceCloseInspectionRequest {
+            attempt_id: CloseAttemptId::parse("attempt-replay-complete").unwrap(),
+            scopes: vec![ReplaceCloseInspectionScopeRequest {
+                scope: scope.clone(),
+                snapshot: CloseRetirementSnapshot::parse("complete-gen", "complete-fp").unwrap(),
+                losses: Vec::new(),
+            }],
+        })
+        .await
+        .unwrap();
+        let snapshot = current_test_snapshot(&db, "attempt-replay-complete").await;
+        capture_test_inventory(
+            &db,
+            "attempt-replay-complete",
+            &scope,
+            &snapshot,
+            Vec::new(),
+        )
+        .await;
+        for expected in db
+            .list_close_expected_retirement_resources("attempt-replay-complete")
+            .await
+            .unwrap()
+        {
+            db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
+                attempt_id: CloseAttemptId::parse("attempt-replay-complete").unwrap(),
+                snapshot: snapshot.clone(),
+                scope: expected.scope,
+                resource: expected.resource,
+                outcome: RetirementOutcome::Retired,
+                detail: None,
+            })
+            .await
+            .unwrap();
+        }
+        let attempt = CloseAttemptId::parse("attempt-replay-complete").unwrap();
+        let first = db.complete_close_retirement(&attempt).await.unwrap();
+        let replay = db.complete_close_retirement(&attempt).await.unwrap();
+        assert_eq!(first, replay);
+        let outcome_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages WHERE message_id = 'close-outcome:attempt-replay-complete'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(outcome_count, 1);
     }
 
     #[allow(clippy::too_many_lines)]
