@@ -1359,6 +1359,27 @@ pub(crate) async fn get_conversation_pr_status(
                 .clone()
                 .expect("persisted conversation has work scope"),
         ),
+        ConvMode::DetachedApprovedTask {
+            base_branch,
+            worktree_path,
+            ..
+        } => {
+            let branch_name = crate::git_ops::run_git(
+                std::path::Path::new(worktree_path.as_str()),
+                &["symbolic-ref", "--short", "HEAD"],
+            )
+            .map_err(|_| {
+                AppError::BadRequest("Detached approved task has no named branch".to_string())
+            })?;
+            (
+                branch_name.trim().to_string(),
+                base_branch.to_string(),
+                worktree_path.to_string(),
+                conv.attached_work_scope_id
+                    .clone()
+                    .expect("persisted conversation has work scope"),
+            )
+        }
         _ => {
             // Not applicable: no branch/worktree to query. Distinct from the
             // `gh`-can't-tell-us cases below, which return 200 + unavailable_reason.

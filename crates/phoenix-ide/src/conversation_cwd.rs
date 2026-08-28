@@ -123,7 +123,17 @@ pub(crate) fn ensure_product_creation_cwd(
         ));
     }
     if path.exists() {
-        return validate_conversation_cwd(raw);
+        let validated = validate_conversation_cwd(raw)?;
+        let allowed = [home, Path::new("/tmp")].into_iter().any(|root| {
+            std::fs::canonicalize(root)
+                .is_ok_and(|canonical_root| validated.as_path().starts_with(canonical_root))
+        });
+        if !allowed {
+            return Err(ConversationCwdError::NotAcceptable(
+                "new directory resolved outside allowed roots".to_string(),
+            ));
+        }
+        return Ok(validated);
     }
     let ancestor = path
         .ancestors()
@@ -306,17 +316,14 @@ mod tests {
     }
 
     #[test]
-    fn worker_accepts_existing_directory_outside_creation_roots() {
+    fn worker_rejects_existing_directory_outside_creation_roots() {
         let home = tempfile::tempdir().expect("home");
         let existing = std::env::current_dir().expect("current directory");
 
-        let valid = ensure_product_creation_cwd(existing.to_string_lossy(), home.path())
-            .expect("existing directories keep the general cwd contract");
+        let error = ensure_product_creation_cwd(existing.to_string_lossy(), home.path())
+            .expect_err("worker preserves the accepted creation-root boundary");
 
-        assert_eq!(
-            valid.as_path(),
-            existing.canonicalize().expect("canonical cwd")
-        );
+        assert!(error.to_string().contains("outside allowed roots"));
     }
 
     #[cfg(unix)]

@@ -2323,7 +2323,11 @@ pub fn transition_parent(
                 let fork_eligible = matches!(context.mode, ModeKind::Branch)
                     || matches!(
                         context.mode_context,
-                        Some(ModeContext::Work { .. } | ModeContext::Branch { .. })
+                        Some(
+                            ModeContext::Work { .. }
+                                | ModeContext::Branch { .. }
+                                | ModeContext::DetachedApprovedTask { .. }
+                        )
                     )
                     || (matches!(context.mode, ModeKind::Direct)
                         && is_git_repository(context.filesystem_root()));
