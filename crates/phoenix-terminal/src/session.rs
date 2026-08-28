@@ -208,6 +208,7 @@ pub enum ActiveTerminalInsertError {
 #[derive(Debug, Default)]
 struct ActiveTerminalRegistryState {
     handles: HashMap<ResourceScopeKey, Arc<TerminalHandle>>,
+    spawn_reservations: std::collections::HashSet<ResourceScopeKey>,
     retirements: HashMap<ResourceScopeKey, ScopeRetirementState>,
 }
 
@@ -273,6 +274,70 @@ impl ActiveTerminals {
     pub fn is_active(&self, scope: &ResourceScopeKey) -> bool {
         let map = self.0.lock().expect("terminal registry poisoned");
         map.handles.contains_key(scope)
+    }
+
+    /// Reserve fresh-terminal admission before any PTY or tmux side effect.
+    ///
+    /// # Panics
+    /// Panics if the terminal registry mutex is poisoned.
+    ///
+    /// # Errors
+    /// Returns a typed rejection when the scope is occupied, already reserved,
+    /// or fenced for retirement.
+    pub fn reserve_spawn(&self, scope: &ResourceScopeKey) -> Result<(), ActiveTerminalInsertError> {
+        let mut map = self.0.lock().expect("terminal registry poisoned");
+        if map
+            .retirements
+            .get(scope)
+            .is_some_and(|retirement| retirement.fenced)
+        {
+            return Err(ActiveTerminalInsertError::RetirementFenced);
+        }
+        if map.handles.contains_key(scope) || !map.spawn_reservations.insert(scope.clone()) {
+            return Err(ActiveTerminalInsertError::Occupied);
+        }
+        Ok(())
+    }
+
+    /// Publish a PTY under its previously reserved admission slot.
+    ///
+    /// # Panics
+    /// Panics if the terminal registry mutex is poisoned.
+    ///
+    /// # Errors
+    /// Returns a typed rejection if the reservation was revoked by retirement.
+    pub fn insert_reserved(
+        &self,
+        scope: ResourceScopeKey,
+        handle: TerminalHandle,
+    ) -> Result<Arc<TerminalHandle>, ActiveTerminalInsertError> {
+        let mut map = self.0.lock().expect("terminal registry poisoned");
+        let reserved = map.spawn_reservations.remove(&scope);
+        if map
+            .retirements
+            .get(&scope)
+            .is_some_and(|retirement| retirement.fenced)
+        {
+            return Err(ActiveTerminalInsertError::RetirementFenced);
+        }
+        if !reserved || map.handles.contains_key(&scope) {
+            return Err(ActiveTerminalInsertError::Occupied);
+        }
+        let handle = Arc::new(handle);
+        map.handles.insert(scope, Arc::clone(&handle));
+        Ok(handle)
+    }
+
+    /// Release a fresh-terminal reservation after planning or spawn failure.
+    ///
+    /// # Panics
+    /// Panics if the terminal registry mutex is poisoned.
+    pub fn release_spawn(&self, scope: &ResourceScopeKey) {
+        self.0
+            .lock()
+            .expect("terminal registry poisoned")
+            .spawn_reservations
+            .remove(scope);
     }
 
     /// Attempt to register a new terminal for `scope`.
@@ -391,6 +456,7 @@ impl ActiveTerminals {
         scope: &ResourceScopeKey,
         map: &mut ActiveTerminalRegistryState,
     ) -> TerminalRetirementPermit {
+        map.spawn_reservations.remove(scope);
         let instance = map
             .handles
             .get(scope)
@@ -554,11 +620,23 @@ impl ActiveTerminals {
             }
         })
         .await;
-        if matches!(wait_outcome, Ok(None)) {
-            return TerminalRetirementOutcome::Residual {
-                reason: "terminal child did not exit before retirement deadline".to_string(),
-            };
-        }
+        let wait_outcome = if matches!(wait_outcome, Ok(None)) {
+            let exact_child_live = permit.instance.as_ref().is_some_and(|instance| {
+                phoenix_core::process_identity::process_identity_matches(
+                    instance.process_identity(),
+                )
+            });
+            if exact_child_live {
+                let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGKILL);
+                tokio::task::spawn_blocking(move || nix::sys::wait::waitpid(child_pid, None))
+                    .await
+                    .map(Some)
+            } else {
+                Ok(Some(Ok(nix::sys::wait::WaitStatus::StillAlive)))
+            }
+        } else {
+            wait_outcome
+        };
         let identity_absent = permit.instance.as_ref().is_none_or(|instance| {
             !phoenix_core::process_identity::process_identity_matches(instance.process_identity())
         });

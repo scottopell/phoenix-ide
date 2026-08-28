@@ -3020,26 +3020,31 @@ impl Database {
         resource: &RetiredResourceIdentity,
     ) -> DbResult<Option<std::path::PathBuf>> {
         let identity = resource.identity();
-        let row: Option<(String, String)> = sqlx::query_as(
-            "SELECT administrative_dir_codec, administrative_dir_value
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT DISTINCT administrative_dir_codec, administrative_dir_value
              FROM close_worktree_cleanup_plans
              WHERE attempt_id = ?1 AND scope = ?2
-               AND inspection_generation = ?3 AND inspection_fingerprint = ?4
-               AND resource_kind = ?5 AND identity_kind = ?6
-               AND identity_codec = ?7 AND identity_value = ?8",
+               AND resource_kind = ?3 AND identity_kind = ?4
+               AND identity_codec = ?5 AND identity_value = ?6
+             ORDER BY (inspection_generation = ?7 AND inspection_fingerprint = ?8) DESC",
         )
         .bind(attempt_id.as_str())
         .bind(scope.as_str())
-        .bind(snapshot.generation())
-        .bind(snapshot.fingerprint())
         .bind(resource.kind().as_str())
         .bind(identity.identity_kind())
         .bind(identity.codec())
         .bind(identity.value())
-        .fetch_optional(&self.pool)
+        .bind(snapshot.generation())
+        .bind(snapshot.fingerprint())
+        .fetch_all(&self.pool)
         .await?;
-        row.map(|(codec, value)| decode_host_path(&codec, &value))
-            .transpose()
+        match rows.as_slice() {
+            [] => Ok(None),
+            [(codec, value)] => decode_host_path(codec, value).map(Some),
+            _ => Err(close_precondition(
+                "same-attempt worktree cleanup authority has conflicting plans",
+            )),
+        }
     }
 
     /// Returns whether the current exact attempt dispatched this resource before

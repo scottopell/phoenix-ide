@@ -1344,6 +1344,7 @@ impl TmuxRegistry {
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
+            command.kill_on_drop(true);
             match tokio::time::timeout(std::time::Duration::from_secs(5), command.output()).await {
                 Err(_) => Some(TmuxRetirementOutcome::RemovalFailed {
                     reason: "tmux exact teardown command exceeded its deadline".to_string(),

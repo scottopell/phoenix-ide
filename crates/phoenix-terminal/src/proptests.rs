@@ -176,6 +176,23 @@ fn relay_removal_preserves_close_retirement_fence() {
 }
 
 #[test]
+fn retirement_revokes_pre_spawn_reservation() {
+    let registry = ActiveTerminals::new();
+    let scope = scope("reserved-before-fence");
+    let dims = Dims { cols: 80, rows: 24 };
+
+    registry.reserve_spawn(&scope).expect("reserve admission");
+    let permit = registry.begin_retirement(&scope);
+
+    assert!(permit.instance.is_none());
+    assert!(matches!(
+        registry.insert_reserved(scope.clone(), dummy_handle(dims)),
+        Err(ActiveTerminalInsertError::RetirementFenced)
+    ));
+    assert!(registry.get(&scope).is_none());
+}
+
+#[test]
 fn begin_retirement_fences_admission_until_reopened() {
     let registry = ActiveTerminals::new();
     let scope = scope("retirement-fence");

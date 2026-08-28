@@ -347,6 +347,16 @@ async fn acquire_handle(
         return reclaim(conversation_id, existing).await;
     }
 
+    // Reserve admission before tmux planning or PTY spawn. Retirement revokes
+    // this reservation atomically with fencing, so no untracked child can be
+    // created after the WorkScope gate is sealed.
+    if terminals.reserve_spawn(scope).is_err() {
+        let _ = ws_sender
+            .send(Message::Text("error: terminal unavailable".to_string()))
+            .await;
+        return None;
+    }
+
     // Slow path: spawn a new PTY. Resolve the exec plan first
     // (REQ-TMUX-004 / design.md §"Terminal Attach Path"). `cwd` is
     // forwarded so a fresh tmux server starts its pane in the
@@ -361,10 +371,12 @@ async fn acquire_handle(
     {
         Ok(Ok(h)) => h,
         Ok(Err(e)) => {
+            terminals.release_spawn(scope);
             tracing::error!(conv_id = %conversation_id, error = %e, "Terminal: PTY spawn failed");
             return None;
         }
         Err(e) => {
+            terminals.release_spawn(scope);
             tracing::error!(conv_id = %conversation_id, error = %e, "Terminal: spawn_blocking panicked");
             return None;
         }
@@ -372,32 +384,20 @@ async fn acquire_handle(
 
     let child_pid = handle.child_pid;
 
-    // Atomic check-and-insert. If we lose the race, the handle we just spawned
-    // is dropped (closing master_fd → SIGHUP), and we fall back to reclaiming
-    // the winner so the caller still gets an attached session.
-    if let Some(arc_handle) = terminals.try_insert(scope.clone(), handle) {
-        // Fresh handle — permit is available immediately (initialized with 1).
-        return acquire_permit(conversation_id, arc_handle).await;
-    }
-
-    tracing::warn!(conv_id = %conversation_id, scope = %scope, "Terminal: post-spawn race lost, reclaiming winner");
-    // Reap the child from the losing spawn to avoid a zombie. The handle was
-    // consumed by try_insert (on loss it was dropped), so master_fd is closed
-    // and the child will receive SIGHUP.
-    let _ = tokio::task::spawn_blocking(move || {
-        let _ = waitpid(child_pid, None);
-    })
-    .await;
-
-    let Some(existing) = terminals.get_for_attach(scope) else {
-        // Winner removed itself between try_insert and get. Report back to
-        // the client and bail — retrying again could loop on edge-case timing.
+    // Publish only through the pre-spawn reservation. A concurrent retirement
+    // can revoke it; dropping the rejected handle closes the PTY master.
+    if let Ok(arc_handle) = terminals.insert_reserved(scope.clone(), handle) {
+        acquire_permit(conversation_id, arc_handle).await
+    } else {
+        tracing::warn!(conv_id = %conversation_id, scope = %scope, "Terminal: spawn reservation revoked before publish");
+        // Never wait unboundedly for a child that may ignore PTY hangup.
+        let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGKILL);
+        let _ = tokio::task::spawn_blocking(move || waitpid(child_pid, None)).await;
         let _ = ws_sender
             .send(Message::Text("error: terminal unavailable".to_string()))
             .await;
-        return None;
-    };
-    reclaim(conversation_id, existing).await
+        None
+    }
 }
 
 /// Decide whether the freshly-spawned PTY should run `tmux attach`

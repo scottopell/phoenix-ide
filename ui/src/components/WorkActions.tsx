@@ -549,7 +549,11 @@ export function WorkControlBar({
       || code === 'stale_close_inspection'
     ) {
       try {
-        setCloseSnapshot(await api.getProductConversationSnapshot(conversationId));
+        const request = ++closeSnapshotRequestRef.current;
+        const snapshot = await api.getProductConversationSnapshot(conversationId);
+        if (request === closeSnapshotRequestRef.current) {
+          setCloseSnapshot(snapshot.close ? snapshot : null);
+        }
         return false;
       } catch (snapshotError) {
         setError(snapshotError instanceof Error ? snapshotError.message : 'Failed to load Close status');

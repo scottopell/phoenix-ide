@@ -228,6 +228,34 @@ describe('WorkControlBar — persisted Close recovery', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: 'Stop work and continue closing' })).toBeVisible());
   });
 
+  it('conflict refresh invalidates an older effect snapshot response', async () => {
+    let resolveInitial!: (value: unknown) => void;
+    const initial = new Promise((resolve) => { resolveInitial = resolve; });
+    const conflict = Object.assign(new Error('repair required'), {
+      code: 'close_retirement_needs_repair',
+    });
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockReturnValueOnce(initial as never)
+      .mockResolvedValueOnce(closeSnapshot('needs_repair', [{
+        scope: 'scope-race',
+        resource_kind: 'terminal',
+        identity: 'terminal:exact',
+        reason: 'removal_failed',
+        detail: 'child retained',
+      }]) as never);
+    vi.mocked(api.abandonTask).mockRejectedValueOnce(conflict);
+
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-conflict-race" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={prStatusHandle({ found: false })} />,
+    );
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByTestId('abandon-button'));
+    expect(await screen.findByLabelText('Close repair required')).toHaveTextContent('child retained');
+
+    resolveInitial({ close: null });
+    await waitFor(() => expect(screen.getByLabelText('Close repair required')).toBeVisible());
+  });
+
   it('renders exact residual repair evidence after reload', async () => {
     vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(closeSnapshot('needs_repair', [{
       scope: 'scope-1',

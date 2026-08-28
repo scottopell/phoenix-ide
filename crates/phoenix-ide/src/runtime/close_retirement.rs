@@ -933,7 +933,7 @@ impl RuntimeManager {
             let (fresh_snapshot, _) = inspect_worktree(identity).await.map_err(|reason| {
                 format!("worktree cannot be reinspected before live resource retirement: {reason}")
             })?;
-            if fresh_snapshot != confirmed.snapshot {
+            if fresh_snapshot.fingerprint() != confirmed.snapshot.fingerprint() {
                 self.db()
                     .return_close_attempt_to_reinspection(attempt_id)
                     .await
@@ -1188,7 +1188,7 @@ impl RuntimeManager {
                         }
                     };
                     if let Some(fresh_snapshot) = fresh_snapshot {
-                        if fresh_snapshot != confirmed.snapshot {
+                        if fresh_snapshot.fingerprint() != confirmed.snapshot.fingerprint() {
                             return self
                                 .record_close_residual(
                                     attempt_id,
@@ -2003,7 +2003,7 @@ where
     let inspection_path = if path.exists() { &path } else { &quarantine };
     let (fresh_snapshot, _) =
         runtime.block_on(inspect_worktree_at(identity, inspection_path.clone()))?;
-    if &fresh_snapshot != confirmed_snapshot {
+    if fresh_snapshot.fingerprint() != confirmed_snapshot.fingerprint() {
         return Ok(ExactWorktreeRemoval::ReinspectionRequired {
             detail: "worktree changed after Close inspection confirmation; fresh confirmation is required"
                 .to_string(),
@@ -2065,7 +2065,65 @@ fn exact_worktree_administrative_dir(
 }
 
 fn quarantine_has_external_writer(path: &Path) -> Result<bool, String> {
-    Ok(quarantine_has_open_descriptors(path)? || quarantine_has_process_cwd(path)?)
+    Ok(quarantine_has_open_descriptors(path)?
+        || quarantine_has_process_cwd(path)?
+        || quarantine_has_writable_mappings(path)?)
+}
+
+#[cfg(target_os = "linux")]
+fn quarantine_has_writable_mappings(path: &Path) -> Result<bool, String> {
+    let canonical = std::fs::canonicalize(path).map_err(|error| {
+        format!("cannot canonicalize quarantine before mapping inspection: {error}")
+    })?;
+    for process in std::fs::read_dir("/proc")
+        .map_err(|error| format!("cannot enumerate process mappings: {error}"))?
+        .flatten()
+    {
+        if !process
+            .file_name()
+            .as_encoded_bytes()
+            .iter()
+            .all(u8::is_ascii_digit)
+        {
+            continue;
+        }
+        let mappings = match std::fs::read_to_string(process.path().join("maps")) {
+            Ok(mappings) => mappings,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                continue
+            }
+            Err(error) => return Err(format!("cannot inspect process mappings: {error}")),
+        };
+        for mapping in mappings.lines() {
+            let mut fields = mapping
+                .splitn(6, char::is_whitespace)
+                .filter(|field| !field.is_empty());
+            let _address = fields.next();
+            let permissions = fields.next().unwrap_or_default();
+            let _offset = fields.next();
+            let _device = fields.next();
+            let _inode = fields.next();
+            let mapped_path = fields.next().unwrap_or_default().trim_start();
+            if permissions.as_bytes().get(1) == Some(&b'w')
+                && permissions.as_bytes().get(3) == Some(&b's')
+                && path_is_within(Path::new(mapped_path), &canonical)
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::unnecessary_wraps)]
+fn quarantine_has_writable_mappings(_path: &Path) -> Result<bool, String> {
+    Ok(false)
 }
 
 #[cfg(target_os = "linux")]
@@ -2100,6 +2158,40 @@ fn quarantine_has_process_cwd(path: &Path) -> Result<bool, String> {
 }
 
 #[cfg(target_os = "macos")]
+fn macos_all_pids() -> Result<Vec<i32>, String> {
+    use std::mem::size_of;
+
+    let mut capacity = 4096_usize;
+    loop {
+        let mut pids = vec![0_i32; capacity];
+        let capacity_bytes = pids
+            .len()
+            .checked_mul(size_of::<i32>())
+            .ok_or_else(|| "process inventory size overflowed".to_string())?;
+        let pid_bytes = unsafe {
+            libc::proc_listpids(
+                1,
+                0,
+                pids.as_mut_ptr().cast(),
+                i32::try_from(capacity_bytes)
+                    .map_err(|_| "process inventory exceeds macOS API limit")?,
+            )
+        };
+        if pid_bytes < 0 {
+            return Err("cannot enumerate processes".to_string());
+        }
+        let pid_bytes = usize::try_from(pid_bytes).expect("nonnegative PID bytes");
+        if pid_bytes < capacity_bytes {
+            pids.truncate(pid_bytes / size_of::<i32>());
+            return Ok(pids);
+        }
+        capacity = capacity
+            .checked_mul(2)
+            .ok_or_else(|| "process inventory size overflowed".to_string())?;
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn quarantine_has_process_cwd(path: &Path) -> Result<bool, String> {
     use std::ffi::CStr;
     use std::mem::{size_of, MaybeUninit};
@@ -2108,19 +2200,7 @@ fn quarantine_has_process_cwd(path: &Path) -> Result<bool, String> {
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         format!("cannot canonicalize quarantine before cwd inspection: {error}")
     })?;
-    let mut pids = vec![0_i32; 4096];
-    let pid_bytes = unsafe {
-        libc::proc_listpids(
-            1,
-            0,
-            pids.as_mut_ptr().cast(),
-            i32::try_from(pids.len() * size_of::<i32>()).expect("PID buffer fits i32"),
-        )
-    };
-    if pid_bytes < 0 {
-        return Err("cannot enumerate process working directories".to_string());
-    }
-    pids.truncate(usize::try_from(pid_bytes).expect("nonnegative PID bytes") / size_of::<i32>());
+    let pids = macos_all_pids()?;
     for pid in pids.into_iter().filter(|pid| *pid > 0) {
         let mut info = MaybeUninit::<libc::proc_vnodepathinfo>::uninit();
         let bytes = unsafe {
@@ -2213,27 +2293,11 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<bool, String> {
         vnode: libc::vnode_info_path,
     }
 
-    const PROC_ALL_PIDS: u32 = 1;
     const PROC_PIDFDVNODEPATHINFO: i32 = 2;
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         format!("cannot canonicalize quarantined worktree before descriptor inspection: {error}")
     })?;
-    let mut pids = vec![0_i32; 4096];
-    // SAFETY: the vector provides writable storage for exactly the byte count passed.
-    let pid_bytes = unsafe {
-        libc::proc_listpids(
-            PROC_ALL_PIDS,
-            0,
-            pids.as_mut_ptr().cast(),
-            i32::try_from(pids.len() * size_of::<i32>()).expect("PID buffer fits i32"),
-        )
-    };
-    if pid_bytes < 0 {
-        return Err("cannot enumerate process descriptors".to_string());
-    }
-    pids.truncate(
-        usize::try_from(pid_bytes).expect("nonnegative PID byte count") / size_of::<i32>(),
-    );
+    let pids = macos_all_pids()?;
     for pid in pids.into_iter().filter(|pid| *pid > 0) {
         let mut descriptor_capacity = 256_usize;
         let descriptors = loop {

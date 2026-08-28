@@ -223,21 +223,10 @@ fn prepare_profile_dir_for_launch(
             profile.display(),
             marker.chrome_process.pid
         ))),
-        ExactProcessState::DeadOrReused => {
-            std::fs::remove_dir_all(&profile).map_err(|error| {
-                BrowserError::ProfileReuseRefused(format!(
-                    "failed to reclaim browser profile {}: {error}",
-                    profile.display()
-                ))
-            })?;
-            std::fs::create_dir_all(&profile).map_err(|error| {
-                BrowserError::LaunchFailed(format!(
-                    "failed to recreate reclaimed browser profile {}: {error}",
-                    profile.display()
-                ))
-            })?;
-            Ok(profile)
-        }
+        // A marker from a dead process epoch is not cleanup authority. Reuse
+        // the profile in place so cookies and other browser state survive the
+        // Phoenix restart; the next successful launch replaces the marker.
+        ExactProcessState::DeadOrReused => Ok(profile),
     }
 }
 
@@ -2900,7 +2889,7 @@ mod profile_marker_tests {
     }
 
     #[test]
-    fn dead_identity_reclaims_matching_profile() {
+    fn dead_identity_preserves_matching_profile_for_reuse() {
         let root = tempfile::tempdir().expect("temp root");
         let session_key = "scope-key";
         let profile = super::user_data_dir_for_key(root.path(), session_key);
@@ -2913,15 +2902,19 @@ mod profile_marker_tests {
         .expect("write dead marker");
 
         let prepared =
-            prepare_profile_dir_for_launch(root.path(), session_key).expect("reclaim dead");
+            prepare_profile_dir_for_launch(root.path(), session_key).expect("reuse prior epoch");
         assert_eq!(prepared, profile);
-        assert!(
-            !prepared.join("stale.txt").exists(),
-            "reclaimed profile must replace old contents"
+        assert_eq!(
+            std::fs::read_to_string(prepared.join("stale.txt")).expect("preserved contents"),
+            "stale"
         );
-        assert!(read_profile_marker(&prepared)
-            .expect("read marker after reclaim")
-            .is_none());
+        assert_eq!(
+            read_profile_marker(&prepared).expect("read retained marker"),
+            Some(marker(
+                session_key,
+                &launch_identity(999_999, 1, "dead-uuid")
+            ))
+        );
     }
 
     #[test]
