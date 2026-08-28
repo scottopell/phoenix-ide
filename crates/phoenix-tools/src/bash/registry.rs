@@ -2161,6 +2161,7 @@ mod tests {
             if child.try_wait().expect("try_wait").is_some() {
                 return;
             }
+            // test-timing-allow: OS child exit is asynchronous; `try_wait` is the causal signal.
             sleep(Duration::from_millis(50)).await;
         }
         unsafe {

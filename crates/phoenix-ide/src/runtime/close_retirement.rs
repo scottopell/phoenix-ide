@@ -1992,7 +1992,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detached_commit_held_by_another_worktree_is_not_reported_as_loss() {
+    async fn detached_commit_held_only_by_another_worktree_is_reported_as_loss() {
         let temp = tempfile::tempdir().unwrap();
         initialize_repository(temp.path());
         run_git(temp.path(), &["checkout", "--quiet", "--detach"]);
@@ -2014,7 +2014,7 @@ mod tests {
         let (_, losses) = inspect_worktree(&inspection_identity(temp.path()))
             .await
             .unwrap();
-        assert!(!losses
+        assert!(losses
             .iter()
             .any(|loss| matches!(loss, CloseLossItem::DetachedUnreachableCommit(_))));
         run_git(
@@ -2068,7 +2068,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initialized_submodule_clean_detached_commit_is_reported_as_loss() {
+    async fn initialized_submodule_detached_commit_is_reported_as_exact_oid_loss() {
         let temp = tempfile::tempdir().unwrap();
         let child = temp.path().join("child-detached");
         let parent = temp.path().join("parent-detached");
@@ -2133,11 +2133,9 @@ mod tests {
         let (_, losses) = inspect_worktree(&inspection_identity(&closing))
             .await
             .unwrap();
-        assert!(losses.iter().any(|loss| matches!(
-            loss,
-            CloseLossItem::InitializedSubmoduleState(path)
-                if path.as_bytes() == b"deps/child"
-        )));
+        assert!(losses
+            .iter()
+            .any(|loss| matches!(loss, CloseLossItem::DetachedUnreachableCommit(_))));
     }
 
     #[tokio::test]
