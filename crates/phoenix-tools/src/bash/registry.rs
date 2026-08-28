@@ -872,11 +872,6 @@ impl BashHandleRegistry {
             teardown_generation: Some(permit.generation()),
             ..CascadeBashReport::default()
         };
-        let removed_by_identity = permit
-            .removed_handles
-            .iter()
-            .map(|handle| (handle.launch_identity.clone(), Arc::clone(handle)))
-            .collect::<std::collections::HashMap<_, _>>();
         {
             let table = permit.entry.write().await;
             if !table.teardown_started || table.teardown_generation != permit.generation().0 {
@@ -908,20 +903,11 @@ impl BashHandleRegistry {
                         }
                         continue;
                     }
-                    if removed_by_identity.contains_key(&target.launch_identity) {
-                        let rc = unsafe { libc::kill(-target.pgid, libc::SIGKILL) };
-                        if rc != 0 {
-                            let err = std::io::Error::last_os_error();
-                            if err.raw_os_error() != Some(libc::ESRCH) {
-                                report.kill_failures.push((target.pgid, err.to_string()));
-                            }
-                        }
-                    } else {
-                        report.kill_failures.push((
-                            target.pgid,
-                            "bash process group is not bound to an owned live Handle".to_string(),
-                        ));
-                    }
+                    report.kill_failures.push((
+                        target.pgid,
+                        "refusing non-atomic process-group signal; retirement remains residual"
+                            .to_string(),
+                    ));
                 }
             }
         }
@@ -937,8 +923,12 @@ impl BashHandleRegistry {
             );
         }
         match verified {
-            BashRetirementOutcome::Retired(_) => BashRetirementOutcome::Retired(report),
-            BashRetirementOutcome::AbsenceVerified(_) => {
+            BashRetirementOutcome::Retired(verification) => {
+                report.kill_failures.extend(verification.kill_failures);
+                BashRetirementOutcome::Retired(report)
+            }
+            BashRetirementOutcome::AbsenceVerified(verification) => {
+                report.kill_failures.extend(verification.kill_failures);
                 BashRetirementOutcome::AbsenceVerified(report)
             }
         }
@@ -1147,7 +1137,7 @@ async fn snapshot_retirement_targets(handles: &[Arc<Handle>]) -> Vec<BashRetirem
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bash::handle::{FinalCause, Handle};
+    use crate::bash::handle::{BashLaunchIdentity, FinalCause, Handle};
     use phoenix_core::process_identity::ProcessIdentity;
 
     fn scope(name: &str) -> ResourceScopeKey {
@@ -2095,7 +2085,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     #[allow(clippy::similar_names)] // pgid/pid mirror spec field names
-    async fn cascade_bash_on_delete_kills_owned_handle_process_group() {
+    async fn cascade_bash_on_delete_fails_closed_for_live_process_group() {
         // Spawn a real `sleep` in its own process group, register a
         // matching Handle, and verify the cascade SIGKILLs it. We then
         // `wait()` on the child (which reaps the zombie) and assert the
@@ -2104,7 +2094,6 @@ mod tests {
         // and `try_wait()` would return Ok(None).
         use std::os::unix::process::CommandExt as _;
         use std::process::Stdio;
-        use tokio::time::{sleep, Duration};
 
         let mut cmd = std::process::Command::new("sleep");
         cmd.arg("60");
@@ -2140,9 +2129,17 @@ mod tests {
         let handles_arc = registry.get_or_create(&real_scope).await;
         {
             let mut g = handles_arc.write().await;
-            let h = Handle::new_live(
+            let process = phoenix_core::process_identity::current_process_identity(pid)
+                .expect("capture real child identity");
+            let h = Handle::new_live_for_actor_with_owner_and_launch_identity(
                 real_scope.clone(),
                 HandleId::new("b-1"),
+                BashLaunchIdentity {
+                    process,
+                    launch_uuid: "owned-real-child".to_string(),
+                },
+                "system".to_string(),
+                phoenix_core::work_scope::ResourceAuthority::Work,
                 "sleep 60".to_string(),
                 None,
                 pgid,
@@ -2155,19 +2152,12 @@ mod tests {
         let report =
             cascade_bash_on_delete(&registry, &real_scope, &work_actor("owner"), None).await;
         assert!(report.live_handle_pgids.contains(&pgid));
-        assert!(report.kill_failures.is_empty());
+        assert!(!report.kill_failures.is_empty(), "{report:?}");
         assert_eq!(registry.scope_count().await, 1);
-        for _ in 0..20 {
-            if child.try_wait().expect("try_wait").is_some() {
-                return;
-            }
-            // test-timing-allow: OS child exit is asynchronous; `try_wait` is the causal signal.
-            sleep(Duration::from_millis(50)).await;
-        }
+        assert!(child.try_wait().expect("try_wait").is_none());
         unsafe {
             let _ = libc::kill(pgid, libc::SIGKILL);
         }
         let _ = child.wait();
-        panic!("owned process group survived retirement SIGKILL");
     }
 }

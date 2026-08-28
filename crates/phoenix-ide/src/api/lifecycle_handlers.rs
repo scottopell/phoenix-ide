@@ -431,19 +431,15 @@ pub(crate) async fn cancel_close_before_retirement(
         ))));
     }
     state
-        .db
-        .cancel_close_before_retirement(obligation.attempt_id().as_str())
+        .runtime
+        .cancel_close_before_retirement(obligation.attempt_id())
         .await
         .map_err(|error| {
             AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                error.to_string(),
+                error.clone(),
                 "close_cancel_failed",
             )))
         })?;
-    state
-        .runtime
-        .cancel_close_resource_leases(obligation.attempt_id())
-        .await;
     Ok(Json(SuccessResponse { success: true }))
 }
 

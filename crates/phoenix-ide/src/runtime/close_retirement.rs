@@ -347,6 +347,22 @@ impl RuntimeManager {
         }
     }
 
+    pub(crate) async fn cancel_close_before_retirement(
+        &self,
+        attempt_id: &CloseAttemptId,
+    ) -> Result<(), String> {
+        let _execution = self
+            .close_retirement_execution
+            .lock(attempt_id.as_str())
+            .await;
+        self.db()
+            .cancel_close_before_retirement(attempt_id.as_str())
+            .await
+            .map_err(|error| error.to_string())?;
+        self.cancel_close_resource_leases(attempt_id).await;
+        Ok(())
+    }
+
     /// Acquires all scope fences, then seals the exact server-owned inventory.
     /// The fence stays held in `close_retirement_leases` through completion or repair.
     pub(crate) async fn capture_close_retirement_inventory(
@@ -1210,7 +1226,8 @@ async fn observe_detached_head_and_submodules(
                 detached_reachability_evidence(&path, &head_oid)?,
             ));
         }
-        observe_initialized_submodules(&path, &[], &mut result)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        observe_initialized_submodules(&path, &[], &mut result, deadline)?;
         Ok(result)
     })
     .await
@@ -1419,7 +1436,11 @@ fn observe_initialized_submodules(
     repository: &Path,
     relative_prefix: &[u8],
     observation: &mut WorktreeObservation,
+    deadline: std::time::Instant,
 ) -> Result<(), String> {
+    if std::time::Instant::now() >= deadline {
+        return Err("Git submodule inspection exceeded its aggregate deadline".to_string());
+    }
     let modules_file = repository.join(".gitmodules");
     if !modules_file.exists() {
         return Ok(());
@@ -1450,6 +1471,9 @@ fn observe_initialized_submodules(
         declarations.stdout.clone(),
     ));
     for declaration in declarations.stdout.split(|byte| *byte == 0) {
+        if std::time::Instant::now() >= deadline {
+            return Err("Git submodule inspection exceeded its aggregate deadline".to_string());
+        }
         if declaration.is_empty() {
             continue;
         }
@@ -1549,7 +1573,7 @@ fn observe_initialized_submodules(
                 Vec::new(),
             ));
         }
-        observe_initialized_submodules(&submodule_path, &relative_path, observation)?;
+        observe_initialized_submodules(&submodule_path, &relative_path, observation, deadline)?;
     }
     Ok(())
 }
