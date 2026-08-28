@@ -557,7 +557,7 @@ impl Handle {
                 Err(error)
             };
         }
-        if current_process_identity(live.pid) != Some(live.launch_identity.process) {
+        if current_process_identity(live.pid) != Some(self.launch_identity.process) {
             let pidfd = i32::try_from(pidfd)
                 .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
             if unsafe { libc::close(pidfd) } != 0 {
