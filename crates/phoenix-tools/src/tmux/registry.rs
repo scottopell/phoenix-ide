@@ -1327,7 +1327,8 @@ impl TmuxRegistry {
                 "#{{==:#{{E:{SERVER_TOKEN_VAR}}},{}}}",
                 permit.instance.server_token
             );
-            match tokio::process::Command::new("tmux")
+            let mut command = tokio::process::Command::new("tmux");
+            command
                 .arg("-f")
                 .arg(self.config_path())
                 .arg("-S")
@@ -1342,11 +1343,12 @@ impl TmuxRegistry {
                 .env_remove("TMUX")
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()
-                .await
-            {
-                Ok(output) if output.status.success() => {
+                .stderr(Stdio::piped());
+            match tokio::time::timeout(std::time::Duration::from_secs(5), command.output()).await {
+                Err(_) => Some(TmuxRetirementOutcome::RemovalFailed {
+                    reason: "tmux exact teardown command exceeded its deadline".to_string(),
+                }),
+                Ok(Ok(output)) if output.status.success() => {
                     if String::from_utf8_lossy(&output.stdout).contains("PHOENIX_TOKEN_MISMATCH") {
                         Some(TmuxRetirementOutcome::IdentityNotProven {
                             reason: "tmux server token changed before exact teardown".to_string(),
@@ -1355,13 +1357,13 @@ impl TmuxRegistry {
                         None
                     }
                 }
-                Ok(output) => Some(TmuxRetirementOutcome::RemovalFailed {
+                Ok(Ok(output)) => Some(TmuxRetirementOutcome::RemovalFailed {
                     reason: format!(
                         "exact token-bound kill-server failed: {}",
                         String::from_utf8_lossy(&output.stderr).trim()
                     ),
                 }),
-                Err(error) => Some(TmuxRetirementOutcome::RemovalFailed {
+                Ok(Err(error)) => Some(TmuxRetirementOutcome::RemovalFailed {
                     reason: error.to_string(),
                 }),
             }
