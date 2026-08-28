@@ -499,11 +499,26 @@ async fn validate_adopted_absence_evidence(
                        AND identity_codec = ?7 AND identity_value = ?8
                        AND proof_kind = 'retired'
                      UNION ALL
-                     SELECT 1 FROM close_retirement_resource_dispatches
-                     WHERE attempt_id = ?1 AND scope = ?2 AND inspection_generation = ?3
-                       AND inspection_fingerprint = ?4
-                       AND resource_kind = ?5 AND identity_kind = ?6
-                       AND identity_codec = ?7 AND identity_value = ?8
+                     SELECT 1 FROM close_retirement_resource_dispatches dispatch
+                     WHERE dispatch.attempt_id = ?1 AND dispatch.scope = ?2
+                       AND dispatch.inspection_generation = ?3
+                       AND dispatch.inspection_fingerprint = ?4
+                       AND dispatch.resource_kind = ?5 AND dispatch.identity_kind = ?6
+                       AND dispatch.identity_codec = ?7 AND dispatch.identity_value = ?8
+                       AND (
+                           dispatch.resource_kind <> 'worktree'
+                           OR EXISTS (
+                               SELECT 1 FROM close_worktree_cleanup_plans plan
+                               WHERE plan.attempt_id = dispatch.attempt_id
+                                 AND plan.scope = dispatch.scope
+                                 AND plan.inspection_generation = dispatch.inspection_generation
+                                 AND plan.inspection_fingerprint = dispatch.inspection_fingerprint
+                                 AND plan.resource_kind = dispatch.resource_kind
+                                 AND plan.identity_kind = dispatch.identity_kind
+                                 AND plan.identity_codec = dispatch.identity_codec
+                                 AND plan.identity_value = dispatch.identity_value
+                           )
+                       )
                  )",
             )
             .bind(request.attempt_id.as_str())
@@ -3121,7 +3136,7 @@ impl Database {
              WHERE attempt_id = ?1 AND scope = ?2
                AND resource_kind = ?3 AND identity_kind = ?4
                AND identity_codec = ?5 AND identity_value = ?6
-             ORDER BY (inspection_generation = ?7 AND inspection_fingerprint = ?8) DESC",
+               AND inspection_generation = ?7 AND inspection_fingerprint = ?8",
         )
         .bind(attempt_id.as_str())
         .bind(scope.as_str())
@@ -3137,7 +3152,7 @@ impl Database {
             [] => Ok(None),
             [(codec, value)] => decode_host_path(codec, value).map(Some),
             _ => Err(close_precondition(
-                "same-attempt worktree cleanup authority has conflicting plans",
+                "exact worktree cleanup authority has conflicting plans",
             )),
         }
     }
@@ -7913,6 +7928,93 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(divergent, DbError::CloseFoundationPrecondition(_)));
+    }
+
+    #[tokio::test]
+    async fn interrupted_worktree_cleanup_adopts_absence_only_with_exact_durable_plan() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let scope = allocate_scope_worktree(&db, "root").await;
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-crash-boundary",
+        )
+        .await
+        .unwrap();
+        set_close_phase(
+            &db,
+            "attempt-crash-boundary",
+            ClosePhase::RetirementRequested,
+        )
+        .await;
+        let attempt_id = CloseAttemptId::parse("attempt-crash-boundary").unwrap();
+        let snapshot = current_test_snapshot(&db, attempt_id.as_str()).await;
+        let resource = RetiredResourceIdentity::parse(
+            RetiredResourceKind::Worktree,
+            LossItemIdentity::Worktree(current_test_worktree(&db, &scope).await),
+        )
+        .unwrap();
+        capture_test_inventory(
+            &db,
+            attempt_id.as_str(),
+            &scope,
+            &snapshot,
+            vec![resource.clone()],
+        )
+        .await;
+        db.record_close_retirement_dispatch(RecordCloseRetirementDispatchRequest {
+            attempt_id: attempt_id.clone(),
+            scope: scope.clone(),
+            snapshot: snapshot.clone(),
+            resource: resource.clone(),
+        })
+        .await
+        .unwrap();
+        let absence = || RecordCloseRetirementEvidenceRequest {
+            attempt_id: attempt_id.clone(),
+            scope: scope.clone(),
+            snapshot: snapshot.clone(),
+            resource: resource.clone(),
+            outcome: RetirementOutcome::AbsenceAdopted {
+                absence_basis: AbsenceBasis::SameAttemptPriorRetirement,
+            },
+            detail: Some("restart observed completed planned cleanup".to_string()),
+        };
+
+        let missing_plan = db
+            .record_close_retirement_evidence(absence())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            missing_plan,
+            DbError::CloseFoundationPrecondition(_)
+        ));
+
+        db.record_close_worktree_cleanup_plan(RecordCloseWorktreeCleanupPlanRequest {
+            attempt_id: attempt_id.clone(),
+            scope: scope.clone(),
+            snapshot: snapshot.clone(),
+            resource: resource.clone(),
+            administrative_dir: std::path::PathBuf::from("/tmp/crash-boundary-admin"),
+        })
+        .await
+        .unwrap();
+        db.record_close_retirement_evidence(absence())
+            .await
+            .unwrap();
+
+        let evidence = db
+            .list_close_retirement_evidence("attempt-crash-boundary")
+            .await
+            .unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(
+            evidence[0].outcome,
+            RetirementOutcome::AbsenceAdopted {
+                absence_basis: AbsenceBasis::SameAttemptPriorRetirement,
+            }
+        );
     }
 
     #[tokio::test]

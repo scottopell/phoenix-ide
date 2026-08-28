@@ -450,6 +450,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "rotate_worktree_less_close_retry_inventory",
         sql: MIGRATION_086,
     },
+    Migration {
+        version: 87,
+        name: "require_worktree_cleanup_plan_for_adopted_absence",
+        sql: MIGRATION_087,
+    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -8432,6 +8437,61 @@ BEGIN
     UPDATE close_obligations
     SET inspection_generation = NULL, inspection_fingerprint = NULL
     WHERE attempt_id = NEW.attempt_id;
+END;
+";
+
+const MIGRATION_087: &str = r"
+CREATE TRIGGER close_worktree_absence_requires_cleanup_plan_on_insert
+BEFORE INSERT ON close_retirement_resources
+FOR EACH ROW
+WHEN NEW.resource_kind = 'worktree'
+ AND NEW.proof_kind = 'absence_adopted'
+ AND NEW.absence_basis = 'same_attempt_prior_retirement'
+ AND NOT EXISTS (
+    SELECT 1 FROM close_retirement_resources proof
+    WHERE proof.attempt_id = NEW.attempt_id AND proof.scope = NEW.scope
+      AND proof.inspection_generation = NEW.inspection_generation
+      AND proof.inspection_fingerprint = NEW.inspection_fingerprint
+      AND proof.resource_kind = NEW.resource_kind AND proof.identity_kind = NEW.identity_kind
+      AND proof.identity_codec = NEW.identity_codec AND proof.identity_value = NEW.identity_value
+      AND proof.proof_kind = 'retired'
+ )
+ AND NOT EXISTS (
+    SELECT 1 FROM close_worktree_cleanup_plans plan
+    WHERE plan.attempt_id = NEW.attempt_id AND plan.scope = NEW.scope
+      AND plan.inspection_generation = NEW.inspection_generation
+      AND plan.inspection_fingerprint = NEW.inspection_fingerprint
+      AND plan.resource_kind = NEW.resource_kind AND plan.identity_kind = NEW.identity_kind
+      AND plan.identity_codec = NEW.identity_codec AND plan.identity_value = NEW.identity_value
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'adopted worktree absence requires exact cleanup plan');
+END;
+
+CREATE TRIGGER close_worktree_absence_requires_cleanup_plan_on_update
+BEFORE UPDATE ON close_retirement_resources
+FOR EACH ROW
+WHEN NEW.resource_kind = 'worktree'
+ AND NEW.proof_kind = 'absence_adopted'
+ AND NEW.absence_basis = 'same_attempt_prior_retirement'
+ AND (
+     OLD.proof_kind <> 'absence_adopted' OR OLD.absence_basis IS NOT NEW.absence_basis
+     OR OLD.attempt_id <> NEW.attempt_id OR OLD.scope <> NEW.scope
+     OR OLD.inspection_generation <> NEW.inspection_generation
+     OR OLD.inspection_fingerprint <> NEW.inspection_fingerprint
+     OR OLD.resource_kind <> NEW.resource_kind OR OLD.identity_kind <> NEW.identity_kind
+     OR OLD.identity_codec <> NEW.identity_codec OR OLD.identity_value <> NEW.identity_value
+ )
+ AND NOT EXISTS (
+    SELECT 1 FROM close_worktree_cleanup_plans plan
+    WHERE plan.attempt_id = NEW.attempt_id AND plan.scope = NEW.scope
+      AND plan.inspection_generation = NEW.inspection_generation
+      AND plan.inspection_fingerprint = NEW.inspection_fingerprint
+      AND plan.resource_kind = NEW.resource_kind AND plan.identity_kind = NEW.identity_kind
+      AND plan.identity_codec = NEW.identity_codec AND plan.identity_value = NEW.identity_value
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'adopted worktree absence requires exact cleanup plan');
 END;
 ";
 
