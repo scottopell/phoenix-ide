@@ -2580,25 +2580,85 @@ impl Database {
     pub async fn resume_close_retirement_after_dispatched_absence(
         &self,
         attempt_id: &CloseAttemptId,
-        snapshot: &CloseRetirementSnapshot,
-    ) -> DbResult<()> {
+        retained_snapshot: &CloseRetirementSnapshot,
+        replacement_generation: &str,
+    ) -> DbResult<CloseRetirementSnapshot> {
+        let inspections = self
+            .list_close_retirement_inspections(attempt_id.as_str())
+            .await?;
+        let losses = self
+            .list_close_retirement_losses(attempt_id.as_str())
+            .await?;
+        let scopes = inspections
+            .into_iter()
+            .map(|inspection| {
+                let snapshot = CloseRetirementSnapshot::parse(
+                    replacement_generation,
+                    inspection.snapshot.fingerprint().to_string(),
+                )
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+                let scope = inspection.target.scope;
+                let scoped_losses = losses
+                    .iter()
+                    .filter(|loss| loss.scope == scope)
+                    .map(|loss| loss.item.clone())
+                    .collect();
+                Ok(ReplaceCloseInspectionScopeRequest {
+                    scope,
+                    snapshot,
+                    losses: scoped_losses,
+                })
+            })
+            .collect::<DbResult<Vec<_>>>()?;
+        let mut ordered_scopes = scopes.iter().collect::<Vec<_>>();
+        ordered_scopes.sort_by(|left, right| left.scope.cmp(&right.scope));
+        let replacement_snapshot = CloseRetirementSnapshot::parse(
+            encode_aggregate_snapshot_component(
+                ordered_scopes
+                    .iter()
+                    .map(|scope| (&scope.scope, scope.snapshot.generation())),
+            ),
+            encode_aggregate_snapshot_component(
+                ordered_scopes
+                    .iter()
+                    .map(|scope| (&scope.scope, scope.snapshot.fingerprint())),
+            ),
+        )
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let obligation = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
         if obligation.phase() != ClosePhase::AwaitingRetirementInspection
-            || obligation.snapshot() != Some(snapshot)
+            || obligation.snapshot() != Some(retained_snapshot)
         {
             return Err(close_precondition(format!(
                 "attempt {attempt_id} dispatched absence requires retained retry inspection authority"
             )));
         }
-        set_close_phase_tx(
-            &mut tx,
-            attempt_id.as_str(),
-            ClosePhase::RetirementRequested,
+        let request = ReplaceCloseInspectionRequest {
+            attempt_id: attempt_id.clone(),
+            scopes,
+        };
+        self.clear_retirement_inspection_rows(&mut tx, attempt_id.as_str())
+            .await?;
+        self.insert_retirement_inspection_rows(&mut tx, &request)
+            .await?;
+        sqlx::query(
+            "UPDATE close_obligations
+             SET phase = 'retirement_requested',
+                 inspection_generation = ?2,
+                 inspection_fingerprint = ?3,
+                 updated_at = ?4
+             WHERE attempt_id = ?1 AND phase = 'awaiting_retirement_inspection'",
         )
+        .bind(attempt_id.as_str())
+        .bind(replacement_snapshot.generation())
+        .bind(replacement_snapshot.fingerprint())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(())
+        Ok(replacement_snapshot)
     }
 
     /// Reports whether every captured scope has a sealed inventory for the active snapshot.
@@ -8671,12 +8731,21 @@ mod tests {
         .unwrap();
         db.retry_close_retirement(&attempt).await.unwrap();
 
-        db.resume_close_retirement_after_dispatched_absence(&attempt, &snapshot)
+        let replacement = db
+            .resume_close_retirement_after_dispatched_absence(
+                &attempt,
+                &snapshot,
+                "server_git_status_v2_retry_dispatched_absence",
+            )
             .await
             .unwrap();
         let resumed = db.get_close_obligation(attempt.as_str()).await.unwrap();
         assert_eq!(resumed.phase(), ClosePhase::RetirementRequested);
-        assert_eq!(resumed.snapshot(), Some(&snapshot));
+        assert_eq!(resumed.snapshot(), Some(&replacement));
+        assert!(!db
+            .close_retirement_inventory_is_complete(attempt.as_str())
+            .await
+            .unwrap());
     }
 
     #[test]

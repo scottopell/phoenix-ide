@@ -120,6 +120,16 @@ impl RuntimeManager {
                     let quarantine = worktree_quarantine_path(&identity)?;
                     match path.try_exists() {
                         Ok(true) => {
+                            if observe_worktree_fingerprint(&path).as_deref()
+                                != Some(identity.fingerprint().as_str())
+                            {
+                                self.db()
+                                    .route_close_attempt_to_repair(&attempt_id)
+                                    .await
+                                    .map_err(|error| error.to_string())?;
+                                return Err("captured worktree administrative incarnation changed"
+                                    .to_string());
+                            }
                             let (snapshot, losses) = inspect_worktree(&identity).await?;
                             (
                                 rotate_inspection_generation(
@@ -134,6 +144,16 @@ impl RuntimeManager {
                                 format!("cannot observe quarantined worktree path: {error}")
                             })? =>
                         {
+                            if observe_worktree_fingerprint(&quarantine).as_deref()
+                                != Some(identity.fingerprint().as_str())
+                            {
+                                self.db()
+                                    .route_close_attempt_to_repair(&attempt_id)
+                                    .await
+                                    .map_err(|error| error.to_string())?;
+                                return Err("captured worktree administrative incarnation changed"
+                                    .to_string());
+                            }
                             let (snapshot, losses) =
                                 inspect_worktree_at(&identity, quarantine).await?;
                             (
@@ -168,18 +188,27 @@ impl RuntimeManager {
                                     .map_err(|error| error.to_string())?
                                 {
                                     if continue_clean_retirement {
-                                        if obligation.phase()
+                                        let active_snapshot = if obligation.phase()
                                             == ClosePhase::AwaitingRetirementInspection
                                         {
                                             self.db()
                                                 .resume_close_retirement_after_dispatched_absence(
                                                     &attempt_id,
                                                     &prior_snapshot,
+                                                    reinspection_generation.as_deref().ok_or_else(
+                                                        || {
+                                                            "dispatched absence retry lacks replacement generation"
+                                                                .to_string()
+                                                        },
+                                                    )?,
                                                 )
                                                 .await
-                                                .map_err(|error| error.to_string())?;
-                                        }
+                                                .map_err(|error| error.to_string())?
+                                        } else {
+                                            prior_snapshot
+                                        };
                                         self.retire_close_runtime_resources(attempt_id).await?;
+                                        return Ok(active_snapshot);
                                     }
                                     return Ok(prior_snapshot);
                                 }
@@ -546,11 +575,7 @@ impl RuntimeManager {
             .close_retirement_inventory_is_complete(attempt_id.as_str())
             .await
             .map_err(|error| error.to_string())?;
-        if !inventory_is_complete
-            && snapshot
-                .generation()
-                .contains("server_git_status_v2_retry_")
-        {
+        if !inventory_is_complete {
             self.capture_close_retirement_inventory(attempt_id.clone(), snapshot.clone())
                 .await?;
         }
@@ -2162,6 +2187,11 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<bool, String> {
     Ok(false)
 }
 
+fn descriptor_inventory_may_be_truncated(returned_bytes: usize, capacity_bytes: usize) -> bool {
+    returned_bytes >= capacity_bytes
+}
+
+#[allow(clippy::too_many_lines)]
 #[cfg(target_os = "macos")]
 fn quarantine_has_open_descriptors(path: &Path) -> Result<bool, String> {
     use std::ffi::CStr;
@@ -2204,31 +2234,40 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<bool, String> {
         usize::try_from(pid_bytes).expect("nonnegative PID byte count") / size_of::<i32>(),
     );
     for pid in pids.into_iter().filter(|pid| *pid > 0) {
-        let mut descriptors = vec![
-            libc::proc_fdinfo {
-                proc_fd: 0,
-                proc_fdtype: 0
+        let mut descriptor_capacity = 256_usize;
+        let descriptors = loop {
+            let mut descriptors = vec![
+                libc::proc_fdinfo {
+                    proc_fd: 0,
+                    proc_fdtype: 0
+                };
+                descriptor_capacity
+            ];
+            let capacity_bytes = descriptors.len() * size_of::<libc::proc_fdinfo>();
+            // SAFETY: the vector provides writable storage for exactly the byte count passed.
+            let descriptor_bytes = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDLISTFDS,
+                    0,
+                    descriptors.as_mut_ptr().cast(),
+                    i32::try_from(capacity_bytes)
+                        .map_err(|_| "process descriptor inventory exceeds macOS API limit")?,
+                )
             };
-            256
-        ];
-        // SAFETY: the vector provides writable storage for exactly the byte count passed.
-        let descriptor_bytes = unsafe {
-            libc::proc_pidinfo(
-                pid,
-                libc::PROC_PIDLISTFDS,
-                0,
-                descriptors.as_mut_ptr().cast(),
-                i32::try_from(descriptors.len() * size_of::<libc::proc_fdinfo>())
-                    .expect("descriptor buffer fits i32"),
-            )
+            if descriptor_bytes <= 0 {
+                break Vec::new();
+            }
+            let descriptor_bytes =
+                usize::try_from(descriptor_bytes).expect("positive descriptor byte count");
+            if !descriptor_inventory_may_be_truncated(descriptor_bytes, capacity_bytes) {
+                descriptors.truncate(descriptor_bytes / size_of::<libc::proc_fdinfo>());
+                break descriptors;
+            }
+            descriptor_capacity = descriptor_capacity
+                .checked_mul(2)
+                .ok_or_else(|| "process descriptor inventory size overflowed".to_string())?;
         };
-        if descriptor_bytes <= 0 {
-            continue;
-        }
-        descriptors.truncate(
-            usize::try_from(descriptor_bytes).expect("positive descriptor byte count")
-                / size_of::<libc::proc_fdinfo>(),
-        );
         for descriptor in descriptors
             .into_iter()
             .filter(|descriptor| descriptor.proc_fdtype == libc::PROX_FDTYPE_VNODE as u32)
@@ -2687,7 +2726,8 @@ fn require_browser_absent(outcome: BrowserRetirementOutcome) -> Result<(), Strin
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_status_observation, exact_worktree_administrative_dir, git_path_from_observation,
+        canonical_status_observation, descriptor_inventory_may_be_truncated,
+        exact_worktree_administrative_dir, git_path_from_observation,
         inspect_and_remove_exact_worktree_with_hook, inspect_worktree, parse_status_losses,
         quarantine_and_remove_exact_worktree, rotate_inspection_generation,
         run_bounded_git_status_until, snapshot_for, staged_index_entries_by_path,
@@ -2698,6 +2738,13 @@ mod tests {
         CloseLossItem, GitPathIdentity, WorktreeFingerprint, WorktreeId, WorktreeIdentity,
     };
     use std::path::Path;
+
+    #[test]
+    fn full_descriptor_buffer_requires_larger_inventory() {
+        assert!(descriptor_inventory_may_be_truncated(4096, 4096));
+        assert!(descriptor_inventory_may_be_truncated(8192, 4096));
+        assert!(!descriptor_inventory_may_be_truncated(4080, 4096));
+    }
 
     fn run_git(repository: &Path, arguments: &[&str]) {
         let output = phoenix_core::git::command()

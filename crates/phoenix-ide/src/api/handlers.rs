@@ -13369,10 +13369,9 @@ pub(crate) mod hard_delete_cascade_tests {
         (tmp, repo, worktree, branch)
     }
 
-    /// Legacy Work-mode chain fixtures without a complete sealed Close inventory
-    /// fail closed without mutating their shared worktree or branch ref.
+    /// A first-pass Work-mode Close captures its inventory before retirement.
     #[tokio::test]
-    async fn archive_chain_without_close_inventory_fails_closed() {
+    async fn archive_chain_captures_first_pass_close_inventory() {
         let state = make_test_state().await;
         let ids = ["sc-a", "sc-a2", "sc-a3"];
         let (_tmp, repo, worktree, branch) =
@@ -13384,26 +13383,25 @@ pub(crate) mod hard_delete_cascade_tests {
             "precondition: branch must exist"
         );
 
-        let error = crate::api::chains::archive_chain_handler(
+        let _ = crate::api::chains::archive_chain_handler(
             axum::extract::State(state.clone()),
             axum::extract::Path("sc-a".to_string()),
         )
         .await
-        .expect_err("incomplete Close inventory must fail closed");
-        assert!(matches!(error, AppError::Conflict(_)));
+        .expect("first-pass Close must capture inventory and converge");
 
-        assert!(worktree.exists(), "failed Close must preserve the worktree");
+        assert!(!worktree.exists(), "Close must retire the shared worktree");
         assert!(
             crate::git_ops::run_git(&repo, &["rev-parse", "--verify", &branch]).is_ok(),
-            "Close must preserve the shared task branch"
+            "archive preserves the shared task branch"
         );
         for id in ids {
             let conv = state
                 .db
                 .get_conversation(id)
                 .await
-                .unwrap_or_else(|_| panic!("{id} row preserved"));
-            assert!(!conv.archived, "{id} must remain active after failed Close");
+                .unwrap_or_else(|_| panic!("{id} row preserved in History"));
+            assert!(conv.archived, "{id} must be archived after Close");
         }
     }
 
