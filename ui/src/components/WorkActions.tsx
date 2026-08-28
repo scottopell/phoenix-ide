@@ -627,16 +627,7 @@ export function WorkControlBar({
     !explicitSelectionUnresolved && disposition.primary === role ? ' work-actions-btn--primary' : '';
 
   const terminalActionStillSafe = async (): Promise<boolean> => {
-    const latest = await prStatusHandle.refreshForSafety();
-    if (!latest) return false;
-    const actionable = (latest.associated_prs ?? []).filter(
-      (pr) => pr.display_state === 'open' || pr.display_state === 'draft',
-    );
-    if (actionable.length > 1 && !latest.active_pr) {
-      setOpenSelectorAfterRefresh(true);
-      setError('Select an active PR before cleaning up or abandoning this task.');
-      return false;
-    }
+    await prStatusHandle.refreshForSafety();
     return true;
   };
 

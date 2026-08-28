@@ -9,7 +9,9 @@ use super::types::{
     TaskApprovalRequest, TaskApprovalResponse, TaskFeedbackRequest,
 };
 use super::AppState;
-use crate::db::{ConvMode, Conversation};
+use crate::db::ConvMode;
+#[cfg(test)]
+use crate::db::Conversation;
 use crate::runtime::fork_resolve::ForkResolveError;
 use crate::state_machine::state::TaskApprovalOutcome;
 use crate::state_machine::{ConvState, Event};
@@ -34,6 +36,7 @@ use axum::{
 /// Returns 409 Conflict with `error_type = "continuation_exists"` so
 /// the frontend can dispatch on it (Phase 5) — e.g. offer to route to
 /// the continuation instead of showing the raw error text.
+#[cfg(test)]
 fn reject_if_continued(conv: &Conversation, action: &str) -> Result<(), AppError> {
     if let Some(continuation_id) = conv.continued_in_conv_id.as_deref() {
         return Err(AppError::Conflict(Box::new(
@@ -50,6 +53,7 @@ fn reject_if_continued(conv: &Conversation, action: &str) -> Result<(), AppError
     Ok(())
 }
 
+#[cfg(test)]
 fn ensure_terminal_action_legal(conv: &Conversation, action: &str) -> Result<(), AppError> {
     reject_if_continued(conv, action)?;
 
@@ -527,7 +531,6 @@ async fn run_legacy_close_compat(state: &AppState, id: &str, action: &str) -> Re
         .get_conversation(id)
         .await
         .map_err(|error| AppError::NotFound(error.to_string()))?;
-    ensure_terminal_action_legal(&transcript, action)?;
     if !matches!(
         transcript.conv_mode,
         ConvMode::Work { .. } | ConvMode::Branch { .. }

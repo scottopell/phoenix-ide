@@ -1068,6 +1068,7 @@ impl ConflictErrorResponse {
         self
     }
 
+    #[cfg(test)]
     pub fn with_continuation_id(mut self, id: impl Into<String>) -> Self {
         self.continuation_id = Some(id.into());
         self

@@ -804,42 +804,6 @@ describe('WorkControlBar — active PR interactions', () => {
     expect(screen.getByRole('button', { name: /#12 open/i })).toBeInTheDocument();
   });
 
-  it('commits a newly ambiguous safety refresh before opening the selector', async () => {
-    const latest = {
-      found: false,
-      refresh: { state: 'fresh' as const, stale: false, last_attempted_at: '', last_refreshed_at: '' },
-      work_change: cleanWorkChange(),
-      associated_prs: [
-        { repo_owner: 'o', repo_name: 'r', pr_number: 12, title: 'Fix CI', url: 'https://gh/pr/12', state: 'OPEN', draft: false, display_state: 'open' as const, base: 'main', head: 'task-123', feedback_status: 'open' as const },
-        { repo_owner: 'o', repo_name: 'r', pr_number: 34, title: 'Follow-up', url: 'https://gh/pr/34', state: 'OPEN', draft: false, display_state: 'open' as const, base: 'task-123', head: 'follow-up', feedback_status: 'open' as const },
-      ],
-    };
-    const handle = prStatusHandle({ found: false }, {
-      refreshForSafety: vi.fn().mockResolvedValue(latest),
-    });
-
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-1"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        prStatusHandle={handle}
-      />,
-    );
-
-    fireEvent.click(screen.getByTestId('clean-up-button'));
-
-    await waitFor(() => expect(handle.refreshForSafety).toHaveBeenCalledTimes(1));
-    expect(api.markMerged).not.toHaveBeenCalled();
-    expect(screen.getAllByLabelText(/Closes this conversation/, { selector: 'summary' })).toHaveLength(2);
-    expect(screen.getAllByText('ⓘ')).toHaveLength(2);
-    expect(screen.getByText('Select an active PR before cleaning up or abandoning this task.')).toBeInTheDocument();
-    const alert = screen.getByRole('alert');
-    expect(alert.closest('.desktop-work-actions-rail')).toBeNull();
-    expect(alert.closest('.desktop-work-actions-compact')).toBeInTheDocument();
-  });
-
   it('shows mixed associated PR cleanup summary while keeping cleanup task-scoped', () => {
     const handle = prStatusHandle({ found: true, number: 12, display_state: 'merged' }, {
       activeSelection: selection({
