@@ -5345,10 +5345,16 @@ async fn archive_conversation(
         .get_conversation(&id)
         .await
         .map_err(|error| AppError::NotFound(error.to_string()))?;
-    if matches!(
+    let has_allocated_worktree = matches!(
         conversation.conv_mode,
-        ConvMode::Work { .. } | ConvMode::Branch { .. }
-    ) {
+        ConvMode::Work { .. }
+            | ConvMode::Branch { .. }
+            | ConvMode::Explore {
+                worktree_path: Some(_),
+                ..
+            }
+    );
+    if has_allocated_worktree {
         super::lifecycle_handlers::close_legacy_compat(&state, &id, "archive").await?;
     } else {
         run_archive_cascade(&state, &id).await?;

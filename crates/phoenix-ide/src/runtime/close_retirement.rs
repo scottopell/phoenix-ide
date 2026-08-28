@@ -1010,8 +1010,9 @@ impl RuntimeManager {
                     .await
                     .map_err(|error| error.to_string())?;
                     let fresh_snapshot: Option<CloseRetirementSnapshot> = match final_removal {
+                        Ok(ExactWorktreeRemoval::Retired) => None,
                         Ok(ExactWorktreeRemoval::Missing { reason }) => {
-                            let absence_basis = AbsenceBasis::PreexistingExactIdentityEvidence;
+                            let absence_basis = AbsenceBasis::SameAttemptPriorRetirement;
                             let adopted = self
                                 .db()
                                 .record_close_retirement_evidence(
@@ -1514,13 +1515,25 @@ fn run_bounded_git_status_until(
         command.process_group(0);
     }
     let mut child = command.spawn().map_err(|error| error.to_string())?;
-    loop {
-        if child
-            .try_wait()
-            .map_err(|error| error.to_string())?
-            .is_some()
-        {
-            return child.wait_with_output().map_err(|error| error.to_string());
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("Git status stdout was not piped")?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or("Git status stderr was not piped")?;
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::BufReader::new(stdout), &mut bytes).map(|_| bytes)
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::BufReader::new(stderr), &mut bytes).map(|_| bytes)
+    });
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            break status;
         }
         if std::time::Instant::now() >= deadline {
             #[cfg(unix)]
@@ -1532,10 +1545,25 @@ fn run_bounded_git_status_until(
             #[cfg(not(unix))]
             let _ = child.kill();
             child.wait().map_err(|error| error.to_string())?;
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
             return Err("Git status inspection exceeded its deadline".to_string());
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| "Git status stdout reader panicked".to_string())?
+        .map_err(|error| error.to_string())?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| "Git status stderr reader panicked".to_string())?
+        .map_err(|error| error.to_string())?;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 type IndexedGitlinks = (Vec<u8>, Vec<(GitPathIdentity, Vec<u8>)>);
@@ -1778,6 +1806,7 @@ fn worktree_quarantine_path(identity: &WorktreeIdentity) -> Result<PathBuf, Stri
 }
 
 enum ExactWorktreeRemoval {
+    Retired,
     Missing { reason: String },
     ReinspectionRequired { detail: String },
     Residual { detail: String },
@@ -1990,7 +2019,11 @@ where
     }
     let expected = identity.fingerprint().as_str().to_string();
     tokio::task::spawn_blocking(move || {
-        let inspection_path = if resuming_quarantine { &quarantine } else { &path };
+        let inspection_path = if resuming_quarantine {
+            &quarantine
+        } else {
+            &path
+        };
         let common = phoenix_core::git::command()
             .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
             .current_dir(inspection_path)
@@ -2071,12 +2104,20 @@ where
                 ),
             });
         }
-        Ok(ExactWorktreeRemoval::Residual {
-            detail: format!(
-                "writer exclusion cannot be held through recursive deletion; confirmed worktree retained at {}",
-                quarantine.display()
-            ),
-        })
+        std::fs::remove_dir_all(&quarantine)
+            .map_err(|error| format!("cannot remove quarantined worktree: {error}"))?;
+        let prune = phoenix_core::git::command()
+            .args(["worktree", "prune", "--expire", "now"])
+            .current_dir(&repo)
+            .output()
+            .map_err(|error| format!("cannot prune retired worktree registration: {error}"))?;
+        if !prune.status.success() {
+            return Err(format!(
+                "cannot prune retired worktree registration: {}",
+                String::from_utf8_lossy(&prune.stderr).trim()
+            ));
+        }
+        Ok(ExactWorktreeRemoval::Retired)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -2334,19 +2375,37 @@ mod tests {
         let outcome = quarantine_and_remove_exact_worktree(&identity, |_| {})
             .await
             .unwrap();
-        let ExactWorktreeRemoval::Residual { detail } = outcome else {
-            panic!("worktree must remain quarantined without writer exclusion");
-        };
-        assert!(detail.contains("writer exclusion"));
+        assert!(matches!(outcome, ExactWorktreeRemoval::Retired));
         assert!(!linked.exists());
-        assert!(worktree_quarantine_path(&identity).unwrap().exists());
+        assert!(!worktree_quarantine_path(&identity).unwrap().exists());
         let listing = phoenix_core::git::command()
             .args(["worktree", "list", "--porcelain"])
             .current_dir(&bare)
             .output()
             .unwrap();
         assert!(listing.status.success());
-        assert!(String::from_utf8_lossy(&listing.stdout).contains(linked.to_str().unwrap()));
+        assert!(!String::from_utf8_lossy(&listing.stdout).contains(linked.to_str().unwrap()));
+    }
+
+    #[test]
+    fn top_level_status_probe_drains_output_larger_than_pipe_capacity() {
+        let temp = tempfile::tempdir().unwrap();
+        initialize_repository(temp.path());
+        for index in 0..3_000 {
+            std::fs::write(
+                temp.path()
+                    .join(format!("untracked-{index:04}-with-a-moderately-long-name")),
+                b"loss\n",
+            )
+            .unwrap();
+        }
+        let output = run_bounded_git_status_until(
+            temp.path(),
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert!(output.stdout.len() > 64 * 1024);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2430,11 +2489,8 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        let ExactWorktreeRemoval::Residual { detail } = retry else {
-            panic!("retry must retain quarantine without writer exclusion");
-        };
-        assert!(detail.contains("writer exclusion"));
-        assert!(retry_quarantine.exists());
+        assert!(matches!(retry, ExactWorktreeRemoval::Retired));
+        assert!(!retry_quarantine.exists());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2655,12 +2711,9 @@ mod tests {
         let outcome = quarantine_and_remove_exact_worktree(&identity, |_| {})
             .await
             .unwrap();
-        let ExactWorktreeRemoval::Residual { detail } = outcome else {
-            panic!("submodule worktree must remain quarantined without writer exclusion");
-        };
-        assert!(detail.contains("writer exclusion"));
+        assert!(matches!(outcome, ExactWorktreeRemoval::Retired));
         assert!(!closing.exists());
-        assert!(worktree_quarantine_path(&identity).unwrap().exists());
+        assert!(!worktree_quarantine_path(&identity).unwrap().exists());
     }
 
     #[test]

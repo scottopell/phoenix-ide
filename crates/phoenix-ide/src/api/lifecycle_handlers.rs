@@ -464,6 +464,21 @@ pub(crate) async fn confirm_close_stop_work(
                 "close_settlement_in_progress",
             )))
         })?;
+    let refreshed = state
+        .db
+        .get_close_obligation(obligation.attempt_id().as_str())
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    if matches!(
+        refreshed.phase(),
+        phoenix_core::domain::close::ClosePhase::SettlingActiveWork
+            | phoenix_core::domain::close::ClosePhase::CancelRequestedDuringSettlement
+    ) {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Close settlement remains in progress",
+            "close_settlement_in_progress",
+        ))));
+    }
     Ok(Json(SuccessResponse { success: true }))
 }
 
@@ -598,11 +613,22 @@ pub(crate) async fn retry_close_retirement(
             .await
     };
     if let Err(error) = retry_result {
-        state
+        let authoritative = state
             .db
-            .route_close_attempt_to_repair(retried.attempt_id())
+            .get_close_obligation(retried.attempt_id().as_str())
             .await
-            .map_err(|route_error| AppError::Internal(route_error.to_string()))?;
+            .map_err(|reload_error| AppError::Internal(reload_error.to_string()))?;
+        if matches!(
+            authoritative.phase(),
+            phoenix_core::domain::close::ClosePhase::RetirementRequested
+                | phoenix_core::domain::close::ClosePhase::NeedsRepair
+        ) {
+            state
+                .db
+                .route_close_attempt_to_repair(retried.attempt_id())
+                .await
+                .map_err(|route_error| AppError::Internal(route_error.to_string()))?;
+        }
         return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
             error,
             "close_retirement_needs_repair",
@@ -674,23 +700,35 @@ async fn run_legacy_close_compat(state: &AppState, id: &str, action: &str) -> Re
     loop {
         obligation = match obligation.phase() {
             ClosePhase::AwaitingBlockerResolution => {
-                let awaiting_confirmation = state
+                if transcript.state.is_busy() {
+                    let awaiting_confirmation = state
+                        .db
+                        .confirm_close_stop_work(obligation.attempt_id().as_str())
+                        .await
+                        .map_err(|error| {
+                            AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                                error.to_string(),
+                                "close_start_failed",
+                            )))
+                        })?;
+                    return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                        format!(
+                            "Close attempt {} requires explicit stop-work confirmation",
+                            awaiting_confirmation.attempt_id()
+                        ),
+                        "close_stop_work_confirmation_required",
+                    ))));
+                }
+                state
                     .db
-                    .confirm_close_stop_work(obligation.attempt_id().as_str())
+                    .begin_close_active_work_settlement(obligation.attempt_id().as_str())
                     .await
                     .map_err(|error| {
                         AppError::Conflict(Box::new(ConflictErrorResponse::new(
                             error.to_string(),
                             "close_start_failed",
                         )))
-                    })?;
-                return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                    format!(
-                        "Close attempt {} requires explicit stop-work confirmation",
-                        awaiting_confirmation.attempt_id()
-                    ),
-                    "close_stop_work_confirmation_required",
-                ))));
+                    })?
             }
             ClosePhase::AwaitingStopWorkConfirmation => {
                 return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(

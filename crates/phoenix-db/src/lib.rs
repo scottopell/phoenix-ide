@@ -1854,8 +1854,9 @@ impl Database {
     /// Retire a scope under an exact active Close attempt's captured authority.
     ///
     /// The attempt must have sealed its topology and captured the target scope.
-    /// Only conversations captured by that attempt are exempt from the current-user
-    /// and active-subagent ownership blocker; all other retirement safeguards apply.
+    /// Conversations captured by that attempt and uncaptured participants in the same
+    /// product-conversation aggregate are exempt from ownership blockers; participants
+    /// owned by a distinct aggregate and all other retirement safeguards still block.
     /// # Errors
     /// Returns a [`DbError`] when the supplied Close attempt is not active and
     /// topology-sealed for the target scope, or the ordinary retirement operation fails.

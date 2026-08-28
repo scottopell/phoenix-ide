@@ -3182,15 +3182,34 @@ impl RuntimeManager {
                 ) {
                     return Ok(false);
                 }
-                if obligation.phase() == phoenix_core::domain::close::ClosePhase::NeedsRepair {
+                let retried = if obligation.phase()
+                    == phoenix_core::domain::close::ClosePhase::NeedsRepair
+                {
                     manager
                         .db
                         .retry_close_retirement(obligation.attempt_id())
                         .await
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| error.to_string())?
+                } else {
+                    obligation.clone()
+                };
+                if retried.phase()
+                    == phoenix_core::domain::close::ClosePhase::AwaitingRetirementInspection
+                {
+                    return match manager
+                        .inspect_close_retirement(retried.attempt_id().clone())
+                        .await
+                    {
+                        Ok(_) => Ok(true),
+                        Err(error) => {
+                            tracing::warn!(attempt_id = %retried.attempt_id(), %error,
+                                "Close retirement inspection could not be rebuilt during repair recovery");
+                            Ok(false)
+                        }
+                    };
                 }
                 match manager
-                    .retire_close_runtime_resources(obligation.attempt_id().clone())
+                    .retire_close_runtime_resources(retried.attempt_id().clone())
                     .await
                 {
                     Ok(()) => Ok(true),

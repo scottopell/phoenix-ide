@@ -1771,19 +1771,27 @@ rule CloseRetirementFailureLeavesOpenNeedsRepair {
     ensures: CloseNeedsRepairVisible(product_conversation, attempt_id)
 }
 
-rule CloseNeedsRepairCanRetryRetirement {
+rule CloseNeedsRepairRetriesSealedRetirement {
     when: CloseRetirementRetryRequested(product_conversation, attempt_id)
     requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = needs_repair
     requires: CloseNeedsRepairVisible(product_conversation, attempt_id)
+    requires: retirement_inventory_is_complete_and_sealed(product_conversation, attempt_id)
     ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = retirement_requested
     ensures: ResourceRetirementRequested(product_conversation, attempt_id)
+}
+
+rule CloseNeedsRepairReinspectsIncompleteInventory {
+    when: CloseRetirementRetryRequested(product_conversation, attempt_id)
+    requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = needs_repair
+    requires: CloseNeedsRepairVisible(product_conversation, attempt_id)
+    requires: not retirement_inventory_is_complete_and_sealed(product_conversation, attempt_id)
+    ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_retirement_inspection
+    ensures: RetirementInspectionRequested(product_conversation, attempt_id)
 
     @guidance
-        -- Retry is exposed on the same visible needs-repair attempt the user sees.
-        -- It carries the exact attempt_id and requests retirement again without any
-        -- local ProductConversation lifecycle mutation. Automatic operator repair may also
-        -- complete by driving the same exact-attempt retirement request path, but no
-        -- hidden synthetic attempt or phase change bypasses this authority.
+        -- User retry and startup recovery use this same exact-attempt branch. Recovery
+        -- dispatches inspection immediately after reopening the attempt; it does not wait
+        -- for another restart or synthesize a replacement Close attempt.
 }
 
 ------------------------------------------------------------

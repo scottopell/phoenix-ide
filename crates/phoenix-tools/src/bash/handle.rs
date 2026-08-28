@@ -569,36 +569,49 @@ impl Handle {
         let result = if stopped != 0 {
             Err(std::io::Error::last_os_error())
         } else {
-            let mut stop_state = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
-            let observed = unsafe {
-                libc::waitid(
-                    libc::P_PIDFD,
-                    pidfd as libc::id_t,
-                    stop_state.as_mut_ptr(),
-                    libc::WSTOPPED | libc::WEXITED | libc::WNOWAIT,
-                )
-            };
-            if observed != 0 {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::ECHILD) {
-                    Ok(None)
-                } else {
-                    Err(error)
-                }
-            } else {
-                let stop_state = unsafe { stop_state.assume_init() };
-                if stop_state.si_code == libc::CLD_STOPPED
-                    && unsafe { stop_state.si_status() } == libc::SIGSTOP
-                {
-                    let rc = unsafe { libc::kill(-live.pgid, signal) };
-                    if rc == 0 {
-                        Ok(Some(live.pgid))
+            let pidfd_id = libc::id_t::try_from(pidfd)
+                .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+            loop {
+                let mut stop_state = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+                let observed = unsafe {
+                    libc::waitid(
+                        libc::P_PIDFD,
+                        pidfd_id,
+                        stop_state.as_mut_ptr(),
+                        libc::WSTOPPED | libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+                    )
+                };
+                if observed != 0 {
+                    let error = std::io::Error::last_os_error();
+                    break if error.raw_os_error() == Some(libc::ECHILD) {
+                        Ok(None)
                     } else {
-                        Err(std::io::Error::last_os_error())
-                    }
-                } else {
-                    Ok(None)
+                        Err(error)
+                    };
                 }
+                let stop_state = unsafe { stop_state.assume_init() };
+                if unsafe { stop_state.si_pid() } != 0 {
+                    break if stop_state.si_code == libc::CLD_STOPPED
+                        && unsafe { stop_state.si_status() } == libc::SIGSTOP
+                    {
+                        let rc = unsafe { libc::kill(-live.pgid, signal) };
+                        if rc == 0 {
+                            Ok(Some(live.pgid))
+                        } else {
+                            Err(std::io::Error::last_os_error())
+                        }
+                    } else {
+                        Ok(None)
+                    };
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    break Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "process incarnation did not reach stopped state before deadline",
+                    ));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         };
         let pidfd =
