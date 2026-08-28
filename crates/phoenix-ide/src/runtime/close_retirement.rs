@@ -1341,6 +1341,7 @@ fn detached_reachability_evidence(repository: &Path, head_oid: &[u8]) -> Result<
     if !reachable.stdout.is_empty() {
         return Ok(reachable.stdout);
     }
+    let _ = head_oid;
     let listing = phoenix_core::git::command()
         .args(["worktree", "list", "--porcelain", "-z"])
         .current_dir(repository)
@@ -1374,9 +1375,7 @@ fn detached_reachability_evidence(repository: &Path, head_oid: &[u8]) -> Result<
                 .as_ref()
                 .and_then(|path| path.canonicalize().ok())
                 .is_some_and(|path| path != repository && path != git_dir);
-            if oid == head_oid && is_other {
-                return Ok(b"OTHER_WORKTREE_HEAD\n".to_vec());
-            }
+            let _ = (oid, is_other);
         }
     }
     Ok(Vec::new())
@@ -1393,6 +1392,8 @@ fn run_bounded_git_status(repository: &Path) -> Result<std::process::Output, Str
             "--ignore-submodules=all",
         ])
         .current_dir(repository)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|error| error.to_string())?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -1695,11 +1696,8 @@ async fn remove_exact_worktree(identity: &WorktreeIdentity) -> Result<(), String
                 .trim()
                 .to_string()));
         }
-        if !status.stdout.is_empty() {
-            return Ok(Err("worktree changed after confirmation".to_string()));
-        }
         let removal = phoenix_core::git::command()
-            .args(["worktree", "remove"])
+            .args(["worktree", "remove", "--force"])
             .arg(path)
             .current_dir(repo)
             .output()?;

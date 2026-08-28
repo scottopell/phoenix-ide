@@ -872,6 +872,11 @@ impl BashHandleRegistry {
             teardown_generation: Some(permit.generation()),
             ..CascadeBashReport::default()
         };
+        let removed_by_identity = permit
+            .removed_handles
+            .iter()
+            .map(|handle| (handle.launch_identity.clone(), Arc::clone(handle)))
+            .collect::<std::collections::HashMap<_, _>>();
         {
             let table = permit.entry.write().await;
             if !table.teardown_started || table.teardown_generation != permit.generation().0 {
@@ -903,10 +908,20 @@ impl BashHandleRegistry {
                         }
                         continue;
                     }
-                    report.kill_failures.push((
-                        target.pgid,
-                        "refusing check-then-signal process-group teardown; terminate the tracked child through its owned handle before retry".to_string(),
-                    ));
+                    if removed_by_identity.contains_key(&target.launch_identity) {
+                        let rc = unsafe { libc::kill(-target.pgid, libc::SIGKILL) };
+                        if rc != 0 {
+                            let err = std::io::Error::last_os_error();
+                            if err.raw_os_error() != Some(libc::ESRCH) {
+                                report.kill_failures.push((target.pgid, err.to_string()));
+                            }
+                        }
+                    } else {
+                        report.kill_failures.push((
+                            target.pgid,
+                            "bash process group is not bound to an owned live Handle".to_string(),
+                        ));
+                    }
                 }
             }
         }
@@ -2080,7 +2095,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     #[allow(clippy::similar_names)] // pgid/pid mirror spec field names
-    async fn cascade_bash_on_delete_refuses_unbound_process_group_signal() {
+    async fn cascade_bash_on_delete_kills_owned_handle_process_group() {
         // Spawn a real `sleep` in its own process group, register a
         // matching Handle, and verify the cascade SIGKILLs it. We then
         // `wait()` on the child (which reaps the zombie) and assert the
@@ -2140,17 +2155,18 @@ mod tests {
         let report =
             cascade_bash_on_delete(&registry, &real_scope, &work_actor("owner"), None).await;
         assert!(report.live_handle_pgids.contains(&pgid));
-        assert_eq!(report.kill_failures.len(), 1);
+        assert!(report.kill_failures.is_empty());
         assert_eq!(registry.scope_count().await, 1);
-        sleep(Duration::from_millis(50)).await;
-        assert!(
-            child.try_wait().expect("try_wait").is_none(),
-            "unbound persisted PGID must not be signaled"
-        );
-        // Best-effort cleanup of the test child.
+        for _ in 0..20 {
+            if child.try_wait().expect("try_wait").is_some() {
+                return;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
         unsafe {
             let _ = libc::kill(pgid, libc::SIGKILL);
         }
         let _ = child.wait();
+        panic!("owned process group survived retirement SIGKILL");
     }
 }
