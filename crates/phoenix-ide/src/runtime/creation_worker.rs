@@ -333,11 +333,7 @@ async fn process_claimed_product_creation(
     let repository_attachment = match staging_repo.zip(staging_oid) {
         Some((repository_root, exact_checkout_oid)) => {
             let git_common_dir = git_common_dir_for_repository_root(Path::new(&repository_root))?;
-            let repository_id = manager
-                .db()
-                .repository_id_for_management_root(&repository_root)
-                .await
-                .map_err(|error| error.to_string())?;
+            let repository_id = None;
             Some(crate::db::ProductCreationRepositoryAttachment {
                 repository_id,
                 exact_checkout_oid,

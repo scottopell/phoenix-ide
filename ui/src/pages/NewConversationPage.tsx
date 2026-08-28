@@ -67,7 +67,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   // `inlineRefTextarea` tracks whichever is focused so trigger detection reads
   // the right caret.
   const inlineRefTextarea = useRef<HTMLTextAreaElement | null>(null);
-  const inlineReferenceRootReady = false;
+  const inlineReferenceRootReady = conv.dirStatus === 'exists' && conv.isGitDir !== null;
   const ir = useInlineReferences({
     cwd: conv.cwd,
     discoveryReady: inlineReferenceRootReady,

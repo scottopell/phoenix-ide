@@ -2107,6 +2107,7 @@ async fn list_recent_management_roots(
         .map_err(|error| AppError::Internal(error.to_string()))?
         .into_iter()
         .filter(|path| std::path::Path::new(path).is_dir())
+        .take(20)
         .map(|path| RecentManagementRootSuggestion { path })
         .collect();
     Ok(Json(RecentManagementRootSuggestionsResponse {

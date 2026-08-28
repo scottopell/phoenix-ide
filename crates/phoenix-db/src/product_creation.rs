@@ -1660,21 +1660,6 @@ impl Database {
         .map_err(DbError::from)
     }
 
-    pub async fn repository_id_for_management_root(
-        &self,
-        management_root: &str,
-    ) -> DbResult<Option<String>> {
-        sqlx::query_scalar(
-            "SELECT repository_id FROM git_repository_locator_observations
-             WHERE locator_kind = 'management_root' AND status = 'present' AND path = ?1
-             ORDER BY observed_at_unix_micros DESC LIMIT 1",
-        )
-        .bind(management_root)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(DbError::Sqlx)
-    }
-
     pub async fn work_scope_has_git_repository(
         &self,
         work_scope_id: &WorkScopeId,
@@ -1717,7 +1702,7 @@ impl Database {
              LIMIT ?1",
         )
         .bind(
-            i64::try_from(limit)
+            i64::try_from(limit.saturating_mul(10))
                 .map_err(|_| DbError::Serialization("limit overflow".to_string()))?,
         )
         .fetch_all(&self.pool)
