@@ -97,6 +97,15 @@ impl RuntimeManager {
         attempt_id: CloseAttemptId,
         continue_clean_retirement: bool,
     ) -> Result<CloseRetirementSnapshot, String> {
+        let prior_obligation = self
+            .db()
+            .get_close_obligation(attempt_id.as_str())
+            .await
+            .map_err(|error| error.to_string())?;
+        let reinspection_generation = (prior_obligation.phase()
+            == ClosePhase::AwaitingRetirementInspection
+            && prior_obligation.snapshot().is_some())
+        .then(|| format!("server_git_status_v2_retry_{}", uuid::Uuid::new_v4()));
         let scopes = self
             .db()
             .list_close_attempt_scopes(attempt_id.as_str())
@@ -110,13 +119,30 @@ impl RuntimeManager {
                     let path = worktree_path(&identity);
                     let quarantine = worktree_quarantine_path(&identity)?;
                     match path.try_exists() {
-                        Ok(true) => inspect_worktree(&identity).await?,
+                        Ok(true) => {
+                            let (snapshot, losses) = inspect_worktree(&identity).await?;
+                            (
+                                rotate_inspection_generation(
+                                    snapshot,
+                                    reinspection_generation.as_deref(),
+                                )?,
+                                losses,
+                            )
+                        }
                         Ok(false)
                             if quarantine.try_exists().map_err(|error| {
                                 format!("cannot observe quarantined worktree path: {error}")
                             })? =>
                         {
-                            inspect_worktree_at(&identity, quarantine).await?
+                            let (snapshot, losses) =
+                                inspect_worktree_at(&identity, quarantine).await?;
+                            (
+                                rotate_inspection_generation(
+                                    snapshot,
+                                    reinspection_generation.as_deref(),
+                                )?,
+                                losses,
+                            )
                         }
                         Ok(false) => {
                             let obligation = self
@@ -503,20 +529,34 @@ impl RuntimeManager {
             .snapshot()
             .cloned()
             .ok_or_else(|| "retirement requested without an inspection snapshot".to_string())?;
-        for captured in self
-            .db()
-            .list_close_attempt_scopes(attempt_id.as_str())
-            .await
-            .map_err(|error| error.to_string())?
-        {
-            self.acquire_close_resource_lease(&attempt_id, captured.scope)
-                .await?;
-        }
-        let mut targets = self
+        let existing_targets = self
             .db()
             .list_close_expected_retirement_resources(attempt_id.as_str())
             .await
             .map_err(|error| error.to_string())?;
+        if existing_targets.is_empty() {
+            let mut acquired_scopes = Vec::new();
+            for captured in self
+                .db()
+                .list_close_attempt_scopes(attempt_id.as_str())
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                match self
+                    .acquire_close_resource_lease(&attempt_id, captured.scope.clone())
+                    .await
+                {
+                    Ok(_) => acquired_scopes.push(captured.scope),
+                    Err(error) => {
+                        for scope in &acquired_scopes {
+                            self.cancel_close_resource_lease(&attempt_id, scope).await;
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        let mut targets = existing_targets;
         if targets.is_empty() {
             self.capture_close_retirement_inventory(attempt_id.clone(), snapshot.clone())
                 .await?;
@@ -2385,15 +2425,6 @@ fn canonical_status_observation(status: &[u8]) -> Vec<u8> {
 
 fn observe_dirty_content(repository: &Path, losses: &[CloseLossItem]) -> Result<Vec<u8>, String> {
     let mut observation = Vec::new();
-    let index = phoenix_core::git::command()
-        .args(["ls-files", "--stage", "-z"])
-        .current_dir(repository)
-        .output()
-        .map_err(|error| format!("cannot inspect dirty index: {error}"))?;
-    if !index.status.success() {
-        return Err(String::from_utf8_lossy(&index.stderr).trim().to_string());
-    }
-    let staged_entries = staged_index_entries_by_path(&index.stdout);
     let mut paths = losses
         .iter()
         .filter_map(|loss| match loss.identity() {
@@ -2405,6 +2436,7 @@ fn observe_dirty_content(repository: &Path, losses: &[CloseLossItem]) -> Result<
         .collect::<Vec<_>>();
     paths.sort();
     paths.dedup();
+    let staged_entries = staged_index_entries_for_paths(repository, &paths)?;
     for path in paths {
         observation.extend_from_slice(b"CONTENT\0");
         observation.extend_from_slice(&path);
@@ -2470,6 +2502,34 @@ fn observe_dirty_content(repository: &Path, losses: &[CloseLossItem]) -> Result<
     Ok(observation)
 }
 
+fn staged_index_entries_for_paths(
+    repository: &Path,
+    paths: &[Vec<u8>],
+) -> Result<std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>>, String> {
+    let mut entries = std::collections::BTreeMap::new();
+    for batch in paths.chunks(256) {
+        let mut command = phoenix_core::git::command();
+        command.args(["--literal-pathspecs", "ls-files", "--stage", "-z", "--"]);
+        for path in batch {
+            command.arg(path_buf_from_git_bytes(path));
+        }
+        let output = command
+            .current_dir(repository)
+            .output()
+            .map_err(|error| format!("cannot inspect dirty index: {error}"))?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
+        for (path, mut path_entries) in staged_index_entries_by_path(&output.stdout) {
+            entries
+                .entry(path)
+                .or_insert_with(Vec::new)
+                .append(&mut path_entries);
+        }
+    }
+    Ok(entries)
+}
+
 fn staged_index_entries_by_path(index: &[u8]) -> std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>> {
     let mut entries = std::collections::BTreeMap::<Vec<u8>, Vec<Vec<u8>>>::new();
     for entry in index
@@ -2519,6 +2579,17 @@ fn parse_status_losses(status: &[u8]) -> Vec<CloseLossItem> {
     losses.sort_by_key(|loss| (loss.category().as_str(), loss.identity().value()));
     losses.dedup();
     losses
+}
+
+fn rotate_inspection_generation(
+    snapshot: CloseRetirementSnapshot,
+    generation: Option<&str>,
+) -> Result<CloseRetirementSnapshot, String> {
+    let Some(generation) = generation else {
+        return Ok(snapshot);
+    };
+    CloseRetirementSnapshot::parse(generation, snapshot.fingerprint().to_string())
+        .map_err(|error| error.to_string())
 }
 
 fn snapshot_for(bytes: &[u8]) -> CloseRetirementSnapshot {
@@ -2625,8 +2696,9 @@ mod tests {
     use super::{
         canonical_status_observation, exact_worktree_administrative_dir, git_path_from_observation,
         inspect_and_remove_exact_worktree_with_hook, inspect_worktree, parse_status_losses,
-        quarantine_and_remove_exact_worktree, run_bounded_git_status_until, snapshot_for,
-        staged_index_entries_by_path, worktree_quarantine_path, CloseLeaseFailure,
+        quarantine_and_remove_exact_worktree, rotate_inspection_generation,
+        run_bounded_git_status_until, snapshot_for, staged_index_entries_by_path,
+        staged_index_entries_for_paths, worktree_quarantine_path, CloseLeaseFailure,
         ExactWorktreeRemoval,
     };
     use phoenix_core::domain::close::{
@@ -3415,6 +3487,30 @@ mod tests {
             entries[b":(bad)file".as_slice()],
             vec![b"100644 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0\t:(bad)file".to_vec()]
         );
+    }
+
+    #[test]
+    fn staged_index_query_materializes_only_requested_dirty_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        initialize_repository(temp.path());
+        std::fs::write(temp.path().join("unrelated"), "tracked\n").unwrap();
+        run_git(temp.path(), &["add", "unrelated"]);
+        run_git(temp.path(), &["commit", "--quiet", "-m", "unrelated"]);
+
+        let entries = staged_index_entries_for_paths(temp.path(), &[b"tracked".to_vec()]).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries.contains_key(b"tracked".as_slice()));
+        assert!(!entries.contains_key(b"unrelated".as_slice()));
+    }
+
+    #[test]
+    fn retry_reinspection_rotates_inventory_generation_without_changing_content_fingerprint() {
+        let snapshot = snapshot_for(b"same worktree contents");
+        let rotated =
+            rotate_inspection_generation(snapshot.clone(), Some("retry-generation")).unwrap();
+        assert_eq!(rotated.generation(), "retry-generation");
+        assert_eq!(rotated.fingerprint(), snapshot.fingerprint());
+        assert_ne!(rotated, snapshot);
     }
 
     #[tokio::test]

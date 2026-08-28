@@ -8505,7 +8505,7 @@ mod tests {
             .unwrap();
         db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
             attempt_id: attempt.clone(),
-            snapshot,
+            snapshot: snapshot.clone(),
             scope,
             resource: worktree.resource,
             outcome: RetirementOutcome::Residual {
@@ -8518,7 +8518,7 @@ mod tests {
 
         let retried = db.retry_close_retirement(&attempt).await.unwrap();
         assert_eq!(retried.phase(), ClosePhase::AwaitingRetirementInspection);
-        assert!(retried.snapshot().is_none());
+        assert_eq!(retried.snapshot(), Some(&snapshot));
     }
 
     #[test]

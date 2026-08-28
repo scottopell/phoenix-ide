@@ -211,7 +211,7 @@ entity CloseObligation {
         awaiting_loss_confirmation -> retirement_requested
         awaiting_loss_confirmation -> completed
         retirement_requested -> needs_repair
-        needs_repair -> retirement_requested
+        needs_repair -> awaiting_retirement_inspection
         retirement_requested -> completed
         needs_repair -> completed
         terminal: completed
@@ -1771,24 +1771,16 @@ rule CloseRetirementFailureLeavesOpenNeedsRepair {
     ensures: CloseNeedsRepairVisible(product_conversation, attempt_id)
 }
 
-rule CloseNeedsRepairRetriesSealedRetirement {
+rule CloseNeedsRepairRetriesThroughReinspection {
     when: CloseRetirementRetryRequested(product_conversation, attempt_id)
     requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = needs_repair
     requires: CloseNeedsRepairVisible(product_conversation, attempt_id)
-    requires: retirement_inventory_is_complete_and_sealed(product_conversation, attempt_id)
-    ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = retirement_requested
-    ensures: ResourceRetirementRequested(product_conversation, attempt_id)
-}
-
-rule CloseNeedsRepairReinspectsIncompleteInventory {
-    when: CloseRetirementRetryRequested(product_conversation, attempt_id)
-    requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = needs_repair
-    requires: CloseNeedsRepairVisible(product_conversation, attempt_id)
-    requires: not retirement_inventory_is_complete_and_sealed(product_conversation, attempt_id)
     ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_retirement_inspection
     ensures: RetirementInspectionRequested(product_conversation, attempt_id)
 
     @guidance
+        -- Retry preserves exact-attempt retirement and dispatch evidence while reinspection
+        -- refreshes the worktree snapshot and reseals resources admitted during repair.
         -- User retry and startup recovery use this same exact-attempt branch. Recovery
         -- dispatches inspection immediately after reopening the attempt; it does not wait
         -- for another restart or synthesize a replacement Close attempt.

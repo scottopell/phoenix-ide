@@ -440,6 +440,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "persist_close_worktree_cleanup_plans",
         sql: MIGRATION_084,
     },
+    Migration {
+        version: 85,
+        name: "preserve_close_reinspection_authority",
+        sql: MIGRATION_085,
+    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -8406,6 +8411,22 @@ WHEN NOT (
 )
 BEGIN
     SELECT RAISE(ABORT, 'invalid close obligation phase transition');
+END;
+";
+
+const MIGRATION_085: &str = r"
+DROP TRIGGER close_obligations_invalidate_inspection_on_reentry;
+CREATE TRIGGER close_obligations_invalidate_inspection_on_reentry
+AFTER UPDATE OF phase ON close_obligations
+FOR EACH ROW
+WHEN NEW.phase = 'awaiting_retirement_inspection'
+  AND OLD.phase <> 'awaiting_retirement_inspection'
+  AND OLD.phase <> 'needs_repair'
+BEGIN
+    DELETE FROM close_retirement_inspections WHERE attempt_id = NEW.attempt_id;
+    UPDATE close_obligations
+    SET inspection_generation = NULL, inspection_fingerprint = NULL
+    WHERE attempt_id = NEW.attempt_id;
 END;
 ";
 
