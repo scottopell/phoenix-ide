@@ -5764,6 +5764,7 @@ impl Database {
         let result = sqlx::query(
             "UPDATE conversation_creation_jobs
              SET status = 'ready', intent_json = ?1, updated_at = ?2, completed_at = ?2,
+                 exact_checkout_oid = NULL,
                  claim_worker_id = NULL, claim_token = NULL, lease_until = NULL
              WHERE id = ?3 AND status = 'claimed' AND generation = ?4
                AND claim_worker_id = ?5 AND claim_token = ?6 AND lease_until > ?2",
