@@ -670,14 +670,21 @@ impl RuntimeManager {
             {
                 Ok(resources) => resources,
                 Err(CloseLeaseFailure::ProcessEpoch { kind, reason }) => {
-                    self.db()
-                        .route_close_attempt_to_repair(&attempt_id)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    return Err(format!(
-                        "{} process-epoch Close teardown requires repair for sealed scope {scope}: {reason}",
-                        kind.as_str()
-                    ));
+                    let scope_resource =
+                        opaque_resource(RetiredResourceKind::WorkScope, scope.as_str().to_string());
+                    return self
+                        .record_close_residual(
+                            &attempt_id,
+                            &snapshot,
+                            &scope,
+                            scope_resource,
+                            RetirementFailureReason::IdentityNotProven,
+                            &format!(
+                                "{} process-epoch Close teardown requires repair: {reason}",
+                                kind.as_str()
+                            ),
+                        )
+                        .await;
                 }
                 Err(CloseLeaseFailure::Tmux { reason, detail }) => {
                     let Some(resource) = expected
@@ -946,7 +953,16 @@ impl RuntimeManager {
                                 }
                             }
                         }
-                        Ok(ExactWorktreeRemoval::Changed { detail }) => {
+                        Ok(ExactWorktreeRemoval::ReinspectionRequired { detail }) => {
+                            self.db()
+                                .return_close_attempt_to_reinspection(attempt_id)
+                                .await
+                                .map_err(|error| error.to_string())?;
+                            Box::pin(self.inspect_close_retirement_only(attempt_id.clone()))
+                                .await?;
+                            return Err(detail);
+                        }
+                        Ok(ExactWorktreeRemoval::Residual { detail }) => {
                             return self
                                 .record_close_residual(
                                     attempt_id,
@@ -1669,7 +1685,8 @@ fn worktree_quarantine_path(identity: &WorktreeIdentity) -> Result<PathBuf, Stri
 enum ExactWorktreeRemoval {
     Removed,
     Missing { reason: String },
-    Changed { detail: String },
+    ReinspectionRequired { detail: String },
+    Residual { detail: String },
 }
 
 fn inspect_and_remove_exact_worktree(
@@ -1699,7 +1716,7 @@ where
             .try_exists()
             .map_err(|error| format!("cannot observe quarantined worktree path: {error}"))?
         {
-            return Ok(ExactWorktreeRemoval::Changed {
+            return Ok(ExactWorktreeRemoval::Residual {
                 detail: format!(
                     "confirmed worktree remains quarantined at {}",
                     quarantine.display()
@@ -1714,8 +1731,9 @@ where
         RepositoryMutationLock::acquire(&path).map_err(|(message, _)| message)?;
     let (fresh_snapshot, _) = runtime.block_on(inspect_worktree(identity))?;
     if &fresh_snapshot != confirmed_snapshot {
-        return Ok(ExactWorktreeRemoval::Changed {
-            detail: "worktree changed after Close inspection confirmation".to_string(),
+        return Ok(ExactWorktreeRemoval::ReinspectionRequired {
+            detail: "worktree changed after Close inspection confirmation; fresh confirmation is required"
+                .to_string(),
         });
     }
     runtime.block_on(quarantine_and_remove_exact_worktree(
@@ -1724,33 +1742,147 @@ where
     ))
 }
 
+fn path_is_within(candidate: &Path, directory: &Path) -> bool {
+    candidate == directory || candidate.starts_with(directory)
+}
+
+#[cfg(target_os = "linux")]
 fn quarantine_has_open_descriptors(path: &Path) -> Result<bool, String> {
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         format!("cannot canonicalize quarantined worktree before descriptor inspection: {error}")
     })?;
-    let output = std::process::Command::new("lsof")
-        .args(["-n", "-P", "-F", "n"])
-        .output()
-        .map_err(|error| {
-            format!("cannot prove quarantined worktree has no open descriptors: {error}")
-        })?;
-    if !output.status.success() {
-        return Err(format!(
-            "cannot prove quarantined worktree has no open descriptors: lsof exited {:?}: {}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let prefix = canonical.as_os_str().as_encoded_bytes();
-    Ok(output.stdout.split(|byte| *byte == b'\n').any(|field| {
-        let Some(name) = field.strip_prefix(b"n") else {
-            return false;
+    let processes = std::fs::read_dir("/proc")
+        .map_err(|error| format!("cannot enumerate process descriptors: {error}"))?;
+    for process in processes.flatten() {
+        if !process
+            .file_name()
+            .as_encoded_bytes()
+            .iter()
+            .all(u8::is_ascii_digit)
+        {
+            continue;
+        }
+        let Ok(descriptors) = std::fs::read_dir(process.path().join("fd")) else {
+            continue;
         };
-        name == prefix
-            || name
-                .strip_prefix(prefix)
-                .is_some_and(|suffix| suffix.first() == Some(&b'/'))
-    }))
+        for descriptor in descriptors.flatten() {
+            if std::fs::read_link(descriptor.path())
+                .is_ok_and(|candidate| path_is_within(&candidate, &canonical))
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(target_os = "macos")]
+fn quarantine_has_open_descriptors(path: &Path) -> Result<bool, String> {
+    use std::ffi::CStr;
+    use std::mem::{size_of, MaybeUninit};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    #[repr(C)]
+    struct ProcFileInfo {
+        open_flags: u32,
+        status: u32,
+        offset: i64,
+        file_type: i32,
+        guard_flags: u32,
+    }
+    #[repr(C)]
+    struct VnodeFdInfoWithPath {
+        file: ProcFileInfo,
+        vnode: libc::vnode_info_path,
+    }
+
+    const PROC_ALL_PIDS: u32 = 1;
+    const PROC_PIDFDVNODEPATHINFO: i32 = 2;
+    let canonical = std::fs::canonicalize(path).map_err(|error| {
+        format!("cannot canonicalize quarantined worktree before descriptor inspection: {error}")
+    })?;
+    let mut pids = vec![0_i32; 4096];
+    // SAFETY: the vector provides writable storage for exactly the byte count passed.
+    let pid_bytes = unsafe {
+        libc::proc_listpids(
+            PROC_ALL_PIDS,
+            0,
+            pids.as_mut_ptr().cast(),
+            i32::try_from(pids.len() * size_of::<i32>()).expect("PID buffer fits i32"),
+        )
+    };
+    if pid_bytes < 0 {
+        return Err("cannot enumerate process descriptors".to_string());
+    }
+    pids.truncate(
+        usize::try_from(pid_bytes).expect("nonnegative PID byte count") / size_of::<i32>(),
+    );
+    for pid in pids.into_iter().filter(|pid| *pid > 0) {
+        let mut descriptors = vec![
+            libc::proc_fdinfo {
+                proc_fd: 0,
+                proc_fdtype: 0
+            };
+            256
+        ];
+        // SAFETY: the vector provides writable storage for exactly the byte count passed.
+        let descriptor_bytes = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDLISTFDS,
+                0,
+                descriptors.as_mut_ptr().cast(),
+                i32::try_from(descriptors.len() * size_of::<libc::proc_fdinfo>())
+                    .expect("descriptor buffer fits i32"),
+            )
+        };
+        if descriptor_bytes <= 0 {
+            continue;
+        }
+        descriptors.truncate(
+            usize::try_from(descriptor_bytes).expect("positive descriptor byte count")
+                / size_of::<libc::proc_fdinfo>(),
+        );
+        for descriptor in descriptors
+            .into_iter()
+            .filter(|descriptor| descriptor.proc_fdtype == libc::PROX_FDTYPE_VNODE as u32)
+        {
+            let mut info = MaybeUninit::<VnodeFdInfoWithPath>::uninit();
+            // SAFETY: proc_pidfdinfo initializes the declared C-compatible structure on success.
+            let bytes = unsafe {
+                libc::proc_pidfdinfo(
+                    pid,
+                    descriptor.proc_fd,
+                    PROC_PIDFDVNODEPATHINFO,
+                    info.as_mut_ptr().cast(),
+                    i32::try_from(size_of::<VnodeFdInfoWithPath>()).expect("vnode info fits i32"),
+                )
+            };
+            if bytes
+                != i32::try_from(size_of::<VnodeFdInfoWithPath>())
+                    .expect("vnode info size fits i32")
+            {
+                continue;
+            }
+            // SAFETY: the exact structure size was reported as initialized above.
+            let info = unsafe { info.assume_init() };
+            let path_bytes = info.vnode.vip_path.as_flattened();
+            // SAFETY: the kernel returns a NUL-terminated MAXPATHLEN path buffer.
+            let candidate = unsafe { CStr::from_ptr(path_bytes.as_ptr()) };
+            if path_is_within(
+                Path::new(std::ffi::OsStr::from_bytes(candidate.to_bytes())),
+                &canonical,
+            ) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn quarantine_has_open_descriptors(_path: &Path) -> Result<bool, String> {
+    Err("open-descriptor inspection is unsupported on this platform".to_string())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1812,7 +1944,7 @@ where
             .try_exists()
             .map_err(|error| format!("cannot observe quarantined worktree path: {error}"))?
         {
-            return Ok(ExactWorktreeRemoval::Changed {
+            return Ok(ExactWorktreeRemoval::Residual {
                 detail: format!(
                     "confirmed worktree remains quarantined at {}",
                     quarantine.display()
@@ -1828,7 +1960,7 @@ where
 
         after_quarantine(&path);
         if quarantine_has_open_descriptors(&quarantine)? {
-            return Ok(ExactWorktreeRemoval::Changed {
+            return Ok(ExactWorktreeRemoval::Residual {
                 detail: format!(
                     "open descriptors can still modify the confirmed worktree; retained at {}",
                     quarantine.display()
@@ -1839,7 +1971,7 @@ where
             .try_exists()
             .map_err(|error| format!("cannot inspect original worktree path: {error}"))?
         {
-            return Ok(ExactWorktreeRemoval::Changed {
+            return Ok(ExactWorktreeRemoval::Residual {
                 detail: format!(
                     "post-inspection write survived at {}; confirmed worktree is retained at {}",
                     path.display(),
@@ -1872,7 +2004,7 @@ where
             .try_exists()
             .map_err(|error| format!("cannot inspect original worktree path: {error}"))?
         {
-            return Ok(ExactWorktreeRemoval::Changed {
+            return Ok(ExactWorktreeRemoval::Residual {
                 detail: format!("post-inspection write survived at {}", path.display()),
             });
         }
@@ -2211,7 +2343,7 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        let ExactWorktreeRemoval::Changed { detail } = result else {
+        let ExactWorktreeRemoval::Residual { detail } = result else {
             panic!("late write must refuse retirement");
         };
         assert!(detail.contains("confirmed worktree is retained at"));
@@ -2239,10 +2371,49 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        let ExactWorktreeRemoval::Changed { detail } = retry else {
+        let ExactWorktreeRemoval::Residual { detail } = retry else {
             panic!("retry must retain the quarantined exact worktree");
         };
         assert!(detail.contains("remains quarantined at"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pre_quarantine_snapshot_change_requests_reinspection_without_renaming() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repository");
+        let linked = temp.path().join("linked");
+        initialize_repository(&repository);
+        run_git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                linked.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let identity = inspection_identity(&linked);
+        let (confirmed, _) = inspect_worktree(&identity).await.unwrap();
+        std::fs::write(linked.join("changed-after-confirmation"), "preserve\n").unwrap();
+        let runtime = tokio::runtime::Handle::current();
+
+        let outcome = tokio::task::spawn_blocking(move || {
+            inspect_and_remove_exact_worktree_with_hook(&runtime, &identity, &confirmed, |_| {})
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            ExactWorktreeRemoval::ReinspectionRequired { .. }
+        ));
+        assert_eq!(
+            std::fs::read_to_string(linked.join("changed-after-confirmation")).unwrap(),
+            "preserve\n"
+        );
     }
 
     #[tokio::test]
@@ -2430,6 +2601,12 @@ mod tests {
         assert!(!closing.exists());
     }
 
+    #[test]
+    fn descriptor_scan_has_no_external_executable_dependency() {
+        let source = include_str!("close_retirement.rs");
+        assert!(!source.contains("Command::new(\"lsof\")"));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn quarantine_preserves_worktree_with_open_file_descriptor() {
@@ -2456,7 +2633,7 @@ mod tests {
         .await
         .unwrap();
 
-        let ExactWorktreeRemoval::Changed { detail } = outcome else {
+        let ExactWorktreeRemoval::Residual { detail } = outcome else {
             panic!("open descriptor must preserve quarantine");
         };
         assert!(detail.contains("open descriptors"));

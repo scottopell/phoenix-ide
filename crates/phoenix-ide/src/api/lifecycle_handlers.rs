@@ -360,22 +360,31 @@ pub(crate) async fn confirm_close_loss_retirement(
                 "close_inspection_failed",
             )))
         })?;
-    if fresh_snapshot != snapshot {
-        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-            "Close confirmation does not match fresh server inspection",
-            "stale_close_inspection",
-        ))));
-    }
-    state
-        .db
-        .confirm_close_loss_retirement(&attempt_id, &fresh_snapshot)
-        .await
-        .map_err(|error| {
-            AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                error.to_string(),
+    if fresh_snapshot == snapshot {
+        state
+            .db
+            .confirm_close_loss_retirement(&attempt_id, &fresh_snapshot)
+            .await
+            .map_err(|error| {
+                AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                    error.to_string(),
+                    "stale_close_inspection",
+                )))
+            })?;
+    } else {
+        let fresh_obligation = state
+            .db
+            .get_close_obligation(attempt_id.as_str())
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+        if fresh_obligation.phase() != phoenix_core::domain::close::ClosePhase::RetirementRequested
+        {
+            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                "Close confirmation does not match fresh server inspection",
                 "stale_close_inspection",
-            )))
-        })?;
+            ))));
+        }
+    }
     state
         .runtime
         .retire_close_runtime_resources(attempt_id)

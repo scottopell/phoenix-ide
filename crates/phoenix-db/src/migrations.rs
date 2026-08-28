@@ -425,6 +425,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "repair_scope_owner_foreign_keys_and_absence_proof",
         sql: MIGRATION_081,
     },
+    Migration {
+        version: 82,
+        name: "return_changed_close_worktree_to_reinspection",
+        sql: MIGRATION_082,
+    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -8325,6 +8330,26 @@ BEGIN
     SELECT RAISE(ABORT, 'adopted absence requires exact retained proof');
 END;
 
+";
+
+const MIGRATION_082: &str = r"
+DROP TRIGGER close_obligations_transition_graph;
+CREATE TRIGGER close_obligations_transition_graph
+BEFORE UPDATE OF phase ON close_obligations
+FOR EACH ROW
+WHEN NOT (
+    (OLD.phase = 'awaiting_blocker_resolution' AND NEW.phase IN ('awaiting_stop_work_confirmation', 'settling_active_work', 'completed'))
+    OR (OLD.phase = 'awaiting_stop_work_confirmation' AND NEW.phase IN ('settling_active_work', 'completed'))
+    OR (OLD.phase = 'settling_active_work' AND NEW.phase IN ('cancel_requested_during_settlement', 'awaiting_retirement_inspection'))
+    OR (OLD.phase = 'cancel_requested_during_settlement' AND NEW.phase = 'completed')
+    OR (OLD.phase = 'awaiting_retirement_inspection' AND NEW.phase IN ('awaiting_loss_confirmation', 'retirement_requested', 'needs_repair', 'completed'))
+    OR (OLD.phase = 'awaiting_loss_confirmation' AND NEW.phase IN ('awaiting_retirement_inspection', 'retirement_requested', 'completed'))
+    OR (OLD.phase = 'retirement_requested' AND NEW.phase IN ('awaiting_retirement_inspection', 'needs_repair', 'completed'))
+    OR (OLD.phase = 'needs_repair' AND NEW.phase IN ('retirement_requested', 'completed'))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid close obligation phase transition');
+END;
 ";
 
 #[cfg(test)]

@@ -2276,9 +2276,12 @@ impl Database {
             "SELECT scope, inspection_generation, inspection_fingerprint, sealed
              FROM close_retirement_inventories
              WHERE attempt_id = ?1
+               AND inspection_generation = ?2 AND inspection_fingerprint = ?3
              ORDER BY scope",
         )
         .bind(request.attempt_id.as_str())
+        .bind(request.snapshot.generation())
+        .bind(request.snapshot.fingerprint())
         .fetch_all(&mut *tx)
         .await?;
         if !existing_inventories.is_empty() {
@@ -2296,10 +2299,13 @@ impl Database {
                     "SELECT scope, resource_kind, identity_kind, identity_codec, identity_value
                  FROM close_expected_retirement_resources
                  WHERE attempt_id = ?1
+                   AND inspection_generation = ?2 AND inspection_fingerprint = ?3
                  ORDER BY scope, resource_kind, identity_kind,
                      identity_codec, identity_value",
                 )
                 .bind(request.attempt_id.as_str())
+                .bind(request.snapshot.generation())
+                .bind(request.snapshot.fingerprint())
                 .fetch_all(&mut *tx)
                 .await?;
             if !inventory_matches || persisted_resources != requested_resources {
@@ -2480,6 +2486,31 @@ impl Database {
         Ok(())
     }
 
+    /// Returns a pre-quarantine worktree snapshot mismatch to fresh inspection.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] unless the attempt still has retirement authority.
+    pub async fn return_close_attempt_to_reinspection(
+        &self,
+        attempt_id: &CloseAttemptId,
+    ) -> DbResult<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let obligation = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
+        if obligation.phase() != ClosePhase::RetirementRequested {
+            return Err(close_precondition(format!(
+                "attempt {attempt_id} reinspection requires retirement_requested"
+            )));
+        }
+        set_close_phase_tx(
+            &mut tx,
+            attempt_id.as_str(),
+            ClosePhase::AwaitingRetirementInspection,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Lists expected retirement resources for the current exact attempt snapshot.
     ///
     /// # Errors
@@ -2544,9 +2575,16 @@ async fn list_close_expected_retirement_resources_tx(
     let status = sqlx::query(
             "SELECT
                  (SELECT COUNT(*) FROM close_attempt_scopes WHERE attempt_id = ?1) AS target_count,
-                 (SELECT COUNT(*) FROM close_retirement_inventories WHERE attempt_id = ?1) AS inventory_count,
-                 (SELECT COUNT(*) FROM close_retirement_inventories
-                  WHERE attempt_id = ?1 AND sealed = 0) AS unsealed_count
+                 (SELECT COUNT(*) FROM close_retirement_inventories inventory
+                  JOIN close_obligations obligation ON obligation.attempt_id = inventory.attempt_id
+                  WHERE inventory.attempt_id = ?1
+                    AND inventory.inspection_generation = obligation.inspection_generation
+                    AND inventory.inspection_fingerprint = obligation.inspection_fingerprint) AS inventory_count,
+                 (SELECT COUNT(*) FROM close_retirement_inventories inventory
+                  JOIN close_obligations obligation ON obligation.attempt_id = inventory.attempt_id
+                  WHERE inventory.attempt_id = ?1 AND inventory.sealed = 0
+                    AND inventory.inspection_generation = obligation.inspection_generation
+                    AND inventory.inspection_fingerprint = obligation.inspection_fingerprint) AS unsealed_count
              WHERE EXISTS (SELECT 1 FROM close_obligations WHERE attempt_id = ?1)",
         )
         .bind(attempt_id)
@@ -6412,6 +6450,67 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, DbError::CloseFoundationPrecondition(_)));
+    }
+
+    #[tokio::test]
+    async fn pre_quarantine_change_returns_to_reinspection_and_uses_new_inventory() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let scope = allocate_scope_worktree(&db, "root").await;
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-reinspect",
+        )
+        .await
+        .unwrap();
+        set_close_phase(
+            &db,
+            "attempt-reinspect",
+            ClosePhase::AwaitingRetirementInspection,
+        )
+        .await;
+        let old_snapshot = CloseRetirementSnapshot::parse("old", "old-fingerprint").unwrap();
+        db.replace_close_inspection(ReplaceCloseInspectionRequest {
+            attempt_id: CloseAttemptId::parse("attempt-reinspect").unwrap(),
+            scopes: vec![ReplaceCloseInspectionScopeRequest {
+                scope: scope.clone(),
+                snapshot: old_snapshot.clone(),
+                losses: Vec::new(),
+            }],
+        })
+        .await
+        .unwrap();
+        let old_aggregate = current_test_snapshot(&db, "attempt-reinspect").await;
+        capture_test_inventory(&db, "attempt-reinspect", &scope, &old_aggregate, Vec::new()).await;
+
+        db.return_close_attempt_to_reinspection(
+            &CloseAttemptId::parse("attempt-reinspect").unwrap(),
+        )
+        .await
+        .unwrap();
+        let new_snapshot = CloseRetirementSnapshot::parse("new", "new-fingerprint").unwrap();
+        db.replace_close_inspection(ReplaceCloseInspectionRequest {
+            attempt_id: CloseAttemptId::parse("attempt-reinspect").unwrap(),
+            scopes: vec![ReplaceCloseInspectionScopeRequest {
+                scope: scope.clone(),
+                snapshot: new_snapshot.clone(),
+                losses: Vec::new(),
+            }],
+        })
+        .await
+        .unwrap();
+        let new_aggregate = current_test_snapshot(&db, "attempt-reinspect").await;
+        capture_test_inventory(&db, "attempt-reinspect", &scope, &new_aggregate, Vec::new()).await;
+
+        let resources = db
+            .list_close_expected_retirement_resources("attempt-reinspect")
+            .await
+            .unwrap();
+        assert!(!resources.is_empty());
+        assert!(resources
+            .iter()
+            .all(|resource| resource.snapshot == new_aggregate));
     }
 
     #[tokio::test]
