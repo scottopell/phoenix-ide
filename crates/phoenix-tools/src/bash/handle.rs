@@ -537,6 +537,7 @@ impl Handle {
     ///
     /// Returns an OS error when opening or signaling the exact process incarnation,
     /// signaling its process group, or closing the kernel-owned PID handle fails.
+    #[cfg_attr(target_os = "linux", allow(clippy::too_many_lines))]
     #[cfg(target_os = "linux")]
     pub async fn signal_live_incarnation(
         &self,
