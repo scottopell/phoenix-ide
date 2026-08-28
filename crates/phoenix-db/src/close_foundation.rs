@@ -1234,6 +1234,33 @@ impl Database {
         Ok(obligation)
     }
 
+    pub async fn begin_close_idle_settlement(&self, attempt_id: &str) -> DbResult<CloseObligation> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let obligation = close_obligation_for_update(&mut tx, attempt_id).await?;
+        match obligation.phase() {
+            ClosePhase::AwaitingBlockerResolution => {
+                set_close_phase_tx(&mut tx, attempt_id, ClosePhase::SettlingActiveWork).await?;
+                Self::capture_close_direct_turn_settlement_targets_tx(&mut tx, attempt_id).await?;
+            }
+            ClosePhase::SettlingActiveWork => {}
+            phase @ (ClosePhase::AwaitingStopWorkConfirmation
+            | ClosePhase::CancelRequestedDuringSettlement
+            | ClosePhase::AwaitingRetirementInspection
+            | ClosePhase::AwaitingLossConfirmation
+            | ClosePhase::RetirementRequested
+            | ClosePhase::NeedsRepair
+            | ClosePhase::Completed) => {
+                return Err(close_precondition(format!(
+                    "attempt {attempt_id} phase {} does not admit idle settlement",
+                    phase.as_str()
+                )));
+            }
+        }
+        let obligation = close_obligation_for_update(&mut tx, attempt_id).await?;
+        tx.commit().await?;
+        Ok(obligation)
+    }
+
     pub async fn begin_close_active_work_settlement(
         &self,
         attempt_id: &str,
@@ -4114,6 +4141,25 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(members, vec![conversation.id]);
+    }
+
+    #[tokio::test]
+    async fn idle_close_enters_settlement_without_stop_work_confirmation() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-idle-settlement",
+        )
+        .await
+        .unwrap();
+
+        let obligation = db
+            .begin_close_idle_settlement("attempt-idle-settlement")
+            .await
+            .unwrap();
+        assert_eq!(obligation.phase(), ClosePhase::SettlingActiveWork);
     }
 
     #[tokio::test]

@@ -1010,7 +1010,17 @@ impl RuntimeManager {
                     .await
                     .map_err(|error| error.to_string())?;
                     let fresh_snapshot: Option<CloseRetirementSnapshot> = match final_removal {
-                        Ok(ExactWorktreeRemoval::Retired) => None,
+                        Ok(ExactWorktreeRemoval::Retired) => {
+                            self.record_close_retired(
+                                attempt_id,
+                                snapshot,
+                                &scope,
+                                target.resource.clone(),
+                                "exact captured Git worktree removal",
+                            )
+                            .await?;
+                            None
+                        }
                         Ok(ExactWorktreeRemoval::Missing { reason }) => {
                             let absence_basis = AbsenceBasis::SameAttemptPriorRetirement;
                             let adopted = self
@@ -1864,6 +1874,120 @@ fn path_is_within(candidate: &Path, directory: &Path) -> bool {
     candidate == directory || candidate.starts_with(directory)
 }
 
+fn exact_worktree_administrative_dir(
+    worktree: &Path,
+    common_git_dir: &Path,
+) -> Result<PathBuf, String> {
+    let git_file = std::fs::read(worktree.join(".git"))
+        .map_err(|error| format!("cannot read exact worktree administrative link: {error}"))?;
+    let git_dir = git_file
+        .strip_prefix(b"gitdir: ")
+        .and_then(|value| value.strip_suffix(b"\n").or(Some(value)))
+        .map(path_buf_from_git_bytes)
+        .ok_or_else(|| "exact worktree administrative link is malformed".to_string())?;
+    let git_dir = std::fs::canonicalize(git_dir)
+        .map_err(|error| format!("cannot resolve exact worktree administrative link: {error}"))?;
+    let worktrees_dir = std::fs::canonicalize(common_git_dir.join("worktrees"))
+        .map_err(|error| format!("cannot resolve repository worktree registrations: {error}"))?;
+    if git_dir.parent() != Some(worktrees_dir.as_path()) {
+        return Err("exact worktree administrative link escapes repository worktrees".to_string());
+    }
+    Ok(git_dir)
+}
+
+fn quarantine_has_external_writer(path: &Path) -> Result<bool, String> {
+    Ok(quarantine_has_open_descriptors(path)? || quarantine_has_process_cwd(path)?)
+}
+
+#[cfg(target_os = "linux")]
+fn quarantine_has_process_cwd(path: &Path) -> Result<bool, String> {
+    let canonical = std::fs::canonicalize(path).map_err(|error| {
+        format!("cannot canonicalize quarantine before cwd inspection: {error}")
+    })?;
+    for process in std::fs::read_dir("/proc")
+        .map_err(|error| format!("cannot enumerate process working directories: {error}"))?
+    {
+        let process = process.map_err(|error| format!("cannot inspect process entry: {error}"))?;
+        if !process
+            .file_name()
+            .as_encoded_bytes()
+            .iter()
+            .all(u8::is_ascii_digit)
+        {
+            continue;
+        }
+        match std::fs::read_link(process.path().join("cwd")) {
+            Ok(cwd) if path_is_within(&cwd, &canonical) => return Ok(true),
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                ) => {}
+            Err(error) => return Err(format!("cannot inspect process working directory: {error}")),
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(target_os = "macos")]
+fn quarantine_has_process_cwd(path: &Path) -> Result<bool, String> {
+    use std::ffi::CStr;
+    use std::mem::{size_of, MaybeUninit};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let canonical = std::fs::canonicalize(path).map_err(|error| {
+        format!("cannot canonicalize quarantine before cwd inspection: {error}")
+    })?;
+    let mut pids = vec![0_i32; 4096];
+    let pid_bytes = unsafe {
+        libc::proc_listpids(
+            1,
+            0,
+            pids.as_mut_ptr().cast(),
+            i32::try_from(pids.len() * size_of::<i32>()).expect("PID buffer fits i32"),
+        )
+    };
+    if pid_bytes < 0 {
+        return Err("cannot enumerate process working directories".to_string());
+    }
+    pids.truncate(usize::try_from(pid_bytes).expect("nonnegative PID bytes") / size_of::<i32>());
+    for pid in pids.into_iter().filter(|pid| *pid > 0) {
+        let mut info = MaybeUninit::<libc::proc_vnodepathinfo>::uninit();
+        let bytes = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDVNODEPATHINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                i32::try_from(size_of::<libc::proc_vnodepathinfo>())
+                    .expect("vnode path info fits i32"),
+            )
+        };
+        if bytes
+            != i32::try_from(size_of::<libc::proc_vnodepathinfo>())
+                .expect("vnode path info size fits i32")
+        {
+            continue;
+        }
+        let info = unsafe { info.assume_init() };
+        let cwd_bytes = info.pvi_cdir.vip_path.as_flattened();
+        let cwd = unsafe { CStr::from_ptr(cwd_bytes.as_ptr()) };
+        if path_is_within(
+            Path::new(std::ffi::OsStr::from_bytes(cwd.to_bytes())),
+            &canonical,
+        ) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn quarantine_has_process_cwd(_path: &Path) -> Result<bool, String> {
+    Err("process working-directory inspection is unsupported on this platform".to_string())
+}
+
 #[cfg(target_os = "linux")]
 fn quarantine_has_open_descriptors(path: &Path) -> Result<bool, String> {
     let canonical = std::fs::canonicalize(path).map_err(|error| {
@@ -2104,19 +2228,23 @@ where
                 ),
             });
         }
+        if quarantine_has_external_writer(&quarantine)? {
+            return Ok(ExactWorktreeRemoval::Residual {
+                detail: format!(
+                    "an external process can still write the confirmed worktree; retained at {}",
+                    quarantine.display()
+                ),
+            });
+        }
+        let administrative_dir = exact_worktree_administrative_dir(&quarantine, &common)?;
         std::fs::remove_dir_all(&quarantine)
             .map_err(|error| format!("cannot remove quarantined worktree: {error}"))?;
-        let prune = phoenix_core::git::command()
-            .args(["worktree", "prune", "--expire", "now"])
-            .current_dir(&repo)
-            .output()
-            .map_err(|error| format!("cannot prune retired worktree registration: {error}"))?;
-        if !prune.status.success() {
-            return Err(format!(
-                "cannot prune retired worktree registration: {}",
-                String::from_utf8_lossy(&prune.stderr).trim()
-            ));
-        }
+        std::fs::remove_dir_all(&administrative_dir).map_err(|error| {
+            format!(
+                "cannot remove exact retired worktree registration {}: {error}",
+                administrative_dir.display()
+            )
+        })?;
         Ok(ExactWorktreeRemoval::Retired)
     })
     .await
@@ -2278,7 +2406,7 @@ fn require_browser_absent(outcome: BrowserRetirementOutcome) -> Result<(), Strin
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_status_observation, git_path_from_observation,
+        canonical_status_observation, exact_worktree_administrative_dir, git_path_from_observation,
         inspect_and_remove_exact_worktree_with_hook, inspect_worktree, parse_status_losses,
         quarantine_and_remove_exact_worktree, run_bounded_git_status_until, snapshot_for,
         worktree_quarantine_path, CloseLeaseFailure, ExactWorktreeRemoval,
@@ -2371,6 +2499,20 @@ mod tests {
             WorktreeFingerprint::parse(fingerprint).unwrap(),
             locator,
         );
+        let unrelated = temp.path().join("unrelated-stale");
+        run_git(
+            &bare,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                unrelated.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let unrelated_admin = exact_worktree_administrative_dir(&unrelated, &bare).unwrap();
+        std::fs::remove_dir_all(&unrelated).unwrap();
 
         let outcome = quarantine_and_remove_exact_worktree(&identity, |_| {})
             .await
@@ -2385,6 +2527,7 @@ mod tests {
             .unwrap();
         assert!(listing.status.success());
         assert!(!String::from_utf8_lossy(&listing.stdout).contains(linked.to_str().unwrap()));
+        assert!(unrelated_admin.exists());
     }
 
     #[test]
@@ -2720,6 +2863,20 @@ mod tests {
     fn descriptor_scan_has_no_external_executable_dependency() {
         let source = include_str!("close_retirement.rs");
         assert!(!source.contains("Command::new(\"lsof\")"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn quarantine_detects_external_process_working_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .current_dir(temp.path())
+            .spawn()
+            .unwrap();
+        assert!(super::quarantine_has_process_cwd(temp.path()).unwrap());
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[cfg(unix)]

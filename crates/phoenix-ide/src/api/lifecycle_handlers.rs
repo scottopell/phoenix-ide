@@ -10,7 +10,6 @@ use super::types::{
     TaskFeedbackRequest,
 };
 use super::AppState;
-use crate::db::ConvMode;
 #[cfg(test)]
 use crate::db::Conversation;
 use crate::runtime::fork_resolve::ForkResolveError;
@@ -541,6 +540,7 @@ pub(crate) async fn cancel_close_before_retirement(
     Ok(Json(SuccessResponse { success: true }))
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn retry_close_retirement(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -634,6 +634,17 @@ pub(crate) async fn retry_close_retirement(
             "close_retirement_needs_repair",
         ))));
     }
+    let authoritative = state
+        .db
+        .get_close_obligation(retried.attempt_id().as_str())
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    if authoritative.phase() == phoenix_core::domain::close::ClosePhase::AwaitingLossConfirmation {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Close requires confirmation of the freshly inspected loss inventory",
+            "close_loss_confirmation_required",
+        ))));
+    }
     Ok(Json(SuccessResponse { success: true }))
 }
 
@@ -646,12 +657,9 @@ async fn run_legacy_close_compat(state: &AppState, id: &str, action: &str) -> Re
         .get_conversation(id)
         .await
         .map_err(|error| AppError::NotFound(error.to_string()))?;
-    if !matches!(
-        transcript.conv_mode,
-        ConvMode::Work { .. } | ConvMode::Branch { .. }
-    ) {
+    if transcript.conv_mode.worktree_path().is_none() {
         return Err(AppError::BadRequest(format!(
-            "Conversation must be in Work or Branch mode to {action}"
+            "Conversation must own an allocated worktree to {action}"
         )));
     }
     let aggregate = state
@@ -721,7 +729,7 @@ async fn run_legacy_close_compat(state: &AppState, id: &str, action: &str) -> Re
                 }
                 state
                     .db
-                    .begin_close_active_work_settlement(obligation.attempt_id().as_str())
+                    .begin_close_idle_settlement(obligation.attempt_id().as_str())
                     .await
                     .map_err(|error| {
                         AppError::Conflict(Box::new(ConflictErrorResponse::new(

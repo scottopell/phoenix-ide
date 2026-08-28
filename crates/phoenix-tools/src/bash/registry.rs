@@ -1105,11 +1105,12 @@ fn record_handle_in_report(
 fn linux_retirement_target_has_live_member(
     target: &BashRetirementTarget,
 ) -> Result<bool, std::io::Error> {
-    if phoenix_core::process_identity::current_process_identity(target.launch_identity.process.pid)
-        != Some(target.launch_identity.process)
-    {
+    let group_exists = unsafe { libc::kill(-target.pgid, 0) } == 0
+        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    if !group_exists {
         return Ok(false);
     }
+    let mut unreadable_process = false;
     for entry in std::fs::read_dir("/proc")? {
         let entry = entry?;
         let Some(pid) = entry
@@ -1119,30 +1120,53 @@ fn linux_retirement_target_has_live_member(
         else {
             continue;
         };
-        let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        let stat = match std::fs::read(format!("/proc/{pid}/stat")) {
             Ok(stat) => stat,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                unreadable_process = true;
+                continue;
+            }
             Err(error) => return Err(error),
         };
-        let Some(close) = stat.rfind(')') else {
+        let Some((state, member_pgid)) = parse_linux_proc_stat(&stat) else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("malformed /proc/{pid}/stat"),
             ));
         };
-        let mut fields = stat[close + 1..].split_whitespace();
-        let Some(state) = fields.next() else {
-            continue;
-        };
-        let Some(member_pgid) = fields.nth(1).and_then(|field| field.parse::<i32>().ok()) else {
-            continue;
-        };
-        if member_pgid == target.pgid && state != "Z" && state != "X" {
+        if member_pgid == target.pgid && state != b'Z' && state != b'X' {
             return Ok(true);
         }
     }
-    Ok(false)
+    if unreadable_process {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "process group {} still exists but /proc was not fully readable",
+                target.pgid
+            ),
+        ));
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        format!(
+            "process group {} still exists without a readable live member",
+            target.pgid
+        ),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_proc_stat(stat: &[u8]) -> Option<(u8, i32)> {
+    let close = stat.iter().rposition(|byte| *byte == b')')?;
+    let mut fields = stat
+        .get(close + 1..)?
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty());
+    let state = *fields.next()?.first()?;
+    let pgid = std::str::from_utf8(fields.nth(1)?).ok()?.parse().ok()?;
+    Some((state, pgid))
 }
 
 fn record_retirement_target_in_report(
@@ -1242,6 +1266,13 @@ mod tests {
             process_id,
             ring_bytes_cap,
         )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_stat_parser_accepts_non_utf8_comm() {
+        let stat = b"123 (bad-\xff-name) S 1 77 77 0";
+        assert_eq!(parse_linux_proc_stat(stat), Some((b'S', 77)));
     }
 
     /// REQ-WSUI-007: `emit_lifecycle` publishes a `BashLifecycleEvent`

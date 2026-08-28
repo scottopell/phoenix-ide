@@ -606,10 +606,29 @@ impl Handle {
                     };
                 }
                 if tokio::time::Instant::now() >= deadline {
-                    break Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "process incarnation did not reach stopped state before deadline",
-                    ));
+                    let resumed = unsafe {
+                        libc::syscall(
+                            libc::SYS_pidfd_send_signal,
+                            pidfd,
+                            libc::SIGCONT,
+                            std::ptr::null::<libc::siginfo_t>(),
+                            0,
+                        )
+                    };
+                    break if resumed == 0 {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "process incarnation did not reach stopped state before deadline",
+                        ))
+                    } else {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!(
+                                "stop observation timed out and incarnation-bound resume failed: {}",
+                                std::io::Error::last_os_error()
+                            ),
+                        ))
+                    };
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }

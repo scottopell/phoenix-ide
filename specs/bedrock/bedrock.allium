@@ -2098,6 +2098,18 @@ rule ModeChangeNotification {
 -- Allium has no formal helper-function declaration; rules call these
 -- predicates by bare identifier. This block defines their complete semantics.
 --
+--   retirement_inventory_is_complete_and_sealed(
+--       product_conversation: ProductConversation,
+--       attempt_id: String
+--   ) -> Boolean
+--       True exactly when the active CloseObligation for the exact product
+--       conversation and attempt has one sealed retirement target row for every
+--       resource required by every attached WorkScope, has no missing target or
+--       incomplete inspection row, and retains the same attempt-bound WorkScope,
+--       tmux, and worktree identities captured before retirement began. False
+--       when any target or inspection is absent, unsealed, superseded, or belongs
+--       to another attempt.
+--
 --   user_resumable(error_kind: ConversationErrorKind) -> Boolean
 --       True exactly for auth, rate_limit, usage_limit_reached, network,
 --       prompt_rejected, invalid_response, server_error, server_overloaded,
