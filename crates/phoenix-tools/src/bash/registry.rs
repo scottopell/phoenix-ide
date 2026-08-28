@@ -1960,9 +1960,7 @@ mod tests {
     #[allow(clippy::similar_names)]
     async fn stale_retirement_permit_does_not_kill_replacement_process_group() {
         use std::os::unix::process::CommandExt as _;
-        use std::os::unix::process::ExitStatusExt as _;
         use std::process::Stdio;
-        use tokio::time::{sleep, Duration};
 
         fn spawn_sleep() -> std::process::Child {
             let mut cmd = std::process::Command::new("sleep");
