@@ -4700,7 +4700,8 @@ impl Database {
         sqlx::query(
             "SELECT id, conversation_id, message_id, status, stage, attempt, generation,
                     claim_worker_id, claim_token, lease_until, next_attempt_at,
-                    intent_json, error, accepted_at, provisioning_started_at,
+                    intent_json, exact_checkout_oid, exact_checkout_logical_base, error,
+                    accepted_at, provisioning_started_at,
                     completed_at, failed_at, created_at, updated_at
              FROM conversation_creation_jobs WHERE id = ?1",
         )
@@ -4716,20 +4717,23 @@ impl Database {
     /// # Errors
     ///
     /// Returns [`DbError`] if the fenced database update fails.
-    pub async fn persist_conversation_creation_exact_checkout_oid(
+    pub async fn persist_conversation_creation_checkout_pin(
         &self,
         conversation_id: &str,
         generation: i64,
         oid: &str,
+        logical_base: &str,
     ) -> DbResult<bool> {
         let updated = sqlx::query(
             "UPDATE conversation_creation_jobs
-             SET exact_checkout_oid = ?1, updated_at = ?2
-             WHERE conversation_id = ?3 AND generation = ?4
+             SET exact_checkout_oid = ?1, exact_checkout_logical_base = ?2, updated_at = ?3
+             WHERE conversation_id = ?4 AND generation = ?5
                AND status = 'provisioning'
-               AND (exact_checkout_oid IS NULL OR exact_checkout_oid = ?1)",
+               AND ((exact_checkout_oid IS NULL AND exact_checkout_logical_base IS NULL)
+                    OR (exact_checkout_oid = ?1 AND exact_checkout_logical_base = ?2))",
         )
         .bind(oid)
+        .bind(logical_base)
         .bind(chrono::Utc::now().to_rfc3339())
         .bind(conversation_id)
         .bind(generation)
@@ -4750,7 +4754,8 @@ impl Database {
         sqlx::query(
             "SELECT id, conversation_id, message_id, status, stage, attempt, generation,
                     claim_worker_id, claim_token, lease_until, next_attempt_at,
-                    intent_json, error, accepted_at, provisioning_started_at,
+                    intent_json, exact_checkout_oid, exact_checkout_logical_base, error,
+                    accepted_at, provisioning_started_at,
                     completed_at, failed_at, created_at, updated_at
              FROM conversation_creation_jobs WHERE conversation_id = ?1",
         )
@@ -4773,7 +4778,8 @@ impl Database {
         sqlx::query(
             "SELECT id, conversation_id, message_id, status, stage, attempt, generation,
                     claim_worker_id, claim_token, lease_until, next_attempt_at,
-                    intent_json, error, accepted_at, provisioning_started_at,
+                    intent_json, exact_checkout_oid, exact_checkout_logical_base, error,
+                    accepted_at, provisioning_started_at,
                     completed_at, failed_at, created_at, updated_at
              FROM conversation_creation_jobs WHERE message_id = ?1",
         )
@@ -6888,6 +6894,89 @@ impl Database {
         Ok(())
     }
 
+    /// Persist an approved-task objective and the existing scope's write authority atomically.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] if the conversation has no attached scope or the snapshot conflicts.
+    pub async fn persist_approved_task_authority(
+        &self,
+        conversation_id: &str,
+        approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
+    ) -> DbResult<()> {
+        let snapshot = phoenix_core::task_handoff::ApprovedTaskSnapshot::from(approval);
+        let priority = serde_json::to_string(&snapshot.priority)
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let now_us = Utc::now().timestamp_micros();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let work_scope_id: Option<String> =
+            sqlx::query_scalar("SELECT work_scope_id FROM conversations WHERE id = ?1")
+                .bind(conversation_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .flatten();
+        let work_scope_id = work_scope_id.ok_or_else(|| {
+            DbError::ContinuationPrecondition(
+                "approved task requires an attached WorkScope".to_string(),
+            )
+        })?;
+        sqlx::query(
+            "INSERT INTO conversation_approved_task_objectives (
+                 conversation_id, task_id, task_title, approved_title, approved_priority,
+                 approved_plan, approved_task_file, approved_artifact_body, created_at_us
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(conversation_id) DO UPDATE SET conversation_id = excluded.conversation_id
+             WHERE task_id = excluded.task_id AND task_title = excluded.task_title
+               AND approved_title = excluded.approved_title
+               AND approved_priority = excluded.approved_priority
+               AND approved_plan = excluded.approved_plan
+               AND approved_task_file = excluded.approved_task_file
+               AND approved_artifact_body = excluded.approved_artifact_body",
+        )
+        .bind(conversation_id)
+        .bind(&snapshot.task_id)
+        .bind(&snapshot.task_title)
+        .bind(&snapshot.title)
+        .bind(priority)
+        .bind(&snapshot.plan)
+        .bind(&snapshot.task_file)
+        .bind(&snapshot.artifact_body)
+        .bind(now_us)
+        .execute(&mut *tx)
+        .await?;
+        let persisted: Option<String> = sqlx::query_scalar(
+            "SELECT task_id FROM conversation_approved_task_objectives WHERE conversation_id = ?1",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if persisted.as_deref() != Some(snapshot.task_id.as_str()) {
+            return Err(DbError::ContinuationPrecondition(
+                "approved task conflicts with the committed objective".to_string(),
+            ));
+        }
+        sqlx::query(
+            "INSERT INTO work_scope_approved_task_authorities (
+                 work_scope_id, objective_conversation_id, created_at_us
+             ) VALUES (?1, ?2, ?3)
+             ON CONFLICT(work_scope_id) DO UPDATE SET work_scope_id = excluded.work_scope_id
+             WHERE objective_conversation_id = excluded.objective_conversation_id",
+        )
+        .bind(&work_scope_id)
+        .bind(conversation_id)
+        .bind(now_us)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE work_scopes SET authority_kind = 'work', updated_at = ?1 WHERE id = ?2",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(work_scope_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Create a fresh Work conversation and `ProductConversation` for an approved task.
     ///
     /// # Errors
@@ -6956,21 +7045,20 @@ impl Database {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let existing: Option<(String, String, String, String, String, String, String)> =
             sqlx::query_as(
-            "SELECT target.id, source.approved_title, source.approved_priority,
-                    source.approved_artifact_body, source.approved_task_title,
-                    source.approved_plan, source.approved_task_file
-             FROM product_conversation_sources source
-             JOIN conversations target ON target.product_conversation_id = source.target_product_conversation_id
-             WHERE source.source_product_conversation_id = ?1
-               AND source.relation_kind = 'approved_task' AND source.relation_key = ?2
-               AND target.parent_conversation_id IS NULL
-             ORDER BY target.created_at ASC, target.id ASC
+                "SELECT target.id, binding.approved_title, binding.approved_priority,
+                    binding.approved_artifact_body, binding.task_title,
+                    binding.approved_plan, binding.approved_task_file
+             FROM approved_task_creation_bindings binding
+             JOIN conversation_creation_jobs job ON job.id = binding.job_id
+             JOIN conversations target ON target.id = job.conversation_id
+             WHERE binding.source_product_conversation_id = ?1
+               AND binding.task_id = ?2
              LIMIT 1",
-        )
-        .bind(parent.product_conversation_id.as_str())
-        .bind(&snapshot.task_id)
-        .fetch_optional(&mut *tx)
-        .await?;
+            )
+            .bind(parent.product_conversation_id.as_str())
+            .bind(&snapshot.task_id)
+            .fetch_optional(&mut *tx)
+            .await?;
         if let Some((existing, title, priority, artifact_body, task_title, plan, task_file)) =
             existing
         {
@@ -7006,46 +7094,6 @@ impl Database {
             .await?;
         Self::insert_work_scope_tx(&mut tx, &scope_id, authority_kind, environment, &now_str)
             .await?;
-        sqlx::query(
-            "INSERT INTO work_scope_git_repositories (work_scope_id, repository_id)
-             SELECT ?1, repository_id
-             FROM work_scope_git_repositories
-             WHERE work_scope_id = ?2",
-        )
-        .bind(scope_id.as_str())
-        .bind(
-            parent
-                .attached_work_scope_id
-                .as_ref()
-                .map(WorkScopeId::as_str),
-        )
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "INSERT INTO product_conversation_sources (
-                 target_product_conversation_id, source_product_conversation_id,
-                 source_conversation_id, relation_kind, relation_key, approved_title,
-                 approved_priority, approved_artifact_body, approved_task_title,
-                 approved_plan, approved_task_file, created_at_us
-             ) VALUES (?1, ?2, ?3, 'approved_task', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        )
-        .bind(product_id.as_str())
-        .bind(parent.product_conversation_id.as_str())
-        .bind(parent_id)
-        .bind(&snapshot.task_id)
-        .bind(&snapshot.title)
-        .bind(
-            serde_json::to_string(&snapshot.priority)
-                .map_err(|error| DbError::Serialization(error.to_string()))?,
-        )
-        .bind(&snapshot.artifact_body)
-        .bind(&snapshot.task_title)
-        .bind(&snapshot.plan)
-        .bind(&snapshot.task_file)
-        .bind(now.timestamp_micros())
-        .execute(&mut *tx)
-        .await?;
-
         let mut slug = base_slug.clone();
         for attempt in 0..=20 {
             let title = schema::title_from_slug(&slug);
@@ -7100,17 +7148,41 @@ impl Database {
         sqlx::query(
             "INSERT INTO conversation_creation_jobs (
                  id, conversation_id, message_id, status, stage, attempt, generation, intent_json,
-                 exact_checkout_oid, error, accepted_at, provisioning_started_at, completed_at,
+                 exact_checkout_oid, exact_checkout_logical_base, error, accepted_at,
+                 provisioning_started_at, completed_at,
                  failed_at, cancelled_at, deletion_requested_at, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, 'accepted', 'validate_intent', 0, 0, ?4, ?5, NULL, ?6, NULL,
-                       NULL, NULL, NULL, NULL, ?6, ?6)",
+             ) VALUES (?1, ?2, ?3, 'accepted', 'validate_intent', 0, 0, ?4, ?5, ?6, NULL, ?7,
+                       NULL, NULL, NULL, NULL, NULL, ?7, ?7)",
         )
         .bind(&job_id)
         .bind(&new_id)
         .bind(&message_id)
         .bind(intent_json)
         .bind(&intent.checkout_ref)
+        .bind(None::<&str>)
         .bind(&now_str)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO approved_task_creation_bindings (
+                 job_id, source_product_conversation_id, source_conversation_id, task_id,
+                 task_title, approved_title, approved_priority, approved_plan,
+                 approved_task_file, approved_artifact_body
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        )
+        .bind(&job_id)
+        .bind(parent.product_conversation_id.as_str())
+        .bind(parent_id)
+        .bind(&snapshot.task_id)
+        .bind(&snapshot.task_title)
+        .bind(&snapshot.title)
+        .bind(
+            serde_json::to_string(&snapshot.priority)
+                .map_err(|error| DbError::Serialization(error.to_string()))?,
+        )
+        .bind(&snapshot.plan)
+        .bind(&snapshot.task_file)
+        .bind(&snapshot.artifact_body)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -8572,6 +8644,54 @@ impl Database {
                         &now,
                     )
                     .await?;
+
+                    let approved_binding = sqlx::query(
+                        "SELECT source_product_conversation_id, source_conversation_id, task_id,
+                                task_title, approved_title, approved_priority, approved_plan,
+                                approved_task_file, approved_artifact_body
+                         FROM approved_task_creation_bindings WHERE job_id = ?1",
+                    )
+                    .bind(job_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                    if let Some(binding) = approved_binding {
+                        let source_conversation_id: String = binding.get("source_conversation_id");
+                        sqlx::query(
+                            "INSERT INTO work_scope_git_repositories (work_scope_id, repository_id)
+                             SELECT ?1, repository_id
+                             FROM conversations source
+                             JOIN work_scope_git_repositories repository
+                               ON repository.work_scope_id = source.work_scope_id
+                             WHERE source.id = ?2",
+                        )
+                        .bind(environment_scope.as_str())
+                        .bind(&source_conversation_id)
+                        .execute(&mut *tx)
+                        .await?;
+                        sqlx::query(
+                            "INSERT INTO product_conversation_sources (
+                                 target_product_conversation_id, source_product_conversation_id,
+                                 source_conversation_id, relation_kind, relation_key, approved_title,
+                                 approved_priority, approved_artifact_body, approved_task_title,
+                                 approved_plan, approved_task_file, created_at_us
+                             ) SELECT c.product_conversation_id, ?1, ?2, 'approved_task', ?3, ?4,
+                                      ?5, ?6, ?7, ?8, ?9, ?10
+                               FROM conversations c WHERE c.id = ?11",
+                        )
+                        .bind(binding.get::<String, _>("source_product_conversation_id"))
+                        .bind(&source_conversation_id)
+                        .bind(binding.get::<String, _>("task_id"))
+                        .bind(binding.get::<String, _>("approved_title"))
+                        .bind(binding.get::<String, _>("approved_priority"))
+                        .bind(binding.get::<String, _>("approved_artifact_body"))
+                        .bind(binding.get::<String, _>("task_title"))
+                        .bind(binding.get::<String, _>("approved_plan"))
+                        .bind(binding.get::<String, _>("approved_task_file"))
+                        .bind(Utc::now().timestamp_micros())
+                        .bind(id)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
 
                     let authority = match mode {
                         ConvMode::Explore { .. } => AuthorityKind::RestrictedExplore,
@@ -11676,6 +11796,23 @@ fn parse_conversation_creation_job_row(
     Ok(ConversationCreationJob {
         id: row.try_get("id")?,
         conversation_id: row.try_get("conversation_id")?,
+        starting_pin: match (
+            row.try_get::<Option<String>, _>("exact_checkout_oid")?,
+            row.try_get::<Option<String>, _>("exact_checkout_logical_base")?,
+        ) {
+            (Some(exact_checkout_oid), Some(logical_base)) => {
+                Some(phoenix_core::domain::db_schema::ConversationCreationPin {
+                    exact_checkout_oid,
+                    logical_base,
+                })
+            }
+            (None, None) => None,
+            _ => {
+                return Err(sqlx::Error::Decode(
+                    "conversation creation checkout pin is structurally incomplete".into(),
+                ));
+            }
+        },
         message_id: row.try_get("message_id")?,
         protocol: CreationProtocolState {
             kind: match &row.try_get::<Option<String>, _>("message_id")? {
@@ -20849,14 +20986,22 @@ mod tests {
             .unwrap();
         let successor_scope = successor.attached_work_scope_id.clone().unwrap();
         assert_ne!(successor_scope, parent_scope);
-        let successor_repository: String = sqlx::query_scalar(
+        let successor_repository: Option<String> = sqlx::query_scalar(
             "SELECT repository_id FROM work_scope_git_repositories WHERE work_scope_id = ?1",
         )
         .bind(successor_scope.as_str())
+        .fetch_optional(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(successor_repository, None);
+        let source_relation_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM product_conversation_sources WHERE target_product_conversation_id = ?1",
+        )
+        .bind(successor.product_conversation_id.as_str())
         .fetch_one(&db.pool)
         .await
         .unwrap();
-        assert_eq!(successor_repository, "handoff-repository");
+        assert_eq!(source_relation_count, 0);
         assert!(matches!(successor.state, ConvState::Provisioning { .. }));
         assert_eq!(successor.conv_mode, ConvMode::Direct);
         let job = db

@@ -152,6 +152,15 @@ fn normalize_product_creation_intent(intent: &ProductCreationIntent) -> DbResult
             "product creation objective must not be empty unless images are provided".to_string(),
         ));
     }
+    if intent
+        .images
+        .iter()
+        .any(|image| image.media_type.trim().is_empty() || image.data.trim().is_empty())
+    {
+        return Err(DbError::Serialization(
+            "product creation images require a media type and non-empty payload".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -425,7 +434,7 @@ impl Database {
     ) -> DbResult<Option<ClaimedProductCreationJob>> {
         let now_str = datetime_to_unix_micros(now);
         let lease_until = datetime_to_unix_micros(now + lease_duration);
-        let row: Option<(i64,)> = sqlx::query_as(
+        let job = sqlx::query(
             "UPDATE product_creation_jobs
              SET status = 'claimed', claim_generation = claim_generation + 1,
                  claim_worker_id = ?2, claim_token = ?3, claim_lease_until_unix_micros = ?4,
@@ -434,30 +443,35 @@ impl Database {
                  status = 'accepted'
                  OR (status = 'retry_scheduled' AND retry_at_unix_micros <= ?1)
                  OR (status = 'claimed' AND claim_lease_until_unix_micros <= ?1)
-             ) RETURNING claim_generation",
+             ) RETURNING request_id, product_conversation_id, cwd, objective, model, effort,
+                 llm_language, status, accepted_at_unix_micros, updated_at_unix_micros,
+                 attempt_count, claim_generation, claim_worker_id, claim_token,
+                 claim_lease_until_unix_micros, retry_at_unix_micros, delivery_attempt_count,
+                 delivery_retry_at_unix_micros, pin_exact_checkout_oid, pin_logical_base,
+                 pin_freshness, staging_path, staging_repo_root, staging_exact_oid,
+                 published_product_id, published_conversation_id, last_error,
+                 cancelled_at_unix_micros, deletion_requested_at_unix_micros,
+                 COALESCE((
+                     SELECT json_group_array(json_object('media_type', image.media_type, 'data', image.data))
+                     FROM (
+                         SELECT media_type, data FROM product_creation_job_images
+                         WHERE product_creation_job_images.request_id = product_creation_jobs.request_id
+                         ORDER BY ordinal
+                     ) image
+                 ), '[]') AS images_json",
         )
         .bind(now_str)
         .bind(worker_id)
         .bind(token)
         .bind(lease_until)
         .bind(request_id)
+        .try_map(parse_product_creation_job_row)
         .fetch_optional(&self.pool)
         .await?;
-        let Some((generation,)) = row else {
-            return Ok(None);
-        };
-        let job = self
-            .get_product_creation_job(request_id)
-            .await?
-            .filter(|job| {
-                job.status == "claimed"
-                    && job.claim_generation == generation
-                    && job.claim_worker_id.as_deref() == Some(worker_id)
-                    && job.claim_token.as_deref() == Some(token)
-            });
         let Some(job) = job else {
             return Ok(None);
         };
+        let generation = job.claim_generation;
         Ok(Some(ClaimedProductCreationJob {
             claim: ProductCreationClaim {
                 worker_id: worker_id.to_string(),

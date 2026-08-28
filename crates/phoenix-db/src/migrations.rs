@@ -404,12 +404,59 @@ const MIGRATIONS: &[Migration] = &[
         version: 77,
         name: "persist_conversation_creation_exact_checkout_oid",
         sql: "ALTER TABLE conversation_creation_jobs ADD COLUMN exact_checkout_oid TEXT;
+ALTER TABLE conversation_creation_jobs ADD COLUMN exact_checkout_logical_base TEXT;
+CREATE TRIGGER conversation_creation_checkout_pin_insert
+BEFORE INSERT ON conversation_creation_jobs
+WHEN (NEW.exact_checkout_oid IS NULL) <> (NEW.exact_checkout_logical_base IS NULL)
+  OR (NEW.exact_checkout_oid IS NOT NULL AND trim(NEW.exact_checkout_oid) = '')
+  OR (NEW.exact_checkout_logical_base IS NOT NULL AND trim(NEW.exact_checkout_logical_base) = '')
+BEGIN
+    SELECT RAISE(ABORT, 'conversation creation checkout pin must be a non-empty pair');
+END;
+CREATE TRIGGER conversation_creation_checkout_pin_update
+BEFORE UPDATE OF exact_checkout_oid, exact_checkout_logical_base ON conversation_creation_jobs
+WHEN (NEW.exact_checkout_oid IS NULL) <> (NEW.exact_checkout_logical_base IS NULL)
+  OR (NEW.exact_checkout_oid IS NOT NULL AND trim(NEW.exact_checkout_oid) = '')
+  OR (NEW.exact_checkout_logical_base IS NOT NULL AND trim(NEW.exact_checkout_logical_base) = '')
+BEGIN
+    SELECT RAISE(ABORT, 'conversation creation checkout pin must be a non-empty pair');
+END;
 ALTER TABLE product_conversation_sources ADD COLUMN approved_title TEXT;
 ALTER TABLE product_conversation_sources ADD COLUMN approved_priority TEXT;
 ALTER TABLE product_conversation_sources ADD COLUMN approved_artifact_body TEXT;
 ALTER TABLE product_conversation_sources ADD COLUMN approved_task_title TEXT;
 ALTER TABLE product_conversation_sources ADD COLUMN approved_plan TEXT;
-ALTER TABLE product_conversation_sources ADD COLUMN approved_task_file TEXT;",
+ALTER TABLE product_conversation_sources ADD COLUMN approved_task_file TEXT;
+CREATE TABLE approved_task_creation_bindings (
+    job_id TEXT PRIMARY KEY REFERENCES conversation_creation_jobs(id) ON DELETE CASCADE,
+    source_product_conversation_id TEXT NOT NULL REFERENCES product_conversations(id),
+    source_conversation_id TEXT NOT NULL REFERENCES conversations(id),
+    task_id TEXT NOT NULL CHECK (trim(task_id) <> ''),
+    task_title TEXT NOT NULL CHECK (trim(task_title) <> ''),
+    approved_title TEXT NOT NULL CHECK (trim(approved_title) <> ''),
+    approved_priority TEXT NOT NULL CHECK (trim(approved_priority) <> ''),
+    approved_plan TEXT NOT NULL,
+    approved_task_file TEXT NOT NULL CHECK (trim(approved_task_file) <> ''),
+    approved_artifact_body TEXT NOT NULL,
+    UNIQUE(source_product_conversation_id, task_id)
+);
+CREATE TABLE conversation_approved_task_objectives (
+    conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL CHECK (trim(task_id) <> ''),
+    task_title TEXT NOT NULL CHECK (trim(task_title) <> ''),
+    approved_title TEXT NOT NULL CHECK (trim(approved_title) <> ''),
+    approved_priority TEXT NOT NULL CHECK (trim(approved_priority) <> ''),
+    approved_plan TEXT NOT NULL,
+    approved_task_file TEXT NOT NULL CHECK (trim(approved_task_file) <> ''),
+    approved_artifact_body TEXT NOT NULL,
+    created_at_us INTEGER NOT NULL CHECK (created_at_us >= 0)
+);
+CREATE TABLE work_scope_approved_task_authorities (
+    work_scope_id TEXT PRIMARY KEY REFERENCES work_scopes(id) ON DELETE CASCADE,
+    objective_conversation_id TEXT NOT NULL UNIQUE
+        REFERENCES conversation_approved_task_objectives(conversation_id) ON DELETE CASCADE,
+    created_at_us INTEGER NOT NULL CHECK (created_at_us >= 0)
+);",
     },
 ];
 

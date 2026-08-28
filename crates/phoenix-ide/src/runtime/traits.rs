@@ -412,12 +412,10 @@ pub trait StateStore: Send + Sync {
         state_updated_at: DateTime<Utc>,
     ) -> Result<crate::db::ContinuationCommitOutcome, String>;
 
-    /// Atomically update mode, cwd, and normalized environment during promotion.
-    async fn update_conversation_mode_and_cwd(
+    async fn persist_approved_task_authority(
         &self,
         conv_id: &str,
-        mode: &ConvMode,
-        cwd: &str,
+        approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
     ) -> Result<(), String>;
 
     /// Get the current conversation mode (used by effect handlers that need
@@ -902,14 +900,13 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
             .await
     }
 
-    async fn update_conversation_mode_and_cwd(
+    async fn persist_approved_task_authority(
         &self,
         conv_id: &str,
-        mode: &ConvMode,
-        cwd: &str,
+        approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
     ) -> Result<(), String> {
         (**self)
-            .update_conversation_mode_and_cwd(conv_id, mode, cwd)
+            .persist_approved_task_authority(conv_id, approval)
             .await
     }
 
@@ -1825,14 +1822,13 @@ impl StateStore for DatabaseStorage {
             .map_err(|error| error.to_string())
     }
 
-    async fn update_conversation_mode_and_cwd(
+    async fn persist_approved_task_authority(
         &self,
         conv_id: &str,
-        mode: &ConvMode,
-        cwd: &str,
+        approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
     ) -> Result<(), String> {
         self.db
-            .update_conversation_mode_and_cwd(conv_id, mode, cwd)
+            .persist_approved_task_authority(conv_id, approval)
             .await
             .map_err(|e| e.to_string())
     }

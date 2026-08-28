@@ -418,10 +418,18 @@ pub struct ConversationCreationIntent {
     pub approved_task: Option<crate::task_handoff::ApprovedTaskSnapshot>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationCreationPin {
+    pub exact_checkout_oid: String,
+    pub logical_base: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConversationCreationJob {
     pub id: String,
     pub conversation_id: String,
+    #[serde(default)]
+    pub starting_pin: Option<ConversationCreationPin>,
     #[serde(default)]
     pub message_id: Option<String>,
     pub protocol: crate::domain::creation_protocol::CreationProtocolState,

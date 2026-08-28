@@ -1533,24 +1533,28 @@ async fn provision_conversation(
             let (branch_name, approved_commit_oid, approved_base_branch) = if let Some(snapshot) =
                 approved_snapshot.as_ref()
             {
-                let (oid, base_branch) = run_admitted_blocking(
-                    acquire_creation_admission(
-                        manager,
-                        "approved-task pin resolution rejected after fatal local authority closure",
-                    )?,
-                    {
-                        let repo_root = repo_root.clone();
-                        move || strict_product_creation_pin(Path::new(&repo_root))
-                    },
-                )
-                .await
-                .map_err(|error| {
-                    (
-                        format!("approved-task pin resolution join failed: {error}"),
-                        ErrorKind::ServerError,
+                let (oid, base_branch) = if let Some(pin) = job.starting_pin.as_ref() {
+                    (pin.exact_checkout_oid.clone(), pin.logical_base.clone())
+                } else {
+                    run_admitted_blocking(
+                        acquire_creation_admission(
+                            manager,
+                            "approved-task pin resolution rejected after fatal local authority closure",
+                        )?,
+                        {
+                            let repo_root = repo_root.clone();
+                            move || strict_product_creation_pin(Path::new(&repo_root))
+                        },
                     )
-                })?
-                .map_err(|error| (error, ErrorKind::ServerError))?;
+                    .await
+                    .map_err(|error| {
+                        (
+                            format!("approved-task pin resolution join failed: {error}"),
+                            ErrorKind::ServerError,
+                        )
+                    })?
+                    .map_err(|error| (error, ErrorKind::ServerError))?
+                };
                 (
                     format!(
                         "task-{}-{}",
@@ -1573,7 +1577,7 @@ async fn provision_conversation(
             if let Some(oid) = approved_commit_oid.as_deref() {
                 if !manager
                     .db()
-                    .persist_conversation_creation_exact_checkout_oid(
+                    .persist_conversation_creation_checkout_pin(
                         &job.conversation_id,
                         i64::try_from(claim.generation).map_err(|_| {
                             (
@@ -1582,6 +1586,9 @@ async fn provision_conversation(
                             )
                         })?,
                         oid,
+                        approved_base_branch
+                            .as_deref()
+                            .expect("approved-task pin includes its logical base"),
                     )
                     .await
                     .map_err(|error| (error.to_string(), ErrorKind::ServerError))?

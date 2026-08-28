@@ -8206,50 +8206,21 @@ where
 
         match result {
             Ok(approval_result) => {
-                let worktree_path =
-                    crate::db::NonEmptyString::new(approval_result.worktree_path.clone())
-                        .expect("worktree_path from task approval must be non-empty");
-                let base_branch =
-                    crate::db::NonEmptyString::new(approval_result.base_branch.clone())
-                        .expect("base_branch from task approval must be non-empty");
-                let task_id = crate::db::NonEmptyString::new(approval_result.task_id.clone())
-                    .expect("task_id from task approval must be non-empty");
-                let task_title = crate::db::NonEmptyString::new(approval_result.task_title.clone())
-                    .expect("task_title from task approval must be non-empty");
-                let work_mode = if approval_result.branch_name == "HEAD" {
-                    crate::db::ConvMode::DetachedApprovedTask {
-                        worktree_path,
-                        base_branch,
-                        task_id,
-                        task_title,
-                    }
-                } else {
-                    crate::db::ConvMode::Work {
-                        branch_name: crate::db::NonEmptyString::new(
-                            approval_result.branch_name.clone(),
-                        )
-                        .expect("branch_name from task approval must be non-empty"),
-                        worktree_path,
-                        base_branch,
-                        task_id,
-                        task_title,
-                    }
-                };
                 storage
-                    .update_conversation_mode_and_cwd(
+                    .persist_approved_task_authority(
                         &self.context.conversation_id,
-                        &work_mode,
-                        &approval_result.worktree_path,
+                        &TaskApprovalHandoffData {
+                            task_id: approval_result.task_id.clone(),
+                            task_title: approval_result.task_title.clone(),
+                            title: title_backup.clone(),
+                            priority: priority_backup,
+                            plan: plan_backup.clone(),
+                            task_file: task_file_backup.clone(),
+                            artifact_body: plan_backup.clone(),
+                        },
                     )
                     .await?;
-
-                // Legitimate cwd mutation (task 13012, in-place promotion).
-                // For Managed conversations (REQ-PROJ-028): the early Explore
-                // worktree is promoted in place (branch rename, same path), so
-                // this write is a no-op — worktree_path == conv.cwd already.
-                // For legacy Managed conversations whose cwd was the repo root,
-                // this is load-bearing: it moves cwd to the new worktree path.
-                promote_runtime_context_to_work(&mut self.context, &approval_result, &work_mode);
+                self.context.resource_authority = crate::work_scope::ResourceAuthority::Work;
 
                 // Upgrade tool registry from Explore to Work mode so the agent
                 // gets bash, patch, etc. for the rest of this conversation.
@@ -8300,14 +8271,18 @@ where
                     .admitted_publication(admitted)
                     .persisted_message(msg);
 
-                // Push updated conversation metadata to the client so it
-                // reflects the new cwd, branch, worktree_path, and mode label
-                // without requiring a reconnect.
-                let branch_name = match &work_mode {
-                    crate::db::ConvMode::DetachedApprovedTask { .. } => None,
-                    _ => Some(approval_result.branch_name.clone()),
+                // Approval changes write authority, not the conversation mode.
+                let (branch_name, conv_mode_label) = match self.context.mode_context.as_ref() {
+                    Some(ModeContext::Work { branch_name, .. }) => {
+                        (Some(branch_name.clone()), "Work")
+                    }
+                    Some(ModeContext::Branch { branch_name, .. }) => {
+                        (Some(branch_name.clone()), "Branch")
+                    }
+                    Some(ModeContext::Explore { .. }) => (None, "Explore"),
+                    Some(ModeContext::DetachedApprovedTask { .. }) => (None, "Approved Task"),
+                    Some(ModeContext::Direct) | None => (None, "Direct"),
                 };
-                let conv_mode_label = work_mode.label();
                 let _ = self
                     .broadcast_tx
                     .admitted_publication(admitted)
@@ -8483,30 +8458,6 @@ where
             successor_conv_id: response.successor_conv_id,
         }))
     }
-}
-
-fn promote_runtime_context_to_work(
-    context: &mut ConvContext,
-    approval: &TaskApprovalResult,
-    mode: &crate::db::ConvMode,
-) {
-    let worktree_path = std::path::PathBuf::from(&approval.worktree_path);
-    context.set_filesystem_root(worktree_path.clone());
-    context.resource_authority = crate::work_scope::ResourceAuthority::Work;
-    context.work_scope_worktree = Some(worktree_path);
-    context.mode_context = Some(match mode {
-        crate::db::ConvMode::DetachedApprovedTask { .. } => ModeContext::DetachedApprovedTask {
-            base_branch: approval.base_branch.clone(),
-            worktree_path: approval.worktree_path.clone(),
-            task_id: approval.task_id.clone(),
-            task_title: approval.task_title.clone(),
-        },
-        _ => ModeContext::Work {
-            branch_name: approval.branch_name.clone(),
-            base_branch: approval.base_branch.clone(),
-            worktree_path: approval.worktree_path.clone(),
-        },
-    });
 }
 
 /// Result of a successful task approval
@@ -15120,60 +15071,6 @@ mod explore_prompt_cache_shape_tests {
         assert_eq!(requests[0].cache_key.as_str(), conv_id);
 
         runtime_handle.abort();
-    }
-}
-
-#[cfg(test)]
-mod runtime_context_promotion_tests {
-    use super::*;
-
-    #[test]
-    fn promotion_refreshes_filesystem_and_resource_context() {
-        let old_root = std::path::PathBuf::from("/repo");
-        let mut context = ConvContext::new("conv", old_root, "model", 200_000);
-        context.resource_authority = crate::work_scope::ResourceAuthority::Restricted;
-        context.work_scope_worktree = None;
-        context.mode_context = Some(ModeContext::Explore {
-            next_taskmd_id_hint: None,
-        });
-        let approval = TaskApprovalResult {
-            task_id: "123".to_string(),
-            task_title: "Approved task".to_string(),
-            branch_name: "task-123-approved".to_string(),
-            first_task: true,
-            worktree_path: "/repo/.phoenix/worktrees/conv".to_string(),
-            base_branch: "main".to_string(),
-        };
-
-        let mode = crate::db::ConvMode::Work {
-            branch_name: crate::db::NonEmptyString::new(approval.branch_name.clone()).unwrap(),
-            worktree_path: crate::db::NonEmptyString::new(approval.worktree_path.clone()).unwrap(),
-            base_branch: crate::db::NonEmptyString::new(approval.base_branch.clone()).unwrap(),
-            task_id: crate::db::NonEmptyString::new(approval.task_id.clone()).unwrap(),
-            task_title: crate::db::NonEmptyString::new(approval.task_title.clone()).unwrap(),
-        };
-        promote_runtime_context_to_work(&mut context, &approval, &mode);
-
-        let promoted_path = std::path::PathBuf::from(&approval.worktree_path);
-        assert_eq!(
-            context.execution_environment.working_dir(),
-            Some(promoted_path.as_path())
-        );
-        assert_eq!(
-            context.resource_authority,
-            crate::work_scope::ResourceAuthority::Work
-        );
-        assert_eq!(context.work_scope_worktree.as_ref(), Some(&promoted_path));
-        assert!(matches!(
-            context.mode_context,
-            Some(ModeContext::Work {
-                branch_name,
-                base_branch,
-                worktree_path,
-            }) if branch_name == approval.branch_name
-                && base_branch == approval.base_branch
-                && worktree_path == approval.worktree_path
-        ));
     }
 }
 

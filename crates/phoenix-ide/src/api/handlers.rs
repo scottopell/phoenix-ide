@@ -1990,6 +1990,15 @@ async fn create_product_conversation(
             "Product creation requires objective text or an image".to_string(),
         ));
     }
+    if req
+        .images
+        .iter()
+        .any(|image| image.media_type.trim().is_empty() || image.data.trim().is_empty())
+    {
+        return Err(AppError::BadRequest(
+            "Product creation images require a media type and non-empty payload".to_string(),
+        ));
+    }
     if req.images.len() > 20
         || req
             .images
