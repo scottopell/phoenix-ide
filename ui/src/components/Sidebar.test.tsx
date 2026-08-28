@@ -1,5 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { notifyProductConversationListMayHaveChanged } from '../notifications';
+import {
+  notifyProductConversationListMayHaveChanged,
+  subscribeCloseSnapshotChanged,
+} from '../notifications';
 import { render, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import type { Conversation, ProductConversationListRow } from '../api';
@@ -228,6 +231,31 @@ describe('Sidebar — ProductConversation navigation', () => {
 
     await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-updated"]')).not.toBeNull());
     expect(apiMock.listProductConversations).toHaveBeenCalledTimes(2);
+  });
+
+  it('notifies the active Close surface when Archive starts a server-authoritative attempt', async () => {
+    apiMock.listProductConversations.mockRejectedValueOnce(new Error('offline'));
+    apiMock.archiveConversation.mockRejectedValueOnce(new Error('close_loss_confirmation_required'));
+    const listener = vi.fn();
+    const unsubscribe = subscribeCloseSnapshotChanged('cached-id', listener);
+
+    const { getByTitle } = render(
+      <MemoryRouter initialEntries={['/c/cached-slug']}>
+        <Sidebar
+          collapsed={false}
+          onToggle={vi.fn()}
+          conversations={[makeConv('cached-id', 'cached-slug')]}
+          archivedConversations={[]}
+          activeSlug="cached-slug"
+          onConversationCreated={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(await waitFor(() => getByTitle('Actions')));
+    fireEvent.click(await waitFor(() => getByTitle('Archive conversation "cached-slug"')));
+    await waitFor(() => expect(listener).toHaveBeenCalledTimes(1));
+    unsubscribe();
   });
 
   it('labels the global nav entry as Coordinator', async () => {

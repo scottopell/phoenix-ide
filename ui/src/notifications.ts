@@ -163,3 +163,22 @@ export function subscribeProductConversationListRevision(listener: () => void): 
 export function getProductConversationListRevision(): number {
   return productConversationListRevision;
 }
+
+const CLOSE_SNAPSHOT_CHANGED_EVENT = 'phoenix:close-snapshot-changed';
+
+export function notifyCloseSnapshotChanged(conversationId: string): void {
+  window.dispatchEvent(new CustomEvent<string>(CLOSE_SNAPSHOT_CHANGED_EVENT, {
+    detail: conversationId,
+  }));
+}
+
+export function subscribeCloseSnapshotChanged(
+  conversationId: string,
+  listener: () => void,
+): () => void {
+  const handler = (event: Event) => {
+    if ((event as CustomEvent<string>).detail === conversationId) listener();
+  };
+  window.addEventListener(CLOSE_SNAPSHOT_CHANGED_EVENT, handler);
+  return () => window.removeEventListener(CLOSE_SNAPSHOT_CHANGED_EVENT, handler);
+}

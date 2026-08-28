@@ -11,7 +11,11 @@ import { useTheme } from '../hooks';
 import type { CodexLoginPreflight } from '../api';
 import { subscribeModels } from '../modelsPoller';
 import { ConversationContext } from '../conversation/ConversationContext';
-import { getProductConversationListRevision, subscribeProductConversationListRevision } from '../notifications';
+import {
+  getProductConversationListRevision,
+  notifyCloseSnapshotChanged,
+  subscribeProductConversationListRevision,
+} from '../notifications';
 
 const COLLAPSED_DOT_LIMIT = 9;
 const PRODUCT_REFRESH_COALESCE_MS = 50;
@@ -229,6 +233,7 @@ export function Sidebar({
       await api.archiveConversation(conv.id);
       onConversationCreated();
     } catch (err) {
+      notifyCloseSnapshotChanged(conv.id);
       console.error('Failed to archive:', err);
     }
   }, [onConversationCreated]);

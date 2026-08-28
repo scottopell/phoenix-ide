@@ -11,6 +11,7 @@ import type { WorkDisposition } from './workDisposition';
 import { derivePrRailAvailability } from './prRailAvailability';
 import { prReviewState } from './prReviewState';
 import { useIsCompactLayout } from '../hooks';
+import { subscribeCloseSnapshotChanged } from '../notifications';
 import './WorkActions.css';
 
 interface WorkControlBarProps {
@@ -324,14 +325,19 @@ export function WorkControlBar({
 
   useEffect(() => {
     let cancelled = false;
-    void api.getProductConversationSnapshot(conversationId)
-      .then((snapshot) => {
-        if (!cancelled && snapshot.close) {
-          setCloseSnapshot(snapshot);
-        }
-      })
-      .catch(() => undefined);
-    return () => { cancelled = true; };
+    const refresh = () => {
+      void api.getProductConversationSnapshot(conversationId)
+        .then((snapshot) => {
+          if (!cancelled) setCloseSnapshot(snapshot.close ? snapshot : null);
+        })
+        .catch(() => undefined);
+    };
+    refresh();
+    const unsubscribe = subscribeCloseSnapshotChanged(conversationId, refresh);
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
   }, [conversationId]);
 
   useEffect(() => {

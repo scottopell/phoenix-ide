@@ -26,6 +26,7 @@ import { StateBar } from './StateBar';
 import { api, type AssociatedPrStatusEnvelope, type PrStatusResponse } from '../api';
 import { ViewerSlotProvider, useViewerSlot } from '../contexts/ViewerSlotContext';
 import { requestActivePrSelectorOpen } from './activePrSelectorIntent';
+import { notifyCloseSnapshotChanged } from '../notifications';
 
 // WorkControlBar reads the unified viewer slot; MemoryRouter backs the slot's
 // URL contract.
@@ -189,6 +190,24 @@ describe('WorkControlBar — persisted Close recovery', () => {
       losses: [],
       residuals,
     },
+  });
+
+  it('refreshes the active Close projection when another surface starts Close', async () => {
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce({ close: null } as never)
+      .mockResolvedValueOnce(closeSnapshot('awaiting_stop_work_confirmation') as never);
+
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-sidebar-close" convModeLabel="Explore" phaseType="idle" continuedInConvId={null} prStatusHandle={prStatusHandle()} />,
+    );
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(1));
+
+    notifyCloseSnapshotChanged('different-conversation');
+    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(1);
+    notifyCloseSnapshotChanged('conv-sidebar-close');
+
+    expect(await screen.findByRole('button', { name: 'Stop work and continue closing' })).toBeVisible();
+    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2);
   });
 
   it('renders exact residual repair evidence after reload', async () => {

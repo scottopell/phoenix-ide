@@ -373,7 +373,7 @@ impl RuntimeManager {
     }
 
     /// Acquires all scope fences, then seals the exact server-owned inventory.
-    /// The fence stays held in `close_retirement_leases` through completion or repair.
+    /// The fence stays held in `close_retirement_leases` until completion or entry into repair.
     pub(crate) async fn capture_close_retirement_inventory(
         &self,
         attempt_id: CloseAttemptId,
@@ -1220,11 +1220,12 @@ impl RuntimeManager {
             })
             .await
             .map_err(|error| error.to_string())?;
+        self.cancel_close_resource_leases(attempt_id).await;
         Err(detail.to_string())
     }
 
     /// Completes one live lease. Callers must persist exactly one receipt per
-    /// returned identity; any residual outcome keeps the registry fence closed.
+    /// returned identity; the repair transition reopens admission after a residual.
     async fn complete_close_resource_lease(
         &self,
         attempt_id: &CloseAttemptId,
@@ -1301,6 +1302,7 @@ async fn inspect_worktree_at(
     }
     let mut observation = canonical_status_observation(&output.stdout);
     let mut losses = parse_status_losses(&output.stdout);
+    observe_dirty_content(&path, &losses, &mut observation)?;
     observe_detached_head_and_submodules(&path, &mut observation, &mut losses).await?;
     Ok((snapshot_for(&observation), losses))
 }
@@ -1676,9 +1678,12 @@ fn observe_initialized_submodules(
                 String::from_utf8_lossy(&status.stderr).trim()
             ));
         }
+        let submodule_losses = parse_status_losses(&status.stdout);
+        let mut submodule_status = canonical_status_observation(&status.stdout);
+        observe_dirty_content(&submodule_path, &submodule_losses, &mut submodule_status)?;
         observation.push((
             [b"SUBMODULE_STATUS\0".as_slice(), relative_path.as_slice()].concat(),
-            canonical_status_observation(&status.stdout),
+            submodule_status,
         ));
 
         let submodule_head = phoenix_core::git::command()
@@ -2347,6 +2352,66 @@ fn canonical_status_observation(status: &[u8]) -> Vec<u8> {
     observation
 }
 
+fn observe_dirty_content(
+    repository: &Path,
+    losses: &[CloseLossItem],
+    observation: &mut Vec<u8>,
+) -> Result<(), String> {
+    let mut paths = losses
+        .iter()
+        .filter_map(|loss| match loss.identity() {
+            LossItemIdentity::GitPath(path) => Some(path.as_bytes().to_vec()),
+            LossItemIdentity::GitOid(_)
+            | LossItemIdentity::Opaque(_)
+            | LossItemIdentity::Worktree(_) => None,
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    for path in paths {
+        observation.extend_from_slice(b"CONTENT\0");
+        observation.extend_from_slice(&path);
+        observation.push(0);
+        let filesystem_path = repository.join(path_buf_from_git_bytes(&path));
+        match std::fs::symlink_metadata(&filesystem_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                observation.extend_from_slice(b"SYMLINK\0");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::ffi::OsStrExt as _;
+                    observation.extend_from_slice(
+                        std::fs::read_link(&filesystem_path)
+                            .map_err(|error| format!("cannot read dirty symlink: {error}"))?
+                            .as_os_str()
+                            .as_bytes(),
+                    );
+                }
+                #[cfg(not(unix))]
+                observation.extend_from_slice(
+                    std::fs::read_link(&filesystem_path)
+                        .map_err(|error| format!("cannot read dirty symlink: {error}"))?
+                        .to_string_lossy()
+                        .as_bytes(),
+                );
+            }
+            Ok(metadata) if metadata.is_file() => {
+                observation.extend_from_slice(b"FILE\0");
+                observation.extend_from_slice(
+                    &std::fs::read(&filesystem_path)
+                        .map_err(|error| format!("cannot read dirty file contents: {error}"))?,
+                );
+            }
+            Ok(_) => observation.extend_from_slice(b"OTHER"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                observation.extend_from_slice(b"ABSENT");
+            }
+            Err(error) => return Err(format!("cannot inspect dirty path contents: {error}")),
+        }
+        observation.push(0);
+    }
+    Ok(())
+}
+
 fn parse_status_losses(status: &[u8]) -> Vec<CloseLossItem> {
     let mut losses = Vec::new();
     let mut rows = status.split(|byte| *byte == 0);
@@ -2387,7 +2452,7 @@ fn snapshot_for(bytes: &[u8]) -> CloseRetirementSnapshot {
     for byte in digest {
         write!(&mut fingerprint, "{byte:02x}").expect("writing into String cannot fail");
     }
-    CloseRetirementSnapshot::parse("server_git_status_v1", fingerprint)
+    CloseRetirementSnapshot::parse("server_git_status_v2", fingerprint)
         .expect("constant generation and SHA-256 fingerprint are valid")
 }
 
@@ -2899,6 +2964,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dirty_file_content_changes_invalidate_snapshot_without_status_shape_change() {
+        let temp = tempfile::tempdir().unwrap();
+        initialize_repository(temp.path());
+        let identity = inspection_identity(temp.path());
+
+        std::fs::write(temp.path().join("tracked"), "first dirty payload\n").unwrap();
+        let (first, first_losses) = inspect_worktree(&identity).await.unwrap();
+        std::fs::write(temp.path().join("tracked"), "second dirty payload\n").unwrap();
+        let (second, second_losses) = inspect_worktree(&identity).await.unwrap();
+
+        assert_eq!(first_losses, second_losses);
+        assert_ne!(first, second);
+    }
+
+    #[tokio::test]
+    async fn untracked_file_content_changes_invalidate_snapshot_without_status_shape_change() {
+        let temp = tempfile::tempdir().unwrap();
+        initialize_repository(temp.path());
+        let identity = inspection_identity(temp.path());
+
+        std::fs::write(temp.path().join("untracked"), "first payload\n").unwrap();
+        let (first, first_losses) = inspect_worktree(&identity).await.unwrap();
+        std::fs::write(temp.path().join("untracked"), "second payload\n").unwrap();
+        let (second, second_losses) = inspect_worktree(&identity).await.unwrap();
+
+        assert_eq!(first_losses, second_losses);
+        assert_ne!(first, second);
+    }
+
+    #[tokio::test]
     async fn initialized_submodule_dirty_state_changes_snapshot_and_emits_exact_path() {
         let temp = tempfile::tempdir().unwrap();
         let child = temp.path().join("child");
@@ -3238,7 +3333,7 @@ mod tests {
     fn porcelain_snapshot_digest_changes_with_server_observation() {
         let clean = snapshot_for(b"");
         let dirty = snapshot_for(b"?? server-observed\0");
-        assert_eq!(clean.generation(), "server_git_status_v1");
+        assert_eq!(clean.generation(), "server_git_status_v2");
         assert_ne!(clean.fingerprint(), dirty.fingerprint());
     }
 }
