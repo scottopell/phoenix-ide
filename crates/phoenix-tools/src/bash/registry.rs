@@ -2060,26 +2060,19 @@ mod tests {
             current_outcome,
             BashRetirementOutcome::Retired(_) | BashRetirementOutcome::AbsenceVerified(_)
         ));
-        for _ in 0..20 {
-            if let Some(status) = replacement_child.try_wait().expect("try_wait replacement") {
-                assert_eq!(status.signal(), Some(libc::SIGKILL));
-                unsafe {
-                    let _ = libc::kill(stale_pgid, libc::SIGKILL);
-                }
-                let stale_status = stale_child.wait().expect("wait stale cleanup");
-                assert_eq!(stale_status.signal(), Some(libc::SIGKILL));
-                return;
-            }
-            // test-timing-allow: OS child exit is asynchronous; `try_wait` is the causal signal.
-            sleep(Duration::from_millis(50)).await;
-        }
+        assert!(
+            replacement_child
+                .try_wait()
+                .expect("try_wait replacement")
+                .is_none(),
+            "fail-closed current retirement must not issue a non-atomic group signal"
+        );
         unsafe {
             let _ = libc::kill(replacement_pgid, libc::SIGKILL);
             let _ = libc::kill(stale_pgid, libc::SIGKILL);
         }
         let _ = replacement_child.wait();
         let _ = stale_child.wait();
-        panic!("replacement subprocess survived current retirement SIGKILL within 1s");
     }
 
     #[cfg(unix)]
