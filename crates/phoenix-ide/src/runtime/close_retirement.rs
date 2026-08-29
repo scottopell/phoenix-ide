@@ -2293,11 +2293,109 @@ unsafe fn errno_location() -> *mut libc::c_int {
     unsafe { libc::__error() }
 }
 
+#[cfg(target_os = "linux")]
+unsafe fn renameat_exclusive(
+    directory: libc::c_int,
+    source: *const libc::c_char,
+    destination: *const libc::c_char,
+) -> libc::c_int {
+    // SAFETY: caller supplies valid descriptors and NUL-terminated names.
+    unsafe {
+        libc::renameat2(
+            directory,
+            source,
+            directory,
+            destination,
+            libc::RENAME_NOREPLACE,
+        )
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn renameat_exclusive(
+    directory: libc::c_int,
+    source: *const libc::c_char,
+    destination: *const libc::c_char,
+) -> libc::c_int {
+    // SAFETY: caller supplies valid descriptors and NUL-terminated names.
+    unsafe { libc::renameatx_np(directory, source, directory, destination, libc::RENAME_EXCL) }
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+unsafe fn renameat_exclusive(
+    _directory: libc::c_int,
+    _source: *const libc::c_char,
+    _destination: *const libc::c_char,
+) -> libc::c_int {
+    -1
+}
+
+#[cfg(unix)]
+fn bind_deletion_entry_to_private_slot(
+    directory: libc::c_int,
+    name: &std::ffi::CStr,
+    expected: &libc::stat,
+) -> Result<(std::ffi::CString, libc::stat), String> {
+    let slot = std::ffi::CString::new(format!(
+        ".phoenix-delete-entry-{}",
+        uuid::Uuid::new_v4().simple()
+    ))
+    .expect("generated deletion slot contains no NUL");
+    // SAFETY: the descriptor and C strings are valid. Exclusive rename
+    // cannot overwrite another entry at the unpredictable destination.
+    if unsafe { renameat_exclusive(directory, name.as_ptr(), slot.as_ptr()) } < 0 {
+        return Err(format!(
+            "cannot bind deletion entry to private slot: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let mut moved = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: descriptor and slot are valid; moved points to writable storage.
+    if unsafe {
+        libc::fstatat(
+            directory,
+            slot.as_ptr(),
+            moved.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } < 0
+    {
+        return Err(format!(
+            "cannot identify deletion entry in private slot: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: fstatat initialized moved on success.
+    let moved = unsafe { moved.assume_init() };
+    if moved.st_dev != expected.st_dev
+        || moved.st_ino != expected.st_ino
+        || moved.st_mode & libc::S_IFMT != expected.st_mode & libc::S_IFMT
+    {
+        return Err(format!(
+            "deletion entry was replaced before identity binding; replacement preserved in private slot {}",
+            slot.to_string_lossy()
+        ));
+    }
+    Ok((slot, moved))
+}
+
 #[cfg(unix)]
 fn remove_directory_contents_at(directory: &std::os::fd::OwnedFd) -> Result<(), String> {
+    remove_directory_contents_at_with_hook(directory, &mut |_, _| {})
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_lines)]
+fn remove_directory_contents_at_with_hook<H>(
+    directory: &std::os::fd::OwnedFd,
+    after_inspection: &mut H,
+) -> Result<(), String>
+where
+    H: FnMut(libc::c_int, &std::ffi::CStr),
+{
     use std::ffi::CStr;
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
-
     // SAFETY: dup returns a new owned descriptor or -1. fdopendir consumes only
     // that duplicate, while the caller retains the descriptor used by openat.
     let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
@@ -2356,18 +2454,21 @@ fn remove_directory_contents_at(directory: &std::os::fd::OwnedFd) -> Result<(), 
             }
             // SAFETY: fstatat initialized metadata on success.
             let metadata = unsafe { metadata.assume_init() };
-            if metadata.st_mode & libc::S_IFMT == libc::S_IFDIR {
-                // SAFETY: openat does not follow the entry because O_NOFOLLOW is set.
+            after_inspection(directory.as_raw_fd(), name);
+            let (slot, moved) =
+                bind_deletion_entry_to_private_slot(directory.as_raw_fd(), name, &metadata)?;
+            if moved.st_mode & libc::S_IFMT == libc::S_IFDIR {
+                // SAFETY: openat does not follow the private slot because O_NOFOLLOW is set.
                 let child = unsafe {
                     libc::openat(
                         directory.as_raw_fd(),
-                        name.as_ptr(),
+                        slot.as_ptr(),
                         libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                     )
                 };
                 if child < 0 {
                     return Err(format!(
-                        "cannot open deletion subdirectory without following replacements: {}",
+                        "cannot open identity-bound deletion subdirectory: {}",
                         std::io::Error::last_os_error()
                     ));
                 }
@@ -2383,27 +2484,27 @@ fn remove_directory_contents_at(directory: &std::os::fd::OwnedFd) -> Result<(), 
                 }
                 // SAFETY: fstat initialized opened on success.
                 let opened = unsafe { opened.assume_init() };
-                if opened.st_dev != metadata.st_dev || opened.st_ino != metadata.st_ino {
+                if opened.st_dev != moved.st_dev || opened.st_ino != moved.st_ino {
                     return Err(
-                        "deletion subdirectory was replaced before descriptor binding".to_string(),
+                        "private deletion slot was replaced before descriptor binding".to_string(),
                     );
                 }
-                remove_directory_contents_at(&child)?;
-                // SAFETY: unlinkat is descriptor-relative and name is valid.
+                remove_directory_contents_at_with_hook(&child, after_inspection)?;
+                // SAFETY: unlinkat targets only the unpredictable identity-checked slot.
                 if unsafe {
-                    libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR)
+                    libc::unlinkat(directory.as_raw_fd(), slot.as_ptr(), libc::AT_REMOVEDIR)
                 } < 0
                 {
                     return Err(format!(
-                        "cannot remove deletion subdirectory: {}",
+                        "cannot remove identity-bound deletion subdirectory: {}",
                         std::io::Error::last_os_error()
                     ));
                 }
             } else {
-                // SAFETY: unlinkat is descriptor-relative and never follows the entry.
-                if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } < 0 {
+                // SAFETY: unlinkat targets only the unpredictable identity-checked slot.
+                if unsafe { libc::unlinkat(directory.as_raw_fd(), slot.as_ptr(), 0) } < 0 {
                     return Err(format!(
-                        "cannot remove deletion entry: {}",
+                        "cannot remove identity-bound deletion entry: {}",
                         std::io::Error::last_os_error()
                     ));
                 }
@@ -3618,7 +3719,7 @@ mod tests {
         git_path_from_observation, inspect_and_remove_exact_worktree_with_hook, inspect_worktree,
         observe_administrative_dir_incarnation, parse_status_losses,
         planned_administrative_dir_is_absent, quarantine_and_remove_exact_worktree,
-        remove_exact_worktree_administrative_dir_with_hook,
+        remove_directory_contents_at_with_hook, remove_exact_worktree_administrative_dir_with_hook,
         remove_quarantine_then_administrative_dir,
         remove_quarantine_then_administrative_dir_with_hooks, rotate_inspection_generation,
         run_bounded_git_status_until, snapshot_for, staged_index_entries_by_path,
@@ -3922,6 +4023,86 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(quarantine.join("write-after-crash")).unwrap(),
             "preserve\n"
+        );
+    }
+
+    #[cfg(unix)]
+    fn open_directory(path: &Path) -> std::os::fd::OwnedFd {
+        std::fs::File::open(path).unwrap().into()
+    }
+
+    #[cfg(unix)]
+    fn preserved_private_slot(root: &Path) -> std::path::PathBuf {
+        std::fs::read_dir(root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name().is_some_and(|name| {
+                    name.as_encoded_bytes()
+                        .starts_with(b".phoenix-delete-entry-")
+                })
+            })
+            .expect("replacement must remain in an identity-bound private slot")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_child_swap_after_inspection_preserves_replacement_for_needs_repair() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let child = root.join("child");
+        let displaced = temp.path().join("inspected-directory");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(child.join("original"), "original\n").unwrap();
+        let descriptor = open_directory(&root);
+        let mut swapped = false;
+
+        let error = remove_directory_contents_at_with_hook(&descriptor, &mut |_, name| {
+            if !swapped && name.to_bytes() == b"child" {
+                std::fs::rename(&child, &displaced).unwrap();
+                std::fs::create_dir(&child).unwrap();
+                std::fs::write(child.join("replacement-marker"), "must survive\n").unwrap();
+                swapped = true;
+            }
+        })
+        .unwrap_err();
+
+        assert!(error.contains("replaced before identity binding"));
+        assert!(displaced.join("original").is_file());
+        let preserved = preserved_private_slot(&root);
+        assert_eq!(
+            std::fs::read_to_string(preserved.join("replacement-marker")).unwrap(),
+            "must survive\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_child_swap_after_inspection_preserves_replacement_for_needs_repair() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let child = root.join("child");
+        let displaced = temp.path().join("inspected-file");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(&child, "original\n").unwrap();
+        let descriptor = open_directory(&root);
+        let mut swapped = false;
+
+        let error = remove_directory_contents_at_with_hook(&descriptor, &mut |_, name| {
+            if !swapped && name.to_bytes() == b"child" {
+                std::fs::rename(&child, &displaced).unwrap();
+                std::fs::write(&child, "replacement must survive\n").unwrap();
+                swapped = true;
+            }
+        })
+        .unwrap_err();
+
+        assert!(error.contains("replaced before identity binding"));
+        assert_eq!(std::fs::read_to_string(&displaced).unwrap(), "original\n");
+        assert_eq!(
+            std::fs::read_to_string(preserved_private_slot(&root)).unwrap(),
+            "replacement must survive\n"
         );
     }
 
