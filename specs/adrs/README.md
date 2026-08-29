@@ -51,7 +51,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [037](037_legacy-direct-turn-terminal-ambiguity-is-retired.md) | Legacy direct-turn terminal ambiguity is retired as failure | Accepted | REQ-DWF-CHAT-013, REQ-DWF-CHAT-014, REQ-COMP-004 |
 | [038](038_commission-review-is-retired-with-forward-history-recovery.md) | Commission review is retired with forward history recovery | Accepted | REQ-CR-001–018, REQ-COMP-001–005, REQ-VS-006/016 |
 | [039](039_creation-publication-uses-request-bound-identity-and-immutable-pins.md) | Creation publication uses request-bound identity and immutable starting pins | Accepted | REQ-CCR-001/002/003/005/005A/006A, REQ-DWF-CREATE-001/002/003/004, REQ-PROJ-017/022, REQ-GITREP-003 |
-| [043](043_creation-staging-uses-a-private-locked-namespace.md) | Creation staging uses a private locked namespace | Accepted | REQ-CCR-005; product-creation worktree ownership and cleanup |
+| [040](040_creation-staging-uses-a-private-locked-namespace.md) | Creation staging uses a private locked namespace | Accepted | REQ-CCR-005; product-creation worktree ownership and cleanup |
 
 ## For agents: which decisions bind your task
 
@@ -107,7 +107,7 @@ ADR-000 (adopt spEARS v2 for new work)
       ├── ADR-034 (Compatibility guarantees are explicit and data-aware)
       │   └── ADR-038 (Commission review is retired with forward history recovery)
       ├── ADR-039 (Creation publication uses request-bound identity and immutable starting pins)
-      │   └── ADR-043 (Creation staging uses a private locked namespace)
+      │   └── ADR-040 (Creation staging uses a private locked namespace)
       ├── ADR-036 (Local SQLite authority loss fails stop)
       │   └── applies ADR-014, ADR-020, ADR-024, and ADR-034 at the local persistence-health boundary
       ├── ADR-037 (Legacy direct-turn terminal ambiguity is retired as failure)

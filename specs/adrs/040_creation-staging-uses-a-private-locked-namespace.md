@@ -1,4 +1,4 @@
-# ADR-043: Creation staging uses a private locked namespace
+# ADR-040: Creation staging uses a private locked namespace
 
 - **Status:** Accepted
 - **Date:** 2026-08-29
