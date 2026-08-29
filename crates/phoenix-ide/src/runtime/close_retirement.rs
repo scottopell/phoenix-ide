@@ -3140,6 +3140,34 @@ fn quarantine_has_process_cwd(_path: &Path) -> Result<bool, String> {
 
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LinuxProcessEffectiveUid(libc::uid_t);
+
+#[cfg(target_os = "linux")]
+impl LinuxProcessEffectiveUid {
+    fn parse_status(status: &str) -> Result<Self, String> {
+        let mut uid_lines = status.lines().filter_map(|line| line.strip_prefix("Uid:"));
+        let uid_fields = uid_lines
+            .next()
+            .ok_or_else(|| "status has no Uid field".to_string())?;
+        if uid_lines.next().is_some() {
+            return Err("status has multiple Uid fields".to_string());
+        }
+        let uid_fields = uid_fields
+            .split_ascii_whitespace()
+            .map(|uid| {
+                uid.parse::<libc::uid_t>()
+                    .map_err(|error| format!("status UID is malformed: {error}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let [_real, effective_uid, _saved, _filesystem] = uid_fields.as_slice() else {
+            return Err("status Uid field must contain exactly four credentials".to_string());
+        };
+        Ok(Self(*effective_uid))
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LinuxProcessOwner {
     Relevant,
     Unrelated,
@@ -3152,19 +3180,37 @@ fn linux_process_owner(
     effective_uid: libc::uid_t,
     inventory: &str,
 ) -> Result<LinuxProcessOwner, String> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    match process.metadata() {
-        Ok(metadata) if metadata.uid() == effective_uid => Ok(LinuxProcessOwner::Relevant),
-        Ok(_) => Ok(LinuxProcessOwner::Unrelated),
+    let status = match std::fs::read_to_string(process.path().join("status")) {
+        Ok(status) => status,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Ok(LinuxProcessOwner::Vanished)
+            return Ok(LinuxProcessOwner::Vanished);
         }
-        Err(error) => Err(format!(
-            "cannot attribute process {} {inventory} inventory: {error}",
+        Err(error) => {
+            return Err(format!(
+                "cannot attribute process {} {inventory} inventory from kernel credentials: {error}",
+                process.file_name().to_string_lossy()
+            ));
+        }
+    };
+    let process_effective_uid =
+        LinuxProcessEffectiveUid::parse_status(&status).map_err(|error| {
+            format!(
+            "cannot attribute process {} {inventory} inventory from kernel credentials: {error}",
             process.file_name().to_string_lossy()
-        )),
-    }
+        )
+        })?;
+
+    // The scanned proc files use `PTRACE_MODE_READ_FSCREDS`: Linux compares the
+    // scanner's filesystem UID with the target's real, effective, and saved UIDs.
+    // Effective UID is Phoenix's process-ownership boundary; unlike proc-dir inode
+    // ownership, it is not rewritten to root when a same-user target is nondumpable.
+    Ok(
+        if process_effective_uid == LinuxProcessEffectiveUid(effective_uid) {
+            LinuxProcessOwner::Relevant
+        } else {
+            LinuxProcessOwner::Unrelated
+        },
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -4938,9 +4984,121 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn descriptor_scan_skips_unreadable_unrelated_process_but_fails_closed_for_owner() {
-        use std::os::unix::fs::MetadataExt as _;
+    fn linux_status_parser_returns_only_the_effective_uid() {
+        assert_eq!(
+            super::LinuxProcessEffectiveUid::parse_status(
+                "Name:\ttest\nUid:\t1000\t1001\t1002\t1003\nGid:\t2000\t2001\t2002\t2003\n",
+            ),
+            Ok(super::LinuxProcessEffectiveUid(1001))
+        );
+    }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_status_parser_rejects_missing_malformed_and_ambiguous_credentials() {
+        for status in [
+            "Name:\ttest\n",
+            "Uid:\t1000\t1000\t1000\n",
+            "Uid:\t1000\t1000\t1000\t1000\t1000\n",
+            "Uid:\t1000\tnot-a-uid\t1000\t1000\n",
+            "Uid:\t1000\t1000\t1000\t1000\nUid:\t2000\t2000\t2000\t2000\n",
+        ] {
+            assert!(
+                super::LinuxProcessEffectiveUid::parse_status(status).is_err(),
+                "accepted ambiguous status: {status:?}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_nondumpable_process_helper() {
+        if std::env::var_os("PHOENIX_NONDUMPABLE_PROCESS_HELPER").is_none() {
+            return;
+        }
+        let cwd = std::env::var_os("PHOENIX_NONDUMPABLE_CWD").unwrap();
+        std::env::set_current_dir(cwd).unwrap();
+        // SAFETY: `prctl(PR_SET_DUMPABLE, 0)` has no pointer arguments.
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) }, 0);
+        use std::io::{Read as _, Write as _};
+        println!("ready");
+        std::io::stdout().flush().unwrap();
+        let _ = std::io::stdin().read(&mut [0_u8]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cwd_scan_does_not_skip_same_user_nondumpable_process() {
+        use std::io::BufRead as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runtime::close_retirement::tests::linux_nondumpable_process_helper",
+                "--nocapture",
+            ])
+            .env("PHOENIX_NONDUMPABLE_PROCESS_HELPER", "1")
+            .env("PHOENIX_NONDUMPABLE_CWD", temp.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+        loop {
+            let mut line = String::new();
+            assert_ne!(
+                output.read_line(&mut line).unwrap(),
+                0,
+                "helper exited before ready"
+            );
+            if line.trim() == "ready" {
+                break;
+            }
+        }
+
+        let proc_root = temp.path().join("proc");
+        std::fs::create_dir(&proc_root).unwrap();
+        std::os::unix::fs::symlink(
+            format!("/proc/{}", child.id()),
+            proc_root.join(child.id().to_string()),
+        )
+        .unwrap();
+        // SAFETY: `geteuid` has no preconditions.
+        let effective_uid = unsafe { libc::geteuid() };
+        if effective_uid != 0 {
+            use std::os::unix::fs::MetadataExt as _;
+            assert_ne!(
+                std::fs::metadata(format!("/proc/{}", child.id()))
+                    .unwrap()
+                    .uid(),
+                effective_uid,
+                "test requires nondumpable proc-dir ownership to differ from process credentials"
+            );
+        }
+        let process = std::fs::read_dir(&proc_root)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            super::linux_process_owner(&process, effective_uid, "working-directory").unwrap(),
+            super::LinuxProcessOwner::Relevant,
+            "same-user nondumpable process must be attributed from kernel credentials"
+        );
+        let scan = super::quarantine_has_process_cwd_in(temp.path(), &proc_root, effective_uid);
+
+        drop(child.stdin.take());
+        child.wait().unwrap();
+        assert!(
+            !matches!(scan, Ok(false)),
+            "same-user nondumpable process was classified as unrelated: {scan:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_scan_skips_unreadable_unrelated_process_but_fails_closed_for_owner() {
         let temp = tempfile::tempdir().unwrap();
         let quarantine = temp.path().join("quarantine");
         let proc_root = temp.path().join("proc");
@@ -4948,24 +5106,34 @@ mod tests {
         std::fs::create_dir_all(&process).unwrap();
         std::fs::create_dir(&quarantine).unwrap();
         std::fs::write(process.join("fd"), b"not a descriptor directory").unwrap();
-        let owner_uid = std::fs::metadata(&process).unwrap().uid();
-        let unrelated_uid = owner_uid.checked_add(1).unwrap_or(owner_uid - 1);
+        std::fs::write(process.join("status"), "Name:\ttest\nUid:\t1\t1\t1\t1\n").unwrap();
 
-        assert!(
-            !super::quarantine_has_open_descriptors_in(&quarantine, &proc_root, unrelated_uid,)
-                .unwrap()
-        );
+        assert!(!super::quarantine_has_open_descriptors_in(&quarantine, &proc_root, 2).unwrap());
 
-        let error = super::quarantine_has_open_descriptors_in(&quarantine, &proc_root, owner_uid)
-            .unwrap_err();
+        let error =
+            super::quarantine_has_open_descriptors_in(&quarantine, &proc_root, 1).unwrap_err();
         assert!(error.contains("cannot inspect process 1 descriptor table"));
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn cwd_scan_skips_restricted_unrelated_process_but_fails_closed_for_owner() {
-        use std::os::unix::fs::MetadataExt as _;
+    fn descriptor_scan_fails_closed_when_kernel_credentials_are_ambiguous() {
+        let temp = tempfile::tempdir().unwrap();
+        let quarantine = temp.path().join("quarantine");
+        let proc_root = temp.path().join("proc");
+        let process = proc_root.join("1");
+        std::fs::create_dir_all(&process).unwrap();
+        std::fs::create_dir(&quarantine).unwrap();
+        std::fs::write(process.join("status"), "Name:\ttest\nUid:\t1\t1\t1\n").unwrap();
 
+        let error =
+            super::quarantine_has_open_descriptors_in(&quarantine, &proc_root, 1).unwrap_err();
+        assert!(error.contains("cannot attribute process 1 descriptor inventory"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cwd_scan_skips_restricted_unrelated_process_but_fails_closed_for_owner() {
         let temp = tempfile::tempdir().unwrap();
         let quarantine = temp.path().join("quarantine");
         let proc_root = temp.path().join("proc");
@@ -4973,39 +5141,27 @@ mod tests {
         std::fs::create_dir_all(&process).unwrap();
         std::fs::create_dir(&quarantine).unwrap();
         std::fs::write(process.join("cwd"), b"not a symlink").unwrap();
-        let owner_uid = std::fs::metadata(&process).unwrap().uid();
-        let unrelated_uid = owner_uid.checked_add(1).unwrap_or(owner_uid - 1);
+        std::fs::write(process.join("status"), "Name:\ttest\nUid:\t1\t1\t1\t1\n").unwrap();
 
-        assert!(
-            !super::quarantine_has_process_cwd_in(&quarantine, &proc_root, unrelated_uid).unwrap()
-        );
-        let error =
-            super::quarantine_has_process_cwd_in(&quarantine, &proc_root, owner_uid).unwrap_err();
+        assert!(!super::quarantine_has_process_cwd_in(&quarantine, &proc_root, 2).unwrap());
+        let error = super::quarantine_has_process_cwd_in(&quarantine, &proc_root, 1).unwrap_err();
         assert!(error.contains("cannot inspect process 1 working directory"));
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn mapping_scan_skips_restricted_unrelated_process_but_fails_closed_for_owner() {
-        use std::os::unix::fs::MetadataExt as _;
-
         let temp = tempfile::tempdir().unwrap();
         let quarantine = temp.path().join("quarantine");
         let proc_root = temp.path().join("proc");
         let process = proc_root.join("1");
         std::fs::create_dir_all(process.join("maps")).unwrap();
         std::fs::create_dir(&quarantine).unwrap();
-        let owner_uid = std::fs::metadata(&process).unwrap().uid();
-        let unrelated_uid = owner_uid.checked_add(1).unwrap_or(owner_uid - 1);
+        std::fs::write(process.join("status"), "Name:\ttest\nUid:\t1\t1\t1\t1\n").unwrap();
 
-        assert!(!super::quarantine_has_writable_mappings_in(
-            &quarantine,
-            &proc_root,
-            unrelated_uid,
-        )
-        .unwrap());
-        let error = super::quarantine_has_writable_mappings_in(&quarantine, &proc_root, owner_uid)
-            .unwrap_err();
+        assert!(!super::quarantine_has_writable_mappings_in(&quarantine, &proc_root, 2).unwrap());
+        let error =
+            super::quarantine_has_writable_mappings_in(&quarantine, &proc_root, 1).unwrap_err();
         assert!(error.contains("cannot inspect process 1 mappings"));
     }
 
