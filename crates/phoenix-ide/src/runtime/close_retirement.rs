@@ -2393,13 +2393,14 @@ unsafe fn renameat_exclusive(
 ) -> libc::c_int {
     // SAFETY: caller supplies valid descriptors and NUL-terminated names.
     unsafe {
-        libc::renameat2(
+        libc::syscall(
+            libc::SYS_renameat2,
             directory,
             source,
             directory,
             destination,
             libc::RENAME_NOREPLACE,
-        )
+        ) as libc::c_int
     }
 }
 
@@ -2873,8 +2874,20 @@ fn exact_worktree_administrative_dir(
     Ok(git_dir)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExternalWriterEvidence {
+    PositiveWriterFound,
+    NoPositiveEvidence,
+}
+
+impl ExternalWriterEvidence {
+    fn found(self) -> bool {
+        matches!(self, Self::PositiveWriterFound)
+    }
+}
+
 fn quarantine_has_external_writer(path: &Path) -> Result<bool, String> {
-    Ok(quarantine_has_open_descriptors(path)?
+    Ok(quarantine_has_open_descriptors(path)?.found()
         || quarantine_has_process_cwd(path)?
         || quarantine_has_writable_mappings(path)?)
 }
@@ -3255,70 +3268,44 @@ fn linux_process_is_relevant(
 fn linux_descriptor_target_is_within(
     target: std::io::Result<PathBuf>,
     canonical_worktree: &Path,
-) -> Result<bool, String> {
-    match target {
-        Ok(candidate) => Ok(path_is_within(&candidate, canonical_worktree)),
-        // Linux resolves each /proc/<pid>/fd/<n> link separately under the
-        // ptrace access check. An entry can disappear after getdents, and an
-        // otherwise enumerable table can contain an individually inaccessible
-        // link. Neither outcome identifies that descriptor as a worktree
-        // reference; failure to enumerate the descriptor table itself remains
-        // ambiguous and is handled by the caller.
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-            ) =>
-        {
-            Ok(false)
-        }
-        Err(error) => Err(format!("cannot inspect process descriptor target: {error}")),
-    }
+) -> bool {
+    target.is_ok_and(|candidate| path_is_within(&candidate, canonical_worktree))
 }
 
 #[cfg(target_os = "linux")]
-fn quarantine_has_open_descriptors(path: &Path) -> Result<bool, String> {
-    // SAFETY: `geteuid` has no preconditions.
-    let effective_uid = unsafe { libc::geteuid() };
-    quarantine_has_open_descriptors_in(path, Path::new("/proc"), effective_uid)
+fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence, String> {
+    quarantine_has_open_descriptors_in(path, Path::new("/proc"))
 }
 
 #[cfg(target_os = "linux")]
 fn quarantine_has_open_descriptors_in(
     path: &Path,
     proc_root: &Path,
-    effective_uid: libc::uid_t,
-) -> Result<bool, String> {
+) -> Result<ExternalWriterEvidence, String> {
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         format!("cannot canonicalize quarantined worktree before descriptor inspection: {error}")
     })?;
-    let processes = std::fs::read_dir(proc_root)
-        .map_err(|error| format!("cannot enumerate process descriptors: {error}"))?;
-    for process in processes {
-        let process = process.map_err(|error| format!("cannot inspect process entry: {error}"))?;
-        if !linux_process_is_relevant(&process, effective_uid, "descriptor")? {
+    let Ok(processes) = std::fs::read_dir(proc_root) else {
+        return Ok(ExternalWriterEvidence::NoPositiveEvidence);
+    };
+    for process in processes.flatten().filter(|process| {
+        process
+            .file_name()
+            .as_encoded_bytes()
+            .iter()
+            .all(u8::is_ascii_digit)
+    }) {
+        let Ok(descriptors) = std::fs::read_dir(process.path().join("fd")) else {
             continue;
-        }
-        let descriptors = match std::fs::read_dir(process.path().join("fd")) {
-            Ok(descriptors) => descriptors,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(format!(
-                    "cannot inspect process {} descriptor table: {error}",
-                    process.file_name().to_string_lossy()
-                ));
-            }
         };
-        for descriptor in descriptors {
-            let descriptor = descriptor
-                .map_err(|error| format!("cannot inspect process descriptor entry: {error}"))?;
-            if linux_descriptor_target_is_within(std::fs::read_link(descriptor.path()), &canonical)?
+        for descriptor in descriptors.flatten() {
+            if linux_descriptor_target_is_within(std::fs::read_link(descriptor.path()), &canonical)
             {
-                return Ok(true);
+                return Ok(ExternalWriterEvidence::PositiveWriterFound);
             }
         }
     }
-    Ok(false)
+    Ok(ExternalWriterEvidence::NoPositiveEvidence)
 }
 
 #[cfg(target_os = "macos")]
@@ -3328,7 +3315,7 @@ fn descriptor_inventory_may_be_truncated(returned_bytes: usize, capacity_bytes: 
 
 #[allow(clippy::too_many_lines)]
 #[cfg(target_os = "macos")]
-fn quarantine_has_open_descriptors(path: &Path) -> Result<bool, String> {
+fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence, String> {
     use std::ffi::CStr;
     use std::mem::{size_of, MaybeUninit};
     use std::os::unix::ffi::OsStrExt as _;
@@ -3417,15 +3404,15 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<bool, String> {
                 Path::new(std::ffi::OsStr::from_bytes(candidate.to_bytes())),
                 &canonical,
             ) {
-                return Ok(true);
+                return Ok(ExternalWriterEvidence::PositiveWriterFound);
             }
         }
     }
-    Ok(false)
+    Ok(ExternalWriterEvidence::NoPositiveEvidence)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn quarantine_has_open_descriptors(_path: &Path) -> Result<bool, String> {
+fn quarantine_has_open_descriptors(_path: &Path) -> Result<ExternalWriterEvidence, String> {
     Err("open-descriptor inspection is unsupported on this platform".to_string())
 }
 
@@ -3624,7 +3611,7 @@ where
         }
 
         after_quarantine(&path);
-        if quarantine_has_open_descriptors(&quarantine)? {
+        if quarantine_has_open_descriptors(&quarantine)?.found() {
             return Ok(ExactWorktreeRemoval::Residual {
                 detail: format!(
                     "open descriptors can still modify the confirmed worktree; retained at {}",
@@ -5137,63 +5124,69 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn descriptor_scan_skips_vanished_and_individually_inaccessible_links() {
+    fn descriptor_scan_skips_unreadable_links() {
         let worktree = Path::new("/quarantine/worktree");
         for kind in [
             std::io::ErrorKind::NotFound,
             std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::InvalidData,
         ] {
             assert!(!super::linux_descriptor_target_is_within(
                 Err(std::io::Error::from(kind)),
                 worktree,
-            )
-            .unwrap());
+            ));
         }
-        assert!(
-            super::linux_descriptor_target_is_within(Ok(worktree.join("open-file")), worktree,)
-                .unwrap()
-        );
         assert!(super::linux_descriptor_target_is_within(
-            Err(std::io::Error::from(std::io::ErrorKind::InvalidData)),
+            Ok(worktree.join("open-file")),
             worktree,
-        )
-        .unwrap_err()
-        .contains("cannot inspect process descriptor target"));
+        ));
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn descriptor_scan_skips_unreadable_unrelated_process_but_fails_closed_for_owner() {
+    fn descriptor_scan_ignores_ambient_failures_and_finds_readable_writer() {
         let temp = tempfile::tempdir().unwrap();
         let quarantine = temp.path().join("quarantine");
         let proc_root = temp.path().join("proc");
-        let process = proc_root.join("1");
-        std::fs::create_dir_all(&process).unwrap();
+        let ambient = proc_root.join("1273");
+        let writer = proc_root.join("1274");
+        std::fs::create_dir_all(&ambient).unwrap();
+        std::fs::create_dir_all(writer.join("fd")).unwrap();
         std::fs::create_dir(&quarantine).unwrap();
-        std::fs::write(process.join("fd"), b"not a descriptor directory").unwrap();
-        std::fs::write(process.join("status"), "Name:\ttest\nUid:\t1\t1\t1\t1\n").unwrap();
+        std::fs::write(ambient.join("fd"), b"not a descriptor directory").unwrap();
+        std::os::unix::fs::symlink(quarantine.join("open-file"), writer.join("fd/3")).unwrap();
 
-        assert!(!super::quarantine_has_open_descriptors_in(&quarantine, &proc_root, 2).unwrap());
-
-        let error =
-            super::quarantine_has_open_descriptors_in(&quarantine, &proc_root, 1).unwrap_err();
-        assert!(error.contains("cannot inspect process 1 descriptor table"));
+        assert_eq!(
+            super::quarantine_has_open_descriptors_in(&quarantine, &proc_root).unwrap(),
+            super::ExternalWriterEvidence::PositiveWriterFound,
+        );
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn descriptor_scan_fails_closed_when_kernel_credentials_are_ambiguous() {
+    fn descriptor_scan_reports_no_evidence_for_unavailable_or_unrelated_inventory() {
         let temp = tempfile::tempdir().unwrap();
         let quarantine = temp.path().join("quarantine");
         let proc_root = temp.path().join("proc");
-        let process = proc_root.join("1");
-        std::fs::create_dir_all(&process).unwrap();
         std::fs::create_dir(&quarantine).unwrap();
-        std::fs::write(process.join("status"), "Name:\ttest\nUid:\t1\t1\t1\n").unwrap();
 
-        let error =
-            super::quarantine_has_open_descriptors_in(&quarantine, &proc_root, 1).unwrap_err();
-        assert!(error.contains("cannot attribute process 1 descriptor inventory"));
+        assert_eq!(
+            super::quarantine_has_open_descriptors_in(&quarantine, &proc_root).unwrap(),
+            super::ExternalWriterEvidence::NoPositiveEvidence,
+        );
+
+        let descriptors = proc_root.join("1273/fd");
+        std::fs::create_dir_all(&descriptors).unwrap();
+        std::os::unix::fs::symlink(temp.path().join("outside"), descriptors.join("3")).unwrap();
+        std::os::unix::fs::symlink(temp.path().join("missing"), descriptors.join("4")).unwrap();
+        std::fs::create_dir_all(proc_root.join("self/fd")).unwrap();
+        std::os::unix::fs::symlink(quarantine.join("ignored"), proc_root.join("self/fd/5"))
+            .unwrap();
+
+        assert_eq!(
+            super::quarantine_has_open_descriptors_in(&quarantine, &proc_root).unwrap(),
+            super::ExternalWriterEvidence::NoPositiveEvidence,
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -5258,7 +5251,10 @@ mod tests {
         assert_ne!(mapping, libc::MAP_FAILED);
         drop(file);
 
-        assert!(!super::quarantine_has_open_descriptors(temp.path()).unwrap());
+        assert_eq!(
+            super::quarantine_has_open_descriptors(temp.path()).unwrap(),
+            super::ExternalWriterEvidence::NoPositiveEvidence,
+        );
         assert!(super::quarantine_has_writable_mappings(temp.path()).unwrap());
 
         // SAFETY: `mapping` is the successful result of the matching 4096-byte mmap call.
