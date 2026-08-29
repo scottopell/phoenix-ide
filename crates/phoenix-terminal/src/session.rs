@@ -740,23 +740,55 @@ impl ActiveTerminals {
 }
 
 #[cfg(unix)]
+fn terminal_child_exit(status: nix::sys::wait::WaitStatus) -> Option<nix::sys::wait::WaitStatus> {
+    use nix::sys::wait::WaitStatus;
+
+    match status {
+        outcome @ (WaitStatus::Exited(..) | WaitStatus::Signaled(..)) => Some(outcome),
+        WaitStatus::Stopped(..) | WaitStatus::Continued(_) | WaitStatus::StillAlive => None,
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        WaitStatus::PtraceEvent(..) | WaitStatus::PtraceSyscall(_) => None,
+    }
+}
+
+#[cfg(unix)]
 async fn wait_for_child_exit(child_pid: Pid) -> nix::Result<nix::sys::wait::WaitStatus> {
-    use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+    use nix::sys::wait::{waitpid, WaitPidFlag};
 
     // Register for SIGCHLD before the first observation so an exit between the
     // check and wait remains visible either as a pending signal or a zombie.
     let mut child_signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())
         .map_err(|error| nix::Error::from_raw(error.raw_os_error().unwrap_or(libc::EIO)))?;
     loop {
-        match waitpid(child_pid, Some(WaitPidFlag::WNOHANG))? {
-            WaitStatus::StillAlive => {
-                let _ = child_signal.recv().await;
-            }
-            outcome @ (WaitStatus::Exited(..)
-            | WaitStatus::Signaled(..)
-            | WaitStatus::Stopped(..)
-            | WaitStatus::Continued(_)) => return Ok(outcome),
+        let status = waitpid(child_pid, Some(WaitPidFlag::WNOHANG))?;
+        if let Some(outcome) = terminal_child_exit(status) {
+            return Ok(outcome);
         }
+        let _ = child_signal.recv().await;
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_wait_status_tests {
+    use super::terminal_child_exit;
+    use nix::{
+        sys::{signal::Signal, wait::WaitStatus},
+        unistd::Pid,
+    };
+
+    #[test]
+    fn ptrace_observations_are_not_terminal_child_exits() {
+        let pid = Pid::from_raw(42);
+
+        assert_eq!(
+            terminal_child_exit(WaitStatus::PtraceEvent(
+                pid,
+                Signal::SIGTRAP,
+                libc::PTRACE_EVENT_EXIT
+            )),
+            None
+        );
+        assert_eq!(terminal_child_exit(WaitStatus::PtraceSyscall(pid)), None);
     }
 }
 
