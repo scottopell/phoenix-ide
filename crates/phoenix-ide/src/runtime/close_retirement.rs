@@ -3252,6 +3252,31 @@ fn linux_process_is_relevant(
 }
 
 #[cfg(target_os = "linux")]
+fn linux_descriptor_target_is_within(
+    target: std::io::Result<PathBuf>,
+    canonical_worktree: &Path,
+) -> Result<bool, String> {
+    match target {
+        Ok(candidate) => Ok(path_is_within(&candidate, canonical_worktree)),
+        // Linux resolves each /proc/<pid>/fd/<n> link separately under the
+        // ptrace access check. An entry can disappear after getdents, and an
+        // otherwise enumerable table can contain an individually inaccessible
+        // link. Neither outcome identifies that descriptor as a worktree
+        // reference; failure to enumerate the descriptor table itself remains
+        // ambiguous and is handled by the caller.
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(format!("cannot inspect process descriptor target: {error}")),
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn quarantine_has_open_descriptors(path: &Path) -> Result<bool, String> {
     // SAFETY: `geteuid` has no preconditions.
     let effective_uid = unsafe { libc::geteuid() };
@@ -3287,13 +3312,9 @@ fn quarantine_has_open_descriptors_in(
         for descriptor in descriptors {
             let descriptor = descriptor
                 .map_err(|error| format!("cannot inspect process descriptor entry: {error}"))?;
-            match std::fs::read_link(descriptor.path()) {
-                Ok(candidate) if path_is_within(&candidate, &canonical) => return Ok(true),
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(format!("cannot inspect process descriptor target: {error}"));
-                }
+            if linux_descriptor_target_is_within(std::fs::read_link(descriptor.path()), &canonical)?
+            {
+                return Ok(true);
             }
         }
     }
@@ -5112,6 +5133,32 @@ mod tests {
             !matches!(scan, Ok(false)),
             "same-user nondumpable process was classified as unrelated: {scan:?}"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_scan_skips_vanished_and_individually_inaccessible_links() {
+        let worktree = Path::new("/quarantine/worktree");
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            assert!(!super::linux_descriptor_target_is_within(
+                Err(std::io::Error::from(kind)),
+                worktree,
+            )
+            .unwrap());
+        }
+        assert!(
+            super::linux_descriptor_target_is_within(Ok(worktree.join("open-file")), worktree,)
+                .unwrap()
+        );
+        assert!(super::linux_descriptor_target_is_within(
+            Err(std::io::Error::from(std::io::ErrorKind::InvalidData)),
+            worktree,
+        )
+        .unwrap_err()
+        .contains("cannot inspect process descriptor target"));
     }
 
     #[cfg(target_os = "linux")]
