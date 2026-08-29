@@ -25,6 +25,7 @@ import {
 } from './viewer-find';
 import { useFocusScope, useFocusScopeCommands } from '../hooks/useFocusScope';
 import {
+  GESTURE_STALE_MS,
   VirtualTranscript,
   type VirtualTranscriptHandle,
   type VirtualTranscriptPhysicalSnapshot,
@@ -65,12 +66,12 @@ import {
   type Chapter,
 } from '../conversation/conversationChapters';
 import {
-  PIN_TO_BOTTOM_THRESHOLD,
   SETTLE_WATCH_INTERVAL_MS,
   initialScrollMachineState,
   reduceScrollMachine,
   type ScrollEffect,
   type ScrollEvent,
+  type ScrollMachineState,
   type ScrollSnapshot,
   type TailActivity,
 } from '../conversation/scrollMachine';
@@ -96,6 +97,54 @@ const ChevronDown = () => (
 );
 
 const RESTORE_OFFSET_TOLERANCE_PX = 2;
+
+function isTextEntry(element: HTMLElement): boolean {
+  const tag = element.tagName;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || element.isContentEditable;
+}
+
+/** Elements that activate on Space, so Space does not reach the scroller.
+ *  A link is deliberately absent: Enter follows a link, Space pages past it. */
+const SPACE_ACTIVATED = 'button, select, summary, input, [role="button"], [role="checkbox"], [role="switch"], [role="radio"], [role="menuitem"], [role="tab"], [role="option"]';
+
+function consumesSpace(element: HTMLElement): boolean {
+  return element.closest(SPACE_ACTIVATED) !== null;
+}
+
+/** Whether the reader is the one who put the viewport where it is. Reading is
+ *  one such state; so is a navigation they have taken over, which is what the
+ *  user-returning phase records. A command still positioning is not — that
+ *  movement is the command's own (REQ-MLRU-014). */
+function readerMovedViewport(machine: ScrollMachineState): boolean {
+  if (machine.kind !== 'live') return false;
+  return machine.follow.kind === 'reading'
+    || (machine.follow.kind === 'navigating' && machine.follow.phase === 'user-returning');
+}
+
+/** A scroller reports positions outside its own scrollable range during
+ *  overscroll. Snapshots are built here so none of them can carry one. */
+function clampScrollTop(scrollTop: number, element: HTMLElement): number {
+  const maxScrollTop = Math.max(0, element.scrollHeight - element.clientHeight);
+  return Math.min(Math.max(scrollTop, 0), maxScrollTop);
+}
+
+function snapshotOf(element: HTMLElement): ScrollSnapshot {
+  return {
+    scrollHeight: element.scrollHeight,
+    scrollTop: clampScrollTop(element.scrollTop, element),
+    clientHeight: element.clientHeight,
+  };
+}
+
+/** Withheld while the user owns the viewport: a follow mode that holds
+ *  position, or a touch that has moved, which takes ownership from the
+ *  movement itself rather than from a scroll event (REQ-MLRU-014). */
+function tailFollowGranted(state: ScrollMachineState): boolean {
+  if (state.kind !== 'live' && state.kind !== 'mount-rescue') return true;
+  if (state.gesture.kind === 'touch' && state.gesture.moved) return false;
+  if (state.kind === 'mount-rescue') return true;
+  return state.follow.kind === 'following' || state.follow.kind === 'returning-to-tail';
+}
 
 function historyViewKey(view: HistoryView): string {
   return `${view.conversationId}:${view.generation}:${view.transcriptGeneration}`;
@@ -586,7 +635,6 @@ function MessageListImpl({
             const focusTarget = command.focusOrigin?.isConnected
               ? command.focusOrigin
               : scrollerRef.current;
-            if (focusTarget && !focusTarget.hasAttribute('tabindex')) focusTarget.setAttribute('tabindex', '-1');
             focusTarget?.focus();
           });
           break;
@@ -766,20 +814,30 @@ function MessageListImpl({
   const cancelScheduledEarlierHistoryRef = useRef<(() => void) | null>(null);
   const requestEarlierHistoryRef = useRef<(source: 'range' | 'upward-intent' | 'retry') => void>(() => {});
   const updateEarlierHistoryRestoreRef = useRef<() => void>(() => {});
-  const touchStartYRef = useRef<number | null>(null);
+  /** Where each owned finger went down, keyed by identifier. Per-touch
+   *  because any one of them dragging is upward intent, and a single baseline
+   *  can only ever describe one of them. */
+  const touchStartYRef = useRef(new Map<number, number>());
+  /** Identifiers of touches that began on the transcript. Counts are taken
+   *  by intersecting this with the event's live `touches` list: the set alone
+   *  over-counts a finger whose row was unmounted mid-gesture (its touchend
+   *  reaches no listener at all), while `touches` alone counts fingers down
+   *  elsewhere on the page. The intersection is both scoped and self-healing,
+   *  since a vanished touch is absent from every later event's list. */
+  const scrollerTouchIdsRef = useRef(new Set<number>());
+  const lastTouchAtMs = useRef(0);
+  const abandonStaleGestureRef = useRef<() => void>(() => {});
+  const staleGestureTimerRef = useRef(0);
 
   const readScrollSnapshot = useCallback((): ScrollSnapshot | null => {
     const s = scrollerRef.current;
-    return s ? { scrollHeight: s.scrollHeight, scrollTop: s.scrollTop, clientHeight: s.clientHeight } : null;
+    return s ? snapshotOf(s) : null;
   }, []);
 
+  // Physical tail edge, forwarded verbatim (scroll_policy.allium).
   const handlePinnedStateChange = useCallback((pinned: boolean) => {
-    const snapshot = readScrollSnapshot();
-    const domAtBottom = snapshot
-      ? snapshot.scrollHeight - snapshot.scrollTop - snapshot.clientHeight <= PIN_TO_BOTTOM_THRESHOLD
-      : pinned;
-    dispatchScrollEventRef.current({ type: 'viewportPinnedChanged', atBottom: pinned || domAtBottom });
-  }, [readScrollSnapshot]);
+    dispatchScrollEventRef.current({ type: 'viewportPinnedChanged', atBottom: pinned });
+  }, []);
 
   const scheduleDomBottomWrite = useCallback(() => {
     if (settleSnapRafRef.current !== 0) return;
@@ -867,6 +925,8 @@ function MessageListImpl({
   const dispatchScrollEvent = useCallback((event: ScrollEvent) => {
     const next = reduceScrollMachine(scrollMachineRef.current, event);
     scrollMachineRef.current = next.state;
+    // REQ-VT-008: intent follows every reduction.
+    transcriptRef.current?.setTailFollowAllowed(tailFollowGranted(next.state));
     applyScrollEffects(next.effects);
   }, [applyScrollEffects]);
   dispatchScrollEventRef.current = dispatchScrollEvent;
@@ -884,37 +944,149 @@ function MessageListImpl({
       ref.dataset['appScrollOwner'] = '';
       dispatchScrollEvent({
         type: 'scrollerAttached',
-        snapshot: { scrollHeight: ref.scrollHeight, scrollTop: ref.scrollTop, clientHeight: ref.clientHeight },
+        snapshot: snapshotOf(ref),
       });
       const onPointerDown = () => {
         dispatchTranscriptPositioningRef.current({ type: 'user_interrupted' });
         dispatchScrollEvent({ type: 'interactionStarted' });
       };
+      // Reads the last published range instead of taking a synchronized
+      // physical snapshot: this runs on every upward scroll and touchmove
+      // event, and a snapshot forces a full layout rebuild each call.
       const requestFromUpwardIntent = () => {
-        const visibleRange = transcriptRef.current?.physicalSnapshot().visibleRange;
-        if (!visibleRange || visibleRange.startIndex <= 2) requestEarlierHistoryRef.current('upward-intent');
+        if (firstVisibleUnitIndexRef.current <= 2) requestEarlierHistoryRef.current('upward-intent');
       };
+      // scroll_policy.allium AbandonedGestureDiscardsEvidenceWithoutConfirming.
+      // Either nothing this scroller owns is still down, or what it owns has
+      // gone longer than the bound without an event of its own. An empty set
+      // was previously a reason to skip, which is backwards: it is the
+      // strongest evidence there is that no observable finger is driving.
+      const endUnobservedGesture = () => {
+        window.clearTimeout(staleGestureTimerRef.current);
+        staleGestureTimerRef.current = 0;
+        scrollerTouchIdsRef.current.clear();
+        touchStartYRef.current.clear();
+        dispatchScrollEvent({ type: 'gestureAbandoned' });
+      };
+      const abandonStaleGesture = abandonStaleGestureRef.current = () => {
+        if (scrollerTouchIdsRef.current.size > 0
+          && Date.now() - lastTouchAtMs.current <= GESTURE_STALE_MS) return;
+        endUnobservedGesture();
+      };
+      // The bound has to expire on its own. Checking it only when some later
+      // input arrives means a reader who simply stops touching the screen
+      // leaves the gesture standing, and streamed content goes on raising
+      // unread against an interaction that ended.
+      const armStaleGestureTimer = () => {
+        window.clearTimeout(staleGestureTimerRef.current);
+        if (scrollerTouchIdsRef.current.size === 0) {
+          staleGestureTimerRef.current = 0;
+          return;
+        }
+        staleGestureTimerRef.current = window.setTimeout(() => {
+          staleGestureTimerRef.current = 0;
+          abandonStaleGesture();
+        }, GESTURE_STALE_MS + 1);
+      };
+      // The event's touch list is global — a finger anywhere on the page can
+      // appear in it — so every read filters to this scroller's own.
+      const ownedTouches = (e: TouchEvent): Touch[] =>
+        Array.from(e.touches).filter((t) => scrollerTouchIdsRef.current.has(t.identifier));
       const onTouchStart = (e: TouchEvent) => {
-        touchStartYRef.current = e.touches[0]?.clientY ?? null;
+        const live = new Set(Array.from(e.touches).map((touch) => touch.identifier));
+        for (const id of Array.from(scrollerTouchIdsRef.current)) {
+          if (!live.has(id)) scrollerTouchIdsRef.current.delete(id);
+        }
+        // A touch that is already down cannot start again, so a touchstart
+        // naming an identifier this scroller still owns is proof the platform
+        // recycled it — the touch it belonged to ended without being seen.
+        // That is definite, where the staleness bound is only a guess, and it
+        // is checked before the timestamp is refreshed so the refresh cannot
+        // make the interaction it replaces look current.
+        const recycled = Array.from(e.changedTouches)
+          .some((touch) => scrollerTouchIdsRef.current.has(touch.identifier));
+        // Abandonment discards a gesture's evidence, not the record of which
+        // fingers are physically down. An identifier this scroller owns that
+        // the browser still reports as down, and that is not the one starting
+        // now, belongs to a finger that never lifted — it is a member of
+        // whatever gesture follows, and disowning it would let that gesture
+        // resolve at zero remaining touches while it is still dragging.
+        const starting = new Set(Array.from(e.changedTouches).map((touch) => touch.identifier));
+        const survivors = Array.from(scrollerTouchIdsRef.current)
+          .filter((id) => live.has(id) && !starting.has(id));
+        // A new touch must not inherit the evidence of a gesture that already
+        // ended, and that gesture cannot be resolved either: the position it
+        // ended at was never observed, and the current one belongs to a later
+        // moment.
+        if (recycled) endUnobservedGesture();
+        else abandonStaleGesture();
+        lastTouchAtMs.current = Date.now();
+        for (const id of survivors) {
+          scrollerTouchIdsRef.current.add(id);
+        }
+        for (const touch of Array.from(e.changedTouches)) {
+          scrollerTouchIdsRef.current.add(touch.identifier);
+        }
+        for (const touch of ownedTouches(e)) {
+          if (!touchStartYRef.current.has(touch.identifier)) {
+            touchStartYRef.current.set(touch.identifier, touch.clientY);
+          }
+        }
+        armStaleGestureTimer();
         dispatchTranscriptPositioningRef.current({ type: 'user_interrupted' });
         dispatchScrollEvent({ type: 'touchStarted' });
       };
       const onTouchMove = (e: TouchEvent) => {
+        lastTouchAtMs.current = Date.now();
+        armStaleGestureTimer();
         dispatchScrollEvent({ type: 'touchMoved' });
-        const currentY = e.touches[0]?.clientY;
-        if (currentY !== undefined && touchStartYRef.current !== null && currentY > touchStartYRef.current) {
+        // Any owned finger dragging down reveals earlier content, so ask each
+        // against its own starting point rather than picking one to speak for
+        // the rest.
+        const draggedDown = ownedTouches(e).some((touch) => {
+          const start = touchStartYRef.current.get(touch.identifier);
+          return start !== undefined && touch.clientY > start;
+        });
+        if (draggedDown) {
           requestFromUpwardIntent();
         }
       };
-      const onTouchEnd = (e: TouchEvent) => {
-        touchStartYRef.current = null;
-        dispatchScrollEvent({ type: 'touchEnded', remainingTouches: e.touches.length });
+      const resolveTouchStop = (e: TouchEvent, type: 'touchEnded' | 'touchCancelled') => {
+        lastTouchAtMs.current = Date.now();
+        let owned = false;
+        for (const touch of Array.from(e.changedTouches)) {
+          if (scrollerTouchIdsRef.current.delete(touch.identifier)) owned = true;
+        }
+        // Prune anything the browser no longer reports as down, so a touch
+        // whose row was unmounted before it lifted cannot hold the gesture
+        // open past this event.
+        const live = new Set(Array.from(e.touches).map((touch) => touch.identifier));
+        for (const id of Array.from(scrollerTouchIdsRef.current)) {
+          if (!live.has(id)) scrollerTouchIdsRef.current.delete(id);
+        }
+        if (!owned) {
+          // A touch anywhere on the page reaches this listener, and the
+          // pruning above can take away the last transcript touch whose own
+          // end was never delivered. Nothing later would notice.
+          abandonStaleGesture();
+          return;
+        }
+        // Only the fingers that actually left lose their baselines; the ones
+        // still down keep measuring against where they started.
+        for (const id of Array.from(touchStartYRef.current.keys())) {
+          if (!scrollerTouchIdsRef.current.has(id)) touchStartYRef.current.delete(id);
+        }
+        armStaleGestureTimer();
+        dispatchScrollEvent({
+          type,
+          remainingTouches: scrollerTouchIdsRef.current.size,
+          snapshot: snapshotOf(ref),
+        });
       };
-      const onTouchCancel = (e: TouchEvent) => {
-        touchStartYRef.current = null;
-        dispatchScrollEvent({ type: 'touchCancelled', remainingTouches: e.touches.length });
-      };
+      const onTouchEnd = (e: TouchEvent) => resolveTouchStop(e, 'touchEnded');
+      const onTouchCancel = (e: TouchEvent) => resolveTouchStop(e, 'touchCancelled');
       const onWheel = (e: WheelEvent) => {
+        abandonStaleGesture();
         dispatchTranscriptPositioningRef.current({ type: 'user_interrupted' });
         dispatchScrollEvent({ type: 'interactionStarted' });
         if (e.deltaY < 0) {
@@ -935,25 +1107,72 @@ function MessageListImpl({
           }
           return;
         }
-        const snapshot = { scrollHeight: ref.scrollHeight, scrollTop: ref.scrollTop, clientHeight: ref.clientHeight };
+        // Echoes of VirtualTranscript's own writes (anchor compensation,
+        // drift reconcile, tail snap) carry no user intent: update geometry
+        // without direction classification, which would otherwise mistake a
+        // compensation write inside the pin zone for a user tail return.
+        if (transcriptRef.current?.isProgrammaticScroll(ref.scrollTop)) {
+          dispatchScrollEvent({
+            type: 'scrollerAttached',
+            snapshot: snapshotOf(ref),
+          });
+          updateEarlierHistoryRestoreRef.current();
+          return;
+        }
+        const snapshot = snapshotOf(ref);
+        const clampedTop = snapshot.scrollTop;
+        // The recorded position is already in range, but the range itself
+        // moves as content grows and shrinks, so re-clamp it against the one
+        // in force now before comparing two positions across that change.
         const machine = scrollMachineRef.current;
         const previousTop = machine.kind === 'live' || machine.kind === 'mount-rescue'
-          ? machine.geometry.lastSnapshot?.scrollTop ?? snapshot.scrollTop
-          : snapshot.scrollTop;
-        dispatchScrollEvent(
-          snapshot.scrollTop < previousTop
-            ? { type: 'upwardIntent', snapshot }
-            : { type: 'downwardMovement', snapshot },
-        );
-        if (snapshot.scrollTop < previousTop) requestFromUpwardIntent();
+          ? clampScrollTop(machine.geometry.lastSnapshot?.scrollTop ?? clampedTop, ref)
+          : clampedTop;
+        // Three outcomes, not two. Clamping collapses rubber-band frames onto
+        // the position already held, and a standstill is not movement in
+        // either direction: folding it into downward would let the bounce at
+        // an edge confirm a tail return the reader never travelled to.
+        if (clampedTop === previousTop) {
+          dispatchScrollEvent({ type: 'scrollerAttached', snapshot });
+        } else if (clampedTop < previousTop) {
+          dispatchScrollEvent({ type: 'upwardIntent', snapshot });
+          requestFromUpwardIntent();
+        } else {
+          dispatchScrollEvent({ type: 'downwardMovement', snapshot });
+        }
         updateEarlierHistoryRestoreRef.current();
       };
+      const UPWARD_KEYS = new Set(['ArrowUp', 'PageUp', 'Home']);
+      const DOWNWARD_KEYS = new Set(['ArrowDown', 'PageDown', 'End', ' ']);
       const onKeyDown = (e: KeyboardEvent) => {
+        // The chat route locks its ancestors' overflow, so this scroller is the
+        // only scrollable box and it is a descendant of the body — a key
+        // arriving with the body as target scrolls nothing at all. Treating
+        // one as viewport movement cancels a positioning command and hands
+        // over ownership for a scroll that never happened.
         const target = e.target;
-        const readsTranscript = target === document.body || (target instanceof Node && ref.contains(target));
-        if (!readsTranscript || (e.key !== 'ArrowUp' && e.key !== 'PageUp' && e.key !== 'Home')) return;
+        if (!(target instanceof Node) || !ref.contains(target)) return;
+        // A key only takes the viewport over when its default action is to
+        // move it. Typing consumes these keys outright, and Space activates a
+        // focused control rather than paging the transcript — treating either
+        // as a takeover would tell the policy a reader moved a viewport that
+        // never moved.
+        if (target instanceof HTMLElement && isTextEntry(target)) return;
+        if (e.key === ' ' && target instanceof HTMLElement && consumesSpace(target)) return;
+        // Shift+Space is the browser's page-up, so the same key means
+        // opposite directions depending on the modifier.
+        // Shift+Space is the browser's page-up, so the same key means
+        // opposite directions depending on the modifier.
+        const upward = UPWARD_KEYS.has(e.key) || (e.key === ' ' && e.shiftKey);
+        // Keys that drive the transcript toward the tail take the viewport
+        // over just as upward ones do. Recognising only upward keys left a
+        // jump stuck in its positioning phase, which then refused to confirm
+        // the arrival the reader had keyed their way to.
+        if (!upward && !DOWNWARD_KEYS.has(e.key)) return;
+        abandonStaleGesture();
         dispatchTranscriptPositioningRef.current({ type: 'user_interrupted' });
         dispatchScrollEvent({ type: 'interactionStarted' });
+        if (!upward) return;
         dispatchScrollEvent({ type: 'upwardIntent' });
         requestFromUpwardIntent();
       };
@@ -962,15 +1181,22 @@ function MessageListImpl({
       ref.addEventListener('touchmove', onTouchMove, { passive: true });
       ref.addEventListener('touchend', onTouchEnd, { passive: true });
       ref.addEventListener('touchcancel', onTouchCancel, { passive: true });
+      window.addEventListener('touchend', onTouchEnd, { passive: true });
+      window.addEventListener('touchcancel', onTouchCancel, { passive: true });
       ref.addEventListener('wheel', onWheel, { passive: true });
       ref.addEventListener('scroll', onScroll, { passive: true });
       window.addEventListener('keydown', onKeyDown);
       detachGestureListenersRef.current = () => {
+        window.clearTimeout(staleGestureTimerRef.current);
+        staleGestureTimerRef.current = 0;
         ref.removeEventListener('pointerdown', onPointerDown);
         ref.removeEventListener('touchstart', onTouchStart);
         ref.removeEventListener('touchmove', onTouchMove);
         ref.removeEventListener('touchend', onTouchEnd);
         ref.removeEventListener('touchcancel', onTouchCancel);
+        window.removeEventListener('touchend', onTouchEnd);
+        window.removeEventListener('touchcancel', onTouchCancel);
+        scrollerTouchIdsRef.current.clear();
         ref.removeEventListener('wheel', onWheel);
         ref.removeEventListener('scroll', onScroll);
         window.removeEventListener('keydown', onKeyDown);
@@ -1044,6 +1270,7 @@ function MessageListImpl({
   }, [conversationId, dispatchScrollEvent, readScrollSnapshot]);
 
   const scrollToNewest = useCallback(() => {
+    abandonStaleGestureRef.current();
     dispatchScrollEvent({ type: 'jumpToNewestRequested', unitCount: allUnitsLengthRef.current });
   }, [dispatchScrollEvent]);
 
@@ -1162,7 +1389,10 @@ function MessageListImpl({
 
   const captureHistoryRestoreBasis = useCallback((readerIntent = false): RestoreBasis => {
     const machine = scrollMachineRef.current;
-    if (!readerIntent && (machine.kind === 'mount-rescue' || (machine.kind === 'live' && machine.follow.kind !== 'reading'))) {
+    // Same question as the acquisition guard, and it must be answered the same
+    // way: a request admitted because the reader moved the viewport has to
+    // carry the reader's anchor, or the prefix merge restores to the tail.
+    if (!readerIntent && !readerMovedViewport(machine)) {
       return { kind: 'following_tail' };
     }
     const transcript = transcriptRef.current;
@@ -1182,7 +1412,7 @@ function MessageListImpl({
   const requestEarlierHistory = useCallback((source: 'range' | 'upward-intent' | 'retry') => {
     const machine = scrollMachineRef.current;
     const ownsCurrentView = machine.kind === 'live' && machine.conversationId === conversationId;
-    const readerOwnsViewport = ownsCurrentView && machine.follow.kind === 'reading';
+    const readerMoved = ownsCurrentView && readerMovedViewport(machine);
     if (
       earlierHistoryRequestScheduledRef.current
       || !hasOlderMessages
@@ -1190,7 +1420,12 @@ function MessageListImpl({
       || !onLoadOlderMessages
       || (!ownsCurrentView && source !== 'retry')
       || (olderHistoryError && source !== 'retry')
-      || (source === 'range' && !readerOwnsViewport)
+      // Which signal noticed the boundary does not change who moved the
+      // viewport to it. Find navigation scrolls rows into view directly,
+      // without going through the transcript, so those writes look like
+      // upward intent — and a positioning-owned search must not walk itself
+      // backwards through history (REQ-MLRU-014).
+      || (source !== 'retry' && !readerMoved)
     ) return;
     earlierHistoryRequestScheduledRef.current = true;
     const restoreBasis = captureHistoryRestoreBasis(source === 'upward-intent' || source === 'retry');
@@ -1539,6 +1774,7 @@ function MessageListImpl({
           key={conversationId ?? '__empty__'}
           ref={transcriptRef}
           scrollerId="messages"
+          ariaLabel="Conversation transcript"
           scrollerRef={handleScrollerRef}
           items={allUnits}
           renderItem={itemContent}

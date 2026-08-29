@@ -1079,6 +1079,17 @@ describe('owned conversation navigation', () => {
   });
 });
 
+// Handoff controls are gated on `isArchived`, which stays true until
+// archive status is confirmed asynchronously. A findBy* query resolves on
+// existence rather than enabled-ness, so a click issued the moment the
+// control appears can land while it is still inert and be dropped.
+async function clickWhenEnabled(control: HTMLElement) {
+  await waitFor(() => expect(control).toBeEnabled());
+  await act(async () => {
+    fireEvent.click(control);
+  });
+}
+
 describe('ConversationPage context exhausted handoff', () => {
   it('dispatch_failed keeps the edit on the parent for durable retry', async () => {
     vi.mocked(api.continueConversation).mockResolvedValue({
@@ -1093,7 +1104,7 @@ describe('ConversationPage context exhausted handoff', () => {
       conv_mode_label: 'Work',
     }));
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Edit first' }));
+    await clickWhenEnabled(await screen.findByRole('button', { name: 'Edit first' }));
     const handoff = await screen.findByTestId('context-exhausted-handoff');
     fireEvent.change(handoff, { target: { value: 'Edited handoff for successor' } });
     fireEvent.click(screen.getByRole('button', { name: 'Continue with edits' }));
@@ -1121,7 +1132,7 @@ describe('ConversationPage context exhausted handoff', () => {
     }));
 
     const continuation = await screen.findByTestId('continuation-link');
-    await act(async () => fireEvent.click(continuation));
+    await clickWhenEnabled(continuation);
     expect(await screen.findByText('Still unavailable')).toBeInTheDocument();
     expect(screen.getByTestId('continuation-link')).toBeInTheDocument();
   });

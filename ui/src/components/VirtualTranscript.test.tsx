@@ -1,7 +1,7 @@
 import { type ReactElement } from 'react';
 import { act, fireEvent, render, screen } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { VirtualTranscript, type VirtualTranscriptHandle, type VirtualTranscriptPhysicalSnapshot } from './VirtualTranscript';
+import { GESTURE_STALE_MS, VirtualTranscript, type VirtualTranscriptHandle, type VirtualTranscriptPhysicalSnapshot } from './VirtualTranscript';
 
 interface TestItem {
   id: string;
@@ -120,6 +120,7 @@ describe('VirtualTranscript', () => {
 
     render(
       <VirtualTranscript
+        ariaLabel="Transcript"
         items={makeItems(100)}
         getKey={(item) => item.id}
         estimatedExtent={20}
@@ -141,6 +142,29 @@ describe('VirtualTranscript', () => {
     expect(getComputedStyle(scroller as Element).overflowAnchor).toBe('none');
   });
 
+  it('exposes the scroll port as a named region a keyboard can reach', () => {
+    render(
+      <VirtualTranscript
+        items={makeItems(100)}
+        getKey={(item) => item.id}
+        estimatedExtent={20}
+        overscan={20}
+        initialTail={false}
+        ariaLabel="Conversation transcript"
+        renderItem={renderRow}
+      />,
+    );
+
+    const scroller = screen.getByRole('region', { name: 'Conversation transcript' });
+    expect(scroller).toHaveClass('virtual-transcript');
+    // Sequential focusability, not merely programmatic: tabIndex -1 would leave
+    // the port unreachable for a keyboard reader (REQ-VT-013).
+    expect(scroller.tabIndex).toBe(0);
+
+    scroller.focus();
+    expect(document.activeElement).toBe(scroller);
+  });
+
   it('quarantines duplicate semantic keys into independent physical rows', () => {
     const error = vi.spyOn(console, 'error').mockImplementation(() => {});
     const ref = { current: null as VirtualTranscriptHandle | null };
@@ -155,6 +179,7 @@ describe('VirtualTranscript', () => {
 
     render(
       <VirtualTranscript
+        ariaLabel="Transcript"
         ref={ref}
         items={items}
         getKey={(item) => item.id}
@@ -196,6 +221,7 @@ describe('VirtualTranscript', () => {
 
     render(
       <VirtualTranscript
+        ariaLabel="Transcript"
         ref={ref}
         items={makeItems(20, 10)}
         getKey={(item) => item.id}
@@ -230,6 +256,7 @@ describe('VirtualTranscript', () => {
 
     render(
       <VirtualTranscript
+        ariaLabel="Transcript"
         ref={ref}
         items={[{ id: 'group', label: 'Group', height: 200 }]}
         getKey={(item) => item.id}
@@ -269,6 +296,7 @@ describe('VirtualTranscript', () => {
 
     const view = render(
       <VirtualTranscript
+        ariaLabel="Transcript"
         ref={ref}
         items={items}
         getKey={(item) => item.id}
@@ -290,6 +318,7 @@ describe('VirtualTranscript', () => {
     act(() => {
       view.rerender(
         <VirtualTranscript
+          ariaLabel="Transcript"
           ref={ref}
           items={resized}
           getKey={(item) => item.id}
@@ -317,6 +346,608 @@ describe('VirtualTranscript', () => {
     });
   });
 
+  it('absorbs above-anchor resize into the top spacer mid-scroll and reconciles scrollTop once settled', () => {
+    vi.useFakeTimers();
+    try {
+      const ref = { current: null as VirtualTranscriptHandle | null };
+      let scroller: HTMLDivElement | null = null;
+      const items = makeItems(30, 20);
+
+      render(
+        <VirtualTranscript
+          ariaLabel="Transcript"
+          ref={ref}
+          items={items}
+          getKey={(item) => item.id}
+          estimatedExtent={20}
+          overscan={200}
+          initialTail={false}
+          renderItem={renderRow}
+          scrollerRef={(element) => { scroller = element; }}
+        />,
+      );
+
+      act(() => ref.current?.scrollToIndex(20, 'start'));
+      expect(scrollTopOf(scroller)).toBe(400);
+      // The write's own echo is recognized as programmatic, not user motion.
+      expect(ref.current?.isProgrammaticScroll(400)).toBe(true);
+
+      // A user scroll event (non-matching scrollTop) marks scrolling as
+      // in-flight; a resize of a mounted row above the anchor must then keep
+      // scrollTop untouched (momentum-preserving) while the top spacer
+      // absorbs the delta.
+      act(() => {
+        scroller!.scrollTop = 395;
+        fireEvent.scroll(scroller!);
+      });
+      expect(ref.current?.isProgrammaticScroll(395)).toBe(false);
+      const row12 = document.querySelector<HTMLElement>('[data-virtual-key="item-12"]')!;
+      act(() => resizeObservers[0]!.triggerEntries([[row12, 50]]));
+      expect(scrollTopOf(scroller)).toBe(395);
+
+      const spacer = document.querySelector<HTMLElement>('.virtual-transcript__spacer')!;
+      expect(spacer.style.height).toBe('190px');
+
+      let anchor = null as ReturnType<VirtualTranscriptHandle['captureVisibleAnchor']>;
+      act(() => {
+        anchor = ref.current?.captureVisibleAnchor() ?? null;
+      });
+      expect(anchor).toMatchObject({ index: 19, key: 'item-19', offset: -15 });
+
+      // Once scrolling settles, drift reconciles into true layout coordinates
+      // with a single scrollTop adjustment.
+      act(() => {
+        vi.advanceTimersByTime(400);
+      });
+      expect(scrollTopOf(scroller)).toBe(425);
+      act(() => {
+        anchor = ref.current?.captureVisibleAnchor() ?? null;
+      });
+      expect(anchor).toMatchObject({ index: 19, key: 'item-19', offset: -15 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('defers drift reconciliation while a touch is held, then reconciles after lift', () => {
+    vi.useFakeTimers();
+    try {
+      const ref = { current: null as VirtualTranscriptHandle | null };
+      let scroller: HTMLDivElement | null = null;
+
+      render(
+        <VirtualTranscript
+          ariaLabel="Transcript"
+          ref={ref}
+          items={makeItems(30, 20)}
+          getKey={(item) => item.id}
+          estimatedExtent={20}
+          overscan={200}
+          initialTail={false}
+          renderItem={renderRow}
+          scrollerRef={(element) => { scroller = element; }}
+        />,
+      );
+
+      act(() => ref.current?.scrollToIndex(20, 'start'));
+      act(() => {
+        fireEvent.touchStart(scroller!, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
+        scroller!.scrollTop = 395;
+        fireEvent.scroll(scroller!);
+      });
+      const row12 = document.querySelector<HTMLElement>('[data-virtual-key="item-12"]')!;
+      act(() => resizeObservers[0]!.triggerEntries([[row12, 50]]));
+      expect(scrollTopOf(scroller)).toBe(395);
+
+      // A stationary held finger keeps the gesture active even with no
+      // scroll events: reconciliation must not write scrollTop mid-gesture.
+      act(() => {
+        vi.advanceTimersByTime(1000);
+      });
+      expect(scrollTopOf(scroller)).toBe(395);
+
+      act(() => {
+        fireEvent.touchEnd(scroller!, { touches: [], changedTouches: [{ identifier: 1 }] });
+      });
+      act(() => {
+        vi.advanceTimersByTime(400);
+      });
+      expect(scrollTopOf(scroller)).toBe(425);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps reconciliation deferred while a second finger stays down on another row', () => {
+    vi.useFakeTimers();
+    try {
+      const ref = { current: null as VirtualTranscriptHandle | null };
+      let scroller: HTMLDivElement | null = null;
+
+      render(
+        <VirtualTranscript
+          ariaLabel="Transcript"
+          ref={ref}
+          items={makeItems(30, 20)}
+          getKey={(item) => item.id}
+          estimatedExtent={20}
+          overscan={200}
+          initialTail={false}
+          renderItem={renderRow}
+          scrollerRef={(element) => { scroller = element; }}
+        />,
+      );
+
+      act(() => ref.current?.scrollToIndex(20, 'start'));
+      // Two fingers land on different rows, so their touch events target
+      // different descendants of the scroller.
+      const rowA = document.querySelector<HTMLElement>('[data-virtual-key="item-18"]')!;
+      const rowB = document.querySelector<HTMLElement>('[data-virtual-key="item-20"]')!;
+      act(() => {
+        fireEvent.touchStart(rowA, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
+        fireEvent.touchStart(rowB, {
+          touches: [{ identifier: 1 }, { identifier: 2 }],
+          changedTouches: [{ identifier: 2 }],
+        });
+        scroller!.scrollTop = 395;
+        fireEvent.scroll(scroller!);
+      });
+      const row12 = document.querySelector<HTMLElement>('[data-virtual-key="item-12"]')!;
+      act(() => resizeObservers[0]!.triggerEntries([[row12, 50]]));
+      expect(scrollTopOf(scroller)).toBe(395);
+
+      // First finger lifts; the second is still down, so the gesture is not
+      // over and reconciliation must stay deferred.
+      act(() => {
+        fireEvent.touchEnd(rowA, { touches: [{ identifier: 2 }], changedTouches: [{ identifier: 1 }] });
+      });
+      act(() => {
+        vi.advanceTimersByTime(1000);
+      });
+      expect(scrollTopOf(scroller)).toBe(395);
+
+      act(() => {
+        fireEvent.touchEnd(rowB, { touches: [], changedTouches: [{ identifier: 2 }] });
+      });
+      act(() => {
+        vi.advanceTimersByTime(400);
+      });
+      expect(scrollTopOf(scroller)).toBe(425);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reconciles within the stale bound when a touch lift is unobservable', () => {
+    vi.useFakeTimers();
+    try {
+      const ref = { current: null as VirtualTranscriptHandle | null };
+      let scroller: HTMLDivElement | null = null;
+
+      render(
+        <VirtualTranscript
+          ariaLabel="Transcript"
+          ref={ref}
+          items={makeItems(30, 20)}
+          getKey={(item) => item.id}
+          estimatedExtent={20}
+          overscan={200}
+          initialTail={false}
+          renderItem={renderRow}
+          scrollerRef={(element) => { scroller = element; }}
+        />,
+      );
+
+      act(() => ref.current?.scrollToIndex(20, 'start'));
+      const row = document.querySelector<HTMLElement>('[data-virtual-key="item-20"]')!;
+      act(() => {
+        fireEvent.touchStart(row, { touches: [{ identifier: 5 }], changedTouches: [{ identifier: 5 }] });
+        scroller!.scrollTop = 395;
+        fireEvent.scroll(scroller!);
+      });
+      const row12 = document.querySelector<HTMLElement>('[data-virtual-key="item-12"]')!;
+      act(() => resizeObservers[0]!.triggerEntries([[row12, 50]]));
+      expect(scrollTopOf(scroller)).toBe(395);
+
+      // Virtualization detaches the touched row and the finger lifts. That
+      // touchend is dispatched at the detached node and reaches no listener
+      // anywhere — verified against Chromium — and pointer events are no
+      // help either, being cancelled when the pan took over and never
+      // reporting the lift. Reconciliation must therefore be bounded rather
+      // than waiting on an event that will never arrive.
+      row.remove();
+      act(() => {
+        vi.advanceTimersByTime(400);
+      });
+      expect(scrollTopOf(scroller)).toBe(395);
+
+      act(() => {
+        vi.advanceTimersByTime(GESTURE_STALE_MS);
+      });
+      expect(scrollTopOf(scroller)).toBe(425);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not tail-follow while the policy withholds the intent from a still-pinned viewport', () => {
+    const ref = { current: null as VirtualTranscriptHandle | null };
+    let scroller: HTMLDivElement | null = null;
+
+    render(
+      <VirtualTranscript
+        ariaLabel="Transcript"
+        ref={ref}
+        items={makeItems(30, 20)}
+        getKey={(item) => item.id}
+        estimatedExtent={20}
+        overscan={200}
+        initialTail
+        renderItem={renderRow}
+        scrollerRef={(element) => { scroller = element; }}
+      />,
+    );
+
+    const pinnedTop = scrollTopOf(scroller);
+    // The finger goes down at the tail and starts dragging. No scroll event
+    // has landed yet and the position is still inside the pinned epsilon, so
+    // the physical layer still considers itself pinned. The policy is what
+    // notices the moved touch and withdraws the tail-follow grant; the
+    // physical layer never infers that from its own geometry.
+    const row = document.querySelector<HTMLElement>('[data-virtual-key="item-29"]')!;
+    act(() => {
+      fireEvent.touchStart(row, { touches: [{ identifier: 3 }], changedTouches: [{ identifier: 3 }] });
+      fireEvent.touchMove(row, { touches: [{ identifier: 3 }] });
+      ref.current?.setTailFollowAllowed(false);
+    });
+
+    // A mounted row above the viewport grows in that window. Tail-following
+    // here would write scrollTop and snap the nascent drag to the bottom;
+    // holding the anchor absorbs the growth into the spacer instead.
+    const grown = document.querySelector<HTMLElement>('[data-virtual-key="item-16"]')!;
+    expect(grown).not.toBeNull();
+    act(() => resizeObservers[0]!.triggerEntries([[grown, 60]]));
+    expect(scrollTopOf(scroller)).toBe(pinnedTop);
+
+    // The growth left the viewport genuinely off the tail, so holding
+    // position stays correct until something returns it there. Once the
+    // policy restores the grant and the viewport is pinned again,
+    // tail-following resumes rather than being disabled for good.
+    act(() => {
+      fireEvent.touchEnd(row, { touches: [], changedTouches: [{ identifier: 3 }] });
+      ref.current?.setTailFollowAllowed(true);
+    });
+    act(() => ref.current?.scrollToTail());
+    const repinnedTop = scrollTopOf(scroller);
+    const grownAgain = document.querySelector<HTMLElement>('[data-virtual-key="item-17"]')!;
+    expect(grownAgain).not.toBeNull();
+    act(() => resizeObservers[0]!.triggerEntries([[grownAgain, 60]]));
+    expect(scrollTopOf(scroller)).toBeGreaterThan(repinnedTop ?? 0);
+  });
+
+  it('never publishes a pinned state the reconciled position does not hold', () => {
+    vi.useFakeTimers();
+    try {
+      const ref = { current: null as VirtualTranscriptHandle | null };
+      let scroller: HTMLDivElement | null = null;
+      const pinnedStates: boolean[] = [];
+
+      render(
+        <VirtualTranscript
+          ariaLabel="Transcript"
+          ref={ref}
+          items={makeItems(30, 50)}
+          getKey={(item) => item.id}
+          estimatedExtent={50}
+          overscan={2000}
+          initialTail={false}
+          renderItem={renderRow}
+          onPinnedChange={(pinned) => pinnedStates.push(pinned)}
+          scrollerRef={(element) => { scroller = element; }}
+        />,
+      );
+
+      // Reading 20px off the tail: 1500 of content, a 100px viewport, so the
+      // maximum scroll position is 1400.
+      act(() => {
+        scroller!.scrollTop = 1380;
+        fireEvent.scroll(scroller!);
+      });
+      const row = document.querySelector<HTMLElement>('[data-virtual-key="item-27"]')!;
+      act(() => {
+        fireEvent.touchStart(row, { touches: [{ identifier: 9 }], changedTouches: [{ identifier: 9 }] });
+      });
+      pinnedStates.length = 0;
+
+      // A row above the anchor shrinks by 30. The gesture defers the
+      // correction into the spacer, which keeps the total extent — and so the
+      // pinned answer — exactly where it was.
+      const above = document.querySelector<HTMLElement>('[data-virtual-key="item-5"]')!;
+      act(() => resizeObservers[0]!.triggerEntries([[above, 20]]));
+      expect(scrollTopOf(scroller)).toBe(1380);
+
+      // Reconciliation removes the spacer shift and writes the equivalent
+      // scroll position. Those are two halves of one position-preserving
+      // operation: between them the extent has shrunk while the viewport has
+      // not yet moved, which reads as pinned even though the reader stays
+      // 20px off the tail throughout. Publishing that intermediate would hand
+      // tail-follow back to a reader who never asked for it.
+      act(() => {
+        fireEvent.touchEnd(row, { touches: [], changedTouches: [{ identifier: 9 }] });
+        vi.advanceTimersByTime(GESTURE_STALE_MS + 500);
+      });
+
+      expect(scrollTopOf(scroller)).toBe(1350);
+      expect(pinnedStates).not.toContain(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('never publishes a visible range the reconciled position does not hold', () => {
+    vi.useFakeTimers();
+    try {
+      const ref = { current: null as VirtualTranscriptHandle | null };
+      let scroller: HTMLDivElement | null = null;
+      const ranges: Array<{ startIndex: number; endIndex: number } | null> = [];
+
+      render(
+        <VirtualTranscript
+          ariaLabel="Transcript"
+          ref={ref}
+          items={makeItems(30, 50)}
+          getKey={(item) => item.id}
+          estimatedExtent={50}
+          overscan={2000}
+          initialTail={false}
+          renderItem={renderRow}
+          onRangeChange={(snapshot) => ranges.push(snapshot.visibleRange)}
+          scrollerRef={(element) => { scroller = element; }}
+        />,
+      );
+
+      act(() => {
+        scroller!.scrollTop = 1380;
+        fireEvent.scroll(scroller!);
+      });
+      const row = document.querySelector<HTMLElement>('[data-virtual-key="item-27"]')!;
+      act(() => {
+        fireEvent.touchStart(row, { touches: [{ identifier: 4 }], changedTouches: [{ identifier: 4 }] });
+      });
+      const settled = ranges.at(-1);
+      ranges.length = 0;
+
+      // The same position-preserving correction as the pinned case. The
+      // reader sees the same rows throughout, so the published range must say
+      // so at every step: an intermediate range is evidence a positioning
+      // command can be acknowledged from, and REQ-VT-005 admits only
+      // observations of the position that actually holds.
+      const above = document.querySelector<HTMLElement>('[data-virtual-key="item-5"]')!;
+      act(() => resizeObservers[0]!.triggerEntries([[above, 20]]));
+      act(() => {
+        fireEvent.touchEnd(row, { touches: [], changedTouches: [{ identifier: 4 }] });
+        vi.advanceTimersByTime(GESTURE_STALE_MS + 500);
+      });
+
+      expect(scrollTopOf(scroller)).toBe(1350);
+      expect(ranges.every((range) => JSON.stringify(range) === JSON.stringify(settled))).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('discards a pending correction that an absolute reposition has superseded', () => {
+    vi.useFakeTimers();
+    try {
+      const ref = { current: null as VirtualTranscriptHandle | null };
+      let scroller: HTMLDivElement | null = null;
+      let followTail = false;
+
+      render(
+        <VirtualTranscript
+          ariaLabel="Transcript"
+          ref={ref}
+          items={makeItems(30, 50)}
+          getKey={(item) => item.id}
+          estimatedExtent={50}
+          overscan={2000}
+          initialTail={false}
+          renderItem={renderRow}
+          onTotalExtentChange={() => { if (followTail) ref.current?.scrollToTail(); }}
+          scrollerRef={(element) => { scroller = element; }}
+        />,
+      );
+
+      act(() => {
+        scroller!.scrollTop = 1380;
+        fireEvent.scroll(scroller!);
+      });
+      const row = document.querySelector<HTMLElement>('[data-virtual-key="item-27"]')!;
+      act(() => {
+        fireEvent.touchStart(row, { touches: [{ identifier: 7 }], changedTouches: [{ identifier: 7 }] });
+      });
+      const above = document.querySelector<HTMLElement>('[data-virtual-key="item-5"]')!;
+      act(() => resizeObservers[0]!.triggerEntries([[above, 20]]));
+
+      // The gesture ends and the policy hands tail-follow back before the
+      // deferred correction has been written. Clearing the drift changes the
+      // total extent, and the extent callback is dispatched from an effect
+      // declared ahead of reconciliation — so the tail snap lands first.
+      followTail = true;
+      act(() => {
+        fireEvent.touchEnd(row, { touches: [], changedTouches: [{ identifier: 7 }] });
+        vi.advanceTimersByTime(GESTURE_STALE_MS + 500);
+      });
+
+      // The correction was computed against the position the snap replaced.
+      // Applying it on top would leave a following viewport short of the
+      // tail by exactly the drift.
+      const maxScrollTop = 30 * 50 - 30 - 100;
+      expect(scrollTopOf(scroller)).toBe(maxScrollTop);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('never captures an anchor offset the reconciled position does not hold', () => {
+    vi.useFakeTimers();
+    try {
+      const ref = { current: null as VirtualTranscriptHandle | null };
+      let scroller: HTMLDivElement | null = null;
+
+      render(
+        <VirtualTranscript
+          ariaLabel="Transcript"
+          ref={ref}
+          items={makeItems(30, 50)}
+          getKey={(item) => item.id}
+          estimatedExtent={50}
+          overscan={2000}
+          initialTail={false}
+          renderItem={renderRow}
+          scrollerRef={(element) => { scroller = element; }}
+        />,
+      );
+
+      act(() => {
+        scroller!.scrollTop = 1380;
+        fireEvent.scroll(scroller!);
+      });
+      const row = document.querySelector<HTMLElement>('[data-virtual-key="item-27"]')!;
+      act(() => {
+        fireEvent.touchStart(row, { touches: [{ identifier: 8 }], changedTouches: [{ identifier: 8 }] });
+      });
+      const before = ref.current?.captureVisibleAnchor() ?? null;
+
+      const above = document.querySelector<HTMLElement>('[data-virtual-key="item-5"]')!;
+      act(() => resizeObservers[0]!.triggerEntries([[above, 20]]));
+      act(() => {
+        fireEvent.touchEnd(row, { touches: [], changedTouches: [{ identifier: 8 }] });
+      });
+
+      // Run the settle timer without flushing React, leaving the correction
+      // computed but not yet written — the window in which a range change can
+      // synchronously ask for an anchor to acquire history from.
+      vi.advanceTimersByTime(GESTURE_STALE_MS + 500);
+      const during = ref.current?.captureVisibleAnchor() ?? null;
+
+      act(() => {});
+      const after = ref.current?.captureVisibleAnchor() ?? null;
+
+      // Prefix restoration replays this offset to put the same row back in the
+      // same place, so an anchor taken mid-correction makes history
+      // acquisition jump by exactly the drift (REQ-VT-005).
+      expect(during).toEqual(before);
+      expect(after).toEqual(before);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('applies the correction as a position, not an offset from wherever the DOM ended up', () => {
+    vi.useFakeTimers();
+    try {
+      const ref = { current: null as VirtualTranscriptHandle | null };
+      let scroller: HTMLDivElement | null = null;
+      let clampOnPublish = false;
+
+      render(
+        <VirtualTranscript
+          ariaLabel="Transcript"
+          ref={ref}
+          items={makeItems(30, 50)}
+          getKey={(item) => item.id}
+          estimatedExtent={50}
+          overscan={2000}
+          initialTail={false}
+          renderItem={renderRow}
+          onRangeChange={() => {
+            if (!clampOnPublish) return;
+            clampOnPublish = false;
+            // Losing the spacer shortens the transcript, and a browser clamps
+            // a viewport sitting past the new maximum. A positioning command
+            // asking for a snapshot in this window then adopts that position.
+            scroller!.scrollTop = 1370;
+            ref.current?.physicalSnapshot();
+          }}
+          scrollerRef={(element) => { scroller = element; }}
+        />,
+      );
+
+      act(() => {
+        scroller!.scrollTop = 1380;
+        fireEvent.scroll(scroller!);
+      });
+      const row = document.querySelector<HTMLElement>('[data-virtual-key="item-27"]')!;
+      act(() => {
+        fireEvent.touchStart(row, { touches: [{ identifier: 6 }], changedTouches: [{ identifier: 6 }] });
+      });
+      const above = document.querySelector<HTMLElement>('[data-virtual-key="item-5"]')!;
+      act(() => resizeObservers[0]!.triggerEntries([[above, 20]]));
+
+      clampOnPublish = true;
+      act(() => {
+        fireEvent.touchEnd(row, { touches: [], changedTouches: [{ identifier: 6 }] });
+        vi.advanceTimersByTime(GESTURE_STALE_MS + 500);
+      });
+
+      // The correction owed was to a position, not a distance. Re-basing it
+      // on the clamp applies part of the shift twice and moves the reader.
+      expect(scrollTopOf(scroller)).toBe(1350);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reconciles immediately when the top spacer can no longer absorb the drift', () => {
+    vi.useFakeTimers();
+    try {
+      const ref = { current: null as VirtualTranscriptHandle | null };
+      let scroller: HTMLDivElement | null = null;
+
+      render(
+        <VirtualTranscript
+          ariaLabel="Transcript"
+          ref={ref}
+          items={makeItems(30, 20)}
+          getKey={(item) => item.id}
+          estimatedExtent={20}
+          overscan={200}
+          initialTail={false}
+          renderItem={renderRow}
+          scrollerRef={(element) => { scroller = element; }}
+        />,
+      );
+
+      act(() => ref.current?.scrollToIndex(20, 'start'));
+      act(() => {
+        scroller!.scrollTop = 395;
+        fireEvent.scroll(scroller!);
+      });
+      const row12 = document.querySelector<HTMLElement>('[data-virtual-key="item-12"]')!;
+      act(() => resizeObservers[0]!.triggerEntries([[row12, 50]]));
+      expect(scrollTopOf(scroller)).toBe(395);
+
+      // Continued upward scrolling reaches the top of the layout before the
+      // settle timer fires: the drift is reconciled through the direct-write
+      // fallback instead of clamping the spacer away from the layout model.
+      act(() => {
+        scroller!.scrollTop = 10;
+        fireEvent.scroll(scroller!);
+      });
+      expect(scrollTopOf(scroller)).toBe(40);
+      const spacer = document.querySelector<HTMLElement>('.virtual-transcript__spacer')!;
+      expect(spacer.style.height).toBe('0px');
+      let anchor = null as ReturnType<VirtualTranscriptHandle['captureVisibleAnchor']>;
+      act(() => {
+        anchor = ref.current?.captureVisibleAnchor() ?? null;
+      });
+      expect(anchor).toMatchObject({ index: 2, key: 'item-2', offset: 0 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('does not republish unchanged height or pinned state when a callback scrolls to the tail', () => {
     const ref = { current: null as VirtualTranscriptHandle | null };
     const totals: number[] = [];
@@ -324,6 +955,7 @@ describe('VirtualTranscript', () => {
 
     render(
       <VirtualTranscript
+        ariaLabel="Transcript"
         ref={ref}
         items={makeItems(20, 10)}
         getKey={(item) => item.id}
@@ -349,6 +981,7 @@ describe('VirtualTranscript', () => {
 
     render(
       <VirtualTranscript
+        ariaLabel="Transcript"
         items={makeItems(20, 20)}
         getKey={(item) => item.id}
         estimatedExtent={20}
@@ -373,6 +1006,7 @@ describe('VirtualTranscript', () => {
   it('uses one shared ResizeObserver for scroller, header, and every mounted row, with cleanup', () => {
     const { unmount } = render(
       <VirtualTranscript
+        ariaLabel="Transcript"
         items={makeItems(3, 20)}
         getKey={(item) => item.id}
         estimatedExtent={20}
@@ -402,6 +1036,7 @@ describe('VirtualTranscript', () => {
 
     render(
       <VirtualTranscript
+        ariaLabel="Transcript"
         ref={ref}
         items={makeItems(20, 20)}
         getKey={(item) => item.id}
@@ -431,6 +1066,7 @@ describe('VirtualTranscript', () => {
 
     render(
       <VirtualTranscript
+        ariaLabel="Transcript"
         ref={ref}
         items={makeItems(20, 10)}
         getKey={(item) => item.id}
@@ -471,6 +1107,7 @@ describe('VirtualTranscript', () => {
 
     render(
       <VirtualTranscript
+        ariaLabel="Transcript"
         ref={ref}
         items={makeItems(5, 20)}
         getKey={(item) => item.id}
@@ -495,6 +1132,7 @@ describe('VirtualTranscript', () => {
 
     render(
       <VirtualTranscript
+        ariaLabel="Transcript"
         ref={ref}
         items={makeItems(5, 20)}
         getKey={(item) => item.id}
@@ -524,6 +1162,7 @@ describe('VirtualTranscript', () => {
 
     render(
       <VirtualTranscript
+        ariaLabel="Transcript"
         items={[]}
         getKey={(item: TestItem) => item.id}
         estimatedExtent={20}
@@ -550,6 +1189,7 @@ describe('VirtualTranscript', () => {
     const initial = makeItems(20, 20);
     const view = render(
       <VirtualTranscript
+        ariaLabel="Transcript"
         ref={ref}
         items={initial}
         getKey={(item) => item.id}
@@ -569,6 +1209,7 @@ describe('VirtualTranscript', () => {
     act(() => {
       view.rerender(
         <VirtualTranscript
+          ariaLabel="Transcript"
           ref={ref}
           items={unrelatedTailUpdate}
           getKey={(item) => item.id}
@@ -585,6 +1226,7 @@ describe('VirtualTranscript', () => {
     act(() => {
       view.rerender(
         <VirtualTranscript
+          ariaLabel="Transcript"
           ref={ref}
           items={[...makeItems(5, 20).map((item) => ({ ...item, id: `older-${item.id}` })), ...unrelatedTailUpdate]}
           getKey={(item) => item.id}
@@ -610,6 +1252,7 @@ describe('VirtualTranscript', () => {
     ];
     const view = render(
       <VirtualTranscript
+        ariaLabel="Transcript"
         ref={ref}
         items={initial}
         getKey={(item) => item.id}
@@ -628,6 +1271,7 @@ describe('VirtualTranscript', () => {
     act(() => {
       view.rerender(
         <VirtualTranscript
+          ariaLabel="Transcript"
           ref={ref}
           items={[{ id: 'z', label: 'Item Z', height: 20 }, ...initial]}
           getKey={(item) => item.id}
@@ -645,6 +1289,7 @@ describe('VirtualTranscript', () => {
     act(() => {
       view.rerender(
         <VirtualTranscript
+          ariaLabel="Transcript"
           ref={ref}
           items={[initial[0]!, initial[2]!]}
           getKey={(item) => item.id}
@@ -672,6 +1317,7 @@ describe('VirtualTranscript', () => {
     ];
     const view = render(
       <VirtualTranscript
+        ariaLabel="Transcript"
         items={initial}
         getKey={(item) => item.id}
         estimatedExtent={20}
@@ -687,6 +1333,7 @@ describe('VirtualTranscript', () => {
     act(() => {
       view.rerender(
         <VirtualTranscript
+          ariaLabel="Transcript"
           items={[{ id: 'z', label: 'Item Z', height: 20 }, ...initial]}
           getKey={(item) => item.id}
           estimatedExtent={20}

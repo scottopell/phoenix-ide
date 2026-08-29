@@ -4,6 +4,7 @@ import { createRef, forwardRef, StrictMode, useEffect, useImperativeHandle, useL
 import { FocusScopeProvider, useFocusScopeCommands } from '../hooks/useFocusScope';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { render, waitFor, act, fireEvent, screen } from '@testing-library/react';
+import { GESTURE_STALE_MS } from './VirtualTranscript';
 import type { VirtualTranscriptPhysicalSnapshot, VirtualTranscriptRangeChange } from './VirtualTranscript';
 import type { ConversationState, Message } from '../api';
 import type { AgentTextHighlight, AgentTextRevealRequest } from './MessageComponents';
@@ -130,6 +131,8 @@ vi.mock('./MessageContextMenu', () => ({
 const virtualTranscriptMock = {
   scrollToIndex: vi.fn(),
   scrollToTail: vi.fn(),
+  setTailFollowAllowed: vi.fn(),
+  isProgrammaticScroll: vi.fn(),
   captureVisibleAnchor: vi.fn(),
   preserveViewportOnNextItemsChange: vi.fn(),
   measureOffsetForIndex: vi.fn(),
@@ -150,6 +153,8 @@ function indexOrZero(index: number): number {
 beforeEach(() => {
   virtualTranscriptMock.scrollToIndex = vi.fn();
   virtualTranscriptMock.scrollToTail = vi.fn();
+  virtualTranscriptMock.setTailFollowAllowed = vi.fn();
+  virtualTranscriptMock.isProgrammaticScroll = vi.fn(() => false);
   virtualTranscriptMock.captureVisibleAnchor = vi.fn(() => null);
   virtualTranscriptMock.preserveViewportOnNextItemsChange = vi.fn();
   virtualTranscriptMock.measureOffsetForIndex = vi.fn(() => null);
@@ -194,7 +199,7 @@ vi.mock('./VirtualTranscript', async () => {
       onRangeChange?: (snapshot: VirtualTranscriptRangeChange) => void;
       header?: React.ReactNode;
       empty?: React.ReactNode;
-    }, ref: React.Ref<{ scrollToIndex: (index: number, align: 'start' | 'end', viewportStartOffset?: number) => void; scrollToTail: () => void; captureVisibleAnchor: () => unknown; preserveViewportOnNextItemsChange: () => void; measureOffsetForIndex: (index: number) => number | null; measureOffsetForIndexAtSnapshot: (index: number, snapshot: VirtualTranscriptPhysicalSnapshot) => number | null; layoutRevision: () => number; physicalSnapshot: (targetIndex?: number) => VirtualTranscriptPhysicalSnapshot }>) => {
+    }, ref: React.Ref<{ scrollToIndex: (index: number, align: 'start' | 'end', viewportStartOffset?: number) => void; scrollToTail: () => void; setTailFollowAllowed: (allowed: boolean) => void; isProgrammaticScroll: (scrollTop: number) => boolean; captureVisibleAnchor: () => unknown; preserveViewportOnNextItemsChange: () => void; measureOffsetForIndex: (index: number) => number | null; measureOffsetForIndexAtSnapshot: (index: number, snapshot: VirtualTranscriptPhysicalSnapshot) => number | null; layoutRevision: () => number; physicalSnapshot: (targetIndex?: number) => VirtualTranscriptPhysicalSnapshot }>) => {
       const containerRef = useRef<HTMLDivElement>(null);
       if (onTotalExtentChange) {
         virtualTranscriptMock.totalExtentChanged = onTotalExtentChange;
@@ -211,6 +216,8 @@ vi.mock('./VirtualTranscript', async () => {
       useImperativeHandle(ref, () => ({
         scrollToIndex: virtualTranscriptMock.scrollToIndex,
         scrollToTail: virtualTranscriptMock.scrollToTail,
+        setTailFollowAllowed: virtualTranscriptMock.setTailFollowAllowed,
+        isProgrammaticScroll: virtualTranscriptMock.isProgrammaticScroll,
         captureVisibleAnchor: virtualTranscriptMock.captureVisibleAnchor,
         preserveViewportOnNextItemsChange: virtualTranscriptMock.preserveViewportOnNextItemsChange,
         measureOffsetForIndex: virtualTranscriptMock.measureOffsetForIndex,
@@ -227,6 +234,7 @@ vi.mock('./VirtualTranscript', async () => {
           data-testid="mock-virtual-transcript"
           id={scrollerId}
           ref={containerRef}
+          tabIndex={0}
           style={{ overflowY: 'auto', height: '100%' }}
         >
           {header}
@@ -1856,6 +1864,101 @@ describe('history scroll acknowledgement + continuity suppression', () => {
 });
 
 describe('history expansion feedback', () => {
+  it('loads earlier history when a navigation-owned viewport is dragged to the loaded start', async () => {
+    const onLoadOlderMessages = vi.fn();
+    const listRef = createRef<React.ElementRef<typeof MessageList>>();
+    virtualTranscriptMock.captureVisibleAnchor.mockReturnValue({ key: 'msg-1', index: 0, offset: 14 });
+
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          ref={listRef}
+          messages={[makeMessage(1, 'user'), makeMessage(2, 'agent'), makeMessage(3, 'user')]}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-nav-history"
+          hasOlderMessages
+          onLoadOlderMessages={onLoadOlderMessages}
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-nav-history', generation: 1, transcriptGeneration: 1 } }}
+        />,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    Object.defineProperty(scroller, 'scrollHeight', { configurable: true, get: () => 1000 });
+    Object.defineProperty(scroller, 'scrollTop', { configurable: true, get: () => 0 });
+    Object.defineProperty(scroller, 'clientHeight', { configurable: true, get: () => 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
+    act(() => virtualTranscriptMock.pinnedChanged?.(false));
+
+    // A jump takes the viewport, then the reader takes over and drags upward.
+    act(() => listRef.current?.scrollToUnitIndex(2));
+    fireEvent.pointerDown(scroller);
+
+    // The drag reaches the loaded-history boundary and stops there. The
+    // scroll handler gated on the previously published range and skipped the
+    // request, so the range publish is the only remaining chance to acquire —
+    // and the viewport moved because the reader moved it.
+    act(() => virtualTranscriptMock.rangeChanged?.({
+      renderedRange: { startIndex: 0, endIndex: 2 },
+      visibleRange: { startIndex: 0, endIndex: 1 },
+      viewportTop: 0,
+      layoutRevision: 2,
+    }));
+
+    await waitFor(() => expect(onLoadOlderMessages).toHaveBeenCalledTimes(1));
+    // Admitted because the reader moved the viewport, so it has to restore to
+    // where the reader is — not to the tail.
+    expect(onLoadOlderMessages).toHaveBeenCalledWith({
+      kind: 'reader_anchor',
+      messageId: 'msg-1',
+      viewportStartOffset: 14,
+    });
+  });
+
+  it('shift+space pages upward and asks for earlier history', async () => {
+    const onLoadOlderMessages = vi.fn();
+    virtualTranscriptMock.captureVisibleAnchor.mockReturnValue({ key: 'msg-1', index: 0, offset: 14 });
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={[makeMessage(1, 'user'), makeMessage(2, 'agent'), makeMessage(3, 'user')]}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-shift-space"
+          hasOlderMessages
+          onLoadOlderMessages={onLoadOlderMessages}
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-shift-space', generation: 1, transcriptGeneration: 1 } }}
+        />,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    Object.defineProperty(scroller, 'scrollHeight', { configurable: true, get: () => 1000 });
+    Object.defineProperty(scroller, 'scrollTop', { configurable: true, get: () => 0 });
+    Object.defineProperty(scroller, 'clientHeight', { configurable: true, get: () => 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
+    act(() => virtualTranscriptMock.rangeChanged?.({
+      renderedRange: { startIndex: 0, endIndex: 2 },
+      visibleRange: { startIndex: 0, endIndex: 1 },
+      viewportTop: 0,
+      layoutRevision: 2,
+    }));
+    onLoadOlderMessages.mockClear();
+
+    // The same key means opposite directions. Clamped at the start of loaded
+    // history, no scroll event follows, so classifying this as downward
+    // leaves the reader with no way to ask for more.
+    fireEvent.keyDown(scroller, { key: ' ', shiftKey: true });
+
+    await waitFor(() => expect(onLoadOlderMessages).toHaveBeenCalled());
+  });
+
+
   it('automatically loads earlier history when the reader approaches the loaded start', async () => {
     const onLoadOlderMessages = vi.fn();
     virtualTranscriptMock.captureVisibleAnchor.mockReturnValue({ key: 'msg-1', index: 0, offset: 14 });
@@ -2461,7 +2564,7 @@ describe('handleTotalListHeightChanged', () => {
 
       // Engagement stops the watch: no more corrections after the user
       // takes over.
-      fireEvent.touchStart(scroller, { touches: [{}] });
+      fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
       written.length = 0;
       act(() => vi.advanceTimersByTime(1000));
       expect(written).toHaveLength(0);
@@ -2527,9 +2630,12 @@ describe('handleTotalListHeightChanged', () => {
   it.each([
     ['moved touch cancellation', (scroller: HTMLElement, rerender: (ui: React.ReactElement) => void) => {
       void rerender;
-      fireEvent.touchStart(scroller, { touches: [{}] });
+      fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
       fireEvent.touchMove(scroller, { touches: [{}] });
-      fireEvent.touchCancel(scroller, { touches: [] });
+      // The gesture leaves the pin zone before cancelling — a cancel inside
+      // the zone would legitimately confirm tail return instead.
+      act(() => virtualTranscriptMock.pinnedChanged?.(false));
+      fireEvent.touchCancel(scroller, { touches: [], changedTouches: [{ identifier: 1 }] });
     }],
     ['conversation reset', (_scroller: HTMLElement, rerender: (ui: React.ReactElement) => void) => {
       rerender(withConvContext(
@@ -2627,7 +2733,7 @@ describe('handleTotalListHeightChanged', () => {
     // The user starts dragging up (still within the pin threshold) and
     // VirtualTranscript reports them off the bottom.
     act(() => virtualTranscriptMock.pinnedChanged?.(false));
-    fireEvent.touchStart(scroller, { touches: [{}] });
+    fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
     fireEvent.touchMove(scroller, { touches: [{}] });
 
     // Genuine tail growth (sub-agents phase) lands while the gesture
@@ -2731,17 +2837,19 @@ describe('handleTotalListHeightChanged', () => {
       act(() => virtualTranscriptMock.totalExtentChanged?.(500));
       virtualTranscriptMock.scrollToTail.mockClear();
 
-      // Finger goes down and starts dragging up — still within the pin
-      // threshold (oldFromBottom = 500 - 80 - 400 = 20) when a
-      // measurement-driven height delta lands.
-      fireEvent.touchStart(scroller, { touches: [{}] });
+      // Finger goes down and drags up out of the pin zone (the drag's scroll
+      // event refreshes geometry: 600 - 80 - 400 = 120 above the bottom)
+      // when a measurement-driven height delta lands.
+      fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
       fireEvent.touchMove(scroller, { touches: [{}] });
       setupScroller(scroller, { scrollHeight: 600, scrollTop: 80, clientHeight: 400 });
+      fireEvent.scroll(scroller);
       act(() => virtualTranscriptMock.totalExtentChanged?.(600));
       expect(virtualTranscriptMock.scrollToTail).not.toHaveBeenCalled();
 
-      // Finger lift and elapsed time do not release durable reading ownership.
-      fireEvent.touchEnd(scroller, { touches: [] });
+      // A finger lift outside the pin zone and elapsed time do not release
+      // durable reading ownership.
+      fireEvent.touchEnd(scroller, { touches: [], changedTouches: [{ identifier: 1 }] });
       act(() => vi.advanceTimersByTime(1300));
       setupScroller(scroller, { scrollHeight: 700, scrollTop: 200, clientHeight: 400 });
       act(() => virtualTranscriptMock.totalExtentChanged?.(700));
@@ -2779,8 +2887,8 @@ describe('handleTotalListHeightChanged', () => {
 
       // Momentum follows a real gesture: finger down + lift (engagement),
       // then the fling's upward scroll events with no finger down.
-      fireEvent.touchStart(scroller, { touches: [{}] });
-      fireEvent.touchEnd(scroller, { touches: [] });
+      fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
+      fireEvent.touchEnd(scroller, { touches: [], changedTouches: [{ identifier: 1 }] });
       // scrollTop decreases (upward) — momentum after finger lift, a wheel
       // notch, or a scrollbar drag all look like this.
       setupScroller(scroller, { scrollHeight: 500, scrollTop: 60, clientHeight: 400 });
@@ -2833,9 +2941,9 @@ describe('handleTotalListHeightChanged', () => {
       virtualTranscriptMock.scrollToTail.mockClear();
 
       vi.setSystemTime(1050);
-      fireEvent.touchStart(scroller, { touches: [{}] });
+      fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
       vi.setSystemTime(1060);
-      fireEvent.touchEnd(scroller, { touches: [] });
+      fireEvent.touchEnd(scroller, { touches: [], changedTouches: [{ identifier: 1 }] });
       vi.setSystemTime(1100);
       setupScroller(scroller, { scrollHeight: 600, scrollTop: 100, clientHeight: 400 });
       act(() => virtualTranscriptMock.totalExtentChanged?.(600));
@@ -2883,9 +2991,9 @@ describe('handleTotalListHeightChanged', () => {
       act(() => virtualTranscriptMock.pinnedChanged?.(true));
 
       vi.setSystemTime(1100);
-      fireEvent.touchStart(scroller, { touches: [{}] });
+      fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
       vi.setSystemTime(1110);
-      fireEvent.touchEnd(scroller, { touches: [] });
+      fireEvent.touchEnd(scroller, { touches: [], changedTouches: [{ identifier: 1 }] });
       vi.setSystemTime(1150);
       setupScroller(scroller, { scrollHeight: 600, scrollTop: 100, clientHeight: 400 });
       act(() => virtualTranscriptMock.totalExtentChanged?.(600));
@@ -2929,22 +3037,22 @@ describe('handleTotalListHeightChanged', () => {
       virtualTranscriptMock.scrollToTail.mockClear();
 
       vi.setSystemTime(1050);
-      fireEvent.touchStart(scroller, { touches: [{}] });
+      fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
       vi.setSystemTime(1070);
       fireEvent.touchMove(scroller, { touches: [{}] });
       vi.setSystemTime(1080);
-      fireEvent.touchEnd(scroller, { touches: [] });
+      fireEvent.touchEnd(scroller, { touches: [], changedTouches: [{ identifier: 1 }] });
       vi.setSystemTime(1100);
       setupScroller(scroller, { scrollHeight: 500, scrollTop: 80, clientHeight: 400 });
       fireEvent.scroll(scroller);
       act(() => virtualTranscriptMock.pinnedChanged?.(false));
 
       vi.setSystemTime(1800);
-      fireEvent.touchStart(scroller, { touches: [{}] });
+      fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
       vi.setSystemTime(1820);
       fireEvent.touchMove(scroller, { touches: [{}] });
       vi.setSystemTime(1830);
-      fireEvent.touchEnd(scroller, { touches: [] });
+      fireEvent.touchEnd(scroller, { touches: [], changedTouches: [{ identifier: 1 }] });
 
       vi.setSystemTime(1900);
       setupScroller(scroller, { scrollHeight: 600, scrollTop: 80, clientHeight: 400 });
@@ -2993,11 +3101,11 @@ describe('handleTotalListHeightChanged', () => {
       virtualTranscriptMock.scrollToTail.mockClear();
 
       vi.setSystemTime(1050);
-      fireEvent.touchStart(scroller, { touches: [{}] });
+      fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
       vi.setSystemTime(1060);
       fireEvent.touchMove(scroller, { touches: [{}] });
       vi.setSystemTime(1070);
-      fireEvent.touchEnd(scroller, { touches: [] });
+      fireEvent.touchEnd(scroller, { touches: [], changedTouches: [{ identifier: 1 }] });
       vi.setSystemTime(1100);
       setupScroller(scroller, { scrollHeight: 600, scrollTop: 95, clientHeight: 400 });
       act(() => virtualTranscriptMock.totalExtentChanged?.(600));
@@ -3009,7 +3117,7 @@ describe('handleTotalListHeightChanged', () => {
     }
   });
 
-  it('does NOT re-snap when at-bottom fires during a moved touch before touch end', () => {
+  it('honors an at-bottom arrival blocked during a moved touch once the touch ends', () => {
     vi.useFakeTimers();
     try {
       const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
@@ -3040,17 +3148,30 @@ describe('handleTotalListHeightChanged', () => {
       virtualTranscriptMock.scrollToTail.mockClear();
 
       vi.setSystemTime(1050);
-      fireEvent.touchStart(scroller, { touches: [{}] });
+      fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
       vi.setSystemTime(1060);
       fireEvent.touchMove(scroller, { touches: [{}] });
+      // The drag leaves the tail and comes back to it. The at-bottom
+      // confirmation is blocked while the moved touch owns the viewport…
+      setupScroller(scroller, { scrollHeight: 500, scrollTop: 20, clientHeight: 400 });
+      fireEvent.scroll(scroller);
+      setupScroller(scroller, { scrollHeight: 500, scrollTop: 100, clientHeight: 400 });
+      fireEvent.scroll(scroller);
       act(() => virtualTranscriptMock.pinnedChanged?.(true));
+      act(() => virtualTranscriptMock.totalExtentChanged?.(500));
+      expect(virtualTranscriptMock.scrollToTail).not.toHaveBeenCalled();
+
+      // …but the gesture ending inside the pin zone confirms the tail
+      // return: this edge is never re-delivered, so deferring it past the
+      // touch would strand the user in reading with a permanent unread chip.
       vi.setSystemTime(1070);
-      fireEvent.touchEnd(scroller, { touches: [] });
+      fireEvent.touchEnd(scroller, { touches: [], changedTouches: [{ identifier: 1 }] });
       vi.setSystemTime(1100);
-      setupScroller(scroller, { scrollHeight: 600, scrollTop: 95, clientHeight: 400 });
+      setupScroller(scroller, { scrollHeight: 600, scrollTop: 100, clientHeight: 400 });
       act(() => virtualTranscriptMock.totalExtentChanged?.(600));
 
-      expect(virtualTranscriptMock.scrollToTail).not.toHaveBeenCalled();
+      expect(virtualTranscriptMock.scrollToTail).toHaveBeenCalled();
+      expect(container.querySelector('.jump-to-newest')).toBeNull();
     } finally {
       vi.useRealTimers();
     }
@@ -3078,14 +3199,61 @@ describe('handleTotalListHeightChanged', () => {
     act(() => virtualTranscriptMock.totalExtentChanged?.(500));
     virtualTranscriptMock.scrollToTail.mockClear();
 
-    fireEvent.touchStart(scroller, { touches: [{}] });
+    fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
     fireEvent.touchMove(scroller, { touches: [{}] });
-    fireEvent.touchCancel(scroller, { touches: [] });
+    // The gesture leaves the pin zone before cancelling — a cancel inside
+    // the zone confirms tail return instead of holding reading ownership.
+    act(() => virtualTranscriptMock.pinnedChanged?.(false));
+    fireEvent.touchCancel(scroller, { touches: [], changedTouches: [{ identifier: 1 }] });
     setupScroller(scroller, { scrollHeight: 600, scrollTop: 95, clientHeight: 400 });
     act(() => virtualTranscriptMock.totalExtentChanged?.(600));
 
     expect(virtualTranscriptMock.scrollToTail).not.toHaveBeenCalled();
     expect(container.querySelector('.jump-to-newest')).not.toBeNull();
+  });
+
+  it('resolves a gesture whose row unmounts before the finger lifts', () => {
+    const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={historical}
+          pendingMessages={[]}
+          convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-detached-touch-target"
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    setupScroller(scroller, { scrollHeight: 500, scrollTop: 100, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(500));
+
+    // The finger lands on a row, drags up out of the pin zone, then the row
+    // is virtualized away while still under the finger.
+    const row = document.createElement('div');
+    scroller.appendChild(row);
+    fireEvent.touchStart(row, { touches: [{ identifier: 7 }], changedTouches: [{ identifier: 7 }] });
+    fireEvent.touchMove(scroller, { touches: [{ identifier: 7 }] });
+    setupScroller(scroller, { scrollHeight: 500, scrollTop: 20, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+    act(() => virtualTranscriptMock.totalExtentChanged?.(600));
+    expect(container.querySelector('.jump-to-newest')).not.toBeNull();
+    row.remove();
+
+    // The finger lifts, but its touchend is dispatched at the detached row
+    // and reaches no listener anywhere — verified against Chromium, where
+    // scroller, document and window all miss it. The gesture cannot resolve
+    // at that instant; what must not happen is a permanent wedge, so the
+    // next gesture prunes the vanished touch and resolves normally.
+    fireEvent.touchStart(scroller, { touches: [{ identifier: 8 }], changedTouches: [{ identifier: 8 }] });
+    fireEvent.touchEnd(scroller, { touches: [], changedTouches: [{ identifier: 8 }] });
+    setupScroller(scroller, { scrollHeight: 600, scrollTop: 200, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+    expect(container.querySelector('.jump-to-newest')).toBeNull();
   });
 
   it('downward scroll does not suppress the pinned re-snap', () => {
@@ -3120,6 +3288,753 @@ describe('handleTotalListHeightChanged', () => {
     // oldFromBottom = 500 - 100 - 400 = 0 (pinned)
     act(() => virtualTranscriptMock.totalExtentChanged?.(600));
     expect(virtualTranscriptMock.scrollToTail).toHaveBeenCalled();
+  });
+
+  it('a programmatic scroll echo in the pin zone does not confirm a tail return', () => {
+    const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={historical}
+          pendingMessages={[]}
+          convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-programmatic-echo"
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 600, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
+
+    // The user reads 300px above the bottom; streamed growth shows the chip.
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 300, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+    setupScroller(scroller, { scrollHeight: 1100, scrollTop: 300, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1100));
+    expect(container.querySelector('.jump-to-newest')).not.toBeNull();
+
+    // An anchor-compensation write lands the scroller inside the pin zone.
+    // Its echo carries no user intent and must not clear the chip. (The
+    // handle captured the mock instance at mount, so mutate it in place.)
+    virtualTranscriptMock.isProgrammaticScroll.mockReturnValue(true);
+    setupScroller(scroller, { scrollHeight: 1100, scrollTop: 620, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+    expect(container.querySelector('.jump-to-newest')).not.toBeNull();
+
+    // Real user movement further into the pin zone confirms the return. It
+    // has to actually move: re-firing at the echo's own position is a
+    // standstill, and a standstill is not evidence of a tail return.
+    virtualTranscriptMock.isProgrammaticScroll.mockReturnValue(false);
+    setupScroller(scroller, { scrollHeight: 1100, scrollTop: 660, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+    expect(container.querySelector('.jump-to-newest')).toBeNull();
+  });
+
+  it('a bottom rubber-band frame that clamps to a standstill does not confirm a tail return', () => {
+    const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={historical}
+          pendingMessages={[]}
+          convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-rubber-band-standstill"
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    // Resting at the exact maximum scroll position, so a rubber-band frame's
+    // clamped position equals the last one: nothing moved.
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 600, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
+    fireEvent.scroll(scroller);
+
+    // A moved touch takes ownership and lifts without travelling, which
+    // leaves the reader holding a viewport that happens to sit at the tail.
+    fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
+    fireEvent.touchMove(scroller, { touches: [{ identifier: 1 }] });
+    fireEvent.touchEnd(scroller, { touches: [], changedTouches: [{ identifier: 1 }] });
+    virtualTranscriptMock.setTailFollowAllowed.mockClear();
+
+    // iOS keeps emitting scroll frames as the bottom rubber-band relaxes.
+    // Their raw scrollTop is past the maximum, so clamping collapses them
+    // onto the position already held. Treating a standstill as downward
+    // movement would hand the viewport back with no travel behind it.
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 680, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 655, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+
+    const grants = virtualTranscriptMock.setTailFollowAllowed.mock.calls.map(([allowed]) => allowed);
+    expect(grants.every((allowed) => allowed === false)).toBe(true);
+  });
+
+  it('a replacement touch does not inherit evidence from a gesture whose lift was never seen', () => {
+    const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={historical}
+          pendingMessages={[]}
+          convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-abandoned-gesture"
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 600, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
+
+    // Reading well above the tail, with streamed growth showing the chip.
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 300, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+    setupScroller(scroller, { scrollHeight: 1100, scrollTop: 300, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1100));
+    expect(container.querySelector('.jump-to-newest')).not.toBeNull();
+
+    // A touch drags toward the tail but stops well short of the return zone,
+    // so it earns travel evidence without earning a confirmation.
+    fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
+    fireEvent.touchMove(scroller, { touches: [{ identifier: 1 }] });
+    setupScroller(scroller, { scrollHeight: 1100, scrollTop: 500, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+    expect(container.querySelector('.jump-to-newest')).not.toBeNull();
+
+    // Its row is virtualized away and the finger lifts against a detached
+    // node, so no touchend is ever observed. Content then reflows shorter,
+    // leaving the viewport inside the return zone without the reader moving.
+    setupScroller(scroller, { scrollHeight: 950, scrollTop: 500, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(950));
+
+    // A fresh tap: down and up with no movement. The browser reports only the
+    // new finger, so the previous one is gone. Joining that stale interaction
+    // would let its travel confirm a return the reader never made.
+    fireEvent.touchStart(scroller, { touches: [{ identifier: 2 }], changedTouches: [{ identifier: 2 }] });
+    fireEvent.touchEnd(scroller, { touches: [], changedTouches: [{ identifier: 2 }] });
+
+    expect(container.querySelector('.jump-to-newest')).not.toBeNull();
+  });
+
+  it('a gesture whose lift was never seen stops blocking confirmations from other input', () => {
+    vi.useFakeTimers();
+    try {
+    const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={historical}
+          pendingMessages={[]}
+          convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-stale-gesture-blocks"
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 600, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
+
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 300, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+    setupScroller(scroller, { scrollHeight: 1100, scrollTop: 300, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1100));
+    expect(container.querySelector('.jump-to-newest')).not.toBeNull();
+
+    // A touch drags, its row is virtualized away, and the lift is never
+    // reported. The policy still believes a finger is down.
+    fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
+    fireEvent.touchMove(scroller, { touches: [{ identifier: 1 }] });
+
+    // The reader finishes the journey on a trackpad and comes to rest at the
+    // tail. A held gesture defers confirmation to its own lift — but this one
+    // has no lift coming, so deferring means the chip never clears.
+    vi.advanceTimersByTime(GESTURE_STALE_MS + 1);
+    fireEvent.wheel(scroller, { deltaY: 120 });
+    setupScroller(scroller, { scrollHeight: 1100, scrollTop: 690, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+
+    expect(container.querySelector('.jump-to-newest')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a top-edge rubber-band return is not travel toward the tail', () => {
+    const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={historical}
+          pendingMessages={[]}
+          convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-top-rubber-band"
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
+      ),
+    );
+
+    // A conversation that barely overflows: the whole scrollable range is
+    // inside the 100px pin zone, so the top edge is also near the tail.
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    setupScroller(scroller, { scrollHeight: 480, scrollTop: 80, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(480));
+
+    setupScroller(scroller, { scrollHeight: 480, scrollTop: 0, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+    setupScroller(scroller, { scrollHeight: 500, scrollTop: 0, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(500));
+    expect(container.querySelector('.jump-to-newest')).not.toBeNull();
+
+    // Dragging at the top edge: iOS reports scrollTop past the start of the
+    // range, and a measurement lands while it is there.
+    fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
+    fireEvent.touchMove(scroller, { touches: [{ identifier: 1 }] });
+    setupScroller(scroller, { scrollHeight: 500, scrollTop: -30, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(500));
+
+    // The bounce relaxes back to the top. Measured against an out-of-range
+    // previous position this reads as movement toward the tail, and the lift
+    // would confirm a return the reader never made.
+    setupScroller(scroller, { scrollHeight: 500, scrollTop: 0, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+    fireEvent.touchEnd(scroller, { touches: [], changedTouches: [{ identifier: 1 }] });
+
+    expect(container.querySelector('.jump-to-newest')).not.toBeNull();
+  });
+
+  it('an explicit jump to newest is not blocked by a gesture whose lift was never seen', () => {
+    vi.useFakeTimers();
+    try {
+    const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={historical}
+          pendingMessages={[]}
+          convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-jump-stale-gesture"
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 600, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
+
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 300, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+    setupScroller(scroller, { scrollHeight: 1100, scrollTop: 300, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1100));
+    const chip = container.querySelector<HTMLElement>('.jump-to-newest')!;
+    expect(chip).not.toBeNull();
+
+    // A drag whose row is virtualized away: the lift is never reported.
+    fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
+    fireEvent.touchMove(scroller, { touches: [{ identifier: 1 }] });
+    vi.advanceTimersByTime(GESTURE_STALE_MS + 1);
+
+    // The reader gives up and taps the chip. A moved gesture blocks the
+    // pinned callback from confirming, so without abandoning it first the
+    // jump lands but ownership never returns — and the next growth brings
+    // the chip straight back.
+    act(() => { chip.click(); });
+    setupScroller(scroller, { scrollHeight: 1100, scrollTop: 700, clientHeight: 400 });
+    act(() => virtualTranscriptMock.pinnedChanged?.(true));
+    setupScroller(scroller, { scrollHeight: 1200, scrollTop: 800, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1200));
+
+    expect(container.querySelector('.jump-to-newest')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a second finger lifting leaves the remaining one able to signal upward intent', async () => {
+    const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const onLoadOlderMessages = vi.fn();
+    virtualTranscriptMock.captureVisibleAnchor.mockReturnValue({ key: 'msg-1', index: 0, offset: 14 });
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={historical}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-two-finger"
+          hasOlderMessages
+          onLoadOlderMessages={onLoadOlderMessages}
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-two-finger', generation: 1, transcriptGeneration: 1 } }}/>,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 0, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
+    act(() => virtualTranscriptMock.rangeChanged?.({
+      renderedRange: { startIndex: 0, endIndex: 2 },
+      visibleRange: { startIndex: 0, endIndex: 1 },
+      viewportTop: 0,
+      layoutRevision: 2,
+    }));
+    onLoadOlderMessages.mockClear();
+
+    // Two fingers down, one lifts. The gesture continues, and at the top of
+    // loaded history the viewport is clamped — so a downward drag emits no
+    // scroll event, and the touch baseline is the only signal left.
+    fireEvent.touchStart(scroller, {
+      touches: [{ identifier: 1, clientY: 300 }],
+      changedTouches: [{ identifier: 1, clientY: 300 }],
+    });
+    fireEvent.touchStart(scroller, {
+      touches: [{ identifier: 1, clientY: 300 }, { identifier: 2, clientY: 320 }],
+      changedTouches: [{ identifier: 2, clientY: 320 }],
+    });
+    // An unrelated finger elsewhere on the page sits ahead of ours in the
+    // event's global list, so the baseline cannot be taken positionally.
+    fireEvent.touchEnd(scroller, {
+      touches: [{ identifier: 7, clientY: 100 }, { identifier: 2, clientY: 320 }],
+      changedTouches: [{ identifier: 1, clientY: 300 }],
+    });
+    fireEvent.touchMove(scroller, {
+      touches: [{ identifier: 7, clientY: 100 }, { identifier: 2, clientY: 420 }],
+    });
+
+    await waitFor(() => expect(onLoadOlderMessages).toHaveBeenCalled());
+  });
+
+  it('the second of two fingers dragging is upward intent even if the first holds still', async () => {
+    const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const onLoadOlderMessages = vi.fn();
+    virtualTranscriptMock.captureVisibleAnchor.mockReturnValue({ key: 'msg-1', index: 0, offset: 14 });
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={historical}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-two-finger-second"
+          hasOlderMessages
+          onLoadOlderMessages={onLoadOlderMessages}
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-two-finger-second', generation: 1, transcriptGeneration: 1 } }}/>,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 0, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
+    act(() => virtualTranscriptMock.rangeChanged?.({
+      renderedRange: { startIndex: 0, endIndex: 2 },
+      visibleRange: { startIndex: 0, endIndex: 1 },
+      viewportTop: 0,
+      layoutRevision: 2,
+    }));
+    onLoadOlderMessages.mockClear();
+
+    // Both fingers belong to the transcript. The first never moves; the
+    // second drags down. One baseline for the pair can only describe the
+    // finger it was taken from, so the drag went unseen.
+    fireEvent.touchStart(scroller, {
+      touches: [{ identifier: 1, clientY: 300 }],
+      changedTouches: [{ identifier: 1, clientY: 300 }],
+    });
+    fireEvent.touchStart(scroller, {
+      touches: [{ identifier: 1, clientY: 300 }, { identifier: 2, clientY: 320 }],
+      changedTouches: [{ identifier: 2, clientY: 320 }],
+    });
+    fireEvent.touchMove(scroller, {
+      touches: [{ identifier: 1, clientY: 300 }, { identifier: 2, clientY: 460 }],
+    });
+
+    await waitFor(() => expect(onLoadOlderMessages).toHaveBeenCalled());
+  });
+
+  it('a lift is judged by where the viewport actually is, not the last frame reported', () => {
+    const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={historical}
+          pendingMessages={[]}
+          convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-lift-endpoint"
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 600, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
+
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 300, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+    setupScroller(scroller, { scrollHeight: 1100, scrollTop: 300, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1100));
+    expect(container.querySelector('.jump-to-newest')).not.toBeNull();
+
+    // The drag carries the viewport into the return zone, which a moved
+    // gesture defers rather than confirming.
+    fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
+    fireEvent.touchMove(scroller, { touches: [{ identifier: 1 }] });
+    setupScroller(scroller, { scrollHeight: 1100, scrollTop: 620, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+
+    // It then travels back up and lifts before iOS delivers another scroll
+    // frame. Judging the lift by the last frame reported would confirm a
+    // return to a tail the viewport is now 400px away from.
+    setupScroller(scroller, { scrollHeight: 1100, scrollTop: 300, clientHeight: 400 });
+    fireEvent.touchEnd(scroller, { touches: [], changedTouches: [{ identifier: 1 }] });
+
+    expect(container.querySelector('.jump-to-newest')).not.toBeNull();
+  });
+
+  it('keying downward after a jump takes the viewport over and confirms at the tail', () => {
+    const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const listRef = createRef<React.ElementRef<typeof MessageList>>();
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          ref={listRef}
+          messages={historical}
+          pendingMessages={[]}
+          convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-downward-keys"
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 300, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
+    act(() => virtualTranscriptMock.pinnedChanged?.(false));
+
+    // A jump takes the viewport; the reader then keys their own way down to
+    // the tail. Only upward keys used to count as taking over, so the jump
+    // stayed in its positioning phase and the arrival was refused.
+    act(() => listRef.current?.scrollToUnitIndex(0));
+    fireEvent.keyDown(scroller, { key: 'PageDown' });
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 600, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+
+    // Following again, so streamed growth follows the tail instead of
+    // raising a chip the reader already keyed past.
+    setupScroller(scroller, { scrollHeight: 1100, scrollTop: 700, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1100));
+    expect(container.querySelector('.jump-to-newest')).toBeNull();
+  });
+
+  it('a touch elsewhere on the page that prunes the last transcript touch ends the gesture', () => {
+    const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={historical}
+          pendingMessages={[]}
+          convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-foreign-touchend"
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 600, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
+
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 300, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+    setupScroller(scroller, { scrollHeight: 1100, scrollTop: 300, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1100));
+    expect(container.querySelector('.jump-to-newest')).not.toBeNull();
+
+    // A transcript drag whose row is virtualized away: its end is never seen.
+    fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
+    fireEvent.touchMove(scroller, { touches: [{ identifier: 1 }] });
+
+    // An unrelated touch elsewhere on the page ends. The window listener
+    // prunes the vanished transcript identifier — leaving ownership empty
+    // without ever resolving the gesture the policy still holds.
+    fireEvent.touchEnd(document.body, { touches: [], changedTouches: [{ identifier: 9 }] });
+
+    // Scrolling back to the tail must still confirm. Nothing else is coming
+    // to notice that the gesture is over.
+    setupScroller(scroller, { scrollHeight: 1100, scrollTop: 690, clientHeight: 400 });
+    fireEvent.wheel(scroller, { deltaY: 120 });
+    fireEvent.scroll(scroller);
+
+    expect(container.querySelector('.jump-to-newest')).toBeNull();
+  });
+
+  it('space claims the viewport only where nothing else consumes it', async () => {
+    const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const listRef = createRef<React.ElementRef<typeof MessageList>>();
+    const onLoadOlderMessages = vi.fn();
+    virtualTranscriptMock.captureVisibleAnchor.mockReturnValue({ key: 'msg-1', index: 0, offset: 14 });
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          ref={listRef}
+          messages={historical}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-space-key"
+          hasOlderMessages
+          onLoadOlderMessages={onLoadOlderMessages}
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-space-key', generation: 1, transcriptGeneration: 1 } }}/>,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 0, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
+    act(() => virtualTranscriptMock.pinnedChanged?.(false));
+
+    // A jump owns the viewport. Space pressed on something inside a row
+    // activates that control rather than paging the transcript, so the
+    // command is still the one positioning and nothing should be acquired.
+    act(() => listRef.current?.scrollToUnitIndex(2));
+    const row = container.querySelector<HTMLElement>('#messages .message')!;
+    const control = document.createElement('button');
+    row.appendChild(control);
+    fireEvent.keyDown(control, { key: ' ' });
+
+    act(() => virtualTranscriptMock.rangeChanged?.({
+      renderedRange: { startIndex: 0, endIndex: 2 },
+      visibleRange: { startIndex: 0, endIndex: 1 },
+      viewportTop: 0,
+      layoutRevision: 2,
+    }));
+
+    // The request is scheduled in a microtask, so let it run before
+    // concluding it never happened.
+    await act(async () => { await Promise.resolve(); });
+    expect(onLoadOlderMessages).not.toHaveBeenCalled();
+
+    // The converse: Space on ordinary transcript content is not consumed by
+    // anything, so it pages the scroller and does take the viewport over.
+    fireEvent.keyDown(row, { key: ' ' });
+    act(() => virtualTranscriptMock.rangeChanged?.({
+      renderedRange: { startIndex: 0, endIndex: 2 },
+      visibleRange: { startIndex: 0, endIndex: 1 },
+      viewportTop: 0,
+      layoutRevision: 3,
+    }));
+    await waitFor(() => expect(onLoadOlderMessages).toHaveBeenCalledTimes(1));
+  });
+
+  it('an unobservable lift stops withholding tail-follow once its bound expires', () => {
+    vi.useFakeTimers();
+    try {
+    const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={historical}
+          pendingMessages={[]}
+          convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-stale-bound-expiry"
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 600, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
+
+    // A drag whose row is virtualized away: the lift is never reported, and
+    // the reader then simply stops touching the screen.
+    fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
+    fireEvent.touchMove(scroller, { touches: [{ identifier: 1 }] });
+    virtualTranscriptMock.setTailFollowAllowed.mockClear();
+
+    // Nothing else happens. The bound has to expire on its own — otherwise
+    // the gesture stands forever and streamed content keeps arriving against
+    // an interaction that ended.
+    act(() => { vi.advanceTimersByTime(GESTURE_STALE_MS + 100); });
+
+    // The viewport comes to rest at the tail under its own momentum. With the
+    // gesture gone this is an idle arrival, so it confirms.
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 600, clientHeight: 400 });
+    act(() => virtualTranscriptMock.pinnedChanged?.(true));
+
+    const grants = virtualTranscriptMock.setTailFollowAllowed.mock.calls.map(([allowed]) => allowed);
+    expect(grants).toContain(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a recycled touch identifier does not extend the interaction it replaced', () => {
+    const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={historical}
+          pendingMessages={[]}
+          convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-recycled-identifier"
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 600, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
+
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 300, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+    setupScroller(scroller, { scrollHeight: 1100, scrollTop: 300, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1100));
+    expect(container.querySelector('.jump-to-newest')).not.toBeNull();
+
+    // A drag that travels toward the tail, then loses its lift to a detached
+    // node. Its evidence is still held by the policy.
+    fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
+    fireEvent.touchMove(scroller, { touches: [{ identifier: 1 }] });
+    setupScroller(scroller, { scrollHeight: 1100, scrollTop: 690, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+
+    // Safari hands the same identifier to the next touch, immediately — too
+    // soon for the staleness bound to have any opinion. A touch that is down
+    // cannot start again, so this is the platform telling us the first one
+    // ended; a stationary tap must not inherit its travel and confirm.
+    fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
+    fireEvent.touchEnd(scroller, { touches: [], changedTouches: [{ identifier: 1 }] });
+
+    expect(container.querySelector('.jump-to-newest')).not.toBeNull();
+  });
+
+  it('keeps a still-down co-touch owned when a recycled identifier resets the gesture', () => {
+    const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={historical}
+          pendingMessages={[]}
+          convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-recycled-cotouch"
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 600, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
+
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 300, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+    setupScroller(scroller, { scrollHeight: 1100, scrollTop: 300, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1100));
+    expect(container.querySelector('.jump-to-newest')).not.toBeNull();
+
+    // Two fingers on the transcript. The first loses its lift to a detached
+    // node; the second stays down throughout.
+    fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
+    fireEvent.touchStart(scroller, {
+      touches: [{ identifier: 1 }, { identifier: 2 }],
+      changedTouches: [{ identifier: 2 }],
+    });
+
+    // Safari recycles identifier 1 for a new finger. Resetting the gesture
+    // must discard the ended touch's evidence without disowning finger 2,
+    // which is still down and still holding the viewport.
+    fireEvent.touchStart(scroller, {
+      touches: [{ identifier: 2 }, { identifier: 1 }],
+      changedTouches: [{ identifier: 1 }],
+    });
+    fireEvent.touchMove(scroller, { touches: [{ identifier: 2 }, { identifier: 1 }] });
+    setupScroller(scroller, { scrollHeight: 1100, scrollTop: 690, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+
+    // The replacement lifts having travelled toward the tail, but finger 2 is
+    // still down, so the gesture is not over and nothing may confirm on it.
+    fireEvent.touchEnd(scroller, { touches: [{ identifier: 2 }], changedTouches: [{ identifier: 1 }] });
+
+    expect(container.querySelector('.jump-to-newest')).not.toBeNull();
+  });
+
+  it('a key that reaches only the body does not claim the viewport', async () => {
+    const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const listRef = createRef<React.ElementRef<typeof MessageList>>();
+    const onLoadOlderMessages = vi.fn();
+    virtualTranscriptMock.captureVisibleAnchor.mockReturnValue({ key: 'msg-1', index: 0, offset: 14 });
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          ref={listRef}
+          messages={historical}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-body-key"
+          hasOlderMessages
+          onLoadOlderMessages={onLoadOlderMessages}
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-body-key', generation: 1, transcriptGeneration: 1 } }}/>,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 0, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
+    act(() => virtualTranscriptMock.pinnedChanged?.(false));
+    act(() => listRef.current?.scrollToUnitIndex(2));
+
+    // The chat route locks its ancestors' overflow, so a key delivered with
+    // the body as target scrolls nothing. Claiming the viewport for it would
+    // cancel the jump still positioning and acquire history the reader never
+    // scrolled toward.
+    fireEvent.keyDown(document.body, { key: 'PageDown' });
+    act(() => virtualTranscriptMock.rangeChanged?.({
+      renderedRange: { startIndex: 0, endIndex: 2 },
+      visibleRange: { startIndex: 0, endIndex: 1 },
+      viewportTop: 0,
+      layoutRevision: 2,
+    }));
+
+    await act(async () => { await Promise.resolve(); });
+    expect(onLoadOlderMessages).not.toHaveBeenCalled();
   });
 
   it('re-snaps when viewport shrinks while pinned', () => {
