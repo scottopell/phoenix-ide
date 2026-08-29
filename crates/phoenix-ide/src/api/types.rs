@@ -98,7 +98,7 @@ pub struct ProductConversationCreationRecoveryRow {
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct ProductConversationCreationRecoveryResponse {
     pub product_creations: Vec<ProductConversationCreationRecoveryRow>,
-    pub next_offset: Option<u32>,
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

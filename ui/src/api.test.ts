@@ -301,7 +301,7 @@ describe('conversation message history clients', () => {
 
     await api.listProductConversationCreations();
 
-    expect(fetchMock).toHaveBeenCalledWith('/api/product-conversations/creation?offset=0');
+    expect(fetchMock).toHaveBeenCalledWith('/api/product-conversations/creation');
   });
 
   it('POSTs cancel product creation', async () => {

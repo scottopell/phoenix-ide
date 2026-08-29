@@ -1102,7 +1102,7 @@ impl Database {
 
     pub async fn list_product_creation_recovery_jobs(
         &self,
-        offset: u32,
+        cursor: Option<(i64, String)>,
     ) -> DbResult<Vec<ProductCreationRecoveryJobRecord>> {
         sqlx::query(
             "SELECT request_id, cwd, objective, model, effort, llm_language, status,
@@ -1119,12 +1119,16 @@ impl Database {
                     'failed',
                     'cancelled',
                     'delivery_failed',
+                    'delivery_pending',
                     'cleanup_ambiguous'
                   )
+               AND (?1 IS NULL OR updated_at_unix_micros < ?1
+                    OR (updated_at_unix_micros = ?1 AND request_id < ?2))
              ORDER BY updated_at_unix_micros DESC, request_id DESC
-             LIMIT 51 OFFSET ?1",
+             LIMIT 51",
         )
-        .bind(offset)
+        .bind(cursor.as_ref().map(|(updated_at, _)| *updated_at))
+        .bind(cursor.as_ref().map(|(_, request_id)| request_id))
         .try_map(|row: SqliteRow| {
             let images_json: String = row.try_get("images_json")?;
             let images: Vec<ProductCreationImage> = serde_json::from_str(&images_json)
@@ -3295,13 +3299,14 @@ mod product_creation_tests {
             .await
             .unwrap());
 
-        let rows = db.list_product_creation_recovery_jobs(0).await.unwrap();
+        let rows = db.list_product_creation_recovery_jobs(None).await.unwrap();
         let statuses: std::collections::HashMap<_, _> = rows
             .iter()
             .map(|row| (row.request_id.as_str(), row.status.as_str()))
             .collect();
-        assert_eq!(statuses.len(), 6);
+        assert_eq!(statuses.len(), 7);
         assert_eq!(statuses.get("req-delivery"), Some(&"delivery_failed"));
+        assert_eq!(statuses.get("req-published"), Some(&"delivery_pending"));
         assert_eq!(statuses.get("req-cancelled"), Some(&"cancelled"));
         assert_eq!(statuses.get("req-failed"), Some(&"failed"));
         assert_eq!(statuses.get("req-retry"), Some(&"retry_scheduled"));
@@ -3327,7 +3332,6 @@ mod product_creation_tests {
             .find(|row| row.request_id == "req-accepted")
             .unwrap();
         assert_eq!(accepted.published_product_conversation_id, None);
-        assert!(rows.iter().all(|row| row.request_id != "req-published"));
         assert!(rows.iter().all(|row| row.request_id != "req-delete-hidden"));
     }
 

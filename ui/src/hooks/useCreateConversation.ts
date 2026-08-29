@@ -82,6 +82,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
     } catch { /* use a fresh in-memory identity */ }
     return generateUUID();
   });
+  const [recoveredLlmLanguage, setRecoveredLlmLanguage] = useState<string | null>(null);
   const replayIntentRef = useRef<string | null>((() => {
     try { return localStorage.getItem(REPLAY_CREATE_INTENT_KEY); } catch { return null; }
   })());
@@ -262,13 +263,14 @@ export function useCreateConversation(navigate: (path: string) => void) {
         objective: trimmed,
         model: selectedModel,
         effort: selectedEffort,
-        llm_language: localStorage.getItem('phoenix-create-llm-language'),
+        llm_language: recoveredLlmLanguage,
         ...(images.length > 0 ? { images } : {}),
       };
       const response = await api.createProductConversation(createRequest);
       setDraft('');
       setImages([]);
       setFiles([]);
+      setRecoveredLlmLanguage(null);
       clearNewConversationDraft();
       try {
         localStorage.removeItem(REPLAY_CREATE_REQUEST_KEY);
@@ -299,6 +301,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
     setDraft(creation.objective);
     setImages(creation.images ?? []);
     setFiles([]);
+    setRecoveredLlmLanguage(creation.llm_language);
     selectModel(creation.model);
     selectEffort(creation.effort);
     try {

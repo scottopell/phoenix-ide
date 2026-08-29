@@ -1703,8 +1703,9 @@ export const api = {
     return resp.json();
   },
 
-  async listProductConversationCreations(offset = 0): Promise<ProductConversationCreationRecoveryResponseType> {
-    const resp = await fetch(`/api/product-conversations/creation?offset=${offset}`);
+  async listProductConversationCreations(cursor?: string | null): Promise<ProductConversationCreationRecoveryResponseType> {
+    const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : '';
+    const resp = await fetch(`/api/product-conversations/creation${query}`);
     if (!resp.ok) {
       throw new Error('Failed to fetch product conversation creations');
     }

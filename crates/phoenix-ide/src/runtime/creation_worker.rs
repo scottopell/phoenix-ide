@@ -992,6 +992,13 @@ fn ensure_phoenix_staging_ignored(repo_root: &Path) -> Result<(), String> {
         writeln!(file, "/.phoenix/").map_err(|error| error.to_string())?;
     }
     let gitignore = repo_root.join(".gitignore");
+    if std::fs::symlink_metadata(&gitignore).is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(format!(
+            "refusing to update symlinked gitignore {}",
+            gitignore.display()
+        ));
+    }
     let mut contents = match std::fs::read(&gitignore) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),

@@ -79,20 +79,29 @@ pub async fn list_product_conversations(
 #[derive(Deserialize)]
 pub struct ProductCreationRecoveryQuery {
     #[serde(default)]
-    offset: u32,
+    cursor: Option<String>,
 }
 
 pub async fn list_product_conversation_creations(
     State(state): State<AppState>,
     Query(query): Query<ProductCreationRecoveryQuery>,
 ) -> Result<Json<ProductConversationCreationRecoveryResponse>, AppError> {
+    let cursor = query
+        .cursor
+        .as_deref()
+        .map(decode_recovery_cursor)
+        .transpose()?;
     let mut jobs = state
         .db
-        .list_product_creation_recovery_jobs(query.offset)
+        .list_product_creation_recovery_jobs(cursor)
         .await
         .map_err(db_to_app)?;
     let has_more = jobs.len() > 50;
     jobs.truncate(50);
+    let next_cursor = has_more
+        .then(|| jobs.last())
+        .flatten()
+        .map(|job| encode_recovery_cursor(job.updated_at.timestamp_micros(), &job.request_id));
     let rows = jobs
         .into_iter()
         .map(|job| ProductConversationCreationRecoveryRow {
@@ -114,7 +123,7 @@ pub async fn list_product_conversation_creations(
         .collect();
     Ok(Json(ProductConversationCreationRecoveryResponse {
         product_creations: rows,
-        next_offset: has_more.then_some(query.offset + 50),
+        next_cursor,
     }))
 }
 
@@ -173,6 +182,23 @@ fn canonical_route(aggregate: &ProductConversationAggregate) -> String {
         "{PRODUCT_CONVERSATION_ROUTE_PREFIX}{}",
         aggregate.product_conversation.id()
     )
+}
+
+fn encode_recovery_cursor(updated_at_micros: i64, request_id: &str) -> String {
+    format!("{updated_at_micros}:{request_id}")
+}
+
+fn decode_recovery_cursor(cursor: &str) -> Result<(i64, String), AppError> {
+    let (updated_at, request_id) = cursor
+        .split_once(':')
+        .ok_or_else(|| AppError::BadRequest("invalid recovery cursor".to_string()))?;
+    let updated_at = updated_at
+        .parse()
+        .map_err(|_| AppError::BadRequest("invalid recovery cursor".to_string()))?;
+    if request_id.is_empty() {
+        return Err(AppError::BadRequest("invalid recovery cursor".to_string()));
+    }
+    Ok((updated_at, request_id.to_string()))
 }
 
 fn creation_allowed_actions(status: &str) -> Vec<ProductConversationCreationAllowedActionView> {

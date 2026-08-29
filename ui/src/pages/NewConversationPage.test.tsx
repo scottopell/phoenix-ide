@@ -122,17 +122,17 @@ describe('NewConversationPage', () => {
 
   it('keeps loaded pages visible after a full refresh and labels cancelling', async () => {
     apiMock.listProductConversationCreations
-      .mockResolvedValueOnce({ product_creations: [{ request_id: 'one', status: 'cancelling', cwd: '/one', objective: 'first page', model: null, effort: null, images: [], llm_language: 'English', updated_at: '2026-01-01T00:00:00Z', last_error: null, allowed_actions: ['delete'], published_product_conversation_id: null }], next_offset: 50 })
-      .mockResolvedValueOnce({ product_creations: [{ request_id: 'two', status: 'failed', cwd: '/two', objective: 'second page', model: null, effort: null, images: [], llm_language: 'English', updated_at: '2025-01-01T00:00:00Z', last_error: null, allowed_actions: ['delete', 'start_over'], published_product_conversation_id: null }], next_offset: null })
-      .mockResolvedValueOnce({ product_creations: [{ request_id: 'one', status: 'cancelling', cwd: '/one', objective: 'first page', model: null, effort: null, images: [], llm_language: 'English', updated_at: '2026-01-01T00:00:00Z', last_error: null, allowed_actions: ['delete'], published_product_conversation_id: null }], next_offset: 50 })
-      .mockResolvedValueOnce({ product_creations: [{ request_id: 'two', status: 'failed', cwd: '/two', objective: 'second page', model: null, effort: null, images: [], llm_language: 'English', updated_at: '2025-01-01T00:00:00Z', last_error: null, allowed_actions: ['delete', 'start_over'], published_product_conversation_id: null }], next_offset: null });
+      .mockResolvedValueOnce({ product_creations: [{ request_id: 'one', status: 'cancelling', cwd: '/one', objective: 'first page', model: null, effort: null, images: [], llm_language: 'English', updated_at: '2026-01-01T00:00:00Z', last_error: null, allowed_actions: ['delete'], published_product_conversation_id: null }], next_cursor: "cursor-50" })
+      .mockResolvedValueOnce({ product_creations: [{ request_id: 'two', status: 'failed', cwd: '/two', objective: 'second page', model: null, effort: null, images: [], llm_language: 'English', updated_at: '2025-01-01T00:00:00Z', last_error: null, allowed_actions: ['delete', 'start_over'], published_product_conversation_id: null }], next_cursor: null })
+      .mockResolvedValueOnce({ product_creations: [{ request_id: 'one', status: 'cancelling', cwd: '/one', objective: 'first page', model: null, effort: null, images: [], llm_language: 'English', updated_at: '2026-01-01T00:00:00Z', last_error: null, allowed_actions: ['delete'], published_product_conversation_id: null }], next_cursor: "cursor-50" })
+      .mockResolvedValueOnce({ product_creations: [{ request_id: 'two', status: 'failed', cwd: '/two', objective: 'second page', model: null, effort: null, images: [], llm_language: 'English', updated_at: '2025-01-01T00:00:00Z', last_error: null, allowed_actions: ['delete', 'start_over'], published_product_conversation_id: null }], next_cursor: null });
 
     renderPage();
     expect((await screen.findAllByText('Cancelling')).length).toBeGreaterThan(0);
     fireEvent.click(screen.getAllByRole('button', { name: 'Load more' }).at(0)!);
     expect((await screen.findAllByText('second page')).length).toBeGreaterThan(0);
     fireEvent.click(screen.getAllByRole('button', { name: 'Delete' }).at(0)!);
-    await waitFor(() => expect(apiMock.listProductConversationCreations).toHaveBeenCalledWith(50));
+    await waitFor(() => expect(apiMock.listProductConversationCreations).toHaveBeenCalledWith("cursor-50"));
     expect(screen.getAllByText('first page').length).toBeGreaterThan(0);
     expect(screen.getAllByText('second page').length).toBeGreaterThan(0);
   });
