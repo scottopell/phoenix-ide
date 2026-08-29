@@ -56,6 +56,26 @@ fn ambiguous_socket_probe(path: &Path) -> TmuxError {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SocketFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+fn socket_file_identity(path: &Path) -> std::io::Result<Option<SocketFileIdentity>> {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_socket() => Ok(Some(SocketFileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })),
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 fn endpoint_is_definitely_not_socket(path: &Path) -> bool {
     #[cfg(unix)]
     {
@@ -1367,6 +1387,93 @@ impl TmuxRegistry {
         Self::verify_exact_absence_from_probe(permit, result).await
     }
 
+    async fn verify_exact_absence_after_successful_kill(
+        &self,
+        permit: &TmuxRetirementPermit,
+        killed_socket: SocketFileIdentity,
+    ) -> Result<TmuxRetirementOutcome, TmuxError> {
+        const MAX_ABSENCE_PROBES: usize = 8;
+
+        let mut last_inconclusive = None;
+        for attempt in 0..MAX_ABSENCE_PROBES {
+            let result = probe(&permit.instance.socket_path)
+                .await
+                .map_err(|source| TmuxError::ProbeFailed {
+                    socket_path: permit.instance.socket_path.clone(),
+                    source,
+                })?;
+            match result {
+                ProbeResult::NoSocket | ProbeResult::NoServer => {
+                    return Ok(TmuxRetirementOutcome::AbsenceVerified);
+                }
+                ProbeResult::DeadSocket => {
+                    let observed =
+                        socket_file_identity(&permit.instance.socket_path).map_err(|source| {
+                            TmuxError::ProbeFailed {
+                                socket_path: permit.instance.socket_path.clone(),
+                                source,
+                            }
+                        })?;
+                    if observed == Some(killed_socket) {
+                        match tokio::fs::remove_file(&permit.instance.socket_path).await {
+                            Ok(()) => {
+                                last_inconclusive = Some(
+                                    "removed the exact stale socket left by kill-server"
+                                        .to_string(),
+                                );
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                last_inconclusive = Some(
+                                    "the exact stale socket disappeared before unlink".to_string(),
+                                );
+                            }
+                            Err(source) => {
+                                return Err(TmuxError::ProbeFailed {
+                                    socket_path: permit.instance.socket_path.clone(),
+                                    source,
+                                });
+                            }
+                        }
+                        if attempt + 1 < MAX_ABSENCE_PROBES {
+                            tokio::task::yield_now().await;
+                            continue;
+                        }
+                        break;
+                    }
+                    return Ok(TmuxRetirementOutcome::IdentityNotProven {
+                        reason: format!(
+                            "tmux socket incarnation changed after kill-server at {}; replacement absence is not proven",
+                            permit.instance.socket_path.display()
+                        ),
+                    });
+                }
+                ProbeResult::Live => match read_server_token(&permit.instance.socket_path).await {
+                    Some(token) if token == permit.instance.server_token => {
+                        last_inconclusive = Some(
+                            "exact tmux server instance remained live after teardown".to_string(),
+                        );
+                    }
+                    Some(_) => return Ok(TmuxRetirementOutcome::AbsenceVerified),
+                    None => {
+                        return Ok(TmuxRetirementOutcome::IdentityNotProven {
+                            reason: "live tmux server token is unreadable".to_string(),
+                        });
+                    }
+                },
+            }
+            if attempt + 1 < MAX_ABSENCE_PROBES {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        Ok(TmuxRetirementOutcome::RemovalFailed {
+            reason: format!(
+                "successful tmux kill-server was not followed by exact absence after {MAX_ABSENCE_PROBES} probes: {}",
+                last_inconclusive.unwrap_or_else(|| "no conclusive probe result".to_string())
+            ),
+        })
+    }
+
     async fn verify_exact_absence_from_probe(
         permit: &TmuxRetirementPermit,
         result: ProbeResult,
@@ -1419,6 +1526,25 @@ impl TmuxRegistry {
         if !exact_owned {
             return self.verify_exact_absence(permit).await;
         }
+        let killed_socket = if self.binary_available {
+            match socket_file_identity(&permit.instance.socket_path) {
+                Ok(Some(identity)) => Some(identity),
+                Ok(None) => {
+                    return Ok(TmuxRetirementOutcome::IdentityNotProven {
+                        reason: "tmux socket incarnation was unavailable before exact teardown"
+                            .to_string(),
+                    });
+                }
+                Err(source) => {
+                    return Err(TmuxError::ProbeFailed {
+                        socket_path: permit.instance.socket_path.clone(),
+                        source,
+                    });
+                }
+            }
+        } else {
+            None
+        };
         let kill_failure = if self.binary_available {
             let token_test = format!(
                 "#{{==:#{{E:{SERVER_TOKEN_VAR}}},{}}}",
@@ -1470,7 +1596,18 @@ impl TmuxRegistry {
         };
         drop(server);
 
-        let verified = self.verify_exact_absence(permit).await?;
+        let verified = if kill_failure.is_none() && self.binary_available {
+            let Some(killed_socket) = killed_socket else {
+                return Ok(TmuxRetirementOutcome::IdentityNotProven {
+                    reason: "tmux socket incarnation was not captured before exact teardown"
+                        .to_string(),
+                });
+            };
+            self.verify_exact_absence_after_successful_kill(permit, killed_socket)
+                .await?
+        } else {
+            self.verify_exact_absence(permit).await?
+        };
         if let Some(failure) = kill_failure {
             return Ok(failure);
         }

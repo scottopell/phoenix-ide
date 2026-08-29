@@ -3988,6 +3988,9 @@ mod tests {
     use phoenix_core::domain::close::{
         CloseLossItem, GitPathIdentity, WorktreeFingerprint, WorktreeId, WorktreeIdentity,
     };
+    use std::io::Write as _;
+    #[cfg(target_os = "linux")]
+    use std::io::{BufRead as _, Read as _};
     use std::path::Path;
 
     #[cfg(target_os = "macos")]
@@ -5020,7 +5023,6 @@ mod tests {
         std::env::set_current_dir(cwd).unwrap();
         // SAFETY: `prctl(PR_SET_DUMPABLE, 0)` has no pointer arguments.
         assert_eq!(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) }, 0);
-        use std::io::{Read as _, Write as _};
         println!("ready");
         std::io::stdout().flush().unwrap();
         let _ = std::io::stdin().read(&mut [0_u8]);
@@ -5029,8 +5031,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn cwd_scan_does_not_skip_same_user_nondumpable_process() {
-        use std::io::BufRead as _;
-
         let temp = tempfile::tempdir().unwrap();
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
@@ -5217,8 +5217,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn quarantine_preserves_worktree_with_open_file_descriptor() {
-        use std::io::Write as _;
-
         let temp = tempfile::tempdir().unwrap();
         let closing = temp.path().join("closing");
         initialize_repository(&closing);
