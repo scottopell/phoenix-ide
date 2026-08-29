@@ -2281,6 +2281,244 @@ fn observe_administrative_dir_incarnation(administrative_dir: &Path) -> Result<S
     }
 }
 
+#[cfg(target_os = "linux")]
+unsafe fn errno_location() -> *mut libc::c_int {
+    // SAFETY: caller treats the platform libc errno pointer according to libc's contract.
+    unsafe { libc::__errno_location() }
+}
+
+#[cfg(not(target_os = "linux"))]
+unsafe fn errno_location() -> *mut libc::c_int {
+    // SAFETY: caller treats the platform libc errno pointer according to libc's contract.
+    unsafe { libc::__error() }
+}
+
+#[cfg(unix)]
+fn remove_directory_contents_at(directory: &std::os::fd::OwnedFd) -> Result<(), String> {
+    use std::ffi::CStr;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+
+    // SAFETY: dup returns a new owned descriptor or -1. fdopendir consumes only
+    // that duplicate, while the caller retains the descriptor used by openat.
+    let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
+    if duplicate < 0 {
+        return Err(format!(
+            "cannot duplicate deletion descriptor: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: duplicate is a valid owned directory descriptor on success above.
+    let stream = unsafe { libc::fdopendir(duplicate) };
+    if stream.is_null() {
+        // SAFETY: fdopendir did not consume the descriptor when it returned null.
+        unsafe { libc::close(duplicate) };
+        return Err(format!(
+            "cannot enumerate deletion descriptor: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let result = (|| {
+        loop {
+            // SAFETY: stream remains valid until closed below. errno is reset so
+            // a null result can distinguish end-of-directory from an error.
+            unsafe { *errno_location() = 0 };
+            // SAFETY: stream is a valid DIR pointer owned by this function.
+            let entry = unsafe { libc::readdir(stream) };
+            if entry.is_null() {
+                let error = std::io::Error::last_os_error();
+                return if error.raw_os_error() == Some(0) {
+                    Ok(())
+                } else {
+                    Err(format!("cannot read deletion descriptor: {error}"))
+                };
+            }
+            // SAFETY: d_name is NUL-terminated for the lifetime of this entry.
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+            if name.to_bytes() == b"." || name.to_bytes() == b".." {
+                continue;
+            }
+            let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: descriptors and C string are valid; metadata points to writable storage.
+            if unsafe {
+                libc::fstatat(
+                    directory.as_raw_fd(),
+                    name.as_ptr(),
+                    metadata.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } < 0
+            {
+                return Err(format!(
+                    "cannot inspect deletion entry: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            // SAFETY: fstatat initialized metadata on success.
+            let metadata = unsafe { metadata.assume_init() };
+            if metadata.st_mode & libc::S_IFMT == libc::S_IFDIR {
+                // SAFETY: openat does not follow the entry because O_NOFOLLOW is set.
+                let child = unsafe {
+                    libc::openat(
+                        directory.as_raw_fd(),
+                        name.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                if child < 0 {
+                    return Err(format!(
+                        "cannot open deletion subdirectory without following replacements: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                // SAFETY: child is a newly owned descriptor on success above.
+                let child = unsafe { OwnedFd::from_raw_fd(child) };
+                let mut opened = std::mem::MaybeUninit::<libc::stat>::uninit();
+                // SAFETY: child is valid and opened points to writable storage.
+                if unsafe { libc::fstat(child.as_raw_fd(), opened.as_mut_ptr()) } < 0 {
+                    return Err(format!(
+                        "cannot identify opened deletion subdirectory: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                // SAFETY: fstat initialized opened on success.
+                let opened = unsafe { opened.assume_init() };
+                if opened.st_dev != metadata.st_dev || opened.st_ino != metadata.st_ino {
+                    return Err(
+                        "deletion subdirectory was replaced before descriptor binding".to_string(),
+                    );
+                }
+                remove_directory_contents_at(&child)?;
+                // SAFETY: unlinkat is descriptor-relative and name is valid.
+                if unsafe {
+                    libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR)
+                } < 0
+                {
+                    return Err(format!(
+                        "cannot remove deletion subdirectory: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+            } else {
+                // SAFETY: unlinkat is descriptor-relative and never follows the entry.
+                if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } < 0 {
+                    return Err(format!(
+                        "cannot remove deletion entry: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+            }
+        }
+    })();
+    // SAFETY: stream is the valid DIR pointer returned by fdopendir.
+    unsafe { libc::closedir(stream) };
+    result
+}
+
+fn remove_identity_bound_directory<F, O>(
+    deletion_target: &Path,
+    expected_identity: &str,
+    observe_identity: O,
+    before_final_move: F,
+    description: &str,
+) -> Result<(), String>
+where
+    F: FnOnce(&Path),
+    O: Fn(&Path) -> Result<String, String>,
+{
+    before_final_move(deletion_target);
+    let parent = deletion_target
+        .parent()
+        .ok_or_else(|| format!("{description} has no parent directory"))?;
+    let tombstone_root = parent.join(format!(".phoenix-delete-{}", uuid::Uuid::new_v4().simple()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let mut builder = std::fs::DirBuilder::new();
+        builder
+            .mode(0o700)
+            .create(&tombstone_root)
+            .map_err(|error| format!("cannot reserve private {description} tombstone: {error}"))?;
+    }
+    #[cfg(not(unix))]
+    {
+        return Err(format!(
+            "identity-bound {description} deletion is unsupported on this platform"
+        ));
+    }
+    let tombstone = tombstone_root.join("object");
+    if let Err(error) = std::fs::rename(deletion_target, &tombstone) {
+        let _ = std::fs::remove_dir(&tombstone_root);
+        return Err(format!(
+            "cannot move {description} into private final tombstone: {error}"
+        ));
+    }
+    if observe_identity(&tombstone)? != expected_identity {
+        return Err(format!(
+            "{description} identity changed before final deletion; replacement preserved at {}",
+            tombstone.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::fd::FromRawFd as _;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let tombstone_name = CString::new("object").expect("static name contains no NUL");
+        let root = CString::new(tombstone_root.as_os_str().as_bytes())
+            .map_err(|_| format!("private {description} tombstone path contains NUL"))?;
+        // SAFETY: root is a valid C path; O_NOFOLLOW rejects a replaced symlink.
+        let root_descriptor = unsafe {
+            libc::open(
+                root.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if root_descriptor < 0 {
+            return Err(format!(
+                "cannot open private {description} tombstone without following replacements: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: root_descriptor is newly owned on success above.
+        let root_descriptor = unsafe { std::os::fd::OwnedFd::from_raw_fd(root_descriptor) };
+        // SAFETY: openat is rooted in the private descriptor and O_NOFOLLOW rejects replacement links.
+        let object_descriptor = unsafe {
+            libc::openat(
+                std::os::fd::AsRawFd::as_raw_fd(&root_descriptor),
+                tombstone_name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if object_descriptor < 0 {
+            return Err(format!(
+                "cannot open identity-bound {description}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: object_descriptor is newly owned on success above.
+        let object_descriptor = unsafe { std::os::fd::OwnedFd::from_raw_fd(object_descriptor) };
+        remove_directory_contents_at(&object_descriptor)?;
+        // SAFETY: unlinkat is rooted at the still-open private directory and does not follow names.
+        if unsafe {
+            libc::unlinkat(
+                std::os::fd::AsRawFd::as_raw_fd(&root_descriptor),
+                tombstone_name.as_ptr(),
+                libc::AT_REMOVEDIR,
+            )
+        } < 0
+        {
+            return Err(format!(
+                "cannot unlink identity-bound {description}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    std::fs::remove_dir(&tombstone_root)
+        .map_err(|error| format!("cannot remove empty {description} tombstone: {error}"))
+}
+
 fn administrative_dir_quarantine_path(
     administrative_dir: &Path,
     incarnation: &str,
@@ -2300,6 +2538,21 @@ fn remove_exact_worktree_administrative_dir(
     administrative_dir: &Path,
     expected_incarnation: &str,
 ) -> Result<(), String> {
+    remove_exact_worktree_administrative_dir_with_hook(
+        administrative_dir,
+        expected_incarnation,
+        |_| {},
+    )
+}
+
+fn remove_exact_worktree_administrative_dir_with_hook<F>(
+    administrative_dir: &Path,
+    expected_incarnation: &str,
+    before_final_move: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&Path),
+{
     let quarantine = administrative_dir_quarantine_path(administrative_dir, expected_incarnation)?;
     let source_exists = administrative_dir
         .try_exists()
@@ -2329,12 +2582,13 @@ fn remove_exact_worktree_administrative_dir(
             "quarantined worktree administrative-directory incarnation changed".to_string(),
         );
     }
-    std::fs::remove_dir_all(&deletion_target).map_err(|error| {
-        format!(
-            "cannot remove exact retired worktree registration {}: {error}",
-            deletion_target.display()
-        )
-    })
+    remove_identity_bound_directory(
+        &deletion_target,
+        expected_incarnation,
+        observe_administrative_dir_incarnation,
+        before_final_move,
+        "retired worktree administrative directory",
+    )
 }
 
 fn exact_worktree_administrative_dir(
@@ -3028,8 +3282,40 @@ fn remove_quarantine_then_administrative_dir<F>(
 where
     F: FnOnce(),
 {
-    std::fs::remove_dir_all(quarantine)
-        .map_err(|error| format!("cannot remove quarantined worktree: {error}"))?;
+    remove_quarantine_then_administrative_dir_with_hooks(
+        quarantine,
+        administrative_dir,
+        administrative_dir_incarnation,
+        |_| {},
+        after_quarantine_removal,
+    )
+}
+
+fn remove_quarantine_then_administrative_dir_with_hooks<B, A>(
+    quarantine: &Path,
+    administrative_dir: &Path,
+    administrative_dir_incarnation: &str,
+    before_final_move: B,
+    after_quarantine_removal: A,
+) -> Result<(), String>
+where
+    B: FnOnce(&Path),
+    A: FnOnce(),
+{
+    let expected = observe_worktree_fingerprint(quarantine).ok_or_else(|| {
+        "cannot observe quarantined worktree identity before deletion".to_string()
+    })?;
+    remove_identity_bound_directory(
+        quarantine,
+        &expected,
+        |path| {
+            observe_worktree_fingerprint(path).ok_or_else(|| {
+                "cannot observe worktree identity in private final tombstone".to_string()
+            })
+        },
+        before_final_move,
+        "quarantined worktree",
+    )?;
     after_quarantine_removal();
     remove_exact_worktree_administrative_dir(administrative_dir, administrative_dir_incarnation)
 }
@@ -3332,7 +3618,9 @@ mod tests {
         git_path_from_observation, inspect_and_remove_exact_worktree_with_hook, inspect_worktree,
         observe_administrative_dir_incarnation, parse_status_losses,
         planned_administrative_dir_is_absent, quarantine_and_remove_exact_worktree,
-        remove_quarantine_then_administrative_dir, rotate_inspection_generation,
+        remove_exact_worktree_administrative_dir_with_hook,
+        remove_quarantine_then_administrative_dir,
+        remove_quarantine_then_administrative_dir_with_hooks, rotate_inspection_generation,
         run_bounded_git_status_until, snapshot_for, staged_index_entries_by_path,
         staged_index_entries_for_paths, worktree_quarantine_path, CloseLeaseFailure,
         ExactWorktreeRemoval,
@@ -3634,6 +3922,89 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(quarantine.join("write-after-crash")).unwrap(),
             "preserve\n"
+        );
+    }
+
+    #[test]
+    fn worktree_quarantine_swap_before_final_move_preserves_replacement_for_needs_repair() {
+        let temp = tempfile::tempdir().unwrap();
+        let quarantine = temp.path().join("quarantine");
+        let displaced = temp.path().join("checked-object");
+        let administrative_dir = temp.path().join("already-removed-admin");
+        initialize_repository(&quarantine);
+        let replacement_marker = "replacement must survive\n";
+
+        let error = remove_quarantine_then_administrative_dir_with_hooks(
+            &quarantine,
+            &administrative_dir,
+            "unused-after-failure",
+            {
+                let quarantine = quarantine.clone();
+                let displaced_for_swap = displaced.clone();
+                move |_| {
+                    std::fs::rename(&quarantine, &displaced_for_swap).unwrap();
+                    initialize_repository(&quarantine);
+                    std::fs::write(quarantine.join("replacement-marker"), replacement_marker)
+                        .unwrap();
+                }
+            },
+            || {},
+        )
+        .unwrap_err();
+
+        assert!(error.contains("identity changed before final deletion"));
+        assert!(displaced.exists());
+        let preserved = std::fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path().join("object/replacement-marker"))
+            .find(|candidate| candidate.is_file())
+            .expect("swapped worktree replacement must remain in the private tombstone");
+        assert_eq!(
+            std::fs::read_to_string(preserved).unwrap(),
+            replacement_marker
+        );
+    }
+
+    #[test]
+    fn administrative_quarantine_swap_before_final_move_preserves_replacement_for_needs_repair() {
+        let temp = tempfile::tempdir().unwrap();
+        let administrative_dir = temp.path().join("admin");
+        std::fs::create_dir(&administrative_dir).unwrap();
+        std::fs::write(administrative_dir.join("original"), "original\n").unwrap();
+        let incarnation = observe_administrative_dir_incarnation(&administrative_dir).unwrap();
+        let quarantine =
+            super::administrative_dir_quarantine_path(&administrative_dir, &incarnation).unwrap();
+        let displaced = temp.path().join("checked-admin");
+        let replacement_marker = "replacement must survive\n";
+
+        let error = remove_exact_worktree_administrative_dir_with_hook(
+            &administrative_dir,
+            &incarnation,
+            {
+                let quarantine = quarantine.clone();
+                let displaced_for_swap = displaced.clone();
+                move |_| {
+                    std::fs::rename(&quarantine, &displaced_for_swap).unwrap();
+                    std::fs::create_dir(&quarantine).unwrap();
+                    std::fs::write(quarantine.join("replacement-marker"), replacement_marker)
+                        .unwrap();
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("identity changed before final deletion"));
+        assert!(displaced.exists());
+        let preserved = std::fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path().join("object/replacement-marker"))
+            .find(|candidate| candidate.is_file())
+            .expect("swapped admin replacement must remain in the private tombstone");
+        assert_eq!(
+            std::fs::read_to_string(preserved).unwrap(),
+            replacement_marker
         );
     }
 
