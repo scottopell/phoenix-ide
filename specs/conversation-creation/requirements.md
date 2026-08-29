@@ -226,6 +226,8 @@ THE SYSTEM SHALL preserve the failed conversation without an automatic retry
 WHEN creation mutates Git refs or worktrees
 THE SYSTEM SHALL serialize mutation by canonical repository identity across live Phoenix processes
 AND cleanup SHALL remove only resources whose durable ownership still belongs to the cleanup operation
+AND deterministic staging paths beneath the repository's `.phoenix/worktrees` namespace SHALL be a Phoenix-private resource namespace whose Phoenix writers serialize through the repository mutation lock
+AND cleanup ownership checks SHALL protect against stale Phoenix operations and observed identity mismatch within that namespace, while hostile same-user filesystem mutation outside Phoenix writers is not part of the automatic-cleanup threat model
 AND SHALL enter an explicit non-destructive ambiguous cleanup outcome when ownership, equivalence, or safety cannot be proven exactly
 
 ### REQ-CCR-005A: Immutable Starting Pin Selection

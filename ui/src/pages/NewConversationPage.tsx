@@ -208,7 +208,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
       const response = await api.listProductConversationCreations();
       setRecoveryRows(response.product_creations);
     } catch {
-      setRecoveryRows([]);
+      // Retain the last durable projection so active-row polling keeps retrying.
     }
   }, []);
 

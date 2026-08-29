@@ -102,6 +102,24 @@ describe('NewConversationPage', () => {
     renderPage();
   });
 
+  it('retains active recovery rows when a poll fails transiently', async () => {
+    apiMock.listProductConversationCreations
+      .mockResolvedValueOnce({
+        product_creations: [{
+          request_id: 'req-active', status: 'claimed', cwd: '/repo/a', objective: 'still running',
+          model: null, effort: null, images: [], updated_at: '2026-01-01T00:00:00Z', last_error: null,
+          allowed_actions: ['cancel'],
+        }],
+      })
+      .mockRejectedValueOnce(new Error('transient'));
+
+    renderPage();
+    expect((await screen.findAllByText('still running')).length).toBeGreaterThan(0);
+
+    await waitFor(() => expect(apiMock.listProductConversationCreations.mock.calls.length).toBeGreaterThan(1), { timeout: 3000 });
+    expect(screen.getAllByText('still running').length).toBeGreaterThan(0);
+  });
+
   it('start over prefills the composer from a recovery row', async () => {
     apiMock.listProductConversationCreations.mockResolvedValueOnce({
       product_creations: [
