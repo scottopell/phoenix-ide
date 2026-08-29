@@ -1101,6 +1101,7 @@ impl Database {
 
     pub async fn list_product_creation_recovery_jobs(
         &self,
+        offset: u32,
     ) -> DbResult<Vec<ProductCreationRecoveryJobRecord>> {
         sqlx::query(
             "SELECT request_id, cwd, objective, model, effort, llm_language, status,
@@ -1120,8 +1121,9 @@ impl Database {
                     'cleanup_ambiguous'
                   )
              ORDER BY updated_at_unix_micros DESC, request_id DESC
-             LIMIT 50",
+             LIMIT 51 OFFSET ?1",
         )
+        .bind(offset)
         .try_map(|row: SqliteRow| {
             let images_json: String = row.try_get("images_json")?;
             let images: Vec<ProductCreationImage> = serde_json::from_str(&images_json)
@@ -3290,7 +3292,7 @@ mod product_creation_tests {
             .await
             .unwrap());
 
-        let rows = db.list_product_creation_recovery_jobs().await.unwrap();
+        let rows = db.list_product_creation_recovery_jobs(0).await.unwrap();
         let statuses: std::collections::HashMap<_, _> = rows
             .iter()
             .map(|row| (row.request_id.as_str(), row.status.as_str()))

@@ -53,6 +53,8 @@ pub struct CreateProductConversationRequest {
     pub effort: Option<phoenix_core::domain::llm_types::ModelEffort>,
     pub objective: String,
     #[serde(default)]
+    pub llm_language: Option<phoenix_core::llm_language::LlmLanguage>,
+    #[serde(default)]
     pub images: Vec<ImageAttachment>,
 }
 
@@ -82,6 +84,8 @@ pub struct ProductConversationCreationRecoveryRow {
     pub objective: String,
     pub model: Option<String>,
     pub effort: Option<phoenix_core::domain::llm_types::ModelEffort>,
+    #[ts(type = "string | null")]
+    pub llm_language: Option<phoenix_core::llm_language::LlmLanguage>,
     #[ts(type = "Array<{ media_type: string; data: string }>")]
     pub images: Vec<crate::db::ProductCreationImage>,
     pub updated_at: String,
@@ -93,6 +97,7 @@ pub struct ProductConversationCreationRecoveryRow {
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct ProductConversationCreationRecoveryResponse {
     pub product_creations: Vec<ProductConversationCreationRecoveryRow>,
+    pub next_offset: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]

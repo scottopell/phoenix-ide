@@ -2041,12 +2041,15 @@ async fn create_product_conversation(
     };
     let selected_llm_language = match existing_job {
         Some(existing) => existing.intent.llm_language,
-        None => state
-            .runtime
-            .db()
-            .get_default_llm_language()
-            .await
-            .map_err(|error| AppError::Internal(error.to_string()))?,
+        None => match req.llm_language {
+            Some(language) => language,
+            None => state
+                .runtime
+                .db()
+                .get_default_llm_language()
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?,
+        },
     };
     let intent = crate::db::ProductCreationIntent {
         cwd: canonical_cwd,

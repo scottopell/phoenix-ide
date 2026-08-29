@@ -728,6 +728,7 @@ export interface CreateProductConversationRequest {
   objective: string;
   model: string;
   effort?: ModelEffort | null;
+  llm_language?: string | null;
   images?: ImageData[];
 }
 
@@ -1702,8 +1703,8 @@ export const api = {
     return resp.json();
   },
 
-  async listProductConversationCreations(): Promise<ProductConversationCreationRecoveryResponseType> {
-    const resp = await fetch('/api/product-conversations/creation');
+  async listProductConversationCreations(offset = 0): Promise<ProductConversationCreationRecoveryResponseType> {
+    const resp = await fetch(`/api/product-conversations/creation?offset=${offset}`);
     if (!resp.ok) {
       throw new Error('Failed to fetch product conversation creations');
     }

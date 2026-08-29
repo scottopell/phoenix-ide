@@ -78,10 +78,14 @@ function ProductCreationRecoveryList({
   rows,
   busyRequestId,
   onAction,
+  canLoadMore,
+  onLoadMore,
 }: {
   rows: ProductConversationCreationRecoveryRow[];
   busyRequestId: string | null;
   onAction: (row: ProductConversationCreationRecoveryRow, action: ProductConversationCreationAllowedActionView) => void;
+  canLoadMore: boolean;
+  onLoadMore: () => void;
 }) {
   if (rows.length === 0) return null;
   return (
@@ -122,6 +126,11 @@ function ProductCreationRecoveryList({
           );
         })}
       </div>
+      {canLoadMore && (
+        <button type="button" className="product-creation-recovery__action" onClick={onLoadMore}>
+          Load more
+        </button>
+      )}
     </section>
   );
 }
@@ -202,15 +211,29 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   const [everExpanded, setEverExpanded] = useState(!terminalPane.collapsed);
   const [recoveryRows, setRecoveryRows] = useState<ProductConversationCreationRecoveryRow[]>([]);
   const [recoveryBusyRequestId, setRecoveryBusyRequestId] = useState<string | null>(null);
+  const [recoveryNextOffset, setRecoveryNextOffset] = useState<number | null>(null);
+  const recoveryRequestSequence = useRef(0);
 
   const refreshRecoveryRows = useCallback(async () => {
+    const sequence = ++recoveryRequestSequence.current;
     try {
-      const response = await api.listProductConversationCreations();
+      const response = await api.listProductConversationCreations(0);
+      if (sequence !== recoveryRequestSequence.current) return;
       setRecoveryRows(response.product_creations);
+      setRecoveryNextOffset(response.next_offset ?? null);
     } catch {
       // Retain the last durable projection so active-row polling keeps retrying.
     }
   }, []);
+
+  const loadMoreRecoveryRows = useCallback(async () => {
+    if (recoveryNextOffset === null) return;
+    const sequence = ++recoveryRequestSequence.current;
+    const response = await api.listProductConversationCreations(recoveryNextOffset);
+    if (sequence !== recoveryRequestSequence.current) return;
+    setRecoveryRows((rows) => [...rows, ...response.product_creations]);
+    setRecoveryNextOffset(response.next_offset ?? null);
+  }, [recoveryNextOffset]);
 
   useEffect(() => {
     void refreshRecoveryRows();
@@ -313,6 +336,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
         model: row.model ?? null,
         effort: row.effort ?? null,
         images: row.images,
+        llm_language: row.llm_language,
       });
       return;
     }
@@ -362,6 +386,8 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
             rows={recoveryRows}
             busyRequestId={recoveryBusyRequestId}
             onAction={handleRecoveryAction}
+            canLoadMore={recoveryNextOffset !== null}
+            onLoadMore={() => void loadMoreRecoveryRows()}
           />
           <ConversationSettings
             cwd={conv.cwd}
@@ -438,6 +464,8 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
             rows={recoveryRows}
             busyRequestId={recoveryBusyRequestId}
             onAction={handleRecoveryAction}
+            canLoadMore={recoveryNextOffset !== null}
+            onLoadMore={() => void loadMoreRecoveryRows()}
           />
           <ConversationSettings
             cwd={conv.cwd}

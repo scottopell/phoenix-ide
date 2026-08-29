@@ -76,14 +76,24 @@ pub async fn list_product_conversations(
     }))
 }
 
+#[derive(Deserialize)]
+pub struct ProductCreationRecoveryQuery {
+    #[serde(default)]
+    offset: u32,
+}
+
 pub async fn list_product_conversation_creations(
     State(state): State<AppState>,
+    Query(query): Query<ProductCreationRecoveryQuery>,
 ) -> Result<Json<ProductConversationCreationRecoveryResponse>, AppError> {
-    let rows = state
+    let mut jobs = state
         .db
-        .list_product_creation_recovery_jobs()
+        .list_product_creation_recovery_jobs(query.offset)
         .await
-        .map_err(db_to_app)?
+        .map_err(db_to_app)?;
+    let has_more = jobs.len() > 50;
+    jobs.truncate(50);
+    let rows = jobs
         .into_iter()
         .map(|job| ProductConversationCreationRecoveryRow {
             request_id: job.request_id,
@@ -92,6 +102,7 @@ pub async fn list_product_conversation_creations(
             objective: job.intent.objective,
             model: job.intent.model,
             effort: job.intent.effort,
+            llm_language: Some(job.intent.llm_language),
             images: job.intent.images,
             updated_at: job.updated_at.to_rfc3339(),
             last_error: (job.status != "delivery_failed")
@@ -102,6 +113,7 @@ pub async fn list_product_conversation_creations(
         .collect();
     Ok(Json(ProductConversationCreationRecoveryResponse {
         product_creations: rows,
+        next_offset: has_more.then_some(query.offset + 50),
     }))
 }
 
@@ -167,6 +179,7 @@ fn creation_allowed_actions(status: &str) -> Vec<ProductConversationCreationAllo
     match status {
         "accepted" | "claimed" | "retry_scheduled" => {
             actions.push(ProductConversationCreationAllowedActionView::Cancel);
+            actions.push(ProductConversationCreationAllowedActionView::Delete);
         }
         "delivery_failed" => {
             actions.push(ProductConversationCreationAllowedActionView::RetryDelivery);
@@ -175,7 +188,7 @@ fn creation_allowed_actions(status: &str) -> Vec<ProductConversationCreationAllo
             actions.push(ProductConversationCreationAllowedActionView::Delete);
             actions.push(ProductConversationCreationAllowedActionView::StartOver);
         }
-        "cleanup_ambiguous" => {
+        "cancelling" | "cleanup_ambiguous" => {
             actions.push(ProductConversationCreationAllowedActionView::Delete);
         }
         _ => {}
@@ -851,7 +864,10 @@ mod tests {
             .iter()
             .find(|row| row["request_id"] == "req-accepted")
             .unwrap();
-        assert_eq!(accepted["allowed_actions"], serde_json::json!(["cancel"]));
+        assert_eq!(
+            accepted["allowed_actions"],
+            serde_json::json!(["cancel", "delete"])
+        );
     }
 
     #[tokio::test]
