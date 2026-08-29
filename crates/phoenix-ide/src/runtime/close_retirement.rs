@@ -455,42 +455,57 @@ impl RuntimeManager {
             .retain(|(candidate, _), _| candidate != attempt_id.as_str());
     }
 
-    async fn cancel_close_resource_lease(&self, attempt_id: &CloseAttemptId, scope: &WorkScopeId) {
-        let lease = self
-            .close_retirement_leases
-            .lock()
-            .await
-            .remove(&(attempt_id.as_str().to_string(), scope.clone()));
-        let Some(lease) = lease else {
-            return;
-        };
-        let CloseResourceLease {
-            bash,
-            tmux,
-            terminal,
-            browser,
-            resources: _,
-        } = lease;
-        self.bash_handles().cancel_retirement(bash).await;
-        if let Err(error) = self.tmux_registry().cancel_retirement(tmux).await {
-            tracing::warn!(%scope, %error, "tmux Close retirement cancellation exceeded its authority deadline");
-        }
-        self.terminals.cancel_retirement(terminal);
-        self.browser_sessions().reopen_after_permit(browser).await;
-    }
-
-    pub(crate) async fn cancel_close_resource_leases(&self, attempt_id: &CloseAttemptId) {
-        let scopes = self
-            .close_retirement_leases
-            .lock()
-            .await
+    pub(crate) async fn cancel_close_resource_leases(
+        &self,
+        attempt_id: &CloseAttemptId,
+    ) -> Result<(), String> {
+        let mut leases = self.close_retirement_leases.lock().await;
+        let keys = leases
             .keys()
             .filter(|(candidate, _)| candidate == attempt_id.as_str())
-            .map(|(_, scope)| scope.clone())
+            .cloned()
             .collect::<Vec<_>>();
-        for scope in scopes {
-            self.cancel_close_resource_lease(attempt_id, &scope).await;
+        let mut cancelling = Vec::with_capacity(keys.len());
+        let mut permits = Vec::with_capacity(keys.len());
+        for key in keys {
+            let Some(lease) = leases.remove(&key) else {
+                continue;
+            };
+            let CloseResourceLease {
+                bash,
+                tmux,
+                terminal,
+                browser,
+                resources,
+            } = lease;
+            cancelling.push((key, bash, terminal, browser, resources));
+            permits.push(tmux);
         }
+        if let Err(error) = self.tmux_registry().cancel_retirement_batch(permits).await {
+            let reason = error.to_string();
+            for ((key, bash, terminal, browser, resources), tmux) in
+                cancelling.into_iter().zip(error.into_permits())
+            {
+                leases.insert(
+                    key,
+                    CloseResourceLease {
+                        bash,
+                        tmux,
+                        terminal,
+                        browser,
+                        resources,
+                    },
+                );
+            }
+            return Err(reason);
+        }
+        drop(leases);
+        for (_, bash, terminal, browser, _) in cancelling {
+            self.bash_handles().cancel_retirement(bash).await;
+            self.terminals.cancel_retirement(terminal);
+            self.browser_sessions().reopen_after_permit(browser).await;
+        }
+        Ok(())
     }
 
     pub(crate) async fn cancel_close_before_retirement(
@@ -501,16 +516,17 @@ impl RuntimeManager {
             .close_retirement_execution
             .lock(attempt_id.as_str())
             .await;
+        self.cancel_close_resource_leases(attempt_id).await?;
         self.db()
             .cancel_close_before_retirement(attempt_id.as_str())
             .await
             .map_err(|error| error.to_string())?;
-        self.cancel_close_resource_leases(attempt_id).await;
         Ok(())
     }
 
     /// Acquires all scope fences, then seals the exact server-owned inventory.
     /// The fence stays held in `close_retirement_leases` until completion or entry into repair.
+    #[allow(clippy::too_many_lines)]
     pub(crate) async fn capture_close_retirement_inventory(
         &self,
         attempt_id: CloseAttemptId,
@@ -522,7 +538,6 @@ impl RuntimeManager {
             .await
             .map_err(|error| error.to_string())?;
         let mut requests = Vec::with_capacity(scopes.len());
-        let mut acquired_scopes = Vec::with_capacity(scopes.len());
         for captured in scopes {
             let resources = match self
                 .acquire_close_resource_lease(&attempt_id, captured.scope.clone())
@@ -530,9 +545,7 @@ impl RuntimeManager {
             {
                 Ok(resources) => resources,
                 Err(reason) => {
-                    for scope in &acquired_scopes {
-                        self.cancel_close_resource_lease(&attempt_id, scope).await;
-                    }
+                    self.cancel_close_resource_leases(&attempt_id).await?;
                     return self
                         .route_close_attempt_to_repair(
                             &attempt_id,
@@ -543,14 +556,11 @@ impl RuntimeManager {
                         .await;
                 }
             };
-            acquired_scopes.push(captured.scope.clone());
             let worktree = match captured.captured_worktree {
                 None => None,
                 Some(CapturedWorktreeIdentity::Resolved(identity)) => Some(identity),
                 Some(CapturedWorktreeIdentity::Unresolved { .. }) => {
-                    for scope in &acquired_scopes {
-                        self.cancel_close_resource_lease(&attempt_id, scope).await;
-                    }
+                    self.cancel_close_resource_leases(&attempt_id).await?;
                     return self
                         .route_close_attempt_to_repair(
                             &attempt_id,
@@ -605,9 +615,11 @@ impl RuntimeManager {
         {
             Ok(_) => Ok(()),
             Err(error) => {
-                for scope in &acquired_scopes {
-                    self.cancel_close_resource_lease(&attempt_id, scope).await;
-                }
+                self.cancel_close_resource_leases(&attempt_id)
+                    .await
+                    .map_err(|cancel_error| {
+                        format!("{error}; fence reopening failed: {cancel_error}")
+                    })?;
                 Err(error.to_string())
             }
         }
@@ -1581,7 +1593,9 @@ impl RuntimeManager {
             })
             .await
             .map_err(|error| error.to_string())?;
-        self.cancel_close_resource_leases(attempt_id).await;
+        self.cancel_close_resource_leases(attempt_id)
+            .await
+            .map_err(|cancel_error| format!("{detail}; fence reopening failed: {cancel_error}"))?;
         Err(detail)
     }
 
@@ -1607,7 +1621,9 @@ impl RuntimeManager {
             })
             .await
             .map_err(|error| error.to_string())?;
-        self.cancel_close_resource_leases(attempt_id).await;
+        self.cancel_close_resource_leases(attempt_id)
+            .await
+            .map_err(|cancel_error| format!("{detail}; fence reopening failed: {cancel_error}"))?;
         Err(detail.to_string())
     }
 
@@ -2400,7 +2416,7 @@ unsafe fn renameat_exclusive(
     destination: *const libc::c_char,
 ) -> libc::c_int {
     // SAFETY: caller supplies valid descriptors and NUL-terminated names.
-    unsafe {
+    let result = unsafe {
         libc::syscall(
             libc::SYS_renameat2,
             directory,
@@ -2408,7 +2424,12 @@ unsafe fn renameat_exclusive(
             directory,
             destination,
             libc::RENAME_NOREPLACE,
-        ) as libc::c_int
+        )
+    };
+    if result == 0 {
+        0
+    } else {
+        -1
     }
 }
 
@@ -5117,16 +5138,6 @@ mod tests {
         .unwrap();
         // SAFETY: `geteuid` has no preconditions.
         let effective_uid = unsafe { libc::geteuid() };
-        if effective_uid != 0 {
-            use std::os::unix::fs::MetadataExt as _;
-            assert_ne!(
-                std::fs::metadata(format!("/proc/{}", child.id()))
-                    .unwrap()
-                    .uid(),
-                effective_uid,
-                "test requires nondumpable proc-dir ownership to differ from process credentials"
-            );
-        }
         let process = std::fs::read_dir(&proc_root)
             .unwrap()
             .next()

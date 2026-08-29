@@ -235,6 +235,53 @@ impl TmuxRetirementPermit {
     }
 }
 
+#[derive(Debug)]
+pub struct TmuxRetirementCancellationError {
+    reason: String,
+    permit: TmuxRetirementPermit,
+}
+
+impl TmuxRetirementCancellationError {
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    #[must_use]
+    pub fn into_permit(self) -> TmuxRetirementPermit {
+        self.permit
+    }
+}
+
+impl std::fmt::Display for TmuxRetirementCancellationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for TmuxRetirementCancellationError {}
+
+#[derive(Debug)]
+pub struct TmuxRetirementBatchCancellationError {
+    reason: String,
+    permits: Vec<TmuxRetirementPermit>,
+}
+
+impl TmuxRetirementBatchCancellationError {
+    #[must_use]
+    pub fn into_permits(self) -> Vec<TmuxRetirementPermit> {
+        self.permits
+    }
+}
+
+impl std::fmt::Display for TmuxRetirementBatchCancellationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for TmuxRetirementBatchCancellationError {}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "proof_kind", rename_all = "snake_case")]
 pub enum TmuxRetirementOutcome {
@@ -2214,30 +2261,116 @@ impl TmuxRegistry {
         }
     }
 
+    /// Reopens an exact set of scope fences only after every current entry lock
+    /// has been acquired, so deadline failure cannot partially reopen the set.
+    ///
+    /// # Errors
+    /// Returns every exact permit with a fresh bounded retry deadline when map
+    /// or entry authority cannot be acquired before the batch deadline.
+    pub async fn cancel_retirement_batch(
+        &self,
+        mut permits: Vec<TmuxRetirementPermit>,
+    ) -> Result<(), TmuxRetirementBatchCancellationError> {
+        let expires = permits
+            .iter()
+            .map(|permit| permit.expires)
+            .min()
+            .unwrap_or_else(close_deadline);
+        let deadline = RetirementDeadline::new(expires);
+        let map = match deadline.read_map(self, "retirement cancellation").await {
+            Ok(map) => map,
+            Err(reason) => {
+                let retry_deadline = close_deadline();
+                for permit in &mut permits {
+                    permit.expires = retry_deadline;
+                }
+                return Err(TmuxRetirementBatchCancellationError { reason, permits });
+            }
+        };
+        let entries = permits
+            .iter()
+            .map(|permit| map.get(&permit.work_scope.stable_key()).cloned())
+            .collect::<Vec<_>>();
+        let mut guards = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            let Some(entry) = entry else {
+                guards.push(None);
+                continue;
+            };
+            let Ok(server) = tokio::time::timeout_at(expires, entry.server.write()).await else {
+                drop(guards);
+                drop(map);
+                let retry_deadline = close_deadline();
+                for permit in &mut permits {
+                    permit.expires = retry_deadline;
+                }
+                return Err(TmuxRetirementBatchCancellationError {
+                    reason:
+                        "tmux retirement cancellation entry write lock exceeded the Close deadline"
+                            .to_string(),
+                    permits,
+                });
+            };
+            guards.push(Some(server));
+        }
+        let mut reopened = Vec::new();
+        for (permit, server) in permits.iter().zip(&mut guards) {
+            let Some(server) = server else {
+                continue;
+            };
+            if Self::matches_exact_instance(server, permit) {
+                server.retirement_fenced = false;
+                if server.status == ServerStatus::Gone {
+                    server.status = ServerStatus::NotProbed;
+                }
+                reopened.push(permit.work_scope.clone());
+            }
+        }
+        drop(guards);
+        drop(map);
+        for work_scope in reopened {
+            self.emit_lifecycle(&work_scope);
+        }
+        Ok(())
+    }
+
     /// Consume exact Close retirement authority and reopen only its current
     /// generation and server identity. A stale permit is a no-op.
     ///
     /// # Errors
-    /// Returns when registry or entry authority cannot be acquired within the
-    /// permit's original absolute retirement deadline.
-    pub async fn cancel_retirement(&self, permit: TmuxRetirementPermit) -> Result<(), String> {
+    /// Returns the same exact-generation permit when registry or entry authority
+    /// cannot be acquired within the current attempt's absolute deadline. The
+    /// returned permit carries a fresh bounded deadline for an explicit retry.
+    pub async fn cancel_retirement(
+        &self,
+        mut permit: TmuxRetirementPermit,
+    ) -> Result<(), TmuxRetirementCancellationError> {
         #[cfg(test)]
         if let Some(hook) = &self.cancel_retirement_test_hook {
             hook.entered.notify_one();
             hook.release.notified().await;
         }
         let deadline = RetirementDeadline::new(permit.expires);
-        let map = deadline.read_map(self, "retirement cancellation").await?;
+        let map = match deadline.read_map(self, "retirement cancellation").await {
+            Ok(map) => map,
+            Err(reason) => {
+                permit.expires = close_deadline();
+                return Err(TmuxRetirementCancellationError { reason, permit });
+            }
+        };
         let key = permit.work_scope.stable_key();
-        let Some(entry) = map.get(&key) else {
+        let Some(entry) = map.get(&key).cloned() else {
             return Ok(());
         };
-        let mut server = tokio::time::timeout_at(permit.expires, entry.server.write())
-            .await
-            .map_err(|_| {
-                "tmux retirement cancellation entry write lock exceeded the Close deadline"
-                    .to_string()
-            })?;
+        let Ok(mut server) = tokio::time::timeout_at(permit.expires, entry.server.write()).await
+        else {
+            permit.expires = close_deadline();
+            return Err(TmuxRetirementCancellationError {
+                reason: "tmux retirement cancellation entry write lock exceeded the Close deadline"
+                    .to_string(),
+                permit,
+            });
+        };
         if Self::matches_exact_instance(&server, &permit) {
             server.retirement_fenced = false;
             if server.status == ServerStatus::Gone {
@@ -3467,7 +3600,9 @@ mod tests {
             let registry = Arc::clone(&registry);
             tokio::spawn(async move { registry.cancel_retirement(stale).await })
         };
-        entered.notified().await;
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("stale cancellation reached the deterministic barrier");
 
         let current = registry
             .begin_retirement(&work_scope, None, None, close_deadline())
@@ -3525,14 +3660,104 @@ mod tests {
             )
             .await
             .expect("retirement fence");
-        let _guard = registry.inner.write().await;
+        let guard = registry.inner.write().await;
 
         let error = registry
             .cancel_retirement(permit)
             .await
             .expect_err("cancellation must remain bounded");
 
-        assert!(error.contains("registry read lock") && error.contains("Close deadline"));
+        assert!(error.reason().contains("registry read lock"));
+        assert!(error.reason().contains("Close deadline"));
+        drop(guard);
+        registry
+            .cancel_retirement(error.into_permit())
+            .await
+            .expect("the exact permit remains retryable after the lock is released");
+        assert!(!registry.is_retirement_fenced(&work_scope).await);
+    }
+
+    #[tokio::test]
+    async fn batch_cancel_deadline_preserves_every_scope_fence_and_permit() {
+        let tmp = TempDir::new().unwrap();
+        let registry = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        let scope_a = scope("batch-cancel-a");
+        let scope_b = scope("batch-cancel-b");
+        let permit_a = registry
+            .begin_retirement(&scope_a, None, None, close_deadline())
+            .await
+            .expect("first scope fence");
+        let permit_b = registry
+            .begin_retirement(
+                &scope_b,
+                None,
+                None,
+                tokio::time::Instant::now() + Duration::from_millis(50),
+            )
+            .await
+            .expect("second scope fence");
+        let entry_b = registry
+            .inner
+            .read()
+            .await
+            .get(&scope_b.stable_key())
+            .cloned()
+            .expect("second scope entry");
+        let guard = entry_b.server.write().await;
+
+        let error = registry
+            .cancel_retirement_batch(vec![permit_a, permit_b])
+            .await
+            .expect_err("batch cancellation must remain bounded");
+        drop(guard);
+
+        assert!(registry.is_retirement_fenced(&scope_a).await);
+        assert!(registry.is_retirement_fenced(&scope_b).await);
+        registry
+            .cancel_retirement_batch(error.into_permits())
+            .await
+            .expect("the complete exact permit set remains retryable");
+        assert!(!registry.is_retirement_fenced(&scope_a).await);
+        assert!(!registry.is_retirement_fenced(&scope_b).await);
+    }
+
+    #[tokio::test]
+    async fn deadline_failed_cancel_n_cannot_reopen_newer_fence_n_plus_one() {
+        let tmp = TempDir::new().unwrap();
+        let registry = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        let work_scope = scope("deadline-stale-cancel-newer-fence");
+        let permit_n = registry
+            .begin_retirement(
+                &work_scope,
+                None,
+                None,
+                tokio::time::Instant::now() + Duration::from_millis(50),
+            )
+            .await
+            .expect("first fence");
+        let guard = registry.inner.write().await;
+        let failed_n = registry
+            .cancel_retirement(permit_n)
+            .await
+            .expect_err("first cancellation must remain bounded");
+        drop(guard);
+
+        let permit_n_plus_one = registry
+            .begin_retirement(&work_scope, None, None, close_deadline())
+            .await
+            .expect("newer fence");
+        registry
+            .cancel_retirement(failed_n.into_permit())
+            .await
+            .expect("stale exact cancellation is a no-op");
+
+        assert_eq!(permit_n_plus_one.generation().0, 2);
+        assert!(registry.is_retirement_fenced(&work_scope).await);
+        registry
+            .cancel_retirement(permit_n_plus_one)
+            .await
+            .expect("newer exact cancellation reopens admission");
+        assert!(!registry.is_retirement_fenced(&work_scope).await);
     }
 
     #[tokio::test]
@@ -3556,14 +3781,21 @@ mod tests {
             .get(&work_scope.stable_key())
             .cloned()
             .expect("scope entry");
-        let _guard = entry.server.write().await;
+        let guard = entry.server.write().await;
 
         let error = registry
             .cancel_retirement(permit)
             .await
             .expect_err("cancellation must remain bounded");
 
-        assert!(error.contains("entry write lock") && error.contains("Close deadline"));
+        assert!(error.reason().contains("entry write lock"));
+        assert!(error.reason().contains("Close deadline"));
+        drop(guard);
+        registry
+            .cancel_retirement(error.into_permit())
+            .await
+            .expect("the exact permit remains retryable after the lock is released");
+        assert!(!registry.is_retirement_fenced(&work_scope).await);
     }
 
     #[tokio::test]

@@ -3211,7 +3211,9 @@ mod lifecycle_hook_tests {
             let manager = Arc::clone(&manager);
             tokio::spawn(async move { manager.reopen_after_permit(stale).await })
         };
-        entered.notified().await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+            .await
+            .expect("stale reopen reached the deterministic barrier");
 
         let current = manager.begin_retirement(&scope).await;
         release.notify_one();

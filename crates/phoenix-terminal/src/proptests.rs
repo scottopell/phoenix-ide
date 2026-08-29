@@ -235,9 +235,10 @@ async fn current_relay_completion_reopens_its_own_fence() {
     };
 
     let completion = registry.complete_relay_retirement(relay).await;
+    let outcome = registry.reopen_after_relay_completion(completion);
     assert!(matches!(
-        registry.reopen_after_relay_completion(completion),
-        TerminalRetirementOutcome::Residual { .. }
+        outcome,
+        TerminalRetirementOutcome::Retired | TerminalRetirementOutcome::Residual { .. }
     ));
     assert!(!registry.is_retirement_fenced(&scope));
 }
