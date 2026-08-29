@@ -1738,24 +1738,28 @@ async fn observe_detached_head_and_submodules(
     let observed = tokio::task::spawn_blocking(move || -> Result<WorktreeObservation, String> {
         let mut visited = std::collections::HashSet::new();
         visited.insert(path.canonicalize().map_err(|error| error.to_string())?);
-        let head = phoenix_core::git::command()
-            .args(["rev-parse", "--verify", "HEAD"])
+        let symbolic = phoenix_core::git::command()
+            .args(["symbolic-ref", "-q", "HEAD"])
             .current_dir(&path)
             .output()
             .map_err(|error| error.to_string())?;
-        if !head.status.success() {
-            return Err(String::from_utf8_lossy(&head.stderr).trim().to_string());
-        }
-        let head_oid = head.stdout.trim_ascii().to_vec();
-        let detached = !phoenix_core::git::command()
-            .args(["symbolic-ref", "-q", "HEAD"])
-            .current_dir(&path)
-            .status()
-            .map_err(|error| error.to_string())?
-            .success();
         let mut result = Vec::new();
-        result.push((b"HEAD".to_vec(), head_oid.clone()));
-        if detached {
+        if symbolic.status.success() {
+            result.push((
+                b"HEAD_SYMBOLIC".to_vec(),
+                symbolic.stdout.trim_ascii().to_vec(),
+            ));
+        } else {
+            let head = phoenix_core::git::command()
+                .args(["rev-parse", "--verify", "HEAD"])
+                .current_dir(&path)
+                .output()
+                .map_err(|error| error.to_string())?;
+            if !head.status.success() {
+                return Err(String::from_utf8_lossy(&head.stderr).trim().to_string());
+            }
+            let head_oid = head.stdout.trim_ascii().to_vec();
+            result.push((b"HEAD".to_vec(), head_oid.clone()));
             result.push((
                 b"DETACHED".to_vec(),
                 detached_reachability_evidence(&path, &head_oid)?,
@@ -2079,8 +2083,51 @@ fn observe_initialized_submodules(
         }
         let relative_path = join_git_paths(relative_prefix, path_identity.as_bytes())?;
         let submodule_path = repository.join(path_buf_from_git_bytes(path_identity.as_bytes()));
-        if !submodule_path.join(".git").exists() {
+        if !submodule_path.is_dir() {
             continue;
+        }
+        let metadata_path = submodule_path.join(".git");
+        match std::fs::symlink_metadata(&metadata_path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let populated = std::fs::read_dir(&submodule_path)
+                    .map_err(|error| {
+                        format!(
+                            "cannot inspect gitlink {}: {error}",
+                            String::from_utf8_lossy(&relative_path)
+                        )
+                    })?
+                    .next()
+                    .transpose()
+                    .map_err(|error| {
+                        format!(
+                            "cannot inspect gitlink {}: {error}",
+                            String::from_utf8_lossy(&relative_path)
+                        )
+                    })?
+                    .is_some();
+                if populated {
+                    observation.push((
+                        [b"SUBMODULE_METADATA_MISSING\0".as_slice(), &relative_path].concat(),
+                        index_oid,
+                    ));
+                    observation.push((
+                        [
+                            b"SUBMODULE_LOSS\0submodule\0".as_slice(),
+                            relative_path.as_slice(),
+                        ]
+                        .concat(),
+                        Vec::new(),
+                    ));
+                }
+                continue;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect git metadata for {}: {error}",
+                    String::from_utf8_lossy(&relative_path)
+                ));
+            }
         }
         let canonical = submodule_path
             .canonicalize()
@@ -3891,7 +3938,17 @@ fn parse_status_losses(status: &[u8]) -> Vec<CloseLossItem> {
                     }
                 }
                 if matches!(xy[0], b'R' | b'C') || matches!(xy[1], b'R' | b'C') {
-                    let _source_path = rows.next();
+                    if let Some(source) = rows
+                        .next()
+                        .map(|source| GitPathIdentity::from_bytes(source.to_vec()))
+                    {
+                        if xy[0] == b'R' {
+                            losses.push(CloseLossItem::StagedTrackedPath(source.clone()));
+                        }
+                        if xy[1] == b'R' {
+                            losses.push(CloseLossItem::UnstagedTrackedPath(source));
+                        }
+                    }
                 }
             }
         }
@@ -4917,6 +4974,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unborn_symbolic_head_has_no_detached_commit_loss() {
+        let temp = tempfile::tempdir().unwrap();
+        run_git(temp.path(), &["init", "--quiet"]);
+
+        let (_, losses) = inspect_worktree(&inspection_identity(temp.path()))
+            .await
+            .expect("unborn symbolic HEAD remains inspectable");
+
+        assert!(!losses
+            .iter()
+            .any(|loss| matches!(loss, CloseLossItem::DetachedUnreachableCommit(_))));
+    }
+
+    #[tokio::test]
     async fn initialized_submodule_dirty_state_changes_snapshot_and_emits_exact_path() {
         let temp = tempfile::tempdir().unwrap();
         let child = temp.path().join("child");
@@ -4965,6 +5036,41 @@ mod tests {
             loss,
             CloseLossItem::UntrackedNonIgnoredPath(path)
                 if path.as_bytes() == b"deps/child/untracked"
+        )));
+    }
+
+    #[tokio::test]
+    async fn populated_gitlink_without_metadata_is_reported_as_loss() {
+        let temp = tempfile::tempdir().unwrap();
+        let child = temp.path().join("child-missing-metadata");
+        let parent = temp.path().join("parent-missing-metadata");
+        initialize_repository(&child);
+        initialize_repository(&parent);
+        let output = phoenix_core::git::command()
+            .args([
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "--quiet",
+                child.to_str().unwrap(),
+                "deps/child",
+            ])
+            .current_dir(&parent)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        run_git(&parent, &["commit", "--quiet", "-am", "add submodule"]);
+        std::fs::remove_file(parent.join("deps/child/.git")).unwrap();
+
+        let (_, losses) = inspect_worktree(&inspection_identity(&parent))
+            .await
+            .unwrap();
+
+        assert!(losses.iter().any(|loss| matches!(
+            loss,
+            CloseLossItem::InitializedSubmoduleState(path)
+                if path.as_bytes() == b"deps/child"
         )));
     }
 
@@ -5473,12 +5579,25 @@ mod tests {
     }
 
     #[test]
-    fn porcelain_rename_source_is_not_parsed_as_another_status_record() {
-        let losses = parse_status_losses(b"R  new-name.txt\0old-long-name.txt\0");
+    fn porcelain_rename_preserves_source_deletion_but_copy_does_not() {
+        let rename_losses = parse_status_losses(b"R  new-name.txt\0old-name.txt\0");
         assert_eq!(
-            losses,
+            rename_losses,
+            vec![
+                CloseLossItem::StagedTrackedPath(GitPathIdentity::from_bytes(
+                    b"new-name.txt".to_vec()
+                )),
+                CloseLossItem::StagedTrackedPath(GitPathIdentity::from_bytes(
+                    b"old-name.txt".to_vec()
+                )),
+            ]
+        );
+
+        let copy_losses = parse_status_losses(b"C  copy-name.txt\0source-name.txt\0");
+        assert_eq!(
+            copy_losses,
             vec![CloseLossItem::StagedTrackedPath(
-                GitPathIdentity::from_bytes(b"new-name.txt".to_vec())
+                GitPathIdentity::from_bytes(b"copy-name.txt".to_vec())
             )]
         );
     }

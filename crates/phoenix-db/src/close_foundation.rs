@@ -1481,8 +1481,7 @@ impl Database {
                AND (
                  EXISTS (
                    SELECT 1 FROM durable_turns turn
-                   WHERE member.member_role IN ('latest', 'root_latest')
-                     AND turn.conversation_id = participant.id
+                   WHERE turn.conversation_id = participant.id
                      AND (
                        (turn.owns_conversation = 1 AND turn.terminal_kind IS NULL)
                        OR EXISTS (
@@ -4936,6 +4935,91 @@ mod tests {
             DbError::CloseFoundationPrecondition(message)
                 if message.contains("unsettled direct-turn receipt")
         ));
+    }
+
+    #[tokio::test]
+    async fn uncaptured_aggregate_participant_remains_a_settlement_blocker() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        create_child(&db, "participant", "root").await;
+        create_child(&db, "latest", "participant").await;
+        sqlx::query(
+            "INSERT INTO workflows (
+                 workflow_id, profile_kind, profile_version, runtime_acceptance_enabled,
+                 external_acceptance_enabled, version, generation, status,
+                 snapshot_codec_family, snapshot_codec_version, snapshot_payload, created_at, updated_at
+             ) VALUES (1, 'direct_turn', 1, 1, 0, 0, 0, 'Active', 'direct_turn', 1, X'00', 1, 1),
+                      (2, 'direct_turn', 1, 1, 0, 0, 0, 'Active', 'direct_turn', 1, X'00', 1, 1)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        for (turn_id, conversation_id) in [(1, "latest"), (2, "participant")] {
+            sqlx::query(
+                "INSERT INTO durable_turns (
+                     turn_id, workflow_id, conversation_id, client_turn_key, prepared_fingerprint,
+                     prepared_payload, disposition, generation, terminal_kind, terminal_reason,
+                     owns_conversation, canonical_message_id
+                 ) VALUES (?1, ?1, ?2, 'turn-key', 'prepared', X'00', 'Runtime', 0, NULL, NULL, 1, NULL)",
+            )
+            .bind(turn_id)
+            .bind(conversation_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("latest"),
+            "attempt-all-members",
+        )
+        .await
+        .unwrap();
+        db.confirm_close_stop_work("attempt-all-members")
+            .await
+            .unwrap();
+        db.begin_close_active_work_settlement("attempt-all-members")
+            .await
+            .unwrap();
+        let target = db
+            .list_unsettled_close_direct_turn_settlement_targets("attempt-all-members")
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(target.conversation_id, "latest");
+        sqlx::query(
+            "UPDATE durable_turns SET generation = 1, terminal_kind = 'Completed', owns_conversation = 0 WHERE turn_id = 1",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert!(db
+            .record_close_direct_turn_settlement_if_released("attempt-all-members", &target)
+            .await
+            .unwrap());
+
+        assert!(matches!(
+            db.advance_close_settlement_when_quiescent("attempt-all-members")
+                .await
+                .unwrap_err(),
+            DbError::CloseFoundationPrecondition(message)
+                if message.contains("active durable member obligation")
+        ));
+        sqlx::query(
+            "UPDATE durable_turns SET generation = 1, terminal_kind = 'Completed', owns_conversation = 0 WHERE turn_id = 2",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            db.advance_close_settlement_when_quiescent("attempt-all-members")
+                .await
+                .unwrap()
+                .phase(),
+            ClosePhase::AwaitingRetirementInspection
+        );
     }
 
     #[tokio::test]

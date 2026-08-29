@@ -256,6 +256,34 @@ describe('WorkControlBar — persisted Close recovery', () => {
     await waitFor(() => expect(screen.getByLabelText('Close repair required')).toBeVisible());
   });
 
+  it('inspection failure refreshes the monotonic Close projection', async () => {
+    let resolveInitial!: (value: unknown) => void;
+    const initial = new Promise((resolve) => { resolveInitial = resolve; });
+    const conflict = Object.assign(new Error('inspection failed'), {
+      code: 'close_inspection_failed',
+    });
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockReturnValueOnce(initial as never)
+      .mockResolvedValueOnce(closeSnapshot('needs_repair', [{
+        scope: 'scope-inspection',
+        resource_kind: 'worktree',
+        identity: 'worktree:exact',
+        reason: 'inspection_failed',
+        detail: 'git metadata unreadable',
+      }]) as never);
+    vi.mocked(api.abandonTask).mockRejectedValueOnce(conflict);
+
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-inspection-race" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={prStatusHandle({ found: false })} />,
+    );
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByTestId('abandon-button'));
+    expect(await screen.findByLabelText('Close repair required')).toHaveTextContent('git metadata unreadable');
+
+    resolveInitial({ close: null });
+    await waitFor(() => expect(screen.getByLabelText('Close repair required')).toBeVisible());
+  });
+
   it('renders exact residual repair evidence after reload', async () => {
     vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(closeSnapshot('needs_repair', [{
       scope: 'scope-1',

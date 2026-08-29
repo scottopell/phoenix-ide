@@ -543,6 +543,7 @@ export function WorkControlBar({
     const code = err instanceof Error && 'code' in err && typeof err.code === 'string' ? err.code : undefined;
     if (
       code === 'close_loss_confirmation_required'
+      || code === 'close_inspection_failed'
       || code === 'close_retirement_needs_repair'
       || code === 'close_stop_work_confirmation_required'
       || code === 'close_settlement_in_progress'

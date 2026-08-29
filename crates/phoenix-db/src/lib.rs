@@ -1776,12 +1776,6 @@ impl Database {
                    FROM close_attempt_members captured
                    WHERE captured.attempt_id = ?2
                      AND captured.conversation_id = owner.id
-               )
-               AND NOT EXISTS (
-                   SELECT 1
-                   FROM close_obligations obligation
-                   WHERE obligation.attempt_id = ?2
-                     AND obligation.product_conversation_id = owner.product_conversation_id
                )",
         )
         .bind(scope_id.as_str())
@@ -1854,9 +1848,9 @@ impl Database {
     /// Retire a scope under an exact active Close attempt's captured authority.
     ///
     /// The attempt must have sealed its topology and captured the target scope.
-    /// Conversations captured by that attempt and uncaptured participants in the same
-    /// product-conversation aggregate are exempt from ownership blockers; participants
-    /// owned by a distinct aggregate and all other retirement safeguards still block.
+    /// Only conversations captured by that exact attempt are exempt from ownership
+    /// blockers. Every uncaptured active participant remains a blocker, including one
+    /// owned by the same product-conversation aggregate.
     /// # Errors
     /// Returns a [`DbError`] when the supplied Close attempt is not active and
     /// topology-sealed for the target scope, or the ordinary retirement operation fails.
@@ -23134,7 +23128,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_attempt_exempts_same_aggregate_active_subagent_absent_from_parent_capture() {
+    async fn close_attempt_blocks_same_aggregate_active_subagent_absent_from_capture() {
         let db = Database::open_in_memory().await.unwrap();
         let scope = retirement_fixture(
             &db,
@@ -23176,11 +23170,11 @@ mod tests {
             db.retire_work_scope_for_close_attempt(
                 &attempt,
                 no_live_resource(scope),
-                "Close retires same-aggregate subordinate participant scope",
+                "Close rejects uncaptured subordinate participant scope",
             )
             .await
             .unwrap(),
-            WorkScopeRetirementOutcome::Retired
+            WorkScopeRetirementOutcome::Blocked(WorkScopeRetirementBlocker::ActiveSubAgent)
         );
     }
 
