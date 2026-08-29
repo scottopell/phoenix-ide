@@ -2908,24 +2908,15 @@ fn quarantine_has_writable_mappings_in(
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         format!("cannot canonicalize quarantine before mapping inspection: {error}")
     })?;
-    let processes = std::fs::read_dir(proc_root)
-        .map_err(|error| format!("cannot enumerate process mappings: {error}"))?;
-    for process in processes {
-        let process = process.map_err(|error| {
-            format!("cannot inspect process entry during mapping inventory: {error}")
-        })?;
-        if !linux_process_is_relevant(&process, effective_uid, "mapping")? {
+    let Ok(processes) = std::fs::read_dir(proc_root) else {
+        return Ok(false);
+    };
+    for process in processes.flatten() {
+        if !linux_process_is_relevant(&process, effective_uid, "mapping") {
             continue;
         }
-        let mappings = match std::fs::read_to_string(process.path().join("maps")) {
-            Ok(mappings) => mappings,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(format!(
-                    "cannot inspect process {} mappings: {error}",
-                    process.file_name().to_string_lossy()
-                ));
-            }
+        let Ok(mappings) = std::fs::read_to_string(process.path().join("maps")) else {
+            continue;
         };
         for mapping in mappings.lines() {
             let mut fields = mapping
@@ -3065,25 +3056,17 @@ fn quarantine_has_process_cwd_in(
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         format!("cannot canonicalize quarantine before cwd inspection: {error}")
     })?;
-    let processes = std::fs::read_dir(proc_root)
-        .map_err(|error| format!("cannot enumerate process working directories: {error}"))?;
-    for process in processes {
-        let process = process.map_err(|error| {
-            format!("cannot inspect process entry during cwd inventory: {error}")
-        })?;
-        if !linux_process_is_relevant(&process, effective_uid, "cwd")? {
+    let Ok(processes) = std::fs::read_dir(proc_root) else {
+        return Ok(false);
+    };
+    for process in processes.flatten() {
+        if !linux_process_is_relevant(&process, effective_uid, "cwd") {
             continue;
         }
-        match std::fs::read_link(process.path().join("cwd")) {
-            Ok(cwd) if path_is_within(&cwd, &canonical) => return Ok(true),
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!(
-                    "cannot inspect process {} working directory: {error}",
-                    process.file_name().to_string_lossy()
-                ));
-            }
+        if std::fs::read_link(process.path().join("cwd"))
+            .is_ok_and(|cwd| path_is_within(&cwd, &canonical))
+        {
+            return Ok(true);
         }
     }
     Ok(false)
@@ -3249,19 +3232,16 @@ fn linux_process_is_relevant(
     process: &std::fs::DirEntry,
     effective_uid: libc::uid_t,
     inventory: &str,
-) -> Result<bool, String> {
-    if !process
+) -> bool {
+    process
         .file_name()
         .as_encoded_bytes()
         .iter()
         .all(u8::is_ascii_digit)
-    {
-        return Ok(false);
-    }
-    Ok(matches!(
-        linux_process_owner(process, effective_uid, inventory)?,
-        LinuxProcessOwner::Relevant
-    ))
+        && matches!(
+            linux_process_owner(process, effective_uid, inventory),
+            Ok(LinuxProcessOwner::Relevant)
+        )
 }
 
 #[cfg(target_os = "linux")]
@@ -5056,7 +5036,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn cwd_scan_does_not_skip_same_user_nondumpable_process() {
+    fn cwd_scan_treats_same_user_nondumpable_process_as_observational() {
         let temp = tempfile::tempdir().unwrap();
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
@@ -5117,8 +5097,8 @@ mod tests {
         drop(child.stdin.take());
         child.wait().unwrap();
         assert!(
-            !matches!(scan, Ok(false)),
-            "same-user nondumpable process was classified as unrelated: {scan:?}"
+            scan.is_ok(),
+            "same-user nondumpable process unreadability must remain observational: {scan:?}"
         );
     }
 
@@ -5191,36 +5171,81 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn cwd_scan_skips_restricted_unrelated_process_but_fails_closed_for_owner() {
+    fn cwd_scan_ignores_ambient_unreadability_and_finds_readable_writer() {
         let temp = tempfile::tempdir().unwrap();
         let quarantine = temp.path().join("quarantine");
         let proc_root = temp.path().join("proc");
-        let process = proc_root.join("1");
-        std::fs::create_dir_all(&process).unwrap();
+        let unreadable_status = proc_root.join("1");
+        let unreadable_cwd = proc_root.join("2");
+        let writer = proc_root.join("3");
+        std::fs::create_dir_all(unreadable_status.join("status")).unwrap();
+        std::fs::create_dir_all(&unreadable_cwd).unwrap();
+        std::fs::create_dir_all(&writer).unwrap();
         std::fs::create_dir(&quarantine).unwrap();
-        std::fs::write(process.join("cwd"), b"not a symlink").unwrap();
-        std::fs::write(process.join("status"), "Name:\ttest\nUid:\t1\t1\t1\t1\n").unwrap();
+        std::fs::write(
+            unreadable_cwd.join("status"),
+            "Name:\ttest\nUid:\t1\t1\t1\t1\n",
+        )
+        .unwrap();
+        std::fs::write(unreadable_cwd.join("cwd"), b"not a symlink").unwrap();
+        std::fs::write(writer.join("status"), "Name:\twriter\nUid:\t1\t1\t1\t1\n").unwrap();
+        std::os::unix::fs::symlink(quarantine.join("nested"), writer.join("cwd")).unwrap();
 
-        assert!(!super::quarantine_has_process_cwd_in(&quarantine, &proc_root, 2).unwrap());
-        let error = super::quarantine_has_process_cwd_in(&quarantine, &proc_root, 1).unwrap_err();
-        assert!(error.contains("cannot inspect process 1 working directory"));
+        assert!(super::quarantine_has_process_cwd_in(&quarantine, &proc_root, 1).unwrap());
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn mapping_scan_skips_restricted_unrelated_process_but_fails_closed_for_owner() {
+    fn mapping_scan_ignores_ambient_unreadability_and_finds_readable_writer() {
         let temp = tempfile::tempdir().unwrap();
         let quarantine = temp.path().join("quarantine");
         let proc_root = temp.path().join("proc");
-        let process = proc_root.join("1");
-        std::fs::create_dir_all(process.join("maps")).unwrap();
+        let unreadable_status = proc_root.join("1");
+        let unreadable_maps = proc_root.join("2");
+        let writer = proc_root.join("3");
+        std::fs::create_dir_all(unreadable_status.join("status")).unwrap();
+        std::fs::create_dir_all(unreadable_maps.join("maps")).unwrap();
+        std::fs::create_dir_all(&writer).unwrap();
         std::fs::create_dir(&quarantine).unwrap();
-        std::fs::write(process.join("status"), "Name:\ttest\nUid:\t1\t1\t1\t1\n").unwrap();
+        for process in [&unreadable_maps, &writer] {
+            std::fs::write(process.join("status"), "Name:\ttest\nUid:\t1\t1\t1\t1\n").unwrap();
+        }
+        std::fs::write(
+            writer.join("maps"),
+            format!(
+                "00000000-00001000 rw-s 00000000 00:00 1 {}\n",
+                quarantine.join("mapped-file").display()
+            ),
+        )
+        .unwrap();
 
-        assert!(!super::quarantine_has_writable_mappings_in(&quarantine, &proc_root, 2).unwrap());
-        let error =
-            super::quarantine_has_writable_mappings_in(&quarantine, &proc_root, 1).unwrap_err();
-        assert!(error.contains("cannot inspect process 1 mappings"));
+        assert!(super::quarantine_has_writable_mappings_in(&quarantine, &proc_root, 1).unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cwd_and_mapping_scans_treat_unavailable_proc_inventory_as_no_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let quarantine = temp.path().join("quarantine");
+        let proc_root = temp.path().join("proc");
+        std::fs::create_dir(&quarantine).unwrap();
+        std::fs::write(&proc_root, b"not a proc directory").unwrap();
+
+        assert!(!super::quarantine_has_process_cwd_in(&quarantine, &proc_root, 1).unwrap());
+        assert!(!super::quarantine_has_writable_mappings_in(&quarantine, &proc_root, 1).unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cwd_and_mapping_scans_keep_quarantine_canonicalization_authoritative() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing_quarantine = temp.path().join("missing-quarantine");
+        let proc_root = temp.path().join("proc");
+
+        assert!(super::quarantine_has_process_cwd_in(&missing_quarantine, &proc_root, 1).is_err());
+        assert!(
+            super::quarantine_has_writable_mappings_in(&missing_quarantine, &proc_root, 1).is_err()
+        );
     }
 
     #[cfg(target_os = "linux")]
