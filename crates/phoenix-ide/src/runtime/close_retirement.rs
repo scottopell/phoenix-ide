@@ -364,11 +364,17 @@ impl RuntimeManager {
             }
         };
         let tmux = match tmux_discovery {
-            PersistentTmuxDiscovery::Absent => {
-                self.tmux_registry()
-                    .begin_retirement(&key, None, None, tmux_expires)
-                    .await
-            }
+            PersistentTmuxDiscovery::Absent => match self
+                .tmux_registry()
+                .begin_retirement(&key, None, None, tmux_expires)
+                .await
+            {
+                Ok(permit) => permit,
+                Err(outcome) => {
+                    self.bash_handles().cancel_retirement(bash).await;
+                    return Err(format!("tmux retirement fencing failed: {outcome:?}"));
+                }
+            },
             PersistentTmuxDiscovery::Exact(identity) => {
                 match self
                     .tmux_registry()
@@ -376,11 +382,17 @@ impl RuntimeManager {
                     .await
                 {
                     Ok(TmuxRetirementRehydration::Permit(permit)) => permit,
-                    Ok(TmuxRetirementRehydration::AbsenceVerified) => {
-                        self.tmux_registry()
-                            .begin_retirement(&key, None, None, tmux_expires)
-                            .await
-                    }
+                    Ok(TmuxRetirementRehydration::AbsenceVerified) => match self
+                        .tmux_registry()
+                        .begin_retirement(&key, None, None, tmux_expires)
+                        .await
+                    {
+                        Ok(permit) => permit,
+                        Err(outcome) => {
+                            self.bash_handles().cancel_retirement(bash).await;
+                            return Err(format!("tmux retirement fencing failed: {outcome:?}"));
+                        }
+                    },
                     Ok(TmuxRetirementRehydration::Residual { reason }) => {
                         self.bash_handles().cancel_retirement(bash).await;
                         return Err(format!("tmux identity is ambiguous: {reason}"));

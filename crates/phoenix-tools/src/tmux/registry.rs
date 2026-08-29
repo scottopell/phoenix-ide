@@ -409,6 +409,13 @@ pub struct TmuxLifecycleEvent {
 /// path. Mirrors [`super::super::bash::registry::BashLifecycleSink`].
 pub type TmuxLifecycleSink = tokio::sync::mpsc::UnboundedSender<TmuxLifecycleEvent>;
 
+#[cfg(test)]
+#[derive(Debug)]
+struct EnsureLiveLockTestHook {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
 /// Top-level registry: maps `ResourceScopeKey::stable_key()` → per-scope tmux
 /// server. One registry instance per Phoenix process.
 #[derive(Debug)]
@@ -431,6 +438,8 @@ pub struct TmuxRegistry {
     /// tool-level tests. Mirrors `BashHandleRegistry::lifecycle_sink`.
     lifecycle_sink: Option<TmuxLifecycleSink>,
     contain_test_spawns: bool,
+    #[cfg(test)]
+    ensure_live_lock_test_hook: Option<Arc<EnsureLiveLockTestHook>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -464,6 +473,8 @@ impl TmuxRegistry {
             runtime_assets: OnceCell::new(),
             lifecycle_sink: None,
             contain_test_spawns: false,
+            #[cfg(test)]
+            ensure_live_lock_test_hook: None,
         }
     }
 
@@ -514,6 +525,8 @@ impl TmuxRegistry {
             runtime_assets: OnceCell::new(),
             lifecycle_sink: None,
             contain_test_spawns: false,
+            #[cfg(test)]
+            ensure_live_lock_test_hook: None,
         }
     }
 
@@ -535,12 +548,25 @@ impl TmuxRegistry {
             runtime_assets: OnceCell::new(),
             lifecycle_sink: sink,
             contain_test_spawns: false,
+            #[cfg(test)]
+            ensure_live_lock_test_hook: None,
         }
     }
 
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn with_test_spawn_containment(mut self) -> Self {
         self.contain_test_spawns = true;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_ensure_live_lock_test_hook(
+        mut self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.ensure_live_lock_test_hook =
+            Some(Arc::new(EnsureLiveLockTestHook { entered, release }));
         self
     }
 
@@ -783,13 +809,17 @@ impl TmuxRegistry {
         legacy_worktree_path: Option<&Path>,
         legacy_conversation_id: Option<&str>,
     ) -> Result<Arc<RwLock<TmuxServer>>, TmuxError> {
-        if let Some(server) = self.get_existing(work_scope).await {
-            if server.read().await.retirement_fenced {
+        let existing_socket = if let Some(server) = self.get_existing(work_scope).await {
+            let server = server.read().await;
+            if server.retirement_fenced {
                 return Err(TmuxError::RetirementFenced {
                     work_scope: work_scope.clone(),
                 });
             }
-        }
+            Some(server.socket_path.clone())
+        } else {
+            None
+        };
         if !self.binary_available {
             return Err(TmuxError::BinaryUnavailable);
         }
@@ -809,30 +839,35 @@ impl TmuxRegistry {
         let legacy_socket = legacy_worktree_path
             .map(|path| socket_path_for_worktree(&self.socket_dir, path))
             .or_else(|| legacy_conversation_id.map(|id| socket_path_for(&self.socket_dir, id)));
-        let current_probe = probe(&socket_path)
-            .await
-            .map_err(|source| TmuxError::ProbeFailed {
-                socket_path: socket_path.clone(),
-                source,
-            })?;
-        let selected_socket = match current_probe {
-            ProbeResult::Live => socket_path.clone(),
-            ProbeResult::DeadSocket if endpoint_is_definitely_not_socket(&socket_path) => {
-                socket_path.clone()
-            }
-            ProbeResult::DeadSocket => return Err(ambiguous_socket_probe(&socket_path)),
-            ProbeResult::NoSocket | ProbeResult::NoServer => {
-                if let Some(legacy) = legacy_socket.filter(|legacy| *legacy != socket_path) {
-                    let legacy_probe =
-                        probe(&legacy)
-                            .await
-                            .map_err(|source| TmuxError::ProbeFailed {
-                                socket_path: legacy.clone(),
-                                source,
-                            })?;
-                    select_socket_from_probes(socket_path.clone(), legacy, legacy_probe)?
-                } else {
+        let selected_socket = if let Some(existing_socket) = existing_socket {
+            existing_socket
+        } else {
+            let current_probe =
+                probe(&socket_path)
+                    .await
+                    .map_err(|source| TmuxError::ProbeFailed {
+                        socket_path: socket_path.clone(),
+                        source,
+                    })?;
+            match current_probe {
+                ProbeResult::Live => socket_path.clone(),
+                ProbeResult::DeadSocket if endpoint_is_definitely_not_socket(&socket_path) => {
                     socket_path.clone()
+                }
+                ProbeResult::DeadSocket => return Err(ambiguous_socket_probe(&socket_path)),
+                ProbeResult::NoSocket | ProbeResult::NoServer => {
+                    if let Some(legacy) = legacy_socket.filter(|legacy| *legacy != socket_path) {
+                        let legacy_probe =
+                            probe(&legacy)
+                                .await
+                                .map_err(|source| TmuxError::ProbeFailed {
+                                    socket_path: legacy.clone(),
+                                    source,
+                                })?;
+                        select_socket_from_probes(socket_path.clone(), legacy, legacy_probe)?
+                    } else {
+                        socket_path.clone()
+                    }
                 }
             }
         };
@@ -856,6 +891,11 @@ impl TmuxRegistry {
         let server_arc = entry.server.clone();
 
         let mut server = server_arc.write().await;
+        #[cfg(test)]
+        if let Some(hook) = &self.ensure_live_lock_test_hook {
+            hook.entered.notify_one();
+            hook.release.notified().await;
+        }
         if server.retirement_fenced {
             return Err(TmuxError::RetirementFenced {
                 work_scope: work_scope.clone(),
@@ -1251,13 +1291,16 @@ impl TmuxRegistry {
         }
     }
 
+    /// # Errors
+    /// Returns a typed residual when the per-scope retirement fence cannot be
+    /// acquired before `expires`.
     pub async fn begin_retirement(
         &self,
         work_scope: &ResourceScopeKey,
         legacy_worktree_path: Option<&Path>,
         legacy_conversation_id: Option<&str>,
         expires: tokio::time::Instant,
-    ) -> TmuxRetirementPermit {
+    ) -> Result<TmuxRetirementPermit, TmuxRetirementOutcome> {
         self.begin_retirement_inner(
             work_scope,
             legacy_worktree_path,
@@ -1288,7 +1331,11 @@ impl TmuxRegistry {
     ) -> Result<TmuxRetirementRehydration, TmuxError> {
         let current_entry = self.get_existing(work_scope).await;
         if let Some(entry) = current_entry {
-            let current = entry.read().await;
+            let Ok(current) = tokio::time::timeout_at(expires, entry.read()).await else {
+                return Ok(TmuxRetirementRehydration::Residual {
+                    reason: "tmux entry identity read lock exceeded the Close deadline".to_string(),
+                });
+            };
             let exact_current = current.socket_path == persisted.socket_path
                 && current.server_token == persisted.server_token;
             let current_socket_matches = current.socket_path == persisted.socket_path;
@@ -1305,7 +1352,14 @@ impl TmuxRegistry {
                         Ok(TmuxRetirementRehydration::Residual { reason })
                     }
                     ExactTmuxIdentityState::Live => {
-                        let mut current = entry.write().await;
+                        let Ok(mut current) = tokio::time::timeout_at(expires, entry.write()).await
+                        else {
+                            return Ok(TmuxRetirementRehydration::Residual {
+                                reason:
+                                    "tmux retirement fence write lock exceeded the Close deadline"
+                                        .to_string(),
+                            });
+                        };
                         if current.retirement_fenced {
                             return Ok(TmuxRetirementRehydration::Residual {
                                 reason: format!(
@@ -1387,7 +1441,13 @@ impl TmuxRegistry {
                 };
 
                 let current_identity = {
-                    let server = entry.server.read().await;
+                    let Ok(server) = tokio::time::timeout_at(expires, entry.server.read()).await
+                    else {
+                        return Ok(TmuxRetirementRehydration::Residual {
+                            reason: "tmux rehydrated entry identity read lock exceeded the Close deadline"
+                                .to_string(),
+                        });
+                    };
                     if server.socket_path == persisted.socket_path {
                         None
                     } else {
@@ -1412,7 +1472,14 @@ impl TmuxRegistry {
                         Ok(TmuxRetirementRehydration::Residual { reason })
                     }
                     ExactTmuxIdentityState::Live => {
-                        let mut server = entry.server.write().await;
+                        let Ok(mut server) =
+                            tokio::time::timeout_at(expires, entry.server.write()).await
+                        else {
+                            return Ok(TmuxRetirementRehydration::Residual {
+                                reason: "tmux rehydrated retirement fence write lock exceeded the Close deadline"
+                                    .to_string(),
+                            });
+                        };
                         if server.retirement_fenced {
                             return Ok(TmuxRetirementRehydration::Residual {
                                 reason: format!(
@@ -1451,7 +1518,7 @@ impl TmuxRegistry {
         legacy_conversation_id: Option<&str>,
         emit_lifecycle: bool,
         expires: tokio::time::Instant,
-    ) -> TmuxRetirementPermit {
+    ) -> Result<TmuxRetirementPermit, TmuxRetirementOutcome> {
         let current = self.derived_socket_path(work_scope);
         let legacy = legacy_worktree_path
             .map(|path| socket_path_for_worktree(&self.socket_dir, path))
@@ -1478,13 +1545,17 @@ impl TmuxRegistry {
         };
 
         let (entry, created) = self.get_or_insert(work_scope, socket_path).await;
-        let mut server = entry.server.write().await;
+        let Ok(mut server) = tokio::time::timeout_at(expires, entry.server.write()).await else {
+            return Err(TmuxRetirementOutcome::RemovalFailed {
+                reason: "tmux retirement fence write lock exceeded the Close deadline".to_string(),
+            });
+        };
         let permit = Self::build_retirement_permit(work_scope, &mut server, !created, expires);
         drop(server);
         if !created && emit_lifecycle {
             self.emit_lifecycle(work_scope);
         }
-        permit
+        Ok(permit)
     }
 
     fn matches_exact_instance(server: &TmuxServer, permit: &TmuxRetirementPermit) -> bool {
@@ -1712,7 +1783,11 @@ impl TmuxRegistry {
             return self.verify_exact_absence(permit).await;
         };
 
-        let server = entry.server.write().await;
+        let Ok(server) = tokio::time::timeout_at(permit.expires, entry.server.write()).await else {
+            return Ok(TmuxRetirementOutcome::RemovalFailed {
+                reason: "tmux exact teardown write lock exceeded the Close deadline".to_string(),
+            });
+        };
         let exact_owned = Self::matches_exact_instance(&server, permit);
         if !exact_owned {
             return self.verify_exact_absence(permit).await;
@@ -1814,18 +1889,31 @@ impl TmuxRegistry {
                 };
                 let exact_owned = match current {
                     Some(current) => {
-                        let server = current.server.read().await;
+                        let Ok(server) =
+                            tokio::time::timeout_at(permit.expires, current.server.read()).await
+                        else {
+                            return Ok(TmuxRetirementOutcome::RemovalFailed {
+                                reason: "tmux final identity read lock exceeded the Close deadline"
+                                    .to_string(),
+                            });
+                        };
                         Self::matches_exact_instance(&server, permit)
                     }
                     None => false,
                 };
                 if exact_owned {
-                    let removed = self
-                        .inner
-                        .write()
+                    let removed = match tokio::time::timeout_at(permit.expires, self.inner.write())
                         .await
-                        .remove(&permit.work_scope.stable_key())
-                        .is_some();
+                    {
+                        Ok(mut inner) => inner.remove(&permit.work_scope.stable_key()).is_some(),
+                        Err(_) => {
+                            return Ok(TmuxRetirementOutcome::RemovalFailed {
+                                reason:
+                                    "tmux final registry write lock exceeded the Close deadline"
+                                        .to_string(),
+                            });
+                        }
+                    };
                     if removed && permit.had_entry {
                         self.emit_lifecycle(&permit.work_scope);
                     }
@@ -2000,9 +2088,35 @@ impl TmuxRegistry {
             };
         }
         if let Some(entry) = existing {
-            if entry.read().await.status == ServerStatus::NotProbed {
-                self.inner.write().await.remove(&work_scope.stable_key());
-                self.emit_lifecycle(work_scope);
+            let status = match tokio::time::timeout_at(expires, entry.read()).await {
+                Ok(entry) => entry.status,
+                Err(_) => {
+                    return CascadeReport {
+                        socket_path: self.derived_socket_path(work_scope),
+                        kill_server_error: Some(
+                            "tmux cascade entry read lock exceeded the Close deadline".to_string(),
+                        ),
+                        unlink_error: None,
+                    };
+                }
+            };
+            if status == ServerStatus::NotProbed {
+                let removed = match tokio::time::timeout_at(expires, self.inner.write()).await {
+                    Ok(mut inner) => inner.remove(&work_scope.stable_key()).is_some(),
+                    Err(_) => {
+                        return CascadeReport {
+                            socket_path: self.derived_socket_path(work_scope),
+                            kill_server_error: Some(
+                                "tmux cascade registry write lock exceeded the Close deadline"
+                                    .to_string(),
+                            ),
+                            unlink_error: None,
+                        };
+                    }
+                };
+                if removed {
+                    self.emit_lifecycle(work_scope);
+                }
                 return CascadeReport {
                     socket_path: self.derived_socket_path(work_scope),
                     kill_server_error: None,
@@ -2019,24 +2133,31 @@ impl TmuxRegistry {
                 expires,
             )
             .await;
-        let outcome = match self.complete_retirement(&permit).await {
-            Ok(outcome) => outcome,
-            Err(error) => TmuxRetirementOutcome::RemovalFailed {
-                reason: error.to_string(),
+        let socket_path = permit.as_ref().map_or_else(
+            |_| self.derived_socket_path(work_scope),
+            |permit| permit.instance.socket_path.clone(),
+        );
+        let outcome = match permit {
+            Ok(permit) => match self.complete_retirement(&permit).await {
+                Ok(outcome) => outcome,
+                Err(error) => TmuxRetirementOutcome::RemovalFailed {
+                    reason: error.to_string(),
+                },
             },
+            Err(outcome) => outcome,
         };
 
         match outcome {
             TmuxRetirementOutcome::Retired | TmuxRetirementOutcome::AbsenceVerified => {
                 CascadeReport {
-                    socket_path: permit.instance.socket_path,
+                    socket_path,
                     kill_server_error: None,
                     unlink_error: None,
                 }
             }
             TmuxRetirementOutcome::IdentityNotProven { reason }
             | TmuxRetirementOutcome::RemovalFailed { reason } => CascadeReport {
-                socket_path: permit.instance.socket_path,
+                socket_path,
                 kill_server_error: Some(reason),
                 unlink_error: None,
             },
@@ -2775,7 +2896,8 @@ mod tests {
         let work_scope = scope("retirement-fence");
         let permit = reg
             .begin_retirement(&work_scope, None, None, close_deadline())
-            .await;
+            .await
+            .expect("retirement fence should be acquired");
 
         assert_eq!(permit.work_scope, work_scope);
         assert!(reg.is_retirement_fenced(&work_scope).await);
@@ -2790,6 +2912,62 @@ mod tests {
             reg.ensure_live(&work_scope, tmp.path(), None, None).await,
             Err(TmuxError::BinaryUnavailable)
         ));
+    }
+
+    #[tokio::test]
+    async fn close_deadline_bounds_retirement_lock_held_by_wedged_ensure_live() {
+        let tmp = TempDir::new().unwrap();
+        let lock_held = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let registry = Arc::new(
+            TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), true)
+                .with_ensure_live_lock_test_hook(Arc::clone(&lock_held), Arc::clone(&release)),
+        );
+        let work_scope = scope("deadline-ensure-live-lock");
+        let socket_path =
+            socket_path_for_worktree(tmp.path(), Path::new("deadline-ensure-live-lock"));
+        let (entry, _) = registry
+            .get_or_insert(&work_scope, socket_path.clone())
+            .await;
+        let original_token = {
+            let server = entry.server.read().await;
+            server.server_token.clone()
+        };
+
+        let ensure_live = {
+            let registry = Arc::clone(&registry);
+            let work_scope = work_scope.clone();
+            let cwd = tmp.path().to_path_buf();
+            tokio::spawn(async move { registry.ensure_live(&work_scope, &cwd, None, None).await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), lock_held.notified())
+            .await
+            .expect("ensure_live must acquire its per-scope lock");
+
+        let expires = tokio::time::Instant::now() + Duration::from_millis(100);
+        let started = tokio::time::Instant::now();
+        let outcome = registry
+            .begin_retirement(&work_scope, None, None, expires)
+            .await
+            .expect_err("contended retirement must preserve a typed residual");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(matches!(
+            outcome,
+            TmuxRetirementOutcome::RemovalFailed { reason }
+                if reason.contains("write lock") && reason.contains("Close deadline")
+        ));
+
+        let exact_server = registry
+            .get_existing(&work_scope)
+            .await
+            .expect("contended server entry must remain exact");
+        ensure_live.abort();
+        assert!(ensure_live.await.unwrap_err().is_cancelled());
+        let server = exact_server.read().await;
+        assert_eq!(server.socket_path, socket_path);
+        assert_eq!(server.server_token, original_token);
+        assert!(!server.retirement_fenced);
+        assert_eq!(server.retirement_generation, 0);
     }
 
     #[cfg(unix)]
@@ -3031,7 +3209,8 @@ mod tests {
         entry.server.write().await.status = ServerStatus::Live;
         let permit = registry
             .begin_retirement(&work_scope, None, None, tokio::time::Instant::now())
-            .await;
+            .await
+            .expect("uncontended retirement fence should be acquired");
 
         let outcome = registry.complete_retirement(&permit).await.unwrap();
         assert!(matches!(
@@ -3292,7 +3471,8 @@ mod tests {
         let stale_token = first.read().await.server_token.clone();
         let permit = reg
             .begin_retirement(&work_scope, None, None, close_deadline())
-            .await;
+            .await
+            .expect("retirement fence should be acquired");
         assert_eq!(permit.instance.socket_path, stale_socket);
         assert_eq!(permit.instance.server_token, stale_token);
 
