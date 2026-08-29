@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { NewConversationPage } from './NewConversationPage';
+import { recoveryDiscoveryDelay } from './recoveryPolling';
 import { ConversationProvider } from '../conversation';
 
 const { apiMock } = vi.hoisted(() => ({ apiMock: {
@@ -203,6 +204,12 @@ describe('NewConversationPage', () => {
     expect(delays.filter((delay) => delay === 5000)).toHaveLength(initialFiveSecondTimers + 1);
 
     setTimeout.mockRestore();
+  });
+
+  it('continues recovery discovery at the capped backoff after extended outages', () => {
+    expect([0, 1, 2, 3, 4, 5].map((attempt) => recoveryDiscoveryDelay(attempt, false)))
+      .toEqual([2000, 5000, 10000, 30000, 30000, 30000]);
+    expect(recoveryDiscoveryDelay(20, true)).toBe(2000);
   });
 
   it('backs off terminal cleanup conflicts instead of polling continuously', async () => {

@@ -8,6 +8,7 @@ import { SUPPORTED_IMAGE_TYPES } from '../utils/images';
 import { ExpansionError, api, type ProductConversationCreationAllowedActionView, type ProductConversationCreationRecoveryRow } from '../api';
 import { useCreateConversation } from '../hooks/useCreateConversation';
 import './NewConversationPage.css';
+import { recoveryDiscoveryDelay } from './recoveryPolling';
 import { useResizablePane } from '../hooks/useResizablePane';
 import { useIsDesktop } from '../hooks/useMediaQuery';
 import { useInlineReferences } from '../hooks';
@@ -144,8 +145,6 @@ const RECOVERY_ADVANCING_STATUSES = new Set([
   'cancelling',
   'delivery_pending',
 ]);
-const RECOVERY_DISCOVERY_BACKOFF_MS = [2000, 5000, 10000, 30000] as const;
-
 interface NewConversationPageProps {
   desktopMode?: boolean;
 }
@@ -280,10 +279,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
     const schedule = () => {
       const canAdvance = recoveryRowsProjection.current.some((row) =>
         RECOVERY_ADVANCING_STATUSES.has(row.status));
-      const delay = canAdvance
-        ? RECOVERY_DISCOVERY_BACKOFF_MS[0]
-        : RECOVERY_DISCOVERY_BACKOFF_MS[discoveryAttempt++];
-      if (delay === undefined) return;
+      const delay = recoveryDiscoveryDelay(discoveryAttempt++, canAdvance);
       timeout = window.setTimeout(async () => {
         await refreshRecoveryRows();
         if (!stopped) schedule();
