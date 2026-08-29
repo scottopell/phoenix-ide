@@ -1265,8 +1265,10 @@ impl Database {
             "UPDATE product_creation_resource_reservations
              SET ownership_token = ?7, updated_at_unix_micros = ?1
              WHERE request_id = ?2 AND generation = ?3 AND resource_identity = ?4
-               AND status = 'reserved'
-               AND (ownership_token IS NULL OR ownership_token = ?7)
+               AND (
+                   (status = 'reserved' AND (ownership_token IS NULL OR ownership_token = ?7))
+                   OR (status = 'present' AND ownership_token = ?7)
+               )
                AND EXISTS (
                    SELECT 1 FROM product_creation_jobs j
                    WHERE j.request_id = ?2 AND j.status = 'claimed'
@@ -2439,6 +2441,26 @@ mod product_creation_tests {
             .await
             .unwrap());
 
+        assert!(db
+            .mark_product_creation_resource_present(
+                "req-owner-fence",
+                &claimed.claim,
+                resource,
+                "owner-token",
+                now + chrono::Duration::seconds(1),
+            )
+            .await
+            .unwrap());
+        assert!(db
+            .record_product_creation_resource_ownership(
+                "req-owner-fence",
+                &claimed.claim,
+                resource,
+                "owner-token",
+                now + chrono::Duration::seconds(1),
+            )
+            .await
+            .unwrap());
         assert!(!db
             .record_product_creation_resource_ownership(
                 "req-owner-fence",
