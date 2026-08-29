@@ -82,7 +82,9 @@ export function useCreateConversation(navigate: (path: string) => void) {
     } catch { /* use a fresh in-memory identity */ }
     return generateUUID();
   });
-  const [recoveredLlmLanguage, setRecoveredLlmLanguage] = useState<string | null>(null);
+  const [recoveredLlmLanguage, setRecoveredLlmLanguage] = useState<string | null>(() => {
+    try { return localStorage.getItem('phoenix-create-llm-language'); } catch { return null; }
+  });
   const replayIntentRef = useRef<string | null>((() => {
     try { return localStorage.getItem(REPLAY_CREATE_INTENT_KEY); } catch { return null; }
   })());
@@ -271,6 +273,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
       setImages([]);
       setFiles([]);
       setRecoveredLlmLanguage(null);
+      try { localStorage.removeItem('phoenix-create-llm-language'); } catch { /* best effort */ }
       clearNewConversationDraft();
       try {
         localStorage.removeItem(REPLAY_CREATE_REQUEST_KEY);

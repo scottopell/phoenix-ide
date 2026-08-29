@@ -32,6 +32,7 @@ function recoveryStatusLabel(status: string): string {
     case 'failed': return 'Failed';
     case 'cancelled': return 'Cancelled';
     case 'delivery_failed': return 'Needs retry';
+    case 'delivery_pending': return 'Finishing';
     default: return status;
   }
 }
@@ -253,7 +254,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   useEffect(() => {
     const interval = window.setInterval(() => void refreshRecoveryRows(), 2000);
     return () => window.clearInterval(interval);
-  }, [recoveryRows, refreshRecoveryRows]);
+  }, [refreshRecoveryRows]);
 
   // Auto-resize textarea
   useEffect(() => {
