@@ -137,6 +137,16 @@ function ProductCreationRecoveryList({
   );
 }
 
+const RECOVERY_ADVANCING_STATUSES = new Set([
+  'accepted',
+  'claimed',
+  'retry_scheduled',
+  'cancelling',
+  'delivery_pending',
+  'cleanup_ambiguous',
+]);
+const RECOVERY_DISCOVERY_BACKOFF_MS = [2000, 5000, 10000, 30000] as const;
+
 interface NewConversationPageProps {
   desktopMode?: boolean;
 }
@@ -217,6 +227,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   const recoveryRequestSequence = useRef(0);
   const recoveryLoadedPages = useRef(1);
   const recoveryLoadingMore = useRef(false);
+  const recoveryRowsProjection = useRef<ProductConversationCreationRecoveryRow[]>([]);
 
   const refreshRecoveryRows = useCallback(async () => {
     if (recoveryLoadingMore.current) return;
@@ -232,6 +243,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
         cursor = nextCursor;
       }
       if (sequence !== recoveryRequestSequence.current) return;
+      recoveryRowsProjection.current = pages;
       setRecoveryRows(pages);
       setRecoveryNextCursor(nextCursor);
     } catch {
@@ -246,7 +258,11 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
     try {
       const response = await api.listProductConversationCreations(recoveryNextCursor);
       if (sequence !== recoveryRequestSequence.current) return;
-      setRecoveryRows((rows) => [...rows, ...response.product_creations]);
+      setRecoveryRows((rows) => {
+        const next = [...rows, ...response.product_creations];
+        recoveryRowsProjection.current = next;
+        return next;
+      });
       recoveryLoadedPages.current += 1;
       setRecoveryNextCursor(response.next_cursor ?? null);
     } finally {
@@ -259,8 +275,26 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   }, [conv.creating, refreshRecoveryRows]);
 
   useEffect(() => {
-    const interval = window.setInterval(() => void refreshRecoveryRows(), 2000);
-    return () => window.clearInterval(interval);
+    let stopped = false;
+    let timeout: number | undefined;
+    let discoveryAttempt = 0;
+    const schedule = () => {
+      const canAdvance = recoveryRowsProjection.current.some((row) =>
+        RECOVERY_ADVANCING_STATUSES.has(row.status));
+      const delay = canAdvance
+        ? RECOVERY_DISCOVERY_BACKOFF_MS[0]
+        : RECOVERY_DISCOVERY_BACKOFF_MS[discoveryAttempt++];
+      if (delay === undefined) return;
+      timeout = window.setTimeout(async () => {
+        await refreshRecoveryRows();
+        if (!stopped) schedule();
+      }, delay);
+    };
+    schedule();
+    return () => {
+      stopped = true;
+      if (timeout !== undefined) window.clearTimeout(timeout);
+    };
   }, [refreshRecoveryRows]);
 
   // Auto-resize textarea

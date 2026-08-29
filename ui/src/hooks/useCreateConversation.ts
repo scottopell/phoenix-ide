@@ -12,12 +12,14 @@ const LAST_MODEL_KEY = 'phoenix-last-model';
 const NEW_CONVERSATION_DRAFT_KEY = 'phoenix-new-conversation-draft';
 const REPLAY_CREATE_REQUEST_KEY = 'phoenix-replay-product-create-request';
 const REPLAY_CREATE_INTENT_KEY = 'phoenix-replay-product-create-intent';
+const RECOVERED_LLM_LANGUAGE_KEY = 'phoenix-create-llm-language';
 
 export function beginNewProductConversationIntent(): void {
   try {
     localStorage.removeItem(REPLAY_CREATE_REQUEST_KEY);
     localStorage.removeItem(REPLAY_CREATE_INTENT_KEY);
     localStorage.removeItem('phoenix-pending-product-create-request');
+    localStorage.removeItem(RECOVERED_LLM_LANGUAGE_KEY);
   } catch { /* best effort */ }
 }
 
@@ -83,7 +85,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
     return generateUUID();
   });
   const [recoveredLlmLanguage, setRecoveredLlmLanguage] = useState<string | null>(() => {
-    try { return localStorage.getItem('phoenix-create-llm-language'); } catch { return null; }
+    try { return localStorage.getItem(RECOVERED_LLM_LANGUAGE_KEY); } catch { return null; }
   });
   const replayIntentRef = useRef<string | null>((() => {
     try { return localStorage.getItem(REPLAY_CREATE_INTENT_KEY); } catch { return null; }
@@ -273,7 +275,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
       setImages([]);
       setFiles([]);
       setRecoveredLlmLanguage(null);
-      try { localStorage.removeItem('phoenix-create-llm-language'); } catch { /* best effort */ }
+      try { localStorage.removeItem(RECOVERED_LLM_LANGUAGE_KEY); } catch { /* best effort */ }
       clearNewConversationDraft();
       try {
         localStorage.removeItem(REPLAY_CREATE_REQUEST_KEY);
@@ -309,9 +311,9 @@ export function useCreateConversation(navigate: (path: string) => void) {
     selectEffort(creation.effort);
     try {
       if (creation.llm_language) {
-        localStorage.setItem('phoenix-create-llm-language', creation.llm_language);
+        localStorage.setItem(RECOVERED_LLM_LANGUAGE_KEY, creation.llm_language);
       } else {
-        localStorage.removeItem('phoenix-create-llm-language');
+        localStorage.removeItem(RECOVERED_LLM_LANGUAGE_KEY);
       }
     } catch { /* replay still retains the pinned language in memory */ }
     setError(null);

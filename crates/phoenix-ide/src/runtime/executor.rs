@@ -8170,19 +8170,8 @@ where
             return Ok(());
         }
         let cwd = self.context.filesystem_root().to_path_buf();
-        let attached_repo_root = self
-            .storage
-            .get_attached_repository_root(&self.context.conversation_id)
-            .await
-            .map_err(|error| format!("Failed to load attached repository root: {error}"))?
-            .map(std::path::PathBuf::from);
-        #[cfg(not(test))]
-        let repo_root = attached_repo_root
-            .ok_or_else(|| "Task approval requires attached GitRepository authority".to_string())?;
-        #[cfg(test)]
-        let repo_root = attached_repo_root.unwrap_or_else(|| {
-            crate::git_ops::repo_root_from_phoenix_worktree(&cwd).unwrap_or_else(|| cwd.clone())
-        });
+        let repo_root =
+            crate::git_ops::repo_root_from_phoenix_worktree(&cwd).unwrap_or_else(|| cwd.clone());
         let worktree_identity = self
             .storage
             .get_product_conversation_id(&self.context.conversation_id)
@@ -8373,17 +8362,6 @@ where
         authority: crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
         let cwd = self.context.filesystem_root().to_path_buf();
-        let attached_repo_root = self
-            .storage
-            .get_attached_repository_root(&self.context.conversation_id)
-            .await
-            .map_err(|error| format!("Failed to load attached repository root: {error}"))?
-            .map(std::path::PathBuf::from);
-        #[cfg(not(test))]
-        attached_repo_root
-            .ok_or_else(|| "Task approval requires attached GitRepository authority".to_string())?;
-        #[cfg(test)]
-        let _ = attached_repo_root;
         let tasks_dir_name = self.context.tasks_dir_name.clone();
 
         let task_file_backup = task_file.clone();

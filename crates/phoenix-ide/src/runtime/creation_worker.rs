@@ -399,19 +399,15 @@ async fn process_claimed_product_creation(
         llm_language: job.intent.llm_language,
         spawned_from_conversation_id: None,
     };
-    let repository_attachment = match staging_repo.zip(staging_oid) {
-        Some((repository_root, exact_checkout_oid)) => {
-            let git_common_dir = git_common_dir_for_repository_root(Path::new(&repository_root))?;
-            let repository_id = None;
-            Some(crate::db::ProductCreationRepositoryAttachment {
-                repository_id,
-                exact_checkout_oid,
-                repository_root,
-                git_common_dir,
-            })
-        }
-        None => None,
-    };
+    let git_publication =
+        staging_repo
+            .zip(staging_oid)
+            .map(|(repository_root, exact_checkout_oid)| {
+                crate::db::ProductCreationGitPublicationFacts {
+                    exact_checkout_oid,
+                    repository_root,
+                }
+            });
     let published = manager
         .db()
         .publish_product_creation_atomically(&crate::db::ProductCreationPublishInput {
@@ -420,7 +416,7 @@ async fn process_claimed_product_creation(
             conversation,
             authority_kind,
             environment,
-            repository_attachment,
+            git_publication,
         })
         .await
         .map_err(|error| error.to_string())?;
@@ -990,29 +986,6 @@ fn ensure_phoenix_staging_ignored(repo_root: &Path) -> Result<(), String> {
             .map_err(|error| error.to_string())?;
         writeln!(file, "/.phoenix/").map_err(|error| error.to_string())?;
     }
-    let gitignore = repo_root.join(".gitignore");
-    if std::fs::symlink_metadata(&gitignore).is_ok_and(|metadata| metadata.file_type().is_symlink())
-    {
-        return Err(format!(
-            "refusing to update symlinked gitignore {}",
-            gitignore.display()
-        ));
-    }
-    let mut contents = match std::fs::read(&gitignore) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => return Err(error.to_string()),
-    };
-    let contains_rule = contents
-        .split(|byte| *byte == b'\n')
-        .any(|line| line.strip_suffix(b"\r").unwrap_or(line) == b".phoenix/worktrees/");
-    if !contains_rule {
-        if !contents.is_empty() && !contents.ends_with(b"\n") {
-            contents.push(b'\n');
-        }
-        contents.extend_from_slice(b".phoenix/worktrees/\n");
-        std::fs::write(&gitignore, contents).map_err(|error| error.to_string())?;
-    }
     Ok(())
 }
 
@@ -1174,11 +1147,12 @@ where
             return Ok(());
         };
         let job = claim().await?;
-        drop(owner);
         let Some(job) = job else {
             return Ok(());
         };
-        if matches!(process(job).await, CreationDrainControl::StopDrain) {
+        let control = process(job).await;
+        drop(owner);
+        if matches!(control, CreationDrainControl::StopDrain) {
             return Ok(());
         }
     }
@@ -2689,7 +2663,7 @@ mod product_creation_ignore_tests {
     use super::*;
 
     #[test]
-    fn staging_ignore_preserves_non_utf8_bytes_and_is_idempotent() {
+    fn staging_ignore_uses_common_exclude_without_rewriting_gitignore() {
         let repo = tempfile::tempdir().unwrap();
         crate::git_ops::run_git(repo.path(), &["init"]).unwrap();
         let gitignore = repo.path().join(".gitignore");
@@ -2697,43 +2671,19 @@ mod product_creation_ignore_tests {
         std::fs::write(&gitignore, original).unwrap();
 
         ensure_phoenix_staging_ignored(repo.path()).unwrap();
-        let first = std::fs::read(&gitignore).unwrap();
-        assert_eq!(
-            first,
-            [original.as_slice(), b".phoenix/worktrees/\n"].concat()
-        );
-
-        ensure_phoenix_staging_ignored(repo.path()).unwrap();
-        assert_eq!(std::fs::read(gitignore).unwrap(), first);
-    }
-
-    #[test]
-    fn staging_ignore_keeps_leading_spaces_significant() {
-        let repo = tempfile::tempdir().unwrap();
-        crate::git_ops::run_git(repo.path(), &["init"]).unwrap();
-        let gitignore = repo.path().join(".gitignore");
-        std::fs::write(&gitignore, b" .phoenix/worktrees/\n").unwrap();
-
         ensure_phoenix_staging_ignored(repo.path()).unwrap();
 
+        assert_eq!(std::fs::read(gitignore).unwrap(), original);
+        let common_dir =
+            crate::git_ops::run_git(repo.path(), &["rev-parse", "--git-common-dir"]).unwrap();
+        let exclude = repo.path().join(common_dir.trim()).join("info/exclude");
+        let contents = std::fs::read_to_string(exclude).unwrap();
         assert_eq!(
-            std::fs::read(gitignore).unwrap(),
-            b" .phoenix/worktrees/\n.phoenix/worktrees/\n"
-        );
-    }
-
-    #[test]
-    fn staging_ignore_separates_rule_from_file_without_trailing_newline() {
-        let repo = tempfile::tempdir().unwrap();
-        crate::git_ops::run_git(repo.path(), &["init"]).unwrap();
-        let gitignore = repo.path().join(".gitignore");
-        std::fs::write(&gitignore, b"target/").unwrap();
-
-        ensure_phoenix_staging_ignored(repo.path()).unwrap();
-
-        assert_eq!(
-            std::fs::read(gitignore).unwrap(),
-            b"target/\n.phoenix/worktrees/\n"
+            contents
+                .lines()
+                .filter(|line| *line == "/.phoenix/")
+                .count(),
+            1
         );
     }
 }
@@ -3135,6 +3085,108 @@ mod runtime_bootstrap_settlement_tests {
         ));
         tokio::time::advance(std::time::Duration::from_secs(30)).await;
         assert_eq!(renewals.load(std::sync::atomic::Ordering::Acquire), 1);
+    }
+
+    struct CountingOwner(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl CountingOwner {
+        fn acquire(owners: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+            owners.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            Self(Arc::clone(owners))
+        }
+    }
+
+    impl Drop for CountingOwner {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+
+    #[tokio::test]
+    async fn continue_retains_owner_through_processing_then_claims_next_pass() {
+        let owners = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let admission_owners = Arc::clone(&owners);
+        let claim_owners = Arc::clone(&owners);
+        let claims = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_claims = Arc::clone(&claims);
+        let (process_started_tx, process_started_rx) = tokio::sync::oneshot::channel();
+        let (release_process_tx, release_process_rx) = tokio::sync::oneshot::channel();
+        let mut process_started_tx = Some(process_started_tx);
+        let mut release_process_rx = Some(release_process_rx);
+
+        let drain = tokio::spawn(drain_claimed_jobs(
+            move || Ok(CountingOwner::acquire(&admission_owners)),
+            move || {
+                assert_eq!(claim_owners.load(std::sync::atomic::Ordering::Acquire), 1);
+                let claim_number =
+                    observed_claims.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                async move {
+                    if claim_number == 0 {
+                        Ok(Some("job"))
+                    } else {
+                        Ok(None)
+                    }
+                }
+            },
+            move |_| {
+                let process_started_tx = process_started_tx.take().unwrap();
+                let release_process_rx = release_process_rx.take().unwrap();
+                async move {
+                    process_started_tx.send(()).unwrap();
+                    release_process_rx.await.unwrap();
+                    CreationDrainControl::Continue
+                }
+            },
+        ));
+
+        process_started_rx.await.unwrap();
+        assert_eq!(owners.load(std::sync::atomic::Ordering::Acquire), 1);
+
+        release_process_tx.send(()).unwrap();
+        drain.await.unwrap().unwrap();
+
+        assert_eq!(owners.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert_eq!(claims.load(std::sync::atomic::Ordering::Acquire), 2);
+    }
+
+    #[tokio::test]
+    async fn stop_drain_retains_owner_through_processing_without_second_claim() {
+        let owners = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let admission_owners = Arc::clone(&owners);
+        let claim_owners = Arc::clone(&owners);
+        let claims = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_claims = Arc::clone(&claims);
+        let (process_started_tx, process_started_rx) = tokio::sync::oneshot::channel();
+        let (release_process_tx, release_process_rx) = tokio::sync::oneshot::channel();
+        let mut process_started_tx = Some(process_started_tx);
+        let mut release_process_rx = Some(release_process_rx);
+
+        let drain = tokio::spawn(drain_claimed_jobs(
+            move || Ok(CountingOwner::acquire(&admission_owners)),
+            move || {
+                assert_eq!(claim_owners.load(std::sync::atomic::Ordering::Acquire), 1);
+                observed_claims.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                async { Ok(Some("job")) }
+            },
+            move |_| {
+                let process_started_tx = process_started_tx.take().unwrap();
+                let release_process_rx = release_process_rx.take().unwrap();
+                async move {
+                    process_started_tx.send(()).unwrap();
+                    release_process_rx.await.unwrap();
+                    CreationDrainControl::StopDrain
+                }
+            },
+        ));
+
+        process_started_rx.await.unwrap();
+        assert_eq!(owners.load(std::sync::atomic::Ordering::Acquire), 1);
+
+        release_process_tx.send(()).unwrap();
+        drain.await.unwrap().unwrap();
+
+        assert_eq!(owners.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert_eq!(claims.load(std::sync::atomic::Ordering::Acquire), 1);
     }
 
     #[tokio::test]

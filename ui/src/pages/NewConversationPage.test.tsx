@@ -138,10 +138,14 @@ describe('NewConversationPage', () => {
   });
 
   it('does not let background polling supersede a slow load-more request', async () => {
+    const realSetTimeout = window.setTimeout.bind(window);
     let poll: TimerHandler | undefined;
-    const setInterval = vi.spyOn(window, 'setInterval').mockImplementation((handler) => {
-      poll = handler;
-      return {} as ReturnType<typeof setInterval>;
+    const setTimeout = vi.spyOn(window, 'setTimeout').mockImplementation((handler, delay, ...args) => {
+      if (Number(delay) >= 2000) {
+        poll = handler;
+        return {} as ReturnType<typeof setTimeout>;
+      }
+      return realSetTimeout(handler, delay, ...args) as unknown as ReturnType<typeof setTimeout>;
     });
     let resolveSecondPage: ((value: { product_creations: Array<Record<string, unknown>>; next_cursor: null }) => void) | undefined;
     const secondPage = new Promise<{ product_creations: Array<Record<string, unknown>>; next_cursor: null }>((resolve) => {
@@ -167,7 +171,38 @@ describe('NewConversationPage', () => {
       next_cursor: null,
     });
     expect((await screen.findAllByText('slow second page')).length).toBeGreaterThan(0);
-    setInterval.mockRestore();
+    setTimeout.mockRestore();
+  });
+
+  it('backs off discovery after projecting only terminal recovery rows', async () => {
+    const realSetTimeout = window.setTimeout.bind(window);
+    const delays: number[] = [];
+    const callbacks: TimerHandler[] = [];
+    const setTimeout = vi.spyOn(window, 'setTimeout').mockImplementation((handler, delay, ...args) => {
+      if (Number(delay) >= 2000) {
+        callbacks.push(handler);
+        delays.push(Number(delay));
+        return {} as ReturnType<typeof setTimeout>;
+      }
+      return realSetTimeout(handler, delay, ...args) as unknown as ReturnType<typeof setTimeout>;
+    });
+    apiMock.listProductConversationCreations.mockResolvedValue({
+      product_creations: [{ request_id: 'done', status: 'failed', cwd: '/done', objective: 'terminal payload', model: null, effort: null, images: [{ media_type: 'image/png', data: 'large' }], llm_language: 'English', updated_at: '2026-01-01T00:00:00Z', last_error: 'done', allowed_actions: ['delete', 'start_over'], published_product_conversation_id: null }],
+      next_cursor: null,
+    });
+
+    renderPage();
+    expect((await screen.findAllByText('terminal payload')).length).toBeGreaterThan(0);
+    const discoveryIndex = delays.indexOf(2000);
+    expect(discoveryIndex).toBeGreaterThanOrEqual(0);
+    const initialFiveSecondTimers = delays.filter((delay) => delay === 5000).length;
+    const firstDiscovery = callbacks[discoveryIndex];
+    if (typeof firstDiscovery === 'function') firstDiscovery();
+    await waitFor(() => expect(apiMock.listProductConversationCreations).toHaveBeenCalledTimes(2));
+    expect(delays.filter((delay) => delay === 2000)).toHaveLength(1);
+    expect(delays.filter((delay) => delay === 5000)).toHaveLength(initialFiveSecondTimers + 1);
+
+    setTimeout.mockRestore();
   });
 
   it('start over prefills the composer from a recovery row', async () => {

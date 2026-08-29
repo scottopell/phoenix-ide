@@ -62,8 +62,11 @@ describe('reconcileSubscribedModelSelection', () => {
       }),
     );
 
+    localStorage.setItem('phoenix-create-llm-language', 'Japanese');
+
     beginNewProductConversationIntent();
 
     expect(localStorage.getItem('phoenix-pending-product-create-request')).toBeNull();
+    expect(localStorage.getItem('phoenix-create-llm-language')).toBeNull();
   });
 });

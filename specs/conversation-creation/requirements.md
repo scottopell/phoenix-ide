@@ -230,6 +230,8 @@ AND deterministic staging paths beneath the repository's `.phoenix/worktrees` na
 AND cleanup ownership checks SHALL protect against stale Phoenix operations and observed identity mismatch within that namespace, while hostile same-user filesystem mutation outside Phoenix writers is not part of the automatic-cleanup threat model
 AND SHALL enter an explicit non-destructive ambiguous cleanup outcome when ownership, equivalence, or safety cannot be proven exactly
 
+ADR-043 records the private staging namespace and automatic-cleanup threat boundary for this requirement.
+
 ### REQ-CCR-005A: Immutable Starting Pin Selection
 
 WHEN Git-backed creation resolves its starting commit under REQ-PROJ-022

@@ -89,18 +89,9 @@ pub(crate) async fn approve_task(
         ));
     }
 
-    let scope_id = conv.attached_work_scope_id.as_ref().ok_or_else(|| {
-        AppError::BadRequest("Task approval requires the attached WorkScope".to_string())
-    })?;
-    if !state
-        .runtime
-        .db()
-        .work_scope_has_git_repository(scope_id)
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?
-    {
+    if conv.project_id.is_none() {
         return Err(AppError::BadRequest(
-            "Task approval requires GitRepository authority attached through WorkScope".to_string(),
+            "Task approval requires a project-scoped conversation".to_string(),
         ));
     }
 

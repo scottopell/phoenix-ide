@@ -108,6 +108,84 @@ pub(crate) fn normalize_product_creation_cwd_intent(
     Ok(normalized.to_string_lossy().into_owned())
 }
 
+#[cfg(unix)]
+fn create_relative_directories_without_symlinks(
+    canonical_ancestor: &Path,
+    suffix: &Path,
+) -> Result<(), ConversationCwdError> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let ancestor = CString::new(canonical_ancestor.as_os_str().as_bytes()).map_err(|_| {
+        ConversationCwdError::NotAcceptable("directory path contains a NUL byte".to_string())
+    })?;
+    let fd = unsafe {
+        libc::open(
+            ancestor.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(ConversationCwdError::NotAcceptable(format!(
+            "failed to open accepted directory root: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let mut current = unsafe { OwnedFd::from_raw_fd(fd) };
+    for component in suffix.components() {
+        let std::path::Component::Normal(segment) = component else {
+            return Err(ConversationCwdError::NotAcceptable(
+                "invalid selected directory segment".to_string(),
+            ));
+        };
+        let segment = CString::new(segment.as_bytes()).map_err(|_| {
+            ConversationCwdError::NotAcceptable("directory path contains a NUL byte".to_string())
+        })?;
+        let mut next = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                segment.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if next < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
+            let created = unsafe { libc::mkdirat(current.as_raw_fd(), segment.as_ptr(), 0o755) };
+            if created < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
+                return Err(ConversationCwdError::NotAcceptable(format!(
+                    "failed to create directory after durable acceptance: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            next = unsafe {
+                libc::openat(
+                    current.as_raw_fd(),
+                    segment.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                )
+            };
+        }
+        if next < 0 {
+            return Err(ConversationCwdError::NotAcceptable(format!(
+                "directory path contains an inaccessible or symlinked segment: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        current = unsafe { OwnedFd::from_raw_fd(next) };
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_relative_directories_without_symlinks(
+    _canonical_ancestor: &Path,
+    _suffix: &Path,
+) -> Result<(), ConversationCwdError> {
+    Err(ConversationCwdError::NotAcceptable(
+        "safe creation of missing selected directories is unsupported on this platform".to_string(),
+    ))
+}
+
 pub(crate) fn ensure_product_creation_cwd(
     cwd: impl AsRef<str>,
     home: &Path,
@@ -163,34 +241,7 @@ pub(crate) fn ensure_product_creation_cwd(
         ));
     }
 
-    let mut current = canonical_ancestor;
-    for component in suffix.components() {
-        current.push(component);
-        if current
-            .symlink_metadata()
-            .is_ok_and(|metadata| metadata.file_type().is_symlink())
-        {
-            return Err(ConversationCwdError::NotAcceptable(
-                "directory path contains a symlink".to_string(),
-            ));
-        }
-        match std::fs::create_dir(&current) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                return Err(ConversationCwdError::NotAcceptable(format!(
-                    "failed to create directory after durable acceptance: {error}"
-                )))
-            }
-        }
-        let canonical = std::fs::canonicalize(&current)
-            .map_err(|error| ConversationCwdError::NotAcceptable(error.to_string()))?;
-        if canonical != current {
-            return Err(ConversationCwdError::NotAcceptable(
-                "directory resolved outside the accepted canonical path".to_string(),
-            ));
-        }
-    }
+    create_relative_directories_without_symlinks(&canonical_ancestor, suffix)?;
     validate_conversation_cwd(raw)
 }
 
@@ -315,6 +366,24 @@ mod tests {
             .expect_err("final symlink rejected");
 
         assert!(error.to_string().contains("symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_creator_rejects_symlinked_segment_without_mutating_target() {
+        let home = tempfile::tempdir().expect("home");
+        let target = tempfile::tempdir().expect("target");
+        std::os::unix::fs::symlink(target.path(), home.path().join("raced"))
+            .expect("insert symlink");
+
+        let error = create_relative_directories_without_symlinks(
+            &home.path().canonicalize().expect("canonical home"),
+            Path::new("raced/child"),
+        )
+        .expect_err("symlinked segment rejected");
+
+        assert!(error.to_string().contains("symlinked segment"));
+        assert!(!target.path().join("child").exists());
     }
 
     #[test]

@@ -141,11 +141,9 @@ pub struct ProductCreationCleanupJob {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProductCreationRepositoryAttachment {
-    pub repository_id: Option<String>,
+pub struct ProductCreationGitPublicationFacts {
     pub exact_checkout_oid: String,
     pub repository_root: String,
-    pub git_common_dir: String,
 }
 
 #[derive(Debug, Clone)]
@@ -155,7 +153,7 @@ pub struct ProductCreationPublishInput {
     pub conversation: Conversation,
     pub authority_kind: AuthorityKind,
     pub environment: EnvironmentContext,
-    pub repository_attachment: Option<ProductCreationRepositoryAttachment>,
+    pub git_publication: Option<ProductCreationGitPublicationFacts>,
 }
 
 fn normalize_product_creation_intent(intent: &ProductCreationIntent) -> DbResult<()> {
@@ -855,15 +853,15 @@ impl Database {
                     .to_string(),
             ));
         }
-        let attachment_matches_environment = !matches!(
-            (&input.environment, &input.repository_attachment),
+        let git_facts_match_environment = !matches!(
+            (&input.environment, &input.git_publication),
             (EnvironmentContext::AllocatedWorktree { .. }, None)
                 | (EnvironmentContext::None, Some(_))
         );
-        if !attachment_matches_environment {
+        if !git_facts_match_environment {
             tx.rollback().await?;
             return Err(DbError::Serialization(
-                "allocated-worktree publication requires a repository attachment".to_string(),
+                "allocated-worktree publication requires Git publication facts".to_string(),
             ));
         }
         let conversation_exists: i64 =
@@ -892,45 +890,6 @@ impl Database {
         )
         .await?;
         insert_conversation_tx(&mut tx, &input.conversation).await?;
-        if let Some(attachment) = input.repository_attachment.as_ref() {
-            let repository_root = attachment.repository_root.as_str();
-            let git_common_dir = attachment.git_common_dir.as_str();
-            let repository_id = attachment
-                .repository_id
-                .clone()
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            sqlx::query("INSERT OR IGNORE INTO git_repositories (id) VALUES (?1)")
-                .bind(&repository_id)
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query(
-                "INSERT INTO work_scope_git_repositories (work_scope_id, repository_id)
-                 VALUES (?1, ?2)",
-            )
-            .bind(scope_id.as_str())
-            .bind(&repository_id)
-            .execute(&mut *tx)
-            .await?;
-            for (locator_kind, path) in [
-                ("management_root", repository_root),
-                ("common_dir", git_common_dir),
-            ] {
-                sqlx::query(
-                    "INSERT INTO git_repository_locator_observations (
-                        repository_id, locator_kind, status, path, observed_at_unix_micros
-                     ) VALUES (?1, ?2, 'present', ?3, ?4)
-                     ON CONFLICT(repository_id, locator_kind)
-                     DO UPDATE SET status = excluded.status, path = excluded.path,
-                                   observed_at_unix_micros = excluded.observed_at_unix_micros",
-                )
-                .bind(&repository_id)
-                .bind(locator_kind)
-                .bind(path)
-                .bind(now)
-                .execute(&mut *tx)
-                .await?;
-            }
-        }
         sqlx::query(
             "INSERT INTO product_conversation_work_scopes (product_conversation_id, work_scope_id)
              VALUES (?1, ?2)",
@@ -960,15 +919,15 @@ impl Database {
         })
         .bind(
             input
-                .repository_attachment
+                .git_publication
                 .as_ref()
-                .map(|attachment| attachment.repository_root.as_str()),
+                .map(|facts| facts.repository_root.as_str()),
         )
         .bind(
             input
-                .repository_attachment
+                .git_publication
                 .as_ref()
-                .map(|attachment| attachment.exact_checkout_oid.as_str()),
+                .map(|facts| facts.exact_checkout_oid.as_str()),
         )
         .bind(input.conversation.product_conversation_id.as_str())
         .bind(&input.conversation.id)
@@ -1823,64 +1782,24 @@ impl Database {
         Ok(deadline.map(unix_micros_to_datetime).transpose()?)
     }
 
-    pub async fn repository_management_root_for_work_scope(
-        &self,
-        work_scope_id: &WorkScopeId,
-    ) -> DbResult<Option<String>> {
-        sqlx::query_scalar(
-            "SELECT locator.path
-             FROM work_scope_git_repositories attachment
-             JOIN git_repository_locator_observations locator
-               ON locator.repository_id = attachment.repository_id
-              AND locator.locator_kind = 'management_root' AND locator.status = 'present'
-             WHERE attachment.work_scope_id = ?1",
-        )
-        .bind(work_scope_id.as_str())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(DbError::from)
-    }
-
-    pub async fn work_scope_has_git_repository(
-        &self,
-        work_scope_id: &WorkScopeId,
-    ) -> DbResult<bool> {
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM work_scope_git_repositories WHERE work_scope_id = ?1",
-        )
-        .bind(work_scope_id.as_str())
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(count == 1)
-    }
-
     pub async fn recent_distinct_published_product_creation_cwds(
         &self,
         limit: usize,
     ) -> DbResult<Vec<String>> {
         let rows = sqlx::query_scalar::<_, String>(
-            "SELECT locator.path
-             FROM conversations conversation
+            "SELECT job.staging_repo_root
+             FROM product_creation_jobs job
+             JOIN conversations conversation ON conversation.id = job.published_conversation_id
              JOIN product_conversations product
                ON product.id = conversation.product_conversation_id
               AND product.kind = 'ordinary'
               AND product.ordinary_lifecycle IN ('open', 'history')
-             JOIN work_scope_git_repositories attachment
-               ON attachment.work_scope_id = conversation.work_scope_id
-             JOIN git_repository_locator_observations locator
-               ON locator.repository_id = attachment.repository_id
-              AND locator.locator_kind = 'management_root' AND locator.status = 'present'
-             WHERE conversation.user_initiated = 1 AND conversation.runtime_role = 'user'
-               AND NOT EXISTS (
-                   SELECT 1 FROM product_creation_jobs job
-                   WHERE job.published_conversation_id = conversation.id
-                     AND job.status <> 'published'
-               )
-             GROUP BY locator.path
+             WHERE job.status = 'published' AND job.staging_repo_root IS NOT NULL
+               AND conversation.user_initiated = 1 AND conversation.runtime_role = 'user'
+             GROUP BY job.staging_repo_root
              ORDER BY COUNT(DISTINCT conversation.product_conversation_id) DESC,
                       MAX(conversation.updated_at) DESC,
-                      locator.path DESC
-             ",
+                      job.staging_repo_root DESC",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -2361,11 +2280,9 @@ mod product_creation_tests {
             environment: EnvironmentContext::UnownedCwd {
                 cwd: "/repo/a".to_string(),
             },
-            repository_attachment: Some(ProductCreationRepositoryAttachment {
-                repository_id: None,
+            git_publication: Some(ProductCreationGitPublicationFacts {
                 exact_checkout_oid: "repo-id".to_string(),
                 repository_root: "/repo/a".to_string(),
-                git_common_dir: "/repo/a/.git".to_string(),
             }),
         })
         .await
@@ -2964,11 +2881,9 @@ mod product_creation_tests {
             environment: EnvironmentContext::UnownedCwd {
                 cwd: "/repo/a".to_string(),
             },
-            repository_attachment: Some(ProductCreationRepositoryAttachment {
-                repository_id: None,
+            git_publication: Some(ProductCreationGitPublicationFacts {
                 exact_checkout_oid: "repo-id".to_string(),
                 repository_root: "/repo/a".to_string(),
-                git_common_dir: "/repo/a/.git".to_string(),
             }),
         })
         .await
@@ -3035,11 +2950,9 @@ mod product_creation_tests {
             environment: EnvironmentContext::UnownedCwd {
                 cwd: "/repo/a".to_string(),
             },
-            repository_attachment: Some(ProductCreationRepositoryAttachment {
-                repository_id: None,
+            git_publication: Some(ProductCreationGitPublicationFacts {
                 exact_checkout_oid: "repo-id".to_string(),
                 repository_root: "/repo/a".to_string(),
-                git_common_dir: "/repo/a/.git".to_string(),
             }),
         })
         .await
@@ -3145,10 +3058,8 @@ mod product_creation_tests {
             environment: EnvironmentContext::UnownedCwd {
                 cwd: "/repo/a".to_string(),
             },
-            repository_attachment: Some(ProductCreationRepositoryAttachment {
-                repository_id: None,
+            git_publication: Some(ProductCreationGitPublicationFacts {
                 repository_root: "/repo/a".to_string(),
-                git_common_dir: "/repo/a/.git".to_string(),
                 exact_checkout_oid: "abc123".to_string(),
             }),
         })
@@ -3285,10 +3196,8 @@ mod product_creation_tests {
             environment: EnvironmentContext::UnownedCwd {
                 cwd: "/repo/delivery".to_string(),
             },
-            repository_attachment: Some(ProductCreationRepositoryAttachment {
-                repository_id: None,
+            git_publication: Some(ProductCreationGitPublicationFacts {
                 repository_root: "/repo/delivery".to_string(),
-                git_common_dir: "/repo/delivery/.git".to_string(),
                 exact_checkout_oid: "abc123".to_string(),
             }),
         })
@@ -3360,10 +3269,8 @@ mod product_creation_tests {
             environment: EnvironmentContext::UnownedCwd {
                 cwd: "/repo/published".to_string(),
             },
-            repository_attachment: Some(ProductCreationRepositoryAttachment {
-                repository_id: None,
+            git_publication: Some(ProductCreationGitPublicationFacts {
                 repository_root: "/repo/published".to_string(),
-                git_common_dir: "/repo/published/.git".to_string(),
                 exact_checkout_oid: "def456".to_string(),
             }),
         })
@@ -3518,7 +3425,7 @@ mod product_creation_tests {
                 environment: EnvironmentContext::UnownedCwd {
                     cwd: "/repo/a".to_string(),
                 },
-                repository_attachment: None,
+                git_publication: None,
             })
             .await;
         assert!(outcome.is_err());
@@ -3581,7 +3488,7 @@ mod product_creation_tests {
                 environment: EnvironmentContext::UnownedCwd {
                     cwd: "/repo/a".to_string(),
                 },
-                repository_attachment: None,
+                git_publication: None,
             })
             .await
             .unwrap();
@@ -3618,7 +3525,7 @@ mod product_creation_tests {
                 environment: EnvironmentContext::UnownedCwd {
                     cwd: "/repo/a".to_string(),
                 },
-                repository_attachment: None,
+                git_publication: None,
             })
             .await
             .unwrap();
@@ -3633,7 +3540,7 @@ mod product_creation_tests {
     }
 
     #[tokio::test]
-    async fn product_creation_publish_attaches_hidden_repository_and_cascade_delete_clears_job() {
+    async fn git_product_creation_publish_keeps_repository_foundation_dormant() {
         let db = Database::open_in_memory().await.unwrap();
         db.accept_product_creation("req-cascade", &intent("/repo/hidden", "owner"))
             .await
@@ -3667,41 +3574,62 @@ mod product_creation_tests {
                 claim: claim.claim,
                 conversation: conv,
                 authority_kind: AuthorityKind::Work,
-                environment: EnvironmentContext::UnownedCwd {
-                    cwd: "/repo/hidden".to_string(),
+                environment: EnvironmentContext::AllocatedWorktree {
+                    cwd: "/repo/hidden/.phoenix/worktrees/conv-cascade".to_string(),
+                    worktree_path: "/repo/hidden/.phoenix/worktrees/conv-cascade".to_string(),
+                    branch_name: None,
+                    base_branch: Some("main".to_string()),
                 },
-                repository_attachment: Some(ProductCreationRepositoryAttachment {
-                    repository_id: Some("repo-hidden-id".to_string()),
+                git_publication: Some(ProductCreationGitPublicationFacts {
                     exact_checkout_oid: "0123456789abcdef".to_string(),
                     repository_root: "/repo/hidden".to_string(),
-                    git_common_dir: "/repo/hidden/.git".to_string(),
                 }),
             })
             .await
             .unwrap());
-        let attached: (String, String) = sqlx::query_as(
-            "SELECT work_scope_id, repository_id FROM work_scope_git_repositories WHERE work_scope_id = ?1",
+        let environment: (String, String, String) = sqlx::query_as(
+            "SELECT environment_kind, cwd, worktree_path
+             FROM work_scope_environments WHERE work_scope_id = ?1",
         )
         .bind(scope.as_str())
         .fetch_one(db.pool())
         .await
         .unwrap();
-        assert_eq!(attached.0, scope.as_str());
-        assert_eq!(attached.1, "repo-hidden-id");
-        let locators: Vec<(String, String)> = sqlx::query_as(
-            "SELECT locator_kind, path FROM git_repository_locator_observations
-             WHERE repository_id = 'repo-hidden-id' ORDER BY locator_kind",
+        assert_eq!(environment.0, "allocated_worktree");
+        assert_eq!(
+            environment.1,
+            "/repo/hidden/.phoenix/worktrees/conv-cascade"
+        );
+        assert_eq!(
+            environment.2,
+            "/repo/hidden/.phoenix/worktrees/conv-cascade"
+        );
+        let staging_facts: (String, String) = sqlx::query_as(
+            "SELECT staging_repo_root, staging_exact_oid
+             FROM product_creation_jobs WHERE request_id = 'req-cascade'",
         )
-        .fetch_all(db.pool())
+        .fetch_one(db.pool())
         .await
         .unwrap();
-        assert_eq!(
-            locators,
-            vec![
-                ("common_dir".to_string(), "/repo/hidden/.git".to_string()),
-                ("management_root".to_string(), "/repo/hidden".to_string()),
-            ]
-        );
+        assert_eq!(staging_facts.0, "/repo/hidden");
+        assert_eq!(staging_facts.1, "0123456789abcdef");
+        let repository_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM git_repositories")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let attachment_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM work_scope_git_repositories")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let locator_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM git_repository_locator_observations")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(repository_count, 0);
+        assert_eq!(attachment_count, 0);
+        assert_eq!(locator_count, 0);
         sqlx::query("DELETE FROM product_conversations WHERE id = ?1")
             .bind(product_id.as_str())
             .execute(db.pool())
@@ -3746,7 +3674,7 @@ mod product_creation_tests {
             environment: EnvironmentContext::UnownedCwd {
                 cwd: "/repo/a".to_string(),
             },
-            repository_attachment: None,
+            git_publication: None,
         })
         .await
         .unwrap();
@@ -3779,7 +3707,7 @@ mod product_creation_tests {
                 environment: EnvironmentContext::UnownedCwd {
                     cwd: "/repo/b".to_string(),
                 },
-                repository_attachment: None,
+                git_publication: None,
             })
             .await
             .unwrap_err();
@@ -3819,11 +3747,9 @@ mod product_creation_tests {
                 environment: EnvironmentContext::UnownedCwd {
                     cwd: cwd.to_string(),
                 },
-                repository_attachment: Some(ProductCreationRepositoryAttachment {
-                    repository_id: Some(format!("repo-{}", cwd.replace('/', "-"))),
+                git_publication: Some(ProductCreationGitPublicationFacts {
                     exact_checkout_oid: format!("oid-{idx}"),
                     repository_root: cwd.to_string(),
-                    git_common_dir: format!("{cwd}/.git"),
                 }),
             })
             .await
