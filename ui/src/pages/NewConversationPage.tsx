@@ -28,6 +28,7 @@ function recoveryStatusLabel(status: string): string {
     case 'accepted': return 'Queued';
     case 'claimed': return 'Starting';
     case 'retry_scheduled': return 'Retrying';
+    case 'cancelling': return 'Cancelling';
     case 'failed': return 'Failed';
     case 'cancelled': return 'Cancelled';
     case 'delivery_failed': return 'Needs retry';
@@ -213,14 +214,23 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   const [recoveryBusyRequestId, setRecoveryBusyRequestId] = useState<string | null>(null);
   const [recoveryNextOffset, setRecoveryNextOffset] = useState<number | null>(null);
   const recoveryRequestSequence = useRef(0);
+  const recoveryLoadedPages = useRef(1);
 
   const refreshRecoveryRows = useCallback(async () => {
     const sequence = ++recoveryRequestSequence.current;
     try {
-      const response = await api.listProductConversationCreations(0);
+      const pages = [];
+      let offset = 0;
+      let nextOffset: number | null = 0;
+      for (let page = 0; page < recoveryLoadedPages.current && nextOffset !== null; page += 1) {
+        const response = await api.listProductConversationCreations(offset);
+        pages.push(...response.product_creations);
+        nextOffset = response.next_offset ?? null;
+        if (nextOffset !== null) offset = nextOffset;
+      }
       if (sequence !== recoveryRequestSequence.current) return;
-      setRecoveryRows(response.product_creations);
-      setRecoveryNextOffset(response.next_offset ?? null);
+      setRecoveryRows(pages);
+      setRecoveryNextOffset(nextOffset);
     } catch {
       // Retain the last durable projection so active-row polling keeps retrying.
     }
@@ -232,6 +242,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
     const response = await api.listProductConversationCreations(recoveryNextOffset);
     if (sequence !== recoveryRequestSequence.current) return;
     setRecoveryRows((rows) => [...rows, ...response.product_creations]);
+    recoveryLoadedPages.current += 1;
     setRecoveryNextOffset(response.next_offset ?? null);
   }, [recoveryNextOffset]);
 
