@@ -85,9 +85,9 @@ describe('NewConversationPage', () => {
     apiMock.listProductConversationCreations
       .mockResolvedValueOnce({
         product_creations: [
-          { request_id: 'req-pending', status: 'accepted', cwd: '/repo/pending', objective: 'pending objective', model: 'claude', effort: null, updated_at: '2025-01-01T00:00:00Z', last_error: null, allowed_actions: ['cancel', 'start_over'] },
-          { request_id: 'req-delivery', status: 'delivery_failed', cwd: '/repo/delivery', objective: 'delivery objective', model: 'claude', effort: 'high', updated_at: '2025-01-01T00:00:00Z', last_error: 'delivery failed', allowed_actions: ['retry_delivery', 'start_over'] },
-          { request_id: 'req-failed', status: 'failed', cwd: '/repo/failed', objective: 'failed objective', model: 'claude', effort: null, updated_at: '2025-01-01T00:00:00Z', last_error: 'boom', allowed_actions: ['delete', 'start_over'] },
+          { request_id: 'req-pending', status: 'accepted', cwd: '/repo/pending', objective: 'pending objective', model: 'claude', effort: null, images: [], llm_language: 'English', updated_at: '2025-01-01T00:00:00Z', last_error: null, allowed_actions: ['cancel', 'delete'] },
+          { request_id: 'req-delivery', status: 'delivery_failed', cwd: '/repo/delivery', objective: 'delivery objective', model: 'claude', effort: 'high', images: [], llm_language: 'English', updated_at: '2025-01-01T00:00:00Z', last_error: null, allowed_actions: ['retry_delivery'] },
+          { request_id: 'req-failed', status: 'failed', cwd: '/repo/failed', objective: 'failed objective', model: 'claude', effort: null, images: [], llm_language: 'English', updated_at: '2025-01-01T00:00:00Z', last_error: 'boom', allowed_actions: ['delete', 'start_over'] },
         ],
       })
       .mockResolvedValue({ product_creations: [] });

@@ -345,8 +345,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
       if (action === 'cancel') await api.cancelProductConversationCreation(row.request_id);
       if (action === 'retry_delivery') await api.retryProductConversationDelivery(row.request_id);
       if (action === 'delete') await api.deleteProductConversationCreation(row.request_id);
-      const refreshed = await api.listProductConversationCreations();
-      setRecoveryRows(refreshed.product_creations);
+      await refreshRecoveryRows();
     } catch (error) {
       console.error(error);
     } finally {
