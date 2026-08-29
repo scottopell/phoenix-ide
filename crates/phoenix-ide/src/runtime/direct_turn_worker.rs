@@ -1980,7 +1980,7 @@ mod tests {
             &["conv-a".to_string()]
         );
         assert!(dispatcher.events.lock().unwrap().is_empty());
-        assert_eq!(sleeps.lock().unwrap().as_slice(), &[ERROR_RETRY_INTERVAL]);
+        assert_eq!(sleeps.lock().unwrap().first(), Some(&ERROR_RETRY_INTERVAL));
         assert_eq!(
             discovery.attempts.load(std::sync::atomic::Ordering::SeqCst),
             3

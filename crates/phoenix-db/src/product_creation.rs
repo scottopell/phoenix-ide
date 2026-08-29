@@ -114,6 +114,13 @@ pub struct ProductCreationResourceReservation {
     pub repository_identity: String,
     pub resource_identity: String,
     pub status: String,
+    pub ownership_token: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProductCreationResourceCleanupDisposition {
+    Released,
+    Conflict,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,6 +187,7 @@ fn parse_product_creation_resource_reservation_row(
         repository_identity: row.try_get("repository_identity")?,
         resource_identity: row.try_get("resource_identity")?,
         status: row.try_get("status")?,
+        ownership_token: row.try_get("ownership_token")?,
     })
 }
 
@@ -1152,7 +1160,8 @@ impl Database {
         request_id: &str,
     ) -> DbResult<Vec<ProductCreationResourceReservation>> {
         sqlx::query(
-            "SELECT id, request_id, generation, repository_identity, resource_identity, status
+            "SELECT id, request_id, generation, repository_identity, resource_identity, status,
+                    ownership_token
              FROM product_creation_resource_reservations
              WHERE request_id = ?1
              ORDER BY id",
@@ -1213,11 +1222,17 @@ impl Database {
         request_id: &str,
         claim: &ProductCreationClaim,
         resource_identity: &str,
+        ownership_token: &str,
         now: DateTime<Utc>,
     ) -> DbResult<bool> {
+        if ownership_token.trim().is_empty() {
+            return Err(DbError::Serialization(
+                "product creation ownership token must not be empty".to_string(),
+            ));
+        }
         let updated = sqlx::query(
             "UPDATE product_creation_resource_reservations
-             SET status = 'present', updated_at_unix_micros = ?1
+             SET status = 'present', ownership_token = ?7, updated_at_unix_micros = ?1
              WHERE request_id = ?2 AND generation = ?3 AND resource_identity = ?4
                AND status = 'reserved'
                AND EXISTS (
@@ -1234,6 +1249,7 @@ impl Database {
         .bind(resource_identity)
         .bind(&claim.worker_id)
         .bind(&claim.token)
+        .bind(ownership_token)
         .execute(&self.pool)
         .await?;
         Ok(updated.rows_affected() == 1)
@@ -1248,7 +1264,7 @@ impl Database {
     ) -> DbResult<bool> {
         let updated = sqlx::query(
             "UPDATE product_creation_resource_reservations
-             SET status = 'reserved', updated_at_unix_micros = ?1
+             SET status = 'reserved', ownership_token = NULL, updated_at_unix_micros = ?1
              WHERE request_id = ?2 AND generation = ?3 AND resource_identity = ?4
                AND status IN ('reserved', 'present')
                AND EXISTS (
@@ -1267,6 +1283,36 @@ impl Database {
         .execute(&self.pool)
         .await?;
         Ok(updated.rows_affected() == 1)
+    }
+
+    pub async fn mark_product_creation_resource_cleanup_conflict(
+        &self,
+        cleanup: &ProductCreationCleanupJob,
+        reservation_id: &str,
+        now: DateTime<Utc>,
+    ) -> DbResult<bool> {
+        self.reconcile_product_creation_resource_cleanup(
+            cleanup,
+            reservation_id,
+            ProductCreationResourceCleanupDisposition::Conflict,
+            now,
+        )
+        .await
+    }
+
+    pub async fn release_product_creation_resource(
+        &self,
+        cleanup: &ProductCreationCleanupJob,
+        reservation_id: &str,
+        now: DateTime<Utc>,
+    ) -> DbResult<bool> {
+        self.reconcile_product_creation_resource_cleanup(
+            cleanup,
+            reservation_id,
+            ProductCreationResourceCleanupDisposition::Released,
+            now,
+        )
+        .await
     }
 
     pub async fn cancel_product_creation(
@@ -1514,15 +1560,20 @@ impl Database {
         Ok(result.rows_affected() == 1)
     }
 
-    pub async fn release_product_creation_resource(
+    pub async fn reconcile_product_creation_resource_cleanup(
         &self,
         cleanup: &ProductCreationCleanupJob,
         reservation_id: &str,
+        disposition: ProductCreationResourceCleanupDisposition,
         now: DateTime<Utc>,
     ) -> DbResult<bool> {
+        let status = match disposition {
+            ProductCreationResourceCleanupDisposition::Released => "released",
+            ProductCreationResourceCleanupDisposition::Conflict => "conflict",
+        };
         let result = sqlx::query(
             "UPDATE product_creation_resource_reservations
-             SET status = 'released', updated_at_unix_micros = ?1
+             SET status = ?7, updated_at_unix_micros = ?1
              WHERE id = ?2 AND request_id = ?3 AND generation = ?4
                AND status = 'cleanup_required'
                AND EXISTS (
@@ -1538,6 +1589,7 @@ impl Database {
         .bind(cleanup.claim.generation)
         .bind(&cleanup.claim.worker_id)
         .bind(&cleanup.claim.token)
+        .bind(status)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
@@ -2361,6 +2413,101 @@ mod product_creation_tests {
             .unwrap();
         assert_eq!(cancelled.status, "cancelled");
         assert!(cancelled.cancelled_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn product_creation_cleanup_conflict_is_durable_and_blocks_finalization() {
+        let db = Database::open_in_memory().await.unwrap();
+        let now = Utc::now();
+        db.accept_product_creation("req-conflict", &intent("/repo/a", "conflict"))
+            .await
+            .unwrap();
+        let claimed = db
+            .claim_product_creation(
+                "req-conflict",
+                "worker",
+                "token",
+                now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(db
+            .reserve_product_creation_resource(
+                "reservation-conflict",
+                "req-conflict",
+                &claimed.claim,
+                "/repo/a",
+                "/repo/a/.phoenix/worktrees/conflict",
+                now,
+            )
+            .await
+            .unwrap());
+        assert!(db
+            .mark_product_creation_resource_present(
+                "req-conflict",
+                &claimed.claim,
+                "/repo/a/.phoenix/worktrees/conflict",
+                "owner-token",
+                now,
+            )
+            .await
+            .unwrap());
+        assert!(db
+            .cancel_product_creation("req-conflict", now + chrono::Duration::seconds(1))
+            .await
+            .unwrap());
+        let cleanup = db
+            .claim_next_product_creation_cleanup(
+                "cleanup-worker",
+                "cleanup-token",
+                now + chrono::Duration::seconds(1),
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cleanup.reservations[0].ownership_token.as_deref(),
+            Some("owner-token")
+        );
+        assert!(db
+            .mark_product_creation_resource_cleanup_conflict(
+                &cleanup,
+                "reservation-conflict",
+                now + chrono::Duration::seconds(2),
+            )
+            .await
+            .unwrap());
+        assert!(db
+            .mark_claimed_product_creation_cleanup_ambiguous(
+                &cleanup,
+                now + chrono::Duration::seconds(2),
+            )
+            .await
+            .unwrap());
+
+        let reservation = db
+            .get_product_creation_resource_reservations("req-conflict")
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(reservation.status, "conflict");
+        assert_eq!(reservation.ownership_token.as_deref(), Some("owner-token"));
+        assert_eq!(
+            db.get_product_creation_job("req-conflict")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "cleanup_ambiguous"
+        );
+        assert!(!db
+            .finish_product_creation_cleanup(&cleanup, now + chrono::Duration::seconds(3))
+            .await
+            .unwrap());
     }
 
     #[tokio::test]

@@ -463,6 +463,17 @@ CREATE TABLE work_scope_approved_task_authorities (
     created_at_us INTEGER NOT NULL CHECK (created_at_us >= 0)
 );",
     },
+    Migration {
+        version: 78,
+        name: "persist_product_creation_resource_ownership",
+        sql: "ALTER TABLE product_creation_resource_reservations
+ADD COLUMN ownership_token TEXT
+CHECK (ownership_token IS NULL OR (
+    typeof(ownership_token) = 'text'
+    AND trim(ownership_token) <> ''
+    AND instr(ownership_token, char(0)) = 0
+));",
+    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -12511,7 +12522,8 @@ mod tests {
                     (73, 'temporarily_skip_recursive_subordinate_parent_invariant'),
                     (74, 'temporarily_skip_completed_continuation_handoffs'),
                     (76, 'temporarily_skip_product_creation_publication'),
-                    (77, 'temporarily_skip_creation_authority_persistence')",
+                    (77, 'temporarily_skip_creation_authority_persistence'),
+                    (78, 'temporarily_skip_product_creation_resource_ownership')",
         )
         .execute(&pool)
         .await
@@ -13401,7 +13413,8 @@ mod tests {
                     (73, 'temporarily_skip_recursive_subordinate_parent_invariant'),
                     (74, 'temporarily_skip_completed_continuation_handoffs'),
                     (76, 'temporarily_skip_product_creation_publication'),
-                    (77, 'temporarily_skip_creation_authority_persistence')",
+                    (77, 'temporarily_skip_creation_authority_persistence'),
+                    (78, 'temporarily_skip_product_creation_resource_ownership')",
         )
         .execute(pool)
         .await

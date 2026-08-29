@@ -25,6 +25,24 @@ pub(crate) struct PublishedProductCreation {
     pub transcript_row_id: String,
 }
 
+const PRODUCT_CREATION_OWNER_MARKER: &str = "phoenix-product-creation-owner";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StagingOwnershipConflict {
+    MissingDurableToken,
+    ExistingOccupantNotProvablyOwned,
+    OwnerMarkerMissing,
+    OwnerMarkerMismatch,
+    OwnerMarkerUnreadable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StagingCleanupOutcome {
+    Cleaned,
+    AlreadyAbsent,
+    OwnershipConflict(StagingOwnershipConflict),
+}
+
 pub(crate) async fn process_product_creation_request(
     manager: &Arc<RuntimeManager>,
     request_id: &str,
@@ -203,6 +221,14 @@ async fn process_claimed_product_creation(
         if !reserved {
             return Err("product creation claim was lost before reserving worktree".to_string());
         }
+        let reservation = manager
+            .db()
+            .get_product_creation_resource_reservations(&job.request_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|reservation| reservation.id == reservation_id)
+            .ok_or_else(|| "product creation worktree reservation disappeared".to_string())?;
         if !manager
             .db()
             .record_product_creation_staging(
@@ -217,7 +243,9 @@ async fn process_claimed_product_creation(
         {
             return Err("product creation staging claim was lost".to_string());
         }
-        let worktree = tokio::task::spawn_blocking({
+        let new_ownership_token = uuid::Uuid::new_v4().to_string();
+        let persisted_ownership_token = reservation.ownership_token.clone();
+        let (worktree, ownership_token, already_present) = tokio::task::spawn_blocking({
             let repo_root = repo_root.clone();
             let oid = oid.clone();
             let key = job.product_conversation_id.to_string();
@@ -225,9 +253,22 @@ async fn process_claimed_product_creation(
                 let _lock = RepositoryMutationLock::acquire(&repo_root).map_err(|e| e.0)?;
                 ensure_phoenix_staging_ignored(Path::new(&repo_root))?;
                 let path = deterministic_worktree_path(&repo_root, &key);
-                if reconcile_owned_worktree_path(&repo_root, &path).map_err(|e| e.0)? {
+                let already_present =
+                    reconcile_owned_worktree_path(&repo_root, &path).map_err(|e| e.0)?;
+                let ownership_token = if already_present {
                     crate::api::handlers::validate_detached_task_worktree(&path, &oid)?;
-                    Ok::<String, String>(path.to_string_lossy().to_string())
+                    let expected = persisted_ownership_token.ok_or_else(|| {
+                        "existing staging occupant lacked durable ownership".to_string()
+                    })?;
+                    match read_product_creation_owner_marker(&path)? {
+                        Some(actual) if actual == expected => expected,
+                        _ => {
+                            return Err(
+                                "existing staging occupant did not match durable ownership"
+                                    .to_string(),
+                            );
+                        }
+                    }
                 } else {
                     std::fs::create_dir_all(
                         path.parent()
@@ -245,26 +286,37 @@ async fn process_claimed_product_creation(
                         ],
                         Duration::from_secs(30),
                     )?;
-                    Ok::<String, String>(path.to_string_lossy().to_string())
-                }
+                    write_product_creation_owner_marker(&path, &new_ownership_token)?;
+                    new_ownership_token
+                };
+                Ok::<(String, String, bool), String>((
+                    path.to_string_lossy().to_string(),
+                    ownership_token,
+                    already_present,
+                ))
             }
         })
         .await
         .map_err(|error| format!("worktree materialization join failed: {error}"))??;
         let non_empty = NonEmptyString::new(worktree.clone())
             .map_err(|_| "materialized worktree path was empty".to_string())?;
-        let present = manager
-            .db()
-            .mark_product_creation_resource_present(
-                &job.request_id,
-                &claimed.claim,
-                &planned_path.to_string_lossy(),
-                chrono::Utc::now(),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        if !present {
-            return Err("product creation claim was lost after materializing worktree".to_string());
+        if !already_present {
+            let present = manager
+                .db()
+                .mark_product_creation_resource_present(
+                    &job.request_id,
+                    &claimed.claim,
+                    &planned_path.to_string_lossy(),
+                    &ownership_token,
+                    chrono::Utc::now(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            if !present {
+                return Err(
+                    "product creation claim was lost after materializing worktree".to_string(),
+                );
+            }
         }
         (
             worktree.clone(),
@@ -544,7 +596,20 @@ async fn cleanup_and_retry_unpublished_product_creation(
     {
         return Ok(());
     }
-    let cleaned = cleanup_unpublished_product_staging(manager, cleanup_job, cleanup_lock).await;
+    let reservations = manager
+        .db()
+        .get_product_creation_resource_reservations(request_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let ownership_token = cleanup_job.staging_path.as_deref().and_then(|path| {
+        reservations
+            .iter()
+            .find(|reservation| reservation.resource_identity == path)
+            .and_then(|reservation| reservation.ownership_token.as_deref())
+    });
+    let cleaned =
+        cleanup_unpublished_product_staging(manager, cleanup_job, ownership_token, cleanup_lock)
+            .await;
     if !cleaned {
         return Ok(());
     }
@@ -575,16 +640,22 @@ async fn cleanup_and_retry_unpublished_product_creation(
 async fn cleanup_unpublished_product_staging(
     manager: &Arc<RuntimeManager>,
     job: &crate::db::ProductCreationJobRecord,
+    ownership_token: Option<&str>,
     cleanup_lock: Option<RepositoryMutationLock>,
 ) -> bool {
     let cleanup = cleanup_unpublished_product_staging_path(
         job.staging_path.as_deref(),
         job.staging_repo_root.as_deref(),
-        job.staging_exact_oid.as_deref(),
+        ownership_token,
         cleanup_lock,
     )
     .await;
-    if matches!(cleanup, Ok(Ok(true))) {
+    if matches!(
+        cleanup,
+        Ok(Ok(
+            StagingCleanupOutcome::Cleaned | StagingCleanupOutcome::AlreadyAbsent
+        ))
+    ) {
         return true;
     }
     manager
@@ -606,27 +677,65 @@ async fn cleanup_unpublished_product_staging(
 async fn cleanup_unpublished_product_staging_path(
     staging_path: Option<&str>,
     staging_repo_root: Option<&str>,
-    staging_exact_oid: Option<&str>,
+    ownership_token: Option<&str>,
     cleanup_lock: Option<RepositoryMutationLock>,
-) -> Result<Result<bool, String>, tokio::task::JoinError> {
-    let (Some(path), Some(repo_root), Some(expected_oid)) = (
+) -> Result<Result<StagingCleanupOutcome, String>, tokio::task::JoinError> {
+    let (Some(path), Some(repo_root)) = (
         staging_path.map(ToOwned::to_owned),
         staging_repo_root.map(ToOwned::to_owned),
-        staging_exact_oid.map(ToOwned::to_owned),
     ) else {
-        return Ok(Ok(true));
+        return Ok(Ok(StagingCleanupOutcome::AlreadyAbsent));
     };
+    let ownership_token = ownership_token.map(ToOwned::to_owned);
     tokio::task::spawn_blocking(move || {
         let path = PathBuf::from(path);
         if !path.exists() {
-            return Ok::<bool, String>(true);
+            return Ok(StagingCleanupOutcome::AlreadyAbsent);
         }
         let _lock = cleanup_lock.ok_or_else(|| "cleanup repository lock missing".to_string())?;
-        let actual_oid = crate::git_ops::run_git(&path, &["rev-parse", "HEAD^{commit}"])?;
-        let actual_root = crate::git_ops::run_git(&path, &["rev-parse", "--show-toplevel"])?;
-        validate_worktree_belongs_to_repository(&repo_root, &path).map_err(|error| error.0)?;
-        if actual_oid.trim() != expected_oid || Path::new(actual_root.trim()) != path {
-            return Ok::<bool, String>(false);
+        let Some(expected_owner) = ownership_token else {
+            return Ok(StagingCleanupOutcome::OwnershipConflict(
+                StagingOwnershipConflict::MissingDurableToken,
+            ));
+        };
+        if validate_worktree_belongs_to_repository(&repo_root, &path).is_err() {
+            return Ok(StagingCleanupOutcome::OwnershipConflict(
+                StagingOwnershipConflict::ExistingOccupantNotProvablyOwned,
+            ));
+        }
+        let Ok(actual_root) = crate::git_ops::run_git(&path, &["rev-parse", "--show-toplevel"])
+        else {
+            return Ok(StagingCleanupOutcome::OwnershipConflict(
+                StagingOwnershipConflict::ExistingOccupantNotProvablyOwned,
+            ));
+        };
+        let Ok(expected_root) = path.canonicalize() else {
+            return Ok(StagingCleanupOutcome::OwnershipConflict(
+                StagingOwnershipConflict::ExistingOccupantNotProvablyOwned,
+            ));
+        };
+        if Path::new(actual_root.trim()) != expected_root {
+            return Ok(StagingCleanupOutcome::OwnershipConflict(
+                StagingOwnershipConflict::ExistingOccupantNotProvablyOwned,
+            ));
+        }
+        match read_product_creation_owner_marker(&path) {
+            Ok(Some(actual_owner)) if actual_owner == expected_owner => {}
+            Ok(Some(_)) => {
+                return Ok(StagingCleanupOutcome::OwnershipConflict(
+                    StagingOwnershipConflict::OwnerMarkerMismatch,
+                ));
+            }
+            Ok(None) => {
+                return Ok(StagingCleanupOutcome::OwnershipConflict(
+                    StagingOwnershipConflict::OwnerMarkerMissing,
+                ));
+            }
+            Err(_) => {
+                return Ok(StagingCleanupOutcome::OwnershipConflict(
+                    StagingOwnershipConflict::OwnerMarkerUnreadable,
+                ));
+            }
         }
         crate::git_ops::run_git(
             Path::new(&repo_root),
@@ -637,7 +746,7 @@ async fn cleanup_unpublished_product_staging_path(
                 path.to_string_lossy().as_ref(),
             ],
         )?;
-        Ok(true)
+        Ok(StagingCleanupOutcome::Cleaned)
     })
     .await
 }
@@ -665,12 +774,24 @@ async fn reconcile_product_creation_cleanup(
         let cleaned = cleanup_unpublished_product_staging_path(
             Some(&reservation.resource_identity),
             Some(&reservation.repository_identity),
-            cleanup.job.staging_exact_oid.as_deref(),
+            reservation.ownership_token.as_deref(),
             cleanup_lock,
         )
         .await
         .map_err(|error| error.to_string())??;
-        if !cleaned {
+        if matches!(cleaned, StagingCleanupOutcome::OwnershipConflict(_)) {
+            if !manager
+                .db()
+                .mark_product_creation_resource_cleanup_conflict(
+                    cleanup,
+                    &reservation.id,
+                    chrono::Utc::now(),
+                )
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                return Ok(());
+            }
             manager
                 .db()
                 .mark_claimed_product_creation_cleanup_ambiguous(cleanup, chrono::Utc::now())
@@ -769,6 +890,38 @@ fn git_common_dir_for_repository_root(repo_root: &Path) -> Result<String, String
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )
     .map(|value| value.trim().to_string())
+}
+
+fn product_creation_owner_marker_path(worktree_path: &Path) -> Result<PathBuf, String> {
+    let git_dir = crate::git_ops::run_git(
+        worktree_path,
+        &["rev-parse", "--path-format=absolute", "--git-dir"],
+    )?;
+    Ok(PathBuf::from(git_dir.trim()).join(PRODUCT_CREATION_OWNER_MARKER))
+}
+
+fn write_product_creation_owner_marker(
+    worktree_path: &Path,
+    ownership_token: &str,
+) -> Result<(), String> {
+    if ownership_token.trim().is_empty() {
+        return Err("product creation ownership token was empty".to_string());
+    }
+    std::fs::write(
+        product_creation_owner_marker_path(worktree_path)?,
+        ownership_token.as_bytes(),
+    )
+    .map_err(|error| format!("could not write product creation owner marker: {error}"))
+}
+
+fn read_product_creation_owner_marker(worktree_path: &Path) -> Result<Option<String>, String> {
+    match std::fs::read_to_string(product_creation_owner_marker_path(worktree_path)?) {
+        Ok(token) => Ok(Some(token)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "could not read product creation owner marker: {error}"
+        )),
+    }
 }
 
 fn ensure_phoenix_staging_ignored(repo_root: &Path) -> Result<(), String> {
@@ -2455,6 +2608,119 @@ mod temporary_creation_branch_tests {
 }
 
 #[cfg(test)]
+mod product_creation_staging_ownership_tests {
+    use super::*;
+
+    fn initialized_repo() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        crate::git_ops::run_git(repo.path(), &["init"]).unwrap();
+        crate::git_ops::run_git(repo.path(), &["config", "user.email", "test@example.com"])
+            .unwrap();
+        crate::git_ops::run_git(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        std::fs::write(repo.path().join("README"), "test").unwrap();
+        crate::git_ops::run_git(repo.path(), &["add", "README"]).unwrap();
+        crate::git_ops::run_git(repo.path(), &["commit", "-m", "initial"]).unwrap();
+        repo
+    }
+
+    fn add_detached_worktree(repo: &Path, path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        crate::git_ops::run_git(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                path.to_string_lossy().as_ref(),
+                "HEAD",
+            ],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn matching_owner_marker_authorizes_staging_removal() {
+        let repo = initialized_repo();
+        let path = repo.path().join(".phoenix/worktrees/owned");
+        add_detached_worktree(repo.path(), &path);
+        write_product_creation_owner_marker(&path, "owner-token").unwrap();
+        let lock = RepositoryMutationLock::acquire(&repo.path().to_string_lossy()).unwrap();
+
+        let outcome = cleanup_unpublished_product_staging_path(
+            Some(path.to_string_lossy().as_ref()),
+            Some(repo.path().to_string_lossy().as_ref()),
+            Some("owner-token"),
+            Some(lock),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(outcome, StagingCleanupOutcome::Cleaned);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn absent_staging_resource_is_already_reconciled() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("absent");
+
+        let outcome = cleanup_unpublished_product_staging_path(
+            Some(path.to_string_lossy().as_ref()),
+            Some(root.path().to_string_lossy().as_ref()),
+            Some("owner-token"),
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(outcome, StagingCleanupOutcome::AlreadyAbsent);
+    }
+
+    #[tokio::test]
+    async fn same_path_and_oid_replacement_is_preserved_as_ownership_conflict() {
+        let repo = initialized_repo();
+        let path = repo.path().join(".phoenix/worktrees/replaced");
+        add_detached_worktree(repo.path(), &path);
+        write_product_creation_owner_marker(&path, "original-owner").unwrap();
+        crate::git_ops::run_git(
+            repo.path(),
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                path.to_string_lossy().as_ref(),
+            ],
+        )
+        .unwrap();
+        add_detached_worktree(repo.path(), &path);
+        let replacement_file = path.join("replacement-owned-by-user");
+        std::fs::write(&replacement_file, "preserve me").unwrap();
+        let lock = RepositoryMutationLock::acquire(&repo.path().to_string_lossy()).unwrap();
+
+        let outcome = cleanup_unpublished_product_staging_path(
+            Some(path.to_string_lossy().as_ref()),
+            Some(repo.path().to_string_lossy().as_ref()),
+            Some("original-owner"),
+            Some(lock),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            StagingCleanupOutcome::OwnershipConflict(StagingOwnershipConflict::OwnerMarkerMissing)
+        );
+        assert_eq!(
+            std::fs::read_to_string(replacement_file).unwrap(),
+            "preserve me"
+        );
+    }
+}
+
+#[cfg(test)]
 mod partial_worktree_cleanup_tests {
     use super::*;
 
@@ -2990,7 +3256,12 @@ fn validate_worktree_belongs_to_repository(
             cwd,
             &["rev-parse", "--path-format=absolute", "--git-common-dir"],
         )
-        .map(|value| value.trim().to_string())
+        .and_then(|value| {
+            Path::new(value.trim())
+                .canonicalize()
+                .map(|path| path.to_string_lossy().to_string())
+                .map_err(|error| format!("could not canonicalize Git common directory: {error}"))
+        })
         .map_err(|error| (error, ErrorKind::ServerError))
     };
     let expected = common_dir(Path::new(repo_root))?;
