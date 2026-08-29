@@ -351,9 +351,10 @@ impl RuntimeManager {
         };
         let key = ResourceScopeKey::Work(scope.clone());
         let bash = self.bash_handles().begin_retirement(&key).await;
+        let tmux_expires = phoenix_tools::tmux::registry::close_deadline();
         let tmux_discovery = match self
             .tmux_registry()
-            .discover_persistent_identity(&key, legacy_worktree_path.as_deref(), None)
+            .discover_persistent_identity(&key, legacy_worktree_path.as_deref(), None, tmux_expires)
             .await
         {
             Ok(discovery) => discovery,
@@ -365,19 +366,19 @@ impl RuntimeManager {
         let tmux = match tmux_discovery {
             PersistentTmuxDiscovery::Absent => {
                 self.tmux_registry()
-                    .begin_retirement(&key, None, None)
+                    .begin_retirement(&key, None, None, tmux_expires)
                     .await
             }
             PersistentTmuxDiscovery::Exact(identity) => {
                 match self
                     .tmux_registry()
-                    .rehydrate_retirement(&key, &identity)
+                    .rehydrate_retirement(&key, &identity, tmux_expires)
                     .await
                 {
                     Ok(TmuxRetirementRehydration::Permit(permit)) => permit,
                     Ok(TmuxRetirementRehydration::AbsenceVerified) => {
                         self.tmux_registry()
-                            .begin_retirement(&key, None, None)
+                            .begin_retirement(&key, None, None, tmux_expires)
                             .await
                     }
                     Ok(TmuxRetirementRehydration::Residual { reason }) => {
@@ -721,9 +722,14 @@ impl RuntimeManager {
                         })
                         .await
                         .map_err(|error| error.to_string())?;
+                    let tmux_expires = phoenix_tools::tmux::registry::close_deadline();
                     match self
                         .tmux_registry()
-                        .rehydrate_retirement(&ResourceScopeKey::Work(scope.clone()), &instance)
+                        .rehydrate_retirement(
+                            &ResourceScopeKey::Work(scope.clone()),
+                            &instance,
+                            tmux_expires,
+                        )
                         .await
                     {
                         Ok(TmuxRetirementRehydration::Permit(permit)) => {

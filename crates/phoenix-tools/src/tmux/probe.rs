@@ -59,7 +59,7 @@ pub(crate) async fn probe_with_binary(
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "tmux probe timed out"))
 }
 
-async fn probe_with_binary_until(
+pub(crate) async fn probe_with_binary_until(
     socket_path: &Path,
     binary: &Path,
     expires: Instant,
