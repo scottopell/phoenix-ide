@@ -5,6 +5,8 @@
 //! decision point for the three lifecycle branches handled in
 //! `registry.rs::ensure_live`.
 
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 use std::process::Stdio;
 
@@ -41,8 +43,15 @@ pub(crate) async fn probe_with_binary(
     socket_path: &Path,
     binary: &Path,
 ) -> std::io::Result<ProbeResult> {
-    if !socket_path.exists() {
-        return Ok(ProbeResult::NoSocket);
+    match std::fs::symlink_metadata(socket_path) {
+        Ok(metadata) if !metadata.file_type().is_socket() => {
+            return Ok(ProbeResult::DeadSocket);
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ProbeResult::NoSocket);
+        }
+        Err(error) => return Err(error),
     }
     let output = tokio::process::Command::new(binary)
         .args(["-S", &socket_path.to_string_lossy(), "ls"])
@@ -54,14 +63,20 @@ pub(crate) async fn probe_with_binary(
         .await?;
     Ok(classify_output(
         output.status.success(),
-        &String::from_utf8_lossy(&output.stderr),
+        &output.stderr,
+        socket_path,
     ))
 }
 
-fn classify_output(success: bool, stderr: &str) -> ProbeResult {
+fn classify_output(success: bool, stderr: &[u8], socket_path: &Path) -> ProbeResult {
     if success {
-        ProbeResult::Live
-    } else if stderr.trim_start().starts_with("no server running on ") {
+        return ProbeResult::Live;
+    }
+
+    let mut expected = b"no server running on ".to_vec();
+    expected.extend_from_slice(socket_path.as_os_str().as_bytes());
+    expected.push(b'\n');
+    if stderr == expected || stderr == &expected[..expected.len() - 1] {
         ProbeResult::NoServer
     } else {
         ProbeResult::DeadSocket
@@ -70,8 +85,15 @@ fn classify_output(success: bool, stderr: &str) -> ProbeResult {
 
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn probe_sync(socket_path: &Path) -> ProbeResult {
-    if !socket_path.exists() {
-        return ProbeResult::NoSocket;
+    match std::fs::symlink_metadata(socket_path) {
+        Ok(metadata) if !metadata.file_type().is_socket() => {
+            return ProbeResult::DeadSocket;
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return ProbeResult::NoSocket;
+        }
+        Err(_) => return ProbeResult::DeadSocket,
     }
     let output = std::process::Command::new("tmux")
         .args(["-S", &socket_path.to_string_lossy(), "ls"])
@@ -81,10 +103,7 @@ pub(crate) fn probe_sync(socket_path: &Path) -> ProbeResult {
         .stderr(Stdio::piped())
         .output();
     match output {
-        Ok(output) => classify_output(
-            output.status.success(),
-            &String::from_utf8_lossy(&output.stderr),
-        ),
+        Ok(output) => classify_output(output.status.success(), &output.stderr, socket_path),
         Err(_) => ProbeResult::DeadSocket,
     }
 }
@@ -102,17 +121,23 @@ mod tests {
     }
 
     #[test]
-    fn nonzero_without_explicit_absence_is_ambiguous() {
+    fn nonzero_without_exact_absence_for_probed_path_is_ambiguous() {
+        let path = Path::new("/tmp/example.sock");
         assert_eq!(
-            classify_output(false, "permission denied"),
+            classify_output(false, b"permission denied", path),
+            ProbeResult::DeadSocket
+        );
+        assert_eq!(
+            classify_output(false, b"no server running on /tmp/other.sock\n", path),
             ProbeResult::DeadSocket
         );
     }
 
     #[test]
-    fn explicit_no_server_response_proves_absence() {
+    fn exact_no_server_response_for_probed_path_proves_absence() {
+        let path = Path::new("/tmp/example.sock");
         assert_eq!(
-            classify_output(false, "no server running on /tmp/example.sock\n"),
+            classify_output(false, b"no server running on /tmp/example.sock\n", path),
             ProbeResult::NoServer
         );
     }
@@ -128,5 +153,17 @@ mod tests {
         let path = tmp.path().join("orphan.sock");
         std::fs::write(&path, b"not a real tmux socket").unwrap();
         assert_eq!(probe(&path).await.unwrap(), ProbeResult::DeadSocket);
+    }
+
+    #[tokio::test]
+    async fn probe_returns_no_server_for_orphan_socket() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("orphan.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        drop(listener);
+        assert_eq!(probe(&path).await.unwrap(), ProbeResult::NoServer);
     }
 }
