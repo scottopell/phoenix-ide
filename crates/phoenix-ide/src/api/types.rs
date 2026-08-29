@@ -79,6 +79,7 @@ pub enum ProductConversationCreationAllowedActionView {
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct ProductConversationCreationRecoveryRow {
     pub request_id: String,
+    pub published_product_conversation_id: Option<String>,
     pub status: String,
     pub cwd: String,
     pub objective: String,

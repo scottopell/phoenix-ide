@@ -97,6 +97,7 @@ pub async fn list_product_conversation_creations(
         .into_iter()
         .map(|job| ProductConversationCreationRecoveryRow {
             request_id: job.request_id,
+            published_product_conversation_id: job.published_product_conversation_id,
             status: job.status.clone(),
             cwd: job.intent.cwd,
             objective: job.intent.objective,

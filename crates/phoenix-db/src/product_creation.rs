@@ -75,6 +75,7 @@ pub struct ProductCreationRecoveryJobRecord {
     pub request_id: String,
     pub status: String,
     pub intent: ProductCreationIntent,
+    pub published_product_conversation_id: Option<String>,
     pub updated_at: DateTime<Utc>,
     pub last_error: Option<String>,
 }
@@ -1105,7 +1106,7 @@ impl Database {
     ) -> DbResult<Vec<ProductCreationRecoveryJobRecord>> {
         sqlx::query(
             "SELECT request_id, cwd, objective, model, effort, llm_language, status,
-                    updated_at_unix_micros, last_error,
+                    published_product_id, updated_at_unix_micros, last_error,
                     COALESCE((SELECT json_group_array(json_object('media_type', ordered.media_type, 'data', ordered.data))
                               FROM (SELECT media_type, data FROM product_creation_job_images
                                     WHERE request_id = j.request_id ORDER BY ordinal) ordered), '[]') AS images_json
@@ -1131,6 +1132,7 @@ impl Database {
             Ok(ProductCreationRecoveryJobRecord {
                 request_id: row.try_get("request_id")?,
                 status: row.try_get("status")?,
+                published_product_conversation_id: row.try_get("published_product_id")?,
                 intent: ProductCreationIntent {
                     cwd: row.try_get("cwd")?,
                     objective: row.try_get("objective")?,
@@ -3186,6 +3188,7 @@ mod product_creation_tests {
             .await
             .unwrap()
             .unwrap();
+        let expected_published_product_id = accepted.product_conversation_id.to_string();
         db.publish_product_creation_atomically(&ProductCreationPublishInput {
             request_id: "req-delivery".to_string(),
             claim: delivery_claim.claim.clone(),
@@ -3315,6 +3318,15 @@ mod product_creation_tests {
             .unwrap();
         assert_eq!(delivery.intent.cwd, "/repo/delivery");
         assert_eq!(delivery.intent.objective, "delivery");
+        assert_eq!(
+            delivery.published_product_conversation_id.as_deref(),
+            Some(expected_published_product_id.as_str())
+        );
+        let accepted = rows
+            .iter()
+            .find(|row| row.request_id == "req-accepted")
+            .unwrap();
+        assert_eq!(accepted.published_product_conversation_id, None);
         assert!(rows.iter().all(|row| row.request_id != "req-published"));
         assert!(rows.iter().all(|row| row.request_id != "req-delete-hidden"));
     }
