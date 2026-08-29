@@ -309,6 +309,72 @@ struct TmuxScopeEntry {
     server: Arc<RwLock<TmuxServer>>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RetirementDeadline {
+    expires: tokio::time::Instant,
+}
+
+impl RetirementDeadline {
+    fn new(expires: tokio::time::Instant) -> Self {
+        Self { expires }
+    }
+
+    async fn read_map<'a>(
+        self,
+        registry: &'a TmuxRegistry,
+        phase: &'static str,
+    ) -> Result<tokio::sync::RwLockReadGuard<'a, HashMap<String, Arc<TmuxScopeEntry>>>, String>
+    {
+        tokio::time::timeout_at(self.expires, registry.inner.read())
+            .await
+            .map_err(|_| format!("tmux {phase} registry read lock exceeded the Close deadline"))
+    }
+
+    async fn write_map<'a>(
+        self,
+        registry: &'a TmuxRegistry,
+        phase: &'static str,
+    ) -> Result<tokio::sync::RwLockWriteGuard<'a, HashMap<String, Arc<TmuxScopeEntry>>>, String>
+    {
+        tokio::time::timeout_at(self.expires, registry.inner.write())
+            .await
+            .map_err(|_| format!("tmux {phase} registry write lock exceeded the Close deadline"))
+    }
+
+    async fn get_existing(
+        self,
+        registry: &TmuxRegistry,
+        work_scope: &ResourceScopeKey,
+        phase: &'static str,
+    ) -> Result<Option<Arc<TmuxScopeEntry>>, String> {
+        let map = self.read_map(registry, phase).await?;
+        Ok(map.get(&work_scope.stable_key()).cloned())
+    }
+
+    async fn get_or_insert(
+        self,
+        registry: &TmuxRegistry,
+        work_scope: &ResourceScopeKey,
+        server: TmuxServer,
+        phase: &'static str,
+    ) -> Result<(Arc<TmuxScopeEntry>, bool), String> {
+        let key = work_scope.stable_key();
+        {
+            let map = self.read_map(registry, phase).await?;
+            if let Some(entry) = map.get(&key) {
+                return Ok((entry.clone(), false));
+            }
+        }
+        let mut map = self.write_map(registry, phase).await?;
+        if let Some(entry) = map.get(&key) {
+            return Ok((entry.clone(), false));
+        }
+        let entry = Arc::new(TmuxScopeEntry::new(server));
+        map.insert(key, entry.clone());
+        Ok((entry, true))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservedWindow {
     pub exit_code: Option<i32>,
@@ -416,6 +482,12 @@ struct EnsureLiveLockTestHook {
     release: Arc<tokio::sync::Notify>,
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+struct CompleteRetirementLockTestHook {
+    before_entry_lock: Arc<tokio::sync::Notify>,
+}
+
 /// Top-level registry: maps `ResourceScopeKey::stable_key()` → per-scope tmux
 /// server. One registry instance per Phoenix process.
 #[derive(Debug)]
@@ -440,6 +512,8 @@ pub struct TmuxRegistry {
     contain_test_spawns: bool,
     #[cfg(test)]
     ensure_live_lock_test_hook: Option<Arc<EnsureLiveLockTestHook>>,
+    #[cfg(test)]
+    complete_retirement_lock_test_hook: Option<Arc<CompleteRetirementLockTestHook>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -475,6 +549,8 @@ impl TmuxRegistry {
             contain_test_spawns: false,
             #[cfg(test)]
             ensure_live_lock_test_hook: None,
+            #[cfg(test)]
+            complete_retirement_lock_test_hook: None,
         }
     }
 
@@ -527,6 +603,8 @@ impl TmuxRegistry {
             contain_test_spawns: false,
             #[cfg(test)]
             ensure_live_lock_test_hook: None,
+            #[cfg(test)]
+            complete_retirement_lock_test_hook: None,
         }
     }
 
@@ -550,6 +628,8 @@ impl TmuxRegistry {
             contain_test_spawns: false,
             #[cfg(test)]
             ensure_live_lock_test_hook: None,
+            #[cfg(test)]
+            complete_retirement_lock_test_hook: None,
         }
     }
 
@@ -567,6 +647,17 @@ impl TmuxRegistry {
     ) -> Self {
         self.ensure_live_lock_test_hook =
             Some(Arc::new(EnsureLiveLockTestHook { entered, release }));
+        self
+    }
+
+    #[cfg(test)]
+    fn with_complete_retirement_lock_test_hook(
+        mut self,
+        before_entry_lock: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.complete_retirement_lock_test_hook = Some(Arc::new(CompleteRetirementLockTestHook {
+            before_entry_lock,
+        }));
         self
     }
 
@@ -1329,9 +1420,16 @@ impl TmuxRegistry {
         persisted: &TmuxServerInstanceIdentity,
         expires: tokio::time::Instant,
     ) -> Result<TmuxRetirementRehydration, TmuxError> {
-        let current_entry = self.get_existing(work_scope).await;
+        let deadline = RetirementDeadline::new(expires);
+        let current_entry = match deadline
+            .get_existing(self, work_scope, "retirement rehydration")
+            .await
+        {
+            Ok(entry) => entry,
+            Err(reason) => return Ok(TmuxRetirementRehydration::Residual { reason }),
+        };
         if let Some(entry) = current_entry {
-            let Ok(current) = tokio::time::timeout_at(expires, entry.read()).await else {
+            let Ok(current) = tokio::time::timeout_at(expires, entry.server.read()).await else {
                 return Ok(TmuxRetirementRehydration::Residual {
                     reason: "tmux entry identity read lock exceeded the Close deadline".to_string(),
                 });
@@ -1352,7 +1450,8 @@ impl TmuxRegistry {
                         Ok(TmuxRetirementRehydration::Residual { reason })
                     }
                     ExactTmuxIdentityState::Live => {
-                        let Ok(mut current) = tokio::time::timeout_at(expires, entry.write()).await
+                        let Ok(mut current) =
+                            tokio::time::timeout_at(expires, entry.server.write()).await
                         else {
                             return Ok(TmuxRetirementRehydration::Residual {
                                 reason:
@@ -1424,19 +1523,22 @@ impl TmuxRegistry {
                 Ok(TmuxRetirementRehydration::Residual { reason })
             }
             ExactTmuxIdentityState::Live => {
-                let key = work_scope.stable_key();
-                let entry = {
-                    let mut map = self.inner.write().await;
-                    if let Some(entry) = map.get(&key) {
-                        entry.clone()
-                    } else {
-                        let mut server =
-                            TmuxServer::new(work_scope.clone(), persisted.socket_path.clone());
-                        server.server_token.clone_from(&persisted.server_token);
-                        server.status = ServerStatus::Live;
-                        let entry = Arc::new(TmuxScopeEntry::new(server));
-                        map.insert(key, entry.clone());
-                        entry
+                let mut rehydrated =
+                    TmuxServer::new(work_scope.clone(), persisted.socket_path.clone());
+                rehydrated.server_token.clone_from(&persisted.server_token);
+                rehydrated.status = ServerStatus::Live;
+                let (entry, _) = match RetirementDeadline::new(expires)
+                    .get_or_insert(
+                        self,
+                        work_scope,
+                        rehydrated,
+                        "missing retirement rehydration",
+                    )
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(reason) => {
+                        return Ok(TmuxRetirementRehydration::Residual { reason });
                     }
                 };
 
@@ -1544,7 +1646,12 @@ impl TmuxRegistry {
             current
         };
 
-        let (entry, created) = self.get_or_insert(work_scope, socket_path).await;
+        let deadline = RetirementDeadline::new(expires);
+        let server = TmuxServer::new(work_scope.clone(), socket_path);
+        let (entry, created) = deadline
+            .get_or_insert(self, work_scope, server, "retirement begin")
+            .await
+            .map_err(|reason| TmuxRetirementOutcome::RemovalFailed { reason })?;
         let Ok(mut server) = tokio::time::timeout_at(expires, entry.server.write()).await else {
             return Err(TmuxRetirementOutcome::RemovalFailed {
                 reason: "tmux retirement fence write lock exceeded the Close deadline".to_string(),
@@ -1775,14 +1882,22 @@ impl TmuxRegistry {
         if !permit.had_entry {
             return Ok(TmuxRetirementOutcome::AbsenceVerified);
         }
-        let current_entry = {
-            let map = self.inner.read().await;
-            map.get(&permit.work_scope.stable_key()).cloned()
+        let deadline = RetirementDeadline::new(permit.expires);
+        let current_entry = match deadline
+            .get_existing(self, &permit.work_scope, "retirement complete initial")
+            .await
+        {
+            Ok(entry) => entry,
+            Err(reason) => return Ok(TmuxRetirementOutcome::RemovalFailed { reason }),
         };
         let Some(entry) = current_entry else {
             return self.verify_exact_absence(permit).await;
         };
 
+        #[cfg(test)]
+        if let Some(hook) = &self.complete_retirement_lock_test_hook {
+            hook.before_entry_lock.notify_one();
+        }
         let Ok(server) = tokio::time::timeout_at(permit.expires, entry.server.write()).await else {
             return Ok(TmuxRetirementOutcome::RemovalFailed {
                 reason: "tmux exact teardown write lock exceeded the Close deadline".to_string(),
@@ -1880,12 +1995,12 @@ impl TmuxRegistry {
 
         match verified {
             TmuxRetirementOutcome::AbsenceVerified => {
-                let current = {
-                    self.inner
-                        .read()
-                        .await
-                        .get(&permit.work_scope.stable_key())
-                        .cloned()
+                let current = match deadline
+                    .get_existing(self, &permit.work_scope, "retirement complete final")
+                    .await
+                {
+                    Ok(entry) => entry,
+                    Err(reason) => return Ok(TmuxRetirementOutcome::RemovalFailed { reason }),
                 };
                 let exact_owned = match current {
                     Some(current) => {
@@ -1902,16 +2017,11 @@ impl TmuxRegistry {
                     None => false,
                 };
                 if exact_owned {
-                    let removed = match tokio::time::timeout_at(permit.expires, self.inner.write())
-                        .await
+                    let removed = match deadline.write_map(self, "retirement complete final").await
                     {
                         Ok(mut inner) => inner.remove(&permit.work_scope.stable_key()).is_some(),
-                        Err(_) => {
-                            return Ok(TmuxRetirementOutcome::RemovalFailed {
-                                reason:
-                                    "tmux final registry write lock exceeded the Close deadline"
-                                        .to_string(),
-                            });
+                        Err(reason) => {
+                            return Ok(TmuxRetirementOutcome::RemovalFailed { reason });
                         }
                     };
                     if removed && permit.had_entry {
@@ -2012,7 +2122,20 @@ impl TmuxRegistry {
         }
         let expires = close_deadline();
 
-        let existing = self.get_existing(work_scope).await;
+        let deadline = RetirementDeadline::new(expires);
+        let existing = match deadline
+            .get_existing(self, work_scope, "cascade retirement")
+            .await
+        {
+            Ok(existing) => existing.map(|entry| entry.server.clone()),
+            Err(reason) => {
+                return CascadeReport {
+                    socket_path: self.derived_socket_path(work_scope),
+                    kill_server_error: Some(reason),
+                    unlink_error: None,
+                };
+            }
+        };
         if existing.is_none() {
             let discovery = match self
                 .discover_persistent_identity(
@@ -2101,15 +2224,12 @@ impl TmuxRegistry {
                 }
             };
             if status == ServerStatus::NotProbed {
-                let removed = match tokio::time::timeout_at(expires, self.inner.write()).await {
+                let removed = match deadline.write_map(self, "cascade retirement").await {
                     Ok(mut inner) => inner.remove(&work_scope.stable_key()).is_some(),
-                    Err(_) => {
+                    Err(reason) => {
                         return CascadeReport {
                             socket_path: self.derived_socket_path(work_scope),
-                            kill_server_error: Some(
-                                "tmux cascade registry write lock exceeded the Close deadline"
-                                    .to_string(),
-                            ),
+                            kill_server_error: Some(reason),
                             unlink_error: None,
                         };
                     }
@@ -2968,6 +3088,137 @@ mod tests {
         assert_eq!(server.server_token, original_token);
         assert!(!server.retirement_fenced);
         assert_eq!(server.retirement_generation, 0);
+    }
+
+    #[tokio::test]
+    async fn close_deadline_bounds_begin_registry_map_lock_without_partial_fence() {
+        let tmp = TempDir::new().unwrap();
+        let registry = Arc::new(TmuxRegistry::with_socket_dir_and_binary(
+            tmp.path().to_path_buf(),
+            false,
+        ));
+        let work_scope = scope("deadline-begin-map");
+        let map_guard = registry.inner.write().await;
+        let expires = tokio::time::Instant::now() + Duration::from_millis(50);
+
+        let outcome = registry
+            .begin_retirement(&work_scope, None, None, expires)
+            .await
+            .expect_err("contended map must produce a typed residual");
+        assert!(matches!(
+            outcome,
+            TmuxRetirementOutcome::RemovalFailed { reason }
+                if reason.contains("retirement begin registry read lock")
+                    && reason.contains("Close deadline")
+        ));
+        assert!(map_guard.get(&work_scope.stable_key()).is_none());
+    }
+
+    #[tokio::test]
+    async fn close_deadline_bounds_missing_rehydration_registry_map_lock() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let owner = TestTmuxServerOwner::new();
+        let scope = scope("deadline-rehydrate-map");
+        let bootstrap = owner.registry();
+        let live = bootstrap
+            .ensure_live(&scope, owner.path(), None, None)
+            .await
+            .expect("bootstrap live server");
+        let persisted = live.read().await.exact_identity();
+        let restarted = owner.registry();
+        let map_guard = restarted.inner.write().await;
+        let expires = tokio::time::Instant::now() + Duration::from_millis(50);
+
+        let result = restarted
+            .rehydrate_missing_entry(&scope, &persisted, expires)
+            .await
+            .expect("map contention is a typed rehydration residual");
+        assert!(matches!(
+            result,
+            TmuxRetirementRehydration::Residual { reason }
+                if reason.contains("missing retirement rehydration registry read lock")
+                    && reason.contains("Close deadline")
+        ));
+        assert!(map_guard.get(&scope.stable_key()).is_none());
+        drop(map_guard);
+        owner.shutdown();
+    }
+
+    #[tokio::test]
+    async fn close_deadline_bounds_complete_initial_registry_map_lock() {
+        let tmp = TempDir::new().unwrap();
+        let registry = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        let work_scope = scope("deadline-complete-initial-map");
+        let socket_path = registry.derived_socket_path(&work_scope);
+        registry.get_or_insert(&work_scope, socket_path).await;
+        let permit = registry
+            .begin_retirement(
+                &work_scope,
+                None,
+                None,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .expect("retirement fence");
+        let map_guard = registry.inner.write().await;
+
+        let outcome = registry.complete_retirement(&permit).await.unwrap();
+        assert!(matches!(
+            outcome,
+            TmuxRetirementOutcome::RemovalFailed { reason }
+                if reason.contains("retirement complete initial registry read lock")
+                    && reason.contains("Close deadline")
+        ));
+        assert!(map_guard.get(&work_scope.stable_key()).is_some());
+    }
+
+    #[tokio::test]
+    async fn close_deadline_bounds_complete_final_registry_map_lock() {
+        let tmp = TempDir::new().unwrap();
+        let before_entry_lock = Arc::new(tokio::sync::Notify::new());
+        let registry = Arc::new(
+            TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false)
+                .with_complete_retirement_lock_test_hook(Arc::clone(&before_entry_lock)),
+        );
+        let work_scope = scope("deadline-complete-final-map");
+        let socket_path = registry.derived_socket_path(&work_scope);
+        registry.get_or_insert(&work_scope, socket_path).await;
+        let permit = registry
+            .begin_retirement(
+                &work_scope,
+                None,
+                None,
+                tokio::time::Instant::now() + Duration::from_millis(100),
+            )
+            .await
+            .expect("retirement fence");
+        let entry = registry
+            .inner
+            .read()
+            .await
+            .get(&work_scope.stable_key())
+            .cloned()
+            .unwrap();
+        let entry_guard = entry.server.write().await;
+        let completing = {
+            let registry = Arc::clone(&registry);
+            let permit = permit.clone();
+            tokio::spawn(async move { registry.complete_retirement(&permit).await.unwrap() })
+        };
+        before_entry_lock.notified().await;
+        let map_guard = registry.inner.write().await;
+        drop(entry_guard);
+
+        let outcome = completing.await.unwrap();
+        assert!(matches!(
+            outcome,
+            TmuxRetirementOutcome::RemovalFailed { reason }
+                if reason.contains("retirement complete final registry read lock")
+                    && reason.contains("Close deadline")
+        ));
+        assert!(map_guard.get(&work_scope.stable_key()).is_some());
     }
 
     #[cfg(unix)]
