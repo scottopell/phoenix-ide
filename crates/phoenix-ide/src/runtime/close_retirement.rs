@@ -33,7 +33,7 @@ use crate::db::{
     CaptureCloseRetirementInventoryRequest, CaptureCloseRetirementInventoryScopeRequest,
     RecordCloseRetirementDispatchRequest, RecordCloseRetirementEvidenceRequest,
     RecordCloseWorktreeCleanupPlanRequest, ReplaceCloseInspectionRequest,
-    ReplaceCloseInspectionScopeRequest,
+    ReplaceCloseInspectionScopeRequest, RouteCloseAttemptToRepairRequest,
 };
 
 /// Process-local capability retained from inventory sealing through per-resource
@@ -128,21 +128,26 @@ impl RuntimeManager {
                             if observe_worktree_fingerprint(&path).as_deref()
                                 != Some(identity.fingerprint().as_str())
                             {
-                                self.db()
-                                    .route_close_attempt_to_repair(&attempt_id)
-                                    .await
-                                    .map_err(|error| error.to_string())?;
-                                return Err("captured worktree administrative incarnation changed"
-                                    .to_string());
+                                return self
+                                    .route_close_attempt_to_repair(
+                                        &attempt_id,
+                                        &scope.scope,
+                                        RetirementFailureReason::IdentityNotProven,
+                                        "captured worktree administrative incarnation changed",
+                                    )
+                                    .await;
                             }
                             let (snapshot, losses) = match inspect_worktree(&identity).await {
                                 Ok(inspection) => inspection,
                                 Err(error) => {
-                                    self.db()
-                                        .route_close_attempt_to_repair(&attempt_id)
-                                        .await
-                                        .map_err(|db_error| db_error.to_string())?;
-                                    return Err(error);
+                                    return self
+                                        .route_close_attempt_to_repair(
+                                            &attempt_id,
+                                            &scope.scope,
+                                            RetirementFailureReason::ManualRepairRequired,
+                                            error,
+                                        )
+                                        .await;
                                 }
                             };
                             (
@@ -161,22 +166,27 @@ impl RuntimeManager {
                             if observe_worktree_fingerprint(&quarantine).as_deref()
                                 != Some(identity.fingerprint().as_str())
                             {
-                                self.db()
-                                    .route_close_attempt_to_repair(&attempt_id)
-                                    .await
-                                    .map_err(|error| error.to_string())?;
-                                return Err("captured worktree administrative incarnation changed"
-                                    .to_string());
+                                return self
+                                    .route_close_attempt_to_repair(
+                                        &attempt_id,
+                                        &scope.scope,
+                                        RetirementFailureReason::IdentityNotProven,
+                                        "captured worktree administrative incarnation changed",
+                                    )
+                                    .await;
                             }
                             let (snapshot, losses) =
                                 match inspect_worktree_at(&identity, quarantine).await {
                                     Ok(inspection) => inspection,
                                     Err(error) => {
-                                        self.db()
-                                            .route_close_attempt_to_repair(&attempt_id)
-                                            .await
-                                            .map_err(|db_error| db_error.to_string())?;
-                                        return Err(error);
+                                        return self
+                                            .route_close_attempt_to_repair(
+                                                &attempt_id,
+                                                &scope.scope,
+                                                RetirementFailureReason::ManualRepairRequired,
+                                                error,
+                                            )
+                                            .await;
                                     }
                                 };
                             (
@@ -236,36 +246,45 @@ impl RuntimeManager {
                                     return Ok(prior_snapshot);
                                 }
                             }
-                            self.db()
-                                .route_close_attempt_to_repair(&attempt_id)
-                                .await
-                                .map_err(|error| error.to_string())?;
-                            return Err(format!(
-                                "scope {} captured worktree is absent before inspection",
-                                scope.scope
-                            ));
+                            return self
+                                .route_close_attempt_to_repair(
+                                    &attempt_id,
+                                    &scope.scope,
+                                    RetirementFailureReason::IdentityNotProven,
+                                    format!(
+                                        "scope {} captured worktree is absent before inspection",
+                                        scope.scope
+                                    ),
+                                )
+                                .await;
                         }
                         Err(error) => {
-                            self.db()
-                                .route_close_attempt_to_repair(&attempt_id)
-                                .await
-                                .map_err(|db_error| db_error.to_string())?;
-                            return Err(format!(
-                                "scope {} captured worktree is inaccessible before inspection: {error}",
-                                scope.scope
-                            ));
+                            return self
+                                .route_close_attempt_to_repair(
+                                    &attempt_id,
+                                    &scope.scope,
+                                    RetirementFailureReason::ManualRepairRequired,
+                                    format!(
+                                        "scope {} captured worktree is inaccessible before inspection: {error}",
+                                        scope.scope
+                                    ),
+                                )
+                                .await;
                         }
                     }
                 }
                 Some(CapturedWorktreeIdentity::Unresolved { .. }) => {
-                    self.db()
-                        .route_close_attempt_to_repair(&attempt_id)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    return Err(format!(
-                        "scope {} has unresolved captured worktree identity",
-                        scope.scope
-                    ));
+                    return self
+                        .route_close_attempt_to_repair(
+                            &attempt_id,
+                            &scope.scope,
+                            RetirementFailureReason::IdentityNotProven,
+                            format!(
+                                "scope {} has unresolved captured worktree identity",
+                                scope.scope
+                            ),
+                        )
+                        .await;
                 }
             };
             requests.push(ReplaceCloseInspectionScopeRequest {
@@ -493,11 +512,14 @@ impl RuntimeManager {
                     for scope in &acquired_scopes {
                         self.cancel_close_resource_lease(&attempt_id, scope).await;
                     }
-                    self.db()
-                        .route_close_attempt_to_repair(&attempt_id)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    return Err(reason);
+                    return self
+                        .route_close_attempt_to_repair(
+                            &attempt_id,
+                            &captured.scope,
+                            RetirementFailureReason::IdentityNotProven,
+                            reason,
+                        )
+                        .await;
                 }
             };
             acquired_scopes.push(captured.scope.clone());
@@ -508,14 +530,17 @@ impl RuntimeManager {
                     for scope in &acquired_scopes {
                         self.cancel_close_resource_lease(&attempt_id, scope).await;
                     }
-                    self.db()
-                        .route_close_attempt_to_repair(&attempt_id)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    return Err(format!(
-                        "scope {} has unresolved captured worktree identity",
-                        captured.scope
-                    ));
+                    return self
+                        .route_close_attempt_to_repair(
+                            &attempt_id,
+                            &captured.scope,
+                            RetirementFailureReason::IdentityNotProven,
+                            format!(
+                                "scope {} has unresolved captured worktree identity",
+                                captured.scope
+                            ),
+                        )
+                        .await;
                 }
             };
             let mut inventory = CloseOwnedResourceInventory {
@@ -820,13 +845,16 @@ impl RuntimeManager {
                         .find(|resource| resource.kind() == RetiredResourceKind::TmuxServer)
                         .cloned()
                     else {
-                        self.db()
-                            .route_close_attempt_to_repair(&attempt_id)
-                            .await
-                            .map_err(|error| error.to_string())?;
-                        return Err(format!(
-                            "tmux Close teardown failed without a sealed tmux target for scope {scope}: {detail}"
-                        ));
+                        return self
+                            .route_close_attempt_to_repair(
+                                &attempt_id,
+                                &scope,
+                                reason,
+                                format!(
+                                    "tmux Close teardown failed without a sealed tmux target for scope {scope}: {detail}"
+                                ),
+                            )
+                            .await;
                     };
                     return self
                         .record_close_residual(
@@ -1483,6 +1511,52 @@ impl RuntimeManager {
             })
             .await
             .map_err(|error| error.to_string())
+    }
+
+    pub(crate) async fn route_close_attempt_to_repair<T>(
+        &self,
+        attempt_id: &CloseAttemptId,
+        scope: &WorkScopeId,
+        reason: RetirementFailureReason,
+        detail: impl Into<String>,
+    ) -> Result<T, String> {
+        let detail = detail.into();
+        let captured = self
+            .db()
+            .list_close_attempt_scopes(attempt_id.as_str())
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|captured| captured.scope == *scope)
+            .ok_or_else(|| format!("Close repair scope {scope} was not captured"))?;
+        let residual = match captured.captured_worktree {
+            Some(CapturedWorktreeIdentity::Resolved(identity)) => RetiredResourceIdentity::parse(
+                RetiredResourceKind::Worktree,
+                LossItemIdentity::Worktree(identity),
+            ),
+            None | Some(CapturedWorktreeIdentity::Unresolved { .. }) => {
+                RetiredResourceIdentity::parse(
+                    RetiredResourceKind::WorkScope,
+                    LossItemIdentity::Opaque(
+                        OpaqueIdentity::parse(scope.as_str().to_string())
+                            .map_err(|error| error.to_string())?,
+                    ),
+                )
+            }
+        }
+        .map_err(|error| error.to_string())?;
+        self.db()
+            .route_close_attempt_to_repair(RouteCloseAttemptToRepairRequest {
+                attempt_id: attempt_id.clone(),
+                scope: scope.clone(),
+                residual,
+                reason,
+                detail: detail.clone(),
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        self.cancel_close_resource_leases(attempt_id).await;
+        Err(detail)
     }
 
     async fn record_close_residual<T>(
@@ -2516,15 +2590,23 @@ where
     result
 }
 
-fn remove_identity_bound_directory<F, O>(
+#[allow(
+    clippy::cast_sign_loss,
+    clippy::too_many_lines,
+    clippy::unnecessary_cast,
+    reason = "libc stat field signedness and width vary across supported Unix targets"
+)]
+fn remove_identity_bound_directory<F, A, O>(
     deletion_target: &Path,
     expected_identity: &str,
     observe_identity: O,
     before_final_move: F,
+    after_identity_observation: A,
     description: &str,
 ) -> Result<(), String>
 where
     F: FnOnce(&Path),
+    A: FnOnce(&Path, &Path),
     O: Fn(&Path) -> Result<String, String>,
 {
     before_final_move(deletion_target);
@@ -2548,18 +2630,33 @@ where
         ));
     }
     let tombstone = tombstone_root.join("object");
+    #[cfg(unix)]
+    let verified_root = {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = std::fs::symlink_metadata(&tombstone_root)
+            .map_err(|error| format!("cannot identify private {description} tombstone: {error}"))?;
+        (metadata.dev(), metadata.ino())
+    };
     if let Err(error) = std::fs::rename(deletion_target, &tombstone) {
         let _ = std::fs::remove_dir(&tombstone_root);
         return Err(format!(
             "cannot move {description} into private final tombstone: {error}"
         ));
     }
+    #[cfg(unix)]
+    let verified_object = {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = std::fs::symlink_metadata(&tombstone)
+            .map_err(|error| format!("cannot identify identity-bound {description}: {error}"))?;
+        (metadata.dev(), metadata.ino())
+    };
     if observe_identity(&tombstone)? != expected_identity {
         return Err(format!(
             "{description} identity changed before final deletion; replacement preserved at {}",
             tombstone.display()
         ));
     }
+    after_identity_observation(&tombstone_root, &tombstone);
     #[cfg(unix)]
     {
         use std::ffi::CString;
@@ -2584,6 +2681,28 @@ where
         }
         // SAFETY: root_descriptor is newly owned on success above.
         let root_descriptor = unsafe { std::os::fd::OwnedFd::from_raw_fd(root_descriptor) };
+        let mut opened_root = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: descriptor is open and fstat initializes opened_root on success.
+        if unsafe {
+            libc::fstat(
+                std::os::fd::AsRawFd::as_raw_fd(&root_descriptor),
+                opened_root.as_mut_ptr(),
+            )
+        } < 0
+        {
+            return Err(format!(
+                "cannot identify opened private {description} tombstone: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: fstat succeeded.
+        let opened_root = unsafe { opened_root.assume_init() };
+        if (opened_root.st_dev as u64, opened_root.st_ino as u64) != verified_root {
+            return Err(format!(
+                "private {description} tombstone root was replaced before descriptor binding; replacement preserved at {}",
+                tombstone_root.display()
+            ));
+        }
         // SAFETY: openat is rooted in the private descriptor and O_NOFOLLOW rejects replacement links.
         let object_descriptor = unsafe {
             libc::openat(
@@ -2600,6 +2719,28 @@ where
         }
         // SAFETY: object_descriptor is newly owned on success above.
         let object_descriptor = unsafe { std::os::fd::OwnedFd::from_raw_fd(object_descriptor) };
+        let mut opened_object = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: descriptor is open and fstat initializes opened_object on success.
+        if unsafe {
+            libc::fstat(
+                std::os::fd::AsRawFd::as_raw_fd(&object_descriptor),
+                opened_object.as_mut_ptr(),
+            )
+        } < 0
+        {
+            return Err(format!(
+                "cannot identify opened identity-bound {description}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: fstat succeeded.
+        let opened_object = unsafe { opened_object.assume_init() };
+        if (opened_object.st_dev as u64, opened_object.st_ino as u64) != verified_object {
+            return Err(format!(
+                "identity-bound {description} object was replaced before descriptor binding; replacement preserved at {}",
+                tombstone.display()
+            ));
+        }
         remove_directory_contents_at(&object_descriptor)?;
         // SAFETY: unlinkat is rooted at the still-open private directory and does not follow names.
         if unsafe {
@@ -2688,6 +2829,7 @@ where
         expected_incarnation,
         observe_administrative_dir_incarnation,
         before_final_move,
+        |_, _| {},
         "retired worktree administrative directory",
     )
 }
@@ -3415,6 +3557,7 @@ where
             })
         },
         before_final_move,
+        |_, _| {},
         "quarantined worktree",
     )?;
     after_quarantine_removal();
@@ -3720,7 +3863,7 @@ mod tests {
         observe_administrative_dir_incarnation, parse_status_losses,
         planned_administrative_dir_is_absent, quarantine_and_remove_exact_worktree,
         remove_directory_contents_at_with_hook, remove_exact_worktree_administrative_dir_with_hook,
-        remove_quarantine_then_administrative_dir,
+        remove_identity_bound_directory, remove_quarantine_then_administrative_dir,
         remove_quarantine_then_administrative_dir_with_hooks, rotate_inspection_generation,
         run_bounded_git_status_until, snapshot_for, staged_index_entries_by_path,
         staged_index_entries_for_paths, worktree_quarantine_path, CloseLeaseFailure,
@@ -4103,6 +4246,86 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(preserved_private_slot(&root)).unwrap(),
             "replacement must survive\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tombstone_object_swap_after_observation_preserves_replacement_for_needs_repair() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("original"), "original\n").unwrap();
+        let identity = observe_administrative_dir_incarnation(&target).unwrap();
+        let displaced = temp.path().join("verified-object");
+
+        let error = remove_identity_bound_directory(
+            &target,
+            &identity,
+            observe_administrative_dir_incarnation,
+            |_| {},
+            |_, object| {
+                std::fs::rename(object, &displaced).unwrap();
+                std::fs::create_dir(object).unwrap();
+                std::fs::write(object.join("replacement-marker"), "must survive\n").unwrap();
+            },
+            "test directory",
+        )
+        .unwrap_err();
+
+        assert!(error.contains("object was replaced before descriptor binding"));
+        assert!(displaced.join("original").is_file());
+        let replacement = std::fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path().join("object/replacement-marker"))
+            .find(|candidate| candidate.is_file())
+            .expect("replacement must remain in the exact tombstone object slot");
+        assert_eq!(
+            std::fs::read_to_string(replacement).unwrap(),
+            "must survive\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tombstone_root_swap_after_observation_preserves_replacement_for_needs_repair() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("original"), "original\n").unwrap();
+        let identity = observe_administrative_dir_incarnation(&target).unwrap();
+        let displaced_root = temp.path().join("verified-root");
+
+        let error = remove_identity_bound_directory(
+            &target,
+            &identity,
+            observe_administrative_dir_incarnation,
+            |_| {},
+            |root, _| {
+                std::fs::rename(root, &displaced_root).unwrap();
+                std::fs::create_dir(root).unwrap();
+                let replacement = root.join("object");
+                std::fs::create_dir(&replacement).unwrap();
+                std::fs::write(replacement.join("replacement-marker"), "must survive\n").unwrap();
+            },
+            "test directory",
+        )
+        .unwrap_err();
+
+        assert!(error.contains("root was replaced before descriptor binding"));
+        assert!(displaced_root.join("object/original").is_file());
+        assert_eq!(
+            std::fs::read_to_string(
+                std::fs::read_dir(temp.path())
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path().join("object/replacement-marker"))
+                    .find(|candidate| candidate.is_file())
+                    .unwrap()
+            )
+            .unwrap(),
+            "must survive\n"
         );
     }
 

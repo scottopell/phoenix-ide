@@ -137,6 +137,14 @@ WHEN retirement cannot confidently identify a resource as the resource owned by 
 THE SYSTEM SHALL leave that resource untouched
 AND SHALL report typed repair information rather than silently succeeding
 
+THE SYSTEM SHALL treat the WorkScope admission gate and Phoenix-created private resource directories as the trust boundary for normal Close reliability
+AND SHALL perform final directory retirement only through a random Phoenix-owned private directory with owner-only permissions after descriptor-bound identity validation of that directory and the object being removed
+
+WHEN a crash or external mutation makes that identity ambiguous
+THE SYSTEM SHALL preserve any safe leftover and route the exact Close attempt to `NeedsRepair`
+
+Concurrent malicious mutation inside a Phoenix-owned private namespace, and mutation of resources outside Phoenix ownership, are outside the supported Close reliability boundary
+
 WHEN retirement succeeds overall
 THE SYSTEM SHALL emit success only after the sealed gate has stopped its currently owned process-epoch resources and the required durable tmux and worktree outcomes are recorded
 

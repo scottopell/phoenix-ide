@@ -53,6 +53,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [039](039_durable-runtime-resource-identity-fails-closed.md) | Durable runtime resource identity fails closed outside proven containment | Accepted | REQ-WL-002b, REQ-WL-002d, REQ-COMP-001 |
 | [040](040_close-uses-scope-gates-and-tmux-only-durable-identity.md) | Close uses WorkScope gates and tmux-only durable identity | Accepted | REQ-WL-002b, REQ-WL-002d, REQ-PROJ-WS-001 |
 | [041](041_minimal-history-finalization.md) | Minimal History finalization | Accepted | REQ-WL-002b, REQ-CONV-001 |
+| [042](042_close-directory-retirement-trusts-private-namespace.md) | Close directory retirement trusts its private namespace | Accepted | REQ-WL-002b |
 
 ## For agents: which decisions bind your task
 

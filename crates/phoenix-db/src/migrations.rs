@@ -460,6 +460,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "bind_worktree_cleanup_plan_to_admin_incarnation",
         sql: MIGRATION_088,
     },
+    Migration {
+        version: 89,
+        name: "require_residual_for_all_close_repair_transitions",
+        sql: MIGRATION_089,
+    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -8559,6 +8564,100 @@ WHEN (
 )
 BEGIN
     SELECT RAISE(ABORT, 'close obligation snapshot must match atomic inspection replacement');
+END;
+";
+
+const MIGRATION_089: &str = r"
+DROP TRIGGER close_retirement_inventories_require_exact_snapshot;
+CREATE TRIGGER close_retirement_inventories_require_exact_snapshot
+BEFORE INSERT ON close_retirement_inventories
+FOR EACH ROW
+WHEN NOT EXISTS (
+    SELECT 1 FROM close_obligations obligation
+    WHERE obligation.attempt_id = NEW.attempt_id
+      AND (
+          (obligation.phase IN ('retirement_requested', 'needs_repair')
+           AND obligation.inspection_generation = NEW.inspection_generation
+           AND obligation.inspection_fingerprint = NEW.inspection_fingerprint)
+          OR (obligation.phase = 'awaiting_retirement_inspection'
+              AND obligation.inspection_generation IS NULL
+              AND obligation.inspection_fingerprint IS NULL
+              AND NEW.inspection_generation = 'no-worktree'
+              AND NEW.inspection_fingerprint = 'no-worktree')
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'retirement inventory requires the exact active snapshot');
+END;
+
+DROP TRIGGER close_retirement_inventories_require_allocated_worktree_before_seal;
+CREATE TRIGGER close_retirement_inventories_require_allocated_worktree_before_seal
+BEFORE UPDATE OF sealed ON close_retirement_inventories
+FOR EACH ROW
+WHEN OLD.sealed = 0
+  AND NEW.sealed = 1
+  AND EXISTS (
+      SELECT 1
+      FROM close_attempt_scopes target
+      WHERE target.attempt_id = NEW.attempt_id
+        AND target.scope = NEW.scope
+        AND (
+            (target.captured_worktree_identity IS NOT NULL AND (
+                (SELECT COUNT(*) FROM close_expected_retirement_resources expected
+                 WHERE expected.attempt_id = NEW.attempt_id
+                   AND expected.scope = NEW.scope
+                   AND expected.inspection_generation = NEW.inspection_generation
+                   AND expected.inspection_fingerprint = NEW.inspection_fingerprint
+                   AND expected.resource_kind = 'worktree'
+                   AND expected.identity_kind = 'worktree'
+                   AND expected.identity_codec = 'worktree_id_v1'
+                   AND expected.identity_value = target.captured_worktree_identity) <> 1
+            ))
+            OR
+            (target.captured_worktree_identity IS NULL AND EXISTS (
+                SELECT 1 FROM close_expected_retirement_resources expected
+                WHERE expected.attempt_id = NEW.attempt_id
+                  AND expected.scope = NEW.scope
+                  AND expected.inspection_generation = NEW.inspection_generation
+                  AND expected.inspection_fingerprint = NEW.inspection_fingerprint
+                  AND expected.resource_kind = 'worktree'
+            ))
+        )
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'retirement inventory worktree rows must match the captured environment');
+END;
+
+DROP TRIGGER close_retirement_resources_require_authority_on_insert;
+CREATE TRIGGER close_retirement_resources_require_authority_on_insert
+BEFORE INSERT ON close_retirement_resources
+FOR EACH ROW
+WHEN NOT EXISTS (
+    SELECT 1 FROM close_obligations obligation
+    WHERE obligation.attempt_id = NEW.attempt_id
+      AND obligation.phase IN ('awaiting_retirement_inspection', 'retirement_requested', 'needs_repair')
+      AND COALESCE(obligation.inspection_generation, 'no-worktree') = NEW.inspection_generation
+      AND COALESCE(obligation.inspection_fingerprint, 'no-worktree') = NEW.inspection_fingerprint
+)
+BEGIN
+    SELECT RAISE(ABORT, 'retirement evidence requires authorized phase and snapshot');
+END;
+
+DROP TRIGGER close_obligations_require_residual_before_needs_repair;
+CREATE TRIGGER close_obligations_require_residual_before_needs_repair
+BEFORE UPDATE OF phase ON close_obligations
+FOR EACH ROW
+WHEN NEW.phase = 'needs_repair'
+  AND OLD.phase <> 'needs_repair'
+  AND NOT EXISTS (
+      SELECT 1 FROM close_retirement_resources resource
+      WHERE resource.attempt_id = OLD.attempt_id
+        AND resource.inspection_generation = COALESCE(NEW.inspection_generation, 'no-worktree')
+        AND resource.inspection_fingerprint = COALESCE(NEW.inspection_fingerprint, 'no-worktree')
+        AND resource.proof_kind = 'residual'
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'needs_repair requires current-snapshot residual evidence');
 END;
 ";
 

@@ -419,6 +419,21 @@ rule DistinctOpenAggregateOrIdentityConflictPreventsDestructiveRetirement {
         -- whether such a distinct aggregate exists because identity evidence conflicts.
 }
 
+rule AmbiguousPrivateDirectoryIdentityPreservesSafeLeftover {
+    when: ResourceRetirementRequested(product_conversation, attempt_id)
+    requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: AttachedWorkScope.scope}
+    requires: phoenix_private_retirement_directory_identity_is_ambiguous(product_conversation, attempt_id)
+    ensures: safe_retirement_leftover_is_preserved(product_conversation, attempt_id)
+    ensures: ResourceRetirementFailed(product_conversation, attempt_id)
+
+    @guidance
+        -- Normal Close authority comes from the sealed WorkScope gate plus a random,
+        -- Phoenix-owned owner-only directory. Final removal validates both the opened
+        -- directory and object identities. Post-crash or external ambiguity preserves
+        -- a safe leftover for repair. Concurrent malicious mutation inside that private
+        -- namespace and mutation outside Phoenix ownership are unsupported.
+}
+
 rule RetirementStepSuccessRecordsTypedEvidence {
     when: ResourceRetirementRequested(product_conversation, attempt_id)
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {

@@ -623,16 +623,26 @@ pub(crate) async fn retry_close_retirement(
             .get_close_obligation(retried.attempt_id().as_str())
             .await
             .map_err(|reload_error| AppError::Internal(reload_error.to_string()))?;
-        if matches!(
-            authoritative.phase(),
-            phoenix_core::domain::close::ClosePhase::RetirementRequested
-                | phoenix_core::domain::close::ClosePhase::NeedsRepair
-        ) {
-            state
+        if authoritative.phase() == phoenix_core::domain::close::ClosePhase::RetirementRequested {
+            let scope = state
                 .db
-                .route_close_attempt_to_repair(retried.attempt_id())
+                .list_close_attempt_scopes(retried.attempt_id().as_str())
                 .await
-                .map_err(|route_error| AppError::Internal(route_error.to_string()))?;
+                .map_err(|route_error| AppError::Internal(route_error.to_string()))?
+                .into_iter()
+                .next()
+                .ok_or_else(|| AppError::Internal("Close retry has no captured scope".to_string()))?
+                .scope;
+            state
+                .runtime
+                .route_close_attempt_to_repair::<()>(
+                    retried.attempt_id(),
+                    &scope,
+                    phoenix_core::domain::close::RetirementFailureReason::ManualRepairRequired,
+                    error.clone(),
+                )
+                .await
+                .expect_err("repair routing returns the persisted repair detail");
         }
         return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
             error,

@@ -162,7 +162,10 @@ impl ClosePhase {
             Self::CancelRequestedDuringSettlement => next == Self::Completed,
             Self::AwaitingRetirementInspection => matches!(
                 next,
-                Self::AwaitingLossConfirmation | Self::RetirementRequested | Self::Completed
+                Self::AwaitingLossConfirmation
+                    | Self::RetirementRequested
+                    | Self::NeedsRepair
+                    | Self::Completed
             ),
             Self::AwaitingLossConfirmation => matches!(
                 next,
@@ -1303,6 +1306,7 @@ mod tests {
                         to,
                         ClosePhase::AwaitingLossConfirmation
                             | ClosePhase::RetirementRequested
+                            | ClosePhase::NeedsRepair
                             | ClosePhase::Completed
                     ),
                     ClosePhase::AwaitingLossConfirmation => matches!(

@@ -699,6 +699,15 @@ pub struct RecordCloseRetirementEvidenceRequest {
 }
 
 #[derive(Debug, Clone)]
+pub struct RouteCloseAttemptToRepairRequest {
+    pub attempt_id: CloseAttemptId,
+    pub scope: WorkScopeId,
+    pub residual: RetiredResourceIdentity,
+    pub reason: RetirementFailureReason,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct RecordCloseRetirementDispatchRequest {
     pub attempt_id: CloseAttemptId,
     pub scope: WorkScopeId,
@@ -2296,7 +2305,29 @@ impl Database {
                         locator: GitPathIdentity::decode_exact(&locator)
                             .map_err(|error| DbError::Serialization(error.to_string()))?,
                     };
-                    route_unresolved_worktree_to_repair(&mut tx, &request.attempt_id).await?;
+                    route_close_attempt_to_repair_tx(
+                        &mut tx,
+                        &RouteCloseAttemptToRepairRequest {
+                            attempt_id: request.attempt_id.clone(),
+                            scope: scope.scope.clone(),
+                            residual: RetiredResourceIdentity::parse(
+                                RetiredResourceKind::WorkScope,
+                                LossItemIdentity::Opaque(
+                                    OpaqueIdentity::parse(scope.scope.as_str().to_owned())
+                                        .map_err(|error| {
+                                            DbError::Serialization(error.to_string())
+                                        })?,
+                                ),
+                            )
+                            .map_err(|error| DbError::Serialization(error.to_string()))?,
+                            reason: RetirementFailureReason::IdentityNotProven,
+                            detail: format!(
+                                "scope {} has unresolved captured worktree identity",
+                                scope.scope
+                            ),
+                        },
+                    )
+                    .await?;
                     tx.commit().await?;
                     return Err(DbError::CloseFoundationRepairRequired(repair));
                 }
@@ -2464,7 +2495,29 @@ impl Database {
                         locator: GitPathIdentity::decode_exact(&locator)
                             .map_err(|error| DbError::Serialization(error.to_string()))?,
                     };
-                    route_unresolved_worktree_to_repair(&mut tx, &request.attempt_id).await?;
+                    route_close_attempt_to_repair_tx(
+                        &mut tx,
+                        &RouteCloseAttemptToRepairRequest {
+                            attempt_id: request.attempt_id.clone(),
+                            scope: scope.scope.clone(),
+                            residual: RetiredResourceIdentity::parse(
+                                RetiredResourceKind::WorkScope,
+                                LossItemIdentity::Opaque(
+                                    OpaqueIdentity::parse(scope.scope.as_str().to_owned())
+                                        .map_err(|error| {
+                                            DbError::Serialization(error.to_string())
+                                        })?,
+                                ),
+                            )
+                            .map_err(|error| DbError::Serialization(error.to_string()))?,
+                            reason: RetirementFailureReason::IdentityNotProven,
+                            detail: format!(
+                                "scope {} has unresolved captured worktree identity",
+                                scope.scope
+                            ),
+                        },
+                    )
+                    .await?;
                     tx.commit().await?;
                     return Err(DbError::CloseFoundationRepairRequired(repair));
                 }
@@ -2561,13 +2614,16 @@ impl Database {
         Ok(resources)
     }
 
-    /// Routes an exact Close attempt to repair without fabricating a per-resource receipt.
+    /// Atomically records the exact scope-level residual and routes its Close attempt to repair.
     ///
     /// # Errors
     /// Returns [`DbError`] when the attempt is not in a retirement phase or persistence fails.
-    pub async fn route_close_attempt_to_repair(&self, attempt_id: &CloseAttemptId) -> DbResult<()> {
-        let mut tx = self.pool.begin().await?;
-        route_unresolved_worktree_to_repair(&mut tx, attempt_id).await?;
+    pub async fn route_close_attempt_to_repair(
+        &self,
+        request: RouteCloseAttemptToRepairRequest,
+    ) -> DbResult<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        route_close_attempt_to_repair_tx(&mut tx, &request).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -2817,44 +2873,146 @@ impl Database {
     }
 }
 
-async fn route_unresolved_worktree_to_repair(
+#[allow(clippy::too_many_lines)]
+async fn route_close_attempt_to_repair_tx(
     tx: &mut Transaction<'_, Sqlite>,
-    attempt_id: &CloseAttemptId,
+    request: &RouteCloseAttemptToRepairRequest,
 ) -> DbResult<()> {
-    let phase: String =
-        sqlx::query_scalar("SELECT phase FROM close_obligations WHERE attempt_id = ?1")
-            .bind(attempt_id.as_str())
-            .fetch_optional(&mut **tx)
-            .await?
-            .ok_or_else(|| DbError::CloseFoundationNotFound(attempt_id.as_str().to_string()))?;
-    match phase.as_str() {
-        "awaiting_retirement_inspection" | "retirement_requested" => {
-            sqlx::query(
-                "UPDATE close_obligations
-                 SET phase = 'needs_repair',
-                     inspection_generation = COALESCE(
-                         inspection_generation,
-                         'no-worktree'
-                     ),
-                     inspection_fingerprint = COALESCE(
-                         inspection_fingerprint,
-                         'no-worktree'
-                     ),
-                     updated_at = ?2
-                 WHERE attempt_id = ?1
-                   AND phase IN ('awaiting_retirement_inspection', 'retirement_requested')",
-            )
-            .bind(attempt_id.as_str())
-            .bind(Utc::now().to_rfc3339())
-            .execute(&mut **tx)
-            .await?;
-        }
-        "needs_repair" => {}
-        _ => {
-            return Err(close_precondition(format!(
-                "attempt {attempt_id} unresolved worktree repair requires awaiting_retirement_inspection, retirement_requested, or needs_repair"
-            )))
-        }
+    let obligation = close_obligation_for_update(tx, request.attempt_id.as_str()).await?;
+    if !matches!(
+        obligation.phase(),
+        ClosePhase::AwaitingRetirementInspection
+            | ClosePhase::RetirementRequested
+            | ClosePhase::NeedsRepair
+    ) {
+        return Err(close_precondition(format!(
+            "attempt {} repair requires awaiting_retirement_inspection, retirement_requested, or needs_repair",
+            request.attempt_id
+        )));
+    }
+    let captured_scope: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM close_attempt_scopes WHERE attempt_id = ?1 AND scope = ?2)",
+    )
+    .bind(request.attempt_id.as_str())
+    .bind(request.scope.as_str())
+    .fetch_one(&mut **tx)
+    .await?;
+    if !captured_scope {
+        return Err(close_precondition(format!(
+            "attempt {} repair scope {} was not captured",
+            request.attempt_id, request.scope
+        )));
+    }
+
+    let generation = obligation
+        .snapshot()
+        .map_or("no-worktree", CloseRetirementSnapshot::generation);
+    let fingerprint = obligation
+        .snapshot()
+        .map_or("no-worktree", CloseRetirementSnapshot::fingerprint);
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT OR IGNORE INTO close_retirement_inventories (
+             attempt_id, scope, inspection_generation, inspection_fingerprint, sealed, captured_at
+         ) VALUES (?1, ?2, ?3, ?4, 0, ?5)",
+    )
+    .bind(request.attempt_id.as_str())
+    .bind(request.scope.as_str())
+    .bind(generation)
+    .bind(fingerprint)
+    .bind(&now)
+    .execute(&mut **tx)
+    .await?;
+    let resource_kind = request.residual.kind().as_str();
+    let identity_kind = request.residual.identity().identity_kind();
+    let identity_codec = request.residual.identity().codec();
+    let identity_value = request.residual.identity().value();
+    sqlx::query(
+        "INSERT INTO close_expected_retirement_resources (
+             attempt_id, scope, inspection_generation, inspection_fingerprint,
+             resource_kind, identity_kind, identity_codec, identity_value
+         ) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+           WHERE NOT EXISTS (
+               SELECT 1 FROM close_expected_retirement_resources
+               WHERE attempt_id = ?1 AND scope = ?2
+                 AND inspection_generation = ?3 AND inspection_fingerprint = ?4
+                 AND resource_kind = ?5 AND identity_kind = ?6
+                 AND identity_codec = ?7 AND identity_value = ?8
+           )",
+    )
+    .bind(request.attempt_id.as_str())
+    .bind(request.scope.as_str())
+    .bind(generation)
+    .bind(fingerprint)
+    .bind(resource_kind)
+    .bind(identity_kind)
+    .bind(identity_codec)
+    .bind(&identity_value)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE close_retirement_inventories SET sealed = 1
+         WHERE attempt_id = ?1 AND scope = ?2
+           AND inspection_generation = ?3 AND inspection_fingerprint = ?4 AND sealed = 0",
+    )
+    .bind(request.attempt_id.as_str())
+    .bind(request.scope.as_str())
+    .bind(generation)
+    .bind(fingerprint)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO close_retirement_resource_history (
+             attempt_id, scope, inspection_generation, inspection_fingerprint, resource_kind,
+             identity_kind, identity_codec, identity_value, proof_kind, absence_basis,
+             residual_reason, detail, recorded_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'residual', NULL, ?9, ?10, ?11)",
+    )
+    .bind(request.attempt_id.as_str())
+    .bind(request.scope.as_str())
+    .bind(generation)
+    .bind(fingerprint)
+    .bind(resource_kind)
+    .bind(identity_kind)
+    .bind(identity_codec)
+    .bind(&identity_value)
+    .bind(request.reason.as_str())
+    .bind(&request.detail)
+    .bind(&now)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO close_retirement_resources (
+             attempt_id, scope, inspection_generation, inspection_fingerprint, resource_kind,
+             identity_kind, identity_codec, identity_value, proof_kind, absence_basis,
+             residual_reason, detail, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'residual', NULL, ?9, ?10, ?11, ?11)",
+    )
+    .bind(request.attempt_id.as_str())
+    .bind(request.scope.as_str())
+    .bind(generation)
+    .bind(fingerprint)
+    .bind(resource_kind)
+    .bind(identity_kind)
+    .bind(identity_codec)
+    .bind(&identity_value)
+    .bind(request.reason.as_str())
+    .bind(&request.detail)
+    .bind(&now)
+    .execute(&mut **tx)
+    .await?;
+    if obligation.snapshot().is_none() {
+        sqlx::query(
+            "UPDATE close_obligations
+             SET inspection_generation = 'no-worktree', inspection_fingerprint = 'no-worktree'
+             WHERE attempt_id = ?1 AND inspection_generation IS NULL AND inspection_fingerprint IS NULL",
+        )
+        .bind(request.attempt_id.as_str())
+        .execute(&mut **tx)
+        .await?;
+    }
+    if obligation.phase() != ClosePhase::NeedsRepair {
+        set_close_phase_tx(tx, request.attempt_id.as_str(), ClosePhase::NeedsRepair).await?;
     }
     Ok(())
 }
@@ -5415,7 +5573,12 @@ mod tests {
 
     #[tokio::test]
     async fn unresolved_worktree_routes_from_inspection_directly_to_repair() {
-        let db = Database::open_in_memory().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repair-projection-reload.db");
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap();
         create_root(&db, "root").await;
         allocate_scope_worktree(&db, "root").await;
         db.begin_close_foundation(
@@ -5432,9 +5595,26 @@ mod tests {
         )
         .await;
 
-        db.route_close_attempt_to_repair(
-            &CloseAttemptId::parse("attempt-inspection-repair").unwrap(),
-        )
+        let captured = db
+            .list_close_attempt_scopes("attempt-inspection-repair")
+            .await
+            .unwrap()
+            .remove(0);
+        let scope = captured.scope;
+        let Some(CapturedWorktreeIdentity::Resolved(worktree)) = captured.captured_worktree else {
+            panic!("allocated scope must capture a resolved worktree");
+        };
+        db.route_close_attempt_to_repair(RouteCloseAttemptToRepairRequest {
+            attempt_id: CloseAttemptId::parse("attempt-inspection-repair").unwrap(),
+            scope: scope.clone(),
+            residual: RetiredResourceIdentity::parse(
+                RetiredResourceKind::Worktree,
+                LossItemIdentity::Worktree(worktree),
+            )
+            .unwrap(),
+            reason: RetirementFailureReason::IdentityNotProven,
+            detail: "captured worktree identity cannot be proven".to_string(),
+        })
         .await
         .unwrap();
 
@@ -5444,6 +5624,29 @@ mod tests {
                 .unwrap()
                 .phase(),
             ClosePhase::NeedsRepair
+        );
+        drop(db);
+        let reloaded = Database::open(path.to_str().unwrap()).await.unwrap();
+        let projection = reloaded
+            .get_active_close_projection_for_product(&product_id("root"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(projection.residuals.len(), 1);
+        assert_eq!(projection.residuals[0].scope.as_str(), scope.as_str());
+        assert_eq!(
+            projection.residuals[0].resource.kind(),
+            RetiredResourceKind::Worktree
+        );
+        assert_eq!(
+            projection.residuals[0].outcome,
+            RetirementOutcome::Residual {
+                residual_reason: RetirementFailureReason::IdentityNotProven
+            }
+        );
+        assert_eq!(
+            projection.residuals[0].detail.as_deref(),
+            Some("captured worktree identity cannot be proven")
         );
     }
 
