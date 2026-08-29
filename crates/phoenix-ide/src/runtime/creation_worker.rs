@@ -950,15 +950,19 @@ fn ensure_phoenix_staging_ignored(repo_root: &Path) -> Result<(), String> {
         writeln!(file, "/.phoenix/").map_err(|error| error.to_string())?;
     }
     let gitignore = repo_root.join(".gitignore");
-    let mut contents = std::fs::read_to_string(&gitignore).unwrap_or_default();
-    if !contents
-        .lines()
-        .any(|line| line.trim() == ".phoenix/worktrees/")
-    {
-        if !contents.is_empty() && !contents.ends_with('\n') {
-            contents.push('\n');
+    let mut contents = match std::fs::read(&gitignore) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error.to_string()),
+    };
+    let contains_rule = contents.split(|byte| *byte == b'\n').any(|line| {
+        line.strip_suffix(b"\r").unwrap_or(line).trim_ascii() == b".phoenix/worktrees/"
+    });
+    if !contains_rule {
+        if !contents.is_empty() && !contents.ends_with(b"\n") {
+            contents.push(b'\n');
         }
-        contents.push_str(".phoenix/worktrees/\n");
+        contents.extend_from_slice(b".phoenix/worktrees/\n");
         std::fs::write(&gitignore, contents).map_err(|error| error.to_string())?;
     }
     Ok(())
@@ -2604,6 +2608,45 @@ mod temporary_creation_branch_tests {
             lease_until: chrono::Utc::now(),
             reservations: vec![],
         }
+    }
+}
+
+#[cfg(test)]
+mod product_creation_ignore_tests {
+    use super::*;
+
+    #[test]
+    fn staging_ignore_preserves_non_utf8_bytes_and_is_idempotent() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::git_ops::run_git(repo.path(), &["init"]).unwrap();
+        let gitignore = repo.path().join(".gitignore");
+        let original = b"target/\n\xff\xfe\n";
+        std::fs::write(&gitignore, original).unwrap();
+
+        ensure_phoenix_staging_ignored(repo.path()).unwrap();
+        let first = std::fs::read(&gitignore).unwrap();
+        assert_eq!(
+            first,
+            [original.as_slice(), b".phoenix/worktrees/\n"].concat()
+        );
+
+        ensure_phoenix_staging_ignored(repo.path()).unwrap();
+        assert_eq!(std::fs::read(gitignore).unwrap(), first);
+    }
+
+    #[test]
+    fn staging_ignore_separates_rule_from_file_without_trailing_newline() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::git_ops::run_git(repo.path(), &["init"]).unwrap();
+        let gitignore = repo.path().join(".gitignore");
+        std::fs::write(&gitignore, b"target/").unwrap();
+
+        ensure_phoenix_staging_ignored(repo.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read(gitignore).unwrap(),
+            b"target/\n.phoenix/worktrees/\n"
+        );
     }
 }
 

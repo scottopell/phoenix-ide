@@ -17,6 +17,8 @@ WHEN ordinary ProductConversation creation names a missing directory beneath the
 THE SYSTEM SHALL accept only an absolute path with no parent traversal whose nearest existing ancestor resolves beneath an allowed root
 AND SHALL persist the normalized directory intent without creating it during request validation or durable acceptance
 AND the claimed creation worker SHALL revalidate the allowed canonical ancestor and idempotently create and canonicalize each missing path segment after durable acceptance before repository detection or publication
+AND a terminal creation outcome SHALL preserve those selected working-directory segments because their existence does not prove exclusive Phoenix ownership
+AND automated cleanup SHALL remain limited to staging resources whose Phoenix ownership is proven exactly
 
 WHEN a sub-agent working directory is inherited from its parent or supplied as an override
 THE SYSTEM SHALL apply the same validation before the sub-agent conversation is persisted or run

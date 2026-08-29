@@ -5,8 +5,9 @@ import { ConversationSettings } from '../components/ConversationSettings';
 import { VoiceRecorder } from '../components/VoiceInput/VoiceRecorder';
 import { PaneDivider } from '../components/PaneDivider';
 import { SUPPORTED_IMAGE_TYPES } from '../utils/images';
-import { ExpansionError } from '../api';
+import { ExpansionError, api, type ProductConversationCreationAllowedActionView, type ProductConversationCreationRecoveryRow } from '../api';
 import { useCreateConversation } from '../hooks/useCreateConversation';
+import './NewConversationPage.css';
 import { useResizablePane } from '../hooks/useResizablePane';
 import { useIsDesktop } from '../hooks/useMediaQuery';
 import { useInlineReferences } from '../hooks';
@@ -21,6 +22,27 @@ const TerminalPanel = lazy(() =>
 
 const GLOBAL_TERMINAL_COLLAPSED_PX = 32;
 const DIRECT_CREATION_RESOLUTION = { kind: 'direct' } as const;
+
+function recoveryStatusLabel(status: string): string {
+  switch (status) {
+    case 'accepted': return 'Queued';
+    case 'claimed': return 'Starting';
+    case 'retry_scheduled': return 'Retrying';
+    case 'failed': return 'Failed';
+    case 'cancelled': return 'Cancelled';
+    case 'delivery_failed': return 'Needs retry';
+    default: return status;
+  }
+}
+
+function recoveryActionLabel(action: ProductConversationCreationAllowedActionView): string {
+  switch (action) {
+    case 'cancel': return 'Cancel';
+    case 'retry_delivery': return 'Retry';
+    case 'delete': return 'Delete';
+    case 'start_over': return 'Start over';
+  }
+}
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -49,6 +71,58 @@ function NewConversationFileChips({ files, onRemove }: { files: File[]; onRemove
         </div>
       ))}
     </div>
+  );
+}
+
+function ProductCreationRecoveryList({
+  rows,
+  busyRequestId,
+  onAction,
+}: {
+  rows: ProductConversationCreationRecoveryRow[];
+  busyRequestId: string | null;
+  onAction: (row: ProductConversationCreationRecoveryRow, action: ProductConversationCreationAllowedActionView) => void;
+}) {
+  if (rows.length === 0) return null;
+  return (
+    <section className="product-creation-recovery" aria-label="Recent product creation attempts">
+      <div className="product-creation-recovery__header">
+        <strong>Recent starts</strong>
+        <span>Resume, clean up, or start over.</span>
+      </div>
+      <div className="product-creation-recovery__list">
+        {rows.map((row) => {
+          const isBusy = busyRequestId === row.request_id;
+          return (
+            <article key={row.request_id} className="product-creation-recovery__item">
+              <div className="product-creation-recovery__summary">
+                <span className={`product-creation-recovery__status product-creation-recovery__status--${row.status.replaceAll('_', '-')}`}>{recoveryStatusLabel(row.status)}</span>
+                <code className="product-creation-recovery__cwd" title={row.cwd}>{row.cwd}</code>
+              </div>
+              <div className="product-creation-recovery__objective">{row.objective || 'Image-only request'}</div>
+              <div className="product-creation-recovery__meta">
+                <span>{row.model ?? 'Unknown model'}</span>
+                <span>{row.effort ?? 'default effort'}</span>
+              </div>
+              {row.last_error && <div className="product-creation-recovery__error">{row.last_error}</div>}
+              <div className="product-creation-recovery__actions">
+                {row.allowed_actions.map((action) => (
+                  <button
+                    key={action}
+                    type="button"
+                    className={`product-creation-recovery__action${action === 'delete' ? ' product-creation-recovery__action--danger' : ''}`}
+                    disabled={isBusy}
+                    onClick={() => onAction(row, action)}
+                  >
+                    {recoveryActionLabel(action)}
+                  </button>
+                ))}
+              </div>
+            </article>
+          );
+        })}
+      </div>
+    </section>
   );
 }
 
@@ -126,6 +200,18 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   // still pays for all of it on every visit to /new. Once mounted, the
   // panel stays mounted so collapse/expand preserves shell state.
   const [everExpanded, setEverExpanded] = useState(!terminalPane.collapsed);
+  const [recoveryRows, setRecoveryRows] = useState<ProductConversationCreationRecoveryRow[]>([]);
+  const [recoveryBusyRequestId, setRecoveryBusyRequestId] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    api.listProductConversationCreations()
+      .then((response) => {
+        if (!cancelled) setRecoveryRows(response.product_creations);
+      })
+      .catch(console.error);
+    return () => { cancelled = true; };
+  }, []);
 
   // Auto-resize textarea
   useEffect(() => {
@@ -207,6 +293,33 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   // the user isn't tempted to type into a draft that can't be sent.
   const llmReady = conv.models === null || conv.models.llm_configured;
 
+  const handleRecoveryAction = async (
+    row: ProductConversationCreationRecoveryRow,
+    action: ProductConversationCreationAllowedActionView,
+  ) => {
+    if (action === 'start_over') {
+      conv.startOverFromCreation({
+        cwd: row.cwd,
+        objective: row.objective,
+        model: row.model ?? null,
+        effort: row.effort ?? null,
+      });
+      return;
+    }
+    setRecoveryBusyRequestId(row.request_id);
+    try {
+      if (action === 'cancel') await api.cancelProductConversationCreation(row.request_id);
+      if (action === 'retry_delivery') await api.retryProductConversationDelivery(row.request_id);
+      if (action === 'delete') await api.deleteProductConversationCreation(row.request_id);
+      const refreshed = await api.listProductConversationCreations();
+      setRecoveryRows(refreshed.product_creations);
+    } catch (error) {
+      console.error(error);
+    } finally {
+      setRecoveryBusyRequestId(null);
+    }
+  };
+
   const inputPlaceholder = 'What would you like to work on?';
 
   return (
@@ -235,6 +348,11 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
       <main className="new-conv-main" data-app-scroll-owner>
         {/* Desktop: workbench card */}
         <div className="new-conv-card desktop-only">
+          <ProductCreationRecoveryList
+            rows={recoveryRows}
+            busyRequestId={recoveryBusyRequestId}
+            onAction={handleRecoveryAction}
+          />
           <ConversationSettings
             cwd={conv.cwd}
             setCwd={conv.setCwd}
@@ -306,6 +424,11 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
 
         {/* Mobile: keep existing layout */}
         <div className="new-conv-content mobile-only">
+          <ProductCreationRecoveryList
+            rows={recoveryRows}
+            busyRequestId={recoveryBusyRequestId}
+            onAction={handleRecoveryAction}
+          />
           <ConversationSettings
             cwd={conv.cwd}
             setCwd={conv.setCwd}

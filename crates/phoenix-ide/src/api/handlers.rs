@@ -21,7 +21,9 @@ use super::lifecycle_handlers::{
     abandon_task, approve_fork_proposal, approve_task, dismiss_fork_proposal, list_fork_proposals,
     mark_merged, reject_task, request_changes_on_fork_proposal, task_feedback,
 };
-use super::product_conversations::{get_product_conversation, list_product_conversations};
+use super::product_conversations::{
+    get_product_conversation, list_product_conversation_creations, list_product_conversations,
+};
 use super::sse::{sse_stream, SseInitTrace};
 use super::types::{
     AcceptedMessageDisposition, AcceptedMessageReconciliation, AttachmentUploadResponse,
@@ -132,6 +134,10 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/product-conversations",
             get(list_product_conversations),
+        )
+        .route(
+            "/api/product-conversations/creation",
+            get(list_product_conversation_creations),
         )
         .route(
             "/api/product-conversations/:reference",

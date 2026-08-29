@@ -71,6 +71,15 @@ pub struct ProductCreationJobRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProductCreationRecoveryJobRecord {
+    pub request_id: String,
+    pub status: String,
+    pub intent: ProductCreationIntent,
+    pub updated_at: DateTime<Utc>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProductCreationAcceptOutcome {
     Accepted(ProductCreationJobRecord),
     Replayed(ProductCreationJobRecord),
@@ -1090,6 +1099,58 @@ impl Database {
         Ok(updated.rows_affected() == 1)
     }
 
+    pub async fn list_product_creation_recovery_jobs(
+        &self,
+    ) -> DbResult<Vec<ProductCreationRecoveryJobRecord>> {
+        sqlx::query(
+            "SELECT request_id, cwd, objective, model, effort, llm_language, status,
+                    updated_at_unix_micros, last_error,
+                    COALESCE((SELECT json_group_array(json_object('media_type', i.media_type, 'data', i.data))
+                              FROM product_creation_job_images i WHERE i.request_id = j.request_id
+                              ORDER BY i.ordinal), '[]') AS images_json
+             FROM product_creation_jobs j
+             WHERE status IN (
+                    'accepted',
+                    'claimed',
+                    'retry_scheduled',
+                    'failed',
+                    'cancelled',
+                    'delivery_failed'
+                  )
+             ORDER BY updated_at_unix_micros DESC, request_id DESC",
+        )
+        .try_map(|row: SqliteRow| {
+            let images_json: String = row.try_get("images_json")?;
+            let images: Vec<ProductCreationImage> = serde_json::from_str(&images_json)
+                .map_err(|error| sqlx::Error::Decode(Box::new(error)))?;
+            Ok(ProductCreationRecoveryJobRecord {
+                request_id: row.try_get("request_id")?,
+                status: row.try_get("status")?,
+                intent: ProductCreationIntent {
+                    cwd: row.try_get("cwd")?,
+                    objective: row.try_get("objective")?,
+                    model: row.try_get("model")?,
+                    effort: row
+                        .try_get::<Option<String>, _>("effort")?
+                        .map(|value| {
+                            ModelEffort::from_str(&value)
+                                .map_err(|error| sqlx::Error::Decode(error.into()))
+                        })
+                        .transpose()?,
+                    llm_language: LlmLanguage::parse_or_default(
+                        &row.try_get::<String, _>("llm_language")?,
+                    ),
+                    images,
+                },
+                updated_at: unix_micros_to_datetime(row.try_get("updated_at_unix_micros")?)?,
+                last_error: row.try_get("last_error")?,
+            })
+        })
+        .fetch_all(&self.pool)
+        .await
+        .map_err(DbError::from)
+    }
+
     pub async fn complete_product_creation_delivery(
         &self,
         request_id: &str,
@@ -1418,7 +1479,7 @@ impl Database {
         sqlx::query(
             "UPDATE product_creation_resource_reservations
              SET generation = ?3, status = 'cleanup_required', updated_at_unix_micros = ?2
-             WHERE request_id = ?1 AND status IN ('reserved', 'present', 'cleanup_required')",
+             WHERE request_id = ?1 AND status IN ('reserved', 'present', 'cleanup_required', 'conflict')",
         )
         .bind(request_id)
         .bind(now_micros)
@@ -1575,7 +1636,7 @@ impl Database {
             "UPDATE product_creation_resource_reservations
              SET status = ?7, updated_at_unix_micros = ?1
              WHERE id = ?2 AND request_id = ?3 AND generation = ?4
-               AND status = 'cleanup_required'
+               AND (status = 'cleanup_required' OR (?7 = 'conflict' AND status = 'conflict'))
                AND EXISTS (
                    SELECT 1 FROM product_creation_jobs j
                    WHERE j.request_id = ?3 AND j.claim_generation = ?4
@@ -2511,6 +2572,111 @@ mod product_creation_tests {
     }
 
     #[tokio::test]
+    async fn persisted_cleanup_conflict_is_idempotent_and_requeued_for_deletion() {
+        let db = Database::open_in_memory().await.unwrap();
+        let now = Utc::now();
+        db.accept_product_creation("req-requeue", &intent("/repo/a", "requeue"))
+            .await
+            .unwrap();
+        let claimed = db
+            .claim_product_creation(
+                "req-requeue",
+                "worker",
+                "token",
+                now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(db
+            .reserve_product_creation_resource(
+                "reservation-requeue",
+                "req-requeue",
+                &claimed.claim,
+                "/repo/a",
+                "/repo/a/.phoenix/worktrees/requeue",
+                now,
+            )
+            .await
+            .unwrap());
+        assert!(db
+            .cancel_product_creation("req-requeue", now + chrono::Duration::seconds(1))
+            .await
+            .unwrap());
+        let cleanup = db
+            .claim_next_product_creation_cleanup(
+                "cleanup-worker",
+                "cleanup-token",
+                now + chrono::Duration::seconds(1),
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(db
+            .mark_product_creation_resource_cleanup_conflict(
+                &cleanup,
+                "reservation-requeue",
+                now + chrono::Duration::seconds(2),
+            )
+            .await
+            .unwrap());
+        assert!(db
+            .mark_product_creation_resource_cleanup_conflict(
+                &cleanup,
+                "reservation-requeue",
+                now + chrono::Duration::seconds(2),
+            )
+            .await
+            .unwrap());
+        assert!(db
+            .mark_claimed_product_creation_cleanup_ambiguous(
+                &cleanup,
+                now + chrono::Duration::seconds(2),
+            )
+            .await
+            .unwrap());
+        assert!(db
+            .request_product_creation_deletion("req-requeue", now + chrono::Duration::seconds(3),)
+            .await
+            .unwrap());
+
+        let deletion = db
+            .claim_next_product_creation_cleanup(
+                "deletion-worker",
+                "deletion-token",
+                now + chrono::Duration::seconds(3),
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(deletion.reservations[0].status, "cleanup_required");
+        assert_eq!(
+            deletion.reservations[0].generation,
+            deletion.claim.generation
+        );
+        assert!(db
+            .release_product_creation_resource(
+                &deletion,
+                "reservation-requeue",
+                now + chrono::Duration::seconds(4),
+            )
+            .await
+            .unwrap());
+        assert!(db
+            .finish_product_creation_cleanup(&deletion, now + chrono::Duration::seconds(4))
+            .await
+            .unwrap());
+        assert!(db
+            .get_product_creation_job("req-requeue")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn product_creation_deletion_tombstone_is_physically_removed_after_cleanup() {
         let db = Database::open_in_memory().await.unwrap();
         let now = Utc::now();
@@ -2797,6 +2963,245 @@ mod product_creation_tests {
             .request_product_creation_deletion("req-published-lifecycle", now)
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn list_product_creation_recovery_jobs_filters_and_orders_user_visible_rows() {
+        let db = Database::open_in_memory().await.unwrap();
+        let now = Utc::now();
+
+        db.accept_product_creation("req-accepted", &intent("/repo/accepted", "accepted"))
+            .await
+            .unwrap();
+        db.accept_product_creation("req-claimed", &intent("/repo/claimed", "claimed"))
+            .await
+            .unwrap();
+        db.claim_product_creation(
+            "req-claimed",
+            "worker",
+            "token",
+            now,
+            chrono::Duration::seconds(30),
+        )
+        .await
+        .unwrap();
+        db.accept_product_creation("req-retry", &intent("/repo/retry", "retry"))
+            .await
+            .unwrap();
+        let retry_claim = db
+            .claim_product_creation(
+                "req-retry",
+                "worker-retry",
+                "token-retry",
+                now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(db
+            .schedule_product_creation_retry("req-retry", &retry_claim.claim, "boom", now)
+            .await
+            .unwrap());
+
+        db.accept_product_creation("req-failed", &intent("/repo/failed", "failed"))
+            .await
+            .unwrap();
+        let failed_claim = db
+            .claim_product_creation(
+                "req-failed",
+                "worker-failed",
+                "token-failed",
+                now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query("UPDATE product_creation_jobs SET attempt_count = ?2 WHERE request_id = ?1")
+            .bind("req-failed")
+            .bind(PRODUCT_CREATION_MAX_ATTEMPTS)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(db
+            .schedule_product_creation_retry("req-failed", &failed_claim.claim, "failed badly", now)
+            .await
+            .unwrap());
+
+        db.accept_product_creation("req-cancelled", &intent("/repo/cancelled", "cancelled"))
+            .await
+            .unwrap();
+        assert!(db
+            .cancel_product_creation("req-cancelled", now)
+            .await
+            .unwrap());
+        let cleanup = db
+            .claim_next_product_creation_cleanup(
+                "cleanup-worker",
+                "cleanup-token",
+                now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(db
+            .finish_product_creation_cleanup(&cleanup, now)
+            .await
+            .unwrap());
+
+        db.accept_product_creation("req-delivery", &intent("/repo/delivery", "delivery"))
+            .await
+            .unwrap();
+        let delivery_claim = db
+            .claim_product_creation(
+                "req-delivery",
+                "worker-delivery",
+                "token-delivery",
+                now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let accepted = db
+            .get_product_creation_job("req-delivery")
+            .await
+            .unwrap()
+            .unwrap();
+        db.publish_product_creation_atomically(&ProductCreationPublishInput {
+            request_id: "req-delivery".to_string(),
+            claim: delivery_claim.claim.clone(),
+            conversation: published_conversation(
+                "conv-delivery",
+                accepted.product_conversation_id,
+                WorkScopeId::new(),
+                "/repo/delivery",
+            ),
+            authority_kind: AuthorityKind::Work,
+            environment: EnvironmentContext::UnownedCwd {
+                cwd: "/repo/delivery".to_string(),
+            },
+            repository_attachment: Some(ProductCreationRepositoryAttachment {
+                repository_id: None,
+                repository_root: "/repo/delivery".to_string(),
+                git_common_dir: "/repo/delivery/.git".to_string(),
+                exact_checkout_oid: "abc123".to_string(),
+            }),
+        })
+        .await
+        .unwrap();
+        let delivery_claim = db
+            .claim_next_product_creation_delivery(
+                "delivery-worker",
+                "delivery-token",
+                delivery_claim.claim.lease_until + chrono::Duration::seconds(1),
+                chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let mut active_delivery_claim = delivery_claim.claim;
+        for i in 1..=4 {
+            assert!(db
+                .schedule_product_creation_delivery_retry(
+                    "req-delivery",
+                    &active_delivery_claim,
+                    now + chrono::Duration::seconds(i),
+                )
+                .await
+                .unwrap());
+            if i < 4 {
+                active_delivery_claim = db
+                    .claim_next_product_creation_delivery(
+                        &format!("delivery-worker-{i}"),
+                        &format!("delivery-token-{i}"),
+                        now + chrono::Duration::seconds(i + 40),
+                        chrono::Duration::minutes(5),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .claim;
+            }
+        }
+
+        db.accept_product_creation("req-published", &intent("/repo/published", "published"))
+            .await
+            .unwrap();
+        let published_claim = db
+            .claim_product_creation(
+                "req-published",
+                "worker-published",
+                "token-published",
+                now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.publish_product_creation_atomically(&ProductCreationPublishInput {
+            request_id: "req-published".to_string(),
+            claim: published_claim.claim,
+            conversation: published_conversation(
+                "conv-published",
+                db.get_product_creation_job("req-published")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .product_conversation_id,
+                WorkScopeId::new(),
+                "/repo/published",
+            ),
+            authority_kind: AuthorityKind::Work,
+            environment: EnvironmentContext::UnownedCwd {
+                cwd: "/repo/published".to_string(),
+            },
+            repository_attachment: Some(ProductCreationRepositoryAttachment {
+                repository_id: None,
+                repository_root: "/repo/published".to_string(),
+                git_common_dir: "/repo/published/.git".to_string(),
+                exact_checkout_oid: "def456".to_string(),
+            }),
+        })
+        .await
+        .unwrap();
+
+        db.accept_product_creation("req-delete-hidden", &intent("/repo/delete", "delete"))
+            .await
+            .unwrap();
+        assert!(db
+            .request_product_creation_deletion("req-delete-hidden", now)
+            .await
+            .unwrap());
+
+        let rows = db.list_product_creation_recovery_jobs().await.unwrap();
+        let statuses: std::collections::HashMap<_, _> = rows
+            .iter()
+            .map(|row| (row.request_id.as_str(), row.status.as_str()))
+            .collect();
+        assert_eq!(statuses.len(), 6);
+        assert_eq!(statuses.get("req-delivery"), Some(&"delivery_failed"));
+        assert_eq!(statuses.get("req-cancelled"), Some(&"cancelled"));
+        assert_eq!(statuses.get("req-failed"), Some(&"failed"));
+        assert_eq!(statuses.get("req-retry"), Some(&"retry_scheduled"));
+        assert_eq!(statuses.get("req-claimed"), Some(&"claimed"));
+        assert_eq!(statuses.get("req-accepted"), Some(&"accepted"));
+        let failed = rows
+            .iter()
+            .find(|row| row.request_id == "req-failed")
+            .unwrap();
+        assert_eq!(failed.last_error.as_deref(), Some("failed badly"));
+        let delivery = rows
+            .iter()
+            .find(|row| row.request_id == "req-delivery")
+            .unwrap();
+        assert_eq!(delivery.intent.cwd, "/repo/delivery");
+        assert_eq!(delivery.intent.objective, "delivery");
+        assert!(rows.iter().all(|row| row.request_id != "req-published"));
+        assert!(rows.iter().all(|row| row.request_id != "req-delete-hidden"));
     }
 
     #[tokio::test]

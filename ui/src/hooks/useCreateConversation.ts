@@ -283,6 +283,26 @@ export function useCreateConversation(navigate: (path: string) => void) {
     }
   };
 
+  const startOverFromCreation = useCallback((creation: {
+    cwd: string;
+    objective: string;
+    model: string | null;
+    effort: ModelEffort | null;
+  }) => {
+    const nextRequestId = generateUUID();
+    setRequestId(nextRequestId);
+    replayIntentRef.current = null;
+    setCwd(creation.cwd);
+    setDraft(creation.objective);
+    selectModel(creation.model);
+    selectEffort(creation.effort);
+    setError(null);
+    try {
+      localStorage.removeItem(REPLAY_CREATE_REQUEST_KEY);
+      localStorage.removeItem(REPLAY_CREATE_INTENT_KEY);
+    } catch { /* best effort */ }
+  }, [selectEffort, selectModel]);
+
   return {
     homeDir,
     cwd,
@@ -319,5 +339,6 @@ export function useCreateConversation(navigate: (path: string) => void) {
     textareaValue,
     updateDraft,
     handleSend,
+    startOverFromCreation,
   };
 }

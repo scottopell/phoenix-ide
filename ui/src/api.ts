@@ -85,6 +85,10 @@ export type { ProductConversationListRow } from './generated/ProductConversation
 export type { ProductConversationSnapshotView } from './generated/ProductConversationSnapshotView';
 import type { ProductConversationListResponse as ProductConversationListResponseType } from './generated/ProductConversationListResponse';
 import type { ProductConversationSnapshotView as ProductConversationSnapshotViewType } from './generated/ProductConversationSnapshotView';
+export type { ProductConversationCreationAllowedActionView } from './generated/ProductConversationCreationAllowedActionView';
+export type { ProductConversationCreationRecoveryResponse } from './generated/ProductConversationCreationRecoveryResponse';
+export type { ProductConversationCreationRecoveryRow } from './generated/ProductConversationCreationRecoveryRow';
+import type { ProductConversationCreationRecoveryResponse as ProductConversationCreationRecoveryResponseType } from './generated/ProductConversationCreationRecoveryResponse';
 
 export interface ConversationContentSearchHit {
   conversation_id: string;
@@ -1696,6 +1700,35 @@ export const api = {
       throw new Error('Failed to fetch product conversations');
     }
     return resp.json();
+  },
+
+  async listProductConversationCreations(): Promise<ProductConversationCreationRecoveryResponseType> {
+    const resp = await fetch('/api/product-conversations/creation');
+    if (!resp.ok) {
+      throw new Error('Failed to fetch product conversation creations');
+    }
+    return resp.json();
+  },
+
+  async cancelProductConversationCreation(requestId: string): Promise<void> {
+    const resp = await fetch(`/api/product-conversations/creation/${encodeURIComponent(requestId)}/cancel`, {
+      method: 'POST',
+    });
+    if (!resp.ok) throw new Error('Failed to cancel product creation');
+  },
+
+  async retryProductConversationDelivery(requestId: string): Promise<void> {
+    const resp = await fetch(`/api/product-conversations/creation/${encodeURIComponent(requestId)}/retry-delivery`, {
+      method: 'POST',
+    });
+    if (!resp.ok) throw new Error('Failed to retry product creation delivery');
+  },
+
+  async deleteProductConversationCreation(requestId: string): Promise<void> {
+    const resp = await fetch(`/api/product-conversations/creation/${encodeURIComponent(requestId)}`, {
+      method: 'DELETE',
+    });
+    if (!resp.ok) throw new Error('Failed to delete product creation');
   },
 
   async getProductConversationSnapshot(

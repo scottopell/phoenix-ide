@@ -63,6 +63,36 @@ pub struct ProductConversationCreateAcceptedResponse {
     pub transcript_row_id: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+#[serde(rename_all = "snake_case")]
+pub enum ProductConversationCreationAllowedActionView {
+    Cancel,
+    RetryDelivery,
+    Delete,
+    StartOver,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProductConversationCreationRecoveryRow {
+    pub request_id: String,
+    pub status: String,
+    pub cwd: String,
+    pub objective: String,
+    pub model: Option<String>,
+    pub effort: Option<phoenix_core::domain::llm_types::ModelEffort>,
+    pub updated_at: String,
+    pub last_error: Option<String>,
+    pub allowed_actions: Vec<ProductConversationCreationAllowedActionView>,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProductConversationCreationRecoveryResponse {
+    pub product_creations: Vec<ProductConversationCreationRecoveryRow>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct RecentManagementRootSuggestion {
     pub path: String,
