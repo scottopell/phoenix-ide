@@ -75,7 +75,7 @@ fn dummy_handle_kind(
     let (stop_tx, _stop_rx) = tokio::sync::watch::channel(StopReason::Running);
 
     super::session::TerminalHandle {
-        master_fd: owned_fd,
+        master_fd: std::sync::Mutex::new(Some(owned_fd)),
         child_pid: nix::unistd::Pid::from_raw(pid), // synthetic test pid — never reaped
         launch_identity: dummy_launch_identity(pid.cast_unsigned()),
         child_kind,
@@ -280,6 +280,41 @@ async fn complete_retirement_requires_exact_instance_and_reopen_for_admission() 
             .try_insert(scope.clone(), dummy_handle(dims))
             .is_some(),
         "reopen_after_repair must permit a fresh terminal after exact teardown"
+    );
+}
+
+#[tokio::test]
+async fn complete_retirement_exits_and_reaps_long_lived_detached_direct_pty() {
+    use crate::session::TerminalRetirementOutcome;
+    use crate::spawn::{spawn_pty, PtyExecPlan};
+
+    let registry = ActiveTerminals::new();
+    let scope = scope("detached-direct-pty");
+    let handle = spawn_pty(
+        std::path::Path::new("/tmp"),
+        Dims::try_new(80, 24).unwrap(),
+        PtyExecPlan::Shell,
+    )
+    .expect("spawn real direct-shell PTY");
+    let process = handle.launch_identity.process;
+    registry
+        .try_insert_exact(scope.clone(), handle)
+        .expect("publish detached PTY");
+
+    assert!(
+        phoenix_core::process_identity::process_identity_matches(process),
+        "direct PTY child must remain live while its detached master is owned"
+    );
+
+    let permit = registry.begin_retirement(&scope);
+    assert_eq!(
+        registry.complete_retirement(&permit).await,
+        TerminalRetirementOutcome::Retired
+    );
+    assert!(registry.get(&scope).is_none());
+    assert!(
+        !phoenix_core::process_identity::process_identity_matches(process),
+        "retirement must close the detached master and reap the exact child"
     );
 }
 

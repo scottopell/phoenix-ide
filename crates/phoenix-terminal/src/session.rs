@@ -2,7 +2,7 @@
 
 use nix::unistd::Pid;
 use std::collections::HashMap;
-use std::os::unix::io::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{watch, Semaphore};
 
@@ -97,8 +97,13 @@ impl TerminalLaunchIdentity {
 /// `Drop` closes `master_fd`, which causes the kernel to deliver `SIGHUP`
 /// to the shell's process group — the correct teardown chain.
 pub struct TerminalHandle {
-    /// PTY master file descriptor.  Closing this is the sole teardown trigger.
-    pub master_fd: OwnedFd,
+    /// PTY master file descriptor. Closing this is the sole teardown trigger.
+    ///
+    /// The option lets retirement close the descriptor while retaining the
+    /// exact handle in the registry until child exit is authoritatively
+    /// observed. That retained handle is the retry owner if exit does not
+    /// settle within the bounded wait.
+    pub master_fd: Mutex<Option<OwnedFd>>,
     /// Child shell PID.  Reaped by the reader task on EIO.
     pub child_pid: Pid,
     /// Durable launch identity captured at spawn time.
@@ -133,6 +138,29 @@ impl std::fmt::Debug for TerminalHandle {
         f.debug_struct("TerminalHandle")
             .field("child_pid", &self.child_pid)
             .finish_non_exhaustive()
+    }
+}
+
+impl TerminalHandle {
+    /// Return the currently owned PTY master descriptor, if retirement has not
+    /// already closed it.
+    ///
+    /// # Panics
+    /// Panics if the descriptor mutex is poisoned.
+    #[must_use]
+    pub fn master_fd_raw(&self) -> Option<RawFd> {
+        self.master_fd
+            .lock()
+            .expect("terminal master fd poisoned")
+            .as_ref()
+            .map(AsRawFd::as_raw_fd)
+    }
+
+    fn close_master_fd(&self) {
+        self.master_fd
+            .lock()
+            .expect("terminal master fd poisoned")
+            .take();
     }
 }
 
@@ -562,7 +590,7 @@ impl ActiveTerminals {
         &self,
         permit: &TerminalRetirementPermit,
     ) -> TerminalRetirementOutcome {
-        let handle = {
+        let attach_permit = {
             let map = self.0.lock().expect("terminal registry poisoned");
             if !Self::matches_exact_instance(&map, permit) {
                 return Self::verify_exact_absence(&map, permit);
@@ -570,25 +598,45 @@ impl ActiveTerminals {
             let Some(handle) = map.handles.get(&permit.work_scope) else {
                 return Self::verify_exact_absence(&map, permit);
             };
-            let handle = Arc::clone(handle);
             let _ = handle.stop_tx.send(StopReason::TearDown);
-            handle
+            Arc::clone(&handle.attach_permit)
         };
 
-        if handle.attach_permit.available_permits() == 0
-            && tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                Arc::clone(&handle.attach_permit).acquire_owned(),
-            )
-            .await
-            .is_err()
-        {
+        // An attached relay remains the teardown authority: do not retain an
+        // Arc that would keep its PTY master open while it waits and reaps. A
+        // detached terminal has no relay, so retirement acquires this authority
+        // immediately and actively closes the exact current handle's master.
+        let Ok(Ok(relay_authority)) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            attach_permit.acquire_owned(),
+        )
+        .await
+        else {
             return TerminalRetirementOutcome::Residual {
                 reason: "terminal relay did not release after teardown request".to_string(),
             };
-        }
+        };
+        let handle = {
+            let map = self.0.lock().expect("terminal registry poisoned");
+            if !Self::matches_exact_instance(&map, permit) {
+                let outcome = Self::verify_exact_absence(&map, permit);
+                drop(relay_authority);
+                return match outcome {
+                    TerminalRetirementOutcome::AbsenceVerified if permit.had_entry => {
+                        TerminalRetirementOutcome::Retired
+                    }
+                    outcome @ (TerminalRetirementOutcome::Retired
+                    | TerminalRetirementOutcome::AbsenceVerified
+                    | TerminalRetirementOutcome::Residual { .. }) => outcome,
+                };
+            }
+            let Some(handle) = map.handles.get(&permit.work_scope) else {
+                unreachable!("exact terminal match without a current handle")
+            };
+            Arc::clone(handle)
+        };
         let child_pid = handle.child_pid;
-        let _ = handle.stop_tx.send(StopReason::TearDown);
+        handle.close_master_fd();
 
         let wait_outcome = tokio::task::spawn_blocking(move || {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -615,6 +663,7 @@ impl ActiveTerminals {
                     .to_string(),
             };
         }
+        drop(relay_authority);
         {
             let mut map = self.0.lock().expect("terminal registry poisoned");
             if !Self::matches_exact_instance(&map, permit) {

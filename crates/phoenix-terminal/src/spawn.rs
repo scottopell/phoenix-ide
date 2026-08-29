@@ -285,7 +285,7 @@ pub fn spawn_pty(
             let (stop_tx, _stop_rx) = tokio::sync::watch::channel(StopReason::Running);
 
             Ok(TerminalHandle {
-                master_fd,
+                master_fd: Mutex::new(Some(master_fd)),
                 child_pid: child,
                 launch_identity,
                 child_kind,

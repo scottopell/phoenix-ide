@@ -22,11 +22,7 @@ use phoenix_core::work_scope::ResourceScopeKey;
 use phoenix_terminal::relay::{run_relay, PtyMasterIo, RelayConfig, RelayExit};
 use phoenix_terminal::session::{ActiveTerminals, Dims, StopReason, TerminalHandle};
 use phoenix_terminal::spawn::{set_nonblocking, set_winsize_raw, spawn_pty, PtyExecPlan};
-use std::{
-    os::unix::io::{AsRawFd, FromRawFd},
-    sync::Arc,
-    time::Duration,
-};
+use std::{os::unix::io::FromRawFd, sync::Arc, time::Duration};
 use tokio::sync::OwnedSemaphorePermit;
 
 /// How long to wait for the sitting relay to release the `attach_permit`
@@ -177,7 +173,10 @@ async fn handle_socket(
     let child_pid = arc_handle.child_pid;
     tracing::info!(conv_id = %conversation_id, pid = %child_pid, "Terminal session attached");
 
-    let master_fd_raw = arc_handle.master_fd.as_raw_fd();
+    let Some(master_fd_raw) = arc_handle.master_fd_raw() else {
+        tracing::warn!(conv_id = %conversation_id, "Terminal session retired before relay setup");
+        return;
+    };
 
     // Apply the new client's dims to the existing PTY (reclaim path) or confirm
     // the freshly-spawned PTY matches them (fresh path — spawn already used these).
@@ -601,7 +600,7 @@ mod reclaim_tests {
         let (stop_tx, _stop_rx) = watch::channel(StopReason::Running);
 
         Arc::new(TerminalHandle {
-            master_fd: owned_fd,
+            master_fd: std::sync::Mutex::new(Some(owned_fd)),
             child_pid: nix::unistd::Pid::from_raw(1),
             launch_identity: TerminalLaunchIdentity {
                 process: ProcessIdentity {
