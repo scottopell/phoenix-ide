@@ -217,6 +217,7 @@ pub struct TerminalRetirementPermit {
     pub work_scope: ResourceScopeKey,
     pub instance: Option<TerminalInstanceIdentity>,
     generation: TerminalRetirementGeneration,
+    deadline: tokio::time::Instant,
     had_entry: bool,
 }
 
@@ -232,6 +233,19 @@ pub enum TerminalRetirementOutcome {
     Retired,
     AbsenceVerified,
     Residual { reason: String },
+}
+
+/// Typed ownership decision made when an attached relay reaches a destructive
+/// exit. Exactly one retirement owner is allowed to remove and reap the handle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayTeardownOwnership {
+    /// Close already fenced this exact instance and owns completion.
+    ExistingRetirementOwner,
+    /// No Close fence existed, so the relay initiated a bounded retirement that
+    /// it may complete only after releasing its attach permit.
+    RelayInitiated(TerminalRetirementPermit),
+    /// The relay no longer corresponds to the registry's current instance.
+    StaleRelay,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -423,16 +437,38 @@ impl ActiveTerminals {
         self.try_insert_exact(scope, handle).ok()
     }
 
-    /// Remove one relay-owned handle without clearing a Close fence.
+    /// Transfer destructive relay cleanup to the registry's single retirement
+    /// owner. The relay must release its handle and attach permit before
+    /// completing a returned relay-initiated permit.
     ///
     /// # Panics
     /// Panics if the registry mutex is poisoned.
-    pub fn remove_from_relay(&self, scope: &ResourceScopeKey) {
-        self.0
-            .lock()
-            .expect("terminal registry poisoned")
+    #[must_use]
+    pub fn claim_relay_teardown(
+        &self,
+        scope: &ResourceScopeKey,
+        handle: &Arc<TerminalHandle>,
+    ) -> RelayTeardownOwnership {
+        let mut map = self.0.lock().expect("terminal registry poisoned");
+        if !map
             .handles
-            .remove(scope);
+            .get(scope)
+            .is_some_and(|current| Arc::ptr_eq(current, handle))
+        {
+            return RelayTeardownOwnership::StaleRelay;
+        }
+        if map
+            .retirements
+            .get(scope)
+            .is_some_and(|retirement| retirement.fenced)
+        {
+            return RelayTeardownOwnership::ExistingRetirementOwner;
+        }
+        RelayTeardownOwnership::RelayInitiated(Self::build_retirement_permit(
+            scope,
+            &mut map,
+            tokio::time::Instant::now() + TERMINAL_CLOSE_RETIREMENT_BUDGET,
+        ))
     }
 
     /// Remove the terminal for `scope` and explicitly reopen normal admission.
@@ -474,6 +510,30 @@ impl ActiveTerminals {
         map.handles.get(scope).cloned()
     }
 
+    /// Reset a reclaimed handle's stop channel only if it is still the current
+    /// attachable instance. This makes a Close fence + `TearDown` atomic against
+    /// relay setup, so setup cannot overwrite an already-issued teardown.
+    ///
+    /// # Panics
+    /// Panics if the terminal registry mutex is poisoned.
+    #[must_use]
+    pub fn prepare_relay(&self, scope: &ResourceScopeKey, handle: &Arc<TerminalHandle>) -> bool {
+        let map = self.0.lock().expect("terminal registry poisoned");
+        if map
+            .retirements
+            .get(scope)
+            .is_some_and(|retirement| retirement.fenced)
+            || !map
+                .handles
+                .get(scope)
+                .is_some_and(|current| Arc::ptr_eq(current, handle))
+        {
+            return false;
+        }
+        let _ = handle.stop_tx.send(StopReason::Running);
+        true
+    }
+
     /// Read-only inspection of whether retirement admission is currently fenced.
     ///
     /// # Panics
@@ -490,6 +550,7 @@ impl ActiveTerminals {
     fn build_retirement_permit(
         scope: &ResourceScopeKey,
         map: &mut ActiveTerminalRegistryState,
+        deadline: tokio::time::Instant,
     ) -> TerminalRetirementPermit {
         map.spawn_reservations.remove(scope);
         let instance = map
@@ -507,6 +568,7 @@ impl ActiveTerminals {
             work_scope: scope.clone(),
             instance,
             generation: TerminalRetirementGeneration(generation),
+            deadline,
             had_entry,
         }
     }
@@ -521,8 +583,24 @@ impl ActiveTerminals {
     /// Panics if the registry mutex is poisoned.
     #[must_use]
     pub fn begin_retirement(&self, scope: &ResourceScopeKey) -> TerminalRetirementPermit {
+        self.begin_retirement_by(
+            scope,
+            tokio::time::Instant::now() + TERMINAL_CLOSE_RETIREMENT_BUDGET,
+        )
+    }
+
+    /// Fence retirement with an already-established absolute deadline.
+    ///
+    /// # Panics
+    /// Panics if the registry mutex is poisoned.
+    #[must_use]
+    pub fn begin_retirement_by(
+        &self,
+        scope: &ResourceScopeKey,
+        deadline: tokio::time::Instant,
+    ) -> TerminalRetirementPermit {
         let mut map = self.0.lock().expect("terminal registry poisoned");
-        Self::build_retirement_permit(scope, &mut map)
+        Self::build_retirement_permit(scope, &mut map, deadline)
     }
 
     fn matches_exact_instance(
@@ -605,11 +683,7 @@ impl ActiveTerminals {
         &self,
         permit: &TerminalRetirementPermit,
     ) -> TerminalRetirementOutcome {
-        self.complete_retirement_by(
-            permit,
-            tokio::time::Instant::now() + TERMINAL_CLOSE_RETIREMENT_BUDGET,
-        )
-        .await
+        self.complete_retirement_by(permit, permit.deadline).await
     }
 
     pub(crate) async fn complete_retirement_by(
@@ -646,7 +720,7 @@ impl ActiveTerminals {
             let Some(handle) = map.handles.get(&permit.work_scope) else {
                 return Self::verify_exact_absence_by(&map, permit, observe_process_identity);
             };
-            let _ = handle.stop_tx.send(StopReason::TearDown);
+            handle.stop_tx.send_replace(StopReason::TearDown);
             Arc::clone(&handle.attach_permit)
         };
 
@@ -735,10 +809,10 @@ impl ActiveTerminals {
     ///   - If `inheritor_scope == Some(work_scope)`, the continuation
     ///     conversation resolves to the same scope and still owns the
     ///     terminal. Skip teardown.
-    ///   - Otherwise, remove the registry entry, signal any attached relay
-    ///     to tear down via `StopReason::TearDown`, and reap the shell
-    ///     when no relay is attached (when a relay is attached, its own
-    ///     teardown branch calls `waitpid`).
+    ///   - Otherwise, fence the registry entry, signal any attached relay
+    ///     to tear down via `StopReason::TearDown`, acquire teardown authority
+    ///     after the relay releases, and reap the exact child within the shared
+    ///     retirement deadline.
     ///
     /// Best-effort. Returns silently if no terminal is registered for the
     /// scope — that is the common case during cascade for scopes that

@@ -20,7 +20,9 @@ use nix::sys::wait::waitpid;
 use phoenix_core::domain::db_schema::ConvMode;
 use phoenix_core::work_scope::ResourceScopeKey;
 use phoenix_terminal::relay::{run_relay, PtyMasterIo, RelayConfig, RelayExit};
-use phoenix_terminal::session::{ActiveTerminals, Dims, StopReason, TerminalHandle};
+use phoenix_terminal::session::{
+    ActiveTerminals, Dims, RelayTeardownOwnership, StopReason, TerminalHandle,
+};
 use phoenix_terminal::spawn::{set_nonblocking, set_winsize_raw, spawn_pty, PtyExecPlan};
 use std::{os::unix::io::FromRawFd, sync::Arc, time::Duration};
 use tokio::sync::OwnedSemaphorePermit;
@@ -196,16 +198,26 @@ async fn handle_socket(
         Err(reason) => {
             tracing::error!(conv_id = %conversation_id, error = %reason, "Terminal: fd setup failed");
             // Full teardown — we failed before the relay started.
-            full_teardown(&terminals, &conversation_id, &scope, arc_handle, child_pid).await;
+            finish_destructive_relay_exit(
+                &terminals,
+                &conversation_id,
+                &scope,
+                arc_handle,
+                attach_permit,
+            )
+            .await;
             return;
         }
     };
 
-    // Reset the stop channel to `Running` before the relay starts. A
-    // reclaimer may have just transitioned it Running → Detach to evict the
-    // previous relay; without this reset the new relay could observe the
-    // stale `Detach` and exit immediately.
-    let _ = arc_handle.stop_tx.send(StopReason::Running);
+    // Reset only through the registry's attach gate. A Close fence may have
+    // issued TearDown after permit acquisition; never overwrite that signal.
+    if !terminals.prepare_relay(&scope, &arc_handle) {
+        drop(arc_handle);
+        drop(attach_permit);
+        tracing::debug!(conv_id = %conversation_id, scope = %scope, "Terminal relay setup yielded to retirement");
+        return;
+    }
     let stop_rx = arc_handle.stop_tx.subscribe();
 
     if teardown_on_terminal {
@@ -290,18 +302,20 @@ async fn handle_socket(
     //                             can recover the session.
     match exit {
         RelayExit::PtyEof | RelayExit::Stopped(StopReason::TearDown) => {
-            full_teardown(&terminals, &conversation_id, &scope, arc_handle, child_pid).await;
+            finish_destructive_relay_exit(
+                &terminals,
+                &conversation_id,
+                &scope,
+                arc_handle,
+                attach_permit,
+            )
+            .await;
         }
         RelayExit::Stopped(StopReason::Detach | StopReason::Running) | RelayExit::WsClosed => {
             detach_only(&conversation_id, arc_handle);
+            drop(attach_permit);
         }
     }
-    // Release the single-attach permit AFTER cleanup runs. This wakes the
-    // next reclaimer's `acquire_owned()` at the earliest point that the
-    // slot is actually free. `drop` is explicit here so the ordering is
-    // obvious at the call site; the code is correct without it, but the
-    // lint-free discipline helps anyone tracing the release point.
-    drop(attach_permit);
 }
 
 /// Acquire an `Arc<TerminalHandle>` AND the single `attach_permit` for the
@@ -489,22 +503,35 @@ async fn acquire_permit(
     }
 }
 
-/// Full teardown: shell must die, registry entry goes away, child reaped.
-async fn full_teardown(
+/// Transfer destructive relay cleanup to the single typed retirement owner.
+/// The relay never removes or reaps while holding the attach permit. Close can
+/// therefore acquire the permit and prove its exact instance; an ordinary
+/// shell exit creates its own bounded permit and completes it only after the
+/// relay has released every PTY/attach capability.
+async fn finish_destructive_relay_exit(
     terminals: &ActiveTerminals,
     conversation_id: &str,
     scope: &ResourceScopeKey,
     arc_handle: Arc<TerminalHandle>,
-    child_pid: nix::unistd::Pid,
+    attach_permit: OwnedSemaphorePermit,
 ) {
-    terminals.remove_from_relay(scope);
-    // When this and any other Arc clones drop, master_fd closes → SIGHUP → shell exits.
+    let ownership = terminals.claim_relay_teardown(scope, &arc_handle);
     drop(arc_handle);
-    let _ = tokio::task::spawn_blocking(move || {
-        let _ = waitpid(child_pid, None);
-    })
-    .await;
-    tracing::info!(conv_id = %conversation_id, scope = %scope, "Terminal session ended");
+    drop(attach_permit);
+
+    match ownership {
+        RelayTeardownOwnership::RelayInitiated(permit) => {
+            let outcome = terminals.complete_retirement(&permit).await;
+            terminals.reopen_after_repair(scope);
+            tracing::info!(conv_id = %conversation_id, scope = %scope, ?outcome, "Terminal session ended");
+        }
+        RelayTeardownOwnership::ExistingRetirementOwner => {
+            tracing::debug!(conv_id = %conversation_id, scope = %scope, "Terminal teardown released to Close retirement owner");
+        }
+        RelayTeardownOwnership::StaleRelay => {
+            tracing::debug!(conv_id = %conversation_id, scope = %scope, "Stale terminal relay released without touching current instance");
+        }
+    }
 }
 
 /// Detach only: release our Arc clone but leave the registry entry intact so
