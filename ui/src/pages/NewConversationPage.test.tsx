@@ -205,6 +205,37 @@ describe('NewConversationPage', () => {
     setTimeout.mockRestore();
   });
 
+  it('backs off terminal cleanup conflicts instead of polling continuously', async () => {
+    const realSetTimeout = window.setTimeout.bind(window);
+    const delays: number[] = [];
+    const callbacks: TimerHandler[] = [];
+    const setTimeout = vi.spyOn(window, 'setTimeout').mockImplementation((handler, delay, ...args) => {
+      if (Number(delay) >= 2000) {
+        callbacks.push(handler);
+        delays.push(Number(delay));
+        return {} as ReturnType<typeof setTimeout>;
+      }
+      return realSetTimeout(handler, delay, ...args) as unknown as ReturnType<typeof setTimeout>;
+    });
+    apiMock.listProductConversationCreations.mockResolvedValue({
+      product_creations: [{ request_id: 'conflict', status: 'cleanup_ambiguous', cwd: '/conflict', objective: 'terminal conflict', model: null, effort: null, images: [], llm_language: 'English', updated_at: '2026-01-01T00:00:00Z', last_error: 'occupied', allowed_actions: ['delete'], published_product_conversation_id: null }],
+      next_cursor: null,
+    });
+
+    renderPage();
+    expect((await screen.findAllByText('terminal conflict')).length).toBeGreaterThan(0);
+    const discoveryIndex = delays.indexOf(2000);
+    expect(discoveryIndex).toBeGreaterThanOrEqual(0);
+    const initialFiveSecondTimers = delays.filter((delay) => delay === 5000).length;
+    const firstDiscovery = callbacks[discoveryIndex];
+    if (typeof firstDiscovery === 'function') firstDiscovery();
+    await waitFor(() => expect(apiMock.listProductConversationCreations).toHaveBeenCalledTimes(2));
+    expect(delays.filter((delay) => delay === 2000)).toHaveLength(1);
+    expect(delays.filter((delay) => delay === 5000)).toHaveLength(initialFiveSecondTimers + 1);
+
+    setTimeout.mockRestore();
+  });
+
   it('start over prefills the composer from a recovery row', async () => {
     apiMock.listProductConversationCreations.mockResolvedValueOnce({
       product_creations: [

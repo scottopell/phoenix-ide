@@ -143,7 +143,6 @@ const RECOVERY_ADVANCING_STATUSES = new Set([
   'retry_scheduled',
   'cancelling',
   'delivery_pending',
-  'cleanup_ambiguous',
 ]);
 const RECOVERY_DISCOVERY_BACKOFF_MS = [2000, 5000, 10000, 30000] as const;
 

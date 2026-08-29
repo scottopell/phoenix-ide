@@ -984,6 +984,9 @@ fn ensure_phoenix_staging_ignored(repo_root: &Path) -> Result<(), String> {
             .append(true)
             .open(&exclude_path)
             .map_err(|error| error.to_string())?;
+        if !existing.is_empty() && !existing.ends_with('\n') {
+            writeln!(file).map_err(|error| error.to_string())?;
+        }
         writeln!(file, "/.phoenix/").map_err(|error| error.to_string())?;
     }
     Ok(())
@@ -2684,6 +2687,23 @@ mod product_creation_ignore_tests {
                 .filter(|line| *line == "/.phoenix/")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn staging_ignore_separates_from_unterminated_common_exclude() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::git_ops::run_git(repo.path(), &["init"]).unwrap();
+        let common_dir =
+            crate::git_ops::run_git(repo.path(), &["rev-parse", "--git-common-dir"]).unwrap();
+        let exclude = repo.path().join(common_dir.trim()).join("info/exclude");
+        std::fs::write(&exclude, "existing-rule").unwrap();
+
+        ensure_phoenix_staging_ignored(repo.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(exclude).unwrap(),
+            "existing-rule\n/.phoenix/\n"
         );
     }
 }
