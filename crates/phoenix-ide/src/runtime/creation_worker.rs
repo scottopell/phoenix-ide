@@ -243,8 +243,28 @@ async fn process_claimed_product_creation(
         {
             return Err("product creation staging claim was lost".to_string());
         }
-        let new_ownership_token = uuid::Uuid::new_v4().to_string();
         let persisted_ownership_token = reservation.ownership_token.clone();
+        let ownership_token = persisted_ownership_token
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        if persisted_ownership_token.is_none()
+            && !manager
+                .db()
+                .record_product_creation_resource_ownership(
+                    &job.request_id,
+                    &claimed.claim,
+                    &planned_path.to_string_lossy(),
+                    &ownership_token,
+                    chrono::Utc::now(),
+                )
+                .await
+                .map_err(|error| error.to_string())?
+        {
+            return Err(
+                "product creation claim was lost before materializing worktree".to_string(),
+            );
+        }
+        let persisted_ownership_token = Some(ownership_token.clone());
         let (worktree, ownership_token, already_present) = tokio::task::spawn_blocking({
             let repo_root = repo_root.clone();
             let oid = oid.clone();
@@ -253,22 +273,15 @@ async fn process_claimed_product_creation(
                 let _lock = RepositoryMutationLock::acquire(&repo_root).map_err(|e| e.0)?;
                 ensure_phoenix_staging_ignored(Path::new(&repo_root))?;
                 let path = deterministic_worktree_path(&repo_root, &key);
-                let already_present =
-                    reconcile_owned_worktree_path(&repo_root, &path).map_err(|e| e.0)?;
+                let already_present = path.try_exists().map_err(|error| {
+                    format!("could not inspect staging path {}: {error}", path.display())
+                })?;
                 let ownership_token = if already_present {
-                    crate::api::handlers::validate_detached_task_worktree(&path, &oid)?;
-                    let expected = persisted_ownership_token.ok_or_else(|| {
-                        "existing staging occupant lacked durable ownership".to_string()
-                    })?;
-                    match read_product_creation_owner_marker(&path)? {
-                        Some(actual) if actual == expected => expected,
-                        _ => {
-                            return Err(
-                                "existing staging occupant did not match durable ownership"
-                                    .to_string(),
-                            );
-                        }
-                    }
+                    verify_existing_product_creation_staging(
+                        &path,
+                        &oid,
+                        persisted_ownership_token.as_deref(),
+                    )?
                 } else {
                     std::fs::create_dir_all(
                         path.parent()
@@ -286,8 +299,8 @@ async fn process_claimed_product_creation(
                         ],
                         Duration::from_secs(30),
                     )?;
-                    write_product_creation_owner_marker(&path, &new_ownership_token)?;
-                    new_ownership_token
+                    write_product_creation_owner_marker(&path, &ownership_token)?;
+                    ownership_token
                 };
                 Ok::<(String, String, bool), String>((
                     path.to_string_lossy().to_string(),
@@ -689,8 +702,15 @@ async fn cleanup_unpublished_product_staging_path(
     let ownership_token = ownership_token.map(ToOwned::to_owned);
     tokio::task::spawn_blocking(move || {
         let path = PathBuf::from(path);
-        if !path.exists() {
-            return Ok(StagingCleanupOutcome::AlreadyAbsent);
+        match path.try_exists() {
+            Ok(false) => return Ok(StagingCleanupOutcome::AlreadyAbsent),
+            Ok(true) => {}
+            Err(error) => {
+                return Err(format!(
+                    "could not inspect product creation staging path {}: {error}",
+                    path.display()
+                ));
+            }
         }
         let _lock = cleanup_lock.ok_or_else(|| "cleanup repository lock missing".to_string())?;
         let Some(expected_owner) = ownership_token else {
@@ -892,6 +912,20 @@ fn git_common_dir_for_repository_root(repo_root: &Path) -> Result<String, String
     .map(|value| value.trim().to_string())
 }
 
+fn verify_existing_product_creation_staging(
+    path: &Path,
+    expected_oid: &str,
+    persisted_ownership_token: Option<&str>,
+) -> Result<String, String> {
+    crate::api::handlers::validate_detached_task_worktree(path, expected_oid)?;
+    let expected = persisted_ownership_token
+        .ok_or_else(|| "existing staging occupant lacked durable ownership".to_string())?;
+    match read_product_creation_owner_marker(path)? {
+        Some(actual) if actual == expected => Ok(expected.to_string()),
+        _ => Err("existing staging occupant did not match durable ownership".to_string()),
+    }
+}
+
 fn product_creation_owner_marker_path(worktree_path: &Path) -> Result<PathBuf, String> {
     let git_dir = crate::git_ops::run_git(
         worktree_path,
@@ -955,9 +989,9 @@ fn ensure_phoenix_staging_ignored(repo_root: &Path) -> Result<(), String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(error) => return Err(error.to_string()),
     };
-    let contains_rule = contents.split(|byte| *byte == b'\n').any(|line| {
-        line.strip_suffix(b"\r").unwrap_or(line).trim_ascii() == b".phoenix/worktrees/"
-    });
+    let contains_rule = contents
+        .split(|byte| *byte == b'\n')
+        .any(|line| line.strip_suffix(b"\r").unwrap_or(line) == b".phoenix/worktrees/");
     if !contains_rule {
         if !contents.is_empty() && !contents.ends_with(b"\n") {
             contents.push(b'\n');
@@ -2635,6 +2669,21 @@ mod product_creation_ignore_tests {
     }
 
     #[test]
+    fn staging_ignore_keeps_leading_spaces_significant() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::git_ops::run_git(repo.path(), &["init"]).unwrap();
+        let gitignore = repo.path().join(".gitignore");
+        std::fs::write(&gitignore, b" .phoenix/worktrees/\n").unwrap();
+
+        ensure_phoenix_staging_ignored(repo.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read(gitignore).unwrap(),
+            b" .phoenix/worktrees/\n.phoenix/worktrees/\n"
+        );
+    }
+
+    #[test]
     fn staging_ignore_separates_rule_from_file_without_trailing_newline() {
         let repo = tempfile::tempdir().unwrap();
         crate::git_ops::run_git(repo.path(), &["init"]).unwrap();
@@ -2679,6 +2728,22 @@ mod product_creation_staging_ownership_tests {
             ],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn occupied_ordinary_directory_is_preserved_before_ownership_proof() {
+        let repo = initialized_repo();
+        let path = repo.path().join(".phoenix/worktrees/replaced");
+        std::fs::create_dir_all(&path).unwrap();
+        let user_file = path.join("user-owned");
+        std::fs::write(&user_file, "preserve me").unwrap();
+        let oid = crate::git_ops::run_git(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+
+        assert!(
+            verify_existing_product_creation_staging(&path, oid.trim(), Some("owner-token"))
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(user_file).unwrap(), "preserve me");
     }
 
     #[tokio::test]

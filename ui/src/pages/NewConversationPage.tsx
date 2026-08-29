@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useRef, useState, KeyboardEvent, ClipboardEvent, ChangeEvent, DragEvent } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useRef, useState, KeyboardEvent, ClipboardEvent, ChangeEvent, DragEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { ImageAttachments } from '../components/ImageAttachments';
 import { ConversationSettings } from '../components/ConversationSettings';
@@ -203,15 +203,24 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   const [recoveryRows, setRecoveryRows] = useState<ProductConversationCreationRecoveryRow[]>([]);
   const [recoveryBusyRequestId, setRecoveryBusyRequestId] = useState<string | null>(null);
 
-  useEffect(() => {
-    let cancelled = false;
-    api.listProductConversationCreations()
-      .then((response) => {
-        if (!cancelled) setRecoveryRows(response.product_creations);
-      })
-      .catch(console.error);
-    return () => { cancelled = true; };
+  const refreshRecoveryRows = useCallback(async () => {
+    try {
+      const response = await api.listProductConversationCreations();
+      setRecoveryRows(response.product_creations);
+    } catch {
+      setRecoveryRows([]);
+    }
   }, []);
+
+  useEffect(() => {
+    void refreshRecoveryRows();
+  }, [conv.creating, refreshRecoveryRows]);
+
+  useEffect(() => {
+    if (!recoveryRows.some((row) => ['accepted', 'claimed', 'retry_scheduled', 'cancelling'].includes(row.status))) return;
+    const interval = window.setInterval(() => void refreshRecoveryRows(), 2000);
+    return () => window.clearInterval(interval);
+  }, [recoveryRows, refreshRecoveryRows]);
 
   // Auto-resize textarea
   useEffect(() => {
@@ -303,6 +312,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
         objective: row.objective,
         model: row.model ?? null,
         effort: row.effort ?? null,
+        images: row.images,
       });
       return;
     }

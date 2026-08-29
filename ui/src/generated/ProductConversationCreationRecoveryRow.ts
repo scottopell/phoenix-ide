@@ -2,4 +2,4 @@
 import type { ModelEffort } from "./ModelEffort";
 import type { ProductConversationCreationAllowedActionView } from "./ProductConversationCreationAllowedActionView";
 
-export type ProductConversationCreationRecoveryRow = { request_id: string, status: string, cwd: string, objective: string, model: string | null, effort: ModelEffort | null, updated_at: string, last_error: string | null, allowed_actions: Array<ProductConversationCreationAllowedActionView>, };
+export type ProductConversationCreationRecoveryRow = { request_id: string, status: string, cwd: string, objective: string, model: string | null, effort: ModelEffort | null, images: Array<{ media_type: string; data: string }>, updated_at: string, last_error: string | null, allowed_actions: Array<ProductConversationCreationAllowedActionView>, };

@@ -288,12 +288,15 @@ export function useCreateConversation(navigate: (path: string) => void) {
     objective: string;
     model: string | null;
     effort: ModelEffort | null;
+    images: ImageData[];
   }) => {
     const nextRequestId = generateUUID();
     setRequestId(nextRequestId);
     replayIntentRef.current = null;
     setCwd(creation.cwd);
     setDraft(creation.objective);
+    setImages(creation.images ?? []);
+    setFiles([]);
     selectModel(creation.model);
     selectEffort(creation.effort);
     setError(null);

@@ -1113,9 +1113,11 @@ impl Database {
                     'accepted',
                     'claimed',
                     'retry_scheduled',
+                    'cancelling',
                     'failed',
                     'cancelled',
-                    'delivery_failed'
+                    'delivery_failed',
+                    'cleanup_ambiguous'
                   )
              ORDER BY updated_at_unix_micros DESC, request_id DESC",
         )
@@ -1276,6 +1278,43 @@ impl Database {
         .execute(&self.pool)
         .await?;
         Ok(inserted.rows_affected() == 1)
+    }
+
+    pub async fn record_product_creation_resource_ownership(
+        &self,
+        request_id: &str,
+        claim: &ProductCreationClaim,
+        resource_identity: &str,
+        ownership_token: &str,
+        now: DateTime<Utc>,
+    ) -> DbResult<bool> {
+        if ownership_token.trim().is_empty() {
+            return Err(DbError::Serialization(
+                "product creation ownership token must not be empty".to_string(),
+            ));
+        }
+        let updated = sqlx::query(
+            "UPDATE product_creation_resource_reservations
+             SET ownership_token = ?7, updated_at_unix_micros = ?1
+             WHERE request_id = ?2 AND generation = ?3 AND resource_identity = ?4
+               AND status = 'reserved' AND ownership_token IS NULL
+               AND EXISTS (
+                   SELECT 1 FROM product_creation_jobs j
+                   WHERE j.request_id = ?2 AND j.status = 'claimed'
+                     AND j.claim_generation = ?3 AND j.claim_worker_id = ?5 AND j.claim_token = ?6
+                     AND j.claim_lease_until_unix_micros > ?1
+               )",
+        )
+        .bind(datetime_to_unix_micros(now))
+        .bind(request_id)
+        .bind(claim.generation)
+        .bind(resource_identity)
+        .bind(&claim.worker_id)
+        .bind(&claim.token)
+        .bind(ownership_token)
+        .execute(&self.pool)
+        .await?;
+        Ok(updated.rows_affected() == 1)
     }
 
     pub async fn mark_product_creation_resource_present(
@@ -1636,7 +1675,7 @@ impl Database {
             "UPDATE product_creation_resource_reservations
              SET status = ?7, updated_at_unix_micros = ?1
              WHERE id = ?2 AND request_id = ?3 AND generation = ?4
-               AND (status = 'cleanup_required' OR (?7 = 'conflict' AND status = 'conflict'))
+               AND (status = 'cleanup_required' OR status = 'conflict')
                AND EXISTS (
                    SELECT 1 FROM product_creation_jobs j
                    WHERE j.request_id = ?3 AND j.claim_generation = ?4
@@ -2474,6 +2513,79 @@ mod product_creation_tests {
             .unwrap();
         assert_eq!(cancelled.status, "cancelled");
         assert!(cancelled.cancelled_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn conflicted_cleanup_can_be_released_after_occupant_becomes_absent() {
+        let db = Database::open_in_memory().await.unwrap();
+        let now = Utc::now();
+        db.accept_product_creation("req-resolved", &intent("/repo/a", "resolved"))
+            .await
+            .unwrap();
+        let claimed = db
+            .claim_product_creation(
+                "req-resolved",
+                "worker",
+                "token",
+                now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(db
+            .reserve_product_creation_resource(
+                "reservation-resolved",
+                "req-resolved",
+                &claimed.claim,
+                "/repo/a",
+                "/repo/a/.phoenix/worktrees/resolved",
+                now,
+            )
+            .await
+            .unwrap());
+        assert!(db
+            .cancel_product_creation("req-resolved", now + chrono::Duration::seconds(1))
+            .await
+            .unwrap());
+        let cleanup = db
+            .claim_next_product_creation_cleanup(
+                "cleanup-worker",
+                "cleanup-token",
+                now + chrono::Duration::seconds(1),
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(db
+            .mark_product_creation_resource_cleanup_conflict(
+                &cleanup,
+                "reservation-resolved",
+                now + chrono::Duration::seconds(2),
+            )
+            .await
+            .unwrap());
+        assert!(db
+            .release_product_creation_resource(
+                &cleanup,
+                "reservation-resolved",
+                now + chrono::Duration::seconds(3),
+            )
+            .await
+            .unwrap());
+        assert!(db
+            .finish_product_creation_cleanup(&cleanup, now + chrono::Duration::seconds(3))
+            .await
+            .unwrap());
+        assert_eq!(
+            db.get_product_creation_job("req-resolved")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "cancelled"
+        );
     }
 
     #[tokio::test]

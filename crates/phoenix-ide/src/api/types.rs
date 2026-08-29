@@ -82,6 +82,8 @@ pub struct ProductConversationCreationRecoveryRow {
     pub objective: String,
     pub model: Option<String>,
     pub effort: Option<phoenix_core::domain::llm_types::ModelEffort>,
+    #[ts(type = "Array<{ media_type: string; data: string }>")]
+    pub images: Vec<crate::db::ProductCreationImage>,
     pub updated_at: String,
     pub last_error: Option<String>,
     pub allowed_actions: Vec<ProductConversationCreationAllowedActionView>,

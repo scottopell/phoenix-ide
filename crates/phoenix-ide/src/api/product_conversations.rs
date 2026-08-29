@@ -92,6 +92,7 @@ pub async fn list_product_conversation_creations(
             objective: job.intent.objective,
             model: job.intent.model,
             effort: job.intent.effort,
+            images: job.intent.images,
             updated_at: job.updated_at.to_rfc3339(),
             last_error: job.last_error,
             allowed_actions: creation_allowed_actions(&job.status),
@@ -162,17 +163,18 @@ fn canonical_route(aggregate: &ProductConversationAggregate) -> String {
 fn creation_allowed_actions(status: &str) -> Vec<ProductConversationCreationAllowedActionView> {
     let mut actions = Vec::with_capacity(2);
     match status {
-        "accepted" | "claimed" | "retry_scheduled" => {
+        "accepted" | "claimed" | "retry_scheduled" | "cancelling" => {
             actions.push(ProductConversationCreationAllowedActionView::Cancel);
-            actions.push(ProductConversationCreationAllowedActionView::StartOver);
         }
         "delivery_failed" => {
             actions.push(ProductConversationCreationAllowedActionView::RetryDelivery);
-            actions.push(ProductConversationCreationAllowedActionView::StartOver);
         }
         "failed" | "cancelled" => {
             actions.push(ProductConversationCreationAllowedActionView::Delete);
             actions.push(ProductConversationCreationAllowedActionView::StartOver);
+        }
+        "cleanup_ambiguous" => {
+            actions.push(ProductConversationCreationAllowedActionView::Delete);
         }
         _ => {}
     }
@@ -847,10 +849,7 @@ mod tests {
             .iter()
             .find(|row| row["request_id"] == "req-accepted")
             .unwrap();
-        assert_eq!(
-            accepted["allowed_actions"],
-            serde_json::json!(["cancel", "start_over"])
-        );
+        assert_eq!(accepted["allowed_actions"], serde_json::json!(["cancel"]));
     }
 
     #[tokio::test]
