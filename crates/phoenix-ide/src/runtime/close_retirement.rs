@@ -3125,10 +3125,23 @@ fn quarantine_has_process_cwd(_path: &Path) -> Result<bool, String> {
 
 #[cfg(target_os = "linux")]
 fn quarantine_has_open_descriptors(path: &Path) -> Result<bool, String> {
+    // SAFETY: `geteuid` has no preconditions.
+    let effective_uid = unsafe { libc::geteuid() };
+    quarantine_has_open_descriptors_in(path, Path::new("/proc"), effective_uid)
+}
+
+#[cfg(target_os = "linux")]
+fn quarantine_has_open_descriptors_in(
+    path: &Path,
+    proc_root: &Path,
+    effective_uid: libc::uid_t,
+) -> Result<bool, String> {
+    use std::os::unix::fs::MetadataExt as _;
+
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         format!("cannot canonicalize quarantined worktree before descriptor inspection: {error}")
     })?;
-    let processes = std::fs::read_dir("/proc")
+    let processes = std::fs::read_dir(proc_root)
         .map_err(|error| format!("cannot enumerate process descriptors: {error}"))?;
     for process in processes {
         let process = process.map_err(|error| format!("cannot inspect process entry: {error}"))?;
@@ -3138,6 +3151,26 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<bool, String> {
             .iter()
             .all(u8::is_ascii_digit)
         {
+            continue;
+        }
+        let process_metadata = match process.metadata() {
+            Ok(metadata) => metadata,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                continue
+            }
+            Err(error) => {
+                return Err(format!(
+                    "cannot attribute process {} descriptor table: {error}",
+                    process.file_name().to_string_lossy()
+                ));
+            }
+        };
+        if process_metadata.uid() != effective_uid {
             continue;
         }
         let descriptors = match std::fs::read_dir(process.path().join("fd")) {
@@ -4864,6 +4897,31 @@ mod tests {
     fn descriptor_scan_has_no_external_executable_dependency() {
         let source = include_str!("close_retirement.rs");
         assert!(!source.contains("Command::new(\"lsof\")"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_scan_skips_unreadable_unrelated_process_but_fails_closed_for_owner() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let quarantine = temp.path().join("quarantine");
+        let proc_root = temp.path().join("proc");
+        let process = proc_root.join("1");
+        std::fs::create_dir_all(&process).unwrap();
+        std::fs::create_dir(&quarantine).unwrap();
+        std::fs::write(process.join("fd"), b"not a descriptor directory").unwrap();
+        let owner_uid = std::fs::metadata(&process).unwrap().uid();
+        let unrelated_uid = owner_uid.checked_add(1).unwrap_or(owner_uid - 1);
+
+        assert!(
+            !super::quarantine_has_open_descriptors_in(&quarantine, &proc_root, unrelated_uid,)
+                .unwrap()
+        );
+
+        let error = super::quarantine_has_open_descriptors_in(&quarantine, &proc_root, owner_uid)
+            .unwrap_err();
+        assert!(error.contains("cannot inspect process 1 descriptor table"));
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
