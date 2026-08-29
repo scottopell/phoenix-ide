@@ -44,7 +44,7 @@ use tokio::sync::{OnceCell, RwLock};
 
 use super::{
     parse_last_exit_marker,
-    probe::{probe, ProbeResult},
+    probe::{command_output, probe, probe_until, ProbeResult},
 };
 
 fn ambiguous_socket_probe(path: &Path) -> TmuxError {
@@ -1423,30 +1423,42 @@ impl TmuxRegistry {
     async fn observe_exact_shutdown(
         permit: &TmuxRetirementPermit,
         killed_socket: SocketFileIdentity,
+        expires: tokio::time::Instant,
     ) -> Result<ExactShutdownObservation, TmuxError> {
-        let result = probe(&permit.instance.socket_path)
+        let Some(result) = probe_until(&permit.instance.socket_path, expires)
             .await
             .map_err(|source| TmuxError::ProbeFailed {
                 socket_path: permit.instance.socket_path.clone(),
                 source,
-            })?;
+            })?
+        else {
+            return Ok(ExactShutdownObservation::Outstanding {
+                reason: "tmux liveness probe exceeded the shutdown deadline".to_string(),
+            });
+        };
         match result {
             ProbeResult::NoSocket | ProbeResult::NoServer => Ok(ExactShutdownObservation::Complete),
             ProbeResult::DeadSocket => {
                 Self::observe_dead_socket_shutdown(&permit.instance.socket_path, killed_socket)
             }
-            ProbeResult::Live => match read_server_token(&permit.instance.socket_path).await {
-                Some(token) if token == permit.instance.server_token => {
-                    Ok(ExactShutdownObservation::Outstanding {
-                        reason: "exact tmux server instance remains live after kill-server"
+            ProbeResult::Live => {
+                match read_server_token_until(&permit.instance.socket_path, expires).await {
+                    Some(Some(token)) if token == permit.instance.server_token => {
+                        Ok(ExactShutdownObservation::Outstanding {
+                            reason: "exact tmux server instance remains live after kill-server"
+                                .to_string(),
+                        })
+                    }
+                    Some(Some(_)) => Ok(ExactShutdownObservation::Complete),
+                    Some(None) => Ok(ExactShutdownObservation::IdentityNotProven {
+                        reason: "live tmux server token is unreadable".to_string(),
+                    }),
+                    None => Ok(ExactShutdownObservation::Outstanding {
+                        reason: "tmux server token reader exceeded the shutdown deadline"
                             .to_string(),
-                    })
+                    }),
                 }
-                Some(_) => Ok(ExactShutdownObservation::Complete),
-                None => Ok(ExactShutdownObservation::IdentityNotProven {
-                    reason: "live tmux server token is unreadable".to_string(),
-                }),
-            },
+            }
         }
     }
 
@@ -1456,12 +1468,22 @@ impl TmuxRegistry {
         mut observe: F,
     ) -> Result<TmuxRetirementOutcome, TmuxError>
     where
-        F: FnMut() -> Fut,
+        F: FnMut(tokio::time::Instant) -> Fut,
         Fut: std::future::Future<Output = Result<ExactShutdownObservation, TmuxError>>,
     {
         let expires = tokio::time::Instant::now() + deadline;
         loop {
-            let last_outstanding = match observe().await? {
+            let observation = match tokio::time::timeout_at(expires, observe(expires)).await {
+                Ok(observation) => observation?,
+                Err(_) => {
+                    return Ok(TmuxRetirementOutcome::RemovalFailed {
+                        reason:
+                            "successful tmux kill-server observation exceeded its shutdown deadline"
+                                .to_string(),
+                    });
+                }
+            };
+            let last_outstanding = match observation {
                 ExactShutdownObservation::Complete => {
                     return Ok(TmuxRetirementOutcome::AbsenceVerified);
                 }
@@ -1491,7 +1513,7 @@ impl TmuxRegistry {
         Self::wait_for_exact_shutdown_with(
             TMUX_SHUTDOWN_DEADLINE,
             TMUX_SHUTDOWN_POLL_INTERVAL,
-            || Self::observe_exact_shutdown(permit, killed_socket),
+            |expires| Self::observe_exact_shutdown(permit, killed_socket, expires),
         )
         .await
     }
@@ -2012,20 +2034,44 @@ async fn read_server_token(socket_path: &Path) -> Option<String> {
     tmux_global_env(socket_path, SERVER_TOKEN_VAR).await
 }
 
+async fn read_server_token_until(
+    socket_path: &Path,
+    expires: tokio::time::Instant,
+) -> Option<Option<String>> {
+    tmux_global_env_output(socket_path, SERVER_TOKEN_VAR, Some(expires))
+        .await
+        .ok()
+        .map(|output| output.and_then(|output| parse_tmux_global_env(&output, SERVER_TOKEN_VAR)))
+}
+
 /// Read one variable from a server's global environment, or `None` if unset.
 /// `tmux show-environment -g VAR` prints `VAR=value` when set and `-VAR` when
 /// not.
 async fn tmux_global_env(socket_path: &Path, var: &str) -> Option<String> {
-    let out = tokio::process::Command::new("tmux")
+    let output = tmux_global_env_output(socket_path, var, None)
+        .await
+        .ok()??;
+    parse_tmux_global_env(&output, var)
+}
+
+async fn tmux_global_env_output(
+    socket_path: &Path,
+    var: &str,
+    expires: Option<tokio::time::Instant>,
+) -> std::io::Result<Option<std::process::Output>> {
+    let mut command = tokio::process::Command::new("tmux");
+    command
         .arg("-S")
         .arg(socket_path)
         .args(["show-environment", "-g", var])
         .env_remove("TMUX")
         .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .await
-        .ok()?;
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    command_output(command, expires).await
+}
+
+fn parse_tmux_global_env(out: &std::process::Output, var: &str) -> Option<String> {
     if !out.status.success() {
         return None;
     }
@@ -2697,7 +2743,7 @@ mod tests {
             TmuxRegistry::wait_for_exact_shutdown_with(
                 Duration::from_secs(1),
                 Duration::from_millis(100),
-                move || {
+                move |_| {
                     let attempt = observed.fetch_add(1, Ordering::SeqCst);
                     async move {
                         Ok(if attempt < 4 {
@@ -2731,7 +2777,7 @@ mod tests {
             TmuxRegistry::wait_for_exact_shutdown_with(
                 Duration::from_millis(250),
                 Duration::from_millis(100),
-                || async {
+                |_| async {
                     Ok(ExactShutdownObservation::Outstanding {
                         reason: "exact server still live".to_string(),
                     })
@@ -2748,6 +2794,28 @@ mod tests {
             waiter.await.unwrap(),
             TmuxRetirementOutcome::RemovalFailed { reason }
                 if reason.contains("shutdown deadline") && reason.contains("exact server still live")
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exact_shutdown_waiter_bounds_a_never_ready_observer() {
+        let waiter = tokio::spawn(async move {
+            TmuxRegistry::wait_for_exact_shutdown_with(
+                Duration::from_millis(250),
+                Duration::from_millis(100),
+                |_| std::future::pending(),
+            )
+            .await
+            .unwrap()
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(250)).await;
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            waiter.await.unwrap(),
+            TmuxRetirementOutcome::RemovalFailed { reason }
+                if reason.contains("observation exceeded") && reason.contains("shutdown deadline")
         ));
     }
 

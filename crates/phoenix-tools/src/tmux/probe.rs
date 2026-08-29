@@ -8,7 +8,11 @@
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
-use std::process::Stdio;
+use std::process::{Output, Stdio};
+
+use tokio::io::AsyncReadExt;
+use tokio::process::Command;
+use tokio::time::Instant;
 
 /// Result of probing an existing socket path. Phoenix issues
 /// `tmux -S <sock> ls` and inspects the result.
@@ -39,33 +43,156 @@ pub async fn probe(socket_path: &Path) -> std::io::Result<ProbeResult> {
     probe_with_binary(socket_path, Path::new("tmux")).await
 }
 
+pub(crate) async fn probe_until(
+    socket_path: &Path,
+    expires: Instant,
+) -> std::io::Result<Option<ProbeResult>> {
+    probe_with_binary_until(socket_path, Path::new("tmux"), expires).await
+}
+
 pub(crate) async fn probe_with_binary(
     socket_path: &Path,
     binary: &Path,
 ) -> std::io::Result<ProbeResult> {
+    probe_with_binary_inner(socket_path, binary, None)
+        .await?
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "tmux probe timed out"))
+}
+
+async fn probe_with_binary_until(
+    socket_path: &Path,
+    binary: &Path,
+    expires: Instant,
+) -> std::io::Result<Option<ProbeResult>> {
+    probe_with_binary_inner(socket_path, binary, Some(expires)).await
+}
+
+async fn probe_with_binary_inner(
+    socket_path: &Path,
+    binary: &Path,
+    expires: Option<Instant>,
+) -> std::io::Result<Option<ProbeResult>> {
     match std::fs::symlink_metadata(socket_path) {
         Ok(metadata) if !metadata.file_type().is_socket() => {
-            return Ok(ProbeResult::DeadSocket);
+            return Ok(Some(ProbeResult::DeadSocket));
         }
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ProbeResult::NoSocket);
+            return Ok(Some(ProbeResult::NoSocket));
         }
         Err(error) => return Err(error),
     }
-    let output = tokio::process::Command::new(binary)
+    let mut command = Command::new(binary);
+    command
         .args(["-S", &socket_path.to_string_lossy(), "ls"])
         .env_remove("TMUX")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .await?;
-    Ok(classify_output(
+        .stderr(Stdio::piped());
+    let Some(output) = command_output(command, expires).await? else {
+        return Ok(None);
+    };
+    Ok(Some(classify_output(
         output.status.success(),
         &output.stderr,
         socket_path,
-    ))
+    )))
+}
+
+pub(crate) async fn command_output(
+    command: Command,
+    expires: Option<Instant>,
+) -> std::io::Result<Option<Output>> {
+    let (mut tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let result = run_command_output(command, expires, tx.closed()).await;
+        let _ = tx.send(result);
+    });
+    rx.await.map_err(std::io::Error::other)?
+}
+
+async fn run_command_output(
+    mut command: Command,
+    expires: Option<Instant>,
+    cancelled: impl std::future::Future<Output = ()>,
+) -> std::io::Result<Option<Output>> {
+    command.kill_on_drop(true);
+    let mut child = command.spawn()?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let mut stdout_reader = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        if let Some(mut stdout) = stdout {
+            stdout.read_to_end(&mut bytes).await?;
+        }
+        Ok::<_, std::io::Error>(bytes)
+    });
+    let mut stderr_reader = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        if let Some(mut stderr) = stderr {
+            stderr.read_to_end(&mut bytes).await?;
+        }
+        Ok::<_, std::io::Error>(bytes)
+    });
+
+    tokio::pin!(cancelled);
+    let status = if let Some(expires) = expires {
+        tokio::select! {
+            status = child.wait() => Some(status?),
+            () = tokio::time::sleep_until(expires) => None,
+            () = &mut cancelled => None,
+        }
+    } else {
+        tokio::select! {
+            status = child.wait() => Some(status?),
+            () = &mut cancelled => None,
+        }
+    };
+    let Some(status) = status else {
+        let _ = child.start_kill();
+        child.wait().await?;
+        stdout_reader.abort();
+        stderr_reader.abort();
+        let _ = stdout_reader.await;
+        let _ = stderr_reader.await;
+        return Ok(None);
+    };
+    let output = {
+        let readers = async {
+            let stdout = (&mut stdout_reader)
+                .await
+                .map_err(std::io::Error::other)??;
+            let stderr = (&mut stderr_reader)
+                .await
+                .map_err(std::io::Error::other)??;
+            Ok::<_, std::io::Error>((stdout, stderr))
+        };
+        tokio::pin!(readers);
+        if let Some(expires) = expires {
+            tokio::select! {
+                output = &mut readers => Some(output?),
+                () = tokio::time::sleep_until(expires) => None,
+                () = &mut cancelled => None,
+            }
+        } else {
+            tokio::select! {
+                output = &mut readers => Some(output?),
+                () = &mut cancelled => None,
+            }
+        }
+    };
+    let Some((stdout, stderr)) = output else {
+        stdout_reader.abort();
+        stderr_reader.abort();
+        let _ = stdout_reader.await;
+        let _ = stderr_reader.await;
+        return Ok(None);
+    };
+    Ok(Some(Output {
+        status,
+        stdout,
+        stderr,
+    }))
 }
 
 fn classify_output(success: bool, stderr: &[u8], socket_path: &Path) -> ProbeResult {
@@ -140,6 +267,47 @@ mod tests {
             classify_output(false, b"no server running on /tmp/example.sock\n", path),
             ProbeResult::NoServer
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deadline_kills_and_reaps_probe_child() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let pid_path = tmp.path().join("probe.pid");
+        let binary = tmp.path().join("tmux");
+        std::fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\necho $$ > {}\nexec sleep 30\n",
+                pid_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut command = Command::new(&binary);
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+        let result = command_output(
+            command,
+            Some(Instant::now() + std::time::Duration::from_millis(500)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, None);
+
+        let pid = std::fs::read_to_string(&pid_path)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        let status = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status.success(), "timed-out probe child {pid} survived");
     }
 
     #[tokio::test]
