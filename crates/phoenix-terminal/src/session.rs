@@ -212,12 +212,13 @@ impl TerminalInstanceIdentity {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct TerminalRetirementPermit {
     pub work_scope: ResourceScopeKey,
     pub instance: Option<TerminalInstanceIdentity>,
     generation: TerminalRetirementGeneration,
     deadline: tokio::time::Instant,
+    owner: TerminalRetirementOwner,
     had_entry: bool,
 }
 
@@ -226,6 +227,22 @@ impl TerminalRetirementPermit {
     pub fn generation(&self) -> TerminalRetirementGeneration {
         self.generation
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalRetirementOwner {
+    Close,
+    Relay,
+}
+
+/// Affine proof that a relay completed the retirement generation it claimed.
+/// Consuming this outcome may reopen only that exact relay-owned fence.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RelayRetirementCompletion {
+    work_scope: ResourceScopeKey,
+    generation: TerminalRetirementGeneration,
+    owner: TerminalRetirementOwner,
+    pub outcome: TerminalRetirementOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -237,7 +254,7 @@ pub enum TerminalRetirementOutcome {
 
 /// Typed ownership decision made when an attached relay reaches a destructive
 /// exit. Exactly one retirement owner is allowed to remove and reap the handle.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum RelayTeardownOwnership {
     /// Close already fenced this exact instance and owns completion.
     ExistingRetirementOwner,
@@ -261,10 +278,10 @@ struct ActiveTerminalRegistryState {
     retirements: HashMap<ResourceScopeKey, ScopeRetirementState>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 struct ScopeRetirementState {
     generation: u64,
-    fenced: bool,
+    owner: Option<TerminalRetirementOwner>,
 }
 
 /// Shared registry of active terminal sessions (REQ-TERM-003, REQ-TERM-WS-001).
@@ -338,7 +355,7 @@ impl ActiveTerminals {
         if map
             .retirements
             .get(scope)
-            .is_some_and(|retirement| retirement.fenced)
+            .is_some_and(|retirement| retirement.owner.is_some())
         {
             return Err(ActiveTerminalInsertError::RetirementFenced);
         }
@@ -365,7 +382,7 @@ impl ActiveTerminals {
         if map
             .retirements
             .get(&scope)
-            .is_some_and(|retirement| retirement.fenced)
+            .is_some_and(|retirement| retirement.owner.is_some())
         {
             return Err(ActiveTerminalInsertError::RetirementFenced);
         }
@@ -409,7 +426,7 @@ impl ActiveTerminals {
         if map
             .retirements
             .get(&scope)
-            .is_some_and(|retirement| retirement.fenced)
+            .is_some_and(|retirement| retirement.owner.is_some())
         {
             return Err(ActiveTerminalInsertError::RetirementFenced);
         }
@@ -460,7 +477,7 @@ impl ActiveTerminals {
         if map
             .retirements
             .get(scope)
-            .is_some_and(|retirement| retirement.fenced)
+            .is_some_and(|retirement| retirement.owner.is_some())
         {
             return RelayTeardownOwnership::ExistingRetirementOwner;
         }
@@ -468,19 +485,24 @@ impl ActiveTerminals {
             scope,
             &mut map,
             tokio::time::Instant::now() + TERMINAL_CLOSE_RETIREMENT_BUDGET,
+            TerminalRetirementOwner::Relay,
         ))
     }
 
-    /// Remove the terminal for `scope` and explicitly reopen normal admission.
-    ///
-    /// This is reserved for non-Close cleanup that owns both effects.
+    /// Remove a terminal only when no retirement owner fences the scope.
     ///
     /// # Panics
     /// Panics if the registry mutex is poisoned.
-    pub fn remove_and_reopen(&self, scope: &ResourceScopeKey) {
+    #[cfg(test)]
+    pub(crate) fn remove_unfenced(&self, scope: &ResourceScopeKey) {
         let mut map = self.0.lock().expect("terminal registry poisoned");
-        map.handles.remove(scope);
-        map.retirements.remove(scope);
+        if map
+            .retirements
+            .get(scope)
+            .is_none_or(|retirement| retirement.owner.is_none())
+        {
+            map.handles.remove(scope);
+        }
     }
 
     /// Look up an active terminal.
@@ -503,7 +525,7 @@ impl ActiveTerminals {
         if map
             .retirements
             .get(scope)
-            .is_some_and(|retirement| retirement.fenced)
+            .is_some_and(|retirement| retirement.owner.is_some())
         {
             return None;
         }
@@ -522,7 +544,7 @@ impl ActiveTerminals {
         if map
             .retirements
             .get(scope)
-            .is_some_and(|retirement| retirement.fenced)
+            .is_some_and(|retirement| retirement.owner.is_some())
             || !map
                 .handles
                 .get(scope)
@@ -544,13 +566,14 @@ impl ActiveTerminals {
         let map = self.0.lock().expect("terminal registry poisoned");
         map.retirements
             .get(scope)
-            .is_some_and(|retirement| retirement.fenced)
+            .is_some_and(|retirement| retirement.owner.is_some())
     }
 
     fn build_retirement_permit(
         scope: &ResourceScopeKey,
         map: &mut ActiveTerminalRegistryState,
         deadline: tokio::time::Instant,
+        owner: TerminalRetirementOwner,
     ) -> TerminalRetirementPermit {
         map.spawn_reservations.remove(scope);
         let instance = map
@@ -558,17 +581,23 @@ impl ActiveTerminals {
             .get(scope)
             .map(TerminalInstanceIdentity::from_handle);
         let had_entry = instance.is_some();
-        let generation = {
-            let retirement = map.retirements.entry(scope.clone()).or_default();
-            retirement.generation = retirement.generation.wrapping_add(1);
-            retirement.fenced = true;
-            retirement.generation
-        };
+        let generation = map
+            .retirements
+            .get(scope)
+            .map_or(1, |retirement| retirement.generation.wrapping_add(1));
+        map.retirements.insert(
+            scope.clone(),
+            ScopeRetirementState {
+                generation,
+                owner: Some(owner),
+            },
+        );
         TerminalRetirementPermit {
             work_scope: scope.clone(),
             instance,
             generation: TerminalRetirementGeneration(generation),
             deadline,
+            owner,
             had_entry,
         }
     }
@@ -576,8 +605,8 @@ impl ActiveTerminals {
     /// Fence `scope` for exact retirement and return the permit authorizing one
     /// teardown attempt against the instance that was current at fence time.
     ///
-    /// Admission stays closed until [`Self::reopen_after_repair`] clears the
-    /// fence, even if `complete_retirement` later verifies exact absence.
+    /// Admission stays closed until the exact permit is cancelled, even if
+    /// `complete_retirement` later verifies exact absence.
     ///
     /// # Panics
     /// Panics if the registry mutex is poisoned.
@@ -600,7 +629,7 @@ impl ActiveTerminals {
         deadline: tokio::time::Instant,
     ) -> TerminalRetirementPermit {
         let mut map = self.0.lock().expect("terminal registry poisoned");
-        Self::build_retirement_permit(scope, &mut map, deadline)
+        Self::build_retirement_permit(scope, &mut map, deadline, TerminalRetirementOwner::Close)
     }
 
     fn matches_exact_instance(
@@ -610,7 +639,7 @@ impl ActiveTerminals {
         let Some(retirement) = map.retirements.get(&permit.work_scope) else {
             return false;
         };
-        if !retirement.fenced || retirement.generation != permit.generation.0 {
+        if retirement.generation != permit.generation.0 || retirement.owner != Some(permit.owner) {
             return false;
         }
         match (
@@ -674,8 +703,8 @@ impl ActiveTerminals {
     ///
     /// A stale permit must not remove a replacement terminal. On an exact match,
     /// this removes the registry-owned handle, signals relay teardown, and reaps
-    /// the shell when no relay is attached. The scope remains fenced until
-    /// [`Self::reopen_after_repair`] is called.
+    /// the shell when no relay is attached. The scope remains fenced until the
+    /// exact owning permit or relay completion is consumed.
     ///
     /// # Panics
     /// Panics if the registry mutex is poisoned.
@@ -792,14 +821,67 @@ impl ActiveTerminals {
         }
     }
 
-    /// Clear a retirement fence after repair authorizes the scope to admit a
-    /// fresh terminal again.
+    /// Complete a relay-owned retirement and return an affine reopening outcome.
+    pub async fn complete_relay_retirement(
+        &self,
+        permit: TerminalRetirementPermit,
+    ) -> RelayRetirementCompletion {
+        let outcome = self.complete_retirement(&permit).await;
+        RelayRetirementCompletion {
+            work_scope: permit.work_scope,
+            generation: permit.generation,
+            owner: permit.owner,
+            outcome,
+        }
+    }
+
+    /// Consume a relay completion and reopen only its exact current relay fence.
     ///
     /// # Panics
     /// Panics if the registry mutex is poisoned.
-    pub fn reopen_after_repair(&self, scope: &ResourceScopeKey) {
+    #[must_use]
+    pub fn reopen_after_relay_completion(
+        &self,
+        completion: RelayRetirementCompletion,
+    ) -> TerminalRetirementOutcome {
+        let RelayRetirementCompletion {
+            work_scope,
+            generation,
+            owner,
+            outcome,
+        } = completion;
         let mut map = self.0.lock().expect("terminal registry poisoned");
-        map.retirements.remove(scope);
+        if let Some(retirement) = map.retirements.get_mut(&work_scope) {
+            if retirement.generation == generation.0
+                && retirement.owner == Some(TerminalRetirementOwner::Relay)
+                && owner == TerminalRetirementOwner::Relay
+            {
+                retirement.owner = None;
+            }
+        }
+        outcome
+    }
+
+    /// Consume an uncommitted Close permit and cancel only its exact fence.
+    ///
+    /// # Panics
+    /// Panics if the registry mutex is poisoned.
+    pub fn cancel_retirement(&self, permit: TerminalRetirementPermit) {
+        let TerminalRetirementPermit {
+            work_scope,
+            generation,
+            owner,
+            ..
+        } = permit;
+        let mut map = self.0.lock().expect("terminal registry poisoned");
+        if let Some(retirement) = map.retirements.get_mut(&work_scope) {
+            if retirement.generation == generation.0
+                && retirement.owner == Some(TerminalRetirementOwner::Close)
+                && owner == TerminalRetirementOwner::Close
+            {
+                retirement.owner = None;
+            }
+        }
     }
 
     /// Cascade-cleanup entry for `run_resource_cleanup_cascade`
@@ -835,7 +917,7 @@ impl ActiveTerminals {
 
         let permit = self.begin_retirement(work_scope);
         let outcome = self.complete_retirement(&permit).await;
-        self.reopen_after_repair(work_scope);
+        self.cancel_retirement(permit);
 
         tracing::info!(
             work_scope = %work_scope,

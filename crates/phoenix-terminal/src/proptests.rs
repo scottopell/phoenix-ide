@@ -151,7 +151,7 @@ fn remove_allows_reinsertion() {
     registry
         .try_insert(scope.clone(), dummy_handle(dims))
         .unwrap();
-    registry.remove_and_reopen(&scope);
+    registry.remove_unfenced(&scope);
 
     let third = registry.try_insert(scope.clone(), dummy_handle(dims));
     assert!(third.is_some(), "insert after remove must succeed");
@@ -180,6 +180,66 @@ fn relay_teardown_transfers_to_existing_close_owner() {
             .is_some_and(|current| std::sync::Arc::ptr_eq(&current, &handle)),
         "relay must leave the exact handle and reap authority with Close"
     );
+}
+
+#[tokio::test]
+async fn stale_relay_completion_cannot_reopen_newer_close_fence() {
+    use crate::session::RelayTeardownOwnership;
+
+    let registry = ActiveTerminals::new();
+    let scope = scope("stale-relay-close-fence");
+    let dims = Dims::try_new(80, 24).unwrap();
+    let handle = registry
+        .try_insert_exact(scope.clone(), dummy_handle(dims))
+        .expect("insert terminal");
+    let relay = match registry.claim_relay_teardown(&scope, &handle) {
+        RelayTeardownOwnership::RelayInitiated(permit) => permit,
+        ownership @ (RelayTeardownOwnership::ExistingRetirementOwner
+        | RelayTeardownOwnership::StaleRelay) => {
+            panic!("relay should own generation N, got {ownership:?}")
+        }
+    };
+    let close = registry.begin_retirement(&scope);
+    assert_eq!(close.generation().get(), relay.generation().get() + 1);
+
+    let completion = registry.complete_relay_retirement(relay).await;
+    assert!(matches!(
+        registry.reopen_after_relay_completion(completion),
+        TerminalRetirementOutcome::Residual { .. }
+    ));
+
+    assert!(registry.is_retirement_fenced(&scope));
+    assert!(matches!(
+        registry.try_insert_exact(scope.clone(), dummy_handle(dims)),
+        Err(ActiveTerminalInsertError::RetirementFenced)
+    ));
+    registry.cancel_retirement(close);
+}
+
+#[tokio::test]
+async fn current_relay_completion_reopens_its_own_fence() {
+    use crate::session::RelayTeardownOwnership;
+
+    let registry = ActiveTerminals::new();
+    let scope = scope("relay-only-reopen");
+    let dims = Dims::try_new(80, 24).unwrap();
+    let handle = registry
+        .try_insert_exact(scope.clone(), dummy_handle(dims))
+        .expect("insert terminal");
+    let relay = match registry.claim_relay_teardown(&scope, &handle) {
+        RelayTeardownOwnership::RelayInitiated(permit) => permit,
+        ownership @ (RelayTeardownOwnership::ExistingRetirementOwner
+        | RelayTeardownOwnership::StaleRelay) => {
+            panic!("relay should own its retirement, got {ownership:?}")
+        }
+    };
+
+    let completion = registry.complete_relay_retirement(relay).await;
+    assert!(matches!(
+        registry.reopen_after_relay_completion(completion),
+        TerminalRetirementOutcome::Residual { .. }
+    ));
+    assert!(!registry.is_retirement_fenced(&scope));
 }
 
 #[test]
@@ -234,9 +294,9 @@ fn begin_retirement_fences_admission_until_reopened() {
         Err(ActiveTerminalInsertError::RetirementFenced)
     ));
 
-    registry.reopen_after_repair(&scope);
+    registry.cancel_retirement(permit);
     assert!(!registry.is_retirement_fenced(&scope));
-    registry.remove_and_reopen(&scope);
+    registry.remove_unfenced(&scope);
     assert!(
         registry
             .try_insert(scope.clone(), dummy_handle(dims))
@@ -300,12 +360,12 @@ async fn complete_retirement_requires_exact_instance_and_reopen_for_admission() 
         Err(ActiveTerminalInsertError::RetirementFenced)
     ));
 
-    registry.reopen_after_repair(&scope);
+    registry.cancel_retirement(second_permit);
     assert!(
         registry
             .try_insert(scope.clone(), dummy_handle(dims))
             .is_some(),
-        "reopen_after_repair must permit a fresh terminal after exact teardown"
+        "exact Close cancellation must permit a fresh terminal after teardown"
     );
 }
 
@@ -400,8 +460,10 @@ async fn attached_relay_close_transfers_authority_and_completes_exact_teardown()
     );
     let close = {
         let registry = registry.clone();
-        let permit = permit.clone();
-        tokio::spawn(async move { registry.complete_retirement(&permit).await })
+        tokio::spawn(async move {
+            let outcome = registry.complete_retirement(&permit).await;
+            (outcome, permit)
+        })
     };
 
     stop_rx.changed().await.unwrap();
@@ -414,12 +476,13 @@ async fn attached_relay_close_transfers_authority_and_completes_exact_teardown()
     drop(relay_permit);
     drop(handle);
 
-    assert_eq!(close.await.unwrap(), TerminalRetirementOutcome::Retired);
+    assert_eq!(close.await.unwrap().0, TerminalRetirementOutcome::Retired);
     assert!(registry.get(&scope).is_none());
 }
 
 #[cfg(unix)]
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn sighup_resistant_attached_child_times_out_bounded_with_retry_authority() {
     use crate::command_tracker::CommandTracker;
     use crate::session::{ShellIntegrationStatus, StopReason, TerminalChildKind, TerminalHandle};
@@ -490,8 +553,10 @@ async fn sighup_resistant_attached_child_times_out_bounded_with_retry_authority(
     let permit = registry.begin_retirement_by(&scope, deadline);
     let completing = {
         let registry = registry.clone();
-        let permit = permit.clone();
-        tokio::spawn(async move { registry.complete_retirement(&permit).await })
+        tokio::spawn(async move {
+            let outcome = registry.complete_retirement(&permit).await;
+            (outcome, permit)
+        })
     };
     let started = std::time::Instant::now();
 
@@ -502,7 +567,7 @@ async fn sighup_resistant_attached_child_times_out_bounded_with_retry_authority(
         crate::session::RelayTeardownOwnership::ExistingRetirementOwner
     );
     drop(relay_permit);
-    let outcome = completing.await.unwrap();
+    let (outcome, permit) = completing.await.unwrap();
     assert!(started.elapsed() < std::time::Duration::from_secs(1));
     assert_eq!(
         outcome,
@@ -632,40 +697,6 @@ async fn complete_retirement_exits_and_reaps_long_lived_detached_direct_pty() {
     );
 }
 
-#[tokio::test]
-async fn complete_retirement_verifies_absence_without_touching_replacement() {
-    let registry = ActiveTerminals::new();
-    let scope = scope("retirement-replacement");
-    let dims = Dims { cols: 80, rows: 24 };
-
-    registry
-        .try_insert_exact(scope.clone(), dummy_handle_with_pid(dims, 1))
-        .expect("original insert");
-    let permit = registry.begin_retirement(&scope);
-
-    registry.remove_and_reopen(&scope);
-    let replacement = registry.begin_retirement(&scope);
-    registry.reopen_after_repair(&scope);
-    registry
-        .try_insert_exact(scope.clone(), dummy_handle_with_pid(dims, 2))
-        .expect("replacement insert after legacy clear");
-
-    assert_eq!(
-        replacement.instance, None,
-        "replacement fence after legacy clear should record absence"
-    );
-
-    assert_eq!(
-        registry.complete_retirement(&permit).await,
-        TerminalRetirementOutcome::AbsenceVerified,
-        "stale permit must verify old instance absence instead of removing replacement"
-    );
-    assert!(
-        registry.get(&scope).is_some(),
-        "replacement must survive stale retirement completion"
-    );
-}
-
 /// `get` returns `Some` for registered scopes, `None` otherwise.
 #[test]
 fn get_returns_correct_presence() {
@@ -790,7 +821,7 @@ proptest! {
                 // try_insert either succeeds or returns None — never panics.
                 let _ = registry.try_insert(scope.clone(), dummy_handle(dims));
             } else {
-                registry.remove_and_reopen(&scope);
+                registry.remove_unfenced(&scope);
             }
 
             // Invariant: count per scope must be 0 or 1.

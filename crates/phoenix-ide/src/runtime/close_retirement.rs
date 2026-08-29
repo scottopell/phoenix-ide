@@ -467,7 +467,7 @@ impl RuntimeManager {
         let key = ResourceScopeKey::Work(scope.clone());
         self.bash_handles().cancel_retirement(lease.bash).await;
         self.tmux_registry().reopen_after_repair(&key).await;
-        self.terminals.reopen_after_repair(&key);
+        self.terminals.cancel_retirement(lease.terminal);
         self.browser_sessions().reopen_after_repair(&key).await;
     }
 

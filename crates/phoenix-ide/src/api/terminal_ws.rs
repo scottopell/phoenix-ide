@@ -521,8 +521,8 @@ async fn finish_destructive_relay_exit(
 
     match ownership {
         RelayTeardownOwnership::RelayInitiated(permit) => {
-            let outcome = terminals.complete_retirement(&permit).await;
-            terminals.reopen_after_repair(scope);
+            let completion = terminals.complete_relay_retirement(permit).await;
+            let outcome = terminals.reopen_after_relay_completion(completion);
             tracing::info!(conv_id = %conversation_id, scope = %scope, ?outcome, "Terminal session ended");
         }
         RelayTeardownOwnership::ExistingRetirementOwner => {
