@@ -1976,6 +1976,64 @@ async fn delete_product_conversation_creation(
     Ok(Json(SuccessResponse { success: true }))
 }
 
+fn product_creation_processing_error_type(status: Option<&str>) -> &'static str {
+    match status {
+        Some(
+            "accepted" | "claimed" | "retry_scheduled" | "cancelling" | "deletion_pending"
+            | "delivery_pending",
+        ) => "product_creation_retry_scheduled",
+        _ => "product_creation_failed",
+    }
+}
+
+#[cfg(test)]
+mod product_creation_error_classification_tests {
+    use super::product_creation_processing_error_type;
+
+    #[test]
+    fn auto_advancing_statuses_report_scheduled_recovery() {
+        for status in [
+            "accepted",
+            "claimed",
+            "retry_scheduled",
+            "cancelling",
+            "deletion_pending",
+            "delivery_pending",
+        ] {
+            assert_eq!(
+                product_creation_processing_error_type(Some(status)),
+                "product_creation_retry_scheduled",
+                "status {status}"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_action_and_terminal_statuses_never_report_scheduled_retry() {
+        for status in [
+            "cancelled",
+            "delivery_failed",
+            "failed",
+            "cleanup_ambiguous",
+            "published",
+        ] {
+            assert_eq!(
+                product_creation_processing_error_type(Some(status)),
+                "product_creation_failed",
+                "status {status}"
+            );
+        }
+        assert_eq!(
+            product_creation_processing_error_type(None),
+            "product_creation_failed"
+        );
+        assert_eq!(
+            product_creation_processing_error_type(Some("unknown")),
+            "product_creation_failed"
+        );
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn create_product_conversation(
     State(state): State<AppState>,
@@ -2088,20 +2146,15 @@ async fn create_product_conversation(
     {
         Ok(published) => published,
         Err(message) => {
-            let terminal = state
+            let status = state
                 .db
                 .get_product_creation_job(&req.request_id)
                 .await
                 .map_err(|error| AppError::Internal(error.to_string()))?
-                .is_some_and(|job| job.status == "failed");
+                .map(|job| job.status);
             return Err(AppError::TypedInternal {
                 message,
-                error_type: if terminal {
-                    "product_creation_failed"
-                } else {
-                    "product_creation_retry_scheduled"
-                }
-                .to_string(),
+                error_type: product_creation_processing_error_type(status.as_deref()).to_string(),
             });
         }
     };

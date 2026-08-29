@@ -506,7 +506,7 @@ async fn deliver_product_creation_objective(
             .await
             .map_err(|error| error.to_string())?
         {
-            manager
+            let completed = manager
                 .db()
                 .complete_product_creation_delivery(
                     &job.request_id,
@@ -516,6 +516,11 @@ async fn deliver_product_creation_objective(
                 )
                 .await
                 .map_err(|error| error.to_string())?;
+            if !completed {
+                return Err(
+                    "product creation delivery claim was lost before completion".to_string()
+                );
+            }
             return Ok(PublishedProductCreation {
                 product_conversation_id: product_id.to_string(),
                 transcript_row_id: conversation_id,
@@ -942,7 +947,11 @@ fn run_git_with_timeout(
 }
 
 fn discover_product_repository(cwd: &Path) -> Result<Option<String>, String> {
-    match crate::git_ops::run_git(cwd, &["rev-parse", "--show-toplevel"]) {
+    match crate::git_ops::run_git_with_env(
+        cwd,
+        &["rev-parse", "--show-toplevel"],
+        &[("LC_ALL", "C")],
+    ) {
         Ok(root) => Path::new(root.trim())
             .canonicalize()
             .map(|path| Some(path.to_string_lossy().to_string()))
@@ -2701,6 +2710,163 @@ mod temporary_creation_branch_tests {
 }
 
 #[cfg(test)]
+mod product_creation_delivery_replay_tests {
+    use super::*;
+    use crate::db::{
+        Database, ProductCreationGitPublicationFacts, ProductCreationIntent,
+        ProductCreationPublishInput,
+    };
+    use crate::platform::PlatformCapability;
+    use crate::runtime::RuntimeManager;
+    use crate::tools::mcp::McpClientManager;
+    use phoenix_core::domain::db_schema::Conversation;
+    use phoenix_core::domain::llm_types::ServiceTier;
+    use phoenix_core::llm_language::LlmLanguage;
+    use phoenix_core::work_scope::WorkScopeId;
+    use phoenix_core::work_scope::{AuthorityKind, EnvironmentContext, RuntimeRole};
+    use phoenix_llm::ModelRegistry;
+
+    fn stale_delivery_conversation(
+        conversation_id: &str,
+        product_conversation_id: &phoenix_core::domain::close::ProductConversationId,
+        cwd: &str,
+    ) -> Conversation {
+        Conversation {
+            id: conversation_id.to_string(),
+            product_conversation_id: product_conversation_id.clone(),
+            slug: Some(conversation_id.to_string()),
+            title: Some(conversation_id.to_string()),
+            cwd: cwd.to_string(),
+            parent_conversation_id: None,
+            user_initiated: true,
+            state: ConvState::Idle,
+            state_updated_at: chrono::Utc::now(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            archived: true,
+            model: None,
+            effort: None,
+            service_tier: ServiceTier::Standard,
+            project_id: None,
+            conv_mode: ConvMode::Direct,
+            runtime_role: RuntimeRole::User,
+            attached_work_scope_id: Some(WorkScopeId::new()),
+            desired_base_branch: None,
+            message_count: 0,
+            transcript_generation: 1,
+            seed_parent_id: None,
+            seed_label: None,
+            continued_in_conv_id: None,
+            chain_name: None,
+            llm_language: LlmLanguage::Caveman,
+            spawned_from_conversation_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_fingerprint_replay_with_stale_delivery_claim_remains_pending() {
+        let db = Database::open_in_memory().await.unwrap();
+        let intent = ProductCreationIntent {
+            cwd: "/repo/a".to_string(),
+            objective: "deliver objective".to_string(),
+            model: None,
+            effort: None,
+            images: Vec::new(),
+            llm_language: LlmLanguage::Caveman,
+        };
+        db.accept_product_creation("req-stale-delivery", &intent)
+            .await
+            .unwrap();
+        let provisioning = db
+            .claim_product_creation(
+                "req-stale-delivery",
+                "provisioner",
+                "provision-token",
+                chrono::Utc::now(),
+                chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let conversation_id = "conv-stale-delivery";
+        let conversation = stale_delivery_conversation(
+            conversation_id,
+            &provisioning.job.product_conversation_id,
+            &intent.cwd,
+        );
+        assert!(db
+            .publish_product_creation_atomically(&ProductCreationPublishInput {
+                request_id: "req-stale-delivery".to_string(),
+                claim: provisioning.claim,
+                conversation,
+                authority_kind: AuthorityKind::Work,
+                environment: EnvironmentContext::UnownedCwd {
+                    cwd: intent.cwd.clone(),
+                },
+                git_publication: Some(ProductCreationGitPublicationFacts {
+                    exact_checkout_oid: "repo-id".to_string(),
+                    repository_root: intent.cwd.clone(),
+                }),
+            })
+            .await
+            .unwrap());
+        db.append_steering_entry(
+            conversation_id,
+            &phoenix_core::domain::sm_event::SteerEntry {
+                text: intent.objective.clone(),
+                llm_text: None,
+                images: Vec::new(),
+                files: Vec::new(),
+                message_id: "req-stale-delivery".to_string(),
+                user_agent: None,
+                skill_invocation: None,
+            },
+            "product-create:req-stale-delivery",
+        )
+        .await
+        .unwrap();
+        let pending = db
+            .get_product_creation_job("req-stale-delivery")
+            .await
+            .unwrap()
+            .unwrap();
+        let stale_delivery = crate::db::ClaimedProductCreationJob {
+            claim: crate::db::ProductCreationClaim {
+                worker_id: pending.claim_worker_id.clone().unwrap(),
+                token: "stale-token".to_string(),
+                generation: pending.claim_generation,
+                lease_until: pending.claim_lease_until.unwrap(),
+            },
+            job: pending,
+        };
+        let manager = Arc::new(RuntimeManager::new(
+            db.clone(),
+            Arc::new(ModelRegistry::new_empty()),
+            PlatformCapability::None {
+                details: "test".to_string(),
+            },
+            Arc::new(McpClientManager::new()),
+            None,
+        ));
+
+        let error = deliver_product_creation_objective(&manager, &stale_delivery)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "product creation delivery claim was lost before completion"
+        );
+        let still_pending = db
+            .get_product_creation_job("req-stale-delivery")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(still_pending.status, "delivery_pending");
+        assert!(db.get_conversation(conversation_id).await.unwrap().archived);
+    }
+}
+
+#[cfg(test)]
 mod product_creation_path_classification_tests {
     use super::*;
 
@@ -2710,6 +2876,21 @@ mod product_creation_path_classification_tests {
         let cwd = root.path().join("standalone");
         std::fs::create_dir(&cwd).unwrap();
 
+        assert_eq!(discover_product_repository(&cwd).unwrap(), None);
+    }
+
+    #[test]
+    fn localized_environment_still_classifies_standalone_directory_as_direct() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("standalone");
+        std::fs::create_dir(&cwd).unwrap();
+
+        let localized_probe = crate::git_ops::run_git_with_env(
+            &cwd,
+            &["rev-parse", "--show-toplevel"],
+            &[("LC_ALL", "de_DE.UTF-8")],
+        );
+        assert!(localized_probe.is_err());
         assert_eq!(discover_product_repository(&cwd).unwrap(), None);
     }
 

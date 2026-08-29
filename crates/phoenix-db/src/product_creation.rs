@@ -909,7 +909,8 @@ impl Database {
              SET status = 'delivery_pending', retry_at_unix_micros = NULL, staging_path = ?2,
                  staging_repo_root = ?3, staging_exact_oid = ?4,
                  published_product_id = ?5, published_conversation_id = ?6,
-                 delivery_retry_at_unix_micros = ?7, updated_at_unix_micros = ?8
+                 delivery_retry_at_unix_micros = ?7, last_error = NULL,
+                 updated_at_unix_micros = ?8
              WHERE request_id = ?1 AND status = 'claimed' AND claim_generation = ?9
                AND claim_worker_id = ?10 AND claim_token = ?11
                AND claim_lease_until_unix_micros > ?8",
@@ -2189,7 +2190,7 @@ mod product_creation_tests {
     }
 
     #[tokio::test]
-    async fn product_creation_snapshots_llm_language_and_retains_last_error() {
+    async fn product_creation_publication_clears_stale_provisioning_error() {
         let db = Database::open_in_memory().await.unwrap();
         let accepted_intent = intent("/repo/a", "ship it");
         db.accept_product_creation("req-language", &accepted_intent)
@@ -2232,6 +2233,48 @@ mod product_creation_tests {
             retried.last_error.as_deref(),
             Some("transient provisioning failure")
         );
+
+        let publish_claim = db
+            .claim_product_creation(
+                "req-language",
+                "worker-b",
+                "token-b",
+                retried.retry_at.expect("retry deadline"),
+                chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap()
+            .expect("claim retry");
+        let conversation = published_conversation(
+            "conv-language",
+            retried.product_conversation_id,
+            WorkScopeId::new(),
+            "/repo/a",
+        );
+        assert!(db
+            .publish_product_creation_atomically(&ProductCreationPublishInput {
+                request_id: "req-language".to_string(),
+                claim: publish_claim.claim,
+                conversation,
+                authority_kind: AuthorityKind::Work,
+                environment: EnvironmentContext::UnownedCwd {
+                    cwd: "/repo/a".to_string(),
+                },
+                git_publication: Some(ProductCreationGitPublicationFacts {
+                    exact_checkout_oid: "repo-id".to_string(),
+                    repository_root: "/repo/a".to_string(),
+                }),
+            })
+            .await
+            .unwrap());
+        let delivery_pending = db
+            .get_product_creation_job("req-language")
+            .await
+            .unwrap()
+            .expect("published job");
+        assert_eq!(delivery_pending.status, "delivery_pending");
+        assert_eq!(delivery_pending.intent.llm_language, LlmLanguage::Caveman);
+        assert!(delivery_pending.last_error.is_none());
     }
 
     #[tokio::test]
