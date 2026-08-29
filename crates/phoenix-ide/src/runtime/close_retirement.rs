@@ -2863,32 +2863,38 @@ fn quarantine_has_external_writer(path: &Path) -> Result<bool, String> {
 
 #[cfg(target_os = "linux")]
 fn quarantine_has_writable_mappings(path: &Path) -> Result<bool, String> {
+    // SAFETY: `geteuid` has no preconditions.
+    let effective_uid = unsafe { libc::geteuid() };
+    quarantine_has_writable_mappings_in(path, Path::new("/proc"), effective_uid)
+}
+
+#[cfg(target_os = "linux")]
+fn quarantine_has_writable_mappings_in(
+    path: &Path,
+    proc_root: &Path,
+    effective_uid: libc::uid_t,
+) -> Result<bool, String> {
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         format!("cannot canonicalize quarantine before mapping inspection: {error}")
     })?;
-    for process in std::fs::read_dir("/proc")
-        .map_err(|error| format!("cannot enumerate process mappings: {error}"))?
-        .flatten()
-    {
-        if !process
-            .file_name()
-            .as_encoded_bytes()
-            .iter()
-            .all(u8::is_ascii_digit)
-        {
+    let processes = std::fs::read_dir(proc_root)
+        .map_err(|error| format!("cannot enumerate process mappings: {error}"))?;
+    for process in processes {
+        let process = process.map_err(|error| {
+            format!("cannot inspect process entry during mapping inventory: {error}")
+        })?;
+        if !linux_process_is_relevant(&process, effective_uid, "mapping")? {
             continue;
         }
         let mappings = match std::fs::read_to_string(process.path().join("maps")) {
             Ok(mappings) => mappings,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-                ) =>
-            {
-                continue
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect process {} mappings: {error}",
+                    process.file_name().to_string_lossy()
+                ));
             }
-            Err(error) => return Err(format!("cannot inspect process mappings: {error}")),
         };
         for mapping in mappings.lines() {
             let mut fields = mapping
@@ -3014,30 +3020,39 @@ fn quarantine_has_writable_mappings(_path: &Path) -> Result<bool, String> {
 
 #[cfg(target_os = "linux")]
 fn quarantine_has_process_cwd(path: &Path) -> Result<bool, String> {
+    // SAFETY: `geteuid` has no preconditions.
+    let effective_uid = unsafe { libc::geteuid() };
+    quarantine_has_process_cwd_in(path, Path::new("/proc"), effective_uid)
+}
+
+#[cfg(target_os = "linux")]
+fn quarantine_has_process_cwd_in(
+    path: &Path,
+    proc_root: &Path,
+    effective_uid: libc::uid_t,
+) -> Result<bool, String> {
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         format!("cannot canonicalize quarantine before cwd inspection: {error}")
     })?;
-    for process in std::fs::read_dir("/proc")
-        .map_err(|error| format!("cannot enumerate process working directories: {error}"))?
-    {
-        let process = process.map_err(|error| format!("cannot inspect process entry: {error}"))?;
-        if !process
-            .file_name()
-            .as_encoded_bytes()
-            .iter()
-            .all(u8::is_ascii_digit)
-        {
+    let processes = std::fs::read_dir(proc_root)
+        .map_err(|error| format!("cannot enumerate process working directories: {error}"))?;
+    for process in processes {
+        let process = process.map_err(|error| {
+            format!("cannot inspect process entry during cwd inventory: {error}")
+        })?;
+        if !linux_process_is_relevant(&process, effective_uid, "cwd")? {
             continue;
         }
         match std::fs::read_link(process.path().join("cwd")) {
             Ok(cwd) if path_is_within(&cwd, &canonical) => return Ok(true),
             Ok(_) => {}
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-                ) => {}
-            Err(error) => return Err(format!("cannot inspect process working directory: {error}")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect process {} working directory: {error}",
+                    process.file_name().to_string_lossy()
+                ));
+            }
         }
     }
     Ok(false)
@@ -3124,6 +3139,55 @@ fn quarantine_has_process_cwd(_path: &Path) -> Result<bool, String> {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LinuxProcessOwner {
+    Relevant,
+    Unrelated,
+    Vanished,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_owner(
+    process: &std::fs::DirEntry,
+    effective_uid: libc::uid_t,
+    inventory: &str,
+) -> Result<LinuxProcessOwner, String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    match process.metadata() {
+        Ok(metadata) if metadata.uid() == effective_uid => Ok(LinuxProcessOwner::Relevant),
+        Ok(_) => Ok(LinuxProcessOwner::Unrelated),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(LinuxProcessOwner::Vanished)
+        }
+        Err(error) => Err(format!(
+            "cannot attribute process {} {inventory} inventory: {error}",
+            process.file_name().to_string_lossy()
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_is_relevant(
+    process: &std::fs::DirEntry,
+    effective_uid: libc::uid_t,
+    inventory: &str,
+) -> Result<bool, String> {
+    if !process
+        .file_name()
+        .as_encoded_bytes()
+        .iter()
+        .all(u8::is_ascii_digit)
+    {
+        return Ok(false);
+    }
+    Ok(matches!(
+        linux_process_owner(process, effective_uid, inventory)?,
+        LinuxProcessOwner::Relevant
+    ))
+}
+
+#[cfg(target_os = "linux")]
 fn quarantine_has_open_descriptors(path: &Path) -> Result<bool, String> {
     // SAFETY: `geteuid` has no preconditions.
     let effective_uid = unsafe { libc::geteuid() };
@@ -3136,8 +3200,6 @@ fn quarantine_has_open_descriptors_in(
     proc_root: &Path,
     effective_uid: libc::uid_t,
 ) -> Result<bool, String> {
-    use std::os::unix::fs::MetadataExt as _;
-
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         format!("cannot canonicalize quarantined worktree before descriptor inspection: {error}")
     })?;
@@ -3145,32 +3207,7 @@ fn quarantine_has_open_descriptors_in(
         .map_err(|error| format!("cannot enumerate process descriptors: {error}"))?;
     for process in processes {
         let process = process.map_err(|error| format!("cannot inspect process entry: {error}"))?;
-        if !process
-            .file_name()
-            .as_encoded_bytes()
-            .iter()
-            .all(u8::is_ascii_digit)
-        {
-            continue;
-        }
-        let process_metadata = match process.metadata() {
-            Ok(metadata) => metadata,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-                ) =>
-            {
-                continue
-            }
-            Err(error) => {
-                return Err(format!(
-                    "cannot attribute process {} descriptor table: {error}",
-                    process.file_name().to_string_lossy()
-                ));
-            }
-        };
-        if process_metadata.uid() != effective_uid {
+        if !linux_process_is_relevant(&process, effective_uid, "descriptor")? {
             continue;
         }
         let descriptors = match std::fs::read_dir(process.path().join("fd")) {
@@ -4922,6 +4959,89 @@ mod tests {
         let error = super::quarantine_has_open_descriptors_in(&quarantine, &proc_root, owner_uid)
             .unwrap_err();
         assert!(error.contains("cannot inspect process 1 descriptor table"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cwd_scan_skips_restricted_unrelated_process_but_fails_closed_for_owner() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let quarantine = temp.path().join("quarantine");
+        let proc_root = temp.path().join("proc");
+        let process = proc_root.join("1");
+        std::fs::create_dir_all(&process).unwrap();
+        std::fs::create_dir(&quarantine).unwrap();
+        std::fs::write(process.join("cwd"), b"not a symlink").unwrap();
+        let owner_uid = std::fs::metadata(&process).unwrap().uid();
+        let unrelated_uid = owner_uid.checked_add(1).unwrap_or(owner_uid - 1);
+
+        assert!(
+            !super::quarantine_has_process_cwd_in(&quarantine, &proc_root, unrelated_uid).unwrap()
+        );
+        let error =
+            super::quarantine_has_process_cwd_in(&quarantine, &proc_root, owner_uid).unwrap_err();
+        assert!(error.contains("cannot inspect process 1 working directory"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mapping_scan_skips_restricted_unrelated_process_but_fails_closed_for_owner() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let quarantine = temp.path().join("quarantine");
+        let proc_root = temp.path().join("proc");
+        let process = proc_root.join("1");
+        std::fs::create_dir_all(process.join("maps")).unwrap();
+        std::fs::create_dir(&quarantine).unwrap();
+        let owner_uid = std::fs::metadata(&process).unwrap().uid();
+        let unrelated_uid = owner_uid.checked_add(1).unwrap_or(owner_uid - 1);
+
+        assert!(!super::quarantine_has_writable_mappings_in(
+            &quarantine,
+            &proc_root,
+            unrelated_uid,
+        )
+        .unwrap());
+        let error = super::quarantine_has_writable_mappings_in(&quarantine, &proc_root, owner_uid)
+            .unwrap_err();
+        assert!(error.contains("cannot inspect process 1 mappings"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mapping_scan_detects_writable_shared_mapping_after_descriptor_is_closed() {
+        use std::os::fd::AsRawFd as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mapped_file = temp.path().join("mapped");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&mapped_file)
+            .unwrap();
+        file.set_len(4096).unwrap();
+        // SAFETY: the file is at least 4096 bytes, and the result is checked before use.
+        let mapping = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(mapping, libc::MAP_FAILED);
+        drop(file);
+
+        assert!(!super::quarantine_has_open_descriptors(temp.path()).unwrap());
+        assert!(super::quarantine_has_writable_mappings(temp.path()).unwrap());
+
+        // SAFETY: `mapping` is the successful result of the matching 4096-byte mmap call.
+        assert_eq!(unsafe { libc::munmap(mapping, 4096) }, 0);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
