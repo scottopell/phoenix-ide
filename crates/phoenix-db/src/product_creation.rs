@@ -1105,9 +1105,9 @@ impl Database {
         sqlx::query(
             "SELECT request_id, cwd, objective, model, effort, llm_language, status,
                     updated_at_unix_micros, last_error,
-                    COALESCE((SELECT json_group_array(json_object('media_type', i.media_type, 'data', i.data))
-                              FROM product_creation_job_images i WHERE i.request_id = j.request_id
-                              ORDER BY i.ordinal), '[]') AS images_json
+                    COALESCE((SELECT json_group_array(json_object('media_type', ordered.media_type, 'data', ordered.data))
+                              FROM (SELECT media_type, data FROM product_creation_job_images
+                                    WHERE request_id = j.request_id ORDER BY ordinal) ordered), '[]') AS images_json
              FROM product_creation_jobs j
              WHERE status IN (
                     'accepted',
@@ -1119,7 +1119,8 @@ impl Database {
                     'delivery_failed',
                     'cleanup_ambiguous'
                   )
-             ORDER BY updated_at_unix_micros DESC, request_id DESC",
+             ORDER BY updated_at_unix_micros DESC, request_id DESC
+             LIMIT 50",
         )
         .try_map(|row: SqliteRow| {
             let images_json: String = row.try_get("images_json")?;

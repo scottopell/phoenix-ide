@@ -94,7 +94,9 @@ pub async fn list_product_conversation_creations(
             effort: job.intent.effort,
             images: job.intent.images,
             updated_at: job.updated_at.to_rfc3339(),
-            last_error: job.last_error,
+            last_error: (job.status != "delivery_failed")
+                .then_some(job.last_error)
+                .flatten(),
             allowed_actions: creation_allowed_actions(&job.status),
         })
         .collect();
@@ -163,7 +165,7 @@ fn canonical_route(aggregate: &ProductConversationAggregate) -> String {
 fn creation_allowed_actions(status: &str) -> Vec<ProductConversationCreationAllowedActionView> {
     let mut actions = Vec::with_capacity(2);
     match status {
-        "accepted" | "claimed" | "retry_scheduled" | "cancelling" => {
+        "accepted" | "claimed" | "retry_scheduled" => {
             actions.push(ProductConversationCreationAllowedActionView::Cancel);
         }
         "delivery_failed" => {

@@ -243,6 +243,12 @@ async fn process_claimed_product_creation(
         {
             return Err("product creation staging claim was lost".to_string());
         }
+        let materialization_lock = tokio::task::spawn_blocking({
+            let repo_root = repo_root.clone();
+            move || RepositoryMutationLock::acquire(&repo_root).map_err(|error| error.0)
+        })
+        .await
+        .map_err(|error| format!("repository lock acquisition join failed: {error}"))??;
         let persisted_ownership_token = reservation.ownership_token.clone();
         let ownership_token = persisted_ownership_token
             .clone()
@@ -265,12 +271,12 @@ async fn process_claimed_product_creation(
             );
         }
         let persisted_ownership_token = Some(ownership_token.clone());
-        let (worktree, ownership_token, already_present) = tokio::task::spawn_blocking({
+        let (worktree, ownership_token) = tokio::task::spawn_blocking({
             let repo_root = repo_root.clone();
             let oid = oid.clone();
             let key = job.product_conversation_id.to_string();
             move || {
-                let _lock = RepositoryMutationLock::acquire(&repo_root).map_err(|e| e.0)?;
+                let _lock = materialization_lock;
                 ensure_phoenix_staging_ignored(Path::new(&repo_root))?;
                 let path = deterministic_worktree_path(&repo_root, &key);
                 let already_present = path.try_exists().map_err(|error| {
@@ -302,10 +308,9 @@ async fn process_claimed_product_creation(
                     write_product_creation_owner_marker(&path, &ownership_token)?;
                     ownership_token
                 };
-                Ok::<(String, String, bool), String>((
+                Ok::<(String, String), String>((
                     path.to_string_lossy().to_string(),
                     ownership_token,
-                    already_present,
                 ))
             }
         })
@@ -313,7 +318,7 @@ async fn process_claimed_product_creation(
         .map_err(|error| format!("worktree materialization join failed: {error}"))??;
         let non_empty = NonEmptyString::new(worktree.clone())
             .map_err(|_| "materialized worktree path was empty".to_string())?;
-        if !already_present {
+        if reservation.status == "reserved" {
             let present = manager
                 .db()
                 .mark_product_creation_resource_present(
@@ -547,7 +552,7 @@ async fn deliver_product_creation_objective(
         manager.kick_creation_worker();
         return Err(error.to_string());
     }
-    manager
+    let completed = manager
         .db()
         .complete_product_creation_delivery(
             &job.request_id,
@@ -560,6 +565,9 @@ async fn deliver_product_creation_objective(
         )
         .await
         .map_err(|error| error.to_string())?;
+    if !completed {
+        return Err("product creation delivery claim was lost before completion".to_string());
+    }
     Ok(PublishedProductCreation {
         product_conversation_id: product_id.to_string(),
         transcript_row_id: conversation_id,
