@@ -112,6 +112,9 @@ pub const TMUX_DEFAULT_SESSION: &str = "main";
 const PANE_READY_MAX_ATTEMPTS: u32 = 50;
 const PANE_READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+const TMUX_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(2);
+const TMUX_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
 /// Filename for the Phoenix-shipped tmux server config, written into
 /// the socket directory and passed via `tmux -f` on every invocation.
 /// The leading underscore avoids collision with the `conv-<id>.sock`
@@ -247,6 +250,13 @@ enum ExactTmuxIdentityState {
     Live,
     Absent,
     Ambiguous { reason: String },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ExactShutdownObservation {
+    Complete,
+    Outstanding { reason: String },
+    IdentityNotProven { reason: String },
 }
 
 /// Lifecycle state of a per-`ResourceScopeKey` tmux server.
@@ -1387,91 +1397,103 @@ impl TmuxRegistry {
         Self::verify_exact_absence_from_probe(permit, result).await
     }
 
+    fn observe_dead_socket_shutdown(
+        socket_path: &Path,
+        killed_socket: SocketFileIdentity,
+    ) -> Result<ExactShutdownObservation, TmuxError> {
+        let observed =
+            socket_file_identity(socket_path).map_err(|source| TmuxError::ProbeFailed {
+                socket_path: socket_path.to_path_buf(),
+                source,
+            })?;
+        if observed == Some(killed_socket) {
+            // The pathname is deliberately not unlinked here. An identity check followed by
+            // pathname removal can delete a replacement installed between those operations.
+            // The tmux server/OS owns cleanup of its exact socket incarnation.
+            Ok(ExactShutdownObservation::Outstanding {
+                reason: "exact stale tmux socket remains after kill-server".to_string(),
+            })
+        } else {
+            // A missing path or different inode proves that the killed incarnation is gone.
+            // Whatever now occupies the pathname is a replacement and must remain untouched.
+            Ok(ExactShutdownObservation::Complete)
+        }
+    }
+
+    async fn observe_exact_shutdown(
+        permit: &TmuxRetirementPermit,
+        killed_socket: SocketFileIdentity,
+    ) -> Result<ExactShutdownObservation, TmuxError> {
+        let result = probe(&permit.instance.socket_path)
+            .await
+            .map_err(|source| TmuxError::ProbeFailed {
+                socket_path: permit.instance.socket_path.clone(),
+                source,
+            })?;
+        match result {
+            ProbeResult::NoSocket | ProbeResult::NoServer => Ok(ExactShutdownObservation::Complete),
+            ProbeResult::DeadSocket => {
+                Self::observe_dead_socket_shutdown(&permit.instance.socket_path, killed_socket)
+            }
+            ProbeResult::Live => match read_server_token(&permit.instance.socket_path).await {
+                Some(token) if token == permit.instance.server_token => {
+                    Ok(ExactShutdownObservation::Outstanding {
+                        reason: "exact tmux server instance remains live after kill-server"
+                            .to_string(),
+                    })
+                }
+                Some(_) => Ok(ExactShutdownObservation::Complete),
+                None => Ok(ExactShutdownObservation::IdentityNotProven {
+                    reason: "live tmux server token is unreadable".to_string(),
+                }),
+            },
+        }
+    }
+
+    async fn wait_for_exact_shutdown_with<F, Fut>(
+        deadline: Duration,
+        poll_interval: Duration,
+        mut observe: F,
+    ) -> Result<TmuxRetirementOutcome, TmuxError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<ExactShutdownObservation, TmuxError>>,
+    {
+        let expires = tokio::time::Instant::now() + deadline;
+        loop {
+            let last_outstanding = match observe().await? {
+                ExactShutdownObservation::Complete => {
+                    return Ok(TmuxRetirementOutcome::AbsenceVerified);
+                }
+                ExactShutdownObservation::IdentityNotProven { reason } => {
+                    return Ok(TmuxRetirementOutcome::IdentityNotProven { reason });
+                }
+                ExactShutdownObservation::Outstanding { reason } => reason,
+            };
+
+            let now = tokio::time::Instant::now();
+            if now >= expires {
+                return Ok(TmuxRetirementOutcome::RemovalFailed {
+                    reason: format!(
+                        "successful tmux kill-server was not followed by exact absence before its shutdown deadline: {last_outstanding}"
+                    ),
+                });
+            }
+            tokio::time::sleep(poll_interval.min(expires - now)).await;
+        }
+    }
+
     async fn verify_exact_absence_after_successful_kill(
         &self,
         permit: &TmuxRetirementPermit,
         killed_socket: SocketFileIdentity,
     ) -> Result<TmuxRetirementOutcome, TmuxError> {
-        const MAX_ABSENCE_PROBES: usize = 8;
-
-        let mut last_inconclusive = None;
-        for attempt in 0..MAX_ABSENCE_PROBES {
-            let result = probe(&permit.instance.socket_path)
-                .await
-                .map_err(|source| TmuxError::ProbeFailed {
-                    socket_path: permit.instance.socket_path.clone(),
-                    source,
-                })?;
-            match result {
-                ProbeResult::NoSocket | ProbeResult::NoServer => {
-                    return Ok(TmuxRetirementOutcome::AbsenceVerified);
-                }
-                ProbeResult::DeadSocket => {
-                    let observed =
-                        socket_file_identity(&permit.instance.socket_path).map_err(|source| {
-                            TmuxError::ProbeFailed {
-                                socket_path: permit.instance.socket_path.clone(),
-                                source,
-                            }
-                        })?;
-                    if observed == Some(killed_socket) {
-                        match tokio::fs::remove_file(&permit.instance.socket_path).await {
-                            Ok(()) => {
-                                last_inconclusive = Some(
-                                    "removed the exact stale socket left by kill-server"
-                                        .to_string(),
-                                );
-                            }
-                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                                last_inconclusive = Some(
-                                    "the exact stale socket disappeared before unlink".to_string(),
-                                );
-                            }
-                            Err(source) => {
-                                return Err(TmuxError::ProbeFailed {
-                                    socket_path: permit.instance.socket_path.clone(),
-                                    source,
-                                });
-                            }
-                        }
-                        if attempt + 1 < MAX_ABSENCE_PROBES {
-                            tokio::task::yield_now().await;
-                            continue;
-                        }
-                        break;
-                    }
-                    return Ok(TmuxRetirementOutcome::IdentityNotProven {
-                        reason: format!(
-                            "tmux socket incarnation changed after kill-server at {}; replacement absence is not proven",
-                            permit.instance.socket_path.display()
-                        ),
-                    });
-                }
-                ProbeResult::Live => match read_server_token(&permit.instance.socket_path).await {
-                    Some(token) if token == permit.instance.server_token => {
-                        last_inconclusive = Some(
-                            "exact tmux server instance remained live after teardown".to_string(),
-                        );
-                    }
-                    Some(_) => return Ok(TmuxRetirementOutcome::AbsenceVerified),
-                    None => {
-                        return Ok(TmuxRetirementOutcome::IdentityNotProven {
-                            reason: "live tmux server token is unreadable".to_string(),
-                        });
-                    }
-                },
-            }
-            if attempt + 1 < MAX_ABSENCE_PROBES {
-                tokio::task::yield_now().await;
-            }
-        }
-
-        Ok(TmuxRetirementOutcome::RemovalFailed {
-            reason: format!(
-                "successful tmux kill-server was not followed by exact absence after {MAX_ABSENCE_PROBES} probes: {}",
-                last_inconclusive.unwrap_or_else(|| "no conclusive probe result".to_string())
-            ),
-        })
+        Self::wait_for_exact_shutdown_with(
+            TMUX_SHUTDOWN_DEADLINE,
+            TMUX_SHUTDOWN_POLL_INTERVAL,
+            || Self::observe_exact_shutdown(permit, killed_socket),
+        )
+        .await
     }
 
     async fn verify_exact_absence_from_probe(
@@ -2625,6 +2647,108 @@ mod tests {
                 .unwrap(),
             TmuxRetirementOutcome::AbsenceVerified
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dead_socket_shutdown_observation_never_unlinks_path_or_replacement() {
+        use std::os::unix::net::UnixListener;
+
+        let tmp = TempDir::new().unwrap();
+        let socket_path = tmp.path().join("shutdown.sock");
+        let stale = UnixListener::bind(&socket_path).unwrap();
+        let stale_identity = socket_file_identity(&socket_path).unwrap().unwrap();
+
+        assert!(matches!(
+            TmuxRegistry::observe_dead_socket_shutdown(&socket_path, stale_identity).unwrap(),
+            ExactShutdownObservation::Outstanding { .. }
+        ));
+        assert_eq!(
+            socket_file_identity(&socket_path).unwrap(),
+            Some(stale_identity),
+            "observing the exact stale incarnation must not unlink it by pathname"
+        );
+
+        std::fs::remove_file(&socket_path).unwrap();
+        let replacement = UnixListener::bind(&socket_path).unwrap();
+        let replacement_identity = socket_file_identity(&socket_path).unwrap().unwrap();
+        assert_ne!(replacement_identity, stale_identity);
+
+        assert_eq!(
+            TmuxRegistry::observe_dead_socket_shutdown(&socket_path, stale_identity).unwrap(),
+            ExactShutdownObservation::Complete
+        );
+        assert_eq!(
+            socket_file_identity(&socket_path).unwrap(),
+            Some(replacement_identity),
+            "a replacement at the checked pathname must remain"
+        );
+        drop(replacement);
+        drop(stale);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exact_shutdown_waiter_allows_delayed_completion_before_deadline() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let observations = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&observations);
+        let waiter = tokio::spawn(async move {
+            TmuxRegistry::wait_for_exact_shutdown_with(
+                Duration::from_secs(1),
+                Duration::from_millis(100),
+                move || {
+                    let attempt = observed.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        Ok(if attempt < 4 {
+                            ExactShutdownObservation::Outstanding {
+                                reason: "shutdown still outstanding".to_string(),
+                            }
+                        } else {
+                            ExactShutdownObservation::Complete
+                        })
+                    }
+                },
+            )
+            .await
+            .unwrap()
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        tokio::time::advance(Duration::from_millis(400)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            waiter.await.unwrap(),
+            TmuxRetirementOutcome::AbsenceVerified
+        );
+        assert_eq!(observations.load(Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exact_shutdown_waiter_deadline_routes_outstanding_shutdown_to_residual() {
+        let waiter = tokio::spawn(async move {
+            TmuxRegistry::wait_for_exact_shutdown_with(
+                Duration::from_millis(250),
+                Duration::from_millis(100),
+                || async {
+                    Ok(ExactShutdownObservation::Outstanding {
+                        reason: "exact server still live".to_string(),
+                    })
+                },
+            )
+            .await
+            .unwrap()
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(250)).await;
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            waiter.await.unwrap(),
+            TmuxRetirementOutcome::RemovalFailed { reason }
+                if reason.contains("shutdown deadline") && reason.contains("exact server still live")
+        ));
     }
 
     #[tokio::test]
