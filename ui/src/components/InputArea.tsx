@@ -584,7 +584,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       : convState.type === 'awaiting_llm'
         ? 'Preparing request...'
         : agentWorking
-          ? 'Agent working... send to queue a follow-up'
+          ? 'Queue follow-up...'
           : hint ? `${baseText} (${hint})` : baseText;
 
   // =========================================================================
