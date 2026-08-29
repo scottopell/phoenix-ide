@@ -464,11 +464,19 @@ impl RuntimeManager {
         let Some(lease) = lease else {
             return;
         };
-        let key = ResourceScopeKey::Work(scope.clone());
-        self.bash_handles().cancel_retirement(lease.bash).await;
-        self.tmux_registry().reopen_after_repair(&key).await;
-        self.terminals.cancel_retirement(lease.terminal);
-        self.browser_sessions().reopen_after_repair(&key).await;
+        let CloseResourceLease {
+            bash,
+            tmux,
+            terminal,
+            browser,
+            resources: _,
+        } = lease;
+        self.bash_handles().cancel_retirement(bash).await;
+        if let Err(error) = self.tmux_registry().cancel_retirement(tmux).await {
+            tracing::warn!(%scope, %error, "tmux Close retirement cancellation exceeded its authority deadline");
+        }
+        self.terminals.cancel_retirement(terminal);
+        self.browser_sessions().reopen_after_permit(browser).await;
     }
 
     pub(crate) async fn cancel_close_resource_leases(&self, attempt_id: &CloseAttemptId) {

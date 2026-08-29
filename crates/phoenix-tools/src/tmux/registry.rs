@@ -214,7 +214,7 @@ impl TmuxServerInstanceIdentity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TmuxRetirementGeneration(u64);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct TmuxRetirementPermit {
     pub work_scope: ResourceScopeKey,
     pub instance: TmuxServerInstanceIdentity,
@@ -244,7 +244,7 @@ pub enum TmuxRetirementOutcome {
     RemovalFailed { reason: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum TmuxRetirementRehydration {
     Permit(TmuxRetirementPermit),
     AbsenceVerified,
@@ -503,6 +503,13 @@ struct RehydrateExistingTestHook {
     release: Arc<tokio::sync::Notify>,
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+struct CancelRetirementTestHook {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
 /// Top-level registry: maps `ResourceScopeKey::stable_key()` → per-scope tmux
 /// server. One registry instance per Phoenix process.
 #[derive(Debug)]
@@ -531,6 +538,8 @@ pub struct TmuxRegistry {
     complete_retirement_lock_test_hook: Option<Arc<CompleteRetirementLockTestHook>>,
     #[cfg(test)]
     cascade_not_probed_test_hook: Option<Arc<CascadeNotProbedTestHook>>,
+    #[cfg(test)]
+    cancel_retirement_test_hook: Option<Arc<CancelRetirementTestHook>>,
     #[cfg(test)]
     rehydrate_existing_test_hook: Option<Arc<RehydrateExistingTestHook>>,
 }
@@ -572,6 +581,8 @@ impl TmuxRegistry {
             complete_retirement_lock_test_hook: None,
             #[cfg(test)]
             cascade_not_probed_test_hook: None,
+            #[cfg(test)]
+            cancel_retirement_test_hook: None,
             #[cfg(test)]
             rehydrate_existing_test_hook: None,
         }
@@ -631,6 +642,8 @@ impl TmuxRegistry {
             #[cfg(test)]
             cascade_not_probed_test_hook: None,
             #[cfg(test)]
+            cancel_retirement_test_hook: None,
+            #[cfg(test)]
             rehydrate_existing_test_hook: None,
         }
     }
@@ -659,6 +672,8 @@ impl TmuxRegistry {
             complete_retirement_lock_test_hook: None,
             #[cfg(test)]
             cascade_not_probed_test_hook: None,
+            #[cfg(test)]
+            cancel_retirement_test_hook: None,
             #[cfg(test)]
             rehydrate_existing_test_hook: None,
         }
@@ -703,6 +718,17 @@ impl TmuxRegistry {
             before_entry_lock: Arc::new(tokio::sync::Notify::new()),
             before_final_authority: Some((entered, release)),
         }));
+        self
+    }
+
+    #[cfg(test)]
+    fn with_cancel_retirement_test_hook(
+        mut self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.cancel_retirement_test_hook =
+            Some(Arc::new(CancelRetirementTestHook { entered, release }));
         self
     }
 
@@ -2188,6 +2214,42 @@ impl TmuxRegistry {
         }
     }
 
+    /// Consume exact Close retirement authority and reopen only its current
+    /// generation and server identity. A stale permit is a no-op.
+    ///
+    /// # Errors
+    /// Returns when registry or entry authority cannot be acquired within the
+    /// permit's original absolute retirement deadline.
+    pub async fn cancel_retirement(&self, permit: TmuxRetirementPermit) -> Result<(), String> {
+        #[cfg(test)]
+        if let Some(hook) = &self.cancel_retirement_test_hook {
+            hook.entered.notify_one();
+            hook.release.notified().await;
+        }
+        let deadline = RetirementDeadline::new(permit.expires);
+        let map = deadline.read_map(self, "retirement cancellation").await?;
+        let key = permit.work_scope.stable_key();
+        let Some(entry) = map.get(&key) else {
+            return Ok(());
+        };
+        let mut server = tokio::time::timeout_at(permit.expires, entry.server.write())
+            .await
+            .map_err(|_| {
+                "tmux retirement cancellation entry write lock exceeded the Close deadline"
+                    .to_string()
+            })?;
+        if Self::matches_exact_instance(&server, &permit) {
+            server.retirement_fenced = false;
+            if server.status == ServerStatus::Gone {
+                server.status = ServerStatus::NotProbed;
+            }
+            drop(server);
+            drop(map);
+            self.emit_lifecycle(&permit.work_scope);
+        }
+        Ok(())
+    }
+
     pub async fn reopen_after_repair(&self, work_scope: &ResourceScopeKey) {
         let key = work_scope.stable_key();
         let Some(entry) = self.inner.read().await.get(&key).cloned() else {
@@ -3334,7 +3396,6 @@ mod tests {
 
         let completing = {
             let registry = Arc::clone(&registry);
-            let permit = permit.clone();
             tokio::spawn(async move { registry.complete_retirement(&permit).await.unwrap() })
         };
         tokio::time::timeout(Duration::from_secs(1), entered.notified())
@@ -3386,6 +3447,123 @@ mod tests {
             reg.ensure_live(&work_scope, tmp.path(), None, None).await,
             Err(TmuxError::BinaryUnavailable)
         ));
+    }
+
+    #[tokio::test]
+    async fn stale_cancel_resuming_after_newer_fence_preserves_admission_rejection() {
+        let tmp = TempDir::new().unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let registry = Arc::new(
+            TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false)
+                .with_cancel_retirement_test_hook(Arc::clone(&entered), Arc::clone(&release)),
+        );
+        let work_scope = scope("stale-cancel-newer-fence");
+        let stale = registry
+            .begin_retirement(&work_scope, None, None, close_deadline())
+            .await
+            .expect("first fence");
+        let cancelling = {
+            let registry = Arc::clone(&registry);
+            tokio::spawn(async move { registry.cancel_retirement(stale).await })
+        };
+        entered.notified().await;
+
+        let current = registry
+            .begin_retirement(&work_scope, None, None, close_deadline())
+            .await
+            .expect("newer fence");
+        release.notify_one();
+        cancelling
+            .await
+            .expect("stale cancellation task")
+            .expect("stale cancellation is a no-op");
+
+        assert_eq!(current.generation().0, 2);
+        assert!(registry.is_retirement_fenced(&work_scope).await);
+        assert!(matches!(
+            registry.ensure_live(&work_scope, tmp.path(), None, None).await,
+            Err(TmuxError::RetirementFenced { work_scope: fenced }) if fenced == work_scope
+        ));
+    }
+
+    #[tokio::test]
+    async fn exact_tmux_cancel_reopens_admission_after_residual() {
+        let tmp = TempDir::new().unwrap();
+        let registry = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        let work_scope = scope("exact-cancel-residual");
+        let permit = registry
+            .begin_retirement(&work_scope, None, None, close_deadline())
+            .await
+            .expect("retirement fence");
+
+        registry
+            .cancel_retirement(permit)
+            .await
+            .expect("exact cancellation");
+
+        assert!(!registry.is_retirement_fenced(&work_scope).await);
+        assert!(matches!(
+            registry
+                .ensure_live(&work_scope, tmp.path(), None, None)
+                .await,
+            Err(TmuxError::BinaryUnavailable)
+        ));
+    }
+
+    #[tokio::test]
+    async fn close_deadline_bounds_tmux_cancel_map_lock() {
+        let tmp = TempDir::new().unwrap();
+        let registry = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        let work_scope = scope("cancel-deadline-map-lock");
+        let permit = registry
+            .begin_retirement(
+                &work_scope,
+                None,
+                None,
+                tokio::time::Instant::now() + Duration::from_millis(50),
+            )
+            .await
+            .expect("retirement fence");
+        let _guard = registry.inner.write().await;
+
+        let error = registry
+            .cancel_retirement(permit)
+            .await
+            .expect_err("cancellation must remain bounded");
+
+        assert!(error.contains("registry read lock") && error.contains("Close deadline"));
+    }
+
+    #[tokio::test]
+    async fn close_deadline_bounds_tmux_cancel_entry_lock() {
+        let tmp = TempDir::new().unwrap();
+        let registry = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        let work_scope = scope("cancel-deadline-entry-lock");
+        let permit = registry
+            .begin_retirement(
+                &work_scope,
+                None,
+                None,
+                tokio::time::Instant::now() + Duration::from_millis(50),
+            )
+            .await
+            .expect("retirement fence");
+        let entry = registry
+            .inner
+            .read()
+            .await
+            .get(&work_scope.stable_key())
+            .cloned()
+            .expect("scope entry");
+        let _guard = entry.server.write().await;
+
+        let error = registry
+            .cancel_retirement(permit)
+            .await
+            .expect_err("cancellation must remain bounded");
+
+        assert!(error.contains("entry write lock") && error.contains("Close deadline"));
     }
 
     #[tokio::test]
@@ -3557,7 +3735,6 @@ mod tests {
         let entry_guard = entry.server.write().await;
         let completing = {
             let registry = Arc::clone(&registry);
-            let permit = permit.clone();
             tokio::spawn(async move { registry.complete_retirement(&permit).await.unwrap() })
         };
         tokio::time::timeout(Duration::from_secs(1), before_entry_lock.notified())

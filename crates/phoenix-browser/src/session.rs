@@ -1370,7 +1370,7 @@ type BrowserRetirementSession = (
 );
 type BrowserActorRetirementSession = (Arc<RwLock<BrowserSession>>, String, BrowserSessionAudience);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct BrowserRetirementPermit {
     pub work_scope: ResourceScopeKey,
     pub actor_session_key: Option<String>,
@@ -1504,6 +1504,13 @@ fn session_key(work_scope: &ResourceScopeKey, actor: &EffectiveResourceAccess) -
     )
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+struct ReopenPermitTestHook {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
 /// Global manager for all browser sessions
 pub struct BrowserSessionManager {
     /// Keyed by browser session identity, with per-scope / per-actor retirement
@@ -1520,6 +1527,8 @@ pub struct BrowserSessionManager {
     /// reaps on age alone.
     scope_liveness_hook: std::sync::OnceLock<ScopeLivenessHook>,
     shutting_down: AtomicBool,
+    #[cfg(test)]
+    reopen_permit_test_hook: Option<Arc<ReopenPermitTestHook>>,
     tmp_root: PathBuf,
 }
 
@@ -1551,6 +1560,8 @@ impl BrowserSessionManager {
             lifecycle_sink: sink,
             scope_liveness_hook: std::sync::OnceLock::new(),
             shutting_down: AtomicBool::new(false),
+            #[cfg(test)]
+            reopen_permit_test_hook: None,
             tmp_root: runtime_env.tmp_root().to_path_buf(),
         });
 
@@ -2520,9 +2531,25 @@ impl BrowserSessionManager {
         }
     }
 
-    async fn reopen_after_permit(&self, permit: &BrowserRetirementPermit) {
+    #[cfg(test)]
+    fn set_reopen_permit_test_hook(
+        &mut self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) {
+        self.reopen_permit_test_hook = Some(Arc::new(ReopenPermitTestHook { entered, release }));
+    }
+
+    /// Consume exact retirement authority and reopen admission only when its
+    /// fence generation and audience identity are still current.
+    pub async fn reopen_after_permit(&self, permit: BrowserRetirementPermit) {
+        #[cfg(test)]
+        if let Some(hook) = &self.reopen_permit_test_hook {
+            hook.entered.notify_one();
+            hook.release.notified().await;
+        }
         let mut state = self.state.write().await;
-        let key = Self::permit_fence_key(permit);
+        let key = Self::permit_fence_key(&permit);
         if state.retirements.get(&key).is_some_and(|retirement| {
             retirement.fenced && retirement.generation == permit.generation.get()
         }) {
@@ -2558,7 +2585,7 @@ impl BrowserSessionManager {
         let work_scope = work_scope.clone();
         tokio::spawn(async move {
             let outcome = manager.complete_retirement(&permit).await;
-            manager.reopen_after_permit(&permit).await;
+            manager.reopen_after_permit(permit).await;
             if let BrowserRetirementOutcome::Residual { reason } = outcome {
                 tracing::warn!(%work_scope, %reason, "requested browser teardown failed");
             }
@@ -2575,7 +2602,7 @@ impl BrowserSessionManager {
         let work_scope = work_scope.clone();
         tokio::spawn(async move {
             let outcome = manager.complete_retirement(&permit).await;
-            manager.reopen_after_permit(&permit).await;
+            manager.reopen_after_permit(permit).await;
             if let BrowserRetirementOutcome::Residual { reason } = outcome {
                 tracing::warn!(%work_scope, %reason, "requested browser teardown failed");
             }
@@ -2594,7 +2621,7 @@ impl BrowserSessionManager {
     ) -> Result<(), BrowserError> {
         let permit = self.begin_retirement_for_actor(work_scope, actor).await;
         let outcome = self.complete_retirement(&permit).await;
-        self.reopen_after_permit(&permit).await;
+        self.reopen_after_permit(permit).await;
         match outcome {
             BrowserRetirementOutcome::Retired | BrowserRetirementOutcome::AbsenceVerified => Ok(()),
             BrowserRetirementOutcome::Residual { reason } => {
@@ -2618,7 +2645,7 @@ impl BrowserSessionManager {
     ) -> Result<(), BrowserError> {
         let permit = self.begin_retirement(work_scope).await;
         let outcome = self.complete_retirement(&permit).await;
-        self.reopen_after_permit(&permit).await;
+        self.reopen_after_permit(permit).await;
         match outcome {
             BrowserRetirementOutcome::Retired | BrowserRetirementOutcome::AbsenceVerified => Ok(()),
             BrowserRetirementOutcome::Residual { reason } => Err(BrowserError::OperationFailed(
@@ -2818,6 +2845,8 @@ impl Default for BrowserSessionManager {
             lifecycle_sink: None,
             scope_liveness_hook: std::sync::OnceLock::new(),
             shutting_down: AtomicBool::new(false),
+            #[cfg(test)]
+            reopen_permit_test_hook: None,
             tmp_root: PhoenixRuntimeEnvironment::detect().tmp_root().to_path_buf(),
         }
     }
@@ -3170,13 +3199,23 @@ mod lifecycle_hook_tests {
     }
 
     #[tokio::test]
-    async fn stale_teardown_reopen_must_not_clear_newer_fence() {
-        let manager = Arc::new(BrowserSessionManager::default());
+    async fn stale_teardown_reopen_resuming_after_newer_fence_is_a_noop() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut manager = BrowserSessionManager::default();
+        manager.set_reopen_permit_test_hook(Arc::clone(&entered), Arc::clone(&release));
+        let manager = Arc::new(manager);
         let scope = scope("browser-stale-teardown-reopen");
         let stale = manager.begin_retirement(&scope).await;
-        let current = manager.begin_retirement(&scope).await;
+        let reopening = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.reopen_after_permit(stale).await })
+        };
+        entered.notified().await;
 
-        manager.reopen_after_permit(&stale).await;
+        let current = manager.begin_retirement(&scope).await;
+        release.notify_one();
+        reopening.await.expect("stale cancellation task");
 
         assert_eq!(current.generation().get(), 2);
         assert!(manager.is_retirement_fenced(&scope).await);
@@ -3184,6 +3223,21 @@ mod lifecycle_hook_tests {
             manager.get_session(&scope).await,
             Err(super::BrowserError::RetirementFenced { work_scope }) if work_scope == scope
         ));
+    }
+
+    #[tokio::test]
+    async fn exact_browser_residual_cancellation_reopens_admission() {
+        let manager = Arc::new(BrowserSessionManager::default());
+        let scope = scope("browser-exact-cancel-reopen");
+        let permit = manager.begin_retirement(&scope).await;
+        assert_eq!(
+            manager.complete_retirement(&permit).await,
+            super::BrowserRetirementOutcome::AbsenceVerified
+        );
+
+        manager.reopen_after_permit(permit).await;
+
+        assert!(!manager.is_retirement_fenced(&scope).await);
     }
 
     #[tokio::test]
