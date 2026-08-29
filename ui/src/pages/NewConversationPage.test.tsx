@@ -103,6 +103,24 @@ describe('NewConversationPage', () => {
     renderPage();
   });
 
+  it('shows a failed recovery action inline and refreshes recovery rows', async () => {
+    const row = {
+      request_id: 'req-failed-action', status: 'delivery_failed', cwd: '/repo/delivery',
+      objective: 'delivery objective', model: 'claude', effort: null, images: [],
+      llm_language: 'English', updated_at: '2025-01-01T00:00:00Z', last_error: 'delivery failed',
+      allowed_actions: ['retry_delivery'], published_product_conversation_id: 'product-1',
+    };
+    apiMock.listProductConversationCreations.mockResolvedValue({ product_creations: [row] });
+    apiMock.retryProductConversationDelivery.mockRejectedValueOnce(new Error('retry endpoint unavailable'));
+
+    renderPage();
+    fireEvent.click((await screen.findAllByRole('button', { name: 'Retry' })).at(0)!);
+
+    expect((await screen.findAllByRole('alert')).some((alert) =>
+      alert.textContent === 'retry endpoint unavailable')).toBe(true);
+    await waitFor(() => expect(apiMock.listProductConversationCreations.mock.calls.length).toBeGreaterThanOrEqual(2));
+  });
+
   it('retains active recovery rows when a poll fails transiently', async () => {
     apiMock.listProductConversationCreations
       .mockResolvedValueOnce({

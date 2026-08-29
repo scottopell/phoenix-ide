@@ -115,9 +115,7 @@ pub async fn list_product_conversation_creations(
             llm_language: Some(job.intent.llm_language),
             images: job.intent.images,
             updated_at: job.updated_at.to_rfc3339(),
-            last_error: (job.status != "delivery_failed")
-                .then_some(job.last_error)
-                .flatten(),
+            last_error: job.last_error,
             allowed_actions: creation_allowed_actions(&job.status),
         })
         .collect();

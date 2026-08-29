@@ -43,6 +43,41 @@ enum StagingCleanupOutcome {
     OwnershipConflict(StagingOwnershipConflict),
 }
 
+fn staging_ownership_conflict_diagnostic(conflict: StagingOwnershipConflict) -> &'static str {
+    match conflict {
+        StagingOwnershipConflict::MissingDurableToken => {
+            "product creation staging cleanup ownership conflict: durable ownership token is missing"
+        }
+        StagingOwnershipConflict::ExistingOccupantNotProvablyOwned => {
+            "product creation staging cleanup ownership conflict: existing occupant is not provably owned by this creation"
+        }
+        StagingOwnershipConflict::OwnerMarkerMissing => {
+            "product creation staging cleanup ownership conflict: owner marker is missing"
+        }
+        StagingOwnershipConflict::OwnerMarkerMismatch => {
+            "product creation staging cleanup ownership conflict: owner marker does not match the durable ownership token"
+        }
+        StagingOwnershipConflict::OwnerMarkerUnreadable => {
+            "product creation staging cleanup ownership conflict: owner marker is unreadable"
+        }
+    }
+}
+
+fn staging_cleanup_diagnostic(
+    cleanup: &Result<Result<StagingCleanupOutcome, String>, tokio::task::JoinError>,
+) -> String {
+    match cleanup {
+        Ok(Ok(StagingCleanupOutcome::OwnershipConflict(conflict))) => {
+            staging_ownership_conflict_diagnostic(*conflict).to_string()
+        }
+        Ok(Err(error)) => format!("product creation staging cleanup failed: {error}"),
+        Err(error) => format!("product creation staging cleanup task failed: {error}"),
+        Ok(Ok(StagingCleanupOutcome::Cleaned | StagingCleanupOutcome::AlreadyAbsent)) => {
+            "product creation staging cleanup became ambiguous".to_string()
+        }
+    }
+}
+
 pub(crate) async fn process_product_creation_request(
     manager: &Arc<RuntimeManager>,
     request_id: &str,
@@ -514,11 +549,14 @@ async fn deliver_product_creation_objective(
     )
     .await;
     if let Err(error) = enqueue_result {
+        let delivery_error =
+            format!("product creation objective delivery timed out after 15 seconds: {error}");
         manager
             .db()
             .schedule_product_creation_delivery_retry(
                 &job.request_id,
                 &claimed.claim,
+                &delivery_error,
                 chrono::Utc::now(),
             )
             .await
@@ -528,16 +566,16 @@ async fn deliver_product_creation_objective(
                 )
             })?;
         manager.kick_creation_worker();
-        return Err(format!(
-            "product creation objective delivery timed out after 15 seconds: {error}"
-        ));
+        return Err(delivery_error);
     }
     if let Err(error) = enqueue_result.expect("checked timeout above") {
+        let delivery_error = error.to_string();
         manager
             .db()
             .schedule_product_creation_delivery_retry(
                 &job.request_id,
                 &claimed.claim,
+                &delivery_error,
                 chrono::Utc::now(),
             )
             .await
@@ -545,7 +583,7 @@ async fn deliver_product_creation_objective(
                 format!("{error}; delivery retry persistence failed: {db_error}")
             })?;
         manager.kick_creation_worker();
-        return Err(error.to_string());
+        return Err(delivery_error);
     }
     let completed = manager
         .db()
@@ -674,6 +712,7 @@ async fn cleanup_unpublished_product_staging(
     ) {
         return true;
     }
+    let cleanup_error = staging_cleanup_diagnostic(&cleanup);
     manager
         .db()
         .mark_product_creation_cleanup_ambiguous(
@@ -684,6 +723,7 @@ async fn cleanup_unpublished_product_staging(
                 generation: job.claim_generation,
                 lease_until: job.claim_lease_until.unwrap_or_else(chrono::Utc::now),
             },
+            &cleanup_error,
             chrono::Utc::now(),
         )
         .await
@@ -802,7 +842,8 @@ async fn reconcile_product_creation_cleanup(
         )
         .await
         .map_err(|error| error.to_string())??;
-        if matches!(cleaned, StagingCleanupOutcome::OwnershipConflict(_)) {
+        if let StagingCleanupOutcome::OwnershipConflict(conflict) = cleaned {
+            let cleanup_error = staging_ownership_conflict_diagnostic(conflict);
             if !manager
                 .db()
                 .mark_product_creation_resource_cleanup_conflict(
@@ -817,7 +858,11 @@ async fn reconcile_product_creation_cleanup(
             }
             manager
                 .db()
-                .mark_claimed_product_creation_cleanup_ambiguous(cleanup, chrono::Utc::now())
+                .mark_claimed_product_creation_cleanup_ambiguous(
+                    cleanup,
+                    cleanup_error,
+                    chrono::Utc::now(),
+                )
                 .await
                 .map_err(|error| error.to_string())?;
             return Ok(());
@@ -2555,6 +2600,25 @@ fn managed_worktree_error_to_kind(error: ManagedWorktreeError) -> (String, Error
     match error {
         ManagedWorktreeError::BadRequest(message) => (message, ErrorKind::InvalidRequest),
         ManagedWorktreeError::Git(message) => (message, ErrorKind::ServerError),
+    }
+}
+
+#[cfg(test)]
+mod staging_diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn ownership_conflicts_have_stable_specific_diagnostics() {
+        assert_eq!(
+            staging_ownership_conflict_diagnostic(StagingOwnershipConflict::OwnerMarkerMismatch),
+            "product creation staging cleanup ownership conflict: owner marker does not match the durable ownership token"
+        );
+        assert_eq!(
+            staging_ownership_conflict_diagnostic(
+                StagingOwnershipConflict::ExistingOccupantNotProvablyOwned,
+            ),
+            "product creation staging cleanup ownership conflict: existing occupant is not provably owned by this creation"
+        );
     }
 }
 

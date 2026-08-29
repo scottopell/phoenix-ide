@@ -80,12 +80,14 @@ function NewConversationFileChips({ files, onRemove }: { files: File[]; onRemove
 function ProductCreationRecoveryList({
   rows,
   busyRequestId,
+  actionErrors,
   onAction,
   canLoadMore,
   onLoadMore,
 }: {
   rows: ProductConversationCreationRecoveryRow[];
   busyRequestId: string | null;
+  actionErrors: Record<string, { action: ProductConversationCreationAllowedActionView; message: string }>;
   onAction: (row: ProductConversationCreationRecoveryRow, action: ProductConversationCreationAllowedActionView) => void;
   canLoadMore: boolean;
   onLoadMore: () => void;
@@ -100,6 +102,7 @@ function ProductCreationRecoveryList({
       <div className="product-creation-recovery__list">
         {rows.map((row) => {
           const isBusy = busyRequestId === row.request_id;
+          const actionError = actionErrors[row.request_id];
           return (
             <article key={row.request_id} className="product-creation-recovery__item">
               <div className="product-creation-recovery__summary">
@@ -112,6 +115,11 @@ function ProductCreationRecoveryList({
                 <span>{row.effort ?? 'default effort'}</span>
               </div>
               {row.last_error && <div className="product-creation-recovery__error">{row.last_error}</div>}
+              {actionError && (
+                <div className="product-creation-recovery__error" role="alert">
+                  {actionError.message}
+                </div>
+              )}
               <div className="product-creation-recovery__actions">
                 {row.allowed_actions.map((action) => (
                   <button
@@ -221,6 +229,10 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   const [everExpanded, setEverExpanded] = useState(!terminalPane.collapsed);
   const [recoveryRows, setRecoveryRows] = useState<ProductConversationCreationRecoveryRow[]>([]);
   const [recoveryBusyRequestId, setRecoveryBusyRequestId] = useState<string | null>(null);
+  const [recoveryActionErrors, setRecoveryActionErrors] = useState<Record<string, {
+    action: ProductConversationCreationAllowedActionView;
+    message: string;
+  }>>({});
   const [recoveryNextCursor, setRecoveryNextCursor] = useState<string | null>(null);
   const recoveryRequestSequence = useRef(0);
   const recoveryLoadedPages = useRef(1);
@@ -388,14 +400,25 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
       return;
     }
     setRecoveryBusyRequestId(row.request_id);
+    setRecoveryActionErrors((errors) => {
+      const remaining = { ...errors };
+      delete remaining[row.request_id];
+      return remaining;
+    });
     try {
       if (action === 'cancel') await api.cancelProductConversationCreation(row.request_id);
       if (action === 'retry_delivery') await api.retryProductConversationDelivery(row.request_id);
       if (action === 'delete') await api.deleteProductConversationCreation(row.request_id);
-      await refreshRecoveryRows();
     } catch (error) {
-      console.error(error);
+      setRecoveryActionErrors((errors) => ({
+        ...errors,
+        [row.request_id]: {
+          action,
+          message: error instanceof Error ? error.message : `Failed to ${recoveryActionLabel(action).toLowerCase()}`,
+        },
+      }));
     } finally {
+      await refreshRecoveryRows();
       setRecoveryBusyRequestId(null);
     }
   };
@@ -431,6 +454,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
           <ProductCreationRecoveryList
             rows={recoveryRows}
             busyRequestId={recoveryBusyRequestId}
+            actionErrors={recoveryActionErrors}
             onAction={handleRecoveryAction}
             canLoadMore={recoveryNextCursor !== null}
             onLoadMore={() => void loadMoreRecoveryRows()}
@@ -509,6 +533,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
           <ProductCreationRecoveryList
             rows={recoveryRows}
             busyRequestId={recoveryBusyRequestId}
+            actionErrors={recoveryActionErrors}
             onAction={handleRecoveryAction}
             canLoadMore={recoveryNextCursor !== null}
             onLoadMore={() => void loadMoreRecoveryRows()}

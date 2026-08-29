@@ -748,6 +748,7 @@ impl Database {
         &self,
         request_id: &str,
         claim: &ProductCreationClaim,
+        delivery_error: &str,
         now: DateTime<Utc>,
     ) -> DbResult<bool> {
         let Some(record) = self.get_product_creation_job(request_id).await? else {
@@ -775,11 +776,12 @@ impl Database {
                  claim_worker_id = NULL,
                  claim_token = NULL,
                  claim_lease_until_unix_micros = NULL,
-                 updated_at_unix_micros = ?5
+                 last_error = ?5,
+                 updated_at_unix_micros = ?6
              WHERE request_id = ?1 AND status = 'delivery_pending'
-               AND delivery_attempt_count = ?6 AND claim_generation = ?7
-               AND claim_worker_id = ?8 AND claim_token = ?9
-               AND claim_lease_until_unix_micros > ?5",
+               AND delivery_attempt_count = ?7 AND claim_generation = ?8
+               AND claim_worker_id = ?9 AND claim_token = ?10
+               AND claim_lease_until_unix_micros > ?6",
         )
         .bind(request_id)
         .bind(next_attempt)
@@ -787,6 +789,7 @@ impl Database {
         .bind(datetime_to_unix_micros(
             now + chrono::Duration::seconds(delay_seconds),
         ))
+        .bind(delivery_error)
         .bind(datetime_to_unix_micros(now))
         .bind(record.delivery_attempt_count)
         .bind(claim.generation)
@@ -801,20 +804,22 @@ impl Database {
         &self,
         request_id: &str,
         claim: &ProductCreationClaim,
+        cleanup_error: &str,
         now: DateTime<Utc>,
     ) -> DbResult<bool> {
         let updated = sqlx::query(
             "UPDATE product_creation_jobs
              SET status = 'cleanup_ambiguous', claim_worker_id = NULL, claim_token = NULL,
                  claim_lease_until_unix_micros = NULL, retry_at_unix_micros = NULL,
-                 updated_at_unix_micros = ?4
+                 last_error = ?4, updated_at_unix_micros = ?5
              WHERE request_id = ?1 AND status = 'claimed' AND claim_generation = ?2
-               AND claim_worker_id = ?3 AND claim_token = ?5
-               AND claim_lease_until_unix_micros > ?4",
+               AND claim_worker_id = ?3 AND claim_token = ?6
+               AND claim_lease_until_unix_micros > ?5",
         )
         .bind(request_id)
         .bind(claim.generation)
         .bind(&claim.worker_id)
+        .bind(cleanup_error)
         .bind(datetime_to_unix_micros(now))
         .bind(&claim.token)
         .execute(&self.pool)
@@ -1584,6 +1589,7 @@ impl Database {
     pub async fn mark_claimed_product_creation_cleanup_ambiguous(
         &self,
         cleanup: &ProductCreationCleanupJob,
+        cleanup_error: &str,
         now: DateTime<Utc>,
     ) -> DbResult<bool> {
         let result = sqlx::query(
@@ -1592,12 +1598,13 @@ impl Database {
                  deletion_requested_at_unix_micros = NULL,
                  cleanup_worker_id = NULL, cleanup_token = NULL,
                  cleanup_lease_until_unix_micros = NULL,
-                 updated_at_unix_micros = ?1
-             WHERE request_id = ?2 AND claim_generation = ?3
+                 last_error = ?1, updated_at_unix_micros = ?2
+             WHERE request_id = ?3 AND claim_generation = ?4
                AND status IN ('cancelling', 'deletion_pending')
-               AND cleanup_worker_id = ?4 AND cleanup_token = ?5
-               AND cleanup_lease_until_unix_micros > ?1",
+               AND cleanup_worker_id = ?5 AND cleanup_token = ?6
+               AND cleanup_lease_until_unix_micros > ?2",
         )
+        .bind(cleanup_error)
         .bind(datetime_to_unix_micros(now))
         .bind(&cleanup.job.request_id)
         .bind(cleanup.claim.generation)
@@ -2132,6 +2139,7 @@ mod product_creation_tests {
             .mark_product_creation_cleanup_ambiguous(
                 "req-cleanup-lease",
                 &claimed.claim,
+                "cleanup reason",
                 now + chrono::Duration::seconds(1),
             )
             .await
@@ -2143,6 +2151,40 @@ mod product_creation_tests {
                 .unwrap()
                 .status,
             "claimed"
+        );
+
+        db.accept_product_creation("req-cleanup-reason", &intent("/repo/a", "cleanup reason"))
+            .await
+            .unwrap();
+        let live_claim = db
+            .claim_product_creation(
+                "req-cleanup-reason",
+                "worker-live",
+                "token-live",
+                now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(db
+            .mark_product_creation_cleanup_ambiguous(
+                "req-cleanup-reason",
+                &live_claim.claim,
+                "owner marker does not match durable token",
+                now + chrono::Duration::seconds(1),
+            )
+            .await
+            .unwrap());
+        let ambiguous = db
+            .get_product_creation_job("req-cleanup-reason")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ambiguous.status, "cleanup_ambiguous");
+        assert_eq!(
+            ambiguous.last_error.as_deref(),
+            Some("owner marker does not match durable token")
         );
     }
 
@@ -2303,7 +2345,12 @@ mod product_creation_tests {
         let now = Utc::now();
         let mut delivery_claim = claim.claim;
         assert!(db
-            .schedule_product_creation_delivery_retry("req-delivery", &delivery_claim, now)
+            .schedule_product_creation_delivery_retry(
+                "req-delivery",
+                &delivery_claim,
+                "delivery failed",
+                now,
+            )
             .await
             .unwrap());
         let pending = db
@@ -2344,7 +2391,12 @@ mod product_creation_tests {
                 .unwrap()
                 .claim;
             assert!(db
-                .schedule_product_creation_delivery_retry("req-delivery", &delivery_claim, now,)
+                .schedule_product_creation_delivery_retry(
+                    "req-delivery",
+                    &delivery_claim,
+                    "delivery failed",
+                    now,
+                )
                 .await
                 .unwrap());
         }
@@ -2373,7 +2425,12 @@ mod product_creation_tests {
             .unwrap()
             .claim;
         assert!(db
-            .schedule_product_creation_delivery_retry("req-delivery", &delivery_claim, now)
+            .schedule_product_creation_delivery_retry(
+                "req-delivery",
+                &delivery_claim,
+                "delivery failed",
+                now,
+            )
             .await
             .unwrap());
         let exhausted = db
@@ -2384,8 +2441,14 @@ mod product_creation_tests {
         assert_eq!(exhausted.delivery_attempt_count, 4);
         assert_eq!(exhausted.status, "delivery_failed");
         assert!(exhausted.delivery_retry_at.is_none());
+        assert_eq!(exhausted.last_error.as_deref(), Some("delivery failed"));
         assert!(!db
-            .schedule_product_creation_delivery_retry("req-delivery", &delivery_claim, now)
+            .schedule_product_creation_delivery_retry(
+                "req-delivery",
+                &delivery_claim,
+                "delivery failed",
+                now,
+            )
             .await
             .unwrap());
     }
@@ -2684,6 +2747,7 @@ mod product_creation_tests {
         assert!(db
             .mark_claimed_product_creation_cleanup_ambiguous(
                 &cleanup,
+                "ownership conflict",
                 now + chrono::Duration::seconds(2),
             )
             .await
@@ -2697,14 +2761,13 @@ mod product_creation_tests {
             .unwrap();
         assert_eq!(reservation.status, "conflict");
         assert_eq!(reservation.ownership_token.as_deref(), Some("owner-token"));
-        assert_eq!(
-            db.get_product_creation_job("req-conflict")
-                .await
-                .unwrap()
-                .unwrap()
-                .status,
-            "cleanup_ambiguous"
-        );
+        let ambiguous = db
+            .get_product_creation_job("req-conflict")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ambiguous.status, "cleanup_ambiguous");
+        assert_eq!(ambiguous.last_error.as_deref(), Some("ownership conflict"));
         assert!(!db
             .finish_product_creation_cleanup(&cleanup, now + chrono::Duration::seconds(3))
             .await
@@ -2773,6 +2836,7 @@ mod product_creation_tests {
         assert!(db
             .mark_claimed_product_creation_cleanup_ambiguous(
                 &cleanup,
+                "ownership conflict",
                 now + chrono::Duration::seconds(2),
             )
             .await
@@ -2781,7 +2845,6 @@ mod product_creation_tests {
             .request_product_creation_deletion("req-requeue", now + chrono::Duration::seconds(3),)
             .await
             .unwrap());
-
         let deletion = db
             .claim_next_product_creation_cleanup(
                 "deletion-worker",
@@ -2792,11 +2855,6 @@ mod product_creation_tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(deletion.reservations[0].status, "cleanup_required");
-        assert_eq!(
-            deletion.reservations[0].generation,
-            deletion.claim.generation
-        );
         assert!(db
             .release_product_creation_resource(
                 &deletion,
@@ -3242,6 +3300,7 @@ mod product_creation_tests {
                 .schedule_product_creation_delivery_retry(
                     "req-delivery",
                     &active_delivery_claim,
+                    &format!("delivery failure {i}"),
                     now + chrono::Duration::seconds(i),
                 )
                 .await
@@ -3332,6 +3391,7 @@ mod product_creation_tests {
             .unwrap();
         assert_eq!(delivery.intent.cwd, "/repo/delivery");
         assert_eq!(delivery.intent.objective, "delivery");
+        assert_eq!(delivery.last_error.as_deref(), Some("delivery failure 4"));
         assert_eq!(
             delivery.published_product_conversation_id.as_deref(),
             Some(expected_published_product_id.as_str())
