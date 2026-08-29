@@ -2120,7 +2120,7 @@ async fn list_recent_management_roots(
 ) -> Result<Json<RecentManagementRootSuggestionsResponse>, AppError> {
     let suggestions = state
         .db
-        .recent_distinct_published_product_creation_cwds(20)
+        .recent_distinct_management_roots(20)
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?
         .into_iter()

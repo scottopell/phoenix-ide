@@ -69,7 +69,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Deciding which tools a user may invoke directly (user tool invocation eligibility) | 005 |
 | Specifying wake contracts, async terminal waits, or sub-agent terminal wake delivery | 006 |
 | Specifying durable conversation creation, worker claims, retries, or provisioning cleanup | 007 |
-| Specifying request-bound creation identity, immutable creation pins, atomic creation publication, or staging cleanup ownership | 043 for the private staging boundary, then 039, 007, and 031 |
+| Specifying request-bound creation identity, immutable creation pins, atomic creation publication, or staging cleanup ownership | 040 for the private staging boundary, then 039, 007, and 031 |
 | Specifying multi-PR branch observation, active PR targeting, or bash terminal-edge reconciliation | 008 |
 | Specifying native process resource sampling, Work Scope health, or resource-observation freshness | 009 |
 | Specifying native macOS self-deployment, activation, or rollback | 010 |

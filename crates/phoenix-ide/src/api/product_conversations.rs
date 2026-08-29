@@ -795,6 +795,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn router_lists_pre_creation_current_management_root() {
+        let state = make_test_state().await;
+        let directory = tempfile::tempdir().unwrap();
+        let project = state
+            .db
+            .find_or_create_project(directory.path().to_str().unwrap())
+            .await
+            .unwrap();
+        state
+            .db
+            .create_conversation_with_project(
+                "pre-creation-api-recents",
+                "pre-creation-api-recents",
+                directory.path().to_str().unwrap(),
+                true,
+                None,
+                None,
+                Some(&project.id),
+                &crate::db::ConvMode::Explore {
+                    worktree_path: None,
+                    next_taskmd_id_hint: None,
+                },
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/recent-management-root-suggestions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            body["suggestions"][0]["path"],
+            directory.path().to_str().unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn router_lists_product_creation_recovery_rows() {
         let state = make_test_state().await;
         let now = chrono::Utc::now();

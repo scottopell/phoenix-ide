@@ -1782,24 +1782,25 @@ impl Database {
         Ok(deadline.map(unix_micros_to_datetime).transpose()?)
     }
 
-    pub async fn recent_distinct_published_product_creation_cwds(
-        &self,
-        limit: usize,
-    ) -> DbResult<Vec<String>> {
+    pub async fn recent_distinct_management_roots(&self, limit: usize) -> DbResult<Vec<String>> {
         let rows = sqlx::query_scalar::<_, String>(
-            "SELECT job.staging_repo_root
-             FROM product_creation_jobs job
-             JOIN conversations conversation ON conversation.id = job.published_conversation_id
+            "SELECT COALESCE(project.canonical_path, job.staging_repo_root) AS management_root
+             FROM conversations conversation
              JOIN product_conversations product
                ON product.id = conversation.product_conversation_id
               AND product.kind = 'ordinary'
               AND product.ordinary_lifecycle IN ('open', 'history')
-             WHERE job.status = 'published' AND job.staging_repo_root IS NOT NULL
-               AND conversation.user_initiated = 1 AND conversation.runtime_role = 'user'
-             GROUP BY job.staging_repo_root
+             JOIN work_scopes scope ON scope.id = conversation.work_scope_id
+             LEFT JOIN projects project ON project.id = conversation.project_id
+             LEFT JOIN product_creation_jobs job
+               ON job.published_conversation_id = conversation.id
+              AND job.status = 'published'
+             WHERE conversation.user_initiated = 1 AND conversation.runtime_role = 'user'
+               AND COALESCE(project.canonical_path, job.staging_repo_root) IS NOT NULL
+             GROUP BY management_root
              ORDER BY COUNT(DISTINCT conversation.product_conversation_id) DESC,
                       MAX(conversation.updated_at) DESC,
-                      job.staging_repo_root DESC",
+                      management_root DESC",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -3715,6 +3716,128 @@ mod product_creation_tests {
     }
 
     #[tokio::test]
+    async fn recent_management_roots_include_pre_creation_scope_and_current_project_locator() {
+        let db = Database::open_in_memory().await.unwrap();
+        let project = db.find_or_create_project("/repo/current").await.unwrap();
+        let conversation = db
+            .create_conversation_with_project(
+                "pre-creation-recents",
+                "pre-creation-recents",
+                "/repo/current/.phoenix/worktrees/old",
+                true,
+                None,
+                None,
+                Some(&project.id),
+                &ConvMode::Explore {
+                    worktree_path: Some(
+                        phoenix_core::domain::db_schema::NonEmptyString::new(
+                            "/repo/current/.phoenix/worktrees/old",
+                        )
+                        .unwrap(),
+                    ),
+                    next_taskmd_id_hint: None,
+                },
+                None,
+                None,
+                None,
+                LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+        assert!(conversation.attached_work_scope_id.is_some());
+
+        sqlx::query("UPDATE projects SET canonical_path = '/repo/moved' WHERE id = ?1")
+            .bind(&project.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.recent_distinct_management_roots(5).await.unwrap(),
+            vec!["/repo/moved".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn current_project_locator_wins_over_stale_creation_staging_root() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.accept_product_creation("req-current-root", &intent("/repo/stale", "publish"))
+            .await
+            .unwrap();
+        let claim = db
+            .claim_next_product_creation(
+                "worker-current-root",
+                "token-current-root",
+                Utc::now(),
+                chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let accepted = db
+            .get_product_creation_job("req-current-root")
+            .await
+            .unwrap()
+            .unwrap();
+        let conversation_id = "conv-current-root";
+        db.publish_product_creation_atomically(&ProductCreationPublishInput {
+            request_id: "req-current-root".to_string(),
+            claim: claim.claim,
+            conversation: published_conversation(
+                conversation_id,
+                accepted.product_conversation_id,
+                WorkScopeId::new(),
+                "/repo/stale/.phoenix/worktrees/one",
+            ),
+            authority_kind: AuthorityKind::Work,
+            environment: EnvironmentContext::AllocatedWorktree {
+                cwd: "/repo/stale/.phoenix/worktrees/one".to_string(),
+                worktree_path: "/repo/stale/.phoenix/worktrees/one".into(),
+                branch_name: None,
+                base_branch: None,
+            },
+            git_publication: Some(ProductCreationGitPublicationFacts {
+                exact_checkout_oid: "stale-oid".to_string(),
+                repository_root: "/repo/stale".to_string(),
+            }),
+        })
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE product_creation_jobs
+             SET status = 'published', claim_worker_id = NULL, claim_token = NULL,
+                 claim_lease_until_unix_micros = NULL, delivery_retry_at_unix_micros = NULL
+             WHERE request_id = 'req-current-root'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let project = db.find_or_create_project("/repo/current").await.unwrap();
+        sqlx::query("UPDATE conversations SET project_id = ?1 WHERE id = ?2")
+            .bind(&project.id)
+            .bind(conversation_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.recent_distinct_management_roots(5).await.unwrap(),
+            vec!["/repo/current".to_string()]
+        );
+        let repositories: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM git_repositories")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let attachments: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM work_scope_git_repositories")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(repositories, 0);
+        assert_eq!(attachments, 0);
+    }
+
+    #[tokio::test]
     async fn product_creation_recent_management_roots_rank_by_support_then_recency() {
         let db = Database::open_in_memory().await.unwrap();
         for (idx, cwd) in [(1, "/repo/a"), (2, "/repo/b"), (3, "/repo/a")] {
@@ -3767,10 +3890,7 @@ mod product_creation_tests {
             // test-timing-allow: recency ordering is the behavior under test and SQLite stores the publication wall clock.
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
-        let cwds = db
-            .recent_distinct_published_product_creation_cwds(5)
-            .await
-            .unwrap();
+        let cwds = db.recent_distinct_management_roots(5).await.unwrap();
         assert_eq!(cwds, vec!["/repo/a".to_string(), "/repo/b".to_string()]);
     }
 }
