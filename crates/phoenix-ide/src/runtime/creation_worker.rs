@@ -2654,6 +2654,31 @@ mod temporary_creation_branch_tests {
 }
 
 #[cfg(test)]
+mod product_creation_path_classification_tests {
+    use super::*;
+
+    #[test]
+    fn newly_created_standalone_directory_has_no_repository() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("standalone");
+        std::fs::create_dir(&cwd).unwrap();
+
+        assert_eq!(discover_product_repository(&cwd).unwrap(), None);
+    }
+
+    #[test]
+    fn newly_created_subdirectory_in_repository_is_git_backed() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::git_ops::run_git(repo.path(), &["init"]).unwrap();
+        let cwd = repo.path().join("new-product");
+        std::fs::create_dir(&cwd).unwrap();
+
+        let discovered = discover_product_repository(&cwd).unwrap().unwrap();
+        assert_eq!(Path::new(&discovered), repo.path().canonicalize().unwrap());
+    }
+}
+
+#[cfg(test)]
 mod product_creation_ignore_tests {
     use super::*;
 
