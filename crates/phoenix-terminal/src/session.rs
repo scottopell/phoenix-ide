@@ -545,27 +545,35 @@ impl ActiveTerminals {
         }
     }
 
-    fn verify_exact_absence(
+    fn verify_exact_absence_by(
         map: &ActiveTerminalRegistryState,
         permit: &TerminalRetirementPermit,
+        observe_process_identity: impl Fn(u32) -> Option<ProcessIdentity>,
     ) -> TerminalRetirementOutcome {
         match (
             map.handles.get(&permit.work_scope),
             permit.instance.as_ref(),
         ) {
-            (None, Some(expected))
-                if phoenix_core::process_identity::process_identity_matches(
-                    expected.process_identity(),
-                ) =>
-            {
-                TerminalRetirementOutcome::Residual {
-                    reason: format!(
-                        "exact terminal child {} remains live outside the registry",
-                        expected.stable_identity()
-                    ),
+            (None, Some(expected)) => {
+                match observe_process_identity(expected.process_identity().pid) {
+                    Some(current) if current == expected.process_identity() => {
+                        TerminalRetirementOutcome::Residual {
+                            reason: format!(
+                                "exact terminal child {} remains live outside the registry",
+                                expected.stable_identity()
+                            ),
+                        }
+                    }
+                    Some(_) => TerminalRetirementOutcome::AbsenceVerified,
+                    None => TerminalRetirementOutcome::Residual {
+                        reason: format!(
+                            "exact terminal child {} absence could not be authoritatively observed",
+                            expected.stable_identity()
+                        ),
+                    },
                 }
             }
-            (None, _) => TerminalRetirementOutcome::AbsenceVerified,
+            (None, None) => TerminalRetirementOutcome::AbsenceVerified,
             (Some(current), Some(expected)) if !expected.matches_handle(current) => {
                 TerminalRetirementOutcome::AbsenceVerified
             }
@@ -609,13 +617,34 @@ impl ActiveTerminals {
         permit: &TerminalRetirementPermit,
         deadline: tokio::time::Instant,
     ) -> TerminalRetirementOutcome {
+        self.complete_retirement_by_observing(
+            permit,
+            deadline,
+            wait_for_child_exit,
+            phoenix_core::process_identity::current_process_identity,
+        )
+        .await
+    }
+
+    pub(crate) async fn complete_retirement_by_observing<Wait, WaitFuture, Observe>(
+        &self,
+        permit: &TerminalRetirementPermit,
+        deadline: tokio::time::Instant,
+        wait_for_exit: Wait,
+        observe_process_identity: Observe,
+    ) -> TerminalRetirementOutcome
+    where
+        Wait: FnOnce(Pid) -> WaitFuture,
+        WaitFuture: std::future::Future<Output = nix::Result<nix::sys::wait::WaitStatus>>,
+        Observe: Fn(u32) -> Option<ProcessIdentity> + Copy,
+    {
         let attach_permit = {
             let map = self.0.lock().expect("terminal registry poisoned");
             if !Self::matches_exact_instance(&map, permit) {
-                return Self::verify_exact_absence(&map, permit);
+                return Self::verify_exact_absence_by(&map, permit, observe_process_identity);
             }
             let Some(handle) = map.handles.get(&permit.work_scope) else {
-                return Self::verify_exact_absence(&map, permit);
+                return Self::verify_exact_absence_by(&map, permit, observe_process_identity);
             };
             let _ = handle.stop_tx.send(StopReason::TearDown);
             Arc::clone(&handle.attach_permit)
@@ -635,7 +664,7 @@ impl ActiveTerminals {
         let handle = {
             let map = self.0.lock().expect("terminal registry poisoned");
             if !Self::matches_exact_instance(&map, permit) {
-                let outcome = Self::verify_exact_absence(&map, permit);
+                let outcome = Self::verify_exact_absence_by(&map, permit, observe_process_identity);
                 drop(relay_authority);
                 return match outcome {
                     TerminalRetirementOutcome::AbsenceVerified if permit.had_entry => {
@@ -656,33 +685,36 @@ impl ActiveTerminals {
 
         // SIGCHLD is the causal child-exit signal. The timeout is only the
         // outer Close liveness bound, and it shares the relay deadline above.
-        let wait_outcome = tokio::time::timeout_at(deadline, wait_for_child_exit(child_pid)).await;
-        let identity_absent = permit.instance.as_ref().is_none_or(|instance| {
-            !phoenix_core::process_identity::process_identity_matches(instance.process_identity())
-        });
-        if !matches!(wait_outcome, Ok(Ok(_))) && !identity_absent {
-            return TerminalRetirementOutcome::Residual {
-                reason: "terminal child exit was not authoritatively observed; exact handle retained for retry"
-                    .to_string(),
-            };
+        let wait_outcome = tokio::time::timeout_at(deadline, wait_for_exit(child_pid)).await;
+        if !matches!(wait_outcome, Ok(Ok(_))) {
+            let expected = permit
+                .instance
+                .as_ref()
+                .expect("exact terminal match must carry process identity")
+                .process_identity();
+            match observe_process_identity(expected.pid) {
+                Some(current) if current != expected => {}
+                Some(_) | None => {
+                    return TerminalRetirementOutcome::Residual {
+                        reason: "terminal child exit was not authoritatively observed; exact handle retained for retry"
+                            .to_string(),
+                    };
+                }
+            }
         }
         drop(relay_authority);
         {
             let mut map = self.0.lock().expect("terminal registry poisoned");
             if !Self::matches_exact_instance(&map, permit) {
-                return Self::verify_exact_absence(&map, permit);
+                return Self::verify_exact_absence_by(&map, permit, observe_process_identity);
             }
             map.handles.remove(&permit.work_scope);
         }
         drop(handle);
-        let map = self.0.lock().expect("terminal registry poisoned");
-        match Self::verify_exact_absence(&map, permit) {
-            TerminalRetirementOutcome::AbsenceVerified if permit.had_entry => {
-                TerminalRetirementOutcome::Retired
-            }
-            outcome @ (TerminalRetirementOutcome::Retired
-            | TerminalRetirementOutcome::AbsenceVerified
-            | TerminalRetirementOutcome::Residual { .. }) => outcome,
+        if permit.had_entry {
+            TerminalRetirementOutcome::Retired
+        } else {
+            TerminalRetirementOutcome::AbsenceVerified
         }
     }
 

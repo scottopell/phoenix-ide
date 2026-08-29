@@ -257,7 +257,14 @@ async fn complete_retirement_requires_exact_instance_and_reopen_for_admission() 
     );
 
     assert_eq!(
-        registry.complete_retirement(&second_permit).await,
+        registry
+            .complete_retirement_by_observing(
+                &second_permit,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+                |pid| async move { Ok(nix::sys::wait::WaitStatus::Exited(pid, 0)) },
+                |_| None,
+            )
+            .await,
         TerminalRetirementOutcome::Retired,
         "current permit must retire the exact current instance"
     );
@@ -295,7 +302,16 @@ async fn retirement_waits_for_attach_release_without_consuming_a_second_budget()
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     let completing = {
         let registry = registry.clone();
-        tokio::spawn(async move { registry.complete_retirement_by(&permit, deadline).await })
+        tokio::spawn(async move {
+            registry
+                .complete_retirement_by_observing(
+                    &permit,
+                    deadline,
+                    |pid| async move { Ok(nix::sys::wait::WaitStatus::Exited(pid, 0)) },
+                    |_| None,
+                )
+                .await
+        })
     };
 
     tokio::task::yield_now().await;
@@ -335,6 +351,75 @@ async fn retirement_attach_wait_uses_declared_outer_deadline() {
         TerminalRetirementOutcome::Residual {
             reason: "terminal relay did not release after teardown request".to_string(),
         }
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn deadline_with_unobservable_identity_retains_exact_handle_for_retry() {
+    let registry = ActiveTerminals::new();
+    let scope = scope("retirement-unobservable-identity");
+    let handle = registry
+        .try_insert_exact(
+            scope.clone(),
+            dummy_handle_with_pid(Dims::try_new(80, 24).unwrap(), 41),
+        )
+        .expect("insert terminal");
+    let permit = registry.begin_retirement(&scope);
+
+    let outcome = registry
+        .complete_retirement_by_observing(
+            &permit,
+            tokio::time::Instant::now(),
+            |_| std::future::pending(),
+            |_| None,
+        )
+        .await;
+
+    assert_eq!(
+        outcome,
+        TerminalRetirementOutcome::Residual {
+            reason: "terminal child exit was not authoritatively observed; exact handle retained for retry"
+                .to_string(),
+        }
+    );
+    assert!(
+        registry
+            .get(&scope)
+            .is_some_and(|current| std::sync::Arc::ptr_eq(&current, &handle)),
+        "an unproven observation must preserve exact handle and retry ownership"
+    );
+}
+
+#[tokio::test]
+async fn failed_wait_with_reused_pid_retires_exact_handle() {
+    let registry = ActiveTerminals::new();
+    let scope = scope("retirement-reused-pid");
+    let handle = registry
+        .try_insert_exact(
+            scope.clone(),
+            dummy_handle_with_pid(Dims::try_new(80, 24).unwrap(), 42),
+        )
+        .expect("insert terminal");
+    let expected = handle.launch_identity.process;
+    let permit = registry.begin_retirement(&scope);
+    let reused = ProcessIdentity {
+        start_time: expected.start_time + 1,
+        ..expected
+    };
+
+    let outcome = registry
+        .complete_retirement_by_observing(
+            &permit,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+            |_| async { Err(nix::errno::Errno::ECHILD) },
+            |_| Some(reused),
+        )
+        .await;
+
+    assert_eq!(outcome, TerminalRetirementOutcome::Retired);
+    assert!(
+        registry.get(&scope).is_none(),
+        "a different identity at the PID proves the exact child absent"
     );
 }
 
@@ -456,13 +541,18 @@ fn global_scope_is_disjoint_and_singleton() {
 /// Mirrors the tmux/browser cascade pattern.
 #[tokio::test]
 async fn cascade_on_delete_removes_entry_for_scope() {
-    let registry = ActiveTerminals::new();
-    let dims = Dims { cols: 80, rows: 24 };
-    let scope = scope("cascade-remove");
+    use crate::spawn::{spawn_pty, PtyExecPlan};
 
-    registry
-        .try_insert(scope.clone(), dummy_handle(dims))
-        .unwrap();
+    let registry = ActiveTerminals::new();
+    let scope = scope("cascade-remove");
+    let handle = spawn_pty(
+        std::path::Path::new("/tmp"),
+        Dims::try_new(80, 24).unwrap(),
+        PtyExecPlan::Shell,
+    )
+    .expect("spawn real direct-shell PTY");
+
+    registry.try_insert(scope.clone(), handle).unwrap();
     assert!(registry.get(&scope).is_some());
 
     registry.cascade_on_delete(&scope, None).await;
