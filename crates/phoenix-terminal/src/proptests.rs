@@ -283,6 +283,61 @@ async fn complete_retirement_requires_exact_instance_and_reopen_for_admission() 
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn retirement_waits_for_attach_release_without_consuming_a_second_budget() {
+    let registry = ActiveTerminals::new();
+    let scope = scope("retirement-shared-deadline");
+    let handle = registry
+        .try_insert_exact(scope.clone(), dummy_handle(Dims::try_new(80, 24).unwrap()))
+        .expect("insert terminal");
+    let relay_authority = handle.attach_permit.clone().acquire_owned().await.unwrap();
+    let permit = registry.begin_retirement(&scope);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let completing = {
+        let registry = registry.clone();
+        tokio::spawn(async move { registry.complete_retirement_by(&permit, deadline).await })
+    };
+
+    tokio::task::yield_now().await;
+    assert!(!completing.is_finished());
+    tokio::time::advance(std::time::Duration::from_secs(9)).await;
+    assert!(!completing.is_finished());
+
+    // Permit release is the causal notification; no sleep or polling is needed.
+    drop(relay_authority);
+    tokio::task::yield_now().await;
+    assert_eq!(
+        completing.await.unwrap(),
+        TerminalRetirementOutcome::Retired
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn retirement_attach_wait_uses_declared_outer_deadline() {
+    let registry = ActiveTerminals::new();
+    let scope = scope("retirement-outer-deadline");
+    let handle = registry
+        .try_insert_exact(scope.clone(), dummy_handle(Dims::try_new(80, 24).unwrap()))
+        .expect("insert terminal");
+    let _relay_authority = handle.attach_permit.clone().acquire_owned().await.unwrap();
+    let permit = registry.begin_retirement(&scope);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let completing = {
+        let registry = registry.clone();
+        tokio::spawn(async move { registry.complete_retirement_by(&permit, deadline).await })
+    };
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(std::time::Duration::from_secs(10)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        completing.await.unwrap(),
+        TerminalRetirementOutcome::Residual {
+            reason: "terminal relay did not release after teardown request".to_string(),
+        }
+    );
+}
+
 #[tokio::test]
 async fn complete_retirement_exits_and_reaps_long_lived_detached_direct_pty() {
     use crate::session::TerminalRetirementOutcome;

@@ -2983,7 +2983,10 @@ fn quarantine_has_writable_mappings(path: &Path) -> Result<bool, String> {
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         format!("cannot canonicalize quarantine before mapping inspection: {error}")
     })?;
-    for pid in macos_all_pids()?.into_iter().filter(|pid| *pid > 0) {
+    let Some(pids) = macos_all_pids() else {
+        return Ok(false);
+    };
+    for pid in pids.into_iter().filter(|pid| *pid > 0) {
         let mut address = 0_u64;
         loop {
             let mut info = MaybeUninit::<ProcRegionWithPathInfo>::zeroed();
@@ -3004,16 +3007,16 @@ fn quarantine_has_writable_mappings(path: &Path) -> Result<bool, String> {
                 != i32::try_from(size_of::<ProcRegionWithPathInfo>())
                     .expect("region path info size fits i32")
             {
-                return Err(format!("cannot inspect process {pid} memory mappings"));
+                // Ambient process inspection is observational. A short kernel
+                // result proves nothing about this process, so skip it.
+                break;
             }
             let info = unsafe { info.assume_init() };
-            let next = info
-                .region
-                .address
-                .checked_add(info.region.size)
-                .ok_or_else(|| format!("process {pid} mapping address overflowed"))?;
+            let Some(next) = info.region.address.checked_add(info.region.size) else {
+                break;
+            };
             if next <= address {
-                return Err(format!("process {pid} mapping inventory did not advance"));
+                break;
             }
             address = next;
             let path_bytes = info.vnode.vip_path.as_flattened();
@@ -3073,36 +3076,35 @@ fn quarantine_has_process_cwd_in(
 }
 
 #[cfg(target_os = "macos")]
-fn macos_all_pids() -> Result<Vec<i32>, String> {
+fn macos_all_pids() -> Option<Vec<i32>> {
+    macos_all_pids_with(|buffer, buffer_bytes| unsafe {
+        libc::proc_listpids(1, 0, buffer, buffer_bytes)
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_all_pids_with(mut list: impl FnMut(*mut libc::c_void, i32) -> i32) -> Option<Vec<i32>> {
     use std::mem::size_of;
 
     let mut capacity = 4096_usize;
     loop {
         let mut pids = vec![0_i32; capacity];
-        let capacity_bytes = pids
-            .len()
-            .checked_mul(size_of::<i32>())
-            .ok_or_else(|| "process inventory size overflowed".to_string())?;
-        let pid_bytes = unsafe {
-            libc::proc_listpids(
-                1,
-                0,
-                pids.as_mut_ptr().cast(),
-                i32::try_from(capacity_bytes)
-                    .map_err(|_| "process inventory exceeds macOS API limit")?,
-            )
-        };
+        let capacity_bytes = pids.len().checked_mul(size_of::<i32>())?;
+        let capacity_bytes_i32 = i32::try_from(capacity_bytes).ok()?;
+        let pid_bytes = list(pids.as_mut_ptr().cast(), capacity_bytes_i32);
         if pid_bytes < 0 {
-            return Err("cannot enumerate processes".to_string());
+            return None;
         }
-        let pid_bytes = usize::try_from(pid_bytes).expect("nonnegative PID bytes");
+        let pid_bytes = usize::try_from(pid_bytes).ok()?;
         if pid_bytes < capacity_bytes {
+            // A non-integral short result is not a trustworthy PID inventory.
+            if !pid_bytes.is_multiple_of(size_of::<i32>()) {
+                return None;
+            }
             pids.truncate(pid_bytes / size_of::<i32>());
-            return Ok(pids);
+            return Some(pids);
         }
-        capacity = capacity
-            .checked_mul(2)
-            .ok_or_else(|| "process inventory size overflowed".to_string())?;
+        capacity = capacity.checked_mul(2)?;
     }
 }
 
@@ -3115,7 +3117,9 @@ fn quarantine_has_process_cwd(path: &Path) -> Result<bool, String> {
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         format!("cannot canonicalize quarantine before cwd inspection: {error}")
     })?;
-    let pids = macos_all_pids()?;
+    let Some(pids) = macos_all_pids() else {
+        return Ok(false);
+    };
     for pid in pids.into_iter().filter(|pid| *pid > 0) {
         let mut info = MaybeUninit::<libc::proc_vnodepathinfo>::uninit();
         let bytes = unsafe {
@@ -3318,7 +3322,9 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         format!("cannot canonicalize quarantined worktree before descriptor inspection: {error}")
     })?;
-    let pids = macos_all_pids()?;
+    let Some(pids) = macos_all_pids() else {
+        return Ok(ExternalWriterEvidence::NoPositiveEvidence);
+    };
     for pid in pids.into_iter().filter(|pid| *pid > 0) {
         let mut descriptor_capacity = 256_usize;
         let descriptors = loop {
@@ -3330,6 +3336,9 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence
                 descriptor_capacity
             ];
             let capacity_bytes = descriptors.len() * size_of::<libc::proc_fdinfo>();
+            let Ok(capacity_bytes_i32) = i32::try_from(capacity_bytes) else {
+                break Vec::new();
+            };
             // SAFETY: the vector provides writable storage for exactly the byte count passed.
             let descriptor_bytes = unsafe {
                 libc::proc_pidinfo(
@@ -3337,8 +3346,7 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence
                     libc::PROC_PIDLISTFDS,
                     0,
                     descriptors.as_mut_ptr().cast(),
-                    i32::try_from(capacity_bytes)
-                        .map_err(|_| "process descriptor inventory exceeds macOS API limit")?,
+                    capacity_bytes_i32,
                 )
             };
             if descriptor_bytes <= 0 {
@@ -3350,9 +3358,10 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence
                 descriptors.truncate(descriptor_bytes / size_of::<libc::proc_fdinfo>());
                 break descriptors;
             }
-            descriptor_capacity = descriptor_capacity
-                .checked_mul(2)
-                .ok_or_else(|| "process descriptor inventory size overflowed".to_string())?;
+            let Some(next_capacity) = descriptor_capacity.checked_mul(2) else {
+                break Vec::new();
+            };
+            descriptor_capacity = next_capacity;
         };
         for descriptor in descriptors
             .into_iter()
@@ -4005,6 +4014,34 @@ mod tests {
         assert!(super::descriptor_inventory_may_be_truncated(4096, 4096));
         assert!(super::descriptor_inventory_may_be_truncated(8192, 4096));
         assert!(!super::descriptor_inventory_may_be_truncated(4080, 4096));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_process_inventory_failures_are_absent_evidence() {
+        assert_eq!(super::macos_all_pids_with(|_, _| -1), None);
+        assert_eq!(super::macos_all_pids_with(|_, _| 3), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_process_inventory_retries_full_buffer_and_accepts_complete_list() {
+        use std::mem::size_of;
+
+        let mut calls = 0;
+        let pids = super::macos_all_pids_with(|buffer, capacity_bytes| {
+            calls += 1;
+            if calls == 1 {
+                return capacity_bytes;
+            }
+            let values = [17_i32, 23_i32];
+            // SAFETY: the scanner supplied at least its initial 4096-PID buffer.
+            unsafe { std::ptr::copy_nonoverlapping(values.as_ptr(), buffer.cast(), values.len()) };
+            i32::try_from(values.len() * size_of::<i32>()).unwrap()
+        });
+
+        assert_eq!(pids, Some(vec![17, 23]));
+        assert_eq!(calls, 2);
     }
 
     fn run_git(repository: &Path, arguments: &[&str]) {

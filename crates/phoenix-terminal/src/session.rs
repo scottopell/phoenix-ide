@@ -9,6 +9,13 @@ use tokio::sync::{watch, Semaphore};
 use super::command_tracker::CommandTracker;
 use phoenix_core::{process_identity::ProcessIdentity, work_scope::ResourceScopeKey};
 
+/// One outer liveness budget for terminal retirement during Close.
+///
+/// Relay authority release and child exit share the same absolute deadline, so
+/// time spent waiting for the relay cannot reset the child-exit budget.
+pub const TERMINAL_CLOSE_RETIREMENT_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(10);
+
 /// Why the current relay should stop.
 ///
 /// `Running` is the initial value on a fresh session. The relay watches for
@@ -590,6 +597,18 @@ impl ActiveTerminals {
         &self,
         permit: &TerminalRetirementPermit,
     ) -> TerminalRetirementOutcome {
+        self.complete_retirement_by(
+            permit,
+            tokio::time::Instant::now() + TERMINAL_CLOSE_RETIREMENT_BUDGET,
+        )
+        .await
+    }
+
+    pub(crate) async fn complete_retirement_by(
+        &self,
+        permit: &TerminalRetirementPermit,
+        deadline: tokio::time::Instant,
+    ) -> TerminalRetirementOutcome {
         let attach_permit = {
             let map = self.0.lock().expect("terminal registry poisoned");
             if !Self::matches_exact_instance(&map, permit) {
@@ -606,11 +625,8 @@ impl ActiveTerminals {
         // Arc that would keep its PTY master open while it waits and reaps. A
         // detached terminal has no relay, so retirement acquires this authority
         // immediately and actively closes the exact current handle's master.
-        let Ok(Ok(relay_authority)) = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            attach_permit.acquire_owned(),
-        )
-        .await
+        let Ok(Ok(relay_authority)) =
+            tokio::time::timeout_at(deadline, attach_permit.acquire_owned()).await
         else {
             return TerminalRetirementOutcome::Residual {
                 reason: "terminal relay did not release after teardown request".to_string(),
@@ -638,26 +654,13 @@ impl ActiveTerminals {
         let child_pid = handle.child_pid;
         handle.close_master_fd();
 
-        let wait_outcome = tokio::task::spawn_blocking(move || {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            loop {
-                match nix::sys::wait::waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG))
-                {
-                    Ok(nix::sys::wait::WaitStatus::StillAlive)
-                        if std::time::Instant::now() < deadline =>
-                    {
-                        std::thread::sleep(std::time::Duration::from_millis(20));
-                    }
-                    Ok(nix::sys::wait::WaitStatus::StillAlive) => return None,
-                    outcome => return Some(outcome),
-                }
-            }
-        })
-        .await;
+        // SIGCHLD is the causal child-exit signal. The timeout is only the
+        // outer Close liveness bound, and it shares the relay deadline above.
+        let wait_outcome = tokio::time::timeout_at(deadline, wait_for_child_exit(child_pid)).await;
         let identity_absent = permit.instance.as_ref().is_none_or(|instance| {
             !phoenix_core::process_identity::process_identity_matches(instance.process_identity())
         });
-        if !matches!(wait_outcome, Ok(Some(Ok(_)))) && !identity_absent {
+        if !matches!(wait_outcome, Ok(Ok(_))) && !identity_absent {
             return TerminalRetirementOutcome::Residual {
                 reason: "terminal child exit was not authoritatively observed; exact handle retained for retry"
                     .to_string(),
@@ -733,6 +736,27 @@ impl ActiveTerminals {
             outcome = ?outcome,
             "terminal: cascade teardown complete"
         );
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_child_exit(child_pid: Pid) -> nix::Result<nix::sys::wait::WaitStatus> {
+    use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+
+    // Register for SIGCHLD before the first observation so an exit between the
+    // check and wait remains visible either as a pending signal or a zombie.
+    let mut child_signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())
+        .map_err(|error| nix::Error::from_raw(error.raw_os_error().unwrap_or(libc::EIO)))?;
+    loop {
+        match waitpid(child_pid, Some(WaitPidFlag::WNOHANG))? {
+            WaitStatus::StillAlive => {
+                let _ = child_signal.recv().await;
+            }
+            outcome @ (WaitStatus::Exited(..)
+            | WaitStatus::Signaled(..)
+            | WaitStatus::Stopped(..)
+            | WaitStatus::Continued(_)) => return Ok(outcome),
+        }
     }
 }
 
