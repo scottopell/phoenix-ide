@@ -137,6 +137,39 @@ describe('NewConversationPage', () => {
     expect(screen.getAllByText('second page').length).toBeGreaterThan(0);
   });
 
+  it('does not let background polling supersede a slow load-more request', async () => {
+    let poll: TimerHandler | undefined;
+    const setInterval = vi.spyOn(window, 'setInterval').mockImplementation((handler) => {
+      poll = handler;
+      return {} as ReturnType<typeof setInterval>;
+    });
+    let resolveSecondPage: ((value: { product_creations: Array<Record<string, unknown>>; next_cursor: null }) => void) | undefined;
+    const secondPage = new Promise<{ product_creations: Array<Record<string, unknown>>; next_cursor: null }>((resolve) => {
+      resolveSecondPage = resolve;
+    });
+    apiMock.listProductConversationCreations
+      .mockResolvedValueOnce({
+        product_creations: [{ request_id: 'one', status: 'failed', cwd: '/one', objective: 'first page', model: null, effort: null, images: [], llm_language: 'English', updated_at: '2026-01-01T00:00:00Z', last_error: null, allowed_actions: ['delete', 'start_over'], published_product_conversation_id: null }],
+        next_cursor: 'cursor-50',
+      })
+      .mockReturnValueOnce(secondPage)
+      .mockResolvedValue({ product_creations: [], next_cursor: null });
+
+    renderPage();
+    fireEvent.click((await screen.findAllByRole('button', { name: 'Load more' })).at(0)!);
+    await waitFor(() => expect(apiMock.listProductConversationCreations).toHaveBeenCalledTimes(2));
+    expect(typeof poll).toBe('function');
+    if (typeof poll === 'function') poll();
+    expect(apiMock.listProductConversationCreations).toHaveBeenCalledTimes(2);
+
+    resolveSecondPage?.({
+      product_creations: [{ request_id: 'two', status: 'failed', cwd: '/two', objective: 'slow second page', model: null, effort: null, images: [], llm_language: 'English', updated_at: '2025-01-01T00:00:00Z', last_error: null, allowed_actions: ['delete', 'start_over'], published_product_conversation_id: null }],
+      next_cursor: null,
+    });
+    expect((await screen.findAllByText('slow second page')).length).toBeGreaterThan(0);
+    setInterval.mockRestore();
+  });
+
   it('start over prefills the composer from a recovery row', async () => {
     apiMock.listProductConversationCreations.mockResolvedValueOnce({
       product_creations: [

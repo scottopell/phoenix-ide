@@ -253,18 +253,17 @@ async fn process_claimed_product_creation(
         let ownership_token = persisted_ownership_token
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        if persisted_ownership_token.is_none()
-            && !manager
-                .db()
-                .record_product_creation_resource_ownership(
-                    &job.request_id,
-                    &claimed.claim,
-                    &planned_path.to_string_lossy(),
-                    &ownership_token,
-                    chrono::Utc::now(),
-                )
-                .await
-                .map_err(|error| error.to_string())?
+        if !manager
+            .db()
+            .record_product_creation_resource_ownership(
+                &job.request_id,
+                &claimed.claim,
+                &planned_path.to_string_lossy(),
+                &ownership_token,
+                chrono::Utc::now(),
+            )
+            .await
+            .map_err(|error| error.to_string())?
         {
             return Err(
                 "product creation claim was lost before materializing worktree".to_string(),

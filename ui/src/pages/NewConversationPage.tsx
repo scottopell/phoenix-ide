@@ -216,8 +216,10 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   const [recoveryNextCursor, setRecoveryNextCursor] = useState<string | null>(null);
   const recoveryRequestSequence = useRef(0);
   const recoveryLoadedPages = useRef(1);
+  const recoveryLoadingMore = useRef(false);
 
   const refreshRecoveryRows = useCallback(async () => {
+    if (recoveryLoadingMore.current) return;
     const sequence = ++recoveryRequestSequence.current;
     try {
       const pages = [];
@@ -238,13 +240,18 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   }, []);
 
   const loadMoreRecoveryRows = useCallback(async () => {
-    if (recoveryNextCursor === null) return;
+    if (recoveryNextCursor === null || recoveryLoadingMore.current) return;
+    recoveryLoadingMore.current = true;
     const sequence = ++recoveryRequestSequence.current;
-    const response = await api.listProductConversationCreations(recoveryNextCursor);
-    if (sequence !== recoveryRequestSequence.current) return;
-    setRecoveryRows((rows) => [...rows, ...response.product_creations]);
-    recoveryLoadedPages.current += 1;
-    setRecoveryNextCursor(response.next_cursor ?? null);
+    try {
+      const response = await api.listProductConversationCreations(recoveryNextCursor);
+      if (sequence !== recoveryRequestSequence.current) return;
+      setRecoveryRows((rows) => [...rows, ...response.product_creations]);
+      recoveryLoadedPages.current += 1;
+      setRecoveryNextCursor(response.next_cursor ?? null);
+    } finally {
+      recoveryLoadingMore.current = false;
+    }
   }, [recoveryNextCursor]);
 
   useEffect(() => {

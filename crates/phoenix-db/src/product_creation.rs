@@ -1306,7 +1306,8 @@ impl Database {
             "UPDATE product_creation_resource_reservations
              SET ownership_token = ?7, updated_at_unix_micros = ?1
              WHERE request_id = ?2 AND generation = ?3 AND resource_identity = ?4
-               AND status = 'reserved' AND ownership_token IS NULL
+               AND status = 'reserved'
+               AND (ownership_token IS NULL OR ownership_token = ?7)
                AND EXISTS (
                    SELECT 1 FROM product_creation_jobs j
                    WHERE j.request_id = ?2 AND j.status = 'claimed'
@@ -2465,6 +2466,84 @@ mod product_creation_tests {
         assert!(exhausted.delivery_retry_at.is_none());
         assert!(!db
             .schedule_product_creation_delivery_retry("req-delivery", &delivery_claim, now)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn persisted_resource_ownership_revalidation_is_fenced_by_live_claim() {
+        let db = Database::open_in_memory().await.unwrap();
+        let now = Utc::now();
+        db.accept_product_creation("req-owner-fence", &intent("/repo/a", "owner fence"))
+            .await
+            .unwrap();
+        let claimed = db
+            .claim_product_creation(
+                "req-owner-fence",
+                "worker",
+                "token",
+                now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let resource = "/repo/a/.phoenix/worktrees/owner-fence";
+        assert!(db
+            .reserve_product_creation_resource(
+                "reservation-owner-fence",
+                "req-owner-fence",
+                &claimed.claim,
+                "/repo/a",
+                resource,
+                now,
+            )
+            .await
+            .unwrap());
+        assert!(db
+            .record_product_creation_resource_ownership(
+                "req-owner-fence",
+                &claimed.claim,
+                resource,
+                "owner-token",
+                now,
+            )
+            .await
+            .unwrap());
+        assert!(db
+            .record_product_creation_resource_ownership(
+                "req-owner-fence",
+                &claimed.claim,
+                resource,
+                "owner-token",
+                now + chrono::Duration::seconds(1),
+            )
+            .await
+            .unwrap());
+
+        assert!(!db
+            .record_product_creation_resource_ownership(
+                "req-owner-fence",
+                &claimed.claim,
+                resource,
+                "different-owner-token",
+                now + chrono::Duration::seconds(1),
+            )
+            .await
+            .unwrap());
+
+        assert!(db
+            .cancel_product_creation("req-owner-fence", now + chrono::Duration::seconds(2))
+            .await
+            .unwrap());
+        assert!(!db
+            .record_product_creation_resource_ownership(
+                "req-owner-fence",
+                &claimed.claim,
+                resource,
+                "owner-token",
+                now + chrono::Duration::seconds(3),
+            )
             .await
             .unwrap());
     }
