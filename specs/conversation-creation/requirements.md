@@ -69,7 +69,7 @@ AND provide full tool access (bash, patch, all tools)
 WHEN a worktree is created for a Git-backed ProductConversation
 THE SYSTEM SHALL place it at `.phoenix/worktrees/{product-conversation-id}/` relative to the
 repository root
-AND ensure `.phoenix/worktrees/` is listed in the repository's `.gitignore`
+AND ensure `.phoenix/` is excluded through the repository's local Git common-directory `info/exclude` file without rewriting the user's tracked `.gitignore`
 
 WHEN two conversations create worktrees for the same GitRepository simultaneously
 THE SYSTEM SHALL create separate directories for each

@@ -109,10 +109,35 @@ pub(crate) fn normalize_product_creation_cwd_intent(
 }
 
 #[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DirectoryIdentity {
+    device: libc::dev_t,
+    inode: libc::ino_t,
+}
+
+#[cfg(unix)]
+fn directory_identity(
+    fd: &impl std::os::fd::AsRawFd,
+) -> Result<DirectoryIdentity, ConversationCwdError> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) } < 0 {
+        return Err(ConversationCwdError::NotAcceptable(format!(
+            "failed to identify selected directory: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok(DirectoryIdentity {
+        device: stat.st_dev,
+        inode: stat.st_ino,
+    })
+}
+
+#[cfg(unix)]
 fn create_relative_directories_without_symlinks(
     canonical_ancestor: &Path,
     suffix: &Path,
-) -> Result<(), ConversationCwdError> {
+) -> Result<DirectoryIdentity, ConversationCwdError> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
@@ -173,7 +198,32 @@ fn create_relative_directories_without_symlinks(
         }
         current = unsafe { OwnedFd::from_raw_fd(next) };
     }
-    Ok(())
+    directory_identity(&current)
+}
+
+#[cfg(unix)]
+fn pathname_directory_identity(path: &Path) -> Result<DirectoryIdentity, ConversationCwdError> {
+    use std::ffi::CString;
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        ConversationCwdError::NotAcceptable("directory path contains a NUL byte".to_string())
+    })?;
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(ConversationCwdError::NotAcceptable(format!(
+            "selected directory path was replaced after creation: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    directory_identity(&fd)
 }
 
 #[cfg(not(unix))]
@@ -241,8 +291,23 @@ pub(crate) fn ensure_product_creation_cwd(
         ));
     }
 
-    create_relative_directories_without_symlinks(&canonical_ancestor, suffix)?;
-    validate_conversation_cwd(raw)
+    #[cfg(unix)]
+    {
+        let created_identity =
+            create_relative_directories_without_symlinks(&canonical_ancestor, suffix)?;
+        let valid = validate_conversation_cwd(raw)?;
+        if pathname_directory_identity(path)? != created_identity {
+            return Err(ConversationCwdError::NotAcceptable(
+                "selected directory path was replaced after creation".to_string(),
+            ));
+        }
+        Ok(valid)
+    }
+    #[cfg(not(unix))]
+    {
+        create_relative_directories_without_symlinks(&canonical_ancestor, suffix)?;
+        validate_conversation_cwd(raw)
+    }
 }
 
 pub(crate) fn validate_conversation_cwd(
@@ -384,6 +449,23 @@ mod tests {
 
         assert!(error.to_string().contains("symlinked segment"));
         assert!(!target.path().join("child").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pathname_identity_detects_replacement_after_descriptor_creation() {
+        let home = tempfile::tempdir().expect("home");
+        let target = home.path().join("selected");
+        let created = create_relative_directories_without_symlinks(
+            &home.path().canonicalize().expect("canonical home"),
+            Path::new("selected"),
+        )
+        .expect("create selected directory");
+        let displaced = home.path().join("displaced");
+        std::fs::rename(&target, &displaced).expect("displace selected directory");
+        std::fs::create_dir(&target).expect("replace selected directory");
+
+        assert_ne!(pathname_directory_identity(&target).unwrap(), created);
     }
 
     #[test]
