@@ -1094,6 +1094,7 @@ fn map_db_not_found(e: DbError) -> AppError {
         }
         other @ (DbError::Sqlx(_)
         | DbError::MessageNotFound(_)
+        | DbError::MessageConflict(_)
         | DbError::SlugExists(_)
         | DbError::ConversationAlreadyExists(_)
         | DbError::Serialization(_)
