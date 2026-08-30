@@ -7835,6 +7835,13 @@ mod migration_094_tests {
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::query(
+            "INSERT INTO messages(message_id, conversation_id, sequence_id, created_at)
+             VALUES ('first-zero', 'c', 0, '2026-08-30T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         for (message_id, sequence_id) in [("a", 1_i64), ("b", 1_i64), ("c", 3_i64)] {
             sqlx::query(
                 "INSERT INTO messages(message_id, conversation_id, sequence_id, created_at)
@@ -7860,7 +7867,12 @@ mod migration_094_tests {
         .unwrap();
         assert_eq!(
             rows,
-            vec![("a".into(), 1), ("c".into(), 3), ("b".into(), 4)]
+            vec![
+                ("first-zero".into(), 0),
+                ("a".into(), 1),
+                ("c".into(), 3),
+                ("b".into(), 4),
+            ]
         );
         assert!(sqlx::query(
             "INSERT INTO messages(message_id, conversation_id, sequence_id, created_at)
@@ -7917,7 +7929,7 @@ FOR EACH ROW
 WHEN NOT EXISTS (SELECT 1 FROM messages WHERE message_id = NEW.message_id)
  AND NEW.sequence_id <= COALESCE((
      SELECT MAX(sequence_id) FROM messages WHERE conversation_id = NEW.conversation_id
- ), 0)
+ ), -1)
 BEGIN
     SELECT RAISE(ABORT, 'message sequence must strictly increase within conversation');
 END;
