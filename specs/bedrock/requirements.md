@@ -624,6 +624,27 @@ state; the one-at-a-time constraint maintains a single writer per worktree.
 
 ---
 
+### REQ-BED-018A: Persisted Prompt Projection Authority
+
+WHEN THE SYSTEM prepares an LLM request for an ordinary conversation turn
+THE SYSTEM SHALL derive provider-visible transcript history only from committed message rows and their committed attachment children
+AND SHALL hydrate one transactionally consistent snapshot of transcript generation, ordered parent rows, and attachment children when the runtime first needs that history
+AND subsequent requests owned by that runtime SHALL read only generation-fenced rows whose conversation-local sequence is greater than the projection cursor
+AND SHALL hydrate attachment children with a constant number of set-based queries independent of transcript length
+AND ordinary append persistence SHALL preserve strictly increasing conversation-local message sequence values
+
+WHEN a prompt-visible row is changed in place, removed, adopted, or transferred between conversations
+THE SYSTEM SHALL atomically advance the transcript generation of every affected source and destination conversation in the same transaction
+AND the next provider request SHALL rebuild from committed authority rather than extend the invalid projection
+
+IF authoritative transcript decoding, snapshot hydration, tail hydration, generation validation, or rebuild fails
+THEN THE SYSTEM SHALL NOT dispatch an LLM request from partial, substituted, or process-local history
+AND SHALL settle any entered requesting transition through its typed LLM error path
+
+**Rationale:** Provider prompts are durable decisions. A bounded projection avoids repeated full-history reads without letting runtime caches become a second transcript authority, and generation fencing makes non-append mutation fail closed.
+
+---
+
 ### REQ-BED-019: Context Continuation Threshold
 
 WHEN LLM response indicates context usage >= 90% of model's context window
@@ -649,6 +670,8 @@ AND the request SHALL describe any tools that were requested but not executed, i
 AND the request SHALL preserve the prior tool history as text rather than discarding it
 AND the request SHALL be bounded to fit the context window and any request-shape limits declared by the selected provider route
 AND bounded history SHALL retain a contiguous newest suffix and begin with a user-role message when non-empty
+AND the continuation request SHALL freeze the current member conversation's persisted prompt projection before provider work begins
+AND SHALL compact that current member's history rather than flattening all ProductConversation transcript members into one aggregate prompt
 AND the system SHALL persist a stable operation identity and the retry inputs before requesting the summary
 
 IF continuation summary generation is interrupted by process restart
@@ -670,7 +693,7 @@ THE SYSTEM SHALL reject the request as an invalid cancellation state
 AND SHALL NOT abort the in-flight continuation request
 AND SHALL remain awaiting the continuation summary
 
-**Rationale:** The summary's consumer is a fresh agent that restarts cold in the same worktree, so it is framed as an operational handoff — exact paths, repo state, and an honest verified-vs-assumed split — rather than a human-facing recap, and completeness is favored over brevity. Describing rejected tool calls with their arguments tells the next agent what was about to run, not merely which tool type. The prior tool history is flattened to text rather than deleted so the summary can draw on the actual work record, and the request is bounded to fit the window so it cannot overflow. An empty summary would silently seed a blank continuation, so it is treated as a recoverable failure. Stable operation identity permits provider calls to be retried while summary commit and continuation remain exactly once.
+**Rationale:** The summary's consumer is a fresh agent that restarts cold in the same worktree, so it is framed as an operational handoff — exact paths, repo state, and an honest verified-vs-assumed split — rather than a human-facing recap, and completeness is favored over brevity. Describing rejected tool calls with their arguments tells the next agent what was about to run, not merely which tool type. The current member's prior tool history is rendered as text rather than deleted so the summary can draw on the actual work record, while generation fencing prevents later appends from leaking into an already-frozen request and bounded suffix selection prevents overflow. An empty summary would silently seed a blank continuation, so it is treated as a recoverable failure. Stable operation identity permits provider calls to be retried while summary commit and continuation remain exactly once.
 
 ---
 
@@ -1037,6 +1060,7 @@ AND SHALL NOT substitute a ProductConversation identity for a transcript-row ide
 AND SHALL require every durable conversation row to explicitly belong to exactly one ProductConversation
 AND SHALL distinguish parent transcript rows from subordinate execution participants within that aggregate
 AND SHALL derive root and latest parent transcript rows from the continuation topology within the ProductConversation rather than storing either as a second mutable aggregate authority
+AND SHALL keep provider prompt projection authority scoped to each current parent transcript row rather than deriving one flattened aggregate transcript
 
 WHEN a parent transcript row has a continuation successor
 THE SYSTEM SHALL require that successor to be a parent transcript row in the same ProductConversation

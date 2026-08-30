@@ -2840,6 +2840,18 @@ impl WakeRepository {
             }
         }
 
+        if !input.exact_pending_delivery_ids.is_empty() {
+            sqlx::query(
+                "UPDATE conversations
+                 SET transcript_generation = transcript_generation + 1
+                 WHERE id IN (?1, ?2)",
+            )
+            .bind(&input.from_conversation_id)
+            .bind(&input.to_conversation_id)
+            .execute(&mut *tx.tx)
+            .await?;
+        }
+
         tx.commit().await?;
         Ok(WakeTransferOutcome::Transferred)
     }
@@ -3304,6 +3316,17 @@ impl WakeRepository {
                 .bind(&link.linked_message.message.message_id)
                 .execute(&mut *tx.tx)
                 .await?;
+        }
+
+        if !links.is_empty() {
+            sqlx::query(
+                "UPDATE conversations
+                 SET transcript_generation = transcript_generation + 1
+                 WHERE id = ?1",
+            )
+            .bind(conversation_id)
+            .execute(&mut *tx.tx)
+            .await?;
         }
 
         tx.commit().await?;
@@ -6029,6 +6052,27 @@ mod tests {
         };
         assert!(adopted.auto_resume);
         assert_eq!(adopted.links.len(), 1);
+        let generation = sqlx::query_scalar::<_, i64>(
+            "SELECT transcript_generation FROM conversations WHERE id = 'conv-1'",
+        )
+        .fetch_one(&repo.workflow_repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            generation, 2,
+            "adoption invalidates an active prompt projection"
+        );
+        let adopted_row = sqlx::query_as::<_, (String, String)>(
+            "SELECT content, display_data FROM messages WHERE conversation_id = 'conv-1'",
+        )
+        .fetch_one(&repo.workflow_repo.pool)
+        .await
+        .unwrap();
+        assert!(adopted_row.0.contains("wake complete"));
+        assert!(
+            adopted_row.1.contains("\\\"adopted\\\":true")
+                || adopted_row.1.contains("\"adopted\":true")
+        );
         let state_json =
             sqlx::query_scalar::<_, String>("SELECT state FROM conversations WHERE id = 'conv-1'")
                 .fetch_one(&repo.workflow_repo.pool)
@@ -9013,6 +9057,31 @@ mod tests {
         assert_eq!(link_owner, "conv-2");
         assert_eq!(message_owner, "conv-2");
         assert_eq!(locator_owner, "conv-2");
+        let generations = sqlx::query_as::<_, (String, i64)>(
+            "SELECT id, transcript_generation FROM conversations
+             WHERE id IN ('conv-1', 'conv-2') ORDER BY id",
+        )
+        .fetch_all(&repo.workflow_repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            generations,
+            vec![("conv-1".into(), 2), ("conv-2".into(), 2)]
+        );
+        let source_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM messages WHERE conversation_id = 'conv-1'",
+        )
+        .fetch_one(&repo.workflow_repo.pool)
+        .await
+        .unwrap();
+        let destination_content = sqlx::query_scalar::<_, String>(
+            "SELECT content FROM messages WHERE conversation_id = 'conv-2'",
+        )
+        .fetch_one(&repo.workflow_repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(source_count, 0);
+        assert!(destination_content.contains("wake complete"));
     }
 
     #[tokio::test]

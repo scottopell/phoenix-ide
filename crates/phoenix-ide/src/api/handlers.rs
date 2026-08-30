@@ -10159,18 +10159,21 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("insert ceiling message");
         }
         if matches!(kind, CeilingFixture::Over) {
+            let next_sequence = i64::try_from(MAX_RENDER_UNIT_ALIGNED_RESPONSE_MESSAGES)
+                .expect("fixture size fits i64")
+                + 1;
             sqlx::query(
                 "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )
             .bind(format!("{conversation_id}-first"))
             .bind(conversation_id)
-            .bind(0_i64)
+            .bind(next_sequence)
             .bind(first_type)
             .bind(first_json)
             .bind("2025-01-01T00:00:00Z")
             .execute(&mut *tx)
             .await
-            .expect("insert over-ceiling first message");
+            .expect("insert over-ceiling final message");
         }
         tx.commit().await.expect("commit fixture load");
         state

@@ -485,6 +485,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "persist_product_creation_resource_ownership",
         sql: MIGRATION_093,
     },
+    Migration {
+        version: 94,
+        name: "enforce_monotonic_message_sequences",
+        sql: MIGRATION_094,
+    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -7799,6 +7804,122 @@ BEGIN
         WHERE work_scope_id = NEW.work_scope_id
           AND product_conversation_id = NEW.product_conversation_id
     ) THEN RAISE(ABORT, 'work scope belongs to a different ordinary product conversation') END;
+END;
+";
+
+#[cfg(test)]
+mod migration_094_tests {
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    #[tokio::test]
+    async fn preserves_duplicate_rows_then_enforces_unique_monotonic_sequences() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE conversations (id TEXT PRIMARY KEY NOT NULL);
+             CREATE TABLE messages (
+                message_id TEXT PRIMARY KEY NOT NULL,
+                conversation_id TEXT NOT NULL,
+                sequence_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+             );",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO conversations(id) VALUES ('c')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for (message_id, sequence_id) in [("a", 1_i64), ("b", 1_i64), ("c", 3_i64)] {
+            sqlx::query(
+                "INSERT INTO messages(message_id, conversation_id, sequence_id, created_at)
+                 VALUES (?1, 'c', ?2, '2026-08-30T00:00:00Z')",
+            )
+            .bind(message_id)
+            .bind(sequence_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        sqlx::query(super::MIGRATION_094)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let rows = sqlx::query_as::<_, (String, i64)>(
+            "SELECT message_id, sequence_id FROM messages
+             WHERE conversation_id = 'c' ORDER BY sequence_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![("a".into(), 1), ("c".into(), 3), ("b".into(), 4)]
+        );
+        assert!(sqlx::query(
+            "INSERT INTO messages(message_id, conversation_id, sequence_id, created_at)
+             VALUES ('duplicate', 'c', 4, '2026-08-30T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            "INSERT INTO messages(message_id, conversation_id, sequence_id, created_at)
+             VALUES ('regressing', 'c', 2, '2026-08-30T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+    }
+}
+
+const MIGRATION_094: &str = r"
+-- Released databases could contain duplicate conversation-local sequences because
+-- message_id was the only uniqueness constraint. Preserve every row and move only
+-- later duplicate identities above that conversation's prior maximum.
+WITH ranked AS (
+    SELECT message_id, conversation_id, sequence_id,
+           ROW_NUMBER() OVER (
+               PARTITION BY conversation_id, sequence_id
+               ORDER BY created_at, message_id
+           ) AS same_sequence_rank,
+           MAX(sequence_id) OVER (PARTITION BY conversation_id) AS prior_max
+    FROM messages
+), duplicates AS (
+    SELECT message_id, prior_max,
+           ROW_NUMBER() OVER (
+               PARTITION BY conversation_id
+               ORDER BY sequence_id, same_sequence_rank, message_id
+           ) AS duplicate_rank
+    FROM ranked
+    WHERE same_sequence_rank > 1
+)
+UPDATE messages
+SET sequence_id = (
+    SELECT prior_max + duplicate_rank FROM duplicates
+    WHERE duplicates.message_id = messages.message_id
+)
+WHERE message_id IN (SELECT message_id FROM duplicates);
+
+DROP INDEX IF EXISTS idx_messages_conversation;
+CREATE UNIQUE INDEX messages_conversation_sequence
+ON messages(conversation_id, sequence_id);
+
+CREATE TRIGGER messages_require_increasing_sequence
+BEFORE INSERT ON messages
+FOR EACH ROW
+WHEN NOT EXISTS (SELECT 1 FROM messages WHERE message_id = NEW.message_id)
+ AND NEW.sequence_id <= COALESCE((
+     SELECT MAX(sequence_id) FROM messages WHERE conversation_id = NEW.conversation_id
+ ), 0)
+BEGIN
+    SELECT RAISE(ABORT, 'message sequence must strictly increase within conversation');
 END;
 ";
 

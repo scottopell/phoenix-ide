@@ -4,7 +4,7 @@
 
 Bedrock provides the core conversation state machine for PhoenixIDE. Users interact with an LLM agent through a reliable, predictable execution model: messages move through explicit idle, LLM, tool, cancellation, error, continuation, and approval states; tools execute serially; cancellation synthesizes tool results when needed to preserve transcript/API integrity; retryable versus non-retryable failures stay distinct; and committed transcript history survives restarts.
 
-Current normative authority is `requirements.md` for timeless rules and `bedrock.allium` for precise lifecycle/state-machine behavior. ADR-026 records lifecycle-versus-WorkScope ownership; ADR-031 records first-class ProductConversation persistence and its staged single-authority cutover; ADR-032 retires Project authority and leaves repository context derived through the attached WorkScope; ADR-036 records process fail-stop when local SQLite authority cannot be established.
+Current normative authority is `requirements.md` for timeless rules and `bedrock.allium` for precise lifecycle/state-machine behavior. Persisted provider prompts use one strict, generation-fenced database projection per current transcript member; continuation freezes that same authority before provider work. ADR-026 records lifecycle-versus-WorkScope ownership; ADR-031 records first-class ProductConversation persistence and its staged single-authority cutover; ADR-032 retires Project authority and leaves repository context derived through the attached WorkScope; ADR-036 records process fail-stop when local SQLite authority cannot be established.
 
 ## Current Reality
 
@@ -36,8 +36,9 @@ Implements Elm Architecture with a typed-effect executor boundary. The SM has tw
 | **REQ-BED-016:** Mode Downgrade | ⏭️ Deprecated | Replaced by work-lifecycle REQ-WL-002/REQ-WL-001. Mode return now tied to task merge or abandon |
 | **REQ-BED-017:** Mode Communication | ✅ Complete | Mode-aware tool errors in the tool-registry builder; the system prompt directs Explore agents to `propose_task` |
 | **REQ-BED-018:** Sub-Agent Mode Enforcement | ✅ Complete | Sub-agent tool sets are restricted by the tool-registry builder (tested); sub-agents inherit the parent worktree |
+| **REQ-BED-018A:** Persisted Prompt Projection Authority | ✅ Complete | Strict transactionally hydrated snapshots, generation-fenced bounded tails, constant-shape child hydration, monotonic append enforcement, and fail-closed typed dispatch errors; wake adoption/transfer invalidate each affected member |
 | **REQ-BED-019:** Context Continuation Threshold | ✅ Complete | Check at 90%, reject tools, trigger continuation |
-| **REQ-BED-020:** Continuation Summary Generation | ✅ Complete | Durable operation identity, restart resume, transient retry, recoverable failure, atomic idempotent commit |
+| **REQ-BED-020:** Continuation Summary Generation | ✅ Complete | Durable operation identity and commit; current-member persisted projection freezes before provider spawn while preserving stale-tool clearing, bounded fitting, restart resume, transient retry, and recoverable failure |
 | **REQ-BED-021:** Context Exhausted State | ✅ Complete | Read-only terminal state |
 | **REQ-BED-022:** Model-Specific Context Limits | ✅ Complete | Per-model thresholds, conservative default |
 | **REQ-BED-023:** Context Warning Indicator | ✅ Complete | 80% warning, manual trigger option |

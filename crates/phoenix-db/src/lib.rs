@@ -10,6 +10,11 @@ mod message_attachments;
 mod migrations;
 mod product_creation;
 pub use product_creation::*;
+mod prompt_projection;
+pub use prompt_projection::{
+    HydratedPromptSnapshot, HydratedPromptTail, PersistedMessageSequence,
+    PromptTranscriptGeneration,
+};
 mod product_conversation_read;
 pub mod retrieval;
 mod sqlite_native_statement;
@@ -10621,6 +10626,85 @@ impl Database {
         Ok(rows)
     }
 
+    /// Read the durable generation and complete hydrated prompt transcript from
+    /// one `SQLite` read transaction. This is the only full-history load used by
+    /// an active runtime prompt projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the conversation does not exist, durable rows are
+    /// malformed, or the consistent read cannot complete.
+    pub async fn load_hydrated_prompt_snapshot(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<HydratedPromptSnapshot> {
+        let mut tx = self.pool.begin().await?;
+        let generation: Option<i64> =
+            sqlx::query_scalar("SELECT transcript_generation FROM conversations WHERE id = ?1")
+                .bind(conversation_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let generation = generation
+            .ok_or_else(|| DbError::ConversationNotFound(conversation_id.to_string()))
+            .and_then(PromptTranscriptGeneration::from_persisted)?;
+        let mut messages = sqlx::query(
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+             FROM messages WHERE conversation_id = ?1 ORDER BY sequence_id ASC",
+        )
+        .bind(conversation_id)
+        .try_map(parse_prompt_message_row)
+        .fetch_all(&mut *tx)
+        .await?;
+        hydrate_attachments_conn(&mut tx, &mut messages).await?;
+        let snapshot = HydratedPromptSnapshot::try_new(conversation_id, generation, messages)?;
+        tx.commit().await?;
+        Ok(snapshot)
+    }
+
+    /// Read a hydrated prompt tail after `cursor`, fenced by the transcript
+    /// generation, from one `SQLite` read transaction. A generation mismatch is
+    /// a typed invalidation and never returns rows from the new generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the conversation does not exist, durable rows are
+    /// malformed, or the consistent read cannot complete.
+    pub async fn load_hydrated_prompt_tail(
+        &self,
+        conversation_id: &str,
+        expected_generation: PromptTranscriptGeneration,
+        cursor: PersistedMessageSequence,
+    ) -> DbResult<HydratedPromptTail> {
+        let mut tx = self.pool.begin().await?;
+        let current_generation: Option<i64> =
+            sqlx::query_scalar("SELECT transcript_generation FROM conversations WHERE id = ?1")
+                .bind(conversation_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let current_generation = current_generation
+            .ok_or_else(|| DbError::ConversationNotFound(conversation_id.to_string()))
+            .and_then(PromptTranscriptGeneration::from_persisted)?;
+        if current_generation != expected_generation {
+            tx.commit().await?;
+            return Ok(HydratedPromptTail::invalidated(current_generation));
+        }
+        let mut messages = sqlx::query(
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+             FROM messages
+             WHERE conversation_id = ?1 AND sequence_id > ?2
+             ORDER BY sequence_id ASC",
+        )
+        .bind(conversation_id)
+        .bind(cursor.value())
+        .try_map(parse_prompt_message_row)
+        .fetch_all(&mut *tx)
+        .await?;
+        hydrate_attachments_conn(&mut tx, &mut messages).await?;
+        let tail = HydratedPromptTail::try_current(conversation_id, cursor, messages)?;
+        tx.commit().await?;
+        Ok(tail)
+    }
+
     /// Get the exact projection consumed by runtime recovery: the newest agent
     /// plus the suffix beginning at the newest user or skill boundary. If no
     /// boundary exists, returns the full pre-turn transcript.
@@ -12752,14 +12836,20 @@ async fn insert_message_tx(
     .execute(&mut **tx)
     .await?;
     if inserted.rows_affected() == 0 {
-        let mut existing = sqlx::query(
+        let Some(mut existing) = sqlx::query(
             "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
              FROM messages WHERE message_id = ?1",
         )
         .bind(&msg.message_id)
         .try_map(parse_message_row)
-        .fetch_one(&mut **tx)
-        .await?;
+        .fetch_optional(&mut **tx)
+        .await?
+        else {
+            return Err(DbError::Serialization(format!(
+                "message sequence {} conflicts within conversation {}",
+                msg.sequence_id, msg.conversation_id
+            )));
+        };
         message_attachments::hydrate(tx, std::slice::from_mut(&mut existing)).await?;
         let exact = existing.message_id == msg.message_id
             && existing.conversation_id == msg.conversation_id
@@ -12999,7 +13089,60 @@ fn is_adopted_wake_result_message(message: &Message) -> bool {
         })
 }
 
-/// Parse a message row from the database
+fn prompt_decode_error(error: impl std::fmt::Display) -> sqlx::Error {
+    sqlx::Error::Decode(Box::new(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        error.to_string(),
+    )))
+}
+
+/// Strict decoder used only at the provider-authority boundary. UI and recovery
+/// readers retain their tolerant decoder, but malformed provider-visible rows
+/// must prevent dispatch rather than fabricate substitute content or times.
+#[allow(clippy::needless_pass_by_value)]
+fn parse_prompt_message_row(row: SqliteRow) -> Result<Message, sqlx::Error> {
+    let message_type_text: String = row.try_get("message_type")?;
+    let message_type: MessageType = serde_json::from_value(serde_json::Value::String(
+        message_type_text.clone(),
+    ))
+    .map_err(|error| {
+        prompt_decode_error(format!(
+            "invalid message_type {message_type_text:?}: {error}"
+        ))
+    })?;
+    let content_text: String = row.try_get("content")?;
+    let content_value = serde_json::from_str(&content_text)
+        .map_err(|error| prompt_decode_error(format!("invalid message content JSON: {error}")))?;
+    let content = MessageContent::from_stored_json(message_type, content_value)
+        .map_err(|error| prompt_decode_error(format!("invalid typed message content: {error}")))?;
+    let display_data = row
+        .try_get::<Option<String>, _>("display_data")?
+        .map(|value| serde_json::from_str(&value))
+        .transpose()
+        .map_err(|error| prompt_decode_error(format!("invalid display_data JSON: {error}")))?;
+    let usage_data = row
+        .try_get::<Option<String>, _>("usage_data")?
+        .map(|value| serde_json::from_str(&value))
+        .transpose()
+        .map_err(|error| prompt_decode_error(format!("invalid usage_data JSON: {error}")))?;
+    let created_at_text: String = row.try_get("created_at")?;
+    let created_at = DateTime::parse_from_rfc3339(&created_at_text)
+        .map_err(|error| prompt_decode_error(format!("invalid created_at: {error}")))?
+        .with_timezone(&Utc);
+
+    Ok(Message {
+        message_id: row.try_get("message_id")?,
+        conversation_id: row.try_get("conversation_id")?,
+        sequence_id: row.try_get("sequence_id")?,
+        message_type,
+        content,
+        display_data,
+        usage_data,
+        created_at,
+    })
+}
+
+/// Tolerant decoder for UI and recovery readers.
 #[allow(clippy::needless_pass_by_value)] // sqlx try_map passes rows by value
 fn parse_message_row(row: SqliteRow) -> Result<Message, sqlx::Error> {
     let msg_type = parse_message_type(&row.try_get::<String, _>("message_type")?);
@@ -17835,6 +17978,328 @@ mod tests {
         let twenty_seven = measured_history_attachment_reads(27).await;
 
         assert_eq!((zero, eight, twenty_seven), (2, 2, 2));
+    }
+
+    #[tokio::test]
+    async fn message_sequences_reject_duplicates_and_regressions() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("monotonic", "monotonic", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.add_message_with_seq(
+            "first",
+            "monotonic",
+            7,
+            &MessageContent::user("first"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        for (id, sequence) in [("duplicate", 7), ("regression", 6)] {
+            let error = db
+                .add_message_with_seq(
+                    id,
+                    "monotonic",
+                    sequence,
+                    &MessageContent::user(id),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("strictly increase"));
+        }
+        assert_eq!(db.get_messages("monotonic").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn authoritative_prompt_snapshot_fails_closed_on_corrupt_row() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("corrupt", "corrupt", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.add_message_with_seq(
+            "corrupt-row",
+            "corrupt",
+            1,
+            &MessageContent::user("valid before corruption"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE messages SET content = '{not-json' WHERE message_id = 'corrupt-row'")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let error = db
+            .load_hydrated_prompt_snapshot("corrupt")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("invalid message content JSON"));
+        assert_eq!(db.get_messages("corrupt").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn prompt_snapshot_transaction_keeps_generation_parents_and_attachments_consistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prompt-snapshot.db");
+        let writer = Database::open(path.to_str().unwrap()).await.unwrap();
+        migrations::run_pending_migrations(writer.pool())
+            .await
+            .unwrap();
+        writer
+            .create_conversation("snapshot-tx", "snapshot-tx", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        writer
+            .add_message_with_seq(
+                "old-parent",
+                "snapshot-tx",
+                1,
+                &MessageContent::user_with_attachments(
+                    "old parent",
+                    vec![image_attachment("old-image")],
+                    vec![file_attachment("old-file")],
+                ),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let reader = Database::open(path.to_str().unwrap()).await.unwrap();
+
+        let mut read_tx = reader.pool.begin().await.unwrap();
+        let generation = sqlx::query_scalar::<_, i64>(
+            "SELECT transcript_generation FROM conversations WHERE id = 'snapshot-tx'",
+        )
+        .fetch_one(&mut *read_tx)
+        .await
+        .unwrap();
+        assert_eq!(generation, 1);
+
+        // The first read fixes the WAL snapshot. A separate connection now
+        // commits a provider-visible mutation plus an append with children.
+        writer
+            .update_message_display_data("old-parent", &serde_json::json!({"mutated": true}))
+            .await
+            .unwrap();
+        writer
+            .add_message_with_seq(
+                "new-parent",
+                "snapshot-tx",
+                2,
+                &MessageContent::user_with_attachments(
+                    "new parent",
+                    vec![image_attachment("new-image")],
+                    vec![file_attachment("new-file")],
+                ),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut parents = sqlx::query(
+            "SELECT message_id, conversation_id, sequence_id, message_type, content,
+                    display_data, usage_data, created_at
+             FROM messages WHERE conversation_id = 'snapshot-tx' ORDER BY sequence_id",
+        )
+        .try_map(parse_prompt_message_row)
+        .fetch_all(&mut *read_tx)
+        .await
+        .unwrap();
+        hydrate_attachments_conn(&mut read_tx, &mut parents)
+            .await
+            .unwrap();
+        read_tx.commit().await.unwrap();
+
+        assert_eq!(parents.len(), 1);
+        assert_eq!(parents[0].message_id, "old-parent");
+        assert!(parents[0].display_data.is_none());
+        let (images, files) = parents[0].content.attachments();
+        assert_eq!((images.len(), files.len()), (1, 1));
+
+        let rebuilt = reader
+            .load_hydrated_prompt_snapshot("snapshot-tx")
+            .await
+            .unwrap();
+        assert_eq!(rebuilt.generation().value(), 2);
+        assert_eq!(rebuilt.messages().len(), 2);
+        assert!(rebuilt.messages()[0].display_data.is_some());
+    }
+
+    #[tokio::test]
+    async fn hydrated_prompt_snapshot_and_tails_are_generation_fenced_and_gap_tolerant() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("prompt-tail", "prompt-tail", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        for (sequence, text) in [(2, "two"), (9, "nine")] {
+            db.add_message_with_seq(
+                &format!("message-{sequence}"),
+                "prompt-tail",
+                sequence,
+                &MessageContent::user(text),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let snapshot = db
+            .load_hydrated_prompt_snapshot("prompt-tail")
+            .await
+            .unwrap();
+        assert_eq!(snapshot.generation().value(), 1);
+        assert_eq!(snapshot.cursor().value(), 9);
+        assert_eq!(
+            snapshot
+                .messages()
+                .iter()
+                .map(|message| message.sequence_id)
+                .collect::<Vec<_>>(),
+            vec![2, 9]
+        );
+
+        let empty = db
+            .load_hydrated_prompt_tail("prompt-tail", snapshot.generation(), snapshot.cursor())
+            .await
+            .unwrap();
+        let HydratedPromptTail::Current(rows) = empty else {
+            panic!("unchanged generation must return a current tail");
+        };
+        assert_eq!(rows.cursor().value(), 9);
+        assert!(rows.messages().is_empty());
+
+        for (sequence, text) in [(14, "fourteen"), (27, "twenty-seven")] {
+            db.add_message_with_seq(
+                &format!("message-{sequence}"),
+                "prompt-tail",
+                sequence,
+                &MessageContent::user(text),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let appended = db
+            .load_hydrated_prompt_tail("prompt-tail", snapshot.generation(), snapshot.cursor())
+            .await
+            .unwrap();
+        let HydratedPromptTail::Current(rows) = appended else {
+            panic!("ordinary appends must not invalidate the generation");
+        };
+        let (cursor, messages) = rows.into_parts();
+        assert_eq!(cursor.value(), 27);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.sequence_id)
+                .collect::<Vec<_>>(),
+            vec![14, 27]
+        );
+        let once = db
+            .load_hydrated_prompt_tail("prompt-tail", snapshot.generation(), cursor)
+            .await
+            .unwrap();
+        assert!(matches!(
+            once,
+            HydratedPromptTail::Current(rows) if rows.messages().is_empty()
+        ));
+
+        db.update_message_display_data("message-2", &serde_json::json!({"adopted": true}))
+            .await
+            .unwrap();
+        let invalidated = db
+            .load_hydrated_prompt_tail("prompt-tail", snapshot.generation(), cursor)
+            .await
+            .unwrap();
+        assert!(matches!(
+            invalidated,
+            HydratedPromptTail::Invalidated(current_generation) if current_generation.value() == 2
+        ));
+    }
+
+    #[tokio::test]
+    async fn steady_state_prompt_tail_has_constant_statement_shape_and_no_full_history_read() {
+        async fn measure(user_count: usize) -> (u64, u64) {
+            let db = Database::open_in_memory().await.unwrap();
+            let conversation_id = format!("projection-shape-{user_count}");
+            db.create_conversation(&conversation_id, &conversation_id, "/tmp", true, None, None)
+                .await
+                .unwrap();
+            for index in 0..user_count {
+                db.add_message_with_seq(
+                    &format!("history-{index}"),
+                    &conversation_id,
+                    i64::try_from(index + 1).unwrap(),
+                    &MessageContent::user_with_attachments(
+                        format!("history {index}"),
+                        vec![image_attachment(&format!("image-{index}"))],
+                        vec![file_attachment(&format!("file-{index}"))],
+                    ),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            }
+            let before_snapshot = native_read_statements(&db);
+            let snapshot = db
+                .load_hydrated_prompt_snapshot(&conversation_id)
+                .await
+                .unwrap();
+            let after_snapshot = native_read_statements(&db);
+            db.add_message_with_seq(
+                "new-tail-row",
+                &conversation_id,
+                i64::try_from(user_count + 1).unwrap(),
+                &MessageContent::user_with_attachments(
+                    "new tail row",
+                    vec![image_attachment("tail-image")],
+                    vec![file_attachment("tail-file")],
+                ),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let before_tail = native_read_statements(&db);
+            let tail = db
+                .load_hydrated_prompt_tail(
+                    &conversation_id,
+                    snapshot.generation(),
+                    snapshot.cursor(),
+                )
+                .await
+                .unwrap();
+            let HydratedPromptTail::Current(rows) = tail else {
+                panic!("append must return a current tail");
+            };
+            assert_eq!(rows.messages().len(), 1);
+            assert_eq!(rows.messages()[0].message_id, "new-tail-row");
+            let (images, files) = rows.messages()[0].content.attachments();
+            assert_eq!((images.len(), files.len()), (1, 1));
+            let after_tail = native_read_statements(&db);
+            (after_snapshot - before_snapshot, after_tail - before_tail)
+        }
+
+        let zero = measure(0).await;
+        let eight = measure(8).await;
+        let twenty_seven = measure(27).await;
+        for (snapshot_reads, tail_reads) in [zero, eight, twenty_seven] {
+            assert_eq!(snapshot_reads, 4);
+            assert!(
+                (4..=5).contains(&tail_reads),
+                "tail read shape must remain bounded, got {tail_reads}"
+            );
+        }
     }
 
     #[tokio::test]
