@@ -8192,13 +8192,15 @@ where
         let blocking_admission = admitted.reborrow();
         let result =
             crate::runtime::creation_worker::run_admitted_blocking(blocking_admission, move || {
-                execute_approve_task_blocking(
+                execute_approve_task_blocking_reviewed(
                     &cwd,
                     &repo_root,
                     &worktree_identity,
                     &tasks_dir_name,
                     &task_file,
                     &title,
+                    priority,
+                    &plan,
                     desired_base_branch.as_deref(),
                 )
             })
@@ -8217,7 +8219,7 @@ where
                             priority: priority_backup,
                             plan: plan_backup.clone(),
                             task_file: task_file_backup.clone(),
-                            artifact_body: plan_backup.clone(),
+                            artifact_body: approval_result.artifact_body.clone(),
                         },
                     )
                     .await?;
@@ -8451,6 +8453,7 @@ where
 }
 
 /// Result of a successful task approval
+#[derive(Debug)]
 struct TaskApprovalResult {
     task_id: String,
     task_title: String,
@@ -8460,6 +8463,8 @@ struct TaskApprovalResult {
     worktree_path: String,
     /// The branch that was checked out when the task was approved (merge target)
     base_branch: String,
+    /// Exact reviewed bytes revalidated before any Git side effect.
+    artifact_body: String,
 }
 
 #[derive(Debug)]
@@ -8534,8 +8539,29 @@ fn reread_reviewed_task_handoff_snapshot(
     expected_plan: &str,
 ) -> Result<ReviewedTaskHandoffSnapshot, String> {
     let path = cwd.join(task_file);
-    let body = std::fs::read_to_string(&path)
-        .map_err(|error| format!("Failed to read reviewed task file '{task_file}': {error}"))?;
+    let body = match std::fs::read_to_string(&path) {
+        Ok(body) => body,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let filename = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| format!("task_file has no filename component: '{task_file}'"))?;
+            let parsed = taskmd_core::filename::parse_filename(filename).ok_or_else(|| {
+                format!("Failed to read reviewed task file '{task_file}': {error}")
+            })?;
+            let promoted = path.with_file_name(format!(
+                "{}-{}-in-progress--{}.md",
+                parsed.id, parsed.priority, parsed.slug
+            ));
+            std::fs::read_to_string(promoted)
+                .map_err(|_| format!("Failed to read reviewed task file '{task_file}': {error}"))?
+        }
+        Err(error) => {
+            return Err(format!(
+                "Failed to read reviewed task file '{task_file}': {error}"
+            ))
+        }
+    };
     if body != expected_plan {
         return Err(format!(
             "Reviewed task file '{task_file}' no longer matches the approved plan. Reject and re-approve the updated artifact."
@@ -10379,27 +10405,18 @@ fn detect_plain_markdown_task_stem(task_file: &str) -> Option<String> {
 ///
 /// `cwd` is the Explore worktree; `repo_root` is the git repository root, used
 /// for the canonical worktree path `{repo_root}/.phoenix/worktrees/{conv_id}`.
-fn execute_approve_task_blocking(
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn execute_approve_task_blocking_reviewed(
     cwd: &std::path::Path,
     repo_root: &std::path::Path,
     conv_id: &str,
     tasks_dir_name: &str,
     task_file: &str,
     title: &str,
+    priority: crate::task_source::Priority,
+    reviewed_artifact: &str,
     desired_base_branch: Option<&str>,
 ) -> Result<TaskApprovalResult, String> {
-    if let Some(stem) = detect_plain_markdown_task_stem(task_file) {
-        return execute_approve_plain_markdown_blocking(
-            cwd,
-            repo_root,
-            conv_id,
-            task_file,
-            &stem,
-            title,
-            desired_base_branch,
-        );
-    }
-
     let _guard = TASK_APPROVAL_MUTEX
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -10412,6 +10429,28 @@ fn execute_approve_task_blocking(
              Reject the plan and ask the agent to propose again — it will \
              draft a task file under {tasks_dir_name}/ this time."
         ));
+    }
+
+    let reviewed = reread_reviewed_task_handoff_snapshot(
+        cwd,
+        repo_root,
+        tasks_dir_name,
+        task_file,
+        title,
+        priority,
+        reviewed_artifact,
+    )?;
+    if let Some(stem) = detect_plain_markdown_task_stem(task_file) {
+        return execute_approve_plain_markdown_blocking(
+            cwd,
+            repo_root,
+            conv_id,
+            task_file,
+            &stem,
+            title,
+            desired_base_branch,
+            reviewed.artifact_body,
+        );
     }
 
     let base_branch = resolve_approval_base_branch(cwd, repo_root, desired_base_branch)?;
@@ -10492,7 +10531,61 @@ fn execute_approve_task_blocking(
         first_task: false,
         worktree_path: worktree_path_str,
         base_branch,
+        artifact_body: reviewed.artifact_body,
     })
+}
+
+#[cfg(test)]
+fn execute_approve_task_blocking(
+    cwd: &std::path::Path,
+    repo_root: &std::path::Path,
+    conv_id: &str,
+    tasks_dir_name: &str,
+    task_file: &str,
+    title: &str,
+    desired_base_branch: Option<&str>,
+) -> Result<TaskApprovalResult, String> {
+    let artifact_body = reread_reviewed_task_handoff_snapshot(
+        cwd,
+        repo_root,
+        tasks_dir_name,
+        task_file,
+        title,
+        std::path::Path::new(task_file)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(crate::task_source::TaskSource::detect)
+            .map_or(crate::task_source::Priority::P2, |source| source.priority()),
+        &std::fs::read_to_string(cwd.join(task_file)).unwrap_or_else(|_| {
+            let filename = std::path::Path::new(task_file)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap();
+            let parsed = taskmd_core::filename::parse_filename(filename).unwrap();
+            std::fs::read_to_string(cwd.join(tasks_dir_name).join(format!(
+                "{}-{}-in-progress--{}.md",
+                parsed.id, parsed.priority, parsed.slug
+            )))
+            .unwrap()
+        }),
+    )?
+    .artifact_body;
+    let priority = std::path::Path::new(task_file)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(crate::task_source::TaskSource::detect)
+        .map_or(crate::task_source::Priority::P2, |source| source.priority());
+    execute_approve_task_blocking_reviewed(
+        cwd,
+        repo_root,
+        conv_id,
+        tasks_dir_name,
+        task_file,
+        title,
+        priority,
+        &artifact_body,
+        desired_base_branch,
+    )
 }
 
 /// Blocking git operations for approving a *plain-markdown* task file (task
@@ -10520,6 +10613,7 @@ fn execute_approve_task_blocking(
 /// `stem` is the task file's filename with the `.md` extension stripped (the
 /// caller has already classified the filename as plain-markdown). `cwd` /
 /// `repo_root` have the same meaning as in [`execute_approve_task_blocking`].
+#[allow(clippy::too_many_arguments)]
 fn execute_approve_plain_markdown_blocking(
     cwd: &std::path::Path,
     repo_root: &std::path::Path,
@@ -10528,11 +10622,8 @@ fn execute_approve_plain_markdown_blocking(
     stem: &str,
     title: &str,
     desired_base_branch: Option<&str>,
+    artifact_body: String,
 ) -> Result<TaskApprovalResult, String> {
-    let _guard = TASK_APPROVAL_MUTEX
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-
     // base_branch is recorded on the resulting Work-mode conversation; for the
     // early-worktree case it is otherwise unused here (the worktree was already
     // created from it).
@@ -10583,6 +10674,7 @@ fn execute_approve_plain_markdown_blocking(
         first_task: false,
         worktree_path: worktree_path_str,
         base_branch,
+        artifact_body,
     })
 }
 
@@ -14062,6 +14154,76 @@ mod cwd_immutability_tests {
     /// detect the early Explore worktree and promote it in place (branch
     /// rename only). The returned `worktree_path` must equal the original
     /// Explore worktree path, so `conv.cwd` is unchanged at approval time.
+    #[test]
+    fn changed_reviewed_snapshot_rejects_before_git_side_effects() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "changed-reviewed-snapshot";
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, "main");
+        let task_file = "tasks/12345-p2-ready--reviewed.md";
+        std::fs::create_dir_all(explore_wt.join("tasks")).unwrap();
+        let reviewed = "# Reviewed\n\nOriginal plan\n";
+        std::fs::write(explore_wt.join(task_file), "# Reviewed\n\nChanged plan\n").unwrap();
+        let head_before = run_git(&explore_wt, &["rev-parse", "HEAD"]).unwrap();
+        let branch_before = run_git(&explore_wt, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
+
+        let error = execute_approve_task_blocking_reviewed(
+            &explore_wt,
+            &repo_root,
+            conv_id,
+            "tasks",
+            task_file,
+            "Reviewed",
+            crate::task_source::Priority::P2,
+            reviewed,
+            Some("main"),
+        )
+        .expect_err("changed snapshot must reject");
+
+        assert!(
+            error.contains("no longer matches the approved plan"),
+            "{error}"
+        );
+        assert_eq!(
+            run_git(&explore_wt, &["rev-parse", "HEAD"]).unwrap(),
+            head_before
+        );
+        assert_eq!(
+            run_git(&explore_wt, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap(),
+            branch_before
+        );
+        assert!(!branch_exists(&repo_root, "task-12345-reviewed"));
+    }
+
+    #[test]
+    fn unchanged_reviewed_snapshot_commits_and_returns_exact_bytes() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "unchanged-reviewed-snapshot";
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, "main");
+        let task_file = "tasks/12345-p2-ready--reviewed.md";
+        std::fs::create_dir_all(explore_wt.join("tasks")).unwrap();
+        let reviewed = "# Reviewed\n\nOriginal plan\n";
+        std::fs::write(explore_wt.join(task_file), reviewed).unwrap();
+
+        let result = execute_approve_task_blocking_reviewed(
+            &explore_wt,
+            &repo_root,
+            conv_id,
+            "tasks",
+            task_file,
+            "Reviewed",
+            crate::task_source::Priority::P2,
+            reviewed,
+            Some("main"),
+        )
+        .expect("unchanged snapshot approves");
+
+        assert_eq!(result.artifact_body, reviewed);
+        let committed_path = explore_wt.join("tasks/12345-p2-in-progress--reviewed.md");
+        assert_eq!(std::fs::read_to_string(committed_path).unwrap(), reviewed);
+        run_git(&explore_wt, &["diff", "--exit-code", "HEAD", "--", "tasks"])
+            .expect("committed task bytes match the worktree");
+    }
+
     #[test]
     fn approve_task_returns_same_path_as_explore_worktree() {
         let (_tmp, repo_root) = init_repo();
