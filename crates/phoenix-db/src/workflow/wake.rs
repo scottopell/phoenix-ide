@@ -2775,6 +2775,43 @@ impl WakeRepository {
         #[cfg(test)]
         maybe_fail_after_transfer_binding_update(self.failpoint_namespace, input.workflow_id)?;
 
+        // Move every materialized pending-delivery message as one ordered set.
+        // Destination sequences are allocated above its current watermark in
+        // the source transcript's durable order, so overlap cannot violate the
+        // destination-local unique/monotonic sequence authority.
+        let moved_messages = sqlx::query(
+            "WITH moving AS (
+                 SELECT m.message_id,
+                        ROW_NUMBER() OVER (
+                            ORDER BY m.sequence_id, m.created_at, m.message_id
+                        ) AS destination_offset
+                 FROM messages m
+                 JOIN wake_delivery_messages l ON l.message_id = m.message_id
+                 JOIN workflow_deliveries d
+                   ON d.workflow_id = l.workflow_id AND d.delivery_id = l.delivery_id
+                 WHERE l.workflow_id = ?1
+                   AND l.conversation_id = ?2
+                   AND m.conversation_id = ?2
+                   AND d.status = 'Pending'
+             ), destination AS (
+                 SELECT COALESCE(MAX(sequence_id), 0) AS prior_max
+                 FROM messages WHERE conversation_id = ?3
+             )
+             UPDATE messages
+             SET conversation_id = ?3,
+                 sequence_id = (SELECT prior_max FROM destination) + (
+                     SELECT destination_offset FROM moving
+                     WHERE moving.message_id = messages.message_id
+                 )
+             WHERE message_id IN (SELECT message_id FROM moving)",
+        )
+        .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+        .bind(&input.from_conversation_id)
+        .bind(&input.to_conversation_id)
+        .execute(&mut *tx.tx)
+        .await?
+        .rows_affected();
+
         for delivery_id in &input.exact_pending_delivery_ids {
             sqlx::query(
                 "UPDATE wake_terminal_receipts
@@ -2806,23 +2843,6 @@ impl WakeRepository {
             .execute(&mut *tx.tx)
             .await?;
 
-            sqlx::query(
-                "UPDATE messages
-                 SET conversation_id = ?3
-                 WHERE message_id IN (
-                     SELECT l.message_id
-                     FROM wake_delivery_messages l
-                     WHERE l.workflow_id = ?1 AND l.delivery_id = ?2 AND l.conversation_id = ?3
-                 )
-                   AND conversation_id = ?4",
-            )
-            .bind(to_i64(input.workflow_id.0, "workflow_id")?)
-            .bind(to_i64(delivery_id.0, "delivery_id")?)
-            .bind(&input.to_conversation_id)
-            .bind(&input.from_conversation_id)
-            .execute(&mut *tx.tx)
-            .await?;
-
             if has_message_fts_tx(&mut tx).await? {
                 sqlx::query(
                     "UPDATE message_fts_rows
@@ -2840,7 +2860,7 @@ impl WakeRepository {
             }
         }
 
-        if !input.exact_pending_delivery_ids.is_empty() {
+        if moved_messages > 0 {
             sqlx::query(
                 "UPDATE conversations
                  SET transcript_generation = transcript_generation + 1

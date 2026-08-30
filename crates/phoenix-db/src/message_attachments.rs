@@ -14,7 +14,7 @@ struct HydratedAttachments {
 pub(crate) async fn hydrate(
     connection: &mut SqliteConnection,
     messages: &mut [Message],
-) -> Result<(), sqlx::Error> {
+) -> DbResult<()> {
     let file_message_ids = messages
         .iter()
         .filter(|message| {
@@ -61,7 +61,7 @@ pub(crate) async fn hydrate(
             .entry(row.get("message_id"))
             .or_insert_with(empty_attachments)
             .files
-            .push(file_from_row(&row));
+            .push(file_from_row(&row)?);
     }
     for row in image_rows {
         by_message
@@ -96,13 +96,19 @@ fn empty_attachments() -> HydratedAttachments {
     }
 }
 
-fn file_from_row(row: &SqliteRow) -> FileAttachment {
-    FileAttachment {
-        original_name: row.get("original_name"),
-        media_type: row.get("media_type"),
-        size_bytes: u64::try_from(row.get::<i64, _>("size_bytes")).unwrap_or(0),
-        stored_path: row.get("stored_path"),
-    }
+fn file_from_row(row: &SqliteRow) -> DbResult<FileAttachment> {
+    let persisted_size = row.try_get::<i64, _>("size_bytes")?;
+    let size_bytes = u64::try_from(persisted_size).map_err(|_| {
+        DbError::Serialization(format!(
+            "message file attachment size must be non-negative, got {persisted_size}"
+        ))
+    })?;
+    Ok(FileAttachment {
+        original_name: row.try_get("original_name")?,
+        media_type: row.try_get("media_type")?,
+        size_bytes,
+        stored_path: row.try_get("stored_path")?,
+    })
 }
 
 /// Persist normalized attachment children on the caller-owned connection. A

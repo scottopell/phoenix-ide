@@ -7811,15 +7811,20 @@ END;
 mod migration_094_tests {
     use sqlx::sqlite::SqlitePoolOptions;
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
-    async fn preserves_duplicate_rows_then_enforces_unique_monotonic_sequences() {
+    async fn preserves_order_and_remaps_generation_and_watermark_before_enforcing_sequences() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
         sqlx::query(
-            "CREATE TABLE conversations (id TEXT PRIMARY KEY NOT NULL);
+            "CREATE TABLE conversations (
+                 id TEXT PRIMARY KEY NOT NULL,
+                 clear_watermark INTEGER NOT NULL DEFAULT 0,
+                 transcript_generation INTEGER NOT NULL DEFAULT 1
+             );
              CREATE TABLE messages (
                 message_id TEXT PRIMARY KEY NOT NULL,
                 conversation_id TEXT NOT NULL,
@@ -7831,28 +7836,39 @@ mod migration_094_tests {
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::query("INSERT INTO conversations(id) VALUES ('c')")
-            .execute(&pool)
-            .await
-            .unwrap();
         sqlx::query(
-            "INSERT INTO messages(message_id, conversation_id, sequence_id, created_at)
-             VALUES ('first-zero', 'c', 0, '2026-08-30T00:00:00Z')",
+            "INSERT INTO conversations(id, clear_watermark, transcript_generation)
+             VALUES ('affected', 3, 7), ('clean', 5, 11)",
         )
         .execute(&pool)
         .await
         .unwrap();
-        for (message_id, sequence_id) in [("a", 1_i64), ("b", 1_i64), ("c", 3_i64)] {
+        for (message_id, sequence_id, created_at) in [
+            ("zero", 0_i64, "2026-08-30T00:00:00Z"),
+            ("one-a", 1, "2026-08-30T00:00:01Z"),
+            ("one-b", 1, "2026-08-30T00:00:02Z"),
+            ("three-a", 3, "2026-08-30T00:00:03Z"),
+            ("three-b", 3, "2026-08-30T00:00:04Z"),
+            ("ten", 10, "2026-08-30T00:00:05Z"),
+        ] {
             sqlx::query(
                 "INSERT INTO messages(message_id, conversation_id, sequence_id, created_at)
-                 VALUES (?1, 'c', ?2, '2026-08-30T00:00:00Z')",
+                 VALUES (?1, 'affected', ?2, ?3)",
             )
             .bind(message_id)
             .bind(sequence_id)
+            .bind(created_at)
             .execute(&pool)
             .await
             .unwrap();
         }
+        sqlx::query(
+            "INSERT INTO messages(message_id, conversation_id, sequence_id, created_at)
+             VALUES ('clean-row', 'clean', 5, '2026-08-30T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         sqlx::query(super::MIGRATION_094)
             .execute(&pool)
@@ -7860,7 +7876,7 @@ mod migration_094_tests {
             .unwrap();
         let rows = sqlx::query_as::<_, (String, i64)>(
             "SELECT message_id, sequence_id FROM messages
-             WHERE conversation_id = 'c' ORDER BY sequence_id",
+             WHERE conversation_id = 'affected' ORDER BY sequence_id",
         )
         .fetch_all(&pool)
         .await
@@ -7868,57 +7884,112 @@ mod migration_094_tests {
         assert_eq!(
             rows,
             vec![
-                ("first-zero".into(), 0),
-                ("a".into(), 1),
-                ("c".into(), 3),
-                ("b".into(), 4),
+                ("zero".into(), 0),
+                ("one-a".into(), 1),
+                ("one-b".into(), 2),
+                ("three-a".into(), 4),
+                ("three-b".into(), 5),
+                ("ten".into(), 12),
             ]
         );
-        assert!(sqlx::query(
-            "INSERT INTO messages(message_id, conversation_id, sequence_id, created_at)
-             VALUES ('duplicate', 'c', 4, '2026-08-30T00:00:00Z')",
+        let conversations = sqlx::query_as::<_, (String, i64, i64)>(
+            "SELECT id, clear_watermark, transcript_generation FROM conversations ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            conversations,
+            vec![("affected".into(), 5, 8), ("clean".into(), 5, 11)]
+        );
+
+        // Idempotent replay of an existing identity is exempt from the monotonic
+        // trigger; a new identity at the same or a regressing sequence is not.
+        sqlx::query(
+            "INSERT OR IGNORE INTO messages(message_id, conversation_id, sequence_id, created_at)
+             VALUES ('ten', 'affected', 12, '2026-08-30T00:00:05Z')",
         )
         .execute(&pool)
         .await
-        .is_err());
-        assert!(sqlx::query(
-            "INSERT INTO messages(message_id, conversation_id, sequence_id, created_at)
-             VALUES ('regressing', 'c', 2, '2026-08-30T00:00:00Z')",
-        )
-        .execute(&pool)
-        .await
-        .is_err());
+        .expect("existing message identity remains replayable");
+        for (message_id, sequence_id) in [("duplicate", 12_i64), ("regressing", 6_i64)] {
+            assert!(sqlx::query(
+                "INSERT OR IGNORE INTO messages(message_id, conversation_id, sequence_id, created_at)
+                 VALUES (?1, 'affected', ?2, '2026-08-30T00:00:06Z')",
+            )
+            .bind(message_id)
+            .bind(sequence_id)
+            .execute(&pool)
+            .await
+            .is_err());
+        }
     }
 }
 
 const MIGRATION_094: &str = r"
 -- Released databases could contain duplicate conversation-local sequences because
--- message_id was the only uniqueness constraint. Preserve every row and move only
--- later duplicate identities above that conversation's prior maximum.
-WITH ranked AS (
+-- message_id was the only uniqueness constraint. Preserve every row and the durable
+-- order (sequence_id, created_at, message_id), shifting later rows only enough to
+-- make each affected conversation strictly increasing.
+CREATE TEMP TABLE migration_094_sequence_map (
+    message_id TEXT PRIMARY KEY NOT NULL,
+    conversation_id TEXT NOT NULL,
+    old_sequence_id INTEGER NOT NULL,
+    new_sequence_id INTEGER NOT NULL
+);
+
+INSERT INTO migration_094_sequence_map
+    (message_id, conversation_id, old_sequence_id, new_sequence_id)
+WITH duplicate_conversations AS (
+    SELECT conversation_id
+    FROM messages
+    GROUP BY conversation_id, sequence_id
+    HAVING COUNT(*) > 1
+), ordered AS (
     SELECT message_id, conversation_id, sequence_id,
            ROW_NUMBER() OVER (
-               PARTITION BY conversation_id, sequence_id
-               ORDER BY created_at, message_id
-           ) AS same_sequence_rank,
-           MAX(sequence_id) OVER (PARTITION BY conversation_id) AS prior_max
-    FROM messages
-), duplicates AS (
-    SELECT message_id, prior_max,
-           ROW_NUMBER() OVER (
                PARTITION BY conversation_id
-               ORDER BY sequence_id, same_sequence_rank, message_id
-           ) AS duplicate_rank
-    FROM ranked
-    WHERE same_sequence_rank > 1
+               ORDER BY sequence_id, created_at, message_id
+           ) AS ordered_rank,
+           DENSE_RANK() OVER (
+               PARTITION BY conversation_id ORDER BY sequence_id
+           ) AS distinct_sequence_rank
+    FROM messages
+    WHERE conversation_id IN (SELECT conversation_id FROM duplicate_conversations)
 )
+SELECT message_id, conversation_id, sequence_id,
+       sequence_id + ordered_rank - distinct_sequence_rank
+FROM ordered;
+
+-- Move the complete affected partition out of the positive sequence namespace
+-- before installing final values, avoiding transient collisions during UPDATE.
+UPDATE messages
+SET sequence_id = -1 - (
+    SELECT new_sequence_id FROM migration_094_sequence_map mapping
+    WHERE mapping.message_id = messages.message_id
+)
+WHERE message_id IN (SELECT message_id FROM migration_094_sequence_map);
+
 UPDATE messages
 SET sequence_id = (
-    SELECT prior_max + duplicate_rank FROM duplicates
-    WHERE duplicates.message_id = messages.message_id
+    SELECT new_sequence_id FROM migration_094_sequence_map mapping
+    WHERE mapping.message_id = messages.message_id
 )
-WHERE message_id IN (SELECT message_id FROM duplicates);
+WHERE message_id IN (SELECT message_id FROM migration_094_sequence_map);
 
+-- clear_watermark is the only durable scalar keyed to transcript sequences. Map
+-- it to the greatest repaired sequence that represents an originally-cleared row.
+UPDATE conversations
+SET clear_watermark = COALESCE((
+        SELECT MAX(mapping.new_sequence_id)
+        FROM migration_094_sequence_map mapping
+        WHERE mapping.conversation_id = conversations.id
+          AND mapping.old_sequence_id <= conversations.clear_watermark
+    ), clear_watermark),
+    transcript_generation = transcript_generation + 1
+WHERE id IN (SELECT DISTINCT conversation_id FROM migration_094_sequence_map);
+
+DROP TABLE migration_094_sequence_map;
 DROP INDEX IF EXISTS idx_messages_conversation;
 CREATE UNIQUE INDEX messages_conversation_sequence
 ON messages(conversation_id, sequence_id);

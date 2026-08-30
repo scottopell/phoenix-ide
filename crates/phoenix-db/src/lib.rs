@@ -183,6 +183,8 @@ pub enum DbError {
     ConversationAlreadyExists(String),
     #[error("Message not found: {0}")]
     MessageNotFound(String),
+    #[error("Message conflicts with first durable payload: {0}")]
+    MessageConflict(String),
     #[error("Slug already exists: {0}")]
     SlugExists(String),
     #[error("Serialization error: {0}")]
@@ -10343,28 +10345,94 @@ impl Database {
         display_data: Option<&serde_json::Value>,
         usage_data: Option<&UsageData>,
     ) -> DbResult<Message> {
-        // Allocate sequence_id from the DB watermark. Callers that also
-        // broadcast the message over SSE must instead use
-        // `add_message_with_seq` with a sequence pre-allocated from the
-        // broadcaster's counter — see the PersistBeforeBroadcast invariant
-        // in specs/sse_wire/sse_wire.allium.
-        let row = sqlx::query(
-            "SELECT COALESCE(MAX(sequence_id), 0) + 1 FROM messages WHERE conversation_id = ?1",
-        )
-        .bind(conversation_id)
-        .fetch_one(&self.pool)
-        .await?;
-        let sequence_id: i64 = row.get(0);
+        let now = Utc::now();
+        let msg_type = content.message_type();
+        let content_str = serde_json::to_string(&content.to_stored_json())
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let display_str = display_data
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let usage_str = usage_data
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
 
-        self.add_message_with_seq(
-            message_id,
-            conversation_id,
-            sequence_id,
-            content,
-            display_data,
-            usage_data,
+        // Take the SQLite write reservation before inspecting the conversation
+        // watermark. Allocation and insert therefore form one serialized write
+        // boundary; concurrent appenders cannot select the same next sequence.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(mut existing) = sqlx::query(
+            "SELECT message_id, conversation_id, sequence_id, message_type, content,
+                    display_data, usage_data, created_at
+             FROM messages WHERE message_id = ?1",
         )
-        .await
+        .bind(message_id)
+        .try_map(parse_message_row)
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            message_attachments::hydrate(&mut tx, std::slice::from_mut(&mut existing)).await?;
+            let exact = existing.conversation_id == conversation_id
+                && existing.message_type == msg_type
+                && existing.content == *content
+                && existing.display_data.as_ref() == display_data
+                && existing.usage_data.as_ref() == usage_data;
+            tx.rollback().await?;
+            if exact {
+                return Ok(existing);
+            }
+            return Err(DbError::MessageConflict(message_id.to_string()));
+        }
+
+        let inserted = sqlx::query(
+            "INSERT INTO messages (
+                 message_id, conversation_id, sequence_id, message_type, content,
+                 display_data, usage_data, created_at
+             )
+             SELECT ?1, ?2, COALESCE(MAX(sequence_id), 0) + 1, ?3, ?4, ?5, ?6, ?7
+             FROM messages WHERE conversation_id = ?2
+             RETURNING sequence_id",
+        )
+        .bind(message_id)
+        .bind(conversation_id)
+        .bind(msg_type.to_string())
+        .bind(&content_str)
+        .bind(&display_str)
+        .bind(&usage_str)
+        .bind(now.to_rfc3339())
+        .fetch_one(&mut *tx)
+        .await?;
+        let sequence_id: i64 = inserted.try_get("sequence_id")?;
+        message_attachments::insert(&mut tx, message_id, content).await?;
+        sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
+            .bind(now.to_rfc3339())
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+
+        let message = Message {
+            message_id: message_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            sequence_id,
+            message_type: msg_type,
+            content: content.clone(),
+            display_data: display_data.cloned(),
+            usage_data: usage_data.cloned(),
+            created_at: now,
+        };
+        if let Err(error) =
+            retrieval::fts_upsert(&self.pool, &message, self.sqlite_workload_collector.clone())
+                .await
+        {
+            tracing::warn!(
+                message_id = %message.message_id,
+                error = %error,
+                "failed to index message for retrieval; startup reconcile will repair"
+            );
+        }
+        Ok(message)
     }
 
     /// Persist one terminal transcript message and its exact direct-turn terminal
@@ -13029,7 +13097,7 @@ async fn clear_creation_job_attachments(
 pub(crate) async fn hydrate_attachments(
     pool: &SqlitePool,
     messages: &mut [Message],
-) -> Result<(), sqlx::Error> {
+) -> DbResult<()> {
     let mut connection = pool.acquire().await?;
     message_attachments::hydrate(&mut connection, messages).await
 }
@@ -13037,7 +13105,7 @@ pub(crate) async fn hydrate_attachments(
 pub(crate) async fn hydrate_attachments_conn(
     connection: &mut sqlx::SqliteConnection,
     messages: &mut [Message],
-) -> Result<(), sqlx::Error> {
+) -> DbResult<()> {
     message_attachments::hydrate(connection, messages).await
 }
 
@@ -18300,6 +18368,115 @@ mod tests {
                 "tail read shape must remain bounded, got {tail_reads}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn concurrent_add_message_allocates_distinct_sequences_and_preserves_replay_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("concurrent-add-message.db");
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        migrations::run_pending_migrations(db.pool()).await.unwrap();
+        db.create_conversation("concurrent-append", "append", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        let mut reservation = db.pool().acquire().await.unwrap();
+        let write_guard = reservation.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let first_db = db.clone();
+        let second_db = db.clone();
+        let first = tokio::spawn(async move {
+            first_db
+                .add_message(
+                    "concurrent-first",
+                    "concurrent-append",
+                    &MessageContent::user("first"),
+                    None,
+                    None,
+                )
+                .await
+        });
+        let second = tokio::spawn(async move {
+            second_db
+                .add_message(
+                    "concurrent-second",
+                    "concurrent-append",
+                    &MessageContent::user("second"),
+                    None,
+                    None,
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!first.is_finished());
+        assert!(!second.is_finished());
+        write_guard.commit().await.unwrap();
+
+        let first = first.await.unwrap().unwrap();
+        let second = second.await.unwrap().unwrap();
+        assert_ne!(first.sequence_id, second.sequence_id);
+        let mut sequences = [first.sequence_id, second.sequence_id];
+        sequences.sort_unstable();
+        assert_eq!(sequences, [1, 2]);
+
+        let replay = db
+            .add_message(
+                "concurrent-first",
+                "concurrent-append",
+                &MessageContent::user("first"),
+                None,
+                None,
+            )
+            .await
+            .expect("exact message-id replay is idempotent");
+        assert_eq!(replay.sequence_id, first.sequence_id);
+        let conflict = db
+            .add_message(
+                "concurrent-first",
+                "concurrent-append",
+                &MessageContent::user("changed"),
+                None,
+                None,
+            )
+            .await
+            .expect_err("changed replay is a typed conflict");
+        assert!(matches!(conflict, DbError::MessageConflict(ref id) if id == "concurrent-first"));
+    }
+
+    #[tokio::test]
+    async fn prompt_projection_rejects_negative_attachment_size() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("corrupt-attachment", "corrupt", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.add_message(
+            "corrupt-file-message",
+            "corrupt-attachment",
+            &MessageContent::user_with_attachments(
+                "file",
+                Vec::new(),
+                vec![file_attachment("corrupt")],
+            ),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query("PRAGMA ignore_check_constraints = ON")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE message_files SET size_bytes = -1 WHERE message_id = 'corrupt-file-message'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let error = db
+            .load_hydrated_prompt_snapshot("corrupt-attachment")
+            .await
+            .expect_err("authoritative projection must fail closed on corrupt attachment size");
+        assert!(error.to_string().contains("must be non-negative"));
     }
 
     #[tokio::test]
