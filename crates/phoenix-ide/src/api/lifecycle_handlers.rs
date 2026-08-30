@@ -71,6 +71,26 @@ fn ensure_terminal_action_legal(conv: &Conversation, action: &str) -> Result<(),
 // Task Approval (REQ-BED-028)
 // ============================================================
 
+async fn ensure_task_approval_authorized(
+    state: &AppState,
+    conversation: &crate::db::Conversation,
+) -> Result<(), AppError> {
+    let approval_authority =
+        crate::resource_authority::resolve_resource_authority(state.runtime.db(), conversation)
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?
+            .task_approval_authority();
+    if approval_authority
+        == crate::resource_authority::TaskApprovalAuthority::GitBackedActiveWorkScope
+    {
+        Ok(())
+    } else {
+        Err(AppError::BadRequest(
+            "Task approval requires an active Git-backed WorkScope".to_string(),
+        ))
+    }
+}
+
 pub(crate) async fn approve_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -90,12 +110,7 @@ pub(crate) async fn approve_task(
         ));
     }
 
-    // 2. Non-project conversations cannot approve tasks (propose_task is project-only)
-    if conv.project_id.is_none() {
-        return Err(AppError::BadRequest(
-            "Task approval requires a project-scoped conversation".to_string(),
-        ));
-    }
+    ensure_task_approval_authorized(&state, &conv).await?;
 
     let handoff = body.map(|Json(req)| req.handoff).unwrap_or_default();
     // 3. Dispatch approval event to state machine
@@ -950,6 +965,58 @@ mod tests {
             llm_language: crate::llm_language::LlmLanguage::default(),
             spawned_from_conversation_id: None,
         }
+    }
+
+    #[tokio::test]
+    async fn product_conversation_without_project_approves_from_allocated_work_scope() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let id = "product-work-scope-approval";
+        state
+            .db
+            .create_conversation(id, id, "/tmp", true, None, None)
+            .await
+            .expect("conversation");
+        state
+            .db
+            .update_conversation_mode_and_cwd(
+                id,
+                &ConvMode::Work {
+                    branch_name: NonEmptyString::new("task-approval").unwrap(),
+                    worktree_path: NonEmptyString::new("/tmp/task-approval").unwrap(),
+                    base_branch: NonEmptyString::new("main").unwrap(),
+                    task_id: NonEmptyString::new("12345").unwrap(),
+                    task_title: NonEmptyString::new("approval").unwrap(),
+                },
+                "/tmp/task-approval",
+            )
+            .await
+            .expect("allocate worktree environment");
+        let conversation = state.db.get_conversation(id).await.expect("conversation");
+        assert!(conversation.project_id.is_none());
+
+        ensure_task_approval_authorized(&state, &conversation)
+            .await
+            .expect("active allocated WorkScope authorizes approval");
+    }
+
+    #[tokio::test]
+    async fn approve_task_rejects_direct_unowned_cwd() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let id = "direct-unowned-approval";
+        state
+            .db
+            .create_conversation(id, id, "/tmp", true, None, None)
+            .await
+            .expect("conversation");
+        let conversation = state.db.get_conversation(id).await.expect("conversation");
+        let error = ensure_task_approval_authorized(&state, &conversation)
+            .await
+            .expect_err("unowned cwd rejects approval");
+        assert!(matches!(
+            error,
+            AppError::BadRequest(message)
+                if message == "Task approval requires an active Git-backed WorkScope"
+        ));
     }
 
     #[test]

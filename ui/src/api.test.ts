@@ -291,6 +291,46 @@ describe('conversation message history clients', () => {
     expect(fetchMock).toHaveBeenCalledWith('/api/product-conversations');
   });
 
+  it('GETs the product conversation creation recovery list', async () => {
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ product_creations: [] }),
+    } as unknown as Response);
+
+    await api.listProductConversationCreations();
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/product-conversations/creation');
+  });
+
+  it('POSTs cancel product creation', async () => {
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    fetchMock.mockResolvedValueOnce({ ok: true, status: 200 } as Response);
+
+    await api.cancelProductConversationCreation('req/1');
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/product-conversations/creation/req%2F1/cancel', { method: 'POST' });
+  });
+
+  it('POSTs retry product creation delivery', async () => {
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    fetchMock.mockResolvedValueOnce({ ok: true, status: 200 } as Response);
+
+    await api.retryProductConversationDelivery('req/1');
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/product-conversations/creation/req%2F1/retry-delivery', { method: 'POST' });
+  });
+
+  it('DELETEs a product creation', async () => {
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    fetchMock.mockResolvedValueOnce({ ok: true, status: 200 } as Response);
+
+    await api.deleteProductConversationCreation('req/1');
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/product-conversations/creation/req%2F1', { method: 'DELETE' });
+  });
+
   it('GETs a product conversation snapshot with message_limit and before params', async () => {
     const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
     fetchMock.mockResolvedValueOnce({
@@ -411,5 +451,27 @@ describe('canChangeModelInState (task 02713)', () => {
 
   it.each(cases)('%o -> %s', (state, expected) => {
     expect(canChangeModelInState(state)).toBe(expected);
+  });
+});
+
+
+describe('directory-first resolution query encoding', () => {
+  beforeEach(() => vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => ({ skills: [], items: [] }) })));
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('encodes direct resolution for skills and files without reservation fields', async () => {
+    await api.listProjectSkills('/repo', { kind: 'direct' });
+    await api.searchProjectFiles('/repo', 'src', 20, { kind: 'direct' });
+
+    const urls = vi.mocked(fetch).mock.calls.map(([url]) => new URL(String(url), 'http://phoenix.test'));
+    for (const url of urls) {
+      expect(url.searchParams.get('kind')).toBe('direct');
+      expect(url.searchParams.get('cwd')).toBe('/repo');
+      expect(url.searchParams.has('reservation_id')).toBe(false);
+      expect(url.searchParams.has('repo_root')).toBe(false);
+      expect(url.searchParams.has('exact_checkout_oid')).toBe(false);
+      expect(url.searchParams.has('logical_base')).toBe(false);
+      expect(url.searchParams.has('freshness')).toBe(false);
+    }
   });
 });

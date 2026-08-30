@@ -140,6 +140,7 @@ impl RuntimeRole {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthorityKind {
+    Direct,
     RestrictedExplore,
     Work,
 }
@@ -148,8 +149,22 @@ impl AuthorityKind {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Direct => "direct",
             Self::RestrictedExplore => "restricted_explore",
             Self::Work => "work",
+        }
+    }
+}
+
+impl TryFrom<&str> for AuthorityKind {
+    type Error = String;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "direct" => Ok(Self::Direct),
+            "restricted_explore" => Ok(Self::RestrictedExplore),
+            "work" => Ok(Self::Work),
+            other => Err(format!("unknown WorkScope authority kind: {other}")),
         }
     }
 }
@@ -159,6 +174,15 @@ impl AuthorityKind {
 pub enum ResourceAuthority {
     Restricted,
     Work,
+}
+
+impl From<AuthorityKind> for ResourceAuthority {
+    fn from(value: AuthorityKind) -> Self {
+        match value {
+            AuthorityKind::RestrictedExplore => Self::Restricted,
+            AuthorityKind::Direct | AuthorityKind::Work => Self::Work,
+        }
+    }
 }
 
 /// The actor identity and effective authority presented to a resource manager.

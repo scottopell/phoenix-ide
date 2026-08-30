@@ -15,6 +15,14 @@ pub enum ModeContext {
         base_branch: String,
         worktree_path: String,
     },
+    /// Detached approved-task successor: write-capable worktree with task
+    /// identity and default-branch provenance, but no mutable branch.
+    DetachedApprovedTask {
+        base_branch: String,
+        worktree_path: String,
+        task_id: String,
+        task_title: String,
+    },
     /// Direct mode: full tool access, no lifecycle ceremony.
     Direct,
     /// Branch mode: work directly on an existing branch. No task file.

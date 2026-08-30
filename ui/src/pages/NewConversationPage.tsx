@@ -1,12 +1,14 @@
-import { lazy, Suspense, useEffect, useRef, useState, KeyboardEvent, ClipboardEvent, ChangeEvent, DragEvent } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useRef, useState, KeyboardEvent, ClipboardEvent, ChangeEvent, DragEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { ImageAttachments } from '../components/ImageAttachments';
 import { ConversationSettings } from '../components/ConversationSettings';
 import { VoiceRecorder } from '../components/VoiceInput/VoiceRecorder';
 import { PaneDivider } from '../components/PaneDivider';
 import { SUPPORTED_IMAGE_TYPES } from '../utils/images';
-import { ExpansionError } from '../api';
+import { ExpansionError, api, type ProductConversationCreationAllowedActionView, type ProductConversationCreationRecoveryRow } from '../api';
 import { useCreateConversation } from '../hooks/useCreateConversation';
+import './NewConversationPage.css';
+import { recoveryDiscoveryDelay } from './recoveryPolling';
 import { useResizablePane } from '../hooks/useResizablePane';
 import { useIsDesktop } from '../hooks/useMediaQuery';
 import { useInlineReferences } from '../hooks';
@@ -20,6 +22,30 @@ const TerminalPanel = lazy(() =>
 );
 
 const GLOBAL_TERMINAL_COLLAPSED_PX = 32;
+const DIRECT_CREATION_RESOLUTION = { kind: 'direct' } as const;
+
+function recoveryStatusLabel(status: string): string {
+  switch (status) {
+    case 'accepted': return 'Queued';
+    case 'claimed': return 'Starting';
+    case 'retry_scheduled': return 'Retrying';
+    case 'cancelling': return 'Cancelling';
+    case 'failed': return 'Failed';
+    case 'cancelled': return 'Cancelled';
+    case 'delivery_failed': return 'Needs retry';
+    case 'delivery_pending': return 'Finishing';
+    default: return status;
+  }
+}
+
+function recoveryActionLabel(action: ProductConversationCreationAllowedActionView): string {
+  switch (action) {
+    case 'cancel': return 'Cancel';
+    case 'retry_delivery': return 'Retry';
+    case 'delete': return 'Delete';
+    case 'start_over': return 'Start over';
+  }
+}
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -51,6 +77,82 @@ function NewConversationFileChips({ files, onRemove }: { files: File[]; onRemove
   );
 }
 
+function ProductCreationRecoveryList({
+  rows,
+  busyRequestId,
+  actionErrors,
+  onAction,
+  canLoadMore,
+  onLoadMore,
+}: {
+  rows: ProductConversationCreationRecoveryRow[];
+  busyRequestId: string | null;
+  actionErrors: Record<string, { action: ProductConversationCreationAllowedActionView; message: string }>;
+  onAction: (row: ProductConversationCreationRecoveryRow, action: ProductConversationCreationAllowedActionView) => void;
+  canLoadMore: boolean;
+  onLoadMore: () => void;
+}) {
+  if (rows.length === 0) return null;
+  return (
+    <section className="product-creation-recovery" aria-label="Recent product creation attempts">
+      <div className="product-creation-recovery__header">
+        <strong>Recent starts</strong>
+        <span>Resume, clean up, or start over.</span>
+      </div>
+      <div className="product-creation-recovery__list">
+        {rows.map((row) => {
+          const isBusy = busyRequestId === row.request_id;
+          const actionError = actionErrors[row.request_id];
+          return (
+            <article key={row.request_id} className="product-creation-recovery__item">
+              <div className="product-creation-recovery__summary">
+                <span className={`product-creation-recovery__status product-creation-recovery__status--${row.status.replaceAll('_', '-')}`}>{recoveryStatusLabel(row.status)}</span>
+                <code className="product-creation-recovery__cwd" title={row.cwd}>{row.cwd}</code>
+              </div>
+              <div className="product-creation-recovery__objective">{row.objective || 'Image-only request'}</div>
+              <div className="product-creation-recovery__meta">
+                <span>{row.model ?? 'Unknown model'}</span>
+                <span>{row.effort ?? 'default effort'}</span>
+              </div>
+              {row.last_error && <div className="product-creation-recovery__error">{row.last_error}</div>}
+              {actionError && (
+                <div className="product-creation-recovery__error" role="alert">
+                  {actionError.message}
+                </div>
+              )}
+              <div className="product-creation-recovery__actions">
+                {row.allowed_actions.map((action) => (
+                  <button
+                    key={action}
+                    type="button"
+                    className={`product-creation-recovery__action${action === 'delete' ? ' product-creation-recovery__action--danger' : ''}`}
+                    disabled={isBusy}
+                    onClick={() => onAction(row, action)}
+                  >
+                    {recoveryActionLabel(action)}
+                  </button>
+                ))}
+              </div>
+            </article>
+          );
+        })}
+      </div>
+      {canLoadMore && (
+        <button type="button" className="product-creation-recovery__action" onClick={onLoadMore}>
+          Load more
+        </button>
+      )}
+    </section>
+  );
+}
+
+const RECOVERY_ADVANCING_STATUSES = new Set([
+  'accepted',
+  'claimed',
+  'retry_scheduled',
+  'cancelling',
+  'delivery_pending',
+]);
 interface NewConversationPageProps {
   desktopMode?: boolean;
 }
@@ -61,24 +163,16 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Inline reference autocomplete (@file, ./path, /skill). Discovery resolves
-  // against the same root the first message will expand against: for a
-  // branch/managed workflow that is the chosen branch's committed tree (what
-  // the conversation's fresh worktree will hold), not the current checkout —
-  // so suggestions never point at uncommitted/untracked files that would 422 on
-  // send. `mode`/`baseBranch` come from the same `submission` mapping the create
-  // call uses, so the two cannot drift. The composer renders both a desktop and
-  // a mobile textarea (one hidden by CSS); `inlineRefTextarea` tracks whichever
-  // is focused so trigger detection reads the right caret.
+  // Inline reference autocomplete (@file, ./path, /skill). The composer renders
+  // both a desktop and a mobile textarea (one hidden by CSS);
+  // `inlineRefTextarea` tracks whichever is focused so trigger detection reads
+  // the right caret.
   const inlineRefTextarea = useRef<HTMLTextAreaElement | null>(null);
-  const inlineReferenceRootReady = conv.dirStatus === 'exists'
-    && conv.isGitDir !== null
-    && (conv.submission.mode === 'direct' || conv.submission.baseBranch !== null);
+  const inlineReferenceRootReady = conv.dirStatus === 'exists' && conv.isGitDir !== null;
   const ir = useInlineReferences({
     cwd: conv.cwd,
     discoveryReady: inlineReferenceRootReady,
-    mode: conv.submission.mode,
-    baseBranch: conv.submission.baseBranch,
+    resolution: DIRECT_CREATION_RESOLUTION,
     // The new-conversation composer's identity is its directory: switching the
     // chosen directory resets the dropdown / inline error.
     scopeKey: conv.cwd,
@@ -133,6 +227,82 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   // still pays for all of it on every visit to /new. Once mounted, the
   // panel stays mounted so collapse/expand preserves shell state.
   const [everExpanded, setEverExpanded] = useState(!terminalPane.collapsed);
+  const [recoveryRows, setRecoveryRows] = useState<ProductConversationCreationRecoveryRow[]>([]);
+  const [recoveryBusyRequestId, setRecoveryBusyRequestId] = useState<string | null>(null);
+  const [recoveryActionErrors, setRecoveryActionErrors] = useState<Record<string, {
+    action: ProductConversationCreationAllowedActionView;
+    message: string;
+  }>>({});
+  const [recoveryNextCursor, setRecoveryNextCursor] = useState<string | null>(null);
+  const recoveryRequestSequence = useRef(0);
+  const recoveryLoadedPages = useRef(1);
+  const recoveryLoadingMore = useRef(false);
+  const recoveryRowsProjection = useRef<ProductConversationCreationRecoveryRow[]>([]);
+
+  const refreshRecoveryRows = useCallback(async () => {
+    if (recoveryLoadingMore.current) return;
+    const sequence = ++recoveryRequestSequence.current;
+    try {
+      const pages = [];
+      let cursor: string | null = null;
+      let nextCursor: string | null = "first";
+      for (let page = 0; page < recoveryLoadedPages.current && nextCursor !== null; page += 1) {
+        const response = await api.listProductConversationCreations(cursor);
+        pages.push(...response.product_creations);
+        nextCursor = response.next_cursor ?? null;
+        cursor = nextCursor;
+      }
+      if (sequence !== recoveryRequestSequence.current) return;
+      recoveryRowsProjection.current = pages;
+      setRecoveryRows(pages);
+      setRecoveryNextCursor(nextCursor);
+    } catch {
+      // Retain the last durable projection so active-row polling keeps retrying.
+    }
+  }, []);
+
+  const loadMoreRecoveryRows = useCallback(async () => {
+    if (recoveryNextCursor === null || recoveryLoadingMore.current) return;
+    recoveryLoadingMore.current = true;
+    const sequence = ++recoveryRequestSequence.current;
+    try {
+      const response = await api.listProductConversationCreations(recoveryNextCursor);
+      if (sequence !== recoveryRequestSequence.current) return;
+      setRecoveryRows((rows) => {
+        const next = [...rows, ...response.product_creations];
+        recoveryRowsProjection.current = next;
+        return next;
+      });
+      recoveryLoadedPages.current += 1;
+      setRecoveryNextCursor(response.next_cursor ?? null);
+    } finally {
+      recoveryLoadingMore.current = false;
+    }
+  }, [recoveryNextCursor]);
+
+  useEffect(() => {
+    void refreshRecoveryRows();
+  }, [conv.creating, refreshRecoveryRows]);
+
+  useEffect(() => {
+    let stopped = false;
+    let timeout: number | undefined;
+    let discoveryAttempt = 0;
+    const schedule = () => {
+      const canAdvance = recoveryRowsProjection.current.some((row) =>
+        RECOVERY_ADVANCING_STATUSES.has(row.status));
+      const delay = recoveryDiscoveryDelay(discoveryAttempt++, canAdvance);
+      timeout = window.setTimeout(async () => {
+        await refreshRecoveryRows();
+        if (!stopped) schedule();
+      }, delay);
+    };
+    schedule();
+    return () => {
+      stopped = true;
+      if (timeout !== undefined) window.clearTimeout(timeout);
+    };
+  }, [refreshRecoveryRows]);
 
   // Auto-resize textarea
   useEffect(() => {
@@ -207,20 +377,53 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   const createStatusText = conv.creating
     ? conv.dirStatus === 'will-create'
       ? 'Creating folder…'
-      : conv.submission.mode === 'managed'
-        ? 'Setting up worktree…'
-        : conv.submission.mode === 'branch'
-          ? 'Opening branch conversation…'
-          : 'Creating conversation…'
+      : 'Creating conversation…'
     : null;
   // Until an LLM is configured, the only meaningful action is the sign-in
   // CTA inside ConversationSettings. Hide the message composer + actions so
   // the user isn't tempted to type into a draft that can't be sent.
   const llmReady = conv.models === null || conv.models.llm_configured;
 
-  const inputPlaceholder = conv.workflow.kind === 'planFromTask'
-    ? 'Optional notes for this task…'
-    : 'What would you like to work on?';
+  const handleRecoveryAction = async (
+    row: ProductConversationCreationRecoveryRow,
+    action: ProductConversationCreationAllowedActionView,
+  ) => {
+    if (action === 'start_over') {
+      conv.startOverFromCreation({
+        cwd: row.cwd,
+        objective: row.objective,
+        model: row.model ?? null,
+        effort: row.effort ?? null,
+        images: row.images,
+        llm_language: row.llm_language,
+      });
+      return;
+    }
+    setRecoveryBusyRequestId(row.request_id);
+    setRecoveryActionErrors((errors) => {
+      const remaining = { ...errors };
+      delete remaining[row.request_id];
+      return remaining;
+    });
+    try {
+      if (action === 'cancel') await api.cancelProductConversationCreation(row.request_id);
+      if (action === 'retry_delivery') await api.retryProductConversationDelivery(row.request_id);
+      if (action === 'delete') await api.deleteProductConversationCreation(row.request_id);
+    } catch (error) {
+      setRecoveryActionErrors((errors) => ({
+        ...errors,
+        [row.request_id]: {
+          action,
+          message: error instanceof Error ? error.message : `Failed to ${recoveryActionLabel(action).toLowerCase()}`,
+        },
+      }));
+    } finally {
+      await refreshRecoveryRows();
+      setRecoveryBusyRequestId(null);
+    }
+  };
+
+  const inputPlaceholder = 'What would you like to work on?';
 
   return (
     <div
@@ -248,6 +451,14 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
       <main className="new-conv-main" data-app-scroll-owner>
         {/* Desktop: workbench card */}
         <div className="new-conv-card desktop-only">
+          <ProductCreationRecoveryList
+            rows={recoveryRows}
+            busyRequestId={recoveryBusyRequestId}
+            actionErrors={recoveryActionErrors}
+            onAction={handleRecoveryAction}
+            canLoadMore={recoveryNextCursor !== null}
+            onLoadMore={() => void loadMoreRecoveryRows()}
+          />
           <ConversationSettings
             cwd={conv.cwd}
             setCwd={conv.setCwd}
@@ -261,23 +472,9 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
             models={conv.models}
             showAllModels={conv.showAllModels}
             setShowAllModels={conv.setShowAllModels}
-            projectDirs={conv.projectDirs}
-            isGitDir={conv.isGitDir}
             error={conv.error}
-            workflow={conv.workflow}
-            setWorkflow={conv.setWorkflow}
-            tasks={conv.tasks}
-            taskAvailabilityLoading={conv.taskAvailabilityLoading}
-            taskAvailable={conv.taskAvailable}
-            tasksLoading={conv.tasksLoading}
-            tasksLoaded={conv.tasksLoaded}
-            loadProjectTasks={conv.loadProjectTasks}
-            branches={conv.branches}
-            currentBranch={conv.currentBranch}
-            gitMetadataLoading={conv.gitMetadataLoading}
-            branchSearch={conv.branchSearch}
-            setBranchSearch={conv.setBranchSearch}
-            branchSearchLoading={conv.branchSearchLoading}
+            recentPaths={conv.recentManagementRootSuggestions.map((suggestion) => suggestion.path)}
+            rootFreshness={null}
           />
 
           {/* Main input — hidden until an LLM is configured */}
@@ -333,6 +530,14 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
 
         {/* Mobile: keep existing layout */}
         <div className="new-conv-content mobile-only">
+          <ProductCreationRecoveryList
+            rows={recoveryRows}
+            busyRequestId={recoveryBusyRequestId}
+            actionErrors={recoveryActionErrors}
+            onAction={handleRecoveryAction}
+            canLoadMore={recoveryNextCursor !== null}
+            onLoadMore={() => void loadMoreRecoveryRows()}
+          />
           <ConversationSettings
             cwd={conv.cwd}
             setCwd={conv.setCwd}
@@ -346,23 +551,9 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
             models={conv.models}
             showAllModels={conv.showAllModels}
             setShowAllModels={conv.setShowAllModels}
-            isGitDir={conv.isGitDir}
-            projectDirs={conv.projectDirs}
             error={conv.error}
-            workflow={conv.workflow}
-            setWorkflow={conv.setWorkflow}
-            tasks={conv.tasks}
-            taskAvailabilityLoading={conv.taskAvailabilityLoading}
-            taskAvailable={conv.taskAvailable}
-            tasksLoading={conv.tasksLoading}
-            tasksLoaded={conv.tasksLoaded}
-            loadProjectTasks={conv.loadProjectTasks}
-            branches={conv.branches}
-            currentBranch={conv.currentBranch}
-            gitMetadataLoading={conv.gitMetadataLoading}
-            branchSearch={conv.branchSearch}
-            setBranchSearch={conv.setBranchSearch}
-            branchSearchLoading={conv.branchSearchLoading}
+            recentPaths={conv.recentManagementRootSuggestions.map((suggestion) => suggestion.path)}
+            rootFreshness={null}
           />
         </div>
       </main>

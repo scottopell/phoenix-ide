@@ -83,6 +83,136 @@ pub(crate) fn run_git(cwd: &Path, args: &[&str]) -> Result<String, String> {
     run_git_with_env(cwd, args, &[])
 }
 
+pub(crate) fn run_git_bounded(
+    cwd: &Path,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    run_git_bounded_with_env(cwd, args, &[], timeout)
+}
+
+fn recv_git_pipe(
+    receiver: &std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    remaining: std::time::Duration,
+    process_group: i32,
+    stream: &str,
+    args: &[&str],
+) -> Result<Vec<u8>, String> {
+    receiver
+        .recv_timeout(remaining)
+        .map_err(|_| {
+            unsafe {
+                let _ = libc::kill(-process_group, libc::SIGKILL);
+            }
+            format!("{stream} drain timed out for git {}", args.join(" "))
+        })?
+        .map_err(|error| format!("failed reading git {stream}: {error}"))
+}
+
+pub(crate) fn run_git_bounded_with_env(
+    cwd: &Path,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    use std::sync::mpsc;
+    use std::thread;
+
+    validate_extra_env(extra_env)?;
+
+    let mut cmd = git_command();
+    cmd.args(args)
+        .current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, v) in extra_env {
+        cmd.env(*k, *v);
+    }
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to spawn git {}: {e}", args.join(" ")))?;
+    let child_id = child.id();
+    let process_group =
+        i32::try_from(child_id).map_err(|_| format!("git pid out of range: {child_id}"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "git child had no stdout".to_string())?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "git child had no stderr".to_string())?;
+    let (stdout_tx, stdout_rx) = mpsc::channel();
+    let (stderr_tx, stderr_rx) = mpsc::channel();
+    let stdout_reader = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let result = stdout.read_to_end(&mut buf).map(|_| buf);
+        let _ = stdout_tx.send(result);
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let result = stderr.read_to_end(&mut buf).map(|_| buf);
+        let _ = stderr_tx.send(result);
+    });
+
+    let start = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| format!("failed waiting for git {}: {e}", args.join(" ")))?
+        {
+            break status;
+        }
+        if start.elapsed() >= timeout {
+            unsafe {
+                let _ = libc::kill(-process_group, libc::SIGKILL);
+            }
+            let _ = child.kill();
+            child
+                .wait()
+                .map_err(|e| format!("failed waiting for timed-out git {}: {e}", args.join(" ")))?;
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            let _ = stdout_rx.recv();
+            let _ = stderr_rx.recv();
+            return Err(format!(
+                "git {:?} timed out after {} seconds",
+                args,
+                timeout.as_secs()
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+
+    let remaining = timeout.saturating_sub(start.elapsed());
+    let stdout_bytes = recv_git_pipe(&stdout_rx, remaining, process_group, "stdout", args)?;
+    let remaining = timeout.saturating_sub(start.elapsed());
+    let stderr_bytes = recv_git_pipe(&stderr_rx, remaining, process_group, "stderr", args)?;
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
+
+    if status.success() {
+        Ok(String::from_utf8_lossy(&stdout_bytes).trim().to_string())
+    } else {
+        Err(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&stderr_bytes).trim()
+        ))
+    }
+}
+
 /// Inject the config every Phoenix git invocation needs so output does not
 /// depend on the user's `~/.gitconfig`. Uses the
 /// `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` mechanism so it
@@ -148,15 +278,7 @@ pub(crate) fn run_git_with_env(
     for (k, v) in extra_env {
         cmd.env(*k, *v);
     }
-    let output = cmd
-        .output()
-        .map_err(|e| format!("Failed to run git {}: {e}", args.join(" ")))?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        Err(format!("git {} failed: {stderr}", args.join(" ")))
-    }
+    run_git_bounded_with_env(cwd, args, extra_env, std::time::Duration::from_secs(30))
 }
 
 /// Run `git` and stream stdout, keeping at most `max_bytes` in memory.
@@ -733,7 +855,11 @@ fn cleanup_failed_worktree(cwd: &Path, worktree_path: &Path, created_branch: Opt
     let worktree_path_str = worktree_path.to_string_lossy().to_string();
 
     // 1. Drop any admin entry + partial dir git registered before it bailed.
-    if let Err(e) = run_git(cwd, &["worktree", "remove", &worktree_path_str, "--force"]) {
+    if let Err(e) = run_git_bounded(
+        cwd,
+        &["worktree", "remove", &worktree_path_str, "--force"],
+        std::time::Duration::from_secs(30),
+    ) {
         tracing::debug!(
             error = %e,
             worktree = %worktree_path_str,
@@ -1955,5 +2081,35 @@ mod tests {
             exclude.lines().filter(|l| l.trim() == ".phoenix/").count(),
             1
         );
+    }
+}
+
+#[cfg(test)]
+mod bounded_git_tests {
+    use super::run_git_bounded_with_env;
+
+    #[test]
+    fn run_git_bounded_kills_spawned_descendants_on_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("descendant.pid");
+        let alias = format!(
+            "alias.spawn-descendant=!sh -c 'sleep 30 & echo $! > {}; wait'",
+            pid_file.display()
+        );
+        let err = run_git_bounded_with_env(
+            dir.path(),
+            &["-c", alias.as_str(), "spawn-descendant"],
+            &[],
+            std::time::Duration::from_millis(200),
+        )
+        .expect_err("timed out");
+        assert!(err.contains("timed out"), "unexpected error: {err}");
+        let descendant_pid: libc::pid_t = std::fs::read_to_string(&pid_file)
+            .expect("descendant pid recorded before timeout")
+            .trim()
+            .parse()
+            .expect("numeric descendant pid");
+        let alive = unsafe { libc::kill(descendant_pid, 0) } == 0;
+        assert!(!alive, "descendant survived timeout kill tree");
     }
 }

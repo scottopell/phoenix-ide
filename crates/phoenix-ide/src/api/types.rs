@@ -43,6 +43,74 @@ pub struct CreateConversationRequest {
     pub seed_label: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateProductConversationRequest {
+    pub request_id: String,
+    pub cwd: String,
+    pub model: String,
+    #[serde(default)]
+    pub effort: Option<phoenix_core::domain::llm_types::ModelEffort>,
+    pub objective: String,
+    #[serde(default)]
+    pub llm_language: Option<phoenix_core::llm_language::LlmLanguage>,
+    #[serde(default)]
+    pub images: Vec<ImageAttachment>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProductConversationCreateAcceptedResponse {
+    pub canonical_route: String,
+    pub product_conversation_id: String,
+    pub transcript_row_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+#[serde(rename_all = "snake_case")]
+pub enum ProductConversationCreationAllowedActionView {
+    Cancel,
+    RetryDelivery,
+    Delete,
+    StartOver,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProductConversationCreationRecoveryRow {
+    pub request_id: String,
+    pub published_product_conversation_id: Option<String>,
+    pub status: String,
+    pub cwd: String,
+    pub objective: String,
+    pub model: Option<String>,
+    pub effort: Option<phoenix_core::domain::llm_types::ModelEffort>,
+    #[ts(type = "string | null")]
+    pub llm_language: Option<phoenix_core::llm_language::LlmLanguage>,
+    #[ts(type = "Array<{ media_type: string; data: string }>")]
+    pub images: Vec<crate::db::ProductCreationImage>,
+    pub updated_at: String,
+    pub last_error: Option<String>,
+    pub allowed_actions: Vec<ProductConversationCreationAllowedActionView>,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProductConversationCreationRecoveryResponse {
+    pub product_creations: Vec<ProductConversationCreationRecoveryRow>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecentManagementRootSuggestion {
+    pub path: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecentManagementRootSuggestionsResponse {
+    pub suggestions: Vec<RecentManagementRootSuggestion>,
+}
+
 /// Request body for one-shot shell-command suggestion (`POST /api/suggest`).
 /// Stateless: no conversation, no tools, no persistence.
 #[derive(Debug, Deserialize)]
@@ -337,7 +405,7 @@ pub enum ProductConversationPresentationView {
 pub struct ProductConversationWorkIdentityView {
     pub work_transcript_row_id: String,
     pub worktree_path: String,
-    pub branch_name: String,
+    pub branch_name: Option<String>,
     pub base_branch: String,
     pub task_id: Option<String>,
     pub task_title: Option<String>,
@@ -591,14 +659,6 @@ pub struct ValidateCwdResponse {
 #[derive(Debug, Serialize)]
 pub struct ListDirectoryResponse {
     pub entries: Vec<DirectoryEntry>,
-}
-
-/// Response for mkdir
-#[derive(Debug, Serialize)]
-pub struct MkdirResponse {
-    pub created: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
 }
 
 /// Directory entry

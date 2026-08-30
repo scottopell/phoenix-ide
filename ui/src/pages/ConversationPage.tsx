@@ -56,6 +56,7 @@ import {
 } from '../hooks';
 import { useToast } from '../hooks/useToast';
 import { useFocusScope } from '../hooks/useFocusScope';
+import { beginNewProductConversationIntent } from '../hooks/useCreateConversation';
 import { Toast } from '../components/Toast';
 import { useAppMachine } from '../hooks/useAppMachine';
 import { ConnectedStateBar } from '../components/StateBar';
@@ -1810,6 +1811,7 @@ function ConversationPageContent({
         // ignore — non-fatal
       }
     }
+    beginNewProductConversationIntent();
     navigate('/new');
   }, [creationFailedDraft, navigate]);
   const handleDeleteProvisioningConversation = useCallback(async () => {
@@ -2659,7 +2661,7 @@ function ConversationPageContent({
           conversationId={conversation.id}
           onClose={() => setShowFileBrowser(false)}
           onFileSelect={handleFileSelect}
-          canOpenWorkspaceDiff={conversation.conv_mode_label === 'Work' || conversation.conv_mode_label === 'Branch'}
+          canOpenWorkspaceDiff={conversation.conv_mode_label === 'Work' || conversation.conv_mode_label === 'Branch' || conversation.conv_mode_label === 'Approved Task'}
         />
       )}
 

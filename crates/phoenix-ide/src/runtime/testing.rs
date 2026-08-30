@@ -530,6 +530,8 @@ pub struct InMemoryStorage {
     state_updated_ats: Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>,
     modes: Mutex<HashMap<String, crate::db::ConvMode>>,
     cwds: Mutex<HashMap<String, String>>,
+    approved_task_authorities:
+        Mutex<HashMap<String, phoenix_core::task_handoff::ApprovedTaskSnapshot>>,
     next_msg_id: Mutex<u64>,
     complete_creation_job_results: Mutex<VecDeque<Result<crate::db::CreationCasOutcome, String>>>,
     complete_creation_job_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
@@ -588,6 +590,7 @@ impl InMemoryStorage {
             state_updated_ats: Mutex::new(HashMap::new()),
             modes: Mutex::new(HashMap::new()),
             cwds: Mutex::new(HashMap::new()),
+            approved_task_authorities: Mutex::new(HashMap::new()),
             next_msg_id: Mutex::new(1),
             complete_creation_job_results: Mutex::new(VecDeque::new()),
             complete_creation_job_started: Mutex::new(None),
@@ -1800,21 +1803,23 @@ impl StateStore for InMemoryStorage {
         Ok(crate::db::ContinuationCommitOutcome::Applied)
     }
 
-    async fn update_conversation_mode_and_cwd(
+    async fn persist_approved_task_authority(
         &self,
         conv_id: &str,
-        mode: &crate::db::ConvMode,
-        cwd: &str,
+        approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
     ) -> Result<(), String> {
-        self.modes
-            .lock()
-            .unwrap()
-            .insert(conv_id.to_string(), mode.clone());
-        self.cwds
-            .lock()
-            .unwrap()
-            .insert(conv_id.to_string(), cwd.to_string());
-        Ok(())
+        let snapshot = phoenix_core::task_handoff::ApprovedTaskSnapshot::from(approval);
+        let mut authorities = self.approved_task_authorities.lock().unwrap();
+        match authorities.get(conv_id) {
+            Some(existing) if existing != &snapshot => {
+                Err("approved task conflicts with the committed objective".to_string())
+            }
+            Some(_) => Ok(()),
+            None => {
+                authorities.insert(conv_id.to_string(), snapshot);
+                Ok(())
+            }
+        }
     }
 
     async fn get_conversation_mode(&self, conv_id: &str) -> Result<crate::db::ConvMode, String> {
@@ -1825,6 +1830,10 @@ impl StateStore for InMemoryStorage {
             .get(conv_id)
             .cloned()
             .unwrap_or_default())
+    }
+
+    async fn get_product_conversation_id(&self, conv_id: &str) -> Result<String, String> {
+        Ok(conv_id.to_string())
     }
 
     async fn update_conversation_cwd_recovery_only(
@@ -2250,20 +2259,6 @@ mod tests {
             MessageContent::User(u) => assert_eq!(u.text, "hello"),
             _ => panic!("Expected User content"),
         }
-    }
-
-    #[tokio::test]
-    async fn in_memory_storage_records_atomic_mode_and_cwd_update() {
-        let storage = InMemoryStorage::new();
-        let mode = crate::db::ConvMode::Direct;
-
-        storage
-            .update_conversation_mode_and_cwd("conv-1", &mode, "/tmp/promoted")
-            .await
-            .unwrap();
-
-        assert_eq!(storage.get_mode("conv-1"), Some(mode));
-        assert_eq!(storage.get_cwd("conv-1").as_deref(), Some("/tmp/promoted"));
     }
 
     /// Integration test: simple text response using builder

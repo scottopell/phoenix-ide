@@ -298,6 +298,40 @@ pub fn mode_work(
     }
 }
 
+#[must_use]
+pub fn mode_detached_approved_task(
+    lang: LlmLanguage,
+    base_branch: &str,
+    worktree_path: &str,
+    task_id: &str,
+    task_title: &str,
+) -> String {
+    match lang {
+        LlmLanguage::PhoenixNative => format!(
+            "\n\nYou are in detached Approved Task mode for task {task_id} ({task_title}), \
+             carrying approved work forward from {base_branch}.\n\
+             Your working directory is {worktree_path}. All file edits and \
+             bash commands MUST stay inside this worktree. Do NOT modify \
+             files in the main checkout or repo root.\n\
+             This successor conversation has filesystem/worktree tooling but no \
+             mutable branch lifecycle: do not create branch-mutation, merge, or \
+             PR-completion narratives as if Phoenix owns a task branch here.\n\n\
+             When the approved task is complete, let the user know it's ready. \
+             If the task file follows the taskmd convention \
+             (`NNNNN-pX-status--slug.md`), also mark it done yourself before \
+             handing off by renaming the file from `...-{{status}}--{{slug}}.md` \
+             to `...-done--{{slug}}.md`."
+        ),
+        LlmLanguage::Caveman => format!(
+            "\n\nYou in detached approved-task cave for {task_id} ({task_title}). \
+             Came from {base_branch}. Cave path: {worktree_path}. Stay in cave. \
+             Use bash and patch. No Phoenix-owned branch dance, no merge tale. \
+             Done? Tell big caveman. If task file like \
+             `NNNNN-pX-status--slug.md`, rename `status` to `done`."
+        ),
+    }
+}
+
 /// Optional hint appended to the Explore-mode prose telling the agent the
 /// next available taskmd ID for this worktree. Language-aware so caveman
 /// stays terse.

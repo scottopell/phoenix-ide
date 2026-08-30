@@ -85,6 +85,10 @@ export type { ProductConversationListRow } from './generated/ProductConversation
 export type { ProductConversationSnapshotView } from './generated/ProductConversationSnapshotView';
 import type { ProductConversationListResponse as ProductConversationListResponseType } from './generated/ProductConversationListResponse';
 import type { ProductConversationSnapshotView as ProductConversationSnapshotViewType } from './generated/ProductConversationSnapshotView';
+export type { ProductConversationCreationAllowedActionView } from './generated/ProductConversationCreationAllowedActionView';
+export type { ProductConversationCreationRecoveryResponse } from './generated/ProductConversationCreationRecoveryResponse';
+export type { ProductConversationCreationRecoveryRow } from './generated/ProductConversationCreationRecoveryRow';
+import type { ProductConversationCreationRecoveryResponse as ProductConversationCreationRecoveryResponseType } from './generated/ProductConversationCreationRecoveryResponse';
 
 export interface ConversationContentSearchHit {
   conversation_id: string;
@@ -712,6 +716,35 @@ export interface ImageData {
   media_type: string;
 }
 
+export type ProductCreationResolution = { kind: 'direct' };
+
+function applyResolutionOpts(params: URLSearchParams, opts?: ProductCreationResolution): void {
+  params.set('kind', opts?.kind ?? 'direct');
+}
+
+export interface CreateProductConversationRequest {
+  request_id: string;
+  cwd: string;
+  objective: string;
+  model: string;
+  effort?: ModelEffort | null;
+  llm_language?: string | null;
+  images?: ImageData[];
+}
+
+export interface CreateProductConversationResponse {
+  product_conversation_id: string;
+  canonical_route: string;
+}
+
+export interface RecentManagementRootSuggestion {
+  path: string;
+}
+
+export interface RecentManagementRootSuggestionsResponse {
+  suggestions: RecentManagementRootSuggestion[];
+}
+
 export interface FileAttachment {
   original_name: string;
   media_type: string;
@@ -1116,25 +1149,6 @@ export type CodexLoginStatus =
   | { kind: 'success'; account_id: string | null; auth_path: string }
   | { kind: 'error'; message: string };
 
-/**
- * Selects the root that directory-scoped discovery (`@file` / `/skill`)
- * resolves against, for the new-conversation composer. `mode`/`baseBranch`
- * mirror the create-time submission: a branch/managed workflow discovers
- * against the chosen branch's committed tree (what its worktree will hold),
- * so suggestions match what create-time expansion can resolve. Omitted ⇒
- * Direct (the working directory).
- */
-export interface ProjectResolutionOpts {
-  // Explicit `| undefined` so a caller can pass `{ mode: undefined }` under
-  // exactOptionalPropertyTypes (the in-conversation composer leaves these unset).
-  mode?: 'direct' | 'managed' | 'branch' | undefined;
-  baseBranch?: string | null | undefined;
-}
-
-function applyResolutionOpts(params: URLSearchParams, opts?: ProjectResolutionOpts): void {
-  if (opts?.mode) params.set('mode', opts.mode);
-  if (opts?.baseBranch) params.set('base_branch', opts.baseBranch);
-}
 
 export type ServiceStatus = 'healthy' | 'stale';
 export type DiscoveryConfidence = 'explicit_api_catalog';
@@ -1536,10 +1550,39 @@ export const api = {
     return resp.json();
   },
 
+  async listRecentManagementRootSuggestions(): Promise<RecentManagementRootSuggestionsResponse> {
+    const resp = await fetch('/api/recent-management-root-suggestions');
+    if (!resp.ok) throw new Error('Failed to list recent management root suggestions');
+    return resp.json();
+  },
+
   async listConversations(): Promise<Conversation[]> {
     const resp = await fetch('/api/conversations');
     if (!resp.ok) throw new Error('Failed to list conversations');
     return (await resp.json()).conversations;
+  },
+
+  async createProductConversation(
+    request: CreateProductConversationRequest,
+  ): Promise<CreateProductConversationResponse> {
+    const resp = await fetch('/api/product-conversations/new', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({})) as { error?: string; error_type?: string };
+      if (err.error_type === 'product_creation_retry_scheduled') {
+        const retryable = new Error(err.error || 'Product creation will retry') as Error & { retryable?: boolean };
+        retryable.retryable = true;
+        throw retryable;
+      }
+      if (resp.status === 422) {
+        throw new ExpansionError(err as ExpansionErrorDetail);
+      }
+      throw new Error(err.error || 'Failed to create product conversation');
+    }
+    return resp.json();
   },
 
   async createConversation(
@@ -1658,6 +1701,36 @@ export const api = {
       throw new Error('Failed to fetch product conversations');
     }
     return resp.json();
+  },
+
+  async listProductConversationCreations(cursor?: string | null): Promise<ProductConversationCreationRecoveryResponseType> {
+    const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : '';
+    const resp = await fetch(`/api/product-conversations/creation${query}`);
+    if (!resp.ok) {
+      throw new Error('Failed to fetch product conversation creations');
+    }
+    return resp.json();
+  },
+
+  async cancelProductConversationCreation(requestId: string): Promise<void> {
+    const resp = await fetch(`/api/product-conversations/creation/${encodeURIComponent(requestId)}/cancel`, {
+      method: 'POST',
+    });
+    if (!resp.ok) throw new Error('Failed to cancel product creation');
+  },
+
+  async retryProductConversationDelivery(requestId: string): Promise<void> {
+    const resp = await fetch(`/api/product-conversations/creation/${encodeURIComponent(requestId)}/retry-delivery`, {
+      method: 'POST',
+    });
+    if (!resp.ok) throw new Error('Failed to retry product creation delivery');
+  },
+
+  async deleteProductConversationCreation(requestId: string): Promise<void> {
+    const resp = await fetch(`/api/product-conversations/creation/${encodeURIComponent(requestId)}`, {
+      method: 'DELETE',
+    });
+    if (!resp.ok) throw new Error('Failed to delete product creation');
   },
 
   async getProductConversationSnapshot(
@@ -1944,15 +2017,6 @@ export const api = {
     return resp.json();
   },
 
-  async mkdir(path: string): Promise<{ created: boolean; error?: string }> {
-    const resp = await fetch('/api/mkdir', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path }),
-    });
-    return resp.json();
-  },
-
   async getWakeStatus(convId: string): Promise<WakeStatus> {
     const resp = await fetch(`/api/conversations/${convId}/wake`);
     if (!resp.ok) throw new Error(await resp.text());
@@ -2079,7 +2143,7 @@ export const api = {
    */
   async listProjectSkills(
     cwd: string,
-    opts?: ProjectResolutionOpts,
+    opts?: ProductCreationResolution,
     signal?: AbortSignal,
   ): Promise<{ skills: SkillEntry[] }> {
     const params = new URLSearchParams({ cwd });
@@ -2167,7 +2231,7 @@ export const api = {
     cwd: string,
     query: string,
     limit = 50,
-    opts?: ProjectResolutionOpts,
+    opts?: ProductCreationResolution,
     signal?: AbortSignal,
   ): Promise<{ items: FileSearchEntry[] }> {
     const params = new URLSearchParams({ cwd, q: query, limit: String(limit) });

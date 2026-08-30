@@ -15,7 +15,7 @@ export type ChainWorkIdentity = {
  * The worktree-owning member whose git metadata this is — and the
  * conversation the UI keys PR-status off.
  */
-work_conv_id: string, worktree_path: string, branch_name: string, base_branch: string, 
+work_conv_id: string, worktree_path: string, branch_name: string | null, base_branch: string, 
 /**
  * Task id + title when the chain is doing Managed (Work-mode) work; both
  * absent for a plain Branch worktree, which carries no task.

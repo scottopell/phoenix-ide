@@ -17,6 +17,1158 @@ use phoenix_llm::ModelRegistry;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
+
+#[derive(Debug, Clone)]
+pub(crate) struct PublishedProductCreation {
+    pub product_conversation_id: String,
+    pub transcript_row_id: String,
+}
+
+const PRODUCT_CREATION_OWNER_MARKER: &str = "phoenix-product-creation-owner";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StagingOwnershipConflict {
+    MissingDurableToken,
+    ExistingOccupantNotProvablyOwned,
+    OwnerMarkerMissing,
+    OwnerMarkerMismatch,
+    OwnerMarkerUnreadable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StagingCleanupOutcome {
+    Cleaned,
+    AlreadyAbsent,
+    OwnershipConflict(StagingOwnershipConflict),
+}
+
+fn staging_ownership_conflict_diagnostic(conflict: StagingOwnershipConflict) -> &'static str {
+    match conflict {
+        StagingOwnershipConflict::MissingDurableToken => {
+            "product creation staging cleanup ownership conflict: durable ownership token is missing"
+        }
+        StagingOwnershipConflict::ExistingOccupantNotProvablyOwned => {
+            "product creation staging cleanup ownership conflict: existing occupant is not provably owned by this creation"
+        }
+        StagingOwnershipConflict::OwnerMarkerMissing => {
+            "product creation staging cleanup ownership conflict: owner marker is missing"
+        }
+        StagingOwnershipConflict::OwnerMarkerMismatch => {
+            "product creation staging cleanup ownership conflict: owner marker does not match the durable ownership token"
+        }
+        StagingOwnershipConflict::OwnerMarkerUnreadable => {
+            "product creation staging cleanup ownership conflict: owner marker is unreadable"
+        }
+    }
+}
+
+fn staging_cleanup_diagnostic(
+    cleanup: &Result<Result<StagingCleanupOutcome, String>, tokio::task::JoinError>,
+) -> String {
+    match cleanup {
+        Ok(Ok(StagingCleanupOutcome::OwnershipConflict(conflict))) => {
+            staging_ownership_conflict_diagnostic(*conflict).to_string()
+        }
+        Ok(Err(error)) => format!("product creation staging cleanup failed: {error}"),
+        Err(error) => format!("product creation staging cleanup task failed: {error}"),
+        Ok(Ok(StagingCleanupOutcome::Cleaned | StagingCleanupOutcome::AlreadyAbsent)) => {
+            "product creation staging cleanup became ambiguous".to_string()
+        }
+    }
+}
+
+pub(crate) async fn process_product_creation_request(
+    manager: &Arc<RuntimeManager>,
+    request_id: &str,
+) -> Result<PublishedProductCreation, String> {
+    if let Some(job) = manager
+        .db()
+        .get_product_creation_job(request_id)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        if job.status == "delivery_pending" {
+            if job
+                .delivery_retry_at
+                .is_some_and(|retry_at| retry_at > chrono::Utc::now())
+            {
+                return Err(
+                    "product creation objective delivery is awaiting its retry deadline"
+                        .to_string(),
+                );
+            }
+            let claim = crate::db::ProductCreationClaim {
+                worker_id: job
+                    .claim_worker_id
+                    .clone()
+                    .ok_or_else(|| "delivery_pending job missing claim worker id".to_string())?,
+                token: job
+                    .claim_token
+                    .clone()
+                    .ok_or_else(|| "delivery_pending job missing claim token".to_string())?,
+                generation: job.claim_generation,
+                lease_until: job
+                    .claim_lease_until
+                    .ok_or_else(|| "delivery_pending job missing claim lease".to_string())?,
+            };
+            let claimed = crate::db::ClaimedProductCreationJob {
+                claim,
+                job: job.clone(),
+            };
+            return deliver_product_creation_objective(manager, &claimed).await;
+        }
+        if job.status == "delivery_failed" {
+            return Err(
+                "product creation delivery previously failed and requires explicit retry"
+                    .to_string(),
+            );
+        }
+        if job.status == "published" {
+            if let (Some(product_id), Some(conversation_id)) =
+                (job.published_product_id, job.published_conversation_id)
+            {
+                return Ok(PublishedProductCreation {
+                    product_conversation_id: product_id.to_string(),
+                    transcript_row_id: conversation_id,
+                });
+            }
+        }
+    }
+    let worker_id = format!("product-creation-worker-{}", uuid::Uuid::new_v4());
+    let token = uuid::Uuid::new_v4().to_string();
+    let Some(claimed) = manager
+        .db()
+        .claim_product_creation(
+            request_id,
+            &worker_id,
+            &token,
+            chrono::Utc::now(),
+            chrono::Duration::seconds(30),
+        )
+        .await
+        .map_err(|e| e.to_string())?
+    else {
+        return Err("product creation is already being processed or awaiting retry".to_string());
+    };
+    match process_product_creation_until_closed(manager, claimed.clone()).await {
+        Ok(published) => Ok(published),
+        Err(error) => {
+            cleanup_and_retry_unpublished_product_creation(
+                manager,
+                request_id,
+                &claimed.claim,
+                &claimed.job,
+                &error,
+            )
+            .await
+            .map_err(|db_error| format!("{error}; retry persistence failed: {db_error}"))?;
+            Err(error)
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn process_claimed_product_creation(
+    manager: &Arc<RuntimeManager>,
+    claimed: &crate::db::ClaimedProductCreationJob,
+) -> Result<PublishedProductCreation, String> {
+    let job = &claimed.job;
+    let cwd = tokio::task::spawn_blocking({
+        let cwd = job.intent.cwd.clone();
+        let home = manager.runtime_home().to_path_buf();
+        move || {
+            crate::conversation_cwd::ensure_product_creation_cwd(&cwd, &home)
+                .map(crate::conversation_cwd::ValidConversationCwd::into_raw)
+                .map_err(|error| error.to_string())
+        }
+    })
+    .await
+    .map_err(|error| format!("directory creation join failed: {error}"))??;
+    let repo_root = tokio::task::spawn_blocking({
+        let cwd = cwd.clone();
+        move || discover_product_repository(Path::new(&cwd))
+    })
+    .await
+    .map_err(|error| format!("repository discovery join failed: {error}"))??;
+
+    let (
+        effective_cwd,
+        conv_mode,
+        authority_kind,
+        environment,
+        logical_base,
+        staging_repo,
+        staging_oid,
+    ) = if let Some(repo_root) = repo_root {
+        let repo_root = repo_root.trim().to_string();
+        let (oid, logical_base) = if let (Some(oid), Some(base)) = (
+            job.pin_exact_checkout_oid.clone(),
+            job.pin_logical_base.clone(),
+        ) {
+            (oid, base)
+        } else {
+            let resolved = tokio::task::spawn_blocking({
+                let repo_root = repo_root.clone();
+                move || strict_product_creation_pin(Path::new(&repo_root))
+            })
+            .await
+            .map_err(|error| format!("starting-pin join failed: {error}"))??;
+            match manager
+                .db()
+                .pin_product_creation_once(
+                    &job.request_id,
+                    &claimed.claim,
+                    &resolved.0,
+                    &resolved.1,
+                    "fresh",
+                )
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                crate::db::ProductCreationPinOutcome::Pinned(_)
+                | crate::db::ProductCreationPinOutcome::Same(_) => resolved,
+                crate::db::ProductCreationPinOutcome::Conflict(existing) => (
+                    existing
+                        .pin_exact_checkout_oid
+                        .ok_or_else(|| "conflicting pin lacked OID".to_string())?,
+                    existing
+                        .pin_logical_base
+                        .ok_or_else(|| "conflicting pin lacked logical base".to_string())?,
+                ),
+            }
+        };
+        let planned_path =
+            deterministic_worktree_path(&repo_root, job.product_conversation_id.as_str());
+        let reservation_id = format!("{}:worktree", job.request_id);
+        let reserved = manager
+            .db()
+            .reserve_product_creation_resource(
+                &reservation_id,
+                &job.request_id,
+                &claimed.claim,
+                &repo_root,
+                planned_path.to_string_lossy().as_ref(),
+                chrono::Utc::now(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if !reserved {
+            return Err("product creation claim was lost before reserving worktree".to_string());
+        }
+        let reservation = manager
+            .db()
+            .get_product_creation_resource_reservations(&job.request_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|reservation| reservation.id == reservation_id)
+            .ok_or_else(|| "product creation worktree reservation disappeared".to_string())?;
+        if !manager
+            .db()
+            .record_product_creation_staging(
+                &job.request_id,
+                &claimed.claim,
+                planned_path.to_string_lossy().as_ref(),
+                &repo_root,
+                &oid,
+            )
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            return Err("product creation staging claim was lost".to_string());
+        }
+        let materialization_lock = tokio::task::spawn_blocking({
+            let repo_root = repo_root.clone();
+            move || RepositoryMutationLock::acquire(Path::new(&repo_root)).map_err(|error| error.0)
+        })
+        .await
+        .map_err(|error| format!("repository lock acquisition join failed: {error}"))??;
+        let persisted_ownership_token = reservation.ownership_token.clone();
+        let ownership_token = persisted_ownership_token
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        if !manager
+            .db()
+            .record_product_creation_resource_ownership(
+                &job.request_id,
+                &claimed.claim,
+                &planned_path.to_string_lossy(),
+                &ownership_token,
+                chrono::Utc::now(),
+            )
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            return Err(
+                "product creation claim was lost before materializing worktree".to_string(),
+            );
+        }
+        let persisted_ownership_token = Some(ownership_token.clone());
+        let (worktree, ownership_token) = tokio::task::spawn_blocking({
+            let repo_root = repo_root.clone();
+            let oid = oid.clone();
+            let key = job.product_conversation_id.to_string();
+            move || {
+                let _lock = materialization_lock;
+                ensure_phoenix_staging_ignored(Path::new(&repo_root))?;
+                let path = deterministic_worktree_path(&repo_root, &key);
+                let already_present = path.try_exists().map_err(|error| {
+                    format!("could not inspect staging path {}: {error}", path.display())
+                })?;
+                let ownership_token = if already_present {
+                    verify_existing_product_creation_staging(
+                        &path,
+                        &oid,
+                        persisted_ownership_token.as_deref(),
+                    )?
+                } else {
+                    std::fs::create_dir_all(
+                        path.parent()
+                            .ok_or_else(|| "worktree path lacked parent".to_string())?,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    run_git_with_timeout(
+                        Path::new(&repo_root),
+                        &[
+                            "worktree",
+                            "add",
+                            "--detach",
+                            path.to_string_lossy().as_ref(),
+                            &oid,
+                        ],
+                        Duration::from_secs(30),
+                    )?;
+                    write_product_creation_owner_marker(&path, &ownership_token)?;
+                    ownership_token
+                };
+                Ok::<(String, String), String>((
+                    path.to_string_lossy().to_string(),
+                    ownership_token,
+                ))
+            }
+        })
+        .await
+        .map_err(|error| format!("worktree materialization join failed: {error}"))??;
+        let non_empty = NonEmptyString::new(worktree.clone())
+            .map_err(|_| "materialized worktree path was empty".to_string())?;
+        if reservation.status == "reserved" {
+            let present = manager
+                .db()
+                .mark_product_creation_resource_present(
+                    &job.request_id,
+                    &claimed.claim,
+                    &planned_path.to_string_lossy(),
+                    &ownership_token,
+                    chrono::Utc::now(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            if !present {
+                return Err(
+                    "product creation claim was lost after materializing worktree".to_string(),
+                );
+            }
+        }
+        (
+            worktree.clone(),
+            ConvMode::DetachedProductCreation {
+                worktree_path: non_empty,
+                base_branch: NonEmptyString::new(logical_base.clone())
+                    .map_err(|_| "logical base was empty".to_string())?,
+            },
+            phoenix_core::work_scope::AuthorityKind::RestrictedExplore,
+            phoenix_core::work_scope::EnvironmentContext::AllocatedWorktree {
+                cwd: worktree.clone(),
+                worktree_path: worktree,
+                branch_name: None,
+                base_branch: Some(logical_base.clone()),
+            },
+            Some(logical_base),
+            Some(repo_root),
+            Some(oid),
+        )
+    } else {
+        (
+            cwd.clone(),
+            ConvMode::Direct,
+            phoenix_core::work_scope::AuthorityKind::Direct,
+            phoenix_core::work_scope::EnvironmentContext::UnownedCwd { cwd },
+            None,
+            None,
+            None,
+        )
+    };
+
+    let product_id = job.product_conversation_id.clone();
+    let conversation_id = uuid::Uuid::new_v4().to_string();
+    let scope_id = phoenix_core::work_scope::WorkScopeId::new();
+    let now = chrono::Utc::now();
+    let conversation = crate::db::Conversation {
+        id: conversation_id.clone(),
+        product_conversation_id: product_id.clone(),
+        slug: Some(generate_slug()),
+        title: (!job.intent.objective.trim().is_empty())
+            .then(|| title_from_text(&job.intent.objective)),
+        cwd: effective_cwd,
+        parent_conversation_id: None,
+        user_initiated: true,
+        state: ConvState::Idle,
+        state_updated_at: now,
+        created_at: now,
+        updated_at: now,
+        archived: true,
+        model: job.intent.model.clone(),
+        effort: job.intent.effort,
+        service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
+        project_id: None,
+        conv_mode,
+        runtime_role: phoenix_core::work_scope::RuntimeRole::User,
+        attached_work_scope_id: Some(scope_id),
+        desired_base_branch: logical_base,
+        message_count: 0,
+        transcript_generation: 1,
+        seed_parent_id: None,
+        seed_label: None,
+        continued_in_conv_id: None,
+        chain_name: None,
+        llm_language: job.intent.llm_language,
+        spawned_from_conversation_id: None,
+    };
+    let git_publication =
+        staging_repo
+            .zip(staging_oid)
+            .map(|(repository_root, exact_checkout_oid)| {
+                crate::db::ProductCreationGitPublicationFacts {
+                    exact_checkout_oid,
+                    repository_root,
+                }
+            });
+    let published = manager
+        .db()
+        .publish_product_creation_atomically(&crate::db::ProductCreationPublishInput {
+            request_id: job.request_id.clone(),
+            claim: claimed.claim.clone(),
+            conversation,
+            authority_kind,
+            environment,
+            git_publication,
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    if !published {
+        return Err("product creation publication claim was lost".to_string());
+    }
+    let delivery = manager
+        .db()
+        .get_product_creation_job(&job.request_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "published product creation job disappeared".to_string())?;
+    let claimed = crate::db::ClaimedProductCreationJob {
+        claim: claimed.claim.clone(),
+        job: delivery,
+    };
+    deliver_product_creation_objective(manager, &claimed).await
+}
+
+async fn expand_product_creation_objective(
+    manager: &RuntimeManager,
+    conversation_id: &str,
+    objective: &str,
+) -> Result<crate::send_chat_service::ExpandedDispatchMessage, String> {
+    let conversation = manager
+        .db()
+        .get_conversation(conversation_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    crate::send_chat_service::expand_message(
+        manager.db(),
+        conversation_id,
+        &conversation.cwd,
+        objective,
+        crate::send_chat_service::MessageExpansionPolicy::ExpandReferences,
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+#[allow(clippy::too_many_lines)]
+async fn deliver_product_creation_objective(
+    manager: &Arc<RuntimeManager>,
+    claimed: &crate::db::ClaimedProductCreationJob,
+) -> Result<PublishedProductCreation, String> {
+    let job = &claimed.job;
+    let product_id = job
+        .published_product_id
+        .clone()
+        .ok_or_else(|| "delivery obligation lacked product id".to_string())?;
+    let conversation_id = job
+        .published_conversation_id
+        .clone()
+        .ok_or_else(|| "delivery obligation lacked conversation id".to_string())?;
+    let steering_fingerprint = manager
+        .db()
+        .get_steering_acceptance_fingerprint(&conversation_id, &job.request_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    if let Some(exact_fingerprint) = steering_fingerprint.as_ref().filter(|fingerprint| {
+        matches!(
+            fingerprint,
+            phoenix_db::SteeringAcceptanceFingerprint::Exact(_)
+        )
+    }) {
+        if manager
+            .db()
+            .product_creation_objective_already_durably_accepted(
+                &job.request_id,
+                Some(exact_fingerprint),
+                &job.intent,
+            )
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            let completed = manager
+                .db()
+                .complete_product_creation_delivery(
+                    &job.request_id,
+                    &claimed.claim,
+                    exact_fingerprint,
+                    &job.intent,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            if !completed {
+                return Err(
+                    "product creation delivery claim was lost before completion".to_string()
+                );
+            }
+            return Ok(PublishedProductCreation {
+                product_conversation_id: product_id.to_string(),
+                transcript_row_id: conversation_id,
+            });
+        }
+    }
+    let images = job
+        .intent
+        .images
+        .iter()
+        .map(|image| crate::db::ImageData {
+            data: image.data.clone(),
+            media_type: image.media_type.clone(),
+        })
+        .collect();
+    let expanded =
+        expand_product_creation_objective(manager, &conversation_id, &job.intent.objective).await?;
+    let enqueue_result = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        manager.enqueue_steer_message(
+            &conversation_id,
+            Event::SteerMessage {
+                text: expanded.display_text,
+                llm_text: expanded.llm_text,
+                images,
+                files: Vec::new(),
+                message_id: job.request_id.clone(),
+                user_agent: None,
+                skill_invocation: expanded.skill_invocation,
+            },
+            &format!("product-create:{}", job.request_id),
+        ),
+    )
+    .await;
+    if let Err(error) = enqueue_result {
+        let delivery_error =
+            format!("product creation objective delivery timed out after 15 seconds: {error}");
+        manager
+            .db()
+            .schedule_product_creation_delivery_retry(
+                &job.request_id,
+                &claimed.claim,
+                &delivery_error,
+                chrono::Utc::now(),
+            )
+            .await
+            .map_err(|db_error| {
+                format!(
+                    "delivery acceptance timed out; delivery retry persistence failed: {db_error}"
+                )
+            })?;
+        manager.kick_creation_worker();
+        return Err(delivery_error);
+    }
+    if let Err(error) = enqueue_result.expect("checked timeout above") {
+        let delivery_error = error.to_string();
+        manager
+            .db()
+            .schedule_product_creation_delivery_retry(
+                &job.request_id,
+                &claimed.claim,
+                &delivery_error,
+                chrono::Utc::now(),
+            )
+            .await
+            .map_err(|db_error| {
+                format!("{error}; delivery retry persistence failed: {db_error}")
+            })?;
+        manager.kick_creation_worker();
+        return Err(delivery_error);
+    }
+    let completed = manager
+        .db()
+        .complete_product_creation_delivery(
+            &job.request_id,
+            &claimed.claim,
+            &crate::db::SteeringAcceptanceFingerprint::Exact(format!(
+                "product-create:{}",
+                job.request_id
+            )),
+            &job.intent,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    if !completed {
+        return Err("product creation delivery claim was lost before completion".to_string());
+    }
+    Ok(PublishedProductCreation {
+        product_conversation_id: product_id.to_string(),
+        transcript_row_id: conversation_id,
+    })
+}
+
+async fn cleanup_and_retry_unpublished_product_creation(
+    manager: &Arc<RuntimeManager>,
+    request_id: &str,
+    claim: &crate::db::ProductCreationClaim,
+    fallback_job: &crate::db::ProductCreationJobRecord,
+    provisioning_error: &str,
+) -> Result<(), String> {
+    let current = manager
+        .db()
+        .get_product_creation_job(request_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "product creation job disappeared after worker failure".to_string())?;
+    if current.status != "claimed"
+        || current.published_product_id.is_some()
+        || current.published_conversation_id.is_some()
+    {
+        return Ok(());
+    }
+    let cleanup_job = if current.staging_path.is_some() {
+        &current
+    } else {
+        fallback_job
+    };
+    if !manager
+        .db()
+        .renew_product_creation_claim(
+            request_id,
+            claim,
+            chrono::Utc::now(),
+            chrono::Duration::seconds(30),
+        )
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        return Ok(());
+    }
+    let reservations = manager
+        .db()
+        .get_product_creation_resource_reservations(request_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let ownership_token = cleanup_job.staging_path.as_deref().and_then(|path| {
+        reservations
+            .iter()
+            .find(|reservation| reservation.resource_identity == path)
+            .and_then(|reservation| reservation.ownership_token.as_deref())
+    });
+    let cleaned = cleanup_unpublished_product_staging(manager, cleanup_job, ownership_token).await;
+    if !cleaned {
+        return Ok(());
+    }
+    if let Some(resource_identity) = cleanup_job.staging_path.as_deref() {
+        if !manager
+            .db()
+            .reset_product_creation_resource_after_cleanup(
+                request_id,
+                claim,
+                resource_identity,
+                chrono::Utc::now(),
+            )
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            return Ok(());
+        }
+    }
+    manager
+        .db()
+        .schedule_product_creation_retry(request_id, claim, provisioning_error, chrono::Utc::now())
+        .await
+        .map_err(|error| error.to_string())?;
+    manager.kick_creation_worker();
+    Ok(())
+}
+
+async fn cleanup_unpublished_product_staging(
+    manager: &Arc<RuntimeManager>,
+    job: &crate::db::ProductCreationJobRecord,
+    ownership_token: Option<&str>,
+) -> bool {
+    let cleanup = cleanup_unpublished_product_staging_path(
+        job.staging_path.as_deref(),
+        job.staging_repo_root.as_deref(),
+        ownership_token,
+    )
+    .await;
+    if matches!(
+        cleanup,
+        Ok(Ok(
+            StagingCleanupOutcome::Cleaned | StagingCleanupOutcome::AlreadyAbsent
+        ))
+    ) {
+        return true;
+    }
+    let cleanup_error = staging_cleanup_diagnostic(&cleanup);
+    manager
+        .db()
+        .mark_product_creation_cleanup_ambiguous(
+            &job.request_id,
+            &crate::db::ProductCreationClaim {
+                worker_id: job.claim_worker_id.clone().unwrap_or_default(),
+                token: job.claim_token.clone().unwrap_or_default(),
+                generation: job.claim_generation,
+                lease_until: job.claim_lease_until.unwrap_or_else(chrono::Utc::now),
+            },
+            &cleanup_error,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap_or(false)
+}
+
+async fn cleanup_unpublished_product_staging_path(
+    staging_path: Option<&str>,
+    staging_repo_root: Option<&str>,
+    ownership_token: Option<&str>,
+) -> Result<Result<StagingCleanupOutcome, String>, tokio::task::JoinError> {
+    let (Some(path), Some(repo_root)) = (
+        staging_path.map(ToOwned::to_owned),
+        staging_repo_root.map(ToOwned::to_owned),
+    ) else {
+        return Ok(Ok(StagingCleanupOutcome::AlreadyAbsent));
+    };
+    let ownership_token = ownership_token.map(ToOwned::to_owned);
+    tokio::task::spawn_blocking(move || {
+        let path = PathBuf::from(path);
+        match path.try_exists() {
+            Ok(false) => return Ok(StagingCleanupOutcome::AlreadyAbsent),
+            Ok(true) => {}
+            Err(error) => {
+                return Err(format!(
+                    "could not inspect product creation staging path {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+        let _lock = match RepositoryMutationLock::acquire(Path::new(&repo_root)) {
+            Ok(lock) => lock,
+            Err((_, _))
+                if missing_repository_and_resource(Path::new(&repo_root), Path::new(&path)) =>
+            {
+                return Ok(StagingCleanupOutcome::AlreadyAbsent);
+            }
+            Err((message, _)) => return Err(message),
+        };
+        let Some(expected_owner) = ownership_token else {
+            return Ok(StagingCleanupOutcome::OwnershipConflict(
+                StagingOwnershipConflict::MissingDurableToken,
+            ));
+        };
+        if validate_worktree_belongs_to_repository(&repo_root, &path).is_err() {
+            return Ok(StagingCleanupOutcome::OwnershipConflict(
+                StagingOwnershipConflict::ExistingOccupantNotProvablyOwned,
+            ));
+        }
+        let Ok(actual_root) = crate::git_ops::run_git(&path, &["rev-parse", "--show-toplevel"])
+        else {
+            return Ok(StagingCleanupOutcome::OwnershipConflict(
+                StagingOwnershipConflict::ExistingOccupantNotProvablyOwned,
+            ));
+        };
+        let Ok(expected_root) = path.canonicalize() else {
+            return Ok(StagingCleanupOutcome::OwnershipConflict(
+                StagingOwnershipConflict::ExistingOccupantNotProvablyOwned,
+            ));
+        };
+        if Path::new(actual_root.trim()) != expected_root {
+            return Ok(StagingCleanupOutcome::OwnershipConflict(
+                StagingOwnershipConflict::ExistingOccupantNotProvablyOwned,
+            ));
+        }
+        match read_product_creation_owner_marker(&path) {
+            Ok(Some(actual_owner)) if actual_owner == expected_owner => {}
+            Ok(Some(_)) => {
+                return Ok(StagingCleanupOutcome::OwnershipConflict(
+                    StagingOwnershipConflict::OwnerMarkerMismatch,
+                ));
+            }
+            Ok(None) => {
+                return Ok(StagingCleanupOutcome::OwnershipConflict(
+                    StagingOwnershipConflict::OwnerMarkerMissing,
+                ));
+            }
+            Err(_) => {
+                return Ok(StagingCleanupOutcome::OwnershipConflict(
+                    StagingOwnershipConflict::OwnerMarkerUnreadable,
+                ));
+            }
+        }
+        crate::git_ops::run_git(
+            Path::new(&repo_root),
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                path.to_string_lossy().as_ref(),
+            ],
+        )?;
+        Ok(StagingCleanupOutcome::Cleaned)
+    })
+    .await
+}
+
+async fn reconcile_product_creation_cleanup(
+    manager: &Arc<RuntimeManager>,
+    cleanup: &crate::db::ProductCreationCleanupJob,
+) -> Result<(), String> {
+    for reservation in &cleanup.reservations {
+        if reservation.status == "released" {
+            continue;
+        }
+        let cleaned = cleanup_unpublished_product_staging_path(
+            Some(&reservation.resource_identity),
+            Some(&reservation.repository_identity),
+            reservation.ownership_token.as_deref(),
+        )
+        .await
+        .map_err(|error| error.to_string())??;
+        if let StagingCleanupOutcome::OwnershipConflict(conflict) = cleaned {
+            let cleanup_error = staging_ownership_conflict_diagnostic(conflict);
+            if !manager
+                .db()
+                .mark_product_creation_resource_cleanup_conflict(
+                    cleanup,
+                    &reservation.id,
+                    chrono::Utc::now(),
+                )
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                return Ok(());
+            }
+            manager
+                .db()
+                .mark_claimed_product_creation_cleanup_ambiguous(
+                    cleanup,
+                    cleanup_error,
+                    chrono::Utc::now(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            return Ok(());
+        }
+        let released = manager
+            .db()
+            .release_product_creation_resource(cleanup, &reservation.id, chrono::Utc::now())
+            .await
+            .map_err(|error| error.to_string())?;
+        if !released {
+            return Ok(());
+        }
+    }
+    if !manager
+        .db()
+        .finish_product_creation_cleanup(cleanup, chrono::Utc::now())
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        return Ok(());
+    }
+    Ok(())
+}
+
+async fn process_product_creation_until_closed(
+    manager: &Arc<RuntimeManager>,
+    claimed: crate::db::ClaimedProductCreationJob,
+) -> Result<PublishedProductCreation, String> {
+    let request_id = claimed.job.request_id.clone();
+    let claim = claimed.claim.clone();
+    let mut fatal = manager.fatal_local_authority_receiver();
+    let mut processing = std::pin::pin!(process_claimed_product_creation(manager, &claimed));
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
+    heartbeat.tick().await;
+    loop {
+        tokio::select! {
+            result = &mut processing => return result,
+            _ = crate::tls::wait_for_fatal_local_authority(&mut fatal) => {
+                return Err("product creation stopped after fatal local authority closure".to_string());
+            }
+            _ = heartbeat.tick() => {
+                let _admitted = manager.acquire_local_authority_pass().map_err(|()| {
+                    "product creation claim renewal rejected after fatal local authority closure".to_string()
+                })?;
+                let renewed = manager.db().renew_product_creation_claim(
+                    &request_id,
+                    &claim,
+                    chrono::Utc::now(),
+                    chrono::Duration::seconds(30),
+                ).await.map_err(|error| error.to_string())?;
+                if !renewed {
+                    let current = manager
+                        .db()
+                        .get_product_creation_job(&request_id)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    if current.is_some_and(|job| {
+                        job.status != "claimed"
+                            && job.published_product_id.is_some()
+                            && job.published_conversation_id.is_some()
+                    }) {
+                        return (&mut processing).await;
+                    }
+                    return Err("product creation claim was lost during heartbeat renewal".to_string());
+                }
+            }
+        }
+    }
+}
+
+fn run_git_with_timeout(
+    repo_root: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<String, String> {
+    crate::git_ops::run_git_bounded(repo_root, args, timeout)
+}
+
+fn discover_product_repository(cwd: &Path) -> Result<Option<String>, String> {
+    match crate::git_ops::run_git_with_env(
+        cwd,
+        &["rev-parse", "--show-toplevel"],
+        &[("LC_ALL", "C")],
+    ) {
+        Ok(root) => Path::new(root.trim())
+            .canonicalize()
+            .map(|path| Some(path.to_string_lossy().to_string()))
+            .map_err(|error| format!("could not canonicalize repository checkout root: {error}")),
+        Err(error) if error.contains("not a git repository") => Ok(None),
+        Err(error) => Err(format!("could not determine repository context: {error}")),
+    }
+}
+
+fn git_common_dir_for_repository_root(repo_root: &Path) -> Result<String, String> {
+    crate::git_ops::run_git(
+        repo_root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .map(|value| value.trim().to_string())
+}
+
+fn verify_existing_product_creation_staging(
+    path: &Path,
+    expected_oid: &str,
+    persisted_ownership_token: Option<&str>,
+) -> Result<String, String> {
+    crate::api::handlers::validate_detached_task_worktree(path, expected_oid)?;
+    let expected = persisted_ownership_token
+        .ok_or_else(|| "existing staging occupant lacked durable ownership".to_string())?;
+    match read_product_creation_owner_marker(path)? {
+        Some(actual) if actual == expected => Ok(expected.to_string()),
+        _ => Err("existing staging occupant did not match durable ownership".to_string()),
+    }
+}
+
+fn product_creation_owner_marker_path(worktree_path: &Path) -> Result<PathBuf, String> {
+    let git_dir = crate::git_ops::run_git(
+        worktree_path,
+        &["rev-parse", "--path-format=absolute", "--git-dir"],
+    )?;
+    Ok(PathBuf::from(git_dir.trim()).join(PRODUCT_CREATION_OWNER_MARKER))
+}
+
+fn write_product_creation_owner_marker(
+    worktree_path: &Path,
+    ownership_token: &str,
+) -> Result<(), String> {
+    if ownership_token.trim().is_empty() {
+        return Err("product creation ownership token was empty".to_string());
+    }
+    std::fs::write(
+        product_creation_owner_marker_path(worktree_path)?,
+        ownership_token.as_bytes(),
+    )
+    .map_err(|error| format!("could not write product creation owner marker: {error}"))
+}
+
+fn read_product_creation_owner_marker(worktree_path: &Path) -> Result<Option<String>, String> {
+    match std::fs::read_to_string(product_creation_owner_marker_path(worktree_path)?) {
+        Ok(token) => Ok(Some(token)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "could not read product creation owner marker: {error}"
+        )),
+    }
+}
+
+fn ensure_phoenix_staging_ignored(repo_root: &Path) -> Result<(), String> {
+    let common_dir = crate::git_ops::run_git(repo_root, &["rev-parse", "--git-common-dir"])?;
+    let common_dir = PathBuf::from(common_dir.trim());
+    let common_dir = if common_dir.is_absolute() {
+        common_dir
+    } else {
+        repo_root.join(common_dir)
+    };
+    let exclude_path = common_dir.join("info").join("exclude");
+    std::fs::create_dir_all(
+        exclude_path
+            .parent()
+            .ok_or_else(|| "git exclude path had no parent".to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let existing = std::fs::read_to_string(&exclude_path).unwrap_or_default();
+    if !existing.lines().any(|line| line.trim() == "/.phoenix/") {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&exclude_path)
+            .map_err(|error| error.to_string())?;
+        if !existing.is_empty() && !existing.ends_with('\n') {
+            writeln!(file).map_err(|error| error.to_string())?;
+        }
+        writeln!(file, "/.phoenix/").map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn strict_product_creation_pin(repo_root: &Path) -> Result<(String, String), String> {
+    let _lock = RepositoryMutationLock::acquire(repo_root).map_err(|e| e.0)?;
+    let remotes = crate::git_ops::run_git(repo_root, &["remote"])
+        .map_err(|error| format!("could not inspect configured remotes: {error}"))?;
+    if remotes.lines().any(|remote| remote.trim() == "origin") {
+        let stdout = run_git_with_timeout(
+            repo_root,
+            &["ls-remote", "--symref", "origin", "HEAD"],
+            Duration::from_secs(30),
+        )
+        .map_err(|error| format!("could not discover origin default: {error}"))?;
+        let branch = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("ref: refs/heads/"))
+            .and_then(|line| line.split_whitespace().next())
+            .ok_or_else(|| {
+                "origin did not advertise an authoritative default branch".to_string()
+            })?;
+        run_git_with_timeout(
+            repo_root,
+            &[
+                "fetch",
+                "origin",
+                "--no-tags",
+                &format!("+refs/heads/{branch}:refs/remotes/origin/{branch}"),
+            ],
+            Duration::from_secs(30),
+        )?;
+        let oid = crate::git_ops::run_git(
+            repo_root,
+            &[
+                "rev-parse",
+                &format!("refs/remotes/origin/{branch}^{{commit}}"),
+            ],
+        )?;
+        return Ok((oid.trim().to_string(), branch.to_string()));
+    }
+    let oid = crate::git_ops::run_git(repo_root, &["rev-parse", "refs/heads/main^{commit}"])
+        .map_err(|_| "repository has no origin and no local refs/heads/main".to_string())?;
+    Ok((oid.trim().to_string(), "main".to_string()))
+}
+
+fn materialize_approved_task_snapshot(
+    worktree_path: &Path,
+    snapshot: &phoenix_core::task_handoff::ApprovedTaskSnapshot,
+) -> Result<(), String> {
+    let relative = Path::new(&snapshot.task_file);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(
+            "approved task artifact path must stay within the detached worktree".to_string(),
+        );
+    }
+    let filename = relative
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "approved task artifact path lacked a filename".to_string())?;
+    let promoted_filename = taskmd_core::filename::parse_filename(filename).map_or_else(
+        || filename.to_string(),
+        |parsed| {
+            taskmd_core::filename::format_filename(
+                &parsed.id,
+                parsed.priority,
+                taskmd_core::constants::Status::InProgress,
+                &parsed.slug,
+            )
+        },
+    );
+    let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+    let canonical_worktree = worktree_path
+        .canonicalize()
+        .map_err(|error| format!("failed to canonicalize detached worktree: {error}"))?;
+    let target_parent = canonical_worktree.join(parent);
+    let mut verified_parent = canonical_worktree.clone();
+    for component in parent.components() {
+        verified_parent.push(component);
+        if verified_parent.exists() {
+            if std::fs::symlink_metadata(&verified_parent)
+                .map_err(|error| format!("failed to inspect approved task parent: {error}"))?
+                .file_type()
+                .is_symlink()
+            {
+                return Err("approved task artifact parent must not contain symlinks".to_string());
+            }
+        } else {
+            std::fs::create_dir(&verified_parent).map_err(|error| {
+                format!("failed to create approved task artifact parent: {error}")
+            })?;
+        }
+    }
+    let canonical_parent = target_parent
+        .canonicalize()
+        .map_err(|error| format!("failed to canonicalize approved task parent: {error}"))?;
+    if !canonical_parent.starts_with(&canonical_worktree) {
+        return Err("approved task artifact parent escaped the detached worktree".to_string());
+    }
+    let source_path = canonical_parent.join(filename);
+    let path = canonical_parent.join(promoted_filename);
+    if path
+        .symlink_metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err("approved task artifact target must not be a symlink".to_string());
+    }
+    if source_path != path && source_path.exists() {
+        std::fs::remove_file(&source_path)
+            .map_err(|error| format!("failed to remove superseded task artifact: {error}"))?;
+    }
+    std::fs::write(&path, &snapshot.artifact_body)
+        .map_err(|error| format!("failed to materialize approved task artifact: {error}"))?;
+    Ok(())
+}
 
 pub(crate) fn resolve_creation_model(
     registry: &ModelRegistry,
@@ -59,11 +1211,12 @@ where
             return Ok(());
         };
         let job = claim().await?;
-        drop(owner);
         let Some(job) = job else {
             return Ok(());
         };
-        if matches!(process(job).await, CreationDrainControl::StopDrain) {
+        let control = process(job).await;
+        drop(owner);
+        if matches!(control, CreationDrainControl::StopDrain) {
             return Ok(());
         }
     }
@@ -84,8 +1237,84 @@ where
     .await
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn drain_pending_jobs(manager: &Arc<RuntimeManager>) -> Result<(), String> {
     let worker_id = CreationWorkerId(format!("creation-worker-{}", uuid::Uuid::new_v4()));
+    let Ok(_product_authority) = manager.acquire_local_authority_pass() else {
+        return Ok(());
+    };
+    while let Some(delivery) = manager
+        .db()
+        .claim_next_product_creation_delivery(
+            &worker_id.0,
+            &uuid::Uuid::new_v4().to_string(),
+            chrono::Utc::now(),
+            chrono::Duration::seconds(30),
+        )
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        if deliver_product_creation_objective(manager, &delivery)
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+    loop {
+        let Some(claimed) = manager
+            .db()
+            .claim_next_product_creation(
+                &worker_id.0,
+                &uuid::Uuid::new_v4().to_string(),
+                chrono::Utc::now(),
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            break;
+        };
+        if let Err(error) = process_product_creation_until_closed(manager, claimed.clone()).await {
+            cleanup_and_retry_unpublished_product_creation(
+                manager,
+                &claimed.job.request_id,
+                &claimed.claim,
+                &claimed.job,
+                &error,
+            )
+            .await?;
+        }
+    }
+    loop {
+        let Some(cleanup) = manager
+            .db()
+            .claim_next_product_creation_cleanup(
+                &worker_id.0,
+                &uuid::Uuid::new_v4().to_string(),
+                chrono::Utc::now(),
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            break;
+        };
+        let _owner = manager.acquire_local_authority_pass().map_err(|()| {
+            "product creation cleanup rejected after fatal local authority closure".to_string()
+        })?;
+        if let Err(error) = reconcile_product_creation_cleanup(manager, &cleanup).await {
+            tracing::warn!(request_id = %cleanup.job.request_id, error = %error, "product creation cleanup will retry");
+            manager
+                .db()
+                .schedule_product_creation_cleanup_retry(
+                    &cleanup,
+                    chrono::Utc::now() + chrono::Duration::seconds(30),
+                )
+                .await
+                .map_err(|db_error| db_error.to_string())?;
+        }
+    }
     loop {
         let Ok(_owner) = manager.acquire_local_authority_pass() else {
             return Ok(());
@@ -533,21 +1762,81 @@ async fn provision_conversation(
                     ErrorKind::InvalidRequest,
                 )
             })?;
-            let branch_name = if requested_mode == "approved_task" {
-                intent.checkout_ref.clone().ok_or_else(|| {
+            let approved_snapshot = if requested_mode == "approved_task" {
+                Some(intent.approved_task.clone().ok_or_else(|| {
                     (
-                        "Approved-task creation requires the approved branch".to_string(),
+                        "Approved-task creation requires the reviewed task artifact snapshot"
+                            .to_string(),
                         ErrorKind::InvalidRequest,
                     )
-                })?
+                })?)
             } else {
-                desired_base_branch.clone().ok_or_else(|| {
+                None
+            };
+            let (branch_name, approved_commit_oid, approved_base_branch) = if let Some(snapshot) =
+                approved_snapshot.as_ref()
+            {
+                let (oid, base_branch) = if let Some(pin) = job.starting_pin.as_ref() {
+                    (pin.exact_checkout_oid.clone(), pin.logical_base.clone())
+                } else {
+                    run_admitted_blocking(
+                        acquire_creation_admission(
+                            manager,
+                            "approved-task pin resolution rejected after fatal local authority closure",
+                        )?,
+                        {
+                            let repo_root = repo_root.clone();
+                            move || strict_product_creation_pin(Path::new(&repo_root))
+                        },
+                    )
+                    .await
+                    .map_err(|error| {
+                        (
+                            format!("approved-task pin resolution join failed: {error}"),
+                            ErrorKind::ServerError,
+                        )
+                    })?
+                    .map_err(|error| (error, ErrorKind::ServerError))?
+                };
+                (
+                    format!(
+                        "task-{}-{}",
+                        snapshot.task_id,
+                        slugify_label(&snapshot.task_title)
+                    ),
+                    Some(oid),
+                    Some(base_branch),
+                )
+            } else {
+                let branch_name = desired_base_branch.clone().ok_or_else(|| {
                     (
                         "Branch mode requires base_branch naming the existing branch".to_string(),
                         ErrorKind::InvalidRequest,
                     )
-                })?
+                })?;
+                validate_user_ref(&branch_name).map_err(app_error_to_kind)?;
+                (branch_name, None, None)
             };
+            if let Some(oid) = approved_commit_oid.as_deref() {
+                if !manager
+                    .db()
+                    .persist_conversation_creation_checkout_pin(
+                        &job.conversation_id,
+                        &claim,
+                        oid,
+                        approved_base_branch
+                            .as_deref()
+                            .expect("approved-task pin includes its logical base"),
+                    )
+                    .await
+                    .map_err(|error| (error.to_string(), ErrorKind::ServerError))?
+                {
+                    return Err(CreationProvisionError::Failed(
+                        "approved-task starting pin lost its provisioning claim".to_string(),
+                        ErrorKind::ServerError,
+                    ));
+                }
+            }
             validate_user_ref(&branch_name).map_err(app_error_to_kind)?;
             let existing_path = deterministic_worktree_path(&repo_root, &job.conversation_id);
             checkpoint_creation_stage(
@@ -569,10 +1858,9 @@ async fn provision_conversation(
             let conv_id = job.conversation_id.clone();
             let repo_for_blocking = repo_root.clone();
             let path_for_blocking = existing_path.clone();
-            let base_branch_for_blocking = desired_base_branch
-                .clone()
-                .unwrap_or_else(|| branch_name.clone());
-            let approved_task_snapshot = intent.approved_task.clone();
+            let approved_task_snapshot = approved_snapshot.clone();
+            let approved_commit_oid_for_blocking = approved_commit_oid.clone();
+            let approved_base_branch_for_blocking = approved_base_branch.clone();
             let worktree_admission = acquire_creation_admission(
                 manager,
                 "branch worktree mutation rejected after fatal local authority closure",
@@ -581,13 +1869,23 @@ async fn provision_conversation(
                 let _lock = RepositoryMutationLock::acquire(Path::new(&repo_for_blocking))?;
                 if reconcile_owned_worktree_path(&repo_for_blocking, &path_for_blocking)? {
                     if approved_task_creation {
+                        validate_worktree_belongs_to_repository(
+                            &repo_for_blocking,
+                            &path_for_blocking,
+                        )?;
                         validate_detached_task_worktree(
+                            &path_for_blocking,
+                            approved_commit_oid_for_blocking
+                                .as_ref()
+                                .expect("approved_task mode has strict pin")
+                                .as_str(),
+                        )
+                        .map_err(|error| (error, ErrorKind::InvalidRequest))?;
+                        materialize_approved_task_snapshot(
                             &path_for_blocking,
                             approved_task_snapshot
                                 .as_ref()
-                                .expect("approved_task mode has reviewed snapshot")
-                                .approved_commit_oid
-                                .as_str(),
+                                .expect("approved_task mode has reviewed snapshot"),
                         )
                         .map_err(|error| (error, ErrorKind::InvalidRequest))?;
                     } else {
@@ -595,7 +1893,9 @@ async fn provision_conversation(
                     }
                     let worktree_path = path_for_blocking.to_string_lossy().to_string();
                     let base_branch = if approved_task_creation {
-                        base_branch_for_blocking
+                        approved_base_branch_for_blocking
+                            .clone()
+                            .expect("approved_task mode has strict base branch")
                     } else {
                         crate::git_ops::run_git(
                             Path::new(&repo_for_blocking),
@@ -626,17 +1926,24 @@ async fn provision_conversation(
                     let worktree_path = create_detached_task_worktree_blocking(
                         &repo_for_blocking,
                         &path_for_blocking,
-                        approved_task_snapshot
+                        approved_commit_oid_for_blocking
                             .as_ref()
-                            .expect("approved_task mode has reviewed snapshot")
-                            .approved_commit_oid
+                            .expect("approved_task mode has strict pin")
                             .as_str(),
                     )
                     .map_err(branch_worktree_error_to_kind)?;
+                    materialize_approved_task_snapshot(
+                        Path::new(&worktree_path),
+                        approved_task_snapshot
+                            .as_ref()
+                            .expect("approved_task mode has reviewed snapshot"),
+                    )
+                    .map_err(|error| (error, ErrorKind::InvalidRequest))?;
                     Ok(BranchWorktreeInfo {
                         branch_name,
                         worktree_path,
-                        base_branch: base_branch_for_blocking,
+                        base_branch: approved_base_branch_for_blocking
+                            .expect("approved_task mode has strict base branch"),
                     })
                 } else {
                     create_branch_worktree_blocking(&repo_for_blocking, &conv_id, &branch_name, &db)
@@ -662,9 +1969,7 @@ async fn provision_conversation(
             effective_cwd.clone_from(&info.worktree_path);
             desired_base_branch = Some(info.base_branch.clone());
             conv_mode = if let Some(snapshot) = intent.approved_task.as_ref() {
-                ConvMode::Work {
-                    branch_name: NonEmptyString::new(info.branch_name)
-                        .map_err(|_| ("empty branch name".to_string(), ErrorKind::ServerError))?,
+                ConvMode::DetachedApprovedTask {
                     worktree_path: NonEmptyString::new(info.worktree_path)
                         .map_err(|_| ("empty worktree path".to_string(), ErrorKind::ServerError))?,
                     base_branch: NonEmptyString::new(info.base_branch)
@@ -1316,6 +2621,25 @@ fn managed_worktree_error_to_kind(error: ManagedWorktreeError) -> (String, Error
 }
 
 #[cfg(test)]
+mod staging_diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn ownership_conflicts_have_stable_specific_diagnostics() {
+        assert_eq!(
+            staging_ownership_conflict_diagnostic(StagingOwnershipConflict::OwnerMarkerMismatch),
+            "product creation staging cleanup ownership conflict: owner marker does not match the durable ownership token"
+        );
+        assert_eq!(
+            staging_ownership_conflict_diagnostic(
+                StagingOwnershipConflict::ExistingOccupantNotProvablyOwned,
+            ),
+            "product creation staging cleanup ownership conflict: existing occupant is not provably owned by this creation"
+        );
+    }
+}
+
+#[cfg(test)]
 mod temporary_creation_branch_tests {
     use super::*;
 
@@ -1390,6 +2714,413 @@ mod temporary_creation_branch_tests {
             lease_until: chrono::Utc::now(),
             reservations: vec![],
         }
+    }
+}
+
+#[cfg(test)]
+mod product_creation_delivery_replay_tests {
+    use super::*;
+    use crate::db::{
+        Database, ProductCreationGitPublicationFacts, ProductCreationIntent,
+        ProductCreationPublishInput,
+    };
+    use crate::platform::PlatformCapability;
+    use crate::runtime::RuntimeManager;
+    use crate::tools::mcp::McpClientManager;
+    use phoenix_core::domain::db_schema::Conversation;
+    use phoenix_core::domain::llm_types::ServiceTier;
+    use phoenix_core::llm_language::LlmLanguage;
+    use phoenix_core::work_scope::WorkScopeId;
+    use phoenix_core::work_scope::{AuthorityKind, EnvironmentContext, RuntimeRole};
+    use phoenix_llm::ModelRegistry;
+
+    fn stale_delivery_conversation(
+        conversation_id: &str,
+        product_conversation_id: &phoenix_core::domain::close::ProductConversationId,
+        cwd: &str,
+    ) -> Conversation {
+        Conversation {
+            id: conversation_id.to_string(),
+            product_conversation_id: product_conversation_id.clone(),
+            slug: Some(conversation_id.to_string()),
+            title: Some(conversation_id.to_string()),
+            cwd: cwd.to_string(),
+            parent_conversation_id: None,
+            user_initiated: true,
+            state: ConvState::Idle,
+            state_updated_at: chrono::Utc::now(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            archived: true,
+            model: None,
+            effort: None,
+            service_tier: ServiceTier::Standard,
+            project_id: None,
+            conv_mode: ConvMode::Direct,
+            runtime_role: RuntimeRole::User,
+            attached_work_scope_id: Some(WorkScopeId::new()),
+            desired_base_branch: None,
+            message_count: 0,
+            transcript_generation: 1,
+            seed_parent_id: None,
+            seed_label: None,
+            continued_in_conv_id: None,
+            chain_name: None,
+            llm_language: LlmLanguage::Caveman,
+            spawned_from_conversation_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_objective_expands_against_published_conversation_root() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("notes.md"), "published root contents").unwrap();
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation(
+            "expanded-product-objective",
+            "expanded-product-objective",
+            root.path().to_string_lossy().as_ref(),
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let manager = RuntimeManager::new(
+            db,
+            Arc::new(ModelRegistry::new_empty()),
+            PlatformCapability::None {
+                details: "test".into(),
+            },
+            Arc::new(McpClientManager::new()),
+            None,
+        );
+
+        let expanded = expand_product_creation_objective(
+            &manager,
+            "expanded-product-objective",
+            "Read @notes.md",
+        )
+        .await
+        .unwrap();
+        assert_eq!(expanded.display_text, "Read @notes.md");
+        assert!(expanded
+            .llm_text
+            .as_deref()
+            .is_some_and(|text| text.contains("published root contents")));
+    }
+
+    #[tokio::test]
+    async fn exact_fingerprint_replay_with_stale_delivery_claim_remains_pending() {
+        let db = Database::open_in_memory().await.unwrap();
+        let intent = ProductCreationIntent {
+            cwd: "/repo/a".to_string(),
+            objective: "deliver objective".to_string(),
+            model: None,
+            effort: None,
+            images: Vec::new(),
+            llm_language: LlmLanguage::Caveman,
+        };
+        db.accept_product_creation("req-stale-delivery", &intent)
+            .await
+            .unwrap();
+        let provisioning = db
+            .claim_product_creation(
+                "req-stale-delivery",
+                "provisioner",
+                "provision-token",
+                chrono::Utc::now(),
+                chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let conversation_id = "conv-stale-delivery";
+        let conversation = stale_delivery_conversation(
+            conversation_id,
+            &provisioning.job.product_conversation_id,
+            &intent.cwd,
+        );
+        assert!(db
+            .publish_product_creation_atomically(&ProductCreationPublishInput {
+                request_id: "req-stale-delivery".to_string(),
+                claim: provisioning.claim,
+                conversation,
+                authority_kind: AuthorityKind::Work,
+                environment: EnvironmentContext::UnownedCwd {
+                    cwd: intent.cwd.clone(),
+                },
+                git_publication: Some(ProductCreationGitPublicationFacts {
+                    exact_checkout_oid: "repo-id".to_string(),
+                    repository_root: intent.cwd.clone(),
+                }),
+            })
+            .await
+            .unwrap());
+        db.append_steering_entry(
+            conversation_id,
+            &phoenix_core::domain::sm_event::SteerEntry {
+                text: intent.objective.clone(),
+                llm_text: None,
+                images: Vec::new(),
+                files: Vec::new(),
+                message_id: "req-stale-delivery".to_string(),
+                user_agent: None,
+                skill_invocation: None,
+            },
+            "product-create:req-stale-delivery",
+        )
+        .await
+        .unwrap();
+        let pending = db
+            .get_product_creation_job("req-stale-delivery")
+            .await
+            .unwrap()
+            .unwrap();
+        let stale_delivery = crate::db::ClaimedProductCreationJob {
+            claim: crate::db::ProductCreationClaim {
+                worker_id: pending.claim_worker_id.clone().unwrap(),
+                token: "stale-token".to_string(),
+                generation: pending.claim_generation,
+                lease_until: pending.claim_lease_until.unwrap(),
+            },
+            job: pending,
+        };
+        let manager = Arc::new(RuntimeManager::new(
+            db.clone(),
+            Arc::new(ModelRegistry::new_empty()),
+            PlatformCapability::None {
+                details: "test".to_string(),
+            },
+            Arc::new(McpClientManager::new()),
+            None,
+        ));
+
+        let error = deliver_product_creation_objective(&manager, &stale_delivery)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "product creation delivery claim was lost before completion"
+        );
+        let still_pending = db
+            .get_product_creation_job("req-stale-delivery")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(still_pending.status, "delivery_pending");
+        assert!(db.get_conversation(conversation_id).await.unwrap().archived);
+    }
+}
+
+#[cfg(test)]
+mod product_creation_path_classification_tests {
+    use super::*;
+
+    #[test]
+    fn newly_created_standalone_directory_has_no_repository() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("standalone");
+        std::fs::create_dir(&cwd).unwrap();
+
+        assert_eq!(discover_product_repository(&cwd).unwrap(), None);
+    }
+
+    #[test]
+    fn localized_environment_still_classifies_standalone_directory_as_direct() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("standalone");
+        std::fs::create_dir(&cwd).unwrap();
+
+        let localized_probe = crate::git_ops::run_git_with_env(
+            &cwd,
+            &["rev-parse", "--show-toplevel"],
+            &[("LC_ALL", "de_DE.UTF-8")],
+        );
+        assert!(localized_probe.is_err());
+        assert_eq!(discover_product_repository(&cwd).unwrap(), None);
+    }
+
+    #[test]
+    fn newly_created_subdirectory_in_repository_is_git_backed() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::git_ops::run_git(repo.path(), &["init"]).unwrap();
+        let cwd = repo.path().join("new-product");
+        std::fs::create_dir(&cwd).unwrap();
+
+        let discovered = discover_product_repository(&cwd).unwrap().unwrap();
+        assert_eq!(Path::new(&discovered), repo.path().canonicalize().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod product_creation_ignore_tests {
+    use super::*;
+
+    #[test]
+    fn staging_ignore_uses_common_exclude_without_rewriting_gitignore() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::git_ops::run_git(repo.path(), &["init"]).unwrap();
+        let gitignore = repo.path().join(".gitignore");
+        let original = b"target/\n\xff\xfe\n";
+        std::fs::write(&gitignore, original).unwrap();
+
+        ensure_phoenix_staging_ignored(repo.path()).unwrap();
+        ensure_phoenix_staging_ignored(repo.path()).unwrap();
+
+        assert_eq!(std::fs::read(gitignore).unwrap(), original);
+        let common_dir =
+            crate::git_ops::run_git(repo.path(), &["rev-parse", "--git-common-dir"]).unwrap();
+        let exclude = repo.path().join(common_dir.trim()).join("info/exclude");
+        let contents = std::fs::read_to_string(exclude).unwrap();
+        assert_eq!(
+            contents
+                .lines()
+                .filter(|line| *line == "/.phoenix/")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn staging_ignore_separates_from_unterminated_common_exclude() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::git_ops::run_git(repo.path(), &["init"]).unwrap();
+        let common_dir =
+            crate::git_ops::run_git(repo.path(), &["rev-parse", "--git-common-dir"]).unwrap();
+        let exclude = repo.path().join(common_dir.trim()).join("info/exclude");
+        std::fs::write(&exclude, "existing-rule").unwrap();
+
+        ensure_phoenix_staging_ignored(repo.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(exclude).unwrap(),
+            "existing-rule\n/.phoenix/\n"
+        );
+    }
+}
+
+#[cfg(test)]
+mod product_creation_staging_ownership_tests {
+    use super::*;
+
+    fn initialized_repo() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        crate::git_ops::run_git(repo.path(), &["init"]).unwrap();
+        crate::git_ops::run_git(repo.path(), &["config", "user.email", "test@example.com"])
+            .unwrap();
+        crate::git_ops::run_git(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        std::fs::write(repo.path().join("README"), "test").unwrap();
+        crate::git_ops::run_git(repo.path(), &["add", "README"]).unwrap();
+        crate::git_ops::run_git(repo.path(), &["commit", "-m", "initial"]).unwrap();
+        repo
+    }
+
+    fn add_detached_worktree(repo: &Path, path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        crate::git_ops::run_git(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                path.to_string_lossy().as_ref(),
+                "HEAD",
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn occupied_ordinary_directory_is_preserved_before_ownership_proof() {
+        let repo = initialized_repo();
+        let path = repo.path().join(".phoenix/worktrees/replaced");
+        std::fs::create_dir_all(&path).unwrap();
+        let user_file = path.join("user-owned");
+        std::fs::write(&user_file, "preserve me").unwrap();
+        let oid = crate::git_ops::run_git(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+
+        assert!(
+            verify_existing_product_creation_staging(&path, oid.trim(), Some("owner-token"))
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(user_file).unwrap(), "preserve me");
+    }
+
+    #[tokio::test]
+    async fn matching_owner_marker_authorizes_staging_removal() {
+        let repo = initialized_repo();
+        let path = repo.path().join(".phoenix/worktrees/owned");
+        add_detached_worktree(repo.path(), &path);
+        write_product_creation_owner_marker(&path, "owner-token").unwrap();
+
+        let outcome = cleanup_unpublished_product_staging_path(
+            Some(path.to_string_lossy().as_ref()),
+            Some(repo.path().to_string_lossy().as_ref()),
+            Some("owner-token"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(outcome, StagingCleanupOutcome::Cleaned);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn absent_staging_resource_is_already_reconciled() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("absent");
+
+        let outcome = cleanup_unpublished_product_staging_path(
+            Some(path.to_string_lossy().as_ref()),
+            Some(root.path().to_string_lossy().as_ref()),
+            Some("owner-token"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(outcome, StagingCleanupOutcome::AlreadyAbsent);
+    }
+
+    #[tokio::test]
+    async fn same_path_and_oid_replacement_is_preserved_as_ownership_conflict() {
+        let repo = initialized_repo();
+        let path = repo.path().join(".phoenix/worktrees/replaced");
+        add_detached_worktree(repo.path(), &path);
+        write_product_creation_owner_marker(&path, "original-owner").unwrap();
+        crate::git_ops::run_git(
+            repo.path(),
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                path.to_string_lossy().as_ref(),
+            ],
+        )
+        .unwrap();
+        add_detached_worktree(repo.path(), &path);
+        let replacement_file = path.join("replacement-owned-by-user");
+        std::fs::write(&replacement_file, "preserve me").unwrap();
+
+        let outcome = cleanup_unpublished_product_staging_path(
+            Some(path.to_string_lossy().as_ref()),
+            Some(repo.path().to_string_lossy().as_ref()),
+            Some("original-owner"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            StagingCleanupOutcome::OwnershipConflict(StagingOwnershipConflict::OwnerMarkerMissing)
+        );
+        assert_eq!(
+            std::fs::read_to_string(replacement_file).unwrap(),
+            "preserve me"
+        );
     }
 }
 
@@ -1663,6 +3394,108 @@ mod runtime_bootstrap_settlement_tests {
         assert_eq!(renewals.load(std::sync::atomic::Ordering::Acquire), 1);
     }
 
+    struct CountingOwner(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl CountingOwner {
+        fn acquire(owners: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+            owners.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            Self(Arc::clone(owners))
+        }
+    }
+
+    impl Drop for CountingOwner {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+
+    #[tokio::test]
+    async fn continue_retains_owner_through_processing_then_claims_next_pass() {
+        let owners = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let admission_owners = Arc::clone(&owners);
+        let claim_owners = Arc::clone(&owners);
+        let claims = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_claims = Arc::clone(&claims);
+        let (process_started_tx, process_started_rx) = tokio::sync::oneshot::channel();
+        let (release_process_tx, release_process_rx) = tokio::sync::oneshot::channel();
+        let mut process_started_tx = Some(process_started_tx);
+        let mut release_process_rx = Some(release_process_rx);
+
+        let drain = tokio::spawn(drain_claimed_jobs(
+            move || Ok(CountingOwner::acquire(&admission_owners)),
+            move || {
+                assert_eq!(claim_owners.load(std::sync::atomic::Ordering::Acquire), 1);
+                let claim_number =
+                    observed_claims.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                async move {
+                    if claim_number == 0 {
+                        Ok(Some("job"))
+                    } else {
+                        Ok(None)
+                    }
+                }
+            },
+            move |_| {
+                let process_started_tx = process_started_tx.take().unwrap();
+                let release_process_rx = release_process_rx.take().unwrap();
+                async move {
+                    process_started_tx.send(()).unwrap();
+                    release_process_rx.await.unwrap();
+                    CreationDrainControl::Continue
+                }
+            },
+        ));
+
+        process_started_rx.await.unwrap();
+        assert_eq!(owners.load(std::sync::atomic::Ordering::Acquire), 1);
+
+        release_process_tx.send(()).unwrap();
+        drain.await.unwrap().unwrap();
+
+        assert_eq!(owners.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert_eq!(claims.load(std::sync::atomic::Ordering::Acquire), 2);
+    }
+
+    #[tokio::test]
+    async fn stop_drain_retains_owner_through_processing_without_second_claim() {
+        let owners = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let admission_owners = Arc::clone(&owners);
+        let claim_owners = Arc::clone(&owners);
+        let claims = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_claims = Arc::clone(&claims);
+        let (process_started_tx, process_started_rx) = tokio::sync::oneshot::channel();
+        let (release_process_tx, release_process_rx) = tokio::sync::oneshot::channel();
+        let mut process_started_tx = Some(process_started_tx);
+        let mut release_process_rx = Some(release_process_rx);
+
+        let drain = tokio::spawn(drain_claimed_jobs(
+            move || Ok(CountingOwner::acquire(&admission_owners)),
+            move || {
+                assert_eq!(claim_owners.load(std::sync::atomic::Ordering::Acquire), 1);
+                observed_claims.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                async { Ok(Some("job")) }
+            },
+            move |_| {
+                let process_started_tx = process_started_tx.take().unwrap();
+                let release_process_rx = release_process_rx.take().unwrap();
+                async move {
+                    process_started_tx.send(()).unwrap();
+                    release_process_rx.await.unwrap();
+                    CreationDrainControl::StopDrain
+                }
+            },
+        ));
+
+        process_started_rx.await.unwrap();
+        assert_eq!(owners.load(std::sync::atomic::Ordering::Acquire), 1);
+
+        release_process_tx.send(()).unwrap();
+        drain.await.unwrap().unwrap();
+
+        assert_eq!(owners.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert_eq!(claims.load(std::sync::atomic::Ordering::Acquire), 1);
+    }
+
     #[tokio::test]
     async fn fatal_deferral_stops_drain_before_second_job_claim() {
         let claims = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1930,7 +3763,12 @@ fn validate_worktree_belongs_to_repository(
             cwd,
             &["rev-parse", "--path-format=absolute", "--git-common-dir"],
         )
-        .map(|value| value.trim().to_string())
+        .and_then(|value| {
+            Path::new(value.trim())
+                .canonicalize()
+                .map(|path| path.to_string_lossy().to_string())
+                .map_err(|error| format!("could not canonicalize Git common directory: {error}"))
+        })
         .map_err(|error| (error, ErrorKind::ServerError))
     };
     let expected = common_dir(Path::new(repo_root))?;
@@ -1981,10 +3819,19 @@ fn validate_existing_worktree(path: &Path) -> Result<(), (String, ErrorKind)> {
 }
 
 fn deterministic_worktree_path(repo_root: &str, conv_id: &str) -> std::path::PathBuf {
-    Path::new(repo_root)
-        .join(".phoenix")
-        .join("worktrees")
-        .join(conv_id)
+    let root = Path::new(repo_root);
+    let anchor = git_common_dir_for_repository_root(root)
+        .ok()
+        .and_then(|common_dir| {
+            let common = PathBuf::from(common_dir);
+            if common.file_name().is_some_and(|name| name == ".git") {
+                common.parent().map(Path::to_path_buf)
+            } else {
+                Some(common)
+            }
+        })
+        .unwrap_or_else(|| root.to_path_buf());
+    anchor.join(".phoenix").join("worktrees").join(conv_id)
 }
 
 fn creation_error_is_retryable(kind: &ErrorKind) -> bool {
@@ -2012,6 +3859,50 @@ fn app_error_to_kind(error: AppError) -> (String, ErrorKind) {
             (message, ErrorKind::ServerError)
         }
         AppError::Forbidden(message) => (message, ErrorKind::Auth),
+    }
+}
+
+#[cfg(test)]
+mod product_pin_tests {
+    use super::strict_product_creation_pin;
+    use std::path::Path;
+
+    fn git(path: &Path, args: &[&str]) -> String {
+        crate::git_ops::run_git(path, args).expect("git command")
+    }
+
+    #[test]
+    fn no_origin_pins_only_local_main() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-b", "main"]);
+        git(dir.path(), &["config", "user.email", "test@example.com"]);
+        git(dir.path(), &["config", "user.name", "Test"]);
+        std::fs::write(dir.path().join("README"), "one").unwrap();
+        git(dir.path(), &["add", "README"]);
+        git(dir.path(), &["commit", "-m", "initial"]);
+        let expected = git(dir.path(), &["rev-parse", "refs/heads/main^{commit}"]);
+        assert_eq!(
+            strict_product_creation_pin(dir.path()).unwrap(),
+            (expected.trim().to_string(), "main".to_string())
+        );
+    }
+
+    #[test]
+    fn no_origin_does_not_fall_back_to_master() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-b", "master"]);
+        assert!(strict_product_creation_pin(dir.path()).is_err());
+    }
+
+    #[test]
+    fn origin_discovery_failure_does_not_fall_back_to_cached_head() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-b", "main"]);
+        git(
+            dir.path(),
+            &["remote", "add", "origin", "/definitely/missing/remote"],
+        );
+        assert!(strict_product_creation_pin(dir.path()).is_err());
     }
 }
 

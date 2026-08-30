@@ -1,0 +1,90 @@
+.product-creation-recovery {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.product-creation-recovery__header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.product-creation-recovery__header > span {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.product-creation-recovery__list {
+  display: grid;
+  gap: 8px;
+}
+
+.product-creation-recovery__item {
+  display: grid;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--bg-secondary) 88%, var(--bg-tertiary));
+}
+
+.product-creation-recovery__summary,
+.product-creation-recovery__meta,
+.product-creation-recovery__actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.product-creation-recovery__status {
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.product-creation-recovery__status--accepted,
+.product-creation-recovery__status--claimed,
+.product-creation-recovery__status--retry-scheduled {
+  color: #facc15;
+}
+
+.product-creation-recovery__status--failed,
+.product-creation-recovery__status--cancelled,
+.product-creation-recovery__status--delivery-failed,
+.product-creation-recovery__action--danger {
+  color: #f87171;
+}
+
+.product-creation-recovery__cwd,
+.product-creation-recovery__meta {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.product-creation-recovery__objective {
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.product-creation-recovery__error {
+  color: #f87171;
+  font-size: 12px;
+}
+
+.product-creation-recovery__action {
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 12px;
+  padding: 5px 9px;
+  cursor: pointer;
+}
+
+.product-creation-recovery__action:disabled {
+  opacity: 0.5;
+  cursor: default;
+}

@@ -471,6 +471,7 @@ pub struct RuntimeManager {
     message_retriever: Arc<dyn crate::db::MessageRetriever>,
     platform: PlatformCapability,
     browser_sessions: Arc<BrowserSessionManager>,
+    runtime_home: PathBuf,
     /// Per-process bash handle registry. Shared by every conversation's
     /// `ToolContext`; each `ResourceScopeKey` gets its own `WorkScopeHandles`
     /// table inside, so a continuation chain on one worktree shares one
@@ -1952,25 +1953,15 @@ pub enum SseEvent {
     },
 }
 
-/// Pick the tool registry for a sub-agent runtime on (re-)creation from
-/// its persisted `conv_mode`.
-///
-/// Explore sub-agents are always persisted as `ConvMode::Explore`
-/// (see `handle_spawn_request`); Work sub-agents inherit the parent's
-/// `conv_mode`, which is one of Direct, Work, or Branch (never Explore --
-/// an Explore parent cannot spawn a Work sub-agent, guarded at spawn
-/// time). So `Explore` variant means an Explore sub-agent, anything
-/// else means a Work sub-agent. See subagents.allium
-/// `SubAgentRegistryOnResume`.
-fn sub_agent_registry_for_conv_mode(
-    conv_mode: &ConvMode,
+fn sub_agent_registry_for_authority(
+    authority: crate::work_scope::ResourceAuthority,
     policy: ExploreToolPolicy,
 ) -> ToolRegistry {
-    match conv_mode {
-        ConvMode::Explore { .. } => ToolRegistry::for_subagent_explore(policy),
-        ConvMode::Direct | ConvMode::Work { .. } | ConvMode::Branch { .. } => {
-            ToolRegistry::for_subagent_work()
+    match authority {
+        crate::work_scope::ResourceAuthority::Restricted => {
+            ToolRegistry::for_subagent_explore(policy)
         }
+        crate::work_scope::ResourceAuthority::Work => ToolRegistry::for_subagent_work(),
     }
 }
 
@@ -2015,7 +2006,11 @@ pub(crate) fn cleanup_branch_for_unretained_work_scope<'a>(
     let conversations: Vec<_> = conversations.into_iter().collect();
     if let Some(branch) = conversations.iter().find_map(|conv| match &conv.conv_mode {
         ConvMode::Work { branch_name, .. } => Some(branch_name.as_str().to_string()),
-        ConvMode::Explore { .. } | ConvMode::Direct | ConvMode::Branch { .. } => None,
+        ConvMode::Explore { .. }
+        | ConvMode::Direct
+        | ConvMode::Branch { .. }
+        | ConvMode::DetachedProductCreation { .. }
+        | ConvMode::DetachedApprovedTask { .. } => None,
     }) {
         if crate::git_ops::run_git(worktree_path, &["symbolic-ref", "-q", "HEAD"]).is_err() {
             return None;
@@ -2124,6 +2119,7 @@ impl RuntimeManager {
                 Some(browser_lifecycle_tx),
                 runtime_env,
             ),
+            runtime_home: runtime_env.home().to_path_buf(),
             bash_handles: Arc::new(BashHandleRegistry::with_lifecycle_sink(Some(
                 bash_lifecycle_tx,
             ))),
@@ -2193,6 +2189,11 @@ impl RuntimeManager {
             fatal_local_authority_fence,
             wake_registrar: Some(wake_registrar),
         }
+    }
+
+    #[must_use]
+    pub fn runtime_home(&self) -> &std::path::Path {
+        &self.runtime_home
     }
 
     /// Get the detected platform capability
@@ -2911,17 +2912,12 @@ impl RuntimeManager {
             let Some(broadcaster) = broadcaster else {
                 continue;
             };
-            let authority = match conv.conv_mode {
-                ConvMode::Explore { .. } => crate::work_scope::ResourceAuthority::Restricted,
-                _ => crate::work_scope::ResourceAuthority::Work,
+            let Ok(resolved) =
+                crate::resource_authority::resolve_resource_authority(self.db(), &conv).await
+            else {
+                continue;
             };
-            let actor = if authority == crate::work_scope::ResourceAuthority::Restricted
-                && conv.runtime_role == crate::work_scope::RuntimeRole::User
-            {
-                crate::work_scope::EffectiveResourceAccess::shared_restricted(&conv_id)
-            } else {
-                crate::work_scope::EffectiveResourceAccess::new(&conv_id, authority)
-            };
+            let actor = resolved.actor;
             let inventory = phoenix_tools::work_scope_inventory::assemble_inventory(
                 work_scope,
                 Some(&actor),
@@ -3413,18 +3409,27 @@ impl RuntimeManager {
         tokio::spawn(async move {
             let _ = ready_tx.send(());
             loop {
-                if let Err(error) =
-                    crate::runtime::creation_worker::drain_pending_jobs(&manager).await
+                if let Err(error) = Box::pin(crate::runtime::creation_worker::drain_pending_jobs(
+                    &manager,
+                ))
+                .await
                 {
                     tracing::error!(error = %error, "conversation creation worker drain failed");
                 }
                 if manager.local_authority_is_closed() {
                     break;
                 }
-                let next_deadline = match manager.db().next_conversation_creation_deadline().await {
-                    Ok(deadline) => deadline,
-                    Err(error) => {
-                        tracing::error!(error = %error, "failed to read conversation creation deadline");
+                let next_deadline = match (
+                    manager.db().next_conversation_creation_deadline().await,
+                    manager.db().next_product_creation_deadline().await,
+                ) {
+                    (Ok(legacy), Ok(product)) => match (legacy, product) {
+                        (Some(left), Some(right)) => Some(left.min(right)),
+                        (left @ Some(_), None) => left,
+                        (None, right) => right,
+                    },
+                    (legacy, product) => {
+                        tracing::error!(?legacy, ?product, "failed to read creation deadline");
                         Some(chrono::Utc::now() + chrono::Duration::seconds(1))
                     }
                 };
@@ -3912,7 +3917,10 @@ impl RuntimeManager {
         conv_context.explore_bash = ExploreToolPolicy::from_platform(&self.platform).bash();
         conv_context.mode = match &sub_conv_mode {
             ConvMode::Direct => ModeKind::Direct,
-            ConvMode::Explore { .. } | ConvMode::Work { .. } => ModeKind::Managed,
+            ConvMode::Explore { .. }
+            | ConvMode::Work { .. }
+            | ConvMode::DetachedProductCreation { .. }
+            | ConvMode::DetachedApprovedTask { .. } => ModeKind::Managed,
             ConvMode::Branch { .. } => ModeKind::Branch,
         };
         conv_context.work_scope_worktree = sub_conv_mode.worktree_path().map(PathBuf::from);
@@ -4850,6 +4858,11 @@ impl RuntimeManager {
             .unwrap_or_else(|| self.llm_registry.default_model_id());
         let model_id = self.llm_registry.resolve_model_id(&stored_model_id);
         let context_window = self.llm_registry.context_window(&model_id);
+        let approved_task_objective = self
+            .db
+            .get_approved_task_objective(conversation_id)
+            .await
+            .map_err(|error| format!("Failed to load approved-task objective: {error}"))?;
         let mode_context = conv_mode_to_context(&conv.conv_mode);
         let mut context = if is_sub_agent {
             let root_id = find_root_conversation_id(&self.db, conversation_id).await;
@@ -4886,12 +4899,11 @@ impl RuntimeManager {
             }
             None => return Err("ordinary conversation is missing its work scope".to_string()),
         };
-        context.resource_authority = match conv.conv_mode {
-            ConvMode::Explore { .. } => crate::work_scope::ResourceAuthority::Restricted,
-            ConvMode::Direct | ConvMode::Work { .. } | ConvMode::Branch { .. } => {
-                crate::work_scope::ResourceAuthority::Work
-            }
-        };
+        context.resource_authority =
+            crate::resource_authority::resolve_resource_authority(self.db(), &conv)
+                .await
+                .map_err(|error| format!("Failed to load resource authority: {error}"))?
+                .authority;
         context.mode_context = Some(mode_context);
         context.effort = conv.effort;
         context.service_tier = self
@@ -4903,7 +4915,10 @@ impl RuntimeManager {
         context.desired_base_branch = conv.desired_base_branch.clone();
         context.mode = match &conv.conv_mode {
             ConvMode::Direct => ModeKind::Direct,
-            ConvMode::Explore { .. } | ConvMode::Work { .. } => ModeKind::Managed,
+            ConvMode::Explore { .. }
+            | ConvMode::Work { .. }
+            | ConvMode::DetachedProductCreation { .. }
+            | ConvMode::DetachedApprovedTask { .. } => ModeKind::Managed,
             ConvMode::Branch { .. } => ModeKind::Branch,
         };
         context.work_scope_worktree = conv.conv_mode.worktree_path().map(PathBuf::from);
@@ -4975,8 +4990,8 @@ impl RuntimeManager {
         context.is_coordinator = is_coordinator;
 
         let tool_executor = if is_sub_agent {
-            let registry = sub_agent_registry_for_conv_mode(
-                &conv.conv_mode,
+            let registry = sub_agent_registry_for_authority(
+                context.resource_authority,
                 ExploreToolPolicy::from_platform(&self.platform),
             );
             ToolRegistryExecutor::with_mcp(
@@ -5017,7 +5032,13 @@ impl RuntimeManager {
                     ));
                 let writing_tools = crate::coordinator_tools::writing_tools(global_read, send_chat);
                 let (registry, upgrade_writing_tools) = match conv.conv_mode {
-                    ConvMode::Explore { .. } => (
+                    ConvMode::Explore { .. } if approved_task_objective.is_some() => (
+                        ToolRegistry::direct(agent_catalog.to_vec(), available_model_ids.clone())
+                            .try_with_writing_conversation_tools(writing_tools)
+                            .map_err(|error| error.clone())?,
+                        None,
+                    ),
+                    ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. } => (
                         ToolRegistry::explore(
                             &context.tasks_dir_name,
                             agent_catalog.to_vec(),
@@ -5048,7 +5069,9 @@ impl RuntimeManager {
                             None,
                         )
                     }
-                    ConvMode::Work { .. } | ConvMode::Branch { .. } => {
+                    ConvMode::Work { .. }
+                    | ConvMode::Branch { .. }
+                    | ConvMode::DetachedApprovedTask { .. } => {
                         // Full tool suite plus `propose_task` (non-blocking fork
                         // proposal — REQ-PROJ-036). Work/Branch always sit on git
                         // history, so the tool is always offered.
@@ -6215,6 +6238,20 @@ pub(crate) fn conv_mode_to_context(mode: &ConvMode) -> ModeContext {
             base_branch: base_branch.to_string(),
             worktree_path: worktree_path.to_string(),
         },
+        ConvMode::DetachedProductCreation { .. } => ModeContext::Explore {
+            next_taskmd_id_hint: None,
+        },
+        ConvMode::DetachedApprovedTask {
+            base_branch,
+            worktree_path,
+            task_id,
+            task_title,
+        } => ModeContext::DetachedApprovedTask {
+            base_branch: base_branch.to_string(),
+            worktree_path: worktree_path.to_string(),
+            task_id: task_id.to_string(),
+            task_title: task_title.to_string(),
+        },
         ConvMode::Branch {
             branch_name,
             base_branch,
@@ -6296,70 +6333,32 @@ mod bash_lifecycle_bridge_tests {
 
 #[cfg(test)]
 mod sub_agent_registry_resume_tests {
-    //! Regression coverage for the resume-path tool-registry selection
-    //! (`runtime.rs` ~1267, subagents.allium `SubAgentRegistryOnResume`).
-    //!
-    //! Before task 13010 this branch hard-coded `for_subagent_explore()`,
-    //! silently stripping `patch` from a re-created Work sub-agent. The
-    //! `sub_agent_registry_for_conv_mode` helper now picks the right
-    //! registry from the persisted `conv_mode`; these tests pin that
-    //! contract so a future refactor cannot quietly regress it.
-    use super::sub_agent_registry_for_conv_mode;
-    use crate::db::{ConvMode, NonEmptyString};
+    use super::sub_agent_registry_for_authority;
     use crate::platform::PlatformCapability;
     use crate::tools::ExploreToolPolicy;
+    use crate::work_scope::ResourceAuthority;
 
-    fn registry_has(conv_mode: &ConvMode, tool: &str) -> bool {
-        sub_agent_registry_for_conv_mode(
-            conv_mode,
+    fn registry_has(authority: ResourceAuthority, tool: &str) -> bool {
+        sub_agent_registry_for_authority(
+            authority,
             ExploreToolPolicy::from_platform(&PlatformCapability::None {
                 details: "test".into(),
             }),
         )
         .definitions()
         .iter()
-        .any(|d| d.name == tool)
+        .any(|definition| definition.name == tool)
     }
 
     #[test]
-    fn explore_subagent_resume_excludes_patch() {
-        let mode = ConvMode::Explore {
-            worktree_path: None,
-            next_taskmd_id_hint: None,
-        };
-        assert!(!registry_has(&mode, "patch"));
-        assert!(registry_has(&mode, "submit_result"));
+    fn restricted_subagent_resume_excludes_patch() {
+        assert!(!registry_has(ResourceAuthority::Restricted, "patch"));
+        assert!(registry_has(ResourceAuthority::Restricted, "submit_result"));
     }
 
     #[test]
-    fn direct_subagent_resume_keeps_patch() {
-        // A Work sub-agent spawned from a Direct parent persists as
-        // ConvMode::Direct (Work sub-agents inherit parent conv_mode).
-        // The previous bug mapped Direct -> Explore registry; the
-        // resumed sub-agent must keep `patch`.
-        assert!(registry_has(&ConvMode::Direct, "patch"));
-    }
-
-    #[test]
-    fn work_subagent_resume_keeps_patch() {
-        let mode = ConvMode::Work {
-            branch_name: NonEmptyString::new("task-0001-x").unwrap(),
-            worktree_path: NonEmptyString::new("/tmp/wt").unwrap(),
-            base_branch: NonEmptyString::new("main").unwrap(),
-            task_id: NonEmptyString::new("0001").unwrap(),
-            task_title: NonEmptyString::new("x").unwrap(),
-        };
-        assert!(registry_has(&mode, "patch"));
-    }
-
-    #[test]
-    fn branch_subagent_resume_keeps_patch() {
-        let mode = ConvMode::Branch {
-            branch_name: NonEmptyString::new("feature-x").unwrap(),
-            worktree_path: NonEmptyString::new("/tmp/wt").unwrap(),
-            base_branch: NonEmptyString::new("feature-x").unwrap(),
-        };
-        assert!(registry_has(&mode, "patch"));
+    fn work_authority_subagent_resume_keeps_patch() {
+        assert!(registry_has(ResourceAuthority::Work, "patch"));
     }
 }
 
@@ -8421,14 +8420,11 @@ mod scope_liveness_tests {
         let approval = TaskApprovalHandoffData {
             task_id: "12345".to_string(),
             task_title: "Inherited handoff".to_string(),
-            branch_name: "task-12345-inherited-handoff".to_string(),
-            approved_commit_oid: "0123456789abcdef0123456789abcdef01234567".to_string(),
-            worktree_path: "/tmp".to_string(),
-            base_branch: "main".to_string(),
             title: "Inherited handoff".to_string(),
             priority: crate::task_source::Priority::P1,
             plan: "Do the work".to_string(),
             task_file: "tasks/12345-p1-ready--inherited-handoff.md".to_string(),
+            artifact_body: "# Inherited handoff\n\nDo the work\n".to_string(),
         };
         let response = manager
             .create_and_start_task_handoff("handoff-parent", &approval, &mut authority)

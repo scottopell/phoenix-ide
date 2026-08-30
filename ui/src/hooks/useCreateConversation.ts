@@ -1,17 +1,27 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { api, ExpansionError, MAX_FILE_ATTACHMENT_SIZE, MAX_FILE_ATTACHMENTS, MAX_TOTAL_FILE_ATTACHMENT_SIZE } from '../api';
+import { api, ExpansionError } from '../api';
 import { subscribeModels } from '../modelsPoller';
-import type { GitBranchEntry, ImageData, ModelEffort, ModelsResponse, Project, TaskEntry } from '../api';
+import type { CreateProductConversationRequest, ImageData, ModelEffort, ModelsResponse, RecentManagementRootSuggestion } from '../api';
 import type { DirStatus } from '../components/SettingsFields';
 import { SUPPORTED_IMAGE_TYPES, processImageFiles } from '../utils/images';
 import { isWebSpeechSupported } from '../components/VoiceInput/VoiceRecorder';
 import { generateUUID } from '../utils/uuid';
-import { useCreateConversationWithStore } from '../conversation';
 
 const LAST_CWD_KEY = 'phoenix-last-cwd';
 const LAST_MODEL_KEY = 'phoenix-last-model';
 const NEW_CONVERSATION_DRAFT_KEY = 'phoenix-new-conversation-draft';
-const MAX_PROJECT_SUGGESTIONS = 5;
+const REPLAY_CREATE_REQUEST_KEY = 'phoenix-replay-product-create-request';
+const REPLAY_CREATE_INTENT_KEY = 'phoenix-replay-product-create-intent';
+const RECOVERED_LLM_LANGUAGE_KEY = 'phoenix-create-llm-language';
+
+export function beginNewProductConversationIntent(): void {
+  try {
+    localStorage.removeItem(REPLAY_CREATE_REQUEST_KEY);
+    localStorage.removeItem(REPLAY_CREATE_INTENT_KEY);
+    localStorage.removeItem('phoenix-pending-product-create-request');
+    localStorage.removeItem(RECOVERED_LLM_LANGUAGE_KEY);
+  } catch { /* best effort */ }
+}
 
 function effortSupportedByModel(models: ModelsResponse | null, modelId: string | null, effort: ModelEffort | null): boolean {
   if (!effort) return true;
@@ -36,7 +46,6 @@ export function reconcileSubscribedModelSelection(
       : null,
   };
 }
-
 
 function readNewConversationDraft(): string {
   try {
@@ -67,109 +76,20 @@ function clearNewConversationDraft(): void {
   }
 }
 
-function relativeTaskPath(cwd: string, taskPath: string): string {
-  const root = cwd.endsWith('/') ? cwd : `${cwd}/`;
-  return taskPath.startsWith(root) ? taskPath.slice(root.length) : taskPath;
-}
-
-const routeForConversation = (conv: { id: string; slug?: string | null }) => `/c/${conv.id}`;
-
-function buildTaskStartPrompt(cwd: string, task: TaskEntry, extraInstructions: string): string {
-  const taskFile = relativeTaskPath(cwd, task.path);
-  const extra = extraInstructions.trim();
-  return [
-    `Start from the existing task file \`${taskFile}\`.`,
-    '',
-    `Call the propose_task tool with {"task_file":"${taskFile}"} as your only tool call so I can review and approve the task before Work mode begins.`,
-    extra ? `\nAdditional context from me:\n${extra}` : '',
-  ].filter(Boolean).join('\n');
-}
-
-export type NewConversationWorkflow =
-  | { kind: 'direct' }
-  | { kind: 'planFromBranch'; baseBranch: string | null }
-  | { kind: 'planFromTask'; task: TaskEntry | null; baseBranch: string | null }
-  | { kind: 'continueBranch'; branch: string | null };
-
-function workflowNeedsGit(workflow: NewConversationWorkflow): boolean {
-  return workflow.kind !== 'direct';
-}
-
-function workflowTask(workflow: NewConversationWorkflow): TaskEntry | null {
-  return workflow.kind === 'planFromTask' ? workflow.task : null;
-}
-
-function workflowBranch(workflow: NewConversationWorkflow): string | null {
-  switch (workflow.kind) {
-    case 'planFromBranch':
-      return workflow.baseBranch;
-    case 'planFromTask':
-      return workflow.baseBranch;
-    case 'continueBranch':
-      return workflow.branch;
-    case 'direct':
-      return null;
-  }
-}
-
-// The selected workflow is a pure function of (user override, git status,
-// default branch) rather than a piece of state reconciled by effects. A null
-// override means "follow the default", so a git repo can never render with
-// 'direct' selected unless the user explicitly chose it. A null branch on an
-// override means "still follow the default branch" and is filled in once
-// branch metadata loads.
-//
-// branchUnavailable is the settled "the fetch finished and found no usable
-// branch" signal (unborn or branchless repo). Only then does the default fall
-// back to 'direct' — otherwise such a repo would be stuck on planFromBranch with
-// no branch and Send permanently disabled. While the fetch is still pending the
-// flag is false, so a normal repo never flashes 'direct'.
-export function effectiveWorkflow(
-  override: NewConversationWorkflow | null,
-  isGitDir: boolean | null,
-  fallbackBranch: string | null,
-  branchUnavailable: boolean,
-): NewConversationWorkflow {
-  if (isGitDir !== true) return { kind: 'direct' };
-  if (!override) {
-    if (!fallbackBranch && branchUnavailable) return { kind: 'direct' };
-    return { kind: 'planFromBranch', baseBranch: fallbackBranch };
-  }
-  switch (override.kind) {
-    case 'planFromBranch':
-      return { ...override, baseBranch: override.baseBranch ?? fallbackBranch };
-    case 'planFromTask':
-      return { ...override, baseBranch: override.baseBranch ?? fallbackBranch };
-    case 'continueBranch':
-      return { ...override, branch: override.branch ?? fallbackBranch };
-    case 'direct':
-      return override;
-  }
-}
-
-function deriveSubmission(workflow: NewConversationWorkflow): { mode: 'direct' | 'managed' | 'branch'; baseBranch: string | null; checkoutRef: string | null } {
-  switch (workflow.kind) {
-    case 'direct':
-      return { mode: 'direct', baseBranch: null, checkoutRef: null };
-    case 'planFromBranch':
-      return { mode: 'managed', baseBranch: workflow.baseBranch, checkoutRef: null };
-    case 'planFromTask':
-      return { mode: 'managed', baseBranch: workflow.baseBranch, checkoutRef: workflow.task?.source_ref ?? null };
-    case 'continueBranch':
-      return { mode: 'branch', baseBranch: workflow.branch, checkoutRef: null };
-  }
-}
-
-export function suggestedProjectDirs(projects: Project[]): string[] {
-  return projects
-    .toSorted((a, b) => b.conversation_count - a.conversation_count
-      || Date.parse(b.created_at) - Date.parse(a.created_at))
-    .slice(0, MAX_PROJECT_SUGGESTIONS)
-    .map((project) => project.canonical_path);
-}
-
 export function useCreateConversation(navigate: (path: string) => void) {
-  const createConversationWithStore = useCreateConversationWithStore();
+  const [requestId, setRequestId] = useState(() => {
+    try {
+      const replay = localStorage.getItem(REPLAY_CREATE_REQUEST_KEY);
+      if (replay) return replay;
+    } catch { /* use a fresh in-memory identity */ }
+    return generateUUID();
+  });
+  const [recoveredLlmLanguage, setRecoveredLlmLanguage] = useState<string | null>(() => {
+    try { return localStorage.getItem(RECOVERED_LLM_LANGUAGE_KEY); } catch { return null; }
+  });
+  const replayIntentRef = useRef<string | null>((() => {
+    try { return localStorage.getItem(REPLAY_CREATE_INTENT_KEY); } catch { return null; }
+  })());
   const [homeDir, setHomeDir] = useState<string>('');
   const [cwd, setCwd] = useState(() => localStorage.getItem(LAST_CWD_KEY) || '');
   const [dirStatus, setDirStatus] = useState<DirStatus>(() =>
@@ -186,34 +106,11 @@ export function useCreateConversation(navigate: (path: string) => void) {
   const [isDragOver, setIsDragOver] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
-
-  const [projectDirs, setProjectDirs] = useState<string[]>([]);
-  // Only the user's deliberate choice is stored; the active workflow is derived
-  // from this plus git status via effectiveWorkflow. null = follow the default.
-  const [workflowOverride, setWorkflowOverride] = useState<NewConversationWorkflow | null>(null);
-  const [tasks, setTasks] = useState<TaskEntry[]>([]);
-  const [taskAvailabilityLoading, setTaskAvailabilityLoading] = useState(false);
-  const [taskAvailable, setTaskAvailable] = useState<boolean | null>(null);
-  const [tasksLoading, setTasksLoading] = useState(false);
-  const [tasksLoaded, setTasksLoaded] = useState(false);
-  const [branches, setBranches] = useState<GitBranchEntry[]>([]);
-  const [currentBranch, setCurrentBranch] = useState<string | null>(null);
-  const [defaultBranch, setDefaultBranch] = useState<string | null>(null);
-  const [gitMetadataLoading, setGitMetadataLoading] = useState(false);
-  // Set once a branch fetch settles with no usable branch (unborn/branchless
-  // repo, or the fetch failed). Distinct from "fetch not started yet" so the
-  // default can degrade to 'direct' only after we actually know there is no
-  // branch — never during the initial load window.
-  const [branchUnavailable, setBranchUnavailable] = useState(false);
-  const [branchSearch, setBranchSearch] = useState('');
-  const [branchSearchLoading, setBranchSearchLoading] = useState(false);
+  const [recentManagementRootSuggestions, setRecentManagementRootSuggestions] = useState<RecentManagementRootSuggestion[]>([]);
 
   const voiceSupported = isWebSpeechSupported();
   const [interimText, setInterimText] = useState('');
   const draftBeforeVoiceRef = useRef<string>('');
-  const metadataRequestSeqRef = useRef(0);
-  const taskAvailabilityRequestSeqRef = useRef(0);
-  const taskListRequestSeqRef = useRef(0);
   const selectedModelRef = useRef(selectedModel);
   const selectedEffortRef = useRef(selectedEffort);
   const selectModel = useCallback((model: string | null) => {
@@ -225,8 +122,6 @@ export function useCreateConversation(navigate: (path: string) => void) {
     setSelectedEffort(effort);
   }, []);
 
-  const workflow = effectiveWorkflow(workflowOverride, isGitDir, defaultBranch ?? currentBranch, branchUnavailable);
-
   useEffect(() => {
     selectedModelRef.current = selectedModel;
   }, [selectedModel]);
@@ -234,9 +129,6 @@ export function useCreateConversation(navigate: (path: string) => void) {
     selectedEffortRef.current = selectedEffort;
   }, [selectedEffort]);
 
-  // Subscribe to the shared models poller so credential transitions
-  // (Codex sign-in/sign-out, gateway flips) reach this page without a
-  // manual refresh.
   useEffect(() => {
     const unsub = subscribeModels(modelsData => {
       setModels(modelsData);
@@ -254,13 +146,12 @@ export function useCreateConversation(navigate: (path: string) => void) {
         setCwd(env.home_dir);
       }
     }).catch(console.error);
-    api.getProjects()
-      .then((projects) => setProjectDirs(suggestedProjectDirs(projects)))
-      .catch((error) => console.warn('Failed to load project suggestions:', error));
+    api.listRecentManagementRootSuggestions()
+      .then((response) => setRecentManagementRootSuggestions(response.suggestions))
+      .catch(console.error);
     return () => { unsub(); };
   }, [selectEffort, selectModel]);
 
-  // Save preferences
   useEffect(() => { localStorage.setItem(LAST_CWD_KEY, cwd); }, [cwd]);
   useEffect(() => { if (selectedModel) localStorage.setItem(LAST_MODEL_KEY, selectedModel); }, [selectedModel]);
   useEffect(() => {
@@ -270,165 +161,12 @@ export function useCreateConversation(navigate: (path: string) => void) {
   }, [models, selectedEffort, selectedModel, selectEffort]);
   useEffect(() => { writeNewConversationDraft(draft); }, [draft]);
 
-  // A new directory drops any prior workflow choice; the active workflow then
-  // re-derives from the new git status (and the metadata fetched below).
-  useEffect(() => {
-    setBranches([]);
-    setTasks([]);
-    taskAvailabilityRequestSeqRef.current += 1;
-    taskListRequestSeqRef.current += 1;
-    setTaskAvailabilityLoading(false);
-    setTaskAvailable(null);
-    setTasksLoading(false);
-    setTasksLoaded(false);
-    setCurrentBranch(null);
-    setDefaultBranch(null);
-    setGitMetadataLoading(false);
-    setBranchUnavailable(false);
-    setWorkflowOverride(null);
-    setBranchSearch('');
-  }, [cwd]);
-
-  useEffect(() => {
-    if (!isGitDir) {
-      setBranches([]);
-      setTasks([]);
-      taskAvailabilityRequestSeqRef.current += 1;
-      taskListRequestSeqRef.current += 1;
-      setTaskAvailabilityLoading(false);
-      setTaskAvailable(null);
-      setTasksLoading(false);
-      setTasksLoaded(false);
-      setCurrentBranch(null);
-      setDefaultBranch(null);
-      setGitMetadataLoading(false);
-      setBranchUnavailable(false);
-      setBranchSearch('');
-      return;
-    }
-    const trimmedCwd = cwd.trim();
-    if (!trimmedCwd) return;
-
-    const requestSeq = ++metadataRequestSeqRef.current;
-    let cancelled = false;
-    setGitMetadataLoading(true);
-    setBranchUnavailable(false);
-    api.listGitBranches(trimmedCwd).then(resp => {
-      if (cancelled || requestSeq !== metadataRequestSeqRef.current || cwd.trim() !== trimmedCwd) return;
-      setBranches(resp.branches);
-      setCurrentBranch(resp.current);
-      setDefaultBranch(resp.default_branch ?? null);
-      // Unborn/branchless repo: HEAD points at no commit, so neither a
-      // default nor a current branch resolves. Record it so the default
-      // workflow degrades to 'direct' instead of a branchless planFromBranch
-      // the user can't send.
-      setBranchUnavailable(!(resp.default_branch || resp.current));
-    }).catch(err => {
-      if (cancelled || requestSeq !== metadataRequestSeqRef.current || cwd.trim() !== trimmedCwd) return;
-      console.warn('Failed to fetch git branches:', err);
-      setBranches([]);
-      setCurrentBranch(null);
-      setDefaultBranch(null);
-      setBranchUnavailable(true);
-    }).finally(() => {
-      if (!cancelled && requestSeq === metadataRequestSeqRef.current) setGitMetadataLoading(false);
-    });
-
-    return () => { cancelled = true; };
-  }, [isGitDir, cwd]);
-
-  useEffect(() => {
-    if (!isGitDir) return;
-    const trimmedCwd = cwd.trim();
-    if (!trimmedCwd) return;
-
-    const requestSeq = ++taskAvailabilityRequestSeqRef.current;
-    let cancelled = false;
-    setTaskAvailabilityLoading(true);
-    setTaskAvailable(null);
-    setTasks([]);
-    setTasksLoaded(false);
-    setTasksLoading(false);
-    api.getProjectTaskAvailability(trimmedCwd).then(resp => {
-      if (cancelled || requestSeq !== taskAvailabilityRequestSeqRef.current || cwd.trim() !== trimmedCwd) return;
-      setTaskAvailable(resp.available);
-    }).catch(err => {
-      if (cancelled || requestSeq !== taskAvailabilityRequestSeqRef.current || cwd.trim() !== trimmedCwd) return;
-      console.warn('Failed to check task availability:', err);
-      setTaskAvailable(false);
-    }).finally(() => {
-      if (!cancelled && requestSeq === taskAvailabilityRequestSeqRef.current) setTaskAvailabilityLoading(false);
-    });
-
-    return () => { cancelled = true; };
-  }, [isGitDir, cwd]);
-
-  const loadProjectTasks = useCallback(() => {
-    if (!isGitDir || tasksLoading || tasksLoaded) return;
-    const trimmedCwd = cwd.trim();
-    if (!trimmedCwd || taskAvailable === false) return;
-
-    const requestSeq = ++taskListRequestSeqRef.current;
-    setTasksLoading(true);
-    api.listProjectTasks(trimmedCwd).then(resp => {
-      if (requestSeq !== taskListRequestSeqRef.current || cwd.trim() !== trimmedCwd) return;
-      setTasks(resp.tasks);
-      setTasksLoaded(true);
-    }).catch(err => {
-      if (requestSeq !== taskListRequestSeqRef.current || cwd.trim() !== trimmedCwd) return;
-      console.warn('Failed to fetch tasks:', err);
-      setTasks([]);
-      setTasksLoaded(true);
-    }).finally(() => {
-      if (requestSeq === taskListRequestSeqRef.current) setTasksLoading(false);
-    });
-  }, [cwd, isGitDir, taskAvailable, tasksLoaded, tasksLoading]);
-
-  useEffect(() => {
-    if (workflow.kind === 'planFromTask') loadProjectTasks();
-  }, [loadProjectTasks, workflow.kind]);
-
-  useEffect(() => {
-    if (!isGitDir || !branchSearch.trim()) return;
-    const trimmedCwd = cwd.trim();
-    if (!trimmedCwd) return;
-
-    setBranchSearchLoading(true);
-    const timer = setTimeout(() => {
-      let cancelled = false;
-      api.listGitBranches(trimmedCwd, branchSearch.trim()).then(resp => {
-        if (cancelled) return;
-        setBranches(resp.branches);
-        setBranchSearchLoading(false);
-      }).catch(err => {
-        if (cancelled) return;
-        console.warn('Branch search failed:', err);
-        setBranchSearchLoading(false);
-      });
-      return () => { cancelled = true; };
-    }, 300);
-
-    return () => { clearTimeout(timer); setBranchSearchLoading(false); };
-  }, [isGitDir, cwd, branchSearch]);
-
-  const selectedTask = workflowTask(workflow);
-  const selectedBranchConflict = workflow.kind === 'continueBranch' && workflow.branch
-    ? branches.find(b => b.name === workflow.branch)?.conflict_slug ?? null
-    : null;
-  const selectedTaskConflict = selectedTask?.conversation_slug ?? null;
-  const selectedConflictSlug = selectedTaskConflict ?? selectedBranchConflict;
-  const hasWorkflowStartingPoint = workflow.kind === 'direct' || Boolean(workflowBranch(workflow));
-  const hasMessageContent = draft.trim().length > 0 || images.length > 0 || files.length > 0 || Boolean(selectedTask);
-  const taskWorkflowReady = workflow.kind !== 'planFromTask' || Boolean(selectedTask);
-  const gitWorkflowReady = !workflowNeedsGit(workflow)
-    || (isGitDir === true && !gitMetadataLoading && !branchSearchLoading && hasWorkflowStartingPoint && taskWorkflowReady);
-
+  const genericFilesEnabled = false;
+  const hasMessageContent = draft.trim().length > 0 || images.length > 0 || files.length > 0;
   const canSend = hasMessageContent
     && !creating
     && dirStatus !== 'invalid'
-    && dirStatus !== 'checking'
-    && gitWorkflowReady
-    && !selectedConflictSlug;
+    && dirStatus !== 'checking';
 
   const addImages = async (files: File[]) => {
     try {
@@ -449,26 +187,12 @@ export function useCreateConversation(navigate: (path: string) => void) {
       setError(`${unsupportedImage.name} is not a supported image attachment type.`);
       return;
     }
-    const genericFiles = dropped.filter(file => !SUPPORTED_IMAGE_TYPES.includes(file.type));
     const imageFiles = dropped.filter(file => SUPPORTED_IMAGE_TYPES.includes(file.type));
+    const genericFiles = dropped.filter(file => !SUPPORTED_IMAGE_TYPES.includes(file.type));
     if (imageFiles.length > 0) await addImages(imageFiles);
-    if (genericFiles.length === 0) return;
-    const tooLarge = genericFiles.find(file => file.size > MAX_FILE_ATTACHMENT_SIZE);
-    if (tooLarge) {
-      setError(`${tooLarge.name} exceeds the 10 MB file attachment limit.`);
-      return;
+    if (genericFiles.length > 0) {
+      setError('File attachments are not available for this conversation flow yet.');
     }
-    if (files.length + genericFiles.length > MAX_FILE_ATTACHMENTS) {
-      setError(`A message can include at most ${MAX_FILE_ATTACHMENTS} files.`);
-      return;
-    }
-    const total = files.reduce((sum, file) => sum + file.size, 0)
-      + genericFiles.reduce((sum, file) => sum + file.size, 0);
-    if (total > MAX_TOTAL_FILE_ATTACHMENT_SIZE) {
-      setError('Attachments exceed the 25 MB total limit.');
-      return;
-    }
-    setFiles(prev => [...prev, ...genericFiles]);
   };
 
   const removeFile = (index: number) => {
@@ -489,7 +213,6 @@ export function useCreateConversation(navigate: (path: string) => void) {
     setInterimText(text);
   };
 
-  /** Update draft and clear any active voice interim state */
   const updateDraft = (value: string) => {
     setDraft(value);
     if (interimText) {
@@ -504,49 +227,17 @@ export function useCreateConversation(navigate: (path: string) => void) {
 
   const handleSend = async () => {
     const trimmed = draft.trim();
-    const taskStartProvidesContent = Boolean(selectedTask);
-    if (!trimmed && images.length === 0 && files.length === 0 && !taskStartProvidesContent) return;
+    if (!trimmed && images.length === 0 && files.length === 0) return;
     if (creating || dirStatus === 'invalid' || dirStatus === 'checking') return;
 
     setError(null);
     setCreating(true);
 
     try {
-      if (dirStatus === 'will-create') {
-        const mkdirResult = await api.mkdir(cwd.trim());
-        if (!mkdirResult.created) {
-          setError(mkdirResult.error || 'Failed to create directory');
-          setCreating(false);
-          return;
-        }
-      }
-
-      const messageId = generateUUID();
-      const clientConversationId = generateUUID();
       const trimmedCwd = cwd.trim();
-      if (workflowNeedsGit(workflow) && isGitDir !== true) {
-        setError('Choose a Git repository before starting an isolated workflow.');
-        setCreating(false);
-        return;
-      }
-      if (workflowNeedsGit(workflow) && (gitMetadataLoading || branchSearchLoading)) {
-        setError('Still loading Git branches. Try again in a moment.');
-        setCreating(false);
-        return;
-      }
-      const submission = deriveSubmission(workflow);
-      if (workflowNeedsGit(workflow) && !submission.baseBranch) {
-        setError('Pick a Git branch to start from.');
-        setCreating(false);
-        return;
-      }
-      if (workflow.kind === 'planFromTask' && !selectedTask) {
-        setError('Pick a task file before starting from a task.');
-        setCreating(false);
-        return;
-      }
-      if (selectedConflictSlug) {
-        setError('That starting point already has an active conversation.');
+      try { localStorage.setItem(REPLAY_CREATE_REQUEST_KEY, requestId); } catch { /* in-memory identity remains stable */ }
+      if (files.length > 0) {
+        setError('File attachments are not available for this conversation flow yet.');
         setCreating(false);
         return;
       }
@@ -555,34 +246,44 @@ export function useCreateConversation(navigate: (path: string) => void) {
         setCreating(false);
         return;
       }
-      const submitText = selectedTask
-        ? buildTaskStartPrompt(trimmedCwd, selectedTask, trimmed)
-        : trimmed;
-      const conv = await createConversationWithStore(
-        trimmedCwd,
-        submitText,
-        messageId,
-        selectedModel,
-        selectedEffort,
+      const immutableIntent = JSON.stringify({
+        cwd: trimmedCwd,
+        objective: trimmed,
+        model: selectedModel,
+        effort: selectedEffort,
         images,
-        submission.mode,
-        submission.baseBranch,
-        undefined,
-        undefined,
-        files,
-        submission.checkoutRef,
-        clientConversationId,
-      );
+      });
+      let activeRequestId = requestId;
+      if (replayIntentRef.current !== null && replayIntentRef.current !== immutableIntent) {
+        activeRequestId = generateUUID();
+        setRequestId(activeRequestId);
+        try { localStorage.setItem(REPLAY_CREATE_REQUEST_KEY, activeRequestId); } catch { /* in-memory identity remains stable */ }
+      }
+      replayIntentRef.current = immutableIntent;
+      try { localStorage.setItem(REPLAY_CREATE_INTENT_KEY, immutableIntent); } catch { /* in-memory intent remains stable */ }
+      const createRequest: CreateProductConversationRequest = {
+        request_id: activeRequestId,
+        cwd: trimmedCwd,
+        objective: trimmed,
+        model: selectedModel,
+        effort: selectedEffort,
+        llm_language: recoveredLlmLanguage,
+        ...(images.length > 0 ? { images } : {}),
+      };
+      const response = await api.createProductConversation(createRequest);
       setDraft('');
       setImages([]);
       setFiles([]);
+      setRecoveredLlmLanguage(null);
+      try { localStorage.removeItem(RECOVERED_LLM_LANGUAGE_KEY); } catch { /* best effort */ }
       clearNewConversationDraft();
-      navigate(routeForConversation(conv));
+      try {
+        localStorage.removeItem(REPLAY_CREATE_REQUEST_KEY);
+        localStorage.removeItem(REPLAY_CREATE_INTENT_KEY);
+      } catch { /* best effort after success */ }
+      navigate(response.canonical_route);
     } catch (err) {
       setCreating(false);
-      // An unresolvable @reference in the first message rejects with a 422.
-      // Re-throw so the composer can surface it inline next to the input
-      // (REQ-IR-007) rather than as a page-level error.
       if (err instanceof ExpansionError) {
         throw err;
       }
@@ -590,9 +291,37 @@ export function useCreateConversation(navigate: (path: string) => void) {
     }
   };
 
-  const setWorkflowFromUser = (next: NewConversationWorkflow) => {
-    setWorkflowOverride(next);
-  };
+  const startOverFromCreation = useCallback((creation: {
+    cwd: string;
+    objective: string;
+    model: string | null;
+    effort: ModelEffort | null;
+    images: ImageData[];
+    llm_language: string | null;
+  }) => {
+    const nextRequestId = generateUUID();
+    setRequestId(nextRequestId);
+    replayIntentRef.current = null;
+    setCwd(creation.cwd);
+    setDraft(creation.objective);
+    setImages(creation.images ?? []);
+    setFiles([]);
+    setRecoveredLlmLanguage(creation.llm_language);
+    selectModel(creation.model);
+    selectEffort(creation.effort);
+    try {
+      if (creation.llm_language) {
+        localStorage.setItem(RECOVERED_LLM_LANGUAGE_KEY, creation.llm_language);
+      } else {
+        localStorage.removeItem(RECOVERED_LLM_LANGUAGE_KEY);
+      }
+    } catch { /* replay still retains the pinned language in memory */ }
+    setError(null);
+    try {
+      localStorage.removeItem(REPLAY_CREATE_REQUEST_KEY);
+      localStorage.removeItem(REPLAY_CREATE_INTENT_KEY);
+    } catch { /* best effort */ }
+  }, [selectEffort, selectModel]);
 
   return {
     homeDir,
@@ -617,23 +346,9 @@ export function useCreateConversation(navigate: (path: string) => void) {
     setIsDragOver,
     error,
     creating,
+    recentManagementRootSuggestions,
     canSend,
-    workflow,
-    setWorkflow: setWorkflowFromUser,
-    tasks,
-    taskAvailabilityLoading,
-    taskAvailable,
-    tasksLoading,
-    tasksLoaded,
-    loadProjectTasks,
-    branches,
-    currentBranch,
-    defaultBranch,
-    gitMetadataLoading,
-    branchSearch,
-    setBranchSearch,
-    branchSearchLoading,
-    projectDirs,
+    genericFilesEnabled,
     addImages,
     removeImage,
     addFiles,
@@ -643,11 +358,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
     handleVoiceInterim,
     textareaValue,
     updateDraft,
-    selectedConflictSlug,
     handleSend,
-    // The create-time mode + branch for the current workflow. Exposed so the
-    // composer's inline-reference discovery resolves against the SAME root the
-    // first message will expand against (one mapping, no drift).
-    submission: deriveSubmission(workflow),
+    startOverFromCreation,
   };
 }

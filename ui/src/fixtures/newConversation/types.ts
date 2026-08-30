@@ -1,4 +1,4 @@
-import type { GitBranchEntry, ModelsResponse, Project, TaskEntry } from '../../api';
+import type { ModelsResponse } from '../../api';
 
 export type NewConversationScenarioId = 'ready-git-project';
 
@@ -7,10 +7,5 @@ export interface NewConversationScenario {
   theme: 'dark' | 'light';
   cwd: string;
   draft: string;
-  projects: Project[];
   models: ModelsResponse;
-  branches: GitBranchEntry[];
-  currentBranch: string;
-  defaultBranch: string;
-  tasks: TaskEntry[];
 }

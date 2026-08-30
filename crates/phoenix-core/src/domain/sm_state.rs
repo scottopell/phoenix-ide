@@ -2230,6 +2230,7 @@ impl ConversationExecutionEnvironment {
 #[derive(Debug, Clone)]
 pub struct ConvContext {
     pub conversation_id: String,
+
     /// The top-level conversation that owns this work tree.
     /// For root conversations this equals `conversation_id`.
     /// For sub-agents it is the root ancestor's id.

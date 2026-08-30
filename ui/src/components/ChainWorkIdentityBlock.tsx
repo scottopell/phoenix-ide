@@ -47,10 +47,22 @@ export function ChainWorkIdentityBlock({ identity }: { identity: ChainWorkIdenti
       <span className="chain-work-identity-title">Work identity</span>
       <dl className="chain-work-identity-fields">
         <div className="chain-work-identity-field">
-          <dt>Branch</dt>
-          <dd title={`${identity.branch_name} → ${identity.base_branch}`}>
-            {identity.branch_name} <span className="chain-work-identity-arrow">→</span>{' '}
-            {identity.base_branch}
+          <dt>{identity.branch_name ? 'Branch' : 'Checkout'}</dt>
+          <dd
+            title={
+              identity.branch_name
+                ? `${identity.branch_name} → ${identity.base_branch}`
+                : `Detached from ${identity.base_branch}`
+            }
+          >
+            {identity.branch_name ? (
+              <>
+                {identity.branch_name} <span className="chain-work-identity-arrow">→</span>{' '}
+                {identity.base_branch}
+              </>
+            ) : (
+              <>Detached from {identity.base_branch}</>
+            )}
           </dd>
         </div>
         {identity.task_id && (

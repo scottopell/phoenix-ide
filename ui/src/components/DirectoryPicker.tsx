@@ -17,6 +17,7 @@ interface DirectoryPickerProps {
   onDismiss?: () => void;
   placeholder?: string;
   className?: string;
+  recentPaths?: readonly string[];
 }
 
 const STATUS_CLASS_MAP: Record<DirStatus, string> = {
@@ -47,7 +48,7 @@ function parsePath(value: string): { parentPath: string; partial: string } {
   return { parentPath: parent, partial };
 }
 
-export function DirectoryPicker({ value, onChange, onStatusChange, onGitStatusChange, onDismiss, placeholder = '/path/to/project', className = '' }: DirectoryPickerProps) {
+export function DirectoryPicker({ value, onChange, onStatusChange, onGitStatusChange, onDismiss, placeholder = '/path/to/project', className = '', recentPaths = [] }: DirectoryPickerProps) {
   const [suggestions, setSuggestions] = useState<DirectoryEntry[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [selectedIndex, setSelectedIndex] = useState(-1);
@@ -160,11 +161,21 @@ export function DirectoryPicker({ value, onChange, onStatusChange, onGitStatusCh
             onStatusChangeRef.current?.('exists');
             onGitStatusChangeRef.current?.(validation.is_git);
           });
-        } else {
-          const parentPath = trimmed.substring(0, trimmed.lastIndexOf('/')) || '/';
-          const parentValidation = await api.validateCwd(parentPath);
+        } else if (!validation.error) {
           applyIfLatest(() => {
-            const status: DirStatus = parentValidation.valid ? 'will-create' : 'invalid';
+            setPathStatus('will-create');
+            onStatusChangeRef.current?.('will-create');
+            onGitStatusChangeRef.current?.(null);
+          });
+        } else {
+          let ancestorPath = trimmed;
+          let ancestorValidation = validation;
+          while (!ancestorValidation.valid && ancestorPath !== '/') {
+            ancestorPath = ancestorPath.substring(0, ancestorPath.lastIndexOf('/')) || '/';
+            ancestorValidation = await api.validateCwd(ancestorPath);
+          }
+          applyIfLatest(() => {
+            const status: DirStatus = ancestorValidation.valid && !validation.error ? 'will-create' : 'invalid';
             setPathStatus(status);
             onStatusChangeRef.current?.(status);
             onGitStatusChangeRef.current?.(null);
@@ -287,6 +298,13 @@ export function DirectoryPicker({ value, onChange, onStatusChange, onGitStatusCh
 
   return (
     <div className="directory-picker">
+      {recentPaths.length > 0 && (
+        <div className="directory-picker-recent" aria-label="Recent directories">
+          {recentPaths.map((path) => (
+            <button key={path} type="button" onClick={() => onChange(path)}>{path}</button>
+          ))}
+        </div>
+      )}
       <div className="path-input-container">
         <input
           ref={inputRef}

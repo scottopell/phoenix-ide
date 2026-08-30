@@ -70,7 +70,7 @@ pub struct ProductConversationTranscriptRow {
 #[derive(Debug, Clone)]
 pub struct ProductConversationWorkIdentity {
     pub worktree_path: String,
-    pub branch_name: String,
+    pub branch_name: Option<String>,
     pub base_branch: String,
     pub task_id: Option<String>,
     pub task_title: Option<String>,
@@ -180,14 +180,14 @@ fn work_identity_from_row(
             Some(_),
             Some("allocated_worktree"),
             Some(worktree_path),
-            Some(branch_name),
+            branch_name,
             Some(base_branch),
         ) => Ok(Some(ProductConversationWorkIdentity {
             worktree_path,
             branch_name,
             base_branch,
-            task_id: row.try_get("cm_task_id")?,
-            task_title: row.try_get("cm_task_title")?,
+            task_id: row.try_get("objective_task_id")?,
+            task_title: row.try_get("objective_task_title")?,
         })),
         _ => Ok(None),
     }
@@ -276,6 +276,16 @@ impl Database {
                    AND root.user_initiated = 1
                    AND root.runtime_role = 'user'
                    AND root.parent_conversation_id IS NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM product_creation_jobs creation
+                       WHERE creation.published_conversation_id = root.id
+                         AND creation.status <> 'published'
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM conversation_creation_jobs creation
+                       WHERE creation.conversation_id = root.id
+                         AND creation.status <> 'ready'
+                   )
                    AND NOT (root.archived = 1 AND EXISTS (
                        SELECT 1 FROM conversation_creation_jobs job
                        WHERE job.conversation_id = root.id AND job.status = 'deletion_pending'
@@ -417,11 +427,16 @@ impl Database {
                      LIMIT 1) AS tail_message_id,
                     conversation.work_scope_id, environment.environment_kind,
                     environment.worktree_path, environment.branch_name, environment.base_branch,
-                    conversation.cm_task_id, conversation.cm_task_title
+                    COALESCE(objective.task_id, conversation.cm_task_id) AS objective_task_id,
+                    COALESCE(objective.task_title, conversation.cm_task_title) AS objective_task_title
              FROM transcript
              JOIN conversations conversation ON conversation.id = transcript.id
              LEFT JOIN work_scope_environments environment
                ON environment.work_scope_id = conversation.work_scope_id
+             LEFT JOIN work_scope_approved_task_authorities authority
+               ON authority.work_scope_id = conversation.work_scope_id
+             LEFT JOIN conversation_approved_task_objectives objective
+               ON objective.conversation_id = authority.objective_conversation_id
              ORDER BY ordinal",
         )
         .bind(product_conversation_id.as_str())
@@ -601,11 +616,16 @@ impl Database {
                      ORDER BY message.sequence_id DESC, message.message_id DESC LIMIT 1) AS tail_message_id,
                     conversation.work_scope_id, environment.environment_kind,
                     environment.worktree_path, environment.branch_name, environment.base_branch,
-                    conversation.cm_task_id, conversation.cm_task_title
+                    COALESCE(objective.task_id, conversation.cm_task_id) AS objective_task_id,
+                    COALESCE(objective.task_title, conversation.cm_task_title) AS objective_task_title
              FROM transcript
              JOIN conversations conversation ON conversation.id = transcript.id
              LEFT JOIN work_scope_environments environment
                ON environment.work_scope_id = conversation.work_scope_id
+             LEFT JOIN work_scope_approved_task_authorities authority
+               ON authority.work_scope_id = conversation.work_scope_id
+             LEFT JOIN conversation_approved_task_objectives objective
+               ON objective.conversation_id = authority.objective_conversation_id
              ORDER BY ordinal",
         ).bind(product_conversation_id.as_str()).fetch_all(&mut *connection).await?;
         let mut transcript_rows = Vec::with_capacity(rows.len());

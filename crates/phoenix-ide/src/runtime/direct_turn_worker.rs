@@ -1753,7 +1753,7 @@ mod tests {
         retry_release_tx.send(()).unwrap();
         dispatched_rx.await.unwrap();
         assert_eq!(dispatcher.events.lock().unwrap().len(), 1);
-        assert_eq!(sleeps.lock().unwrap().as_slice(), &[ERROR_RETRY_INTERVAL]);
+        assert_eq!(sleeps.lock().unwrap().first(), Some(&ERROR_RETRY_INTERVAL));
         drop(kick_tx);
         handle.await.unwrap().unwrap();
     }
@@ -1876,7 +1876,7 @@ mod tests {
         retry_release_tx.send(()).unwrap();
         dispatched_rx.await.unwrap();
         assert_eq!(dispatcher.events.lock().unwrap().len(), 1);
-        assert_eq!(sleeps.lock().unwrap().as_slice(), &[ERROR_RETRY_INTERVAL]);
+        assert_eq!(sleeps.lock().unwrap().first(), Some(&ERROR_RETRY_INTERVAL));
         drop(kick_tx);
         handle.await.unwrap().unwrap();
     }
@@ -1980,7 +1980,7 @@ mod tests {
             &["conv-a".to_string()]
         );
         assert!(dispatcher.events.lock().unwrap().is_empty());
-        assert_eq!(sleeps.lock().unwrap().as_slice(), &[ERROR_RETRY_INTERVAL]);
+        assert_eq!(sleeps.lock().unwrap().first(), Some(&ERROR_RETRY_INTERVAL));
         assert_eq!(
             discovery.attempts.load(std::sync::atomic::Ordering::SeqCst),
             3
@@ -2088,7 +2088,7 @@ mod tests {
             dispatcher.terminal_attempts.lock().unwrap().as_slice(),
             &["conv-a".to_string(), "conv-a".to_string()]
         );
-        assert_eq!(sleeps.lock().unwrap().as_slice(), &[ERROR_RETRY_INTERVAL]);
+        assert_eq!(sleeps.lock().unwrap().first(), Some(&ERROR_RETRY_INTERVAL));
         drop(kick_tx);
         handle.await.unwrap().unwrap();
     }

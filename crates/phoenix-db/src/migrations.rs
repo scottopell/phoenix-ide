@@ -470,6 +470,21 @@ const MIGRATIONS: &[Migration] = &[
         name: "bind_close_worktree_final_tombstone",
         sql: MIGRATION_090,
     },
+    Migration {
+        version: 91,
+        name: "persist_product_creation_jobs",
+        sql: MIGRATION_091,
+    },
+    Migration {
+        version: 92,
+        name: "persist_conversation_creation_exact_checkout_oid",
+        sql: MIGRATION_092,
+    },
+    Migration {
+        version: 93,
+        name: "persist_product_creation_resource_ownership",
+        sql: MIGRATION_093,
+    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -8718,6 +8733,169 @@ BEGIN
 END;
 ";
 
+const MIGRATION_091: &str = r"
+PRAGMA writable_schema = ON;
+UPDATE sqlite_schema
+SET sql = replace(
+    sql,
+    'authority_kind IN (''restricted_explore'', ''work'')',
+    'authority_kind IN (''direct'', ''restricted_explore'', ''work'')'
+)
+WHERE type = 'table' AND name = 'work_scopes';
+PRAGMA writable_schema = RESET;
+
+CREATE TABLE product_creation_jobs (
+    request_id TEXT PRIMARY KEY CHECK (typeof(request_id) = 'text' AND trim(request_id) <> ''),
+    product_conversation_id TEXT NOT NULL UNIQUE
+        CHECK (typeof(product_conversation_id) = 'text' AND trim(product_conversation_id) <> ''),
+    cwd TEXT NOT NULL CHECK (typeof(cwd) = 'text' AND trim(cwd) <> '' AND instr(cwd, char(0)) = 0),
+    objective TEXT NOT NULL CHECK (typeof(objective) = 'text'),
+    model TEXT CHECK (model IS NULL OR (typeof(model) = 'text' AND trim(model) <> '')),
+    effort TEXT CHECK (effort IS NULL OR (typeof(effort) = 'text' AND trim(effort) <> '')),
+    llm_language TEXT NOT NULL CHECK (llm_language IN ('phoenix-native', 'caveman')),
+    status TEXT NOT NULL CHECK (status IN ('accepted', 'claimed', 'retry_scheduled', 'cancelling', 'cancelled', 'deletion_pending', 'delivery_pending', 'delivery_failed', 'published', 'failed', 'cleanup_ambiguous')),
+    accepted_at_unix_micros INTEGER NOT NULL CHECK (typeof(accepted_at_unix_micros) = 'integer' AND accepted_at_unix_micros >= 0),
+    updated_at_unix_micros INTEGER NOT NULL CHECK (typeof(updated_at_unix_micros) = 'integer' AND updated_at_unix_micros >= 0),
+    attempt_count INTEGER NOT NULL DEFAULT 1 CHECK (typeof(attempt_count) = 'integer' AND attempt_count >= 1 AND attempt_count <= 4),
+    claim_generation INTEGER NOT NULL DEFAULT 0 CHECK (typeof(claim_generation) = 'integer' AND claim_generation >= 0),
+    claim_worker_id TEXT CHECK (claim_worker_id IS NULL OR (typeof(claim_worker_id) = 'text' AND trim(claim_worker_id) <> '')),
+    claim_token TEXT CHECK (claim_token IS NULL OR (typeof(claim_token) = 'text' AND trim(claim_token) <> '')),
+    claim_lease_until_unix_micros INTEGER CHECK (claim_lease_until_unix_micros IS NULL OR (typeof(claim_lease_until_unix_micros) = 'integer' AND claim_lease_until_unix_micros >= 0)),
+    retry_at_unix_micros INTEGER CHECK (retry_at_unix_micros IS NULL OR (typeof(retry_at_unix_micros) = 'integer' AND retry_at_unix_micros >= 0)),
+    cleanup_worker_id TEXT CHECK (cleanup_worker_id IS NULL OR (typeof(cleanup_worker_id) = 'text' AND trim(cleanup_worker_id) <> '')),
+    cleanup_token TEXT CHECK (cleanup_token IS NULL OR (typeof(cleanup_token) = 'text' AND trim(cleanup_token) <> '')),
+    cleanup_lease_until_unix_micros INTEGER CHECK (cleanup_lease_until_unix_micros IS NULL OR (typeof(cleanup_lease_until_unix_micros) = 'integer' AND cleanup_lease_until_unix_micros >= 0)),
+    delivery_attempt_count INTEGER NOT NULL DEFAULT 1 CHECK (typeof(delivery_attempt_count) = 'integer' AND delivery_attempt_count >= 1 AND delivery_attempt_count <= 4),
+    delivery_retry_at_unix_micros INTEGER CHECK (delivery_retry_at_unix_micros IS NULL OR (typeof(delivery_retry_at_unix_micros) = 'integer' AND delivery_retry_at_unix_micros >= 0)),
+    pin_exact_checkout_oid TEXT CHECK (pin_exact_checkout_oid IS NULL OR (typeof(pin_exact_checkout_oid) = 'text' AND trim(pin_exact_checkout_oid) <> '')),
+    pin_logical_base TEXT CHECK (pin_logical_base IS NULL OR (typeof(pin_logical_base) = 'text' AND trim(pin_logical_base) <> '')),
+    pin_freshness TEXT CHECK (pin_freshness IS NULL OR pin_freshness = 'fresh'),
+    staging_path TEXT CHECK (staging_path IS NULL OR (typeof(staging_path) = 'text' AND trim(staging_path) <> '' AND instr(staging_path, char(0)) = 0)),
+    staging_repo_root TEXT CHECK (staging_repo_root IS NULL OR (typeof(staging_repo_root) = 'text' AND trim(staging_repo_root) <> '' AND instr(staging_repo_root, char(0)) = 0)),
+    staging_exact_oid TEXT CHECK (staging_exact_oid IS NULL OR (typeof(staging_exact_oid) = 'text' AND trim(staging_exact_oid) <> '')),
+    published_product_id TEXT UNIQUE REFERENCES product_conversations(id) ON DELETE CASCADE,
+    published_conversation_id TEXT UNIQUE REFERENCES conversations(id) ON DELETE CASCADE,
+    last_error TEXT CHECK (last_error IS NULL OR typeof(last_error) = 'text'),
+    cancelled_at_unix_micros INTEGER CHECK (cancelled_at_unix_micros IS NULL OR (typeof(cancelled_at_unix_micros) = 'integer' AND cancelled_at_unix_micros >= 0)),
+    deletion_requested_at_unix_micros INTEGER CHECK (deletion_requested_at_unix_micros IS NULL OR (typeof(deletion_requested_at_unix_micros) = 'integer' AND deletion_requested_at_unix_micros >= 0)),
+    CHECK ((pin_exact_checkout_oid IS NULL AND pin_logical_base IS NULL AND pin_freshness IS NULL)
+        OR (pin_exact_checkout_oid IS NOT NULL AND pin_logical_base IS NOT NULL AND pin_freshness = 'fresh')),
+    CHECK ((status = 'accepted' AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until_unix_micros IS NULL AND retry_at_unix_micros IS NULL AND cleanup_worker_id IS NULL AND cleanup_token IS NULL AND cleanup_lease_until_unix_micros IS NULL AND published_product_id IS NULL AND published_conversation_id IS NULL AND cancelled_at_unix_micros IS NULL AND deletion_requested_at_unix_micros IS NULL)
+        OR (status = 'claimed' AND claim_worker_id IS NOT NULL AND claim_token IS NOT NULL AND claim_lease_until_unix_micros IS NOT NULL AND retry_at_unix_micros IS NULL AND cleanup_worker_id IS NULL AND cleanup_token IS NULL AND cleanup_lease_until_unix_micros IS NULL AND published_product_id IS NULL AND published_conversation_id IS NULL AND cancelled_at_unix_micros IS NULL AND deletion_requested_at_unix_micros IS NULL)
+        OR (status = 'retry_scheduled' AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until_unix_micros IS NULL AND retry_at_unix_micros IS NOT NULL AND cleanup_worker_id IS NULL AND cleanup_token IS NULL AND cleanup_lease_until_unix_micros IS NULL AND published_product_id IS NULL AND published_conversation_id IS NULL AND cancelled_at_unix_micros IS NULL AND deletion_requested_at_unix_micros IS NULL)
+        OR (status = 'cancelling' AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until_unix_micros IS NULL AND retry_at_unix_micros IS NULL AND published_product_id IS NULL AND published_conversation_id IS NULL AND cancelled_at_unix_micros IS NULL AND deletion_requested_at_unix_micros IS NULL)
+        OR (status = 'cancelled' AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until_unix_micros IS NULL AND retry_at_unix_micros IS NULL AND published_product_id IS NULL AND published_conversation_id IS NULL AND cancelled_at_unix_micros IS NOT NULL)
+        OR (status = 'deletion_pending' AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until_unix_micros IS NULL AND retry_at_unix_micros IS NULL AND published_product_id IS NULL AND published_conversation_id IS NULL AND deletion_requested_at_unix_micros IS NOT NULL)
+        OR (status = 'delivery_pending' AND ((claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until_unix_micros IS NULL) OR (claim_worker_id IS NOT NULL AND claim_token IS NOT NULL AND claim_lease_until_unix_micros IS NOT NULL)) AND retry_at_unix_micros IS NULL AND cleanup_worker_id IS NULL AND cleanup_token IS NULL AND cleanup_lease_until_unix_micros IS NULL AND published_product_id IS NOT NULL AND published_conversation_id IS NOT NULL AND cancelled_at_unix_micros IS NULL AND deletion_requested_at_unix_micros IS NULL)
+        OR (status = 'delivery_failed' AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until_unix_micros IS NULL AND retry_at_unix_micros IS NULL AND cleanup_worker_id IS NULL AND cleanup_token IS NULL AND cleanup_lease_until_unix_micros IS NULL AND delivery_retry_at_unix_micros IS NULL AND published_product_id IS NOT NULL AND published_conversation_id IS NOT NULL AND cancelled_at_unix_micros IS NULL AND deletion_requested_at_unix_micros IS NULL)
+        OR (status = 'published' AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until_unix_micros IS NULL AND retry_at_unix_micros IS NULL AND cleanup_worker_id IS NULL AND cleanup_token IS NULL AND cleanup_lease_until_unix_micros IS NULL AND published_product_id IS NOT NULL AND published_conversation_id IS NOT NULL AND cancelled_at_unix_micros IS NULL AND deletion_requested_at_unix_micros IS NULL)
+        OR (status IN ('failed', 'cleanup_ambiguous') AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until_unix_micros IS NULL AND retry_at_unix_micros IS NULL AND cleanup_worker_id IS NULL AND cleanup_token IS NULL AND cleanup_lease_until_unix_micros IS NULL AND published_product_id IS NULL AND published_conversation_id IS NULL AND cancelled_at_unix_micros IS NULL AND deletion_requested_at_unix_micros IS NULL))
+);
+CREATE INDEX product_creation_jobs_claim_order
+    ON product_creation_jobs(status, accepted_at_unix_micros, request_id);
+CREATE INDEX product_creation_jobs_retry_order
+    ON product_creation_jobs(status, retry_at_unix_micros, accepted_at_unix_micros, request_id);
+CREATE INDEX product_creation_jobs_cleanup_order
+    ON product_creation_jobs(status, cleanup_lease_until_unix_micros, updated_at_unix_micros, request_id);
+CREATE INDEX product_creation_jobs_delivery_order
+    ON product_creation_jobs(status, delivery_retry_at_unix_micros, updated_at_unix_micros, request_id);
+CREATE INDEX product_creation_jobs_published_cwd
+    ON product_creation_jobs(status, cwd, updated_at_unix_micros DESC, request_id DESC);
+CREATE TRIGGER product_creation_checkout_pin_immutable
+BEFORE UPDATE OF pin_exact_checkout_oid, pin_logical_base, pin_freshness ON product_creation_jobs
+WHEN OLD.pin_exact_checkout_oid IS NOT NULL AND (
+    NEW.pin_exact_checkout_oid IS NULL
+    OR NEW.pin_exact_checkout_oid <> OLD.pin_exact_checkout_oid
+    OR NEW.pin_logical_base <> OLD.pin_logical_base
+    OR NEW.pin_freshness <> OLD.pin_freshness
+)
+BEGIN
+    SELECT RAISE(ABORT, 'product creation checkout pin is immutable after first set');
+END;
+
+CREATE TABLE product_creation_job_images (
+    request_id TEXT NOT NULL REFERENCES product_creation_jobs(request_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (typeof(ordinal) = 'integer' AND ordinal >= 0),
+    media_type TEXT NOT NULL CHECK (typeof(media_type) = 'text' AND trim(media_type) <> ''),
+    data TEXT NOT NULL CHECK (typeof(data) = 'text' AND trim(data) <> ''),
+    PRIMARY KEY (request_id, ordinal)
+);
+
+CREATE TABLE product_creation_resource_reservations (
+    id TEXT PRIMARY KEY CHECK (typeof(id) = 'text' AND trim(id) <> ''),
+    request_id TEXT NOT NULL REFERENCES product_creation_jobs(request_id) ON DELETE CASCADE,
+    generation INTEGER NOT NULL CHECK (typeof(generation) = 'integer' AND generation > 0),
+    repository_identity TEXT NOT NULL CHECK (typeof(repository_identity) = 'text' AND trim(repository_identity) <> ''),
+    resource_identity TEXT NOT NULL CHECK (typeof(resource_identity) = 'text' AND trim(resource_identity) <> ''),
+    status TEXT NOT NULL CHECK (status IN ('reserved', 'present', 'cleanup_required', 'released', 'conflict')),
+    created_at_unix_micros INTEGER NOT NULL CHECK (typeof(created_at_unix_micros) = 'integer' AND created_at_unix_micros >= 0),
+    updated_at_unix_micros INTEGER NOT NULL CHECK (typeof(updated_at_unix_micros) = 'integer' AND updated_at_unix_micros >= 0),
+    UNIQUE(request_id, resource_identity)
+);
+CREATE INDEX product_creation_resource_reservations_job
+    ON product_creation_resource_reservations(request_id, status);
+
+";
+
+const MIGRATION_092: &str = r"ALTER TABLE conversation_creation_jobs ADD COLUMN exact_checkout_oid TEXT;
+ALTER TABLE conversation_creation_jobs ADD COLUMN exact_checkout_logical_base TEXT;
+CREATE TRIGGER conversation_creation_checkout_pin_insert
+BEFORE INSERT ON conversation_creation_jobs
+WHEN (NEW.exact_checkout_oid IS NULL) <> (NEW.exact_checkout_logical_base IS NULL)
+  OR (NEW.exact_checkout_oid IS NOT NULL AND trim(NEW.exact_checkout_oid) = '')
+  OR (NEW.exact_checkout_logical_base IS NOT NULL AND trim(NEW.exact_checkout_logical_base) = '')
+BEGIN
+    SELECT RAISE(ABORT, 'conversation creation checkout pin must be a non-empty pair');
+END;
+CREATE TRIGGER conversation_creation_checkout_pin_update
+BEFORE UPDATE OF exact_checkout_oid, exact_checkout_logical_base ON conversation_creation_jobs
+WHEN (NEW.exact_checkout_oid IS NULL) <> (NEW.exact_checkout_logical_base IS NULL)
+  OR (NEW.exact_checkout_oid IS NOT NULL AND trim(NEW.exact_checkout_oid) = '')
+  OR (NEW.exact_checkout_logical_base IS NOT NULL AND trim(NEW.exact_checkout_logical_base) = '')
+  OR (OLD.exact_checkout_oid IS NOT NULL AND (
+        NEW.exact_checkout_oid IS NULL
+        OR NEW.exact_checkout_oid <> OLD.exact_checkout_oid
+        OR NEW.exact_checkout_logical_base <> OLD.exact_checkout_logical_base
+      ))
+BEGIN
+    SELECT RAISE(ABORT, 'conversation creation checkout pin must be a non-empty immutable pair');
+END;
+ALTER TABLE product_conversation_sources ADD COLUMN approved_title TEXT;
+ALTER TABLE product_conversation_sources ADD COLUMN approved_priority TEXT;
+ALTER TABLE product_conversation_sources ADD COLUMN approved_artifact_body TEXT;
+ALTER TABLE product_conversation_sources ADD COLUMN approved_task_title TEXT;
+ALTER TABLE product_conversation_sources ADD COLUMN approved_plan TEXT;
+ALTER TABLE product_conversation_sources ADD COLUMN approved_task_file TEXT;
+CREATE TABLE approved_task_creation_bindings (
+    job_id TEXT PRIMARY KEY REFERENCES conversation_creation_jobs(id) ON DELETE CASCADE,
+    source_product_conversation_id TEXT NOT NULL REFERENCES product_conversations(id),
+    source_conversation_id TEXT NOT NULL CHECK (trim(source_conversation_id) <> ''),
+    task_id TEXT NOT NULL CHECK (trim(task_id) <> ''), task_title TEXT NOT NULL CHECK (trim(task_title) <> ''),
+    approved_title TEXT NOT NULL CHECK (trim(approved_title) <> ''), approved_priority TEXT NOT NULL CHECK (trim(approved_priority) <> ''),
+    approved_plan TEXT NOT NULL, approved_task_file TEXT NOT NULL CHECK (trim(approved_task_file) <> ''), approved_artifact_body TEXT NOT NULL,
+    UNIQUE(source_product_conversation_id, task_id)
+);
+CREATE TABLE conversation_approved_task_objectives (
+    conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL CHECK (trim(task_id) <> ''), task_title TEXT NOT NULL CHECK (trim(task_title) <> ''),
+    approved_title TEXT NOT NULL CHECK (trim(approved_title) <> ''), approved_priority TEXT NOT NULL CHECK (trim(approved_priority) <> ''),
+    approved_plan TEXT NOT NULL, approved_task_file TEXT NOT NULL CHECK (trim(approved_task_file) <> ''), approved_artifact_body TEXT NOT NULL,
+    created_at_us INTEGER NOT NULL CHECK (created_at_us >= 0)
+);
+CREATE TABLE work_scope_approved_task_authorities (
+    work_scope_id TEXT PRIMARY KEY REFERENCES work_scopes(id) ON DELETE CASCADE,
+    objective_conversation_id TEXT NOT NULL UNIQUE REFERENCES conversation_approved_task_objectives(conversation_id) ON DELETE CASCADE,
+    created_at_us INTEGER NOT NULL CHECK (created_at_us >= 0)
+);";
+
+const MIGRATION_093: &str = r"ALTER TABLE product_creation_resource_reservations
+ADD COLUMN ownership_token TEXT
+CHECK (ownership_token IS NULL OR (
+    typeof(ownership_token) = 'text'
+    AND trim(ownership_token) <> ''
+    AND instr(ownership_token, char(0)) = 0
+));";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -13359,7 +13537,10 @@ mod tests {
                     (71, 'temporarily_skip_product_conversation_lifecycle_correction'),
                     (72, 'temporarily_skip_product_conversation_lifecycle_retention'),
                     (73, 'temporarily_skip_recursive_subordinate_parent_invariant'),
-                    (74, 'temporarily_skip_completed_continuation_handoffs')",
+                    (74, 'temporarily_skip_completed_continuation_handoffs'),
+                    (91, 'temporarily_skip_product_creation_jobs'),
+                    (92, 'temporarily_skip_creation_checkout_pin'),
+                    (93, 'temporarily_skip_product_creation_ownership')",
         )
         .execute(&pool)
         .await
@@ -14247,7 +14428,10 @@ mod tests {
                     (71, 'temporarily_skip_product_conversation_lifecycle_correction'),
                     (72, 'temporarily_skip_product_conversation_lifecycle_retention'),
                     (73, 'temporarily_skip_recursive_subordinate_parent_invariant'),
-                    (74, 'temporarily_skip_completed_continuation_handoffs')",
+                    (74, 'temporarily_skip_completed_continuation_handoffs'),
+                    (91, 'temporarily_skip_product_creation_jobs'),
+                    (92, 'temporarily_skip_creation_checkout_pin'),
+                    (93, 'temporarily_skip_product_creation_ownership')",
         )
         .execute(pool)
         .await

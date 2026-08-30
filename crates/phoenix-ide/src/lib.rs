@@ -18,6 +18,7 @@ mod message_expander;
 mod phx_cli;
 mod project_opportunistic_build_warm;
 mod resolution_root;
+mod resource_authority;
 mod runtime;
 mod send_chat_service;
 mod suggest;

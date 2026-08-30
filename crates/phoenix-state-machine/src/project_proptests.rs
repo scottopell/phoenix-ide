@@ -75,7 +75,11 @@ mod tests {
                     prop_assert!(!task_id.as_str().is_empty(),
                         "Work mode must always have a non-empty task_id");
                 }
-                ConvMode::Explore { .. } | ConvMode::Direct | ConvMode::Branch { .. } => {
+                ConvMode::Explore { .. }
+                | ConvMode::Direct
+                | ConvMode::Branch { .. }
+                | ConvMode::DetachedProductCreation { .. }
+                | ConvMode::DetachedApprovedTask { .. } => {
                     prop_assert!(false, "Expected Work mode");
                 }
             }
@@ -89,7 +93,11 @@ mod tests {
                     prop_assert!(!worktree_path.as_str().is_empty(),
                         "Work mode must always have a non-empty worktree_path");
                 }
-                ConvMode::Explore { .. } | ConvMode::Direct | ConvMode::Branch { .. } => {
+                ConvMode::Explore { .. }
+                | ConvMode::Direct
+                | ConvMode::Branch { .. }
+                | ConvMode::DetachedProductCreation { .. }
+                | ConvMode::DetachedApprovedTask { .. } => {
                     prop_assert!(false, "Expected Work mode");
                 }
             }
@@ -103,7 +111,11 @@ mod tests {
                     prop_assert!(!branch_name.as_str().is_empty(),
                         "Work mode must always have a non-empty branch_name");
                 }
-                ConvMode::Explore { .. } | ConvMode::Direct | ConvMode::Branch { .. } => {
+                ConvMode::Explore { .. }
+                | ConvMode::Direct
+                | ConvMode::Branch { .. }
+                | ConvMode::DetachedProductCreation { .. }
+                | ConvMode::DetachedApprovedTask { .. } => {
                     prop_assert!(false, "Expected Work mode");
                 }
             }
@@ -126,7 +138,11 @@ mod tests {
                     // Compile-time: no task_id field accessible here.
                     // If this test compiles, the invariant holds.
                 }
-                ConvMode::Explore { .. } | ConvMode::Direct | ConvMode::Work { .. } => {
+                ConvMode::Explore { .. }
+                | ConvMode::Direct
+                | ConvMode::Work { .. }
+                | ConvMode::DetachedProductCreation { .. }
+                | ConvMode::DetachedApprovedTask { .. } => {
                     prop_assert!(false, "Expected Branch mode");
                 }
             }
@@ -140,7 +156,11 @@ mod tests {
                     prop_assert!(!branch_name.as_str().is_empty(),
                         "Branch mode must always have a non-empty branch_name");
                 }
-                ConvMode::Explore { .. } | ConvMode::Direct | ConvMode::Work { .. } => {
+                ConvMode::Explore { .. }
+                | ConvMode::Direct
+                | ConvMode::Work { .. }
+                | ConvMode::DetachedProductCreation { .. }
+                | ConvMode::DetachedApprovedTask { .. } => {
                     prop_assert!(false, "Expected Branch mode");
                 }
             }

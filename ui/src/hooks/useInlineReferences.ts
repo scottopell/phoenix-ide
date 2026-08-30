@@ -8,6 +8,7 @@ import {
 } from 'react';
 import { createElement, type ReactNode } from 'react';
 import { api } from '../api';
+import type { ProductCreationResolution } from '../api';
 import type { SkillEntry } from '../api';
 import { useScopedState } from './useScopedState';
 import {
@@ -37,21 +38,11 @@ export interface UseInlineReferencesParams {
    */
   cwd: string | undefined;
   /**
-   * Whether the caller has finished resolving the root represented by `cwd`,
-   * `mode`, and `baseBranch`. False keeps trigger UI state but defers discovery.
+   * Whether the caller has finished resolving the root represented by `cwd`.
    */
   discoveryReady?: boolean;
-  /**
-   * Creation mode of the composer's workflow. With `baseBranch`, branch/managed
-   * modes discover candidates from the chosen branch's committed tree (what the
-   * conversation's worktree will hold) rather than the live `cwd`, so a
-   * suggestion always matches what create-time expansion can resolve. Omitted ⇒
-   * Direct (resolve against `cwd`). An in-conversation composer leaves this
-   * unset: its conversation already resolves against its own `cwd`.
-   */
-  mode?: 'direct' | 'managed' | 'branch';
-  /** Branch the conversation will be created on, for branch/managed modes. */
-  baseBranch?: string | null;
+  /** Root selection for pre-creation file and skill discovery. */
+  resolution?: ProductCreationResolution;
   /**
    * Identity of the composer this engine belongs to: a conversation id for an
    * in-conversation composer, a stable key for the new-conversation composer.
@@ -96,20 +87,17 @@ export interface InlineReferences {
 export function useInlineReferences({
   cwd,
   discoveryReady = true,
-  mode,
-  baseBranch,
+  resolution,
   scopeKey,
   textareaRef,
   value,
   setValue,
 }: UseInlineReferencesParams): InlineReferences {
-  // Candidates depend on the directory AND the ref (branch/managed resolve
-  // against a branch's committed tree, not `cwd`). The skill cache and the
-  // in-flight staleness guards key on this composite so switching workflow or
-  // branch refetches against the new root. JSON-encoded so the component parts
-  // can't collide.
-  const discoveryOpts = useMemo(() => ({ mode, baseBranch }), [mode, baseBranch]);
-  const discoveryKey = cwd ? JSON.stringify([cwd, mode ?? 'direct', baseBranch ?? '']) : undefined;
+  const discoveryOpts = useMemo<ProductCreationResolution>(
+    () => resolution ?? { kind: 'direct' },
+    [resolution],
+  );
+  const discoveryKey = cwd ? JSON.stringify([cwd, discoveryOpts]) : undefined;
   // Transient UI state is keyed on the composer identity (`scopeKey`) so it
   // resets when the composer switches conversations, even within one `cwd`.
   /** Active trigger state — null when no trigger is open. */

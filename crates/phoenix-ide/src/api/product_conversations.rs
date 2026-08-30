@@ -13,11 +13,13 @@ use super::types::{
     OrdinaryProductConversationLifecycleView, ProductConversationChainQaCompatibilityView,
     ProductConversationCloseInspectionView, ProductConversationCloseLossView,
     ProductConversationClosePhaseView, ProductConversationCloseResidualView,
-    ProductConversationCloseView, ProductConversationHandoffView, ProductConversationListResponse,
-    ProductConversationListRow, ProductConversationPresentationView,
-    ProductConversationSegmentView, ProductConversationSnapshotView,
-    ProductConversationSourceRelationView, ProductConversationSourceView,
-    ProductConversationTranscriptRowView, ProductConversationWorkIdentityView,
+    ProductConversationCloseView, ProductConversationCreationAllowedActionView,
+    ProductConversationCreationRecoveryResponse, ProductConversationCreationRecoveryRow,
+    ProductConversationHandoffView, ProductConversationListResponse, ProductConversationListRow,
+    ProductConversationPresentationView, ProductConversationSegmentView,
+    ProductConversationSnapshotView, ProductConversationSourceRelationView,
+    ProductConversationSourceView, ProductConversationTranscriptRowView,
+    ProductConversationWorkIdentityView,
 };
 use super::AppState;
 use crate::db::{
@@ -77,6 +79,55 @@ pub async fn list_product_conversations(
     }))
 }
 
+#[derive(Deserialize)]
+pub struct ProductCreationRecoveryQuery {
+    #[serde(default)]
+    cursor: Option<String>,
+}
+
+pub async fn list_product_conversation_creations(
+    State(state): State<AppState>,
+    Query(query): Query<ProductCreationRecoveryQuery>,
+) -> Result<Json<ProductConversationCreationRecoveryResponse>, AppError> {
+    let cursor = query
+        .cursor
+        .as_deref()
+        .map(decode_recovery_cursor)
+        .transpose()?;
+    let mut jobs = state
+        .db
+        .list_product_creation_recovery_jobs(cursor)
+        .await
+        .map_err(db_to_app)?;
+    let has_more = jobs.len() > 50;
+    jobs.truncate(50);
+    let next_cursor = has_more
+        .then(|| jobs.last())
+        .flatten()
+        .map(|job| encode_recovery_cursor(job.updated_at.timestamp_micros(), &job.request_id));
+    let rows = jobs
+        .into_iter()
+        .map(|job| ProductConversationCreationRecoveryRow {
+            request_id: job.request_id,
+            published_product_conversation_id: job.published_product_conversation_id,
+            status: job.status.clone(),
+            cwd: job.intent.cwd,
+            objective: job.intent.objective,
+            model: job.intent.model,
+            effort: job.intent.effort,
+            llm_language: Some(job.intent.llm_language),
+            images: job.intent.images,
+            updated_at: job.updated_at.to_rfc3339(),
+            last_error: job.last_error,
+            allowed_actions: creation_allowed_actions(&job.status),
+        })
+        .collect();
+    Ok(Json(ProductConversationCreationRecoveryResponse {
+        product_creations: rows,
+        next_cursor,
+    }))
+}
+
 pub async fn get_product_conversation(
     State(state): State<AppState>,
     Path(reference): Path<String>,
@@ -132,6 +183,45 @@ fn canonical_route(aggregate: &ProductConversationAggregate) -> String {
         "{PRODUCT_CONVERSATION_ROUTE_PREFIX}{}",
         aggregate.product_conversation.id()
     )
+}
+
+fn encode_recovery_cursor(updated_at_micros: i64, request_id: &str) -> String {
+    format!("{updated_at_micros}:{request_id}")
+}
+
+fn decode_recovery_cursor(cursor: &str) -> Result<(i64, String), AppError> {
+    let (updated_at, request_id) = cursor
+        .split_once(':')
+        .ok_or_else(|| AppError::BadRequest("invalid recovery cursor".to_string()))?;
+    let updated_at = updated_at
+        .parse()
+        .map_err(|_| AppError::BadRequest("invalid recovery cursor".to_string()))?;
+    if request_id.is_empty() {
+        return Err(AppError::BadRequest("invalid recovery cursor".to_string()));
+    }
+    Ok((updated_at, request_id.to_string()))
+}
+
+fn creation_allowed_actions(status: &str) -> Vec<ProductConversationCreationAllowedActionView> {
+    let mut actions = Vec::with_capacity(2);
+    match status {
+        "accepted" | "claimed" | "retry_scheduled" => {
+            actions.push(ProductConversationCreationAllowedActionView::Cancel);
+            actions.push(ProductConversationCreationAllowedActionView::Delete);
+        }
+        "delivery_failed" => {
+            actions.push(ProductConversationCreationAllowedActionView::RetryDelivery);
+        }
+        "failed" | "cancelled" => {
+            actions.push(ProductConversationCreationAllowedActionView::Delete);
+            actions.push(ProductConversationCreationAllowedActionView::StartOver);
+        }
+        "cancelling" | "cleanup_ambiguous" => {
+            actions.push(ProductConversationCreationAllowedActionView::Delete);
+        }
+        _ => {}
+    }
+    actions
 }
 
 fn list_row(projection: &ProductConversationListProjection) -> ProductConversationListRow {
@@ -757,6 +847,159 @@ mod tests {
             "one"
         );
         assert!(decode_cursor("not a cursor").is_err());
+    }
+
+    #[tokio::test]
+    async fn router_lists_pre_creation_current_management_root() {
+        let state = make_test_state().await;
+        let directory = tempfile::tempdir().unwrap();
+        let project = state
+            .db
+            .find_or_create_project(directory.path().to_str().unwrap())
+            .await
+            .unwrap();
+        state
+            .db
+            .create_conversation_with_project(
+                "pre-creation-api-recents",
+                "pre-creation-api-recents",
+                directory.path().to_str().unwrap(),
+                true,
+                None,
+                None,
+                Some(&project.id),
+                &crate::db::ConvMode::Explore {
+                    worktree_path: None,
+                    next_taskmd_id_hint: None,
+                },
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/recent-management-root-suggestions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            body["suggestions"][0]["path"],
+            directory.path().to_str().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn router_lists_product_creation_recovery_rows() {
+        let state = make_test_state().await;
+        let now = chrono::Utc::now();
+
+        state
+            .db
+            .accept_product_creation(
+                "req-accepted",
+                &crate::db::ProductCreationIntent {
+                    cwd: "/repo/accepted".to_string(),
+                    objective: "accepted objective".to_string(),
+                    model: Some("claude".to_string()),
+                    effort: Some(phoenix_core::domain::llm_types::ModelEffort::High),
+                    llm_language: phoenix_core::llm_language::LlmLanguage::default(),
+                    images: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .accept_product_creation(
+                "req-failed",
+                &crate::db::ProductCreationIntent {
+                    cwd: "/repo/failed".to_string(),
+                    objective: "failed objective".to_string(),
+                    model: Some("claude".to_string()),
+                    effort: None,
+                    llm_language: phoenix_core::llm_language::LlmLanguage::default(),
+                    images: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let failed_claim = state
+            .db
+            .claim_product_creation(
+                "req-failed",
+                "worker",
+                "token",
+                now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query("UPDATE product_creation_jobs SET attempt_count = ?2 WHERE request_id = ?1")
+            .bind("req-failed")
+            .bind(4_i64)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        assert!(
+            state
+                .db
+                .schedule_product_creation_retry(
+                    "req-failed",
+                    &failed_claim.claim,
+                    "failed badly",
+                    now,
+                )
+                .await
+                .unwrap()
+        );
+
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/product-conversations/creation")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let rows = body["product_creations"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        let failed = rows
+            .iter()
+            .find(|row| row["request_id"] == "req-failed")
+            .unwrap();
+        assert_eq!(failed["status"], "failed");
+        assert_eq!(failed["cwd"], "/repo/failed");
+        assert_eq!(failed["objective"], "failed objective");
+        assert_eq!(failed["last_error"], "failed badly");
+        assert_eq!(
+            failed["allowed_actions"],
+            serde_json::json!(["delete", "start_over"])
+        );
+        let accepted = rows
+            .iter()
+            .find(|row| row["request_id"] == "req-accepted")
+            .unwrap();
+        assert_eq!(
+            accepted["allowed_actions"],
+            serde_json::json!(["cancel", "delete"])
+        );
     }
 
     #[tokio::test]

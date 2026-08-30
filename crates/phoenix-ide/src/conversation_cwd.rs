@@ -54,6 +54,241 @@ impl ValidConversationCwd {
     }
 }
 
+pub(crate) fn normalize_product_creation_cwd_intent(
+    cwd: impl AsRef<str>,
+    home: &Path,
+) -> Result<String, ConversationCwdError> {
+    let raw = cwd.as_ref().trim();
+    if raw.is_empty() {
+        return Err(ConversationCwdError::Empty);
+    }
+    let path = Path::new(raw);
+    if path.exists() {
+        return validate_conversation_cwd(raw).map(ValidConversationCwd::into_raw);
+    }
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(ConversationCwdError::NotAcceptable(
+            "a new directory must use an absolute path without parent traversal".to_string(),
+        ));
+    }
+
+    let ancestor = path
+        .ancestors()
+        .find(|ancestor| ancestor.exists())
+        .ok_or_else(|| {
+            ConversationCwdError::NotAcceptable("no existing parent directory".to_string())
+        })?;
+    let canonical_ancestor = std::fs::canonicalize(ancestor)
+        .map_err(|error| ConversationCwdError::NotAcceptable(error.to_string()))?;
+    if !canonical_ancestor.is_dir() {
+        return Err(ConversationCwdError::NotAcceptable(
+            "nearest existing parent is not a directory".to_string(),
+        ));
+    }
+    let allowed = [home, Path::new("/tmp")].into_iter().any(|root| {
+        std::fs::canonicalize(root)
+            .is_ok_and(|canonical_root| canonical_ancestor.starts_with(canonical_root))
+    });
+    if !allowed {
+        return Err(ConversationCwdError::NotAcceptable(
+            "new directories must be under the server home directory or /tmp".to_string(),
+        ));
+    }
+    let suffix = path.strip_prefix(ancestor).map_err(|error| {
+        ConversationCwdError::NotAcceptable(format!("invalid new directory path: {error}"))
+    })?;
+    let normalized = canonical_ancestor.join(suffix);
+    if normalized.parent().is_none() {
+        return Err(ConversationCwdError::FilesystemRoot);
+    }
+    Ok(normalized.to_string_lossy().into_owned())
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DirectoryIdentity {
+    device: libc::dev_t,
+    inode: libc::ino_t,
+}
+
+#[cfg(unix)]
+fn directory_identity(
+    fd: &impl std::os::fd::AsRawFd,
+) -> Result<DirectoryIdentity, ConversationCwdError> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) } < 0 {
+        return Err(ConversationCwdError::NotAcceptable(format!(
+            "failed to identify selected directory: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok(DirectoryIdentity {
+        device: stat.st_dev,
+        inode: stat.st_ino,
+    })
+}
+
+#[cfg(unix)]
+fn traverse_absolute_directory_without_symlinks(
+    path: &Path,
+    create_missing: bool,
+) -> Result<(PathBuf, DirectoryIdentity), ConversationCwdError> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    if !path.is_absolute() {
+        return Err(ConversationCwdError::NotAcceptable(
+            "selected directory must use an absolute path".to_string(),
+        ));
+    }
+    let root = CString::new("/").expect("root has no NUL");
+    let fd = unsafe {
+        libc::open(
+            root.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(ConversationCwdError::NotAcceptable(format!(
+            "failed to open filesystem root: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let mut current = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut canonical = PathBuf::from("/");
+    for component in path.components() {
+        let segment = match component {
+            std::path::Component::RootDir | std::path::Component::CurDir => continue,
+            std::path::Component::Normal(segment) => segment,
+            std::path::Component::ParentDir | std::path::Component::Prefix(_) => {
+                return Err(ConversationCwdError::NotAcceptable(
+                    "invalid selected directory segment".to_string(),
+                ))
+            }
+        };
+        let c_segment = CString::new(segment.as_bytes()).map_err(|_| {
+            ConversationCwdError::NotAcceptable("directory path contains a NUL byte".to_string())
+        })?;
+        let mut next = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                c_segment.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if create_missing
+            && next < 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT)
+        {
+            let created = unsafe { libc::mkdirat(current.as_raw_fd(), c_segment.as_ptr(), 0o755) };
+            if created < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
+                return Err(ConversationCwdError::NotAcceptable(format!(
+                    "failed to create directory after durable acceptance: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            next = unsafe {
+                libc::openat(
+                    current.as_raw_fd(),
+                    c_segment.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                )
+            };
+        }
+        if next < 0 {
+            return Err(ConversationCwdError::NotAcceptable(format!(
+                "directory path contains an inaccessible or symlinked segment: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        current = unsafe { OwnedFd::from_raw_fd(next) };
+        canonical.push(segment);
+    }
+    let identity = directory_identity(&current)?;
+    Ok((canonical, identity))
+}
+
+#[cfg(not(unix))]
+fn traverse_absolute_directory_without_symlinks(
+    _path: &Path,
+    _create_missing: bool,
+) -> Result<(PathBuf, ()), ConversationCwdError> {
+    Err(ConversationCwdError::NotAcceptable(
+        "safe creation of missing selected directories is unsupported on this platform".to_string(),
+    ))
+}
+
+pub(crate) fn ensure_product_creation_cwd(
+    cwd: impl AsRef<str>,
+    home: &Path,
+) -> Result<ValidConversationCwd, ConversationCwdError> {
+    let raw = cwd.as_ref();
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        #[cfg(unix)]
+        match traverse_absolute_directory_without_symlinks(path, false) {
+            Ok((canonical, _identity)) => {
+                if canonical.parent().is_none() {
+                    return Err(ConversationCwdError::FilesystemRoot);
+                }
+                return Ok(ValidConversationCwd {
+                    raw: canonical.to_string_lossy().into_owned(),
+                    #[cfg(test)]
+                    canonical,
+                });
+            }
+            Err(error) if path.exists() => return Err(error),
+            Err(_) => {}
+        }
+    }
+    let ancestor = path
+        .ancestors()
+        .find(|ancestor| ancestor.exists())
+        .ok_or_else(|| {
+            ConversationCwdError::NotAcceptable("no existing parent directory".to_string())
+        })?;
+    let canonical_ancestor = std::fs::canonicalize(ancestor)
+        .map_err(|error| ConversationCwdError::NotAcceptable(error.to_string()))?;
+    let allowed = [home, Path::new("/tmp")].into_iter().any(|root| {
+        std::fs::canonicalize(root)
+            .is_ok_and(|canonical_root| canonical_ancestor.starts_with(canonical_root))
+    });
+    if !allowed {
+        return Err(ConversationCwdError::NotAcceptable(
+            "new directories must remain under the server home directory or /tmp".to_string(),
+        ));
+    }
+    let suffix = path.strip_prefix(ancestor).map_err(|error| {
+        ConversationCwdError::NotAcceptable(format!("invalid accepted directory path: {error}"))
+    })?;
+    if canonical_ancestor.join(suffix) != path {
+        return Err(ConversationCwdError::NotAcceptable(
+            "directory resolved outside the accepted canonical path".to_string(),
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        let (canonical, _identity) = traverse_absolute_directory_without_symlinks(path, true)?;
+        Ok(ValidConversationCwd {
+            raw: canonical.to_string_lossy().into_owned(),
+            #[cfg(test)]
+            canonical,
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        traverse_absolute_directory_without_symlinks(path, true)?;
+        validate_conversation_cwd(raw)
+    }
+}
+
 pub(crate) fn validate_conversation_cwd(
     cwd: impl AsRef<str>,
 ) -> Result<ValidConversationCwd, ConversationCwdError> {
@@ -118,6 +353,177 @@ mod tests {
         let err =
             validate_conversation_cwd(link.to_str().unwrap()).expect_err("root link rejected");
         assert!(err.to_string().contains("filesystem root"), "got: {err}");
+    }
+
+    #[test]
+    fn normalizes_missing_product_directory_without_creating_it() {
+        let home = tempfile::tempdir().expect("home");
+        let requested = home.path().join("new/project");
+
+        let normalized =
+            normalize_product_creation_cwd_intent(requested.to_string_lossy(), home.path())
+                .expect("missing leaf is acceptable");
+
+        assert_eq!(
+            Path::new(&normalized),
+            home.path()
+                .canonicalize()
+                .expect("canonical home")
+                .join("new/project")
+        );
+        assert!(
+            !requested.exists(),
+            "acceptance validation must not mutate the filesystem"
+        );
+    }
+
+    #[test]
+    fn creates_product_directory_only_when_worker_ensures_it() {
+        let home = tempfile::tempdir().expect("home");
+        let requested = home.path().join("new/project");
+        let normalized =
+            normalize_product_creation_cwd_intent(requested.to_string_lossy(), home.path())
+                .expect("missing leaf is acceptable");
+
+        let valid = ensure_product_creation_cwd(&normalized, home.path())
+            .expect("worker creates directory");
+        let replayed = ensure_product_creation_cwd(&normalized, home.path())
+            .expect("worker creation is idempotent");
+
+        assert!(requested.is_dir());
+        assert_eq!(valid.raw(), normalized);
+        assert_eq!(replayed, valid);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_rejects_symlink_at_final_missing_component() {
+        let home = tempfile::tempdir().expect("home");
+        let target = tempfile::tempdir().expect("target");
+        let requested = home.path().join("new-project");
+        let normalized =
+            normalize_product_creation_cwd_intent(requested.to_string_lossy(), home.path())
+                .expect("missing leaf accepted");
+        std::os::unix::fs::symlink(target.path(), &requested).expect("insert final symlink");
+
+        let error = ensure_product_creation_cwd(&normalized, home.path())
+            .expect_err("final symlink rejected");
+
+        assert!(error.to_string().contains("symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_traversal_rejects_symlinked_segment_without_mutating_target() {
+        let home = tempfile::tempdir().expect("home");
+        let target = tempfile::tempdir().expect("target");
+        std::os::unix::fs::symlink(target.path(), home.path().join("raced"))
+            .expect("insert symlink");
+
+        let error =
+            traverse_absolute_directory_without_symlinks(&home.path().join("raced/child"), true)
+                .expect_err("symlinked segment rejected");
+
+        assert!(error.to_string().contains("symlinked segment"));
+        assert!(!target.path().join("child").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_parent_replacement_with_symlink_is_rejected() {
+        let home = tempfile::tempdir().expect("home");
+        let outside = tempfile::tempdir().expect("outside");
+        let parent = home.path().join("parent");
+        std::fs::create_dir(&parent).expect("parent");
+        let requested = parent.join("selected");
+        std::fs::create_dir(&requested).expect("selected");
+        let displaced = home.path().join("displaced");
+        std::fs::rename(&parent, &displaced).expect("displace parent");
+        std::os::unix::fs::symlink(outside.path(), &parent).expect("replace parent with symlink");
+
+        let error = ensure_product_creation_cwd(requested.to_string_lossy(), home.path())
+            .expect_err("replaced parent symlink rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("symlink")
+                || message.contains("must remain under the server home directory or /tmp")
+                || message.contains("directory resolved outside the accepted canonical path"),
+            "unexpected rejection: {message}"
+        );
+    }
+
+    #[test]
+    fn worker_accepts_existing_directory_outside_creation_roots() {
+        let home = tempfile::tempdir().expect("home");
+        let existing = std::env::current_dir().expect("current directory");
+
+        let valid = ensure_product_creation_cwd(existing.to_string_lossy(), home.path())
+            .expect("existing directories keep the general cwd contract");
+
+        assert_eq!(
+            valid.as_path(),
+            existing.canonicalize().expect("canonical cwd")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_rejects_intermediate_symlink_after_target_was_created() {
+        let home = tempfile::tempdir().expect("home");
+        let outside = tempfile::tempdir().expect("outside");
+        let requested = home.path().join("new/project");
+        let normalized =
+            normalize_product_creation_cwd_intent(requested.to_string_lossy(), home.path())
+                .expect("missing leaf accepted");
+        std::os::unix::fs::symlink(outside.path(), home.path().join("new"))
+            .expect("insert intermediate symlink");
+        std::fs::create_dir(outside.path().join("project")).expect("raced target exists");
+
+        let error = ensure_product_creation_cwd(&normalized, home.path())
+            .expect_err("existing target reached through an intermediate symlink is rejected");
+
+        assert!(error.to_string().contains("symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_rejects_symlink_inserted_after_acceptance() {
+        let home = tempfile::tempdir().expect("home");
+        let outside = tempfile::tempdir().expect("outside");
+        let requested = home.path().join("new/project");
+        let normalized =
+            normalize_product_creation_cwd_intent(requested.to_string_lossy(), home.path())
+                .expect("missing leaf is acceptable");
+        std::os::unix::fs::symlink(outside.path(), home.path().join("new"))
+            .expect("insert symlink after acceptance");
+
+        let error = ensure_product_creation_cwd(&normalized, home.path())
+            .expect_err("symlink escape rejected");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("outside the accepted canonical path")
+                || message.contains("must remain under the server home directory or /tmp"),
+            "unexpected rejection: {message}"
+        );
+        assert!(
+            !outside.path().join("project").exists(),
+            "revalidation must reject before creating beneath the symlink"
+        );
+    }
+
+    #[test]
+    fn rejects_missing_product_directory_outside_allowed_roots() {
+        let home = tempfile::tempdir().expect("home");
+        let requested = std::env::current_dir()
+            .expect("current directory")
+            .join(format!("missing-product-cwd-{}", uuid::Uuid::new_v4()));
+
+        let error = normalize_product_creation_cwd_intent(requested.to_string_lossy(), home.path())
+            .expect_err("outside path rejected");
+
+        assert!(error.to_string().contains("server home directory or /tmp"));
+        assert!(!requested.exists());
     }
 
     #[test]

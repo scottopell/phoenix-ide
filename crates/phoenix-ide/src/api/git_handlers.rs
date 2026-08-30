@@ -1359,6 +1359,27 @@ pub(crate) async fn get_conversation_pr_status(
                 .clone()
                 .expect("persisted conversation has work scope"),
         ),
+        ConvMode::DetachedApprovedTask {
+            base_branch,
+            worktree_path,
+            ..
+        } => {
+            let branch_name = crate::git_ops::run_git(
+                std::path::Path::new(worktree_path.as_str()),
+                &["symbolic-ref", "--short", "HEAD"],
+            )
+            .map_err(|_| {
+                AppError::BadRequest("Detached approved task has no named branch".to_string())
+            })?;
+            (
+                branch_name.trim().to_string(),
+                base_branch.to_string(),
+                worktree_path.to_string(),
+                conv.attached_work_scope_id
+                    .clone()
+                    .expect("persisted conversation has work scope"),
+            )
+        }
         _ => {
             // Not applicable: no branch/worktree to query. Distinct from the
             // `gh`-can't-tell-us cases below, which return 200 + unavailable_reason.
@@ -2163,7 +2184,7 @@ pub(crate) async fn get_conversation_diff(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    let (worktree_path, base_branch) = match &conv.conv_mode {
+    let (worktree_path, comparator) = match &conv.conv_mode {
         ConvMode::Work {
             worktree_path,
             base_branch,
@@ -2174,9 +2195,22 @@ pub(crate) async fn get_conversation_diff(
             base_branch,
             ..
         } => (worktree_path.to_string(), base_branch.to_string()),
+        ConvMode::DetachedApprovedTask { worktree_path, .. } => {
+            let starting_oid = state
+                .db
+                .immutable_starting_oid_for_conversation(&id)
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?
+                .ok_or_else(|| {
+                    AppError::Internal(
+                        "detached conversation is missing its immutable starting OID".to_string(),
+                    )
+                })?;
+            (worktree_path.to_string(), starting_oid)
+        }
         _ => {
             return Err(AppError::BadRequest(
-                "Conversation is not in Work or Branch mode (no worktree to diff)".to_string(),
+                "Conversation has no worktree to diff".to_string(),
             ));
         }
     };
@@ -2190,7 +2224,7 @@ pub(crate) async fn get_conversation_diff(
         }
 
         let (captured, checkout_status) = capture_with_stable_checkout(&wt, || {
-            Ok(capture_branch_diff(&wt, &base_branch, MAX_DIFF_BYTES))
+            Ok(capture_branch_diff(&wt, &comparator, MAX_DIFF_BYTES))
         })?;
 
         Ok(build_diff_response(

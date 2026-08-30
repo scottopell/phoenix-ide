@@ -42,7 +42,7 @@ surface FreshWorkConversationProvisioningRequestImport {
 enum CreationVariant { seeded_empty | initial_turn }
 enum CreationOriginKind { ordinary | approved_task }
 enum CreationRejectReason { invalid_creation_intent | profile_unavailable }
-enum CreationFailureReason { retry_exhausted | permanent_effect_failure }
+enum CreationFailureReason { retry_exhausted }
 enum CreationManualReason {
     foreign_resource
     | indeterminate_external_state
@@ -51,15 +51,14 @@ enum CreationManualReason {
 }
 enum CreationLifecycleKind { cancel | delete }
 enum RepositoryKind { non_git | git_resolved | git_identity_unresolved }
-enum CanonicalDefaultOutcomeKind { resolved | unresolved | not_applicable }
-enum CanonicalDefaultFreshness { current | stale_cached }
+enum CanonicalDefaultOutcomeKind { resolved | not_applicable }
 enum CreationEffectKind {
-    resolve_repository | resolve_canonical_default | reserve_worktree
+    resolve_repository | resolve_canonical_default
     | materialize_or_adopt_worktree | attach_work_scope
     | materialize_approved_artifact | finalize_attachments | commit_metadata
-    | expand_initial_message | bootstrap_runtime | dispatch_first_llm
-    | remove_owned_worktree | release_worktree_reservation
-    | remove_finalized_attachments | remove_conversation_metadata
+    | bootstrap_runtime | dispatch_first_llm
+    | remove_owned_worktree | remove_finalized_attachments
+    | remove_conversation_metadata
 }
 enum CreationOutcome { provisioning | ready | cancelled | deletion_pending | deleted | failed | manual_resolution }
 enum ReconciliationResult { absent | matching | foreign | indeterminate }
@@ -97,15 +96,13 @@ value CanonicalDefaultOutcome {
     kind: CanonicalDefaultOutcomeKind
     commit_id: String when kind = resolved
     branch_name: String when kind = resolved
-    freshness: CanonicalDefaultFreshness when kind = resolved
-    unresolved_reason: String when kind = unresolved
 }
 
 value CreationAcceptanceReceipt {
     product_conversation_id: String
     transcript_conversation_id: String
     workflow_id: String
-    idempotency_key: String
+    request_id: String
 }
 
 ------------------------------------------------------------
@@ -183,13 +180,13 @@ config {
 ------------------------------------------------------------
 
 -- next_product_conversation_id(), next_transcript_conversation_id(), creation_profile_ref(), creation_snapshot_codec(), creation_event_codec(), creation_effect_codec()
--- creation_acceptance_scope(raw_intent), creation_acceptance_key(raw_intent), creation_request_fingerprint(raw_intent)
+-- creation_acceptance_scope(raw_intent), creation_request_id(raw_intent), creation_request_fingerprint(raw_intent)
 -- structurally_valid_intent(intent), normalized_intent(intent), creation_profile_accepting()
 -- approved_task_creation_request(source_conversation, target_conversation, target_product_conversation, source_work_scope_id)
 -- exact_source_repository_from_work_scope(source_work_scope_id): gitrep/GitRepository?
 -- resolved_repository_kind(observation): RepositoryKind
 -- hidden_repository_for_effect(effect): gitrep/GitRepository
--- shell_for(intent), initial_creation_plan(binding), creation_effect_kind(effect): CreationEffectKind
+-- initial_creation_plan(binding), creation_effect_kind(effect): CreationEffectKind
 -- effect_is_declared(binding, kind), dependency_exists(binding, successor_kind, predecessor_kind)
 -- no_effect_other_than(binding, kind), no_post_resolution_effects_declared(binding)
 -- no_other_post_resolution_creation_dependencies(binding)
@@ -197,7 +194,7 @@ config {
 -- readiness_members(binding), readiness_requires_dispatch(binding)
 -- repository_resolution_observation(effect, observation): RepositoryResolution
 -- canonical_default_outcome(effect, observation): CanonicalDefaultOutcome
--- hidden_repository_identity_proven(observation), transient_failure(evidence), permanent_failure(evidence)
+-- hidden_repository_identity_proven(observation), transient_failure(evidence)
 -- retry_deadline(effect), attempt_count(effect), reconciliation_result(effect, observation)
 -- matching_owned_resource(effect, observation), foreign_resource_evidence(effect, observation), indeterminate_evidence(effect, observation)
 -- metadata_receipt_materializes_conversation(binding, receipt), conversation_projection_ready(binding)
@@ -210,8 +207,8 @@ config {
 -- stale_creation_result(effect), preserve_cancel_or_delete_outcome(binding)
 --
 --   no_post_resolution_effects_declared(binding: CreationWorkflowBinding) -> Boolean
---       True iff unresolved Git identity leaves no canonical-default, reservation,
---       worktree, WorkScope, metadata, artifact, runtime, or dispatch effect declared.
+--       True iff unresolved Git identity leaves no canonical-default, worktree,
+--       WorkScope, metadata, artifact, runtime, or dispatch effect declared.
 --
 --   repository_resolution_observation(
 --       effect: dwf/Effect,
@@ -261,7 +258,7 @@ rule ShellFirstDurableAcceptance {
     requires: not dwf/ExternalAcceptanceBinding.exists(
         profile: creation_profile_ref(),
         authority_scope: creation_acceptance_scope(raw_intent),
-        idempotency_key: creation_acceptance_key(raw_intent)
+        idempotency_key: creation_request_id(raw_intent)
     )
 
     let intent = normalized_intent(raw_intent)
@@ -285,24 +282,24 @@ rule ShellFirstDurableAcceptance {
     ensures: dwf/ExternalAcceptanceBinding.created(
         profile: creation_profile_ref(),
         authority_scope: creation_acceptance_scope(raw_intent),
-        idempotency_key: creation_acceptance_key(raw_intent),
+        idempotency_key: creation_request_id(raw_intent),
         intent_fingerprint: creation_request_fingerprint(raw_intent),
         workflow_id: workflow_id,
         receipt: dwf/ExternalAcceptanceReceipt{
-            idempotency_key: creation_acceptance_key(raw_intent),
+            idempotency_key: creation_request_id(raw_intent),
             workflow_id: workflow_id,
             handle_codec: creation_receipt_codec(),
-            handle_payload: creation_receipt_payload(intent.product_conversation_id, intent.transcript_conversation_id, workflow_id, creation_acceptance_key(raw_intent))
+            handle_payload: creation_receipt_payload(intent.product_conversation_id, intent.transcript_conversation_id, workflow_id, creation_request_id(raw_intent))
         },
         accepted_at: now()
     )
-    ensures: shell_for(intent)
     ensures: initial_creation_plan(CreationWorkflowBinding{product_conversation_id: intent.product_conversation_id, transcript_conversation_id: intent.transcript_conversation_id})
 
     @guidance
-        -- The visible conversation shell, creation intent, workflow, initial DAG,
-        -- barriers, and stable external acceptance binding commit before any Git,
-        -- filesystem, runtime, or provider effects begin.
+        -- The durable creation binding, intent, workflow, initial DAG, barriers,
+        -- and stable external acceptance binding commit before any Git,
+        -- filesystem, runtime, or provider effects begin. ProductConversation
+        -- publication remains downstream of successful readiness.
 }
 
 rule ReplayCreationAcceptanceFromStableBinding {
@@ -310,12 +307,12 @@ rule ReplayCreationAcceptanceFromStableBinding {
     let binding = dwf/ExternalAcceptanceBinding{
         profile: creation_profile_ref(),
         authority_scope: creation_acceptance_scope(raw_intent),
-        idempotency_key: creation_acceptance_key(raw_intent)
+        idempotency_key: creation_request_id(raw_intent)
     }
     requires: dwf/ExternalAcceptanceBinding.exists(
         profile: creation_profile_ref(),
         authority_scope: creation_acceptance_scope(raw_intent),
-        idempotency_key: creation_acceptance_key(raw_intent)
+        idempotency_key: creation_request_id(raw_intent)
     )
     requires: binding.intent_fingerprint = creation_request_fingerprint(raw_intent)
     ensures: CreationProfileAcceptanceReplay(binding.receipt)
@@ -326,15 +323,15 @@ rule RejectConflictingCreationAcceptanceKey {
     let binding = dwf/ExternalAcceptanceBinding{
         profile: creation_profile_ref(),
         authority_scope: creation_acceptance_scope(raw_intent),
-        idempotency_key: creation_acceptance_key(raw_intent)
+        idempotency_key: creation_request_id(raw_intent)
     }
     requires: dwf/ExternalAcceptanceBinding.exists(
         profile: creation_profile_ref(),
         authority_scope: creation_acceptance_scope(raw_intent),
-        idempotency_key: creation_acceptance_key(raw_intent)
+        idempotency_key: creation_request_id(raw_intent)
     )
     requires: binding.intent_fingerprint != creation_request_fingerprint(raw_intent)
-    ensures: CreationProfileAcceptanceConflict(creation_acceptance_key(raw_intent))
+    ensures: CreationProfileAcceptanceConflict(creation_request_id(raw_intent))
 }
 
 rule InvalidIntentRejectedBeforeShell {
@@ -364,7 +361,7 @@ rule ApprovedStartNewUsesOrdinaryDurableCreation {
     ensures: ConversationCreationRequested(CreationRequester, raw_intent)
 
     @guidance
-        -- Start-new reuses shell-first durable creation with the target identities
+        -- Start-new reuses durable creation with the target identities
         -- allocated by Bedrock. Repository context is resolved from the exact source
         -- WorkScope ID and remains pre-scope evidence until successful worktree
         -- materialization creates a fresh target WorkScope attachment.
@@ -382,7 +379,7 @@ rule InitialCreationPlanDeclaresRepositoryResolutionFirst {
         -- second plan without guessing Git behavior from request mode or path.
 }
 
-rule ApprovedTaskNonGitResolutionPublishesTypedFailure {
+rule ApprovedTaskNonGitResolutionSchedulesRetryableJobFailure {
     when: RepositoryObservationRecorded(adapter, effect, observation)
     let binding = CreationWorkflowBinding{workflow: effect.workflow}
     requires: creation_effect_kind(effect) = resolve_repository
@@ -391,7 +388,8 @@ rule ApprovedTaskNonGitResolutionPublishesTypedFailure {
     requires: binding.intent.start.initial_turn_origin = approved_task
     requires: resolved_repository_kind(observation) = non_git
     ensures: binding.repository_resolution = repository_resolution_observation(effect, observation)
-    ensures: CreationFailurePublished(effect.workflow.id, permanent_effect_failure)
+    ensures: dwf/Effect{id: effect.id}.status = retry_wait
+    ensures: dwf/Effect{id: effect.id}.next_eligible_at = retry_deadline(effect)
     ensures: not WorkScopeAttachmentCreated(binding)
     ensures: no_post_resolution_effects_declared(binding)
 }
@@ -409,27 +407,22 @@ rule ResolvedInitialTurnCreationDagDeclared {
 
     ensures: effect_is_declared(binding, finalize_attachments)
     ensures: effect_is_declared(binding, commit_metadata)
-    ensures: effect_is_declared(binding, expand_initial_message)
     ensures: effect_is_declared(binding, bootstrap_runtime)
     ensures: effect_is_declared(binding, dispatch_first_llm)
     ensures: resolved_repository_kind(observation) = git_resolved implies effect_is_declared(binding, resolve_canonical_default)
-    ensures: resolved_repository_kind(observation) = git_resolved implies effect_is_declared(binding, reserve_worktree)
     ensures: resolved_repository_kind(observation) = git_resolved implies effect_is_declared(binding, materialize_or_adopt_worktree)
     ensures: resolved_repository_kind(observation) = git_resolved implies effect_is_declared(binding, attach_work_scope)
     ensures: binding.intent.start.initial_turn_origin = approved_task implies effect_is_declared(binding, materialize_approved_artifact)
     ensures: dependency_exists(binding, finalize_attachments, resolve_repository)
     ensures: resolved_repository_kind(observation) = git_resolved implies dependency_exists(binding, resolve_canonical_default, resolve_repository)
-    ensures: resolved_repository_kind(observation) = git_resolved implies dependency_exists(binding, reserve_worktree, resolve_canonical_default)
-    ensures: resolved_repository_kind(observation) = git_resolved implies dependency_exists(binding, materialize_or_adopt_worktree, reserve_worktree)
+    ensures: resolved_repository_kind(observation) = git_resolved implies dependency_exists(binding, materialize_or_adopt_worktree, resolve_canonical_default)
     ensures: resolved_repository_kind(observation) = git_resolved implies dependency_exists(binding, attach_work_scope, materialize_or_adopt_worktree)
     ensures: resolved_repository_kind(observation) = git_resolved implies dependency_exists(binding, commit_metadata, attach_work_scope)
     ensures: resolved_repository_kind(observation) = non_git implies dependency_exists(binding, commit_metadata, resolve_repository)
     ensures: binding.intent.start.initial_turn_origin = approved_task implies dependency_exists(binding, materialize_approved_artifact, attach_work_scope)
     ensures: binding.intent.start.initial_turn_origin = approved_task implies dependency_exists(binding, materialize_approved_artifact, commit_metadata)
-    ensures: binding.intent.start.initial_turn_origin = approved_task implies dependency_exists(binding, expand_initial_message, materialize_approved_artifact)
-    ensures: binding.intent.start.initial_turn_origin = ordinary implies dependency_exists(binding, expand_initial_message, commit_metadata)
     ensures: dependency_exists(binding, commit_metadata, finalize_attachments)
-    ensures: dependency_exists(binding, bootstrap_runtime, expand_initial_message)
+    ensures: dependency_exists(binding, bootstrap_runtime, commit_metadata)
     ensures: dependency_exists(binding, dispatch_first_llm, bootstrap_runtime)
     ensures: no_other_post_resolution_creation_dependencies(binding)
     ensures: readiness_members(binding) = workflow_effect_set(binding)
@@ -446,16 +439,13 @@ rule ResolvedSeededEmptyCreationDagDeclared {
     ensures: effect_is_declared(binding, finalize_attachments)
     ensures: effect_is_declared(binding, commit_metadata)
     ensures: effect_is_declared(binding, bootstrap_runtime)
-    ensures: not effect_is_declared(binding, expand_initial_message)
     ensures: not effect_is_declared(binding, dispatch_first_llm)
     ensures: resolved_repository_kind(observation) = git_resolved implies effect_is_declared(binding, resolve_canonical_default)
-    ensures: resolved_repository_kind(observation) = git_resolved implies effect_is_declared(binding, reserve_worktree)
     ensures: resolved_repository_kind(observation) = git_resolved implies effect_is_declared(binding, materialize_or_adopt_worktree)
     ensures: resolved_repository_kind(observation) = git_resolved implies effect_is_declared(binding, attach_work_scope)
     ensures: dependency_exists(binding, finalize_attachments, resolve_repository)
     ensures: resolved_repository_kind(observation) = git_resolved implies dependency_exists(binding, resolve_canonical_default, resolve_repository)
-    ensures: resolved_repository_kind(observation) = git_resolved implies dependency_exists(binding, reserve_worktree, resolve_canonical_default)
-    ensures: resolved_repository_kind(observation) = git_resolved implies dependency_exists(binding, materialize_or_adopt_worktree, reserve_worktree)
+    ensures: resolved_repository_kind(observation) = git_resolved implies dependency_exists(binding, materialize_or_adopt_worktree, resolve_canonical_default)
     ensures: resolved_repository_kind(observation) = git_resolved implies dependency_exists(binding, attach_work_scope, materialize_or_adopt_worktree)
     ensures: resolved_repository_kind(observation) = git_resolved implies dependency_exists(binding, commit_metadata, attach_work_scope)
     ensures: resolved_repository_kind(observation) = non_git implies dependency_exists(binding, commit_metadata, resolve_repository)
@@ -466,13 +456,14 @@ rule ResolvedSeededEmptyCreationDagDeclared {
     ensures: readiness_requires_dispatch(binding) = false
 }
 
-rule UnresolvedGitRepositoryIdentityPublishesTypedFailure {
+rule UnresolvedGitRepositoryIdentitySchedulesRetryableJobFailure {
     when: RepositoryObservationRecorded(adapter, effect, observation)
     let binding = CreationWorkflowBinding{workflow: effect.workflow}
     requires: creation_effect_kind(effect) = resolve_repository
     requires: resolved_repository_kind(observation) = git_identity_unresolved
     ensures: binding.repository_resolution = repository_resolution_observation(effect, observation)
-    ensures: CreationFailurePublished(effect.workflow.id, permanent_effect_failure)
+    ensures: dwf/Effect{id: effect.id}.status = retry_wait
+    ensures: dwf/Effect{id: effect.id}.next_eligible_at = retry_deadline(effect)
     ensures: not WorkScopeAttachmentCreated(binding)
     ensures: no_post_resolution_effects_declared(binding)
 }
@@ -486,8 +477,8 @@ rule RepositoryResolutionPersistsTypedPreScopeOutcome {
     @guidance
         -- Git detection yields either git_resolved with an exact hidden identity or
         -- git_identity_unresolved with a typed reason before any WorkScope exists.
-        -- Unresolved identity never fabricates a row or copies repository identity
-        -- onto ProductConversation.
+        -- Unresolved identity is a retryable job failure that never fabricates a
+        -- WorkScope row or copies repository identity onto ProductConversation.
 }
 
 rule CanonicalDefaultResolutionIsTypedAndGatesWorktreeMaterialization {
@@ -496,14 +487,32 @@ rule CanonicalDefaultResolutionIsTypedAndGatesWorktreeMaterialization {
     requires: creation_effect_kind(effect) = resolve_canonical_default
     ensures: binding.canonical_default_outcome = canonical_default_outcome(effect, observation)
     ensures: binding.canonical_default_outcome.kind = resolved implies WorktreeMaterializationEligible(binding)
-    ensures: binding.canonical_default_outcome.kind = unresolved implies CreationFailurePublished(effect.workflow.id, permanent_effect_failure)
-    ensures: binding.canonical_default_outcome.kind = unresolved implies not WorkScopeAttachmentCreated(binding)
 
     @guidance
-        -- Canonical-default resolution yields resolved(commit, branch, freshness)
-        -- or unresolved(error). Only resolved evidence may materialize a worktree;
-        -- unresolved failure remains bound to the shell and creates no WorkScope.
+        -- Canonical-default resolution yields only resolved(commit, branch).
+        -- With origin present, the observation must come from a fresh authoritative
+        -- default-branch fetch under the repository lock. With no origin, the
+        -- observation must be the exact local refs/heads/main branch. Any failure is
+        -- retryable and blocks worktree materialization and publication.
 }
+
+rule CanonicalDefaultResolutionSelectsImmutableOriginAwarePin {
+    when: RepositoryObservationRecorded(adapter, effect, observation)
+    let binding = CreationWorkflowBinding{workflow: effect.workflow}
+    requires: creation_effect_kind(effect) = resolve_canonical_default
+    requires: binding.canonical_default_outcome.kind = resolved
+    ensures: starting_pin_selected(binding)
+    ensures: canonical_default_has_origin(binding) implies starting_pin_from_authoritative_origin_default(binding)
+    ensures: not canonical_default_has_origin(binding) implies starting_pin_from_exact_local_main(binding)
+
+    @guidance
+        -- The recorded starting pin depends only on the resolved canonical-default
+        -- outcome: origin-backed evidence pins the exact freshly fetched remote-backed
+        -- default tip; no-origin evidence pins the exact local refs/heads/main tip.
+        -- Nothing falls back to cached stale provenance, the current checkout, or a
+        -- synthetic branch.
+}
+
 
 rule SuccessfulWorktreeMaterializationPrecedesFreshScopeAttachment {
     when: MetadataEffectReceipted(adapter, binding, receipt)
@@ -535,6 +544,14 @@ rule ApprovedArtifactMaterializesBeforeFirstDispatch {
     ensures: ApprovedArtifactMaterialized(binding.intent.start.approved_task, binding.transcript_conversation_id)
 }
 
+rule ApprovalUsesAttachedWorkScopeOnlyAndDoesNotBypassPinOrPublicationRules {
+    when: MetadataEffectReceipted(adapter, binding, receipt)
+    requires: binding.intent.start.initial_turn_origin = approved_task
+    ensures: binding.repository_resolution.kind = non_git or WorkScopeAttachmentCreated(binding)
+    ensures: starting_pin_selected(binding) or binding.repository_resolution.kind = non_git
+    ensures: approved_artifact_receipt_matches_reviewed_source(binding, receipt)
+}
+
 rule WorktreeReconciliationInspectsBeforeReplay {
     when: RepositoryObservationRecorded(adapter, effect, observation)
     requires: creation_effect_kind(effect) = materialize_or_adopt_worktree
@@ -545,13 +562,13 @@ rule WorktreeReconciliationInspectsBeforeReplay {
 
     @guidance
         -- Creation never blindly replays ambiguous worktree mutation. It inspects
-        -- existing state and either adopts, repairs, compensates, or enters manual
-        -- resolution.
+        -- existing state and either adopts, repairs, compensates, or preserves
+        -- explicit ambiguity for manual resolution.
 }
 
 rule RepositoryMutationUsesPhysicalLock {
     when: CreationEffectStarted(adapter, effect)
-    requires: creation_effect_kind(effect) in {reserve_worktree, materialize_or_adopt_worktree, remove_owned_worktree}
+    requires: creation_effect_kind(effect) in {materialize_or_adopt_worktree, remove_owned_worktree}
     requires: no_active_physical_repository_lock(hidden_repository_for_effect(effect))
     ensures: PhysicalRepositoryLock.created(
         repository: hidden_repository_for_effect(effect),
@@ -563,7 +580,7 @@ rule RepositoryMutationUsesPhysicalLock {
 
 rule RepositoryMutationWaitsForExistingPhysicalLock {
     when: CreationEffectStarted(adapter, effect)
-    requires: creation_effect_kind(effect) in {reserve_worktree, materialize_or_adopt_worktree, remove_owned_worktree}
+    requires: creation_effect_kind(effect) in {materialize_or_adopt_worktree, remove_owned_worktree}
     requires: active_physical_repository_lock(hidden_repository_for_effect(effect))
     ensures: dwf/Effect{id: effect.id}.status = retry_wait
     ensures: not PhysicalRepositoryLock.created(holder_effect: effect)
@@ -571,7 +588,7 @@ rule RepositoryMutationWaitsForExistingPhysicalLock {
 
 rule RepositoryMutationReleasesPhysicalLock {
     when: CreationEvidenceRecorded(adapter, effect, evidence)
-    requires: creation_effect_kind(effect) in {reserve_worktree, materialize_or_adopt_worktree, remove_owned_worktree}
+    requires: creation_effect_kind(effect) in {materialize_or_adopt_worktree, remove_owned_worktree}
     requires: PhysicalRepositoryLock{holder_effect: effect}.released_at = null
     requires: effect_attempt_finished(effect, evidence)
     ensures: PhysicalRepositoryLock{holder_effect: effect}.released_at = now()
@@ -597,12 +614,6 @@ rule TransientCreationFailureRetriesWithDurableDeadline {
     ensures: dwf/Effect{id: effect.id}.next_eligible_at = retry_deadline(effect)
 }
 
-rule PermanentCreationFailureProducesTypedReceipt {
-    when: CreationEvidenceRecorded(adapter, effect, evidence)
-    requires: permanent_failure(evidence)
-    ensures: dwf/Receipt.created(effect: effect)
-    ensures: CreationFailurePublished(effect.workflow.id, permanent_effect_failure)
-}
 
 rule MetadataReceiptMaterializesConversationShellState {
     when: MetadataEffectReceipted(adapter, binding, receipt)

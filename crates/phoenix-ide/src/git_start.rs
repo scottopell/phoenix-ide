@@ -17,6 +17,7 @@ pub(crate) struct GitStartPoint {
     logical_base: LogicalBaseBranch,
     checkout_ref: CheckoutRef,
     tree_ref: TreeRef,
+    reserved_oid: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +65,21 @@ impl GitStartPoint {
             logical_base: LogicalBaseBranch(logical_base.into()),
             checkout_ref: CheckoutRef(checkout_ref.into()),
             tree_ref: TreeRef(tree_ref.into()),
+            reserved_oid: None,
+        }
+    }
+
+    pub(crate) fn with_reserved_oid(
+        logical_base: impl Into<String>,
+        checkout_ref: impl Into<String>,
+        tree_ref: impl Into<String>,
+        reserved_oid: impl Into<String>,
+    ) -> Self {
+        Self {
+            logical_base: LogicalBaseBranch(logical_base.into()),
+            checkout_ref: CheckoutRef(checkout_ref.into()),
+            tree_ref: TreeRef(tree_ref.into()),
+            reserved_oid: Some(reserved_oid.into()),
         }
     }
 
@@ -77,6 +93,10 @@ impl GitStartPoint {
 
     pub(crate) fn tree_ref(&self) -> &str {
         &self.tree_ref.0
+    }
+
+    pub(crate) fn reserved_oid(&self) -> Option<&str> {
+        self.reserved_oid.as_deref()
     }
 
     pub(crate) fn for_create_request(
@@ -103,18 +123,28 @@ impl GitStartPoint {
         Some(Self::new(branch, tree_ref.clone(), tree_ref))
     }
 
-    pub(crate) fn for_default_task_start(repo_root: &Path) -> Option<Self> {
-        refresh_origin_default(repo_root);
-        let default_branch = origin_head_branch(repo_root)?;
-        let remote_ref = format!("origin/{default_branch}");
-        let tree_ref = if verify_commit(repo_root, &remote_ref) {
-            remote_ref
-        } else if verify_commit(repo_root, &default_branch) {
-            default_branch.clone()
+    pub(crate) fn cached_default_task_start(repo_root: &Path) -> Option<Self> {
+        let default_branch = if has_remote_named_origin(repo_root) {
+            origin_head_branch(repo_root)?
         } else {
-            return None;
+            resolve_local_only_default_branch(repo_root)?
         };
-        Some(Self::new(default_branch, tree_ref.clone(), tree_ref))
+        let checkout_ref = preferred_default_checkout_ref(repo_root, &default_branch)?;
+        let oid = resolve_commit_oid(repo_root, &checkout_ref)?;
+        let mut start = Self::new(default_branch, oid.clone(), oid.clone());
+        start.reserved_oid = Some(oid);
+        Some(start)
+    }
+
+    pub(crate) fn for_default_task_start(repo_root: &Path) -> Option<Self> {
+        let resolved = refreshed_default_task_start(repo_root)?;
+        let mut start = Self::new(
+            resolved.default_branch.clone(),
+            resolved.checkout_ref.clone(),
+            resolved.checkout_ref,
+        );
+        start.reserved_oid = Some(resolved.reserved_oid);
+        Some(start)
     }
 
     pub(crate) fn for_approval(
@@ -184,12 +214,143 @@ fn resolve_checkout_for_materialized_use(
     }
 }
 
-fn refresh_origin_default(repo_root: &Path) {
-    let _ = run_git(repo_root, &["fetch", "origin"])
-        .inspect_err(|e| tracing::debug!(error = %e, "project task refresh fetch failed"));
-    let _ = run_git(repo_root, &["remote", "set-head", "origin", "--auto"]).inspect_err(
-        |e| tracing::debug!(error = %e, "project task refresh origin HEAD update failed"),
-    );
+pub(crate) fn refresh_and_resolve_default_branch_for_reservation(
+    repo_root: &Path,
+) -> Option<String> {
+    refresh_and_resolve_default_branch(repo_root)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RefreshedDefaultTaskStart {
+    default_branch: String,
+    checkout_ref: String,
+    reserved_oid: String,
+}
+
+fn discover_remote_head_branch(repo_root: &Path) -> Option<String> {
+    let output = phoenix_core::git::command()
+        .current_dir(repo_root)
+        .args(["ls-remote", "--symref", "origin", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("ref: refs/heads/"))
+        .and_then(|line| line.split_whitespace().next())
+        .map(str::to_string)
+}
+
+fn refreshed_default_task_start(repo_root: &Path) -> Option<RefreshedDefaultTaskStart> {
+    if has_remote_named_origin(repo_root) {
+        let default_branch =
+            discover_remote_head_branch(repo_root).or_else(|| origin_head_branch(repo_root))?;
+        run_git(
+            repo_root,
+            &[
+                "fetch",
+                "origin",
+                "--no-tags",
+                &format!("+refs/heads/{default_branch}:refs/remotes/origin/{default_branch}"),
+            ],
+        )
+        .inspect_err(|e| tracing::debug!(error = %e, branch = %default_branch, "project task targeted default fetch failed"))
+        .ok()?;
+        let checkout_ref = preferred_default_checkout_ref(repo_root, &default_branch)?;
+        let reserved_oid = resolve_commit_oid(repo_root, &checkout_ref)?;
+        return Some(RefreshedDefaultTaskStart {
+            default_branch,
+            checkout_ref,
+            reserved_oid,
+        });
+    }
+
+    let default_branch = resolve_local_only_default_branch(repo_root)?;
+    let checkout_ref = preferred_default_checkout_ref(repo_root, &default_branch)?;
+    let reserved_oid = resolve_commit_oid(repo_root, &checkout_ref)?;
+    Some(RefreshedDefaultTaskStart {
+        default_branch,
+        checkout_ref,
+        reserved_oid,
+    })
+}
+
+fn refresh_and_resolve_default_branch(repo_root: &Path) -> Option<String> {
+    refreshed_default_task_start(repo_root).map(|resolved| resolved.default_branch)
+}
+
+fn resolve_local_only_default_branch(repo_root: &Path) -> Option<String> {
+    let branches = local_heads(repo_root);
+    match branches.as_slice() {
+        [only] => return Some(only.clone()),
+        [] => return None,
+        _ => {}
+    }
+
+    let init_default = init_default_branch(repo_root)?;
+    branches
+        .into_iter()
+        .find(|branch| branch == &init_default)
+        .filter(|branch| !branch.is_empty())
+}
+
+fn local_heads(repo_root: &Path) -> Vec<String> {
+    run_git(
+        repo_root,
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+    )
+    .ok()
+    .map(|output| {
+        output
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn init_default_branch(repo_root: &Path) -> Option<String> {
+    run_git(repo_root, &["config", "--get", "init.defaultBranch"])
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn has_remote_named_origin(repo_root: &Path) -> bool {
+    run_git(repo_root, &["remote", "get-url", "origin"]).is_ok()
+}
+
+pub(crate) fn preferred_default_checkout_ref_for_reservation(
+    repo_root: &Path,
+    default_branch: &str,
+) -> Option<String> {
+    preferred_default_checkout_ref(repo_root, default_branch)
+}
+
+fn preferred_default_checkout_ref(repo_root: &Path, default_branch: &str) -> Option<String> {
+    let remote_ref = format!("origin/{default_branch}");
+    if verify_commit(repo_root, &remote_ref) {
+        Some(remote_ref)
+    } else if verify_commit(repo_root, default_branch) {
+        Some(default_branch.to_string())
+    } else {
+        None
+    }
+}
+
+pub(crate) fn resolve_commit_oid_for_reservation(repo_root: &Path, rev: &str) -> Option<String> {
+    resolve_commit_oid(repo_root, rev)
+}
+
+fn resolve_commit_oid(repo_root: &Path, rev: &str) -> Option<String> {
+    run_git(repo_root, &["rev-parse", &format!("{rev}^{{commit}}")])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 fn origin_head_branch(repo_root: &Path) -> Option<String> {
@@ -278,6 +439,55 @@ mod tests {
     }
 
     #[test]
+    fn default_task_start_falls_back_to_local_only_repo() {
+        let repo = TempDir::new().unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.path().join("README.md"), "one").unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-qm", "initial"]);
+
+        let start = GitStartPoint::for_default_task_start(repo.path()).unwrap();
+        assert_eq!(start.logical_base(), "main");
+        assert_eq!(start.checkout_ref(), "main");
+        assert_eq!(start.tree_ref(), "main");
+        assert_eq!(
+            start.reserved_oid(),
+            resolve_commit_oid(repo.path(), "main").as_deref()
+        );
+    }
+
+    #[test]
+    fn default_task_start_uses_init_default_branch_for_local_only_repo_with_multiple_heads() {
+        let repo = TempDir::new().unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        git(repo.path(), &["config", "init.defaultBranch", "main"]);
+        std::fs::write(repo.path().join("README.md"), "one").unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-qm", "initial"]);
+        git(repo.path(), &["branch", "feature"]);
+        git(repo.path(), &["checkout", "-q", "feature"]);
+
+        let start = GitStartPoint::for_default_task_start(repo.path()).unwrap();
+        assert_eq!(start.logical_base(), "main");
+        assert_eq!(start.checkout_ref(), "main");
+        assert_eq!(start.tree_ref(), "main");
+    }
+
+    #[test]
+    fn default_task_start_is_unresolved_for_local_only_repo_with_multiple_heads_and_no_authority() {
+        let repo = TempDir::new().unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        git(repo.path(), &["config", "init.defaultBranch", ""]);
+        std::fs::write(repo.path().join("README.md"), "one").unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-qm", "initial"]);
+        git(repo.path(), &["branch", "feature"]);
+        git(repo.path(), &["checkout", "-q", "feature"]);
+
+        assert!(GitStartPoint::for_default_task_start(repo.path()).is_none());
+    }
+
+    #[test]
     fn explicit_create_ref_is_not_materialized_as_branch() {
         let (_origin, clone) = repo_with_origin();
         let start =
@@ -319,5 +529,42 @@ mod tests {
             GitStartPoint::for_inline_discovery(clone.path(), "managed", Some("feature")).unwrap();
         assert_eq!(start.logical_base(), "feature");
         assert_eq!(start.tree_ref(), "origin/feature");
+    }
+
+    #[test]
+    fn default_task_start_targeted_fetch_updates_only_default_branch() {
+        let (origin, clone) = repo_with_origin();
+        git(clone.path(), &["checkout", "-q", "-b", "feature"]);
+        git(clone.path(), &["push", "-u", "origin", "feature"]);
+        let old_feature = run_git(clone.path(), &["rev-parse", "origin/feature"]).unwrap();
+        git(clone.path(), &["checkout", "-q", "main"]);
+
+        let updater = TempDir::new().unwrap();
+        git(
+            updater.path(),
+            &["clone", "-q", origin.path().to_str().unwrap(), "."],
+        );
+        std::fs::write(updater.path().join("README.md"), "main-two").unwrap();
+        git(updater.path(), &["add", "."]);
+        git(updater.path(), &["commit", "-qm", "advance main"]);
+        git(updater.path(), &["push", "origin", "main"]);
+        git(updater.path(), &["checkout", "-q", "feature"]);
+        std::fs::write(updater.path().join("feature.txt"), "feature-two").unwrap();
+        git(updater.path(), &["add", "."]);
+        git(updater.path(), &["commit", "-qm", "advance feature"]);
+        git(updater.path(), &["push", "origin", "feature"]);
+
+        let start = GitStartPoint::for_default_task_start(clone.path()).unwrap();
+        assert_eq!(start.logical_base(), "main");
+        assert_eq!(start.checkout_ref(), "origin/main");
+        let new_main = run_git(clone.path(), &["rev-parse", "origin/main"]).unwrap();
+        let feature_after = run_git(clone.path(), &["rev-parse", "origin/feature"]).unwrap();
+        assert_ne!(
+            new_main.trim(),
+            run_git(clone.path(), &["rev-parse", "main"])
+                .unwrap()
+                .trim()
+        );
+        assert_eq!(feature_after.trim(), old_feature.trim());
     }
 }

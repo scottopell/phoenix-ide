@@ -6,7 +6,7 @@
 
 ## Current Reality
 
-The additive Repository Foundation is shipped: deterministic Project-seeded hidden `GitRepository` rows and singular nullable `WorkScope.repository` attachments exist as dormant relational data, with query-only readiness validation. Legacy `Project` remains the sole live repository authority, and Foundation locator/default-branch observations may truthfully remain empty because Foundation performs no live probes. No ProductConversation or Close capability has made hidden authority live.
+The additive Repository Foundation is shipped: deterministic Project-seeded hidden `GitRepository` rows and singular nullable `WorkScope.repository` attachments exist as dormant relational data, with query-only readiness validation. Legacy `Project` remains the sole live repository authority, and Foundation locator/default-branch observations may truthfully remain empty because Foundation performs no live probes. Git-backed ProductConversation publication explicitly leaves those Foundation tables untouched: its allocated worktree is a `WorkScope` environment, while repository root and exact checkout OID remain creation-job staging facts. No ProductConversation or Close capability has made hidden authority live.
 
 Authority activation is deferred until an owning normative requirement for an exact ProductConversation or destructive Close capability requires generation `2`. The offline operation stops Phoenix, acquires exclusive SQLite access, captures and verifies the exact pre-activation snapshot with its paired Project-authority binary, preserves seeded identities, migrates or quarantines every repository-sensitive reader and writer, and changes authority transactionally. Live cutover, runtime-wide drain, identity convergence, and production authorization from a source census are not supported activation behavior.
 
@@ -39,7 +39,7 @@ Current normative authority is `requirements.md` and `git-repository.allium`. AD
 |-------------|--------|-------|
 | REQ-GITREP-001 | Foundation implemented; activation deferred | Opaque Project-seeded hidden identities exist dormantly; Project remains live authority |
 | REQ-GITREP-002 | Foundation schema implemented | Mutable locator rows have typed status, but Foundation performs no live observation and valid tables may be empty |
-| REQ-GITREP-003 | Partially implemented | Typed dormant observation storage exists and Phoenix observes branch facts through legacy paths, but the hidden model is not live authority |
+| REQ-GITREP-003 | Partially implemented | Typed dormant observation storage exists and Phoenix observes branch facts through legacy paths, but origin-backed pin selection and stale no-origin pin truth are not yet live authority |
 | REQ-GITREP-004 | Foundation attachment implemented; activation deferred | Singular nullable `WorkScope.repository` is backfilled dormantly; ProductConversation and pre-scope hidden-authority consumers are not live |
 | REQ-GITREP-005 | Partially implemented | Continuation already preserves one work context, and follow-up is specified as fresh work, but repository attachment is still carried through legacy surfaces |
 | REQ-GITREP-006 | Not implemented | Immutable restart repair evidence bound to ProductConversation, WorkScope, hidden GitRepository, and fingerprint is not yet the shipped persistence contract |

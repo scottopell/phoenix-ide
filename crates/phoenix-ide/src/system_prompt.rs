@@ -221,7 +221,11 @@ pub fn build_system_prompt_with_options(
     // case.
     let mode_states_worktree_boundary = matches!(
         mode,
-        Some(ModeContext::Work { .. } | ModeContext::Branch { .. })
+        Some(
+            ModeContext::Work { .. }
+                | ModeContext::Branch { .. }
+                | ModeContext::DetachedApprovedTask { .. }
+        )
     );
     if !mode_states_worktree_boundary
         && crate::git_ops::repo_root_from_phoenix_worktree(working_dir).is_some()
@@ -263,6 +267,20 @@ pub fn build_system_prompt_with_options(
                     branch_name,
                     base_branch,
                     worktree_path,
+                ));
+            }
+            ModeContext::DetachedApprovedTask {
+                base_branch,
+                worktree_path,
+                task_id,
+                task_title,
+            } => {
+                prompt.push_str(&llm_language::mode_detached_approved_task(
+                    language,
+                    base_branch,
+                    worktree_path,
+                    task_id,
+                    task_title,
                 ));
             }
             ModeContext::Direct => {

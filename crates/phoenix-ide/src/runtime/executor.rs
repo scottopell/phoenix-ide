@@ -4689,9 +4689,12 @@ where
 
         // --- Mode validation and one-writer constraint (REQ-PROJ-008) ---
         let parent_allows_work = match self.context.mode_context.as_ref() {
-            Some(ModeContext::Work { .. } | ModeContext::Direct | ModeContext::Branch { .. }) => {
-                true
-            }
+            Some(
+                ModeContext::Work { .. }
+                | ModeContext::Direct
+                | ModeContext::Branch { .. }
+                | ModeContext::DetachedApprovedTask { .. },
+            ) => true,
             Some(ModeContext::Explore { .. }) | None => false,
         };
 
@@ -4751,7 +4754,9 @@ where
         // that own a worktree (Work/Branch).
         let parent_worktree_path: Option<&str> = match self.context.mode_context.as_ref() {
             Some(
-                ModeContext::Work { worktree_path, .. } | ModeContext::Branch { worktree_path, .. },
+                ModeContext::Work { worktree_path, .. }
+                | ModeContext::Branch { worktree_path, .. }
+                | ModeContext::DetachedApprovedTask { worktree_path, .. },
             ) => Some(worktree_path.as_str()),
             _ => None,
         };
@@ -6636,6 +6641,11 @@ where
         let tasks_dir_name = self.context.tasks_dir_name.clone();
         let is_sub_agent = self.context.is_sub_agent;
         let mode_context = self.context.mode_context.clone();
+        let has_approved_task_write_authority =
+            matches!(
+                self.context.resource_authority,
+                crate::work_scope::ResourceAuthority::Work
+            ) && matches!(mode_context, Some(ModeContext::Explore { .. }));
         let llm_language = self.context.llm_language;
         let persona = self.context.persona.clone();
         let is_coordinator = self.context.is_coordinator;
@@ -6766,7 +6776,7 @@ where
 
             // Build system prompt with AGENTS.md content + mode context
             // TODO(task 61006): snapshot system prompt per conversation to stop mid-session cache busts
-            let system_prompt = if is_coordinator {
+            let mut system_prompt = if is_coordinator {
                 crate::system_prompt::build_coordinator_system_prompt(llm_language, explore_bash)
             } else {
                 build_system_prompt(
@@ -6779,6 +6789,12 @@ where
                     explore_bash_capability,
                 )
             };
+
+            if has_approved_task_write_authority {
+                system_prompt.push_str(
+                    "\n\nThe conversation mode remains Explore, but the approved-task objective on its attached WorkScope grants full write authority. Execute that approved task with the available write tools; do not propose another plan merely because the mode label is Explore.",
+                );
+            }
 
             let tools = request_tool_surface.callable_tools(available_tools);
             let callable_tool_names: std::collections::HashSet<&str> =
@@ -8113,14 +8129,55 @@ where
         plan: String,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<(), String> {
+        if matches!(
+            self.context.mode_context.as_ref(),
+            Some(ModeContext::DetachedApprovedTask { .. })
+        ) {
+            let tasks_dir_name = self.context.tasks_dir_name.clone();
+            let reviewed = reread_reviewed_task_handoff_snapshot(
+                self.context.filesystem_root(),
+                self.context.filesystem_root(),
+                &tasks_dir_name,
+                &task_file,
+                &title,
+                priority,
+                &plan,
+            )?;
+            let approval_msg = format!(
+                "Task approved in the existing detached worktree {}.\n\n## Approved plan: {}\n\nPriority: {}\n\n{}",
+                self.context.filesystem_root().display(),
+                reviewed.task_title,
+                priority,
+                plan,
+            );
+            let msg_id = uuid::Uuid::new_v4().to_string();
+            let content = MessageContent::User(crate::db::UserContent::meta(&approval_msg));
+            let seq = self.broadcast_tx.next_seq();
+            let msg = self
+                .storage
+                .add_message_with_seq(
+                    &msg_id,
+                    &self.context.conversation_id,
+                    seq,
+                    &content,
+                    None,
+                    None,
+                )
+                .await?;
+            let _ = self
+                .broadcast_tx
+                .admitted_publication(admitted)
+                .persisted_message(msg);
+            return Ok(());
+        }
         let cwd = self.context.filesystem_root().to_path_buf();
-        // The spec invariant WorktreePathDerivedFromConversation requires
-        // the worktree path to be rooted at the repo root, not at cwd.
-        // For Managed conversations cwd IS the Explore worktree; for legacy
-        // pre-REQ-PROJ-028 Managed conversations cwd IS already the repo root.
         let repo_root =
             crate::git_ops::repo_root_from_phoenix_worktree(&cwd).unwrap_or_else(|| cwd.clone());
-        let conv_id = self.context.conversation_id.clone();
+        let worktree_identity = self
+            .storage
+            .get_product_conversation_id(&self.context.conversation_id)
+            .await
+            .map_err(|error| format!("Failed to load ProductConversation identity: {error}"))?;
         let desired_base_branch = self.context.desired_base_branch.clone();
         let tasks_dir_name = self.context.tasks_dir_name.clone();
         let storage = self.storage.clone();
@@ -8135,13 +8192,15 @@ where
         let blocking_admission = admitted.reborrow();
         let result =
             crate::runtime::creation_worker::run_admitted_blocking(blocking_admission, move || {
-                execute_approve_task_blocking(
+                execute_approve_task_blocking_reviewed(
                     &cwd,
                     &repo_root,
-                    &conv_id,
+                    &worktree_identity,
                     &tasks_dir_name,
                     &task_file,
                     &title,
+                    priority,
+                    &plan,
                     desired_base_branch.as_deref(),
                 )
             })
@@ -8150,40 +8209,21 @@ where
 
         match result {
             Ok(approval_result) => {
-                // Update conversation mode to Work (includes worktree_path, base_branch, task_number)
-                let work_mode = crate::db::ConvMode::Work {
-                    branch_name: crate::db::NonEmptyString::new(
-                        approval_result.branch_name.clone(),
-                    )
-                    .expect("branch_name from task approval must be non-empty"),
-                    worktree_path: crate::db::NonEmptyString::new(
-                        approval_result.worktree_path.clone(),
-                    )
-                    .expect("worktree_path from task approval must be non-empty"),
-                    base_branch: crate::db::NonEmptyString::new(
-                        approval_result.base_branch.clone(),
-                    )
-                    .expect("base_branch from task approval must be non-empty"),
-                    task_id: crate::db::NonEmptyString::new(approval_result.task_id.clone())
-                        .expect("task_id from task approval must be non-empty"),
-                    task_title: crate::db::NonEmptyString::new(approval_result.task_title.clone())
-                        .expect("task_title from task approval must be non-empty"),
-                };
                 storage
-                    .update_conversation_mode_and_cwd(
+                    .persist_approved_task_authority(
                         &self.context.conversation_id,
-                        &work_mode,
-                        &approval_result.worktree_path,
+                        &TaskApprovalHandoffData {
+                            task_id: approval_result.task_id.clone(),
+                            task_title: approval_result.task_title.clone(),
+                            title: title_backup.clone(),
+                            priority: priority_backup,
+                            plan: plan_backup.clone(),
+                            task_file: task_file_backup.clone(),
+                            artifact_body: approval_result.artifact_body.clone(),
+                        },
                     )
                     .await?;
-
-                // Legitimate cwd mutation (task 13012, in-place promotion).
-                // For Managed conversations (REQ-PROJ-028): the early Explore
-                // worktree is promoted in place (branch rename, same path), so
-                // this write is a no-op — worktree_path == conv.cwd already.
-                // For legacy Managed conversations whose cwd was the repo root,
-                // this is load-bearing: it moves cwd to the new worktree path.
-                promote_runtime_context_to_work(&mut self.context, &approval_result);
+                self.context.resource_authority = crate::work_scope::ResourceAuthority::Work;
 
                 // Upgrade tool registry from Explore to Work mode so the agent
                 // gets bash, patch, etc. for the rest of this conversation.
@@ -8234,9 +8274,18 @@ where
                     .admitted_publication(admitted)
                     .persisted_message(msg);
 
-                // Push updated conversation metadata to the client so it
-                // reflects the new cwd, branch, worktree_path, and mode label
-                // without requiring a reconnect.
+                // Approval changes write authority, not the conversation mode.
+                let (branch_name, conv_mode_label) = match self.context.mode_context.as_ref() {
+                    Some(ModeContext::Work { branch_name, .. }) => {
+                        (Some(branch_name.clone()), "Work")
+                    }
+                    Some(ModeContext::Branch { branch_name, .. }) => {
+                        (Some(branch_name.clone()), "Branch")
+                    }
+                    Some(ModeContext::Explore { .. }) => (None, "Explore"),
+                    Some(ModeContext::DetachedApprovedTask { .. }) => (None, "Approved Task"),
+                    Some(ModeContext::Direct) | None => (None, "Direct"),
+                };
                 let _ = self
                     .broadcast_tx
                     .admitted_publication(admitted)
@@ -8249,9 +8298,9 @@ where
                             project_id: None,
                             project_name: None,
                             updated_at: None,
-                            branch_name: Some(approval_result.branch_name.clone()),
+                            branch_name,
                             worktree_path: Some(approval_result.worktree_path.clone()),
-                            conv_mode_label: Some("Work".to_string()),
+                            conv_mode_label: Some(conv_mode_label.to_string()),
                             base_branch: Some(approval_result.base_branch.clone()),
                             task_title: Some(approval_result.task_title.clone()),
                             work_scope_key: Some(self.context.resource_scope.stable_key()),
@@ -8307,6 +8356,7 @@ where
             }
         }
     }
+    #[allow(clippy::too_many_lines)]
     async fn execute_approve_task_fresh_handoff(
         &mut self,
         task_file: String,
@@ -8316,10 +8366,6 @@ where
         authority: crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
         let cwd = self.context.filesystem_root().to_path_buf();
-        let repo_root =
-            crate::git_ops::repo_root_from_phoenix_worktree(&cwd).unwrap_or_else(|| cwd.clone());
-        let conv_id = self.context.conversation_id.clone();
-        let desired_base_branch = self.context.desired_base_branch.clone();
         let tasks_dir_name = self.context.tasks_dir_name.clone();
 
         let task_file_backup = task_file.clone();
@@ -8331,23 +8377,22 @@ where
         let blocking_admission = authority.reborrow();
         let result =
             crate::runtime::creation_worker::run_admitted_blocking(blocking_admission, move || {
-                execute_approve_task_blocking(
+                persist_fresh_approved_task_artifact_blocking(
                     &cwd,
-                    &repo_root,
-                    &conv_id,
                     &tasks_dir_name,
                     &task_file,
                     &title,
-                    desired_base_branch.as_deref(),
+                    priority,
+                    &plan,
                 )
             })
             .await
             .map_err(|e| format!("Task approval join error: {e}"))?;
 
-        let approval_result = match result {
+        let approval = match result {
             Ok(result) => result,
             Err(e) => {
-                tracing::error!(error = %e, "Fresh task approval git operations failed");
+                tracing::error!(error = %e, "Fresh task approval artifact verification failed");
                 self.install_live_state(
                     ConvState::AwaitingTaskApproval {
                         task_file: task_file_backup,
@@ -8358,8 +8403,6 @@ where
                     Utc::now(),
                     true,
                 )?;
-                // Direct state write bypasses apply_transition_result, so
-                // close any turn span opened by the brief LlmRequesting here.
                 self.settle_turn_span();
                 let _ = self.broadcast_tx.send_seq(|seq| SseEvent::Error {
                     sequence_id: seq,
@@ -8384,16 +8427,13 @@ where
         let request = TaskApprovalHandoffRequest {
             parent_conversation_id: self.context.conversation_id.clone(),
             approval: TaskApprovalHandoffData {
-                task_id: approval_result.task_id,
-                task_title: approval_result.task_title,
-                branch_name: approval_result.branch_name,
-                approved_commit_oid: approval_result.approved_commit_oid,
-                worktree_path: approval_result.worktree_path,
-                base_branch: approval_result.base_branch,
+                task_id: approval.task_id,
+                task_title: approval.task_title,
                 title: title_backup,
                 priority: priority_backup,
                 plan: plan_backup,
-                task_file: approval_result.task_file,
+                task_file: approval.task_file,
+                artifact_body: approval.artifact_body,
             },
             authority,
             response_tx,
@@ -8412,30 +8452,158 @@ where
     }
 }
 
-fn promote_runtime_context_to_work(context: &mut ConvContext, approval: &TaskApprovalResult) {
-    let worktree_path = std::path::PathBuf::from(&approval.worktree_path);
-    context.set_filesystem_root(worktree_path.clone());
-    context.resource_authority = crate::work_scope::ResourceAuthority::Work;
-    context.work_scope_worktree = Some(worktree_path);
-    context.mode_context = Some(ModeContext::Work {
-        branch_name: approval.branch_name.clone(),
-        base_branch: approval.base_branch.clone(),
-        worktree_path: approval.worktree_path.clone(),
-    });
-}
-
 /// Result of a successful task approval
+#[derive(Debug)]
 struct TaskApprovalResult {
     task_id: String,
     task_title: String,
     branch_name: String,
-    approved_commit_oid: String,
     first_task: bool,
-    task_file: String,
     /// Absolute path to the git worktree created for this conversation
     worktree_path: String,
     /// The branch that was checked out when the task was approved (merge target)
     base_branch: String,
+    /// Exact reviewed bytes revalidated before any Git side effect.
+    artifact_body: String,
+}
+
+#[derive(Debug)]
+struct ReviewedTaskHandoffSnapshot {
+    task_id: String,
+    task_title: String,
+    task_file: String,
+    artifact_body: String,
+}
+
+fn persist_fresh_approved_task_artifact_blocking(
+    cwd: &std::path::Path,
+    tasks_dir_name: &str,
+    task_file: &str,
+    expected_title: &str,
+    expected_priority: crate::task_source::Priority,
+    expected_plan: &str,
+) -> Result<ReviewedTaskHandoffSnapshot, String> {
+    let _guard = TASK_APPROVAL_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut snapshot = reread_reviewed_task_handoff_snapshot(
+        cwd,
+        cwd,
+        tasks_dir_name,
+        task_file,
+        expected_title,
+        expected_priority,
+        expected_plan,
+    )?;
+    if detect_plain_markdown_task_stem(task_file).is_none() {
+        let filename = Path::new(task_file)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| format!("task_file has no filename component: '{task_file}'"))?;
+        let parsed = taskmd_core::filename::parse_filename(filename)
+            .ok_or_else(|| format!("invalid taskmd filename: '{filename}'"))?;
+        let promoted = promote_task_status_to_in_progress(
+            &cwd.join(tasks_dir_name),
+            &parsed.id,
+            parsed.status,
+            filename,
+        )?;
+        if promoted != filename {
+            let _ = run_git(cwd, &["add", "--", task_file]);
+            snapshot.task_file = format!("{tasks_dir_name}/{promoted}");
+        }
+    }
+    ensure_gitignore_has_phoenix(cwd)?;
+    run_git(cwd, &["add", "--", &snapshot.task_file])?;
+    if run_git(cwd, &["diff", "--cached", "--quiet"]).is_err() {
+        run_git(
+            cwd,
+            &[
+                "commit",
+                "-m",
+                &format!("task {}: {}", snapshot.task_id, expected_title),
+            ],
+        )
+        .map_err(|error| format!("Failed to commit approved task artifact: {error}"))?;
+    }
+    Ok(snapshot)
+}
+
+fn reread_reviewed_task_handoff_snapshot(
+    cwd: &std::path::Path,
+    _repo_root: &std::path::Path,
+    tasks_dir_name: &str,
+    task_file: &str,
+    expected_title: &str,
+    expected_priority: crate::task_source::Priority,
+    expected_plan: &str,
+) -> Result<ReviewedTaskHandoffSnapshot, String> {
+    let path = cwd.join(task_file);
+    let body = match std::fs::read_to_string(&path) {
+        Ok(body) => body,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let filename = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| format!("task_file has no filename component: '{task_file}'"))?;
+            let parsed = taskmd_core::filename::parse_filename(filename).ok_or_else(|| {
+                format!("Failed to read reviewed task file '{task_file}': {error}")
+            })?;
+            let promoted = path.with_file_name(format!(
+                "{}-{}-in-progress--{}.md",
+                parsed.id, parsed.priority, parsed.slug
+            ));
+            std::fs::read_to_string(promoted)
+                .map_err(|_| format!("Failed to read reviewed task file '{task_file}': {error}"))?
+        }
+        Err(error) => {
+            return Err(format!(
+                "Failed to read reviewed task file '{task_file}': {error}"
+            ))
+        }
+    };
+    if body != expected_plan {
+        return Err(format!(
+            "Reviewed task file '{task_file}' no longer matches the approved plan. Reject and re-approve the updated artifact."
+        ));
+    }
+    if let Some(stem) = detect_plain_markdown_task_stem(task_file) {
+        let source = crate::task_source::TaskSource::PlainMarkdown { stem: stem.clone() };
+        let task_id = source.branch_and_id("handoff").1;
+        return Ok(ReviewedTaskHandoffSnapshot {
+            task_id,
+            task_title: expected_title.to_string(),
+            task_file: task_file.to_string(),
+            artifact_body: body,
+        });
+    }
+
+    let filename = std::path::Path::new(task_file)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .ok_or_else(|| format!("task_file has no filename component: '{task_file}'"))?;
+    let parsed = taskmd_core::filename::parse_filename(filename).ok_or_else(|| {
+        format!(
+            "task_file '{filename}' does not match the taskmd filename pattern (NNNNN-pX-status--slug.md)"
+        )
+    })?;
+    if !task_file.starts_with(&format!("{tasks_dir_name}/")) {
+        return Err(format!(
+            "taskmd-named task files must be under {tasks_dir_name}/ (got '{task_file}')"
+        ));
+    }
+    let derived_priority = phoenix_core::task_source::Priority(parsed.priority);
+    if derived_priority != expected_priority {
+        return Err(format!(
+            "Reviewed task file '{task_file}' priority changed from the approved snapshot. Reject and re-approve the updated artifact."
+        ));
+    }
+    Ok(ReviewedTaskHandoffSnapshot {
+        task_id: parsed.id,
+        task_title: expected_title.to_string(),
+        artifact_body: body,
+        task_file: task_file.to_string(),
+    })
 }
 
 /// Per-block character cap when flattening tool blocks for the continuation
@@ -10011,6 +10179,9 @@ fn open_early_worktree_and_rename_branch(
         );
         return Ok((worktree_path, temp_branch));
     }
+    if temp_branch == "HEAD" {
+        return Ok((worktree_path, temp_branch));
+    }
     if !temp_branch.starts_with("task-pending-") {
         return Err(format!(
             "Expected approval worktree to be on a task-pending branch or the exact approval branch, but found '{temp_branch}'"
@@ -10234,27 +10405,18 @@ fn detect_plain_markdown_task_stem(task_file: &str) -> Option<String> {
 ///
 /// `cwd` is the Explore worktree; `repo_root` is the git repository root, used
 /// for the canonical worktree path `{repo_root}/.phoenix/worktrees/{conv_id}`.
-fn execute_approve_task_blocking(
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn execute_approve_task_blocking_reviewed(
     cwd: &std::path::Path,
     repo_root: &std::path::Path,
     conv_id: &str,
     tasks_dir_name: &str,
     task_file: &str,
     title: &str,
+    priority: crate::task_source::Priority,
+    reviewed_artifact: &str,
     desired_base_branch: Option<&str>,
 ) -> Result<TaskApprovalResult, String> {
-    if let Some(stem) = detect_plain_markdown_task_stem(task_file) {
-        return execute_approve_plain_markdown_blocking(
-            cwd,
-            repo_root,
-            conv_id,
-            task_file,
-            &stem,
-            title,
-            desired_base_branch,
-        );
-    }
-
     let _guard = TASK_APPROVAL_MUTEX
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -10267,6 +10429,28 @@ fn execute_approve_task_blocking(
              Reject the plan and ask the agent to propose again — it will \
              draft a task file under {tasks_dir_name}/ this time."
         ));
+    }
+
+    let reviewed = reread_reviewed_task_handoff_snapshot(
+        cwd,
+        repo_root,
+        tasks_dir_name,
+        task_file,
+        title,
+        priority,
+        reviewed_artifact,
+    )?;
+    if let Some(stem) = detect_plain_markdown_task_stem(task_file) {
+        return execute_approve_plain_markdown_blocking(
+            cwd,
+            repo_root,
+            conv_id,
+            task_file,
+            &stem,
+            title,
+            desired_base_branch,
+            reviewed.artifact_body,
+        );
     }
 
     let base_branch = resolve_approval_base_branch(cwd, repo_root, desired_base_branch)?;
@@ -10340,19 +10524,68 @@ fn execute_approve_task_blocking(
         tracing::info!(branch = %branch_name, "Task file already on the branch unchanged — no commit needed");
     }
 
-    let approved_commit_oid = run_git(&worktree_path, &["rev-parse", "HEAD"])?
-        .trim()
-        .to_string();
     Ok(TaskApprovalResult {
         task_id,
         task_title: title.to_string(),
         branch_name,
-        approved_commit_oid,
         first_task: false,
-        task_file: format!("{tasks_dir_name}/{final_filename}"),
         worktree_path: worktree_path_str,
         base_branch,
+        artifact_body: reviewed.artifact_body,
     })
+}
+
+#[cfg(test)]
+fn execute_approve_task_blocking(
+    cwd: &std::path::Path,
+    repo_root: &std::path::Path,
+    conv_id: &str,
+    tasks_dir_name: &str,
+    task_file: &str,
+    title: &str,
+    desired_base_branch: Option<&str>,
+) -> Result<TaskApprovalResult, String> {
+    let artifact_body = reread_reviewed_task_handoff_snapshot(
+        cwd,
+        repo_root,
+        tasks_dir_name,
+        task_file,
+        title,
+        std::path::Path::new(task_file)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(crate::task_source::TaskSource::detect)
+            .map_or(crate::task_source::Priority::P2, |source| source.priority()),
+        &std::fs::read_to_string(cwd.join(task_file)).unwrap_or_else(|_| {
+            let filename = std::path::Path::new(task_file)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap();
+            let parsed = taskmd_core::filename::parse_filename(filename).unwrap();
+            std::fs::read_to_string(cwd.join(tasks_dir_name).join(format!(
+                "{}-{}-in-progress--{}.md",
+                parsed.id, parsed.priority, parsed.slug
+            )))
+            .unwrap()
+        }),
+    )?
+    .artifact_body;
+    let priority = std::path::Path::new(task_file)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(crate::task_source::TaskSource::detect)
+        .map_or(crate::task_source::Priority::P2, |source| source.priority());
+    execute_approve_task_blocking_reviewed(
+        cwd,
+        repo_root,
+        conv_id,
+        tasks_dir_name,
+        task_file,
+        title,
+        priority,
+        &artifact_body,
+        desired_base_branch,
+    )
 }
 
 /// Blocking git operations for approving a *plain-markdown* task file (task
@@ -10380,6 +10613,7 @@ fn execute_approve_task_blocking(
 /// `stem` is the task file's filename with the `.md` extension stripped (the
 /// caller has already classified the filename as plain-markdown). `cwd` /
 /// `repo_root` have the same meaning as in [`execute_approve_task_blocking`].
+#[allow(clippy::too_many_arguments)]
 fn execute_approve_plain_markdown_blocking(
     cwd: &std::path::Path,
     repo_root: &std::path::Path,
@@ -10388,11 +10622,8 @@ fn execute_approve_plain_markdown_blocking(
     stem: &str,
     title: &str,
     desired_base_branch: Option<&str>,
+    artifact_body: String,
 ) -> Result<TaskApprovalResult, String> {
-    let _guard = TASK_APPROVAL_MUTEX
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-
     // base_branch is recorded on the resulting Work-mode conversation; for the
     // early-worktree case it is otherwise unused here (the worktree was already
     // created from it).
@@ -10436,18 +10667,14 @@ fn execute_approve_plain_markdown_blocking(
         tracing::info!(branch = %branch_name, worktree = %worktree_path_str, "Plain-markdown task approved — temp branch renamed; task file already on the branch unchanged, no commit needed");
     }
 
-    let approved_commit_oid = run_git(&worktree_path, &["rev-parse", "HEAD"])?
-        .trim()
-        .to_string();
     Ok(TaskApprovalResult {
         task_id,
         task_title: title.to_string(),
         branch_name,
-        approved_commit_oid,
         first_task: false,
-        task_file: task_file.to_string(),
         worktree_path: worktree_path_str,
         base_branch,
+        artifact_body,
     })
 }
 
@@ -13928,6 +14155,76 @@ mod cwd_immutability_tests {
     /// rename only). The returned `worktree_path` must equal the original
     /// Explore worktree path, so `conv.cwd` is unchanged at approval time.
     #[test]
+    fn changed_reviewed_snapshot_rejects_before_git_side_effects() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "changed-reviewed-snapshot";
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, "main");
+        let task_file = "tasks/12345-p2-ready--reviewed.md";
+        std::fs::create_dir_all(explore_wt.join("tasks")).unwrap();
+        let reviewed = "# Reviewed\n\nOriginal plan\n";
+        std::fs::write(explore_wt.join(task_file), "# Reviewed\n\nChanged plan\n").unwrap();
+        let head_before = run_git(&explore_wt, &["rev-parse", "HEAD"]).unwrap();
+        let branch_before = run_git(&explore_wt, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
+
+        let error = execute_approve_task_blocking_reviewed(
+            &explore_wt,
+            &repo_root,
+            conv_id,
+            "tasks",
+            task_file,
+            "Reviewed",
+            crate::task_source::Priority::P2,
+            reviewed,
+            Some("main"),
+        )
+        .expect_err("changed snapshot must reject");
+
+        assert!(
+            error.contains("no longer matches the approved plan"),
+            "{error}"
+        );
+        assert_eq!(
+            run_git(&explore_wt, &["rev-parse", "HEAD"]).unwrap(),
+            head_before
+        );
+        assert_eq!(
+            run_git(&explore_wt, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap(),
+            branch_before
+        );
+        assert!(!branch_exists(&repo_root, "task-12345-reviewed"));
+    }
+
+    #[test]
+    fn unchanged_reviewed_snapshot_commits_and_returns_exact_bytes() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "unchanged-reviewed-snapshot";
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, "main");
+        let task_file = "tasks/12345-p2-ready--reviewed.md";
+        std::fs::create_dir_all(explore_wt.join("tasks")).unwrap();
+        let reviewed = "# Reviewed\n\nOriginal plan\n";
+        std::fs::write(explore_wt.join(task_file), reviewed).unwrap();
+
+        let result = execute_approve_task_blocking_reviewed(
+            &explore_wt,
+            &repo_root,
+            conv_id,
+            "tasks",
+            task_file,
+            "Reviewed",
+            crate::task_source::Priority::P2,
+            reviewed,
+            Some("main"),
+        )
+        .expect("unchanged snapshot approves");
+
+        assert_eq!(result.artifact_body, reviewed);
+        let committed_path = explore_wt.join("tasks/12345-p2-in-progress--reviewed.md");
+        assert_eq!(std::fs::read_to_string(committed_path).unwrap(), reviewed);
+        run_git(&explore_wt, &["diff", "--exit-code", "HEAD", "--", "tasks"])
+            .expect("committed task bytes match the worktree");
+    }
+
+    #[test]
     fn approve_task_returns_same_path_as_explore_worktree() {
         let (_tmp, repo_root) = init_repo();
         let conv_id = "test-conv-immutable-cwd";
@@ -14459,7 +14756,6 @@ mod approve_task_promoted_filename_tests {
         .expect("retry should recover the already-promoted in-progress filename");
 
         assert_eq!(result.branch_name, target_branch);
-        assert_eq!(result.task_file, format!("tasks/{in_progress_filename}"));
         assert!(explore_wt.join("tasks").join(in_progress_filename).exists());
     }
 
@@ -14499,12 +14795,81 @@ mod approve_task_failure_effect_tests {
     use super::test_git_helpers::{add_explore_worktree, init_repo};
     use super::*;
     use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
+    use crate::runtime::TaskApprovalHandoffResponse;
     use crate::state_machine::state::{TaskApprovalHandoff, TaskApprovalOutcome};
     use crate::state_machine::{ConvContext, ConvState, Event};
     use crate::tools::BrowserSessionManager;
     use phoenix_llm::ModelRegistry;
     use std::sync::Arc;
     use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn fresh_handoff_approval_sends_parent_conversation_id_to_handoff_worker() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "fresh-handoff-parent";
+        let base_branch = "main";
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, base_branch);
+        let tasks_dir = explore_wt.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        let task_filename = "12345-p2-ready--fresh-handoff.md";
+        std::fs::write(tasks_dir.join(task_filename), "Plan\n").unwrap();
+
+        let mut context = ConvContext::new(conv_id, explore_wt.clone(), "test-model", 200_000);
+        context.desired_base_branch = Some(base_branch.to_string());
+        let (_event_tx, event_rx) = mpsc::channel(32);
+        let event_tx_dup = mpsc::channel::<Event>(1).0;
+        let llm = Arc::new(MockLlmClient::new("test-model"));
+        let (handoff_tx, mut handoff_rx) = mpsc::channel(1);
+        let mut rt = ConversationRuntime::new(
+            context,
+            ConvState::AwaitingTaskApproval {
+                task_file: format!("tasks/{task_filename}"),
+                title: "Fresh handoff".to_string(),
+                priority: crate::task_source::Priority::P2,
+                plan: "Plan\n".to_string(),
+            },
+            Arc::new(InMemoryStorage::new()),
+            llm,
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx_dup,
+            SseBroadcaster::new(128, 0),
+        )
+        .with_fatal_local_authority_fence(crate::runtime::FatalLocalAuthorityFence::new())
+        .with_task_handoff_channel(handoff_tx);
+
+        let waiter = tokio::spawn(async move {
+            let request =
+                tokio::time::timeout(std::time::Duration::from_secs(5), handoff_rx.recv())
+                    .await
+                    .expect("handoff request timeout")
+                    .expect("handoff request");
+            let observed_parent_id = request.parent_conversation_id.clone();
+            request
+                .response_tx
+                .send(Ok(TaskApprovalHandoffResponse {
+                    successor_conv_id: "successor-1".to_string(),
+                    state_updated_at: chrono::Utc::now(),
+                }))
+                .expect("reply to runtime");
+            observed_parent_id
+        });
+
+        rt.process_event(Event::TaskApprovalDecided {
+            outcome: TaskApprovalOutcome::Approved {
+                handoff: TaskApprovalHandoff::StartFreshWorkConversation,
+            },
+        })
+        .await
+        .expect("fresh handoff approval should succeed");
+
+        assert_eq!(waiter.await.unwrap(), conv_id);
+    }
 
     #[tokio::test]
     async fn approval_failure_does_not_dispatch_llm() {
@@ -14912,55 +15277,6 @@ mod explore_prompt_cache_shape_tests {
         assert_eq!(requests[0].cache_key.as_str(), conv_id);
 
         runtime_handle.abort();
-    }
-}
-
-#[cfg(test)]
-mod runtime_context_promotion_tests {
-    use super::*;
-
-    #[test]
-    fn promotion_refreshes_filesystem_and_resource_context() {
-        let old_root = std::path::PathBuf::from("/repo");
-        let mut context = ConvContext::new("conv", old_root, "model", 200_000);
-        context.resource_authority = crate::work_scope::ResourceAuthority::Restricted;
-        context.work_scope_worktree = None;
-        context.mode_context = Some(ModeContext::Explore {
-            next_taskmd_id_hint: None,
-        });
-        let approval = TaskApprovalResult {
-            task_id: "123".to_string(),
-            task_title: "Approved task".to_string(),
-            branch_name: "task-123-approved".to_string(),
-            approved_commit_oid: "0123456789abcdef0123456789abcdef01234567".to_string(),
-            first_task: true,
-            task_file: "tasks/123-p1-ready--approved.md".to_string(),
-            worktree_path: "/repo/.phoenix/worktrees/conv".to_string(),
-            base_branch: "main".to_string(),
-        };
-
-        promote_runtime_context_to_work(&mut context, &approval);
-
-        let promoted_path = std::path::PathBuf::from(&approval.worktree_path);
-        assert_eq!(
-            context.execution_environment.working_dir(),
-            Some(promoted_path.as_path())
-        );
-        assert_eq!(
-            context.resource_authority,
-            crate::work_scope::ResourceAuthority::Work
-        );
-        assert_eq!(context.work_scope_worktree.as_ref(), Some(&promoted_path));
-        assert!(matches!(
-            context.mode_context,
-            Some(ModeContext::Work {
-                branch_name,
-                base_branch,
-                worktree_path,
-            }) if branch_name == approval.branch_name
-                && base_branch == approval.base_branch
-                && worktree_path == approval.worktree_path
-        ));
     }
 }
 
