@@ -361,6 +361,19 @@ THE SYSTEM SHALL preserve the tail by issuing exactly one VirtualTranscript
 scroll-to-tail command
 AND SHALL keep unread-tail state clear
 
+WHEN a key whose default action moves the transcript in either direction is
+pressed at a target within the transcript
+THE SYSTEM SHALL treat it as the user taking the viewport over
+AND SHALL NOT treat a key the focused element consumes for itself — text
+entry, or an activation key on a control that activates on it — as viewport
+movement
+SO THAT the test is what the key actually does from that element, not merely
+where focus happens to sit: a link inside the transcript activates on Enter
+and pages on Space, and pages the transcript accordingly, while a key
+delivered outside the transcript moves a box that is not this one
+SO THAT a positioning command in flight yields to a reader who keys their own
+way to the tail, in either direction
+
 WHEN upward wheel or viewport movement, a moved touch, or a conversation-
 navigation jump indicates that the user is reading earlier content
 THE SYSTEM SHALL transfer viewport ownership to the user immediately
@@ -374,8 +387,12 @@ WHEN unrelated layout height changes while viewport ownership belongs
 to the user
 THE SYSTEM SHALL neither move the viewport nor create unread state
 
-WHEN an idle viewport is confirmed at the bottom
+WHEN an idle viewport is confirmed at the bottom — by the physical
+pinned-state notification, or by downward movement whose observed
+position lands inside the pin-to-bottom threshold
 THE SYSTEM SHALL restore tail-follow intent and clear unread state
+SO THAT a viewport coasting to rest at the tail returns to following
+without depending on an exact-bottom edge the viewport may never cross
 
 WHEN the user requests jump-to-newest
 THE SYSTEM SHALL enter a returning-to-tail mode and issue exactly one
@@ -387,12 +404,115 @@ WHEN a touch begins
 THE SYSTEM SHALL remember the pre-gesture follow mode
 AND a touch that ends without movement SHALL restore that mode
 
+WHEN the rendered range reaches the start of loaded history
+THE SYSTEM SHALL acquire earlier history only if the reader moved the
+viewport there — while reading, or while a navigation the reader has taken
+over is returning under their control
+AND SHALL apply that condition whatever noticed the boundary, since a
+positioning command that scrolls a target into view directly is
+indistinguishable from reader movement at the scroll event alone
+SO THAT a jump that lands near the start of loaded history does not
+recursively acquire more of it, while a reader who drags there after such a
+jump is not left at a boundary that never expands
+
+WHEN a gesture the platform never reports as ended is discovered — at the
+next interaction, when the platform recycles an identifier the system still
+holds, or when a finger reported down outlasts the gesture-staleness bound
+without an event of its own, which SHALL expire on its own rather than only
+when some later input happens to look
+AND a touch beginning under an identifier already held SHALL end the prior
+interaction unconditionally, that being proof rather than inference: a touch
+already down cannot begin again
+THE SYSTEM SHALL end that gesture without confirming a tail return
+AND SHALL discard its travel evidence rather than carrying it into the next
+gesture
+AND SHALL keep every touch it holds that the platform still reports as down,
+those being fingers that never lifted rather than evidence of the gesture
+that ended
+AND SHALL leave viewport ownership where the interaction placed it
+SO THAT an interaction whose end position was never observed can neither
+confirm from geometry belonging to a later moment nor defer every subsequent
+confirmation to a lift that is not coming, and a finger still dragging is not
+disowned by the ending of a gesture beside it, which would let the next lift
+resolve at zero remaining touches and move the viewport under it
+
+WHEN a touch moves
+THE SYSTEM SHALL measure each owned touch against where that same touch began
+AND SHALL treat any one of them travelling toward earlier content as upward
+intent
+SO THAT a viewport clamped at the start of loaded history, which emits no
+scroll event to reason from, still hears the finger that is actually dragging
+rather than whichever one the platform happens to list first
+
 WHEN a touch moves
 THE SYSTEM SHALL transfer viewport ownership to the user even if no
 scroll event is emitted
 AND a bottom callback received during that moved touch SHALL NOT release
-user ownership
-AND touch end or cancellation SHALL preserve user ownership
+user ownership while the gesture is active
+SO THAT a callback describing where the viewport is cannot decide who owns it
+
+WHEN a gesture ends or is cancelled
+THE SYSTEM SHALL take its own measurement of where the viewport is at that
+moment rather than relying on the last one observed
+SO THAT a platform that reports the lift ahead of the scroll frames placing
+it cannot have the gesture judged against a position it has already left
+
+WHEN a gesture ends or is cancelled inside the pin-to-bottom threshold,
+having moved the viewport toward the tail during that gesture
+THE SYSTEM SHALL confirm the tail return
+AND SHALL otherwise preserve user ownership
+SO THAT a confirmation blocked mid-gesture is honoured at the lift rather
+than lost with the callback that produced it, while a drag that stops short
+of the tail — or one that never moved the viewport at all, which iOS
+produces whenever touch movement outruns scroll events — keeps the viewport
+
+THE SYSTEM SHALL derive that condition at the lift from whether observed
+movement carried the viewport toward the tail during the gesture
+AND SHALL NOT maintain revocable evidence of having arrived
+SO THAT no event is responsible for invalidating state it did not create:
+the evidence is only ever set within a gesture, and an update missed
+anywhere can withhold a confirmation but never manufacture one
+
+THE SYSTEM SHALL record that evidence only from observed movement toward the
+tail
+AND SHALL NOT record it from layout changes, settle probes, or echoes of its
+own position writes
+AND SHALL NOT infer it from distance to the tail measured at two moments
+SO THAT content moving beneath a stationary finger — growing away from the
+reader, or collapsing until the tail is close — cannot supply the travel the
+lift derivation treats as proof of a return, since the tail moves
+independently of the viewport and a change in distance is therefore not
+evidence of anything the reader did
+
+WHEN a viewport measurement is taken
+THE SYSTEM SHALL clamp the observed scroll position into the scrollable range
+in force at that moment
+SO THAT no recorded measurement carries a position the scroller cannot
+actually hold, at either edge
+
+WHEN scroll movement is classified as upward or downward intent
+THE SYSTEM SHALL re-clamp the previously recorded position into the range in
+force now before comparing the two
+SO THAT a range that moved between the two measurements cannot make a
+stationary viewport look as though it travelled
+AND SHALL classify a clamped position equal to the previous one as neither
+direction, recording its geometry without inferring intent
+SO THAT overscroll rubber-band bounce-back at either edge is never
+classified as user reading intent, and the standstill that clamping
+produces at an edge is never mistaken for movement toward the tail
+
+WHEN a scroll event is the echo of a position write VirtualTranscript
+itself made — anchor compensation, drift reconciliation, or a tail snap
+THE SYSTEM SHALL update geometry baselines without classifying the
+movement as user intent
+SO THAT physical compensation inside the pin-to-bottom zone cannot be
+mistaken for a user tail return
+
+THE SYSTEM SHALL keep the physical tail edge and pin-to-bottom zone
+membership as separate observations with distinct owners: the edge is
+reported by the virtual transcript's pinned-state notification, and zone
+membership is derived from the scroll position carried by each event
+AND SHALL NOT record either as the other
 
 THE SYSTEM SHALL use VirtualTranscript pinned-state notification only as
 bottom geometry and explicit return-to-tail confirmation

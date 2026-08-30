@@ -139,13 +139,6 @@ impl<'a> ShellGhClient<'a> {
         }
     }
 
-    fn with_deadline(cwd: &'a Path, deadline: Instant) -> Self {
-        Self {
-            cwd,
-            deadline: Some(deadline),
-        }
-    }
-
     fn run_json<T: for<'de> Deserialize<'de>>(
         &self,
         args: &[&str],
@@ -637,20 +630,6 @@ fn get_pr_status_for_repo_branch_with_client(
     };
     let canonical_repo = client.repo_view().unwrap_or(requested_repo);
     status_refresh_from_prs(client, prs, &canonical_repo, attempted_at)
-}
-
-pub(crate) fn get_pr_status_for_branch_with_deadline(
-    cwd: &Path,
-    branch_name: &str,
-    deadline: Instant,
-) -> PrStatusRefresh {
-    if run_git(cwd, &["rev-parse", "--is-inside-work-tree"]).is_err() {
-        return PrStatusRefresh {
-            response: PrStatusResponse::unavailable(PrUnavailableReason::NotGitRepo),
-            observations: Vec::new(),
-        };
-    }
-    get_pr_status_with_client(&ShellGhClient::with_deadline(cwd, deadline), branch_name)
 }
 
 pub(crate) fn get_pr_status_for_pr(

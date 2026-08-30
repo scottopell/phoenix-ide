@@ -15,6 +15,8 @@
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(test)]
+use tokio::io::AsyncReadExt;
 
 use serde_json::Value;
 use tokio::process::Command;
@@ -23,8 +25,8 @@ use tokio::process::Command;
 use std::os::unix::process::ExitStatusExt;
 
 use super::handle::{
-    ExitState, ExitWatchPanicGuard, FinalCause, Handle, HandleId, HandleState, KillSignal,
-    TOMBSTONE_TAIL_LINES,
+    BashLaunchIdentity, ExitState, ExitWatchPanicGuard, FinalCause, Handle, HandleId, HandleState,
+    KillSignal, BASH_LAUNCH_UUID_ENV_VAR, TOMBSTONE_TAIL_LINES,
 };
 use super::registry::{BashHandleError, BashTerminalEffect, LiveHandleSummary};
 use super::ring::{RingLine, WindowView};
@@ -38,6 +40,7 @@ use phoenix_core::domain::tool_wire::{
     BashRingLine, BashRingWindow, BashRunTombstonePayload, BashRunningPayload,
     BashStillRunningPayload, BashTombstonedPayload, BashWaiterPanickedPayload,
 };
+use phoenix_core::process_identity::current_process_identity;
 
 // ---------------------------------------------------------------------------
 // Configuration constants (REQ-BASH config)
@@ -730,6 +733,7 @@ fn spawn_child(
     // load-bearing piece is the process-group leader bit (setpgid below)
     // so that `kill(-pgid, sig)` reaches the user's processes.
     let mut sandbox_scratch_dir = None;
+    let launch_uuid = uuid::Uuid::new_v4().to_string();
     let mut command = match spawn_mode {
         BashSpawnMode::Direct => {
             let mut command = Command::new("bash");
@@ -749,6 +753,7 @@ fn spawn_child(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    command.env(BASH_LAUNCH_UUID_ENV_VAR, &launch_uuid);
 
     command.kill_on_drop(true);
 
@@ -779,12 +784,18 @@ fn spawn_child(
     let pid = child
         .id()
         .ok_or_else(|| "spawned child has no pid".to_string())?;
+    let launch_identity = BashLaunchIdentity {
+        process: current_process_identity(pid)
+            .ok_or_else(|| format!("spawned child identity unavailable for pid {pid}"))?,
+        launch_uuid,
+    };
     // pgid == pid because we made the child a process group leader.
     let pgid = i32::try_from(pid).unwrap_or(0);
 
-    let handle = Handle::new_live_for_actor_with_owner(
+    let handle = Handle::new_live_for_actor_with_owner_and_launch_identity(
         ctx.work_scope.clone(),
         handle_id,
+        launch_identity,
         ctx.resource_access.conversation_id().to_string(),
         ctx.resource_access.authority(),
         cmd.to_string(),
@@ -1959,6 +1970,63 @@ mod tests {
         fn register_calls(&self) -> usize {
             *self.register_calls.lock().expect("register_calls lock")
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_child_injects_launch_uuid_and_captures_exact_identity() {
+        let ctx = ctx_with_registrar(&scope("spawn-launch-identity"), None);
+        let spawn_context = spawn_context_for(&ctx);
+        let (handle, spawned) = spawn_child(
+            "printf '%s' \"$PHOENIX_BASH_LAUNCH_UUID\"",
+            None,
+            &ctx,
+            &spawn_context,
+            HandleId::new("b-launch-identity"),
+            RING_BUFFER_BYTES,
+            BashSpawnMode::Direct,
+        )
+        .expect("spawn child");
+        let (mut child, scratch_dir) = spawned.into_waiter_parts();
+        assert!(scratch_dir.is_none());
+
+        let mut stdout = child.stdout.take().expect("child stdout");
+        let mut stderr = child.stderr.take().expect("child stderr");
+        let stdout_task = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes).await.map(|_| bytes)
+        });
+        let stderr_task = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).await.map(|_| bytes)
+        });
+        let status = child.wait().await.expect("wait child");
+        assert!(status.success(), "child failed: {status:?}");
+        let stdout = stdout_task
+            .await
+            .expect("join stdout")
+            .expect("read stdout");
+        let stderr = stderr_task
+            .await
+            .expect("join stderr")
+            .expect("read stderr");
+        assert!(
+            stderr.is_empty(),
+            "unexpected stderr: {:?}",
+            String::from_utf8_lossy(&stderr)
+        );
+        let launch_uuid = String::from_utf8(stdout).expect("utf8 stdout");
+
+        assert_eq!(launch_uuid, handle.launch_identity.launch_uuid);
+        assert_eq!(
+            handle.launch_identity.process.pid,
+            handle.live_pid().await.expect("live pid")
+        );
+        assert!(handle.launch_identity.process.start_time > 0);
+        assert_eq!(
+            handle.launch_identity.process.pid,
+            handle.live_pid().await.expect("live pid")
+        );
     }
 
     #[cfg(unix)]

@@ -10,6 +10,7 @@ use phoenix_core::domain::close::{
     OpaqueIdentity, ProductConversationId, RetiredResourceIdentity, RetiredResourceKind,
     RetirementFailureReason, RetirementOutcome, TranscriptConversationId, WorktreeIdentity,
 };
+use phoenix_core::domain::db_schema::MessageContent;
 use phoenix_core::work_scope::{RuntimeRole, WorkScopeId};
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Connection, Row, Sqlite, Transaction};
@@ -46,6 +47,14 @@ pub struct CloseAdmissionFence {
     pub product_conversation_id: ProductConversationId,
     pub attempt_id: CloseAttemptId,
     pub phase: ClosePhase,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseProjection {
+    pub obligation: CloseObligation,
+    pub inspections: Vec<CloseInspection>,
+    pub losses: Vec<CloseInspectionLoss>,
+    pub residuals: Vec<CloseRetiredResource>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -336,6 +345,7 @@ fn parse_loss_category(value: &str) -> DbResult<LossCategory> {
 fn parse_retired_resource_kind(value: &str) -> DbResult<RetiredResourceKind> {
     match value {
         "worktree" => Ok(RetiredResourceKind::Worktree),
+        "work_scope" => Ok(RetiredResourceKind::WorkScope),
         "bash_process_group" => Ok(RetiredResourceKind::BashProcessGroup),
         "tmux_server" => Ok(RetiredResourceKind::TmuxServer),
         "pty_session" => Ok(RetiredResourceKind::PtySession),
@@ -488,6 +498,27 @@ async fn validate_adopted_absence_evidence(
                        AND resource_kind = ?5 AND identity_kind = ?6
                        AND identity_codec = ?7 AND identity_value = ?8
                        AND proof_kind = 'retired'
+                     UNION ALL
+                     SELECT 1 FROM close_retirement_resource_dispatches dispatch
+                     WHERE dispatch.attempt_id = ?1 AND dispatch.scope = ?2
+                       AND dispatch.inspection_generation = ?3
+                       AND dispatch.inspection_fingerprint = ?4
+                       AND dispatch.resource_kind = ?5 AND dispatch.identity_kind = ?6
+                       AND dispatch.identity_codec = ?7 AND dispatch.identity_value = ?8
+                       AND (
+                           dispatch.resource_kind <> 'worktree'
+                           OR EXISTS (
+                               SELECT 1 FROM close_worktree_cleanup_plans plan
+                               WHERE plan.attempt_id = dispatch.attempt_id
+                                 AND plan.scope = dispatch.scope
+                                 AND plan.inspection_generation = dispatch.inspection_generation
+                                 AND plan.inspection_fingerprint = dispatch.inspection_fingerprint
+                                 AND plan.resource_kind = dispatch.resource_kind
+                                 AND plan.identity_kind = dispatch.identity_kind
+                                 AND plan.identity_codec = dispatch.identity_codec
+                                 AND plan.identity_value = dispatch.identity_value
+                           )
+                       )
                  )",
             )
             .bind(request.attempt_id.as_str())
@@ -665,6 +696,68 @@ pub struct RecordCloseRetirementEvidenceRequest {
     pub resource: RetiredResourceIdentity,
     pub outcome: RetirementOutcome,
     pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RouteCloseAttemptToRepairRequest {
+    pub attempt_id: CloseAttemptId,
+    pub scope: WorkScopeId,
+    pub residual: RetiredResourceIdentity,
+    pub reason: RetirementFailureReason,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecordCloseRetirementDispatchRequest {
+    pub attempt_id: CloseAttemptId,
+    pub scope: WorkScopeId,
+    pub snapshot: CloseRetirementSnapshot,
+    pub resource: RetiredResourceIdentity,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecordCloseWorktreeCleanupPlanRequest {
+    pub attempt_id: CloseAttemptId,
+    pub scope: WorkScopeId,
+    pub snapshot: CloseRetirementSnapshot,
+    pub resource: RetiredResourceIdentity,
+    pub administrative_dir_incarnation: String,
+    pub administrative_dir: std::path::PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseWorktreeFinalTombstone {
+    pub root: std::path::PathBuf,
+    pub device: u64,
+    pub inode: u64,
+    pub object_device: Option<u64>,
+    pub object_inode: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BindCloseWorktreeFinalTombstoneRequest {
+    pub attempt_id: CloseAttemptId,
+    pub scope: WorkScopeId,
+    pub snapshot: CloseRetirementSnapshot,
+    pub resource: RetiredResourceIdentity,
+    pub tombstone: CloseWorktreeFinalTombstone,
+}
+
+#[derive(Debug, Clone)]
+pub struct BindCloseWorktreeFinalTombstoneObjectRequest {
+    pub attempt_id: CloseAttemptId,
+    pub scope: WorkScopeId,
+    pub snapshot: CloseRetirementSnapshot,
+    pub resource: RetiredResourceIdentity,
+    pub object_device: u64,
+    pub object_inode: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseWorktreeCleanupPlan {
+    pub administrative_dir: std::path::PathBuf,
+    pub administrative_dir_incarnation: String,
+    pub final_tombstone: Option<CloseWorktreeFinalTombstone>,
 }
 
 async fn close_obligation_for_update(
@@ -965,6 +1058,7 @@ impl Database {
     pub async fn begin_close_foundation(
         &self,
         product_conversation_id: &ProductConversationId,
+        expected_latest_transcript_id: &TranscriptConversationId,
         attempt_id: &str,
     ) -> DbResult<CloseObligation> {
         let mut conn = self.pool.acquire().await?;
@@ -1010,6 +1104,21 @@ impl Database {
                     "attempt {attempt_id} does not capture exactly one latest transcript"
                 )));
             }
+            let topology = read_topology_tx(&mut tx, product_conversation_id)
+                .await?
+                .ok_or_else(|| {
+                    DbError::CloseFoundationNotFound(product_conversation_id.to_string())
+                })?;
+            validate_begin_preconditions(&topology, expected_latest_transcript_id.as_str())?;
+            let captured_latest = parse_transcript_conversation_id(
+                captured_members[0].try_get("conversation_id")?,
+                "close_attempt_members.conversation_id",
+            )?;
+            if captured_latest != *expected_latest_transcript_id {
+                return Err(DbError::CloseFoundationConflict(format!(
+                    "attempt {attempt_id} captures latest transcript {captured_latest}, not {expected_latest_transcript_id}"
+                )));
+            }
 
             tx.commit().await?;
             return Ok(obligation);
@@ -1018,7 +1127,7 @@ impl Database {
         let topology = read_topology_tx(&mut tx, product_conversation_id)
             .await?
             .ok_or_else(|| DbError::CloseFoundationNotFound(product_conversation_id.to_string()))?;
-        validate_begin_preconditions(&topology, &topology.latest.id)?;
+        validate_begin_preconditions(&topology, expected_latest_transcript_id.as_str())?;
 
         if let Some(row) = sqlx::query(
             "SELECT attempt_id, product_conversation_id, phase, inspection_generation,
@@ -1194,6 +1303,33 @@ impl Database {
         Ok(obligation)
     }
 
+    pub async fn begin_close_idle_settlement(&self, attempt_id: &str) -> DbResult<CloseObligation> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let obligation = close_obligation_for_update(&mut tx, attempt_id).await?;
+        match obligation.phase() {
+            ClosePhase::AwaitingBlockerResolution => {
+                set_close_phase_tx(&mut tx, attempt_id, ClosePhase::SettlingActiveWork).await?;
+                Self::capture_close_direct_turn_settlement_targets_tx(&mut tx, attempt_id).await?;
+            }
+            ClosePhase::SettlingActiveWork => {}
+            phase @ (ClosePhase::AwaitingStopWorkConfirmation
+            | ClosePhase::CancelRequestedDuringSettlement
+            | ClosePhase::AwaitingRetirementInspection
+            | ClosePhase::AwaitingLossConfirmation
+            | ClosePhase::RetirementRequested
+            | ClosePhase::NeedsRepair
+            | ClosePhase::Completed) => {
+                return Err(close_precondition(format!(
+                    "attempt {attempt_id} phase {} does not admit idle settlement",
+                    phase.as_str()
+                )));
+            }
+        }
+        let obligation = close_obligation_for_update(&mut tx, attempt_id).await?;
+        tx.commit().await?;
+        Ok(obligation)
+    }
+
     pub async fn begin_close_active_work_settlement(
         &self,
         attempt_id: &str,
@@ -1215,6 +1351,54 @@ impl Database {
             | ClosePhase::Completed) => {
                 return Err(close_precondition(format!(
                     "attempt {attempt_id} phase {} does not admit active-work settlement",
+                    phase.as_str()
+                )));
+            }
+        }
+        let obligation = close_obligation_for_update(&mut tx, attempt_id).await?;
+        tx.commit().await?;
+        Ok(obligation)
+    }
+
+    pub async fn cancel_close_before_retirement(
+        &self,
+        attempt_id: &str,
+    ) -> DbResult<CloseObligation> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let obligation = close_obligation_for_update(&mut tx, attempt_id).await?;
+        match obligation.phase() {
+            ClosePhase::SettlingActiveWork => {
+                set_close_phase_tx(
+                    &mut tx,
+                    attempt_id,
+                    ClosePhase::CancelRequestedDuringSettlement,
+                )
+                .await?;
+            }
+            ClosePhase::CancelRequestedDuringSettlement => {}
+            ClosePhase::AwaitingBlockerResolution
+            | ClosePhase::AwaitingStopWorkConfirmation
+            | ClosePhase::AwaitingRetirementInspection
+            | ClosePhase::AwaitingLossConfirmation => {
+                let now = Utc::now().to_rfc3339();
+                sqlx::query(
+                    "UPDATE close_obligations
+                     SET phase = 'completed', completed_at = ?2, updated_at = ?2,
+                         close_outcome = 'cancelled',
+                         inspection_generation = NULL, inspection_fingerprint = NULL
+                     WHERE attempt_id = ?1 AND phase = ?3",
+                )
+                .bind(attempt_id)
+                .bind(now)
+                .bind(obligation.phase().as_str())
+                .execute(&mut *tx)
+                .await?;
+            }
+            phase @ (ClosePhase::RetirementRequested
+            | ClosePhase::NeedsRepair
+            | ClosePhase::Completed) => {
+                return Err(close_precondition(format!(
+                    "attempt {attempt_id} phase {} does not admit pre-retirement cancellation",
                     phase.as_str()
                 )));
             }
@@ -1326,8 +1510,7 @@ impl Database {
                AND (
                  EXISTS (
                    SELECT 1 FROM durable_turns turn
-                   WHERE member.member_role IN ('latest', 'root_latest')
-                     AND turn.conversation_id = participant.id
+                   WHERE turn.conversation_id = participant.id
                      AND (
                        (turn.owns_conversation = 1 AND turn.terminal_kind IS NULL)
                        OR EXISTS (
@@ -1673,6 +1856,20 @@ impl Database {
         .collect()
     }
 
+    pub async fn close_attempt_latest_was_busy(&self, attempt_id: &str) -> DbResult<bool> {
+        let captured_state: String = sqlx::query_scalar(
+            "SELECT captured_state_kind
+             FROM close_attempt_members
+             WHERE attempt_id = ?1 AND member_role IN ('latest', 'root_latest')",
+        )
+        .bind(attempt_id)
+        .fetch_one(&self.pool)
+        .await?;
+        let captured_state = CapturedConversationStateKind::from_db_str(&captured_state)
+            .ok_or_else(|| DbError::Serialization("unknown captured state kind".to_string()))?;
+        Ok(captured_state.is_busy())
+    }
+
     pub async fn list_close_attempt_scopes(
         &self,
         attempt_id: &str,
@@ -1692,19 +1889,33 @@ impl Database {
         .collect()
     }
 
-    #[allow(clippy::too_many_lines)]
     pub async fn replace_close_inspection(
         &self,
         request: ReplaceCloseInspectionRequest,
     ) -> DbResult<()> {
+        self.replace_close_inspection_with_empty_generation(request, None)
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub async fn replace_close_inspection_with_empty_generation(
+        &self,
+        request: ReplaceCloseInspectionRequest,
+        empty_generation: Option<&str>,
+    ) -> DbResult<()> {
         let mut ordered_scopes = request.scopes.iter().collect::<Vec<_>>();
         ordered_scopes.sort_by(|left, right| left.scope.cmp(&right.scope));
-        let aggregate_snapshot = CloseRetirementSnapshot::parse(
+        let aggregate_generation = if ordered_scopes.is_empty() {
+            empty_generation.unwrap_or("no-worktree").to_string()
+        } else {
             encode_aggregate_snapshot_component(
                 ordered_scopes
                     .iter()
                     .map(|scope| (&scope.scope, scope.snapshot.generation())),
-            ),
+            )
+        };
+        let aggregate_snapshot = CloseRetirementSnapshot::parse(
+            aggregate_generation,
             encode_aggregate_snapshot_component(
                 ordered_scopes
                     .iter()
@@ -1814,12 +2025,22 @@ impl Database {
                 tx.commit().await?;
                 return Ok(());
             }
-            return Err(close_precondition(format!(
-                "attempt {} inspection replacement replay differs from persisted inspection",
-                request.attempt_id
-            )));
+            if obligation.phase() != ClosePhase::AwaitingLossConfirmation {
+                return Err(close_precondition(format!(
+                    "attempt {} inspection replacement replay differs from persisted inspection",
+                    request.attempt_id
+                )));
+            }
         }
 
+        if obligation.phase() == ClosePhase::AwaitingLossConfirmation {
+            set_close_phase_tx(
+                &mut tx,
+                request.attempt_id.as_str(),
+                ClosePhase::AwaitingRetirementInspection,
+            )
+            .await?;
+        }
         self.ensure_inspection_replacement_allowed(&mut tx, &request)
             .await?;
         self.clear_retirement_inspection_rows(&mut tx, request.attempt_id.as_str())
@@ -1830,6 +2051,152 @@ impl Database {
             .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Confirms the exact loss snapshot before admitting resource retirement.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] when the attempt is not awaiting loss confirmation,
+    /// the supplied snapshot is stale, or no persisted loss remains to confirm.
+    pub async fn confirm_close_loss_retirement(
+        &self,
+        attempt_id: &CloseAttemptId,
+        snapshot: &CloseRetirementSnapshot,
+    ) -> DbResult<CloseObligation> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let obligation = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
+        if obligation.phase() != ClosePhase::AwaitingLossConfirmation {
+            return Err(close_precondition(format!(
+                "attempt {attempt_id} is not awaiting loss confirmation"
+            )));
+        }
+        if obligation.snapshot() != Some(snapshot) {
+            return Err(close_precondition(format!(
+                "attempt {attempt_id} loss confirmation snapshot is stale"
+            )));
+        }
+        let has_loss: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM close_retirement_losses loss
+                 JOIN close_retirement_inspections inspection
+                   ON inspection.attempt_id = loss.attempt_id
+                  AND inspection.scope = loss.scope
+                  AND inspection.generation = loss.generation
+                 WHERE loss.attempt_id = ?1
+               )",
+        )
+        .bind(attempt_id.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+        if !has_loss {
+            return Err(close_precondition(format!(
+                "attempt {attempt_id} has no exact loss evidence to confirm"
+            )));
+        }
+        set_close_phase_tx(
+            &mut tx,
+            attempt_id.as_str(),
+            ClosePhase::RetirementRequested,
+        )
+        .await?;
+        let confirmed = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
+        tx.commit().await?;
+        Ok(confirmed)
+    }
+
+    /// Reads one complete active Close projection from a single `SQLite` snapshot.
+    /// # Errors
+    /// Returns [`DbError`] when the obligation or normalized evidence cannot be read.
+    pub async fn get_active_close_projection_for_product(
+        &self,
+        product_conversation_id: &ProductConversationId,
+    ) -> DbResult<Option<CloseProjection>> {
+        let mut connection = self.pool.acquire().await?;
+        let mut tx = connection.begin().await?;
+        let obligation = sqlx::query(
+            "SELECT attempt_id, product_conversation_id, phase,
+                    inspection_generation, inspection_fingerprint,
+                    created_at, updated_at, completed_at, close_outcome
+             FROM close_obligations
+             WHERE product_conversation_id = ?1 AND phase <> 'completed'",
+        )
+        .bind(product_conversation_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(parse_close_obligation_row)
+        .transpose()?;
+        let Some(obligation) = obligation else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let inspections = sqlx::query(
+            "SELECT attempt_id, scope, generation, fingerprint, inspected_at
+             FROM close_retirement_inspections
+             WHERE attempt_id = ?1
+             ORDER BY scope, inspected_at",
+        )
+        .bind(obligation.attempt_id().as_str())
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(parse_close_inspection_row)
+        .collect::<DbResult<Vec<_>>>()?;
+        let losses = sqlx::query(
+            "SELECT loss.attempt_id, loss.scope, loss.generation, inspection.fingerprint,
+                    loss.category, loss.identity_kind, loss.identity_codec, loss.identity_value
+             FROM close_retirement_losses loss
+             JOIN close_retirement_inspections inspection
+               ON inspection.attempt_id = loss.attempt_id
+              AND inspection.scope = loss.scope
+              AND inspection.generation = loss.generation
+             WHERE loss.attempt_id = ?1
+             ORDER BY loss.scope, loss.generation, loss.category, loss.identity_kind, loss.identity_value",
+        )
+        .bind(obligation.attempt_id().as_str())
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(parse_close_inspection_loss_row)
+        .collect::<DbResult<Vec<_>>>()?;
+        let residuals = sqlx::query(
+            "SELECT resource.attempt_id, resource.scope, resource.inspection_generation,
+                    resource.inspection_fingerprint, resource.resource_kind, resource.identity_kind,
+                    resource.identity_codec, resource.identity_value, resource.proof_kind,
+                    resource.absence_basis, resource.residual_reason, resource.detail,
+                    resource.created_at, resource.updated_at,
+                    captured.captured_worktree_fingerprint, captured.captured_worktree_locator
+             FROM close_retirement_resources resource
+             JOIN close_attempt_scopes captured
+               ON captured.attempt_id = resource.attempt_id AND captured.scope = resource.scope
+             WHERE resource.attempt_id = ?1
+               AND resource.proof_kind = 'residual'
+               AND resource.inspection_generation = ?2
+               AND resource.inspection_fingerprint = ?3
+             ORDER BY resource.scope, resource.resource_kind, resource.identity_value",
+        )
+        .bind(obligation.attempt_id().as_str())
+        .bind(
+            obligation
+                .snapshot()
+                .map(CloseRetirementSnapshot::generation),
+        )
+        .bind(
+            obligation
+                .snapshot()
+                .map(CloseRetirementSnapshot::fingerprint),
+        )
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(parse_close_retired_resource_row)
+        .collect::<DbResult<Vec<_>>>()?;
+        tx.rollback().await?;
+        Ok(Some(CloseProjection {
+            obligation,
+            inspections,
+            losses,
+            residuals,
+        }))
     }
 
     pub async fn list_close_retirement_inspections(
@@ -1966,7 +2333,29 @@ impl Database {
                         locator: GitPathIdentity::decode_exact(&locator)
                             .map_err(|error| DbError::Serialization(error.to_string()))?,
                     };
-                    route_unresolved_worktree_to_repair(&mut tx, &request.attempt_id).await?;
+                    route_close_attempt_to_repair_tx(
+                        &mut tx,
+                        &RouteCloseAttemptToRepairRequest {
+                            attempt_id: request.attempt_id.clone(),
+                            scope: scope.scope.clone(),
+                            residual: RetiredResourceIdentity::parse(
+                                RetiredResourceKind::WorkScope,
+                                LossItemIdentity::Opaque(
+                                    OpaqueIdentity::parse(scope.scope.as_str().to_owned())
+                                        .map_err(|error| {
+                                            DbError::Serialization(error.to_string())
+                                        })?,
+                                ),
+                            )
+                            .map_err(|error| DbError::Serialization(error.to_string()))?,
+                            reason: RetirementFailureReason::IdentityNotProven,
+                            detail: format!(
+                                "scope {} has unresolved captured worktree identity",
+                                scope.scope
+                            ),
+                        },
+                    )
+                    .await?;
                     tx.commit().await?;
                     return Err(DbError::CloseFoundationRepairRequired(repair));
                 }
@@ -1990,6 +2379,12 @@ impl Database {
         for scope in &request.scopes {
             let mut unique = std::collections::BTreeSet::new();
             for resource in scope.inventory.resources() {
+                if resource.kind() == RetiredResourceKind::WorkScope {
+                    return Err(close_precondition(format!(
+                        "scope {} inventory cannot supply a WorkScope resource",
+                        scope.scope
+                    )));
+                }
                 let identity = resource.identity();
                 let resource_key = (
                     resource.kind().as_str().to_string(),
@@ -2011,15 +2406,27 @@ impl Database {
                     resource_key.3,
                 ));
             }
+            let scope_identity = OpaqueIdentity::parse(scope.scope.as_str().to_owned())
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+            requested_resources.push((
+                scope.scope.as_str().to_string(),
+                RetiredResourceKind::WorkScope.as_str().to_string(),
+                "opaque".to_string(),
+                scope_identity.codec().to_string(),
+                scope_identity.as_str().to_string(),
+            ));
         }
         requested_resources.sort();
         let existing_inventories: Vec<(String, String, String, i64)> = sqlx::query_as(
             "SELECT scope, inspection_generation, inspection_fingerprint, sealed
              FROM close_retirement_inventories
              WHERE attempt_id = ?1
+               AND inspection_generation = ?2 AND inspection_fingerprint = ?3
              ORDER BY scope",
         )
         .bind(request.attempt_id.as_str())
+        .bind(request.snapshot.generation())
+        .bind(request.snapshot.fingerprint())
         .fetch_all(&mut *tx)
         .await?;
         if !existing_inventories.is_empty() {
@@ -2037,10 +2444,13 @@ impl Database {
                     "SELECT scope, resource_kind, identity_kind, identity_codec, identity_value
                  FROM close_expected_retirement_resources
                  WHERE attempt_id = ?1
+                   AND inspection_generation = ?2 AND inspection_fingerprint = ?3
                  ORDER BY scope, resource_kind, identity_kind,
                      identity_codec, identity_value",
                 )
                 .bind(request.attempt_id.as_str())
+                .bind(request.snapshot.generation())
+                .bind(request.snapshot.fingerprint())
                 .fetch_all(&mut *tx)
                 .await?;
             if !inventory_matches || persisted_resources != requested_resources {
@@ -2113,7 +2523,29 @@ impl Database {
                         locator: GitPathIdentity::decode_exact(&locator)
                             .map_err(|error| DbError::Serialization(error.to_string()))?,
                     };
-                    route_unresolved_worktree_to_repair(&mut tx, &request.attempt_id).await?;
+                    route_close_attempt_to_repair_tx(
+                        &mut tx,
+                        &RouteCloseAttemptToRepairRequest {
+                            attempt_id: request.attempt_id.clone(),
+                            scope: scope.scope.clone(),
+                            residual: RetiredResourceIdentity::parse(
+                                RetiredResourceKind::WorkScope,
+                                LossItemIdentity::Opaque(
+                                    OpaqueIdentity::parse(scope.scope.as_str().to_owned())
+                                        .map_err(|error| {
+                                            DbError::Serialization(error.to_string())
+                                        })?,
+                                ),
+                            )
+                            .map_err(|error| DbError::Serialization(error.to_string()))?,
+                            reason: RetirementFailureReason::IdentityNotProven,
+                            detail: format!(
+                                "scope {} has unresolved captured worktree identity",
+                                scope.scope
+                            ),
+                        },
+                    )
+                    .await?;
                     tx.commit().await?;
                     return Err(DbError::CloseFoundationRepairRequired(repair));
                 }
@@ -2173,6 +2605,23 @@ impl Database {
                 .execute(&mut *tx)
                 .await?;
             }
+            let scope_identity = OpaqueIdentity::parse(scope.scope.as_str().to_owned())
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+            sqlx::query(
+                "INSERT INTO close_expected_retirement_resources (
+                     attempt_id, scope, inspection_generation, inspection_fingerprint,
+                     resource_kind, identity_kind, identity_codec, identity_value
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'opaque', ?6, ?7)",
+            )
+            .bind(request.attempt_id.as_str())
+            .bind(scope.scope.as_str())
+            .bind(request.snapshot.generation())
+            .bind(request.snapshot.fingerprint())
+            .bind(RetiredResourceKind::WorkScope.as_str())
+            .bind(scope_identity.codec())
+            .bind(scope_identity.as_str())
+            .execute(&mut *tx)
+            .await?;
             sqlx::query(
                 "UPDATE close_retirement_inventories SET sealed = 1
                  WHERE attempt_id = ?1 AND scope = ?2
@@ -2193,6 +2642,250 @@ impl Database {
         Ok(resources)
     }
 
+    /// Atomically records the exact scope-level residual and routes its Close attempt to repair.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] when the attempt is not in a retirement phase or persistence fails.
+    pub async fn route_close_attempt_to_repair(
+        &self,
+        request: RouteCloseAttemptToRepairRequest,
+    ) -> DbResult<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        route_close_attempt_to_repair_tx(&mut tx, &request).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Returns a pre-quarantine worktree snapshot mismatch to fresh inspection.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] unless the attempt still has retirement authority.
+    pub async fn return_close_attempt_to_reinspection(
+        &self,
+        attempt_id: &CloseAttemptId,
+    ) -> DbResult<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let obligation = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
+        if obligation.phase() != ClosePhase::RetirementRequested {
+            return Err(close_precondition(format!(
+                "attempt {attempt_id} reinspection requires retirement_requested"
+            )));
+        }
+        set_close_phase_tx(
+            &mut tx,
+            attempt_id.as_str(),
+            ClosePhase::AwaitingRetirementInspection,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Advances retained same-attempt dispatch authority after retry observes the
+    /// already-dispatched worktree absent.
+    #[allow(clippy::too_many_lines)]
+    pub async fn resume_close_retirement_after_dispatched_absence(
+        &self,
+        attempt_id: &CloseAttemptId,
+        retained_snapshot: &CloseRetirementSnapshot,
+        replacement_generation: &str,
+    ) -> DbResult<CloseRetirementSnapshot> {
+        let inspections = self
+            .list_close_retirement_inspections(attempt_id.as_str())
+            .await?;
+        let losses = self
+            .list_close_retirement_losses(attempt_id.as_str())
+            .await?;
+        let scopes = inspections
+            .into_iter()
+            .map(|inspection| {
+                let snapshot = CloseRetirementSnapshot::parse(
+                    replacement_generation,
+                    inspection.snapshot.fingerprint().to_string(),
+                )
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+                let scope = inspection.target.scope;
+                let scoped_losses = losses
+                    .iter()
+                    .filter(|loss| loss.scope == scope)
+                    .map(|loss| loss.item.clone())
+                    .collect();
+                Ok(ReplaceCloseInspectionScopeRequest {
+                    scope,
+                    snapshot,
+                    losses: scoped_losses,
+                })
+            })
+            .collect::<DbResult<Vec<_>>>()?;
+        let mut ordered_scopes = scopes.iter().collect::<Vec<_>>();
+        ordered_scopes.sort_by(|left, right| left.scope.cmp(&right.scope));
+        let replacement_snapshot = CloseRetirementSnapshot::parse(
+            encode_aggregate_snapshot_component(
+                ordered_scopes
+                    .iter()
+                    .map(|scope| (&scope.scope, scope.snapshot.generation())),
+            ),
+            encode_aggregate_snapshot_component(
+                ordered_scopes
+                    .iter()
+                    .map(|scope| (&scope.scope, scope.snapshot.fingerprint())),
+            ),
+        )
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let obligation = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
+        if obligation.phase() != ClosePhase::AwaitingRetirementInspection
+            || obligation.snapshot() != Some(retained_snapshot)
+        {
+            return Err(close_precondition(format!(
+                "attempt {attempt_id} dispatched absence requires retained retry inspection authority"
+            )));
+        }
+        let request = ReplaceCloseInspectionRequest {
+            attempt_id: attempt_id.clone(),
+            scopes,
+        };
+        self.clear_retirement_inspection_rows(&mut tx, attempt_id.as_str())
+            .await?;
+        self.insert_retirement_inspection_rows(&mut tx, &request)
+            .await?;
+        sqlx::query(
+            "UPDATE close_obligations
+             SET phase = 'retirement_requested',
+                 inspection_generation = ?2,
+                 inspection_fingerprint = ?3,
+                 updated_at = ?4
+             WHERE attempt_id = ?1 AND phase = 'awaiting_retirement_inspection'",
+        )
+        .bind(attempt_id.as_str())
+        .bind(replacement_snapshot.generation())
+        .bind(replacement_snapshot.fingerprint())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO close_retirement_inventories (
+                 attempt_id, scope, inspection_generation, inspection_fingerprint,
+                 sealed, captured_at
+             )
+             SELECT attempt_id, scope, ?2, ?3, 0, captured_at
+             FROM close_retirement_inventories
+             WHERE attempt_id = ?1
+               AND inspection_generation = ?4
+               AND inspection_fingerprint = ?3",
+        )
+        .bind(attempt_id.as_str())
+        .bind(replacement_snapshot.generation())
+        .bind(replacement_snapshot.fingerprint())
+        .bind(retained_snapshot.generation())
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO close_expected_retirement_resources (
+                 attempt_id, scope, inspection_generation, inspection_fingerprint,
+                 resource_kind, identity_kind, identity_codec, identity_value
+             )
+             SELECT attempt_id, scope, ?2, ?3, resource_kind, identity_kind,
+                    identity_codec, identity_value
+             FROM close_expected_retirement_resources
+             WHERE attempt_id = ?1
+               AND inspection_generation = ?4
+               AND inspection_fingerprint = ?3",
+        )
+        .bind(attempt_id.as_str())
+        .bind(replacement_snapshot.generation())
+        .bind(replacement_snapshot.fingerprint())
+        .bind(retained_snapshot.generation())
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE close_retirement_inventories SET sealed = 1
+             WHERE attempt_id = ?1
+               AND inspection_generation = ?2
+               AND inspection_fingerprint = ?3",
+        )
+        .bind(attempt_id.as_str())
+        .bind(replacement_snapshot.generation())
+        .bind(replacement_snapshot.fingerprint())
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO close_retirement_resource_dispatches (
+                 attempt_id, scope, inspection_generation, inspection_fingerprint,
+                 resource_kind, identity_kind, identity_codec, identity_value, dispatched_at_us
+             )
+             SELECT dispatch.attempt_id, dispatch.scope, ?3, ?4,
+                    dispatch.resource_kind, dispatch.identity_kind, dispatch.identity_codec,
+                    dispatch.identity_value, dispatch.dispatched_at_us
+             FROM close_retirement_resource_dispatches dispatch
+             JOIN close_expected_retirement_resources expected
+               ON expected.attempt_id = dispatch.attempt_id
+              AND expected.scope = dispatch.scope
+              AND expected.inspection_generation = ?3
+              AND expected.inspection_fingerprint = ?4
+              AND expected.resource_kind = dispatch.resource_kind
+              AND expected.identity_kind = dispatch.identity_kind
+              AND expected.identity_codec = dispatch.identity_codec
+              AND expected.identity_value = dispatch.identity_value
+             WHERE dispatch.attempt_id = ?1
+               AND dispatch.inspection_generation = ?2
+               AND dispatch.inspection_fingerprint = ?4",
+        )
+        .bind(attempt_id.as_str())
+        .bind(retained_snapshot.generation())
+        .bind(replacement_snapshot.generation())
+        .bind(replacement_snapshot.fingerprint())
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO close_worktree_cleanup_plans (
+                 attempt_id, scope, inspection_generation, inspection_fingerprint,
+                 resource_kind, identity_kind, identity_codec, identity_value,
+                 administrative_dir_codec, administrative_dir_value,
+                 administrative_dir_incarnation, planned_at_us
+             )
+             SELECT plan.attempt_id, plan.scope, ?3, ?4, plan.resource_kind,
+                    plan.identity_kind, plan.identity_codec, plan.identity_value,
+                    plan.administrative_dir_codec, plan.administrative_dir_value,
+                    plan.administrative_dir_incarnation, plan.planned_at_us
+             FROM close_worktree_cleanup_plans plan
+             WHERE plan.attempt_id = ?1
+               AND plan.inspection_generation = ?2
+               AND plan.inspection_fingerprint = ?4",
+        )
+        .bind(attempt_id.as_str())
+        .bind(retained_snapshot.generation())
+        .bind(replacement_snapshot.generation())
+        .bind(replacement_snapshot.fingerprint())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(replacement_snapshot)
+    }
+
+    /// Reports whether every captured scope has a sealed inventory for the active snapshot.
+    pub async fn close_retirement_inventory_is_complete(&self, attempt_id: &str) -> DbResult<bool> {
+        let status = sqlx::query(
+            "SELECT
+                 (SELECT COUNT(*) FROM close_attempt_scopes WHERE attempt_id = ?1) AS target_count,
+                 (SELECT COUNT(*) FROM close_retirement_inventories inventory
+                  JOIN close_obligations obligation ON obligation.attempt_id = inventory.attempt_id
+                  WHERE inventory.attempt_id = ?1 AND inventory.sealed = 1
+                    AND inventory.inspection_generation = obligation.inspection_generation
+                    AND inventory.inspection_fingerprint = obligation.inspection_fingerprint) AS sealed_count
+             WHERE EXISTS (SELECT 1 FROM close_obligations WHERE attempt_id = ?1)",
+        )
+        .bind(attempt_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| DbError::CloseFoundationNotFound(attempt_id.to_string()))?;
+        Ok(
+            status.try_get::<i64, _>("target_count")?
+                == status.try_get::<i64, _>("sealed_count")?,
+        )
+    }
+
     /// Lists expected retirement resources for the current exact attempt snapshot.
     ///
     /// # Errors
@@ -2208,34 +2901,146 @@ impl Database {
     }
 }
 
-async fn route_unresolved_worktree_to_repair(
+#[allow(clippy::too_many_lines)]
+async fn route_close_attempt_to_repair_tx(
     tx: &mut Transaction<'_, Sqlite>,
-    attempt_id: &CloseAttemptId,
+    request: &RouteCloseAttemptToRepairRequest,
 ) -> DbResult<()> {
-    let phase: String =
-        sqlx::query_scalar("SELECT phase FROM close_obligations WHERE attempt_id = ?1")
-            .bind(attempt_id.as_str())
-            .fetch_optional(&mut **tx)
-            .await?
-            .ok_or_else(|| DbError::CloseFoundationNotFound(attempt_id.as_str().to_string()))?;
-    match phase.as_str() {
-        "retirement_requested" => {
-            sqlx::query(
-                "UPDATE close_obligations
-                 SET phase = 'needs_repair', updated_at = ?2
-                 WHERE attempt_id = ?1 AND phase = 'retirement_requested'",
-            )
-            .bind(attempt_id.as_str())
-            .bind(Utc::now().to_rfc3339())
-            .execute(&mut **tx)
-            .await?;
-        }
-        "needs_repair" => {}
-        _ => {
-            return Err(close_precondition(format!(
-                "attempt {attempt_id} unresolved worktree repair requires retirement_requested or needs_repair"
-            )))
-        }
+    let obligation = close_obligation_for_update(tx, request.attempt_id.as_str()).await?;
+    if !matches!(
+        obligation.phase(),
+        ClosePhase::AwaitingRetirementInspection
+            | ClosePhase::RetirementRequested
+            | ClosePhase::NeedsRepair
+    ) {
+        return Err(close_precondition(format!(
+            "attempt {} repair requires awaiting_retirement_inspection, retirement_requested, or needs_repair",
+            request.attempt_id
+        )));
+    }
+    let captured_scope: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM close_attempt_scopes WHERE attempt_id = ?1 AND scope = ?2)",
+    )
+    .bind(request.attempt_id.as_str())
+    .bind(request.scope.as_str())
+    .fetch_one(&mut **tx)
+    .await?;
+    if !captured_scope {
+        return Err(close_precondition(format!(
+            "attempt {} repair scope {} was not captured",
+            request.attempt_id, request.scope
+        )));
+    }
+
+    let generation = obligation
+        .snapshot()
+        .map_or("no-worktree", CloseRetirementSnapshot::generation);
+    let fingerprint = obligation
+        .snapshot()
+        .map_or("no-worktree", CloseRetirementSnapshot::fingerprint);
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT OR IGNORE INTO close_retirement_inventories (
+             attempt_id, scope, inspection_generation, inspection_fingerprint, sealed, captured_at
+         ) VALUES (?1, ?2, ?3, ?4, 0, ?5)",
+    )
+    .bind(request.attempt_id.as_str())
+    .bind(request.scope.as_str())
+    .bind(generation)
+    .bind(fingerprint)
+    .bind(&now)
+    .execute(&mut **tx)
+    .await?;
+    let resource_kind = request.residual.kind().as_str();
+    let identity_kind = request.residual.identity().identity_kind();
+    let identity_codec = request.residual.identity().codec();
+    let identity_value = request.residual.identity().value();
+    sqlx::query(
+        "INSERT INTO close_expected_retirement_resources (
+             attempt_id, scope, inspection_generation, inspection_fingerprint,
+             resource_kind, identity_kind, identity_codec, identity_value
+         ) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+           WHERE NOT EXISTS (
+               SELECT 1 FROM close_expected_retirement_resources
+               WHERE attempt_id = ?1 AND scope = ?2
+                 AND inspection_generation = ?3 AND inspection_fingerprint = ?4
+                 AND resource_kind = ?5 AND identity_kind = ?6
+                 AND identity_codec = ?7 AND identity_value = ?8
+           )",
+    )
+    .bind(request.attempt_id.as_str())
+    .bind(request.scope.as_str())
+    .bind(generation)
+    .bind(fingerprint)
+    .bind(resource_kind)
+    .bind(identity_kind)
+    .bind(identity_codec)
+    .bind(&identity_value)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE close_retirement_inventories SET sealed = 1
+         WHERE attempt_id = ?1 AND scope = ?2
+           AND inspection_generation = ?3 AND inspection_fingerprint = ?4 AND sealed = 0",
+    )
+    .bind(request.attempt_id.as_str())
+    .bind(request.scope.as_str())
+    .bind(generation)
+    .bind(fingerprint)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO close_retirement_resource_history (
+             attempt_id, scope, inspection_generation, inspection_fingerprint, resource_kind,
+             identity_kind, identity_codec, identity_value, proof_kind, absence_basis,
+             residual_reason, detail, recorded_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'residual', NULL, ?9, ?10, ?11)",
+    )
+    .bind(request.attempt_id.as_str())
+    .bind(request.scope.as_str())
+    .bind(generation)
+    .bind(fingerprint)
+    .bind(resource_kind)
+    .bind(identity_kind)
+    .bind(identity_codec)
+    .bind(&identity_value)
+    .bind(request.reason.as_str())
+    .bind(&request.detail)
+    .bind(&now)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO close_retirement_resources (
+             attempt_id, scope, inspection_generation, inspection_fingerprint, resource_kind,
+             identity_kind, identity_codec, identity_value, proof_kind, absence_basis,
+             residual_reason, detail, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'residual', NULL, ?9, ?10, ?11, ?11)",
+    )
+    .bind(request.attempt_id.as_str())
+    .bind(request.scope.as_str())
+    .bind(generation)
+    .bind(fingerprint)
+    .bind(resource_kind)
+    .bind(identity_kind)
+    .bind(identity_codec)
+    .bind(&identity_value)
+    .bind(request.reason.as_str())
+    .bind(&request.detail)
+    .bind(&now)
+    .execute(&mut **tx)
+    .await?;
+    if obligation.snapshot().is_none() {
+        sqlx::query(
+            "UPDATE close_obligations
+             SET inspection_generation = 'no-worktree', inspection_fingerprint = 'no-worktree'
+             WHERE attempt_id = ?1 AND inspection_generation IS NULL AND inspection_fingerprint IS NULL",
+        )
+        .bind(request.attempt_id.as_str())
+        .execute(&mut **tx)
+        .await?;
+    }
+    if obligation.phase() != ClosePhase::NeedsRepair {
+        set_close_phase_tx(tx, request.attempt_id.as_str(), ClosePhase::NeedsRepair).await?;
     }
     Ok(())
 }
@@ -2247,9 +3052,16 @@ async fn list_close_expected_retirement_resources_tx(
     let status = sqlx::query(
             "SELECT
                  (SELECT COUNT(*) FROM close_attempt_scopes WHERE attempt_id = ?1) AS target_count,
-                 (SELECT COUNT(*) FROM close_retirement_inventories WHERE attempt_id = ?1) AS inventory_count,
-                 (SELECT COUNT(*) FROM close_retirement_inventories
-                  WHERE attempt_id = ?1 AND sealed = 0) AS unsealed_count
+                 (SELECT COUNT(*) FROM close_retirement_inventories inventory
+                  JOIN close_obligations obligation ON obligation.attempt_id = inventory.attempt_id
+                  WHERE inventory.attempt_id = ?1
+                    AND inventory.inspection_generation = obligation.inspection_generation
+                    AND inventory.inspection_fingerprint = obligation.inspection_fingerprint) AS inventory_count,
+                 (SELECT COUNT(*) FROM close_retirement_inventories inventory
+                  JOIN close_obligations obligation ON obligation.attempt_id = inventory.attempt_id
+                  WHERE inventory.attempt_id = ?1 AND inventory.sealed = 0
+                    AND inventory.inspection_generation = obligation.inspection_generation
+                    AND inventory.inspection_fingerprint = obligation.inspection_fingerprint) AS unsealed_count
              WHERE EXISTS (SELECT 1 FROM close_obligations WHERE attempt_id = ?1)",
         )
         .bind(attempt_id)
@@ -2314,7 +3126,506 @@ async fn list_close_expected_retirement_resources_tx(
         .collect()
 }
 
+fn encode_host_path(path: &std::path::Path) -> String {
+    #[cfg(unix)]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt as _;
+        path.as_os_str().as_bytes()
+    };
+    #[cfg(not(unix))]
+    let bytes = path.to_string_lossy().as_bytes();
+    bytes.iter().fold(String::new(), |mut encoded, byte| {
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+        encoded
+    })
+}
+
+fn decode_host_path(codec: &str, value: &str) -> DbResult<std::path::PathBuf> {
+    if codec != "hex_path_v1" || !value.len().is_multiple_of(2) {
+        return Err(DbError::Serialization(
+            "invalid durable host path".to_string(),
+        ));
+    }
+    let bytes = value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let text = std::str::from_utf8(pair)
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+            u8::from_str_radix(text, 16).map_err(|error| DbError::Serialization(error.to_string()))
+        })
+        .collect::<DbResult<Vec<_>>>()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt as _;
+        Ok(std::path::PathBuf::from(std::ffi::OsString::from_vec(
+            bytes,
+        )))
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8(bytes)
+            .map(std::path::PathBuf::from)
+            .map_err(|error| DbError::Serialization(error.to_string()))
+    }
+}
+
+type OptionalFinalTombstoneColumns = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+type WorktreeCleanupPlanColumns = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 impl Database {
+    /// Durably records intent to remove one exact sealed resource before external
+    /// teardown begins. A restart can adopt absence only from this same-attempt
+    /// dispatch record, never from a path or scope-wide guess.
+    ///
+    /// # Errors
+    /// Returns a database error unless the request names one sealed resource in
+    /// the exact active Close snapshot.
+    pub async fn record_close_retirement_dispatch(
+        &self,
+        request: RecordCloseRetirementDispatchRequest,
+    ) -> DbResult<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let current = close_obligation_for_update(&mut tx, request.attempt_id.as_str()).await?;
+        if !matches!(
+            current.phase(),
+            ClosePhase::RetirementRequested | ClosePhase::NeedsRepair
+        ) || current.snapshot() != Some(&request.snapshot)
+        {
+            return Err(close_precondition(format!(
+                "attempt {} dispatch lacks the exact active retirement authority",
+                request.attempt_id
+            )));
+        }
+        let identity = request.resource.identity();
+        let inserted = sqlx::query(
+            "INSERT OR IGNORE INTO close_retirement_resource_dispatches (
+                 attempt_id, scope, inspection_generation, inspection_fingerprint,
+                 resource_kind, identity_kind, identity_codec, identity_value, dispatched_at_us
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )
+        .bind(request.attempt_id.as_str())
+        .bind(request.scope.as_str())
+        .bind(request.snapshot.generation())
+        .bind(request.snapshot.fingerprint())
+        .bind(request.resource.kind().as_str())
+        .bind(identity.identity_kind())
+        .bind(identity.codec())
+        .bind(identity.value())
+        .bind(Utc::now().timestamp_micros())
+        .execute(&mut *tx)
+        .await?;
+        if inserted.rows_affected() == 0 {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                     SELECT 1 FROM close_retirement_resource_dispatches
+                     WHERE attempt_id = ?1 AND scope = ?2
+                       AND inspection_generation = ?3 AND inspection_fingerprint = ?4
+                       AND resource_kind = ?5 AND identity_kind = ?6
+                       AND identity_codec = ?7 AND identity_value = ?8
+                 )",
+            )
+            .bind(request.attempt_id.as_str())
+            .bind(request.scope.as_str())
+            .bind(request.snapshot.generation())
+            .bind(request.snapshot.fingerprint())
+            .bind(request.resource.kind().as_str())
+            .bind(identity.identity_kind())
+            .bind(identity.codec())
+            .bind(identity.value())
+            .fetch_one(&mut *tx)
+            .await?;
+            if !exists {
+                return Err(close_precondition(format!(
+                    "attempt {} dispatch resource is not in the exact sealed inventory",
+                    request.attempt_id
+                )));
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Durably binds the validated Git administrative directory to an exact
+    /// dispatched worktree retirement before either filesystem location is deleted.
+    ///
+    /// # Errors
+    /// Returns a database error unless the exact dispatch exists and the plan is
+    /// either new or byte-for-byte identical to the prior plan.
+    pub async fn record_close_worktree_cleanup_plan(
+        &self,
+        request: RecordCloseWorktreeCleanupPlanRequest,
+    ) -> DbResult<()> {
+        if request.resource.kind() != RetiredResourceKind::Worktree {
+            return Err(close_precondition(
+                "cleanup plan resource is not a worktree",
+            ));
+        }
+        let identity = request.resource.identity();
+        let administrative_dir_value = encode_host_path(&request.administrative_dir);
+        let result = sqlx::query(
+            "INSERT INTO close_worktree_cleanup_plans (
+                 attempt_id, scope, inspection_generation, inspection_fingerprint,
+                 resource_kind, identity_kind, identity_codec, identity_value,
+                 administrative_dir_codec, administrative_dir_value,
+                 administrative_dir_incarnation, planned_at_us
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(request.attempt_id.as_str())
+        .bind(request.scope.as_str())
+        .bind(request.snapshot.generation())
+        .bind(request.snapshot.fingerprint())
+        .bind(request.resource.kind().as_str())
+        .bind(identity.identity_kind())
+        .bind(identity.codec())
+        .bind(identity.value())
+        .bind("hex_path_v1")
+        .bind(&administrative_dir_value)
+        .bind(&request.administrative_dir_incarnation)
+        .bind(Utc::now().timestamp_micros())
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            let prior: Option<(String, String, String)> = sqlx::query_as(
+                "SELECT administrative_dir_codec, administrative_dir_value,
+                        administrative_dir_incarnation
+                 FROM close_worktree_cleanup_plans
+                 WHERE attempt_id = ?1 AND scope = ?2
+                   AND inspection_generation = ?3 AND inspection_fingerprint = ?4
+                   AND resource_kind = ?5 AND identity_kind = ?6
+                   AND identity_codec = ?7 AND identity_value = ?8",
+            )
+            .bind(request.attempt_id.as_str())
+            .bind(request.scope.as_str())
+            .bind(request.snapshot.generation())
+            .bind(request.snapshot.fingerprint())
+            .bind(request.resource.kind().as_str())
+            .bind(identity.identity_kind())
+            .bind(identity.codec())
+            .bind(identity.value())
+            .fetch_optional(&self.pool)
+            .await?;
+            if prior.as_ref().map(|(codec, value, incarnation)| {
+                (codec.as_str(), value.as_str(), incarnation.as_str())
+            }) != Some((
+                "hex_path_v1",
+                administrative_dir_value.as_str(),
+                request.administrative_dir_incarnation.as_str(),
+            )) {
+                return Err(close_precondition(
+                    "exact worktree cleanup plan conflicts with durable plan",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Binds the private final tombstone to an exact worktree cleanup plan.
+    ///
+    /// A replay is accepted only when it presents the identical path and filesystem identity.
+    ///
+    /// # Errors
+    /// Returns a database error or a precondition error when the exact plan is absent
+    /// or already binds a different path or filesystem identity.
+    pub async fn bind_close_worktree_final_tombstone(
+        &self,
+        request: BindCloseWorktreeFinalTombstoneRequest,
+    ) -> DbResult<()> {
+        let identity = request.resource.identity();
+        let root = encode_host_path(&request.tombstone.root);
+        let device = request.tombstone.device.to_string();
+        let inode = request.tombstone.inode.to_string();
+        let result = sqlx::query(
+            "UPDATE close_worktree_cleanup_plans
+             SET final_tombstone_root_codec = 'hex_path_v1',
+                 final_tombstone_root_value = ?1,
+                 final_tombstone_root_device = ?2,
+                 final_tombstone_root_inode = ?3
+             WHERE attempt_id = ?4 AND scope = ?5
+               AND inspection_generation = ?6 AND inspection_fingerprint = ?7
+               AND resource_kind = ?8 AND identity_kind = ?9
+               AND identity_codec = ?10 AND identity_value = ?11
+               AND final_tombstone_root_codec IS NULL",
+        )
+        .bind(&root)
+        .bind(&device)
+        .bind(&inode)
+        .bind(request.attempt_id.as_str())
+        .bind(request.scope.as_str())
+        .bind(request.snapshot.generation())
+        .bind(request.snapshot.fingerprint())
+        .bind(request.resource.kind().as_str())
+        .bind(identity.identity_kind())
+        .bind(identity.codec())
+        .bind(identity.value())
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 1 {
+            return Ok(());
+        }
+        let prior: Option<OptionalFinalTombstoneColumns> = sqlx::query_as(
+            "SELECT final_tombstone_root_codec, final_tombstone_root_value,
+                    final_tombstone_root_device, final_tombstone_root_inode,
+                    final_tombstone_object_device, final_tombstone_object_inode
+             FROM close_worktree_cleanup_plans
+             WHERE attempt_id = ?1 AND scope = ?2
+               AND inspection_generation = ?3 AND inspection_fingerprint = ?4
+               AND resource_kind = ?5 AND identity_kind = ?6
+               AND identity_codec = ?7 AND identity_value = ?8",
+        )
+        .bind(request.attempt_id.as_str())
+        .bind(request.scope.as_str())
+        .bind(request.snapshot.generation())
+        .bind(request.snapshot.fingerprint())
+        .bind(request.resource.kind().as_str())
+        .bind(identity.identity_kind())
+        .bind(identity.codec())
+        .bind(identity.value())
+        .fetch_optional(&self.pool)
+        .await?;
+        if prior
+            .as_ref()
+            .map(|(codec, value, prior_device, prior_inode, _, _)| {
+                match (
+                    codec.as_deref(),
+                    value.as_deref(),
+                    prior_device.as_deref(),
+                    prior_inode.as_deref(),
+                ) {
+                    (Some(codec), Some(value), Some(device), Some(inode)) => {
+                        (codec, value, device, inode)
+                    }
+                    _ => ("", "", "", ""),
+                }
+            })
+            == Some((
+                "hex_path_v1",
+                root.as_str(),
+                device.as_str(),
+                inode.as_str(),
+            ))
+        {
+            Ok(())
+        } else {
+            Err(close_precondition(
+                "exact worktree final tombstone conflicts with durable plan",
+            ))
+        }
+    }
+
+    /// Binds the moved final tombstone object after rename and before deletion.
+    ///
+    /// # Errors
+    /// Returns a database or precondition error when the exact root plan is absent
+    /// or the object identity conflicts with an earlier binding.
+    pub async fn bind_close_worktree_final_tombstone_object(
+        &self,
+        request: BindCloseWorktreeFinalTombstoneObjectRequest,
+    ) -> DbResult<()> {
+        let identity = request.resource.identity();
+        let device = request.object_device.to_string();
+        let inode = request.object_inode.to_string();
+        let result = sqlx::query(
+            "UPDATE close_worktree_cleanup_plans
+             SET final_tombstone_object_device = ?1,
+                 final_tombstone_object_inode = ?2
+             WHERE attempt_id = ?3 AND scope = ?4
+               AND inspection_generation = ?5 AND inspection_fingerprint = ?6
+               AND resource_kind = ?7 AND identity_kind = ?8
+               AND identity_codec = ?9 AND identity_value = ?10
+               AND final_tombstone_root_codec IS NOT NULL
+               AND final_tombstone_object_device IS NULL",
+        )
+        .bind(&device)
+        .bind(&inode)
+        .bind(request.attempt_id.as_str())
+        .bind(request.scope.as_str())
+        .bind(request.snapshot.generation())
+        .bind(request.snapshot.fingerprint())
+        .bind(request.resource.kind().as_str())
+        .bind(identity.identity_kind())
+        .bind(identity.codec())
+        .bind(identity.value())
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 1 {
+            return Ok(());
+        }
+        let prior: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT final_tombstone_object_device, final_tombstone_object_inode
+             FROM close_worktree_cleanup_plans
+             WHERE attempt_id = ?1 AND scope = ?2
+               AND inspection_generation = ?3 AND inspection_fingerprint = ?4
+               AND resource_kind = ?5 AND identity_kind = ?6
+               AND identity_codec = ?7 AND identity_value = ?8",
+        )
+        .bind(request.attempt_id.as_str())
+        .bind(request.scope.as_str())
+        .bind(request.snapshot.generation())
+        .bind(request.snapshot.fingerprint())
+        .bind(request.resource.kind().as_str())
+        .bind(identity.identity_kind())
+        .bind(identity.codec())
+        .bind(identity.value())
+        .fetch_optional(&self.pool)
+        .await?;
+        if prior.as_ref().map(|(d, i)| (d.as_deref(), i.as_deref()))
+            == Some((Some(device.as_str()), Some(inode.as_str())))
+        {
+            Ok(())
+        } else {
+            Err(close_precondition(
+                "exact worktree final tombstone object conflicts with durable plan",
+            ))
+        }
+    }
+
+    /// Returns the administrative directory from an exact durable worktree cleanup plan.
+    ///
+    /// # Errors
+    /// Returns a database or identity-decoding error when the plan cannot be read.
+    pub async fn close_worktree_cleanup_plan(
+        &self,
+        attempt_id: &CloseAttemptId,
+        scope: &WorkScopeId,
+        snapshot: &CloseRetirementSnapshot,
+        resource: &RetiredResourceIdentity,
+    ) -> DbResult<Option<CloseWorktreeCleanupPlan>> {
+        let identity = resource.identity();
+        let rows: Vec<WorktreeCleanupPlanColumns> = sqlx::query_as(
+            "SELECT DISTINCT administrative_dir_codec, administrative_dir_value,
+                             administrative_dir_incarnation, final_tombstone_root_codec,
+                             final_tombstone_root_value, final_tombstone_root_device,
+                             final_tombstone_root_inode, final_tombstone_object_device,
+                             final_tombstone_object_inode
+             FROM close_worktree_cleanup_plans
+             WHERE attempt_id = ?1 AND scope = ?2
+               AND resource_kind = ?3 AND identity_kind = ?4
+               AND identity_codec = ?5 AND identity_value = ?6
+               AND inspection_generation = ?7 AND inspection_fingerprint = ?8",
+        )
+        .bind(attempt_id.as_str())
+        .bind(scope.as_str())
+        .bind(resource.kind().as_str())
+        .bind(identity.identity_kind())
+        .bind(identity.codec())
+        .bind(identity.value())
+        .bind(snapshot.generation())
+        .bind(snapshot.fingerprint())
+        .fetch_all(&self.pool)
+        .await?;
+        match rows.as_slice() {
+            [] => Ok(None),
+            [(
+                codec,
+                value,
+                incarnation,
+                tombstone_codec,
+                tombstone_value,
+                tombstone_device,
+                tombstone_inode,
+                object_device,
+                object_inode,
+            )] => {
+                let final_tombstone = match (
+                    tombstone_codec.as_deref(),
+                    tombstone_value.as_deref(),
+                    tombstone_device.as_deref(),
+                    tombstone_inode.as_deref(),
+                ) {
+                    (None, None, None, None) => None,
+                    (Some(tombstone_codec), Some(tombstone_value), Some(device), Some(inode)) => {
+                        Some(CloseWorktreeFinalTombstone {
+                            root: decode_host_path(tombstone_codec, tombstone_value)?,
+                            device: device.parse().map_err(|_| {
+                                close_precondition("invalid final tombstone device")
+                            })?,
+                            inode: inode
+                                .parse()
+                                .map_err(|_| close_precondition("invalid final tombstone inode"))?,
+                            object_device: object_device
+                                .as_deref()
+                                .map(str::parse)
+                                .transpose()
+                                .map_err(|_| {
+                                    close_precondition("invalid final tombstone object device")
+                                })?,
+                            object_inode: object_inode
+                                .as_deref()
+                                .map(str::parse)
+                                .transpose()
+                                .map_err(|_| {
+                                    close_precondition("invalid final tombstone object inode")
+                                })?,
+                        })
+                    }
+                    _ => return Err(close_precondition("incomplete final tombstone binding")),
+                };
+                Ok(Some(CloseWorktreeCleanupPlan {
+                    administrative_dir: decode_host_path(codec, value)?,
+                    administrative_dir_incarnation: incarnation.clone(),
+                    final_tombstone,
+                }))
+            }
+            _ => Err(close_precondition(
+                "exact worktree cleanup authority has conflicting plans",
+            )),
+        }
+    }
+
+    /// Returns whether the current exact attempt dispatched this resource before
+    /// process-local teardown. This is deliberately narrower than prior evidence.
+    ///
+    /// # Errors
+    /// Returns a database error when dispatch evidence cannot be read.
+    pub async fn close_retirement_resource_was_dispatched(
+        &self,
+        attempt_id: &CloseAttemptId,
+        scope: &WorkScopeId,
+        snapshot: &CloseRetirementSnapshot,
+        resource: &RetiredResourceIdentity,
+    ) -> DbResult<bool> {
+        let identity = resource.identity();
+        sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM close_retirement_resource_dispatches
+                 WHERE attempt_id = ?1 AND scope = ?2
+                   AND inspection_generation = ?3 AND inspection_fingerprint = ?4
+                   AND resource_kind = ?5 AND identity_kind = ?6
+                   AND identity_codec = ?7 AND identity_value = ?8
+             )",
+        )
+        .bind(attempt_id.as_str())
+        .bind(scope.as_str())
+        .bind(snapshot.generation())
+        .bind(snapshot.fingerprint())
+        .bind(resource.kind().as_str())
+        .bind(identity.identity_kind())
+        .bind(identity.codec())
+        .bind(identity.value())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Records one exact resource-retirement outcome for an authorized Close snapshot.
     ///
     /// # Errors
@@ -2564,8 +3875,135 @@ impl Database {
             )));
         }
 
+        if matches!(request.outcome, RetirementOutcome::Residual { .. })
+            && phase == ClosePhase::RetirementRequested
+        {
+            set_close_phase_tx(
+                &mut tx,
+                request.attempt_id.as_str(),
+                ClosePhase::NeedsRepair,
+            )
+            .await?;
+        }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Completes one fully retired Close attempt and archives its captured members.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] when the attempt is absent, not retirement-ready, or persistence fails.
+    pub async fn complete_close_retirement(
+        &self,
+        attempt_id: &CloseAttemptId,
+    ) -> DbResult<CloseObligation> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let obligation = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
+        if obligation.phase() == ClosePhase::Completed {
+            tx.commit().await?;
+            return Ok(obligation);
+        }
+        if obligation.phase() != ClosePhase::RetirementRequested {
+            return Err(close_precondition(format!(
+                "attempt {attempt_id} completion requires retirement_requested"
+            )));
+        }
+        let now = Utc::now().to_rfc3339();
+        let aggregate_transcript_id: String = sqlx::query_scalar(
+            "SELECT conversation_id
+             FROM close_attempt_members
+             WHERE attempt_id = ?1 AND member_role IN ('latest', 'root_latest')",
+        )
+        .bind(attempt_id.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+        let persisted_sequence_max: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(sequence_id), 0) FROM messages WHERE conversation_id = ?1",
+        )
+        .bind(&aggregate_transcript_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let outcome_content = MessageContent::system(format!(
+            "Close attempt {attempt_id} completed; this conversation is now archived in History."
+        ));
+        let outcome_content_json = serde_json::to_string(&outcome_content.to_stored_json())
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        sqlx::query(
+            "INSERT INTO messages (
+                 message_id, conversation_id, sequence_id, message_type, content, created_at
+             ) VALUES (?1, ?2, ?3, 'system', ?4, ?5)",
+        )
+        .bind(format!("close-outcome:{attempt_id}"))
+        .bind(&aggregate_transcript_id)
+        .bind(persisted_sequence_max + 1)
+        .bind(outcome_content_json)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE conversations
+             SET archived = 1, updated_at = ?2
+             WHERE id IN (
+                 SELECT conversation_id FROM close_attempt_members WHERE attempt_id = ?1
+             )",
+        )
+        .bind(attempt_id.as_str())
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE product_conversations
+             SET ordinary_lifecycle = 'history'
+             WHERE id = (SELECT product_conversation_id FROM close_obligations WHERE attempt_id = ?1)
+               AND kind = 'ordinary'",
+        )
+        .bind(attempt_id.as_str())
+        .execute(&mut *tx)
+        .await?;
+        let completed = sqlx::query(
+            "UPDATE close_obligations
+             SET phase = 'completed', close_outcome = 'archived',
+                 completed_at = ?2, updated_at = ?2
+             WHERE attempt_id = ?1 AND phase = 'retirement_requested'",
+        )
+        .bind(attempt_id.as_str())
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        if completed.rows_affected() != 1 {
+            return Err(close_precondition(format!(
+                "attempt {attempt_id} completion lost retirement authority"
+            )));
+        }
+        let obligation = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
+        tx.commit().await?;
+        Ok(obligation)
+    }
+
+    /// Reopens one repairable Close attempt for exact retirement retry.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] when the attempt is absent, is not in repair, or persistence fails.
+    pub async fn retry_close_retirement(
+        &self,
+        attempt_id: &CloseAttemptId,
+    ) -> DbResult<CloseObligation> {
+        let mut tx = self.pool.begin().await?;
+        let obligation = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
+        if obligation.phase() != ClosePhase::NeedsRepair {
+            return Err(close_precondition(format!(
+                "attempt {attempt_id} retry requires needs_repair"
+            )));
+        }
+        set_close_phase_tx(
+            &mut tx,
+            attempt_id.as_str(),
+            ClosePhase::AwaitingRetirementInspection,
+        )
+        .await?;
+        let obligation = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
+        tx.commit().await?;
+        Ok(obligation)
     }
 
     /// Lists retained retirement evidence for an attempt.
@@ -2791,6 +4229,10 @@ mod tests {
         ProductConversationId::parse(id.to_string()).unwrap()
     }
 
+    fn transcript_id(id: &str) -> TranscriptConversationId {
+        TranscriptConversationId::parse(id.to_string()).unwrap()
+    }
+
     async fn create_root(db: &Database, id: &str) {
         let mut conversation = db
             .create_conversation(id, id, "/tmp", true, None, None)
@@ -2982,6 +4424,7 @@ mod tests {
         )
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn capture_test_inventory(
         db: &Database,
         attempt_id: &str,
@@ -2991,6 +4434,7 @@ mod tests {
     ) {
         let mut inventory = CloseOwnedResourceInventory {
             worktree: None,
+            work_scopes: std::collections::BTreeSet::default(),
             bash_process_groups: std::collections::BTreeSet::default(),
             tmux_servers: std::collections::BTreeSet::default(),
             pty_sessions: std::collections::BTreeSet::default(),
@@ -3007,6 +4451,9 @@ mod tests {
                 LossItemIdentity::GitPath(_) | LossItemIdentity::GitOid(_) => unreachable!(),
             };
             match resource.kind() {
+                RetiredResourceKind::WorkScope => {
+                    inventory.work_scopes.insert(identity);
+                }
                 RetiredResourceKind::BashProcessGroup => {
                     inventory.bash_process_groups.insert(identity);
                 }
@@ -3040,6 +4487,7 @@ mod tests {
             } else {
                 CloseOwnedResourceInventory {
                     worktree: None,
+                    work_scopes: std::collections::BTreeSet::default(),
                     bash_process_groups: std::collections::BTreeSet::default(),
                     tmux_servers: std::collections::BTreeSet::default(),
                     pty_sessions: std::collections::BTreeSet::default(),
@@ -3193,7 +4641,17 @@ mod tests {
             | ClosePhase::CancelRequestedDuringSettlement
             | ClosePhase::AwaitingRetirementInspection => (None, None, None),
         };
-        if phase == ClosePhase::Completed {
+        let has_sealed_inventory: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM close_retirement_inventories
+                 WHERE attempt_id = ?1 AND sealed = 1
+               )",
+        )
+        .bind(attempt_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        if phase == ClosePhase::Completed && !has_sealed_inventory {
             let generation = generation.as_deref().unwrap();
             let fingerprint = fingerprint.as_deref().unwrap();
             sqlx::query(
@@ -3223,8 +4681,8 @@ mod tests {
                      attempt_id, scope, inspection_generation, inspection_fingerprint,
                      resource_kind, identity_kind, identity_codec, identity_value
                  )
-                 SELECT target.attempt_id, target.scope, ?2, ?3, 'worktree', 'git_path',
-                        'git_path_bytes_hex_v1', 'git_path_bytes_hex_v1:2f746d702f776f726b74726565'
+                 SELECT target.attempt_id, target.scope, ?2, ?3, 'worktree', 'worktree',
+                        'worktree_id_v1', target.captured_worktree_identity
                  FROM close_attempt_scopes target
                  JOIN work_scopes scope ON scope.id = target.scope
                  WHERE target.attempt_id = ?1 AND scope.environment_kind = 'allocated_worktree'
@@ -3236,6 +4694,22 @@ mod tests {
                          AND existing.inspection_fingerprint = ?3
                          AND existing.resource_kind = 'worktree'
                    )",
+            )
+            .bind(attempt_id)
+            .bind(generation)
+            .bind(fingerprint)
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO close_expected_retirement_resources (
+                     attempt_id, scope, inspection_generation, inspection_fingerprint,
+                     resource_kind, identity_kind, identity_codec, identity_value
+                 )
+                 SELECT target.attempt_id, target.scope, ?2, ?3, 'work_scope', 'opaque',
+                        'opaque_string_v1', target.scope
+                 FROM close_attempt_scopes target
+                 WHERE target.attempt_id = ?1",
             )
             .bind(attempt_id)
             .bind(generation)
@@ -3289,6 +4763,32 @@ mod tests {
             .await
             .unwrap();
             sqlx::query(
+                "INSERT INTO close_retirement_resources (
+                     attempt_id, scope, inspection_generation, inspection_fingerprint,
+                     resource_kind, identity_kind, identity_codec, identity_value,
+                     proof_kind, created_at, updated_at
+                 )
+                 SELECT target.attempt_id, target.scope, ?2, ?3, 'work_scope', 'opaque',
+                        'opaque_string_v1', target.scope, 'retired', ?4, ?4
+                 FROM close_attempt_scopes target
+                 WHERE target.attempt_id = ?1",
+            )
+            .bind(attempt_id)
+            .bind(generation)
+            .bind(fingerprint)
+            .bind(Utc::now().to_rfc3339())
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "UPDATE close_obligations SET phase = 'completed', close_outcome = 'archived'
+                 WHERE attempt_id = ?1",
+            )
+            .bind(attempt_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
                 "UPDATE conversations SET archived = 1
                  WHERE id IN (
                      SELECT conversation_id FROM close_attempt_members WHERE attempt_id = ?1
@@ -3298,6 +4798,35 @@ mod tests {
             .execute(db.pool())
             .await
             .unwrap();
+        }
+        if phase == ClosePhase::Completed {
+            let snapshot = CloseRetirementSnapshot::parse(
+                generation.as_deref().unwrap(),
+                fingerprint.as_deref().unwrap(),
+            )
+            .unwrap();
+            let recorded = db.list_close_retirement_evidence(attempt_id).await.unwrap();
+            for expected in db
+                .list_close_expected_retirement_resources(attempt_id)
+                .await
+                .unwrap()
+            {
+                if recorded.iter().any(|evidence| {
+                    evidence.scope == expected.scope && evidence.resource == expected.resource
+                }) {
+                    continue;
+                }
+                db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
+                    attempt_id: CloseAttemptId::parse(attempt_id).unwrap(),
+                    snapshot: snapshot.clone(),
+                    scope: expected.scope,
+                    resource: expected.resource,
+                    outcome: RetirementOutcome::Retired,
+                    detail: Some("test evidence".to_string()),
+                })
+                .await
+                .unwrap();
+            }
         }
         sqlx::query(
             "UPDATE close_obligations
@@ -3379,7 +4908,11 @@ mod tests {
         let contender_db = db.clone();
         let contender = tokio::spawn(async move {
             contender_db
-                .begin_close_foundation(&product_id("race-root"), "loser")
+                .begin_close_foundation(
+                    &product_id("race-root"),
+                    &transcript_id("race-root"),
+                    "loser",
+                )
                 .await
         });
         tokio::task::yield_now().await;
@@ -3409,7 +4942,11 @@ mod tests {
         );
 
         let obligation = db
-            .begin_close_foundation(&conversation.product_conversation_id, "fresh-attempt")
+            .begin_close_foundation(
+                &conversation.product_conversation_id,
+                &transcript_id(&conversation.id),
+                "fresh-attempt",
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -3427,13 +4964,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn idle_close_enters_settlement_without_stop_work_confirmation() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-idle-settlement",
+        )
+        .await
+        .unwrap();
+
+        let obligation = db
+            .begin_close_idle_settlement("attempt-idle-settlement")
+            .await
+            .unwrap();
+        assert_eq!(obligation.phase(), ClosePhase::SettlingActiveWork);
+    }
+
+    #[tokio::test]
     async fn active_work_settlement_advances_only_once_when_captured_members_are_quiescent() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "latest", "root").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-settlement")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("latest"),
+            "attempt-settlement",
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             db.confirm_close_stop_work("attempt-settlement")
@@ -3501,9 +5061,13 @@ mod tests {
             .await
             .unwrap();
         }
-        db.begin_close_foundation(&product_id("root"), "attempt-exact-receipt")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("latest"),
+            "attempt-exact-receipt",
+        )
+        .await
+        .unwrap();
         db.confirm_close_stop_work("attempt-exact-receipt")
             .await
             .unwrap();
@@ -3546,9 +5110,13 @@ mod tests {
     async fn active_work_settlement_requires_stop_work_confirmation() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-confirm")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-confirm",
+        )
+        .await
+        .unwrap();
 
         assert!(matches!(
             db.begin_close_active_work_settlement("attempt-confirm")
@@ -3599,9 +5167,13 @@ mod tests {
         .execute(db.pool())
         .await
         .unwrap();
-        db.begin_close_foundation(&product_conversation_id, "attempt-participant")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_conversation_id,
+            &transcript_id("participant"),
+            "attempt-participant",
+        )
+        .await
+        .unwrap();
         assert_eq!(
             db.list_close_settlement_conversation_ids("attempt-participant")
                 .await
@@ -3622,6 +5194,91 @@ mod tests {
             DbError::CloseFoundationPrecondition(message)
                 if message.contains("unsettled direct-turn receipt")
         ));
+    }
+
+    #[tokio::test]
+    async fn uncaptured_aggregate_participant_remains_a_settlement_blocker() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        create_child(&db, "participant", "root").await;
+        create_child(&db, "latest", "participant").await;
+        sqlx::query(
+            "INSERT INTO workflows (
+                 workflow_id, profile_kind, profile_version, runtime_acceptance_enabled,
+                 external_acceptance_enabled, version, generation, status,
+                 snapshot_codec_family, snapshot_codec_version, snapshot_payload, created_at, updated_at
+             ) VALUES (1, 'direct_turn', 1, 1, 0, 0, 0, 'Active', 'direct_turn', 1, X'00', 1, 1),
+                      (2, 'direct_turn', 1, 1, 0, 0, 0, 'Active', 'direct_turn', 1, X'00', 1, 1)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        for (turn_id, conversation_id) in [(1, "latest"), (2, "participant")] {
+            sqlx::query(
+                "INSERT INTO durable_turns (
+                     turn_id, workflow_id, conversation_id, client_turn_key, prepared_fingerprint,
+                     prepared_payload, disposition, generation, terminal_kind, terminal_reason,
+                     owns_conversation, canonical_message_id
+                 ) VALUES (?1, ?1, ?2, 'turn-key', 'prepared', X'00', 'Runtime', 0, NULL, NULL, 1, NULL)",
+            )
+            .bind(turn_id)
+            .bind(conversation_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("latest"),
+            "attempt-all-members",
+        )
+        .await
+        .unwrap();
+        db.confirm_close_stop_work("attempt-all-members")
+            .await
+            .unwrap();
+        db.begin_close_active_work_settlement("attempt-all-members")
+            .await
+            .unwrap();
+        let target = db
+            .list_unsettled_close_direct_turn_settlement_targets("attempt-all-members")
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(target.conversation_id, "latest");
+        sqlx::query(
+            "UPDATE durable_turns SET generation = 1, terminal_kind = 'Completed', owns_conversation = 0 WHERE turn_id = 1",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert!(db
+            .record_close_direct_turn_settlement_if_released("attempt-all-members", &target)
+            .await
+            .unwrap());
+
+        assert!(matches!(
+            db.advance_close_settlement_when_quiescent("attempt-all-members")
+                .await
+                .unwrap_err(),
+            DbError::CloseFoundationPrecondition(message)
+                if message.contains("active durable member obligation")
+        ));
+        sqlx::query(
+            "UPDATE durable_turns SET generation = 1, terminal_kind = 'Completed', owns_conversation = 0 WHERE turn_id = 2",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            db.advance_close_settlement_when_quiescent("attempt-all-members")
+                .await
+                .unwrap()
+                .phase(),
+            ClosePhase::AwaitingRetirementInspection
+        );
     }
 
     #[tokio::test]
@@ -3649,9 +5306,13 @@ mod tests {
         .execute(db.pool())
         .await
         .unwrap();
-        db.begin_close_foundation(&product_id("root"), "attempt-busy")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("latest"),
+            "attempt-busy",
+        )
+        .await
+        .unwrap();
         db.confirm_close_stop_work("attempt-busy").await.unwrap();
         db.begin_close_active_work_settlement("attempt-busy")
             .await
@@ -3707,9 +5368,13 @@ mod tests {
         .execute(db.pool())
         .await
         .unwrap();
-        db.begin_close_foundation(&product_id("root"), "attempt-creation")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-creation",
+        )
+        .await
+        .unwrap();
         db.confirm_close_stop_work("attempt-creation")
             .await
             .unwrap();
@@ -3744,9 +5409,13 @@ mod tests {
     async fn cancelled_active_work_settlement_completes_after_members_quiesce() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-cancel-settlement")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-cancel-settlement",
+        )
+        .await
+        .unwrap();
         db.confirm_close_stop_work("attempt-cancel-settlement")
             .await
             .unwrap();
@@ -3804,9 +5473,13 @@ mod tests {
         .execute(db.pool())
         .await
         .unwrap();
-        db.begin_close_foundation(&product_id("root"), "attempt-cancel-busy")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-cancel-busy",
+        )
+        .await
+        .unwrap();
         db.confirm_close_stop_work("attempt-cancel-busy")
             .await
             .unwrap();
@@ -3904,9 +5577,13 @@ mod tests {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "latest", "root").await;
-        db.begin_close_foundation(&product_id("root"), "admission-fence")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("latest"),
+            "admission-fence",
+        )
+        .await
+        .unwrap();
 
         for conversation_id in ["root", "latest"] {
             assert!(matches!(
@@ -3941,6 +5618,7 @@ mod tests {
         let scope = allocate_scope_worktree(&db, &conversation.id).await;
         db.begin_close_foundation(
             &conversation.product_conversation_id,
+            &transcript_id(&conversation.id),
             "fresh-retirement-attempt",
         )
         .await
@@ -3960,6 +5638,7 @@ mod tests {
                 scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
                     scope: scope.clone(),
                     inventory: CloseOwnedResourceInventory {
+                        work_scopes: std::collections::BTreeSet::new(),
                         worktree: Some(current_test_worktree(&db, &scope).await),
                         bash_process_groups: std::collections::BTreeSet::default(),
                         tmux_servers: std::collections::BTreeSet::default(),
@@ -3971,7 +5650,10 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(resources.len(), 1);
+        assert_eq!(resources.len(), 2);
+        assert!(resources
+            .iter()
+            .any(|resource| { resource.resource.kind() == RetiredResourceKind::WorkScope }));
     }
 
     #[tokio::test]
@@ -3979,7 +5661,7 @@ mod tests {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         create_root(&db, "other").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-owned")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("root"), "attempt-owned")
             .await
             .unwrap();
 
@@ -4024,7 +5706,7 @@ mod tests {
         assert_eq!(topology.members[2].role, CloseMemberRole::Latest);
 
         let obligation = db
-            .begin_close_foundation(&product_id("root"), "attempt-1")
+            .begin_close_foundation(&product_id("root"), &transcript_id("leaf"), "attempt-1")
             .await
             .unwrap();
         assert_eq!(obligation.attempt_id().as_str(), "attempt-1");
@@ -4199,7 +5881,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(topology.member_ids(), vec!["a|b", "b"]);
-        db.begin_close_foundation(&product_id("a|b"), "attempt-delimiter")
+        db.begin_close_foundation(&product_id("a|b"), &transcript_id("b"), "attempt-delimiter")
             .await
             .unwrap();
         assert_eq!(
@@ -4223,13 +5905,92 @@ mod tests {
         assert_eq!(topology.member_ids(), vec!["root"]);
         assert_eq!(topology.members[0].role, CloseMemberRole::RootLatest);
 
-        db.begin_close_foundation(&product_id("root"), "attempt-1")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("root"), "attempt-1")
             .await
             .unwrap();
         let members = db.list_close_attempt_members("attempt-1").await.unwrap();
         assert_eq!(members.len(), 1);
         assert_eq!(members[0].conversation_id.as_str(), "root");
         assert_eq!(members[0].role, CloseMemberRole::RootLatest);
+    }
+
+    #[tokio::test]
+    async fn unresolved_worktree_routes_from_inspection_directly_to_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repair-projection-reload.db");
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap();
+        create_root(&db, "root").await;
+        allocate_scope_worktree(&db, "root").await;
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-inspection-repair",
+        )
+        .await
+        .unwrap();
+        set_close_phase(
+            &db,
+            "attempt-inspection-repair",
+            ClosePhase::AwaitingRetirementInspection,
+        )
+        .await;
+
+        let captured = db
+            .list_close_attempt_scopes("attempt-inspection-repair")
+            .await
+            .unwrap()
+            .remove(0);
+        let scope = captured.scope;
+        let Some(CapturedWorktreeIdentity::Resolved(worktree)) = captured.captured_worktree else {
+            panic!("allocated scope must capture a resolved worktree");
+        };
+        db.route_close_attempt_to_repair(RouteCloseAttemptToRepairRequest {
+            attempt_id: CloseAttemptId::parse("attempt-inspection-repair").unwrap(),
+            scope: scope.clone(),
+            residual: RetiredResourceIdentity::parse(
+                RetiredResourceKind::Worktree,
+                LossItemIdentity::Worktree(worktree),
+            )
+            .unwrap(),
+            reason: RetirementFailureReason::IdentityNotProven,
+            detail: "captured worktree identity cannot be proven".to_string(),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.get_close_obligation("attempt-inspection-repair")
+                .await
+                .unwrap()
+                .phase(),
+            ClosePhase::NeedsRepair
+        );
+        drop(db);
+        let reloaded = Database::open(path.to_str().unwrap()).await.unwrap();
+        let projection = reloaded
+            .get_active_close_projection_for_product(&product_id("root"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(projection.residuals.len(), 1);
+        assert_eq!(projection.residuals[0].scope.as_str(), scope.as_str());
+        assert_eq!(
+            projection.residuals[0].resource.kind(),
+            RetiredResourceKind::Worktree
+        );
+        assert_eq!(
+            projection.residuals[0].outcome,
+            RetirementOutcome::Residual {
+                residual_reason: RetirementFailureReason::IdentityNotProven
+            }
+        );
+        assert_eq!(
+            projection.residuals[0].detail.as_deref(),
+            Some("captured worktree identity cannot be proven")
+        );
     }
 
     #[allow(clippy::too_many_lines)]
@@ -4246,9 +6007,13 @@ mod tests {
         .await
         .unwrap();
 
-        db.begin_close_foundation(&product_id("root"), "attempt-unresolved")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-unresolved",
+        )
+        .await
+        .unwrap();
         let scopes = db
             .list_close_attempt_scopes("attempt-unresolved")
             .await
@@ -4282,6 +6047,7 @@ mod tests {
                 scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
                     scope: scope.clone(),
                     inventory: CloseOwnedResourceInventory {
+                        work_scopes: std::collections::BTreeSet::new(),
                         worktree: None,
                         bash_process_groups: std::collections::BTreeSet::new(),
                         tmux_servers: std::collections::BTreeSet::new(),
@@ -4319,6 +6085,7 @@ mod tests {
                 scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
                     scope: scope.clone(),
                     inventory: CloseOwnedResourceInventory {
+                        work_scopes: std::collections::BTreeSet::new(),
                         worktree: None,
                         bash_process_groups: std::collections::BTreeSet::new(),
                         tmux_servers: std::collections::BTreeSet::new(),
@@ -4348,7 +6115,7 @@ mod tests {
         create_child(&db, "leaf", "root").await;
 
         let obligation = db
-            .begin_close_foundation(&product_id("root"), "attempt-1")
+            .begin_close_foundation(&product_id("root"), &transcript_id("leaf"), "attempt-1")
             .await
             .unwrap();
         assert_eq!(obligation.product_conversation_id(), &product_id("root"));
@@ -4366,7 +6133,7 @@ mod tests {
         set_state(&db, "root", approval_state()).await;
 
         let err = db
-            .begin_close_foundation(&product_id("root"), "attempt-1")
+            .begin_close_foundation(&product_id("root"), &transcript_id("leaf"), "attempt-1")
             .await
             .unwrap_err();
         assert!(matches!(err, DbError::CloseFoundationPrecondition(_)));
@@ -4449,7 +6216,11 @@ mod tests {
             create_root(&db, id).await;
             set_state(&db, id, state).await;
             let obligation = db
-                .begin_close_foundation(&product_id(id), &format!("attempt-{id}"))
+                .begin_close_foundation(
+                    &product_id(id),
+                    &transcript_id(id),
+                    &format!("attempt-{id}"),
+                )
                 .await
                 .unwrap();
             assert_eq!(obligation.product_conversation_id().as_str(), id);
@@ -4460,6 +6231,24 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn close_busy_classification_uses_the_transactional_admission_snapshot() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        set_state(&db, "root", ConvState::LlmRequesting { attempt: 1 }).await;
+        let obligation = db
+            .begin_close_foundation(&product_id("root"), &transcript_id("root"), "attempt-busy")
+            .await
+            .unwrap();
+
+        set_state(&db, "root", ConvState::Idle).await;
+
+        assert!(db
+            .close_attempt_latest_was_busy(obligation.attempt_id().as_str())
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -4476,7 +6265,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            db.begin_close_foundation(&product_id("root"), "attempt-1")
+            db.begin_close_foundation(&product_id("root"), &transcript_id("leaf"), "attempt-1")
                 .await
                 .unwrap_err(),
             DbError::CloseFoundationPrecondition(_)
@@ -4492,7 +6281,7 @@ mod tests {
         set_state(&db, "mid", awaiting_continuation_state()).await;
 
         let err = db
-            .begin_close_foundation(&product_id("root"), "attempt-1")
+            .begin_close_foundation(&product_id("root"), &transcript_id("leaf"), "attempt-1")
             .await
             .unwrap_err();
         assert!(matches!(err, DbError::CloseFoundationPrecondition(_)));
@@ -4530,7 +6319,11 @@ mod tests {
             create_root(&db, id).await;
             set_state(&db, id, state).await;
             let obligation = db
-                .begin_close_foundation(&product_id(id), &format!("attempt-{id}"))
+                .begin_close_foundation(
+                    &product_id(id),
+                    &transcript_id(id),
+                    &format!("attempt-{id}"),
+                )
                 .await
                 .unwrap();
             assert_eq!(obligation.product_conversation_id().as_str(), id);
@@ -4550,20 +6343,55 @@ mod tests {
         create_root(&db, "approval").await;
         set_state(&db, "approval", approval_state()).await;
         assert!(matches!(
-            db.begin_close_foundation(&product_id("approval"), "attempt-approval")
-                .await
-                .unwrap_err(),
+            db.begin_close_foundation(
+                &product_id("approval"),
+                &transcript_id("approval"),
+                "attempt-approval"
+            )
+            .await
+            .unwrap_err(),
             DbError::CloseFoundationPrecondition(_)
         ));
 
         create_root(&db, "awaiting").await;
         set_state(&db, "awaiting", awaiting_continuation_state()).await;
         assert!(matches!(
-            db.begin_close_foundation(&product_id("awaiting"), "attempt-awaiting")
-                .await
-                .unwrap_err(),
+            db.begin_close_foundation(
+                &product_id("awaiting"),
+                &transcript_id("awaiting"),
+                "attempt-awaiting"
+            )
+            .await
+            .unwrap_err(),
             DbError::CloseFoundationPrecondition(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn stale_latest_token_is_rejected_atomically_under_begin_immediate() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        create_child(&db, "latest", "root").await;
+
+        let stale = db
+            .begin_close_foundation(&product_id("root"), &transcript_id("root"), "attempt-stale")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            stale,
+            DbError::CloseFoundationPrecondition(message)
+                if message.contains("addressed conversation root is not latest latest")
+        ));
+
+        let obligation = db
+            .begin_close_foundation(
+                &product_id("root"),
+                &transcript_id("latest"),
+                "attempt-fresh",
+            )
+            .await
+            .unwrap();
+        assert_eq!(obligation.attempt_id().as_str(), "attempt-fresh");
     }
 
     #[tokio::test]
@@ -4573,14 +6401,14 @@ mod tests {
         create_child(&db, "latest", "root").await;
 
         let first = db
-            .begin_close_foundation(&product_id("root"), "attempt-1")
+            .begin_close_foundation(&product_id("root"), &transcript_id("latest"), "attempt-1")
             .await
             .unwrap();
 
         set_state(&db, "latest", ConvState::LlmRequesting { attempt: 2 }).await;
 
         let second = db
-            .begin_close_foundation(&product_id("root"), "attempt-1")
+            .begin_close_foundation(&product_id("root"), &transcript_id("latest"), "attempt-1")
             .await
             .unwrap();
         assert_eq!(first, second);
@@ -4632,13 +6460,13 @@ mod tests {
                 .is_err()
         );
         let third = db
-            .begin_close_foundation(&product_id("root"), "attempt-1")
+            .begin_close_foundation(&product_id("root"), &transcript_id("latest"), "attempt-1")
             .await
             .unwrap();
         assert_eq!(first, third);
 
         let err = db
-            .begin_close_foundation(&product_id("root"), "attempt-2")
+            .begin_close_foundation(&product_id("root"), &transcript_id("latest"), "attempt-2")
             .await
             .unwrap_err();
         assert!(matches!(err, DbError::CloseFoundationConflict(_)));
@@ -4677,7 +6505,11 @@ mod tests {
         .unwrap();
 
         let error = db
-            .begin_close_foundation(&product_id("root"), "attempt-partial")
+            .begin_close_foundation(
+                &product_id("root"),
+                &transcript_id("latest"),
+                "attempt-partial",
+            )
             .await
             .unwrap_err();
         assert!(matches!(
@@ -4713,7 +6545,7 @@ mod tests {
             .unwrap();
 
         let error = db
-            .begin_close_foundation(&product_id("root"), "attempt-nul")
+            .begin_close_foundation(&product_id("root"), &transcript_id("root"), "attempt-nul")
             .await
             .unwrap_err();
         assert!(matches!(
@@ -4761,7 +6593,7 @@ mod tests {
             .await
             .unwrap();
 
-        db.begin_close_foundation(&product_id("root"), "attempt-1")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("leaf"), "attempt-1")
             .await
             .unwrap();
         let members = db.list_close_attempt_members("attempt-1").await.unwrap();
@@ -4780,7 +6612,7 @@ mod tests {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "leaf", "root").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-1")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("leaf"), "attempt-1")
             .await
             .unwrap();
 
@@ -4811,7 +6643,11 @@ mod tests {
         create_child(&db, "latest", "root").await;
         set_archived(&db, "latest", true).await;
         let error = db
-            .begin_close_foundation(&product_id("root"), "attempt-archived-member")
+            .begin_close_foundation(
+                &product_id("root"),
+                &transcript_id("latest"),
+                "attempt-archived-member",
+            )
             .await
             .unwrap_err();
         assert!(matches!(error, DbError::CloseFoundationPrecondition(_)));
@@ -4823,9 +6659,13 @@ mod tests {
         create_root(&db, "archived").await;
         set_archived(&db, "archived", true).await;
         assert!(matches!(
-            db.begin_close_foundation(&product_id("archived"), "attempt-a")
-                .await
-                .unwrap_err(),
+            db.begin_close_foundation(
+                &product_id("archived"),
+                &transcript_id("archived"),
+                "attempt-a"
+            )
+            .await
+            .unwrap_err(),
             DbError::CloseFoundationPrecondition(_)
         ));
 
@@ -4851,7 +6691,11 @@ mod tests {
         .await
         .unwrap();
         assert!(db
-            .begin_close_foundation(&parent.product_conversation_id, "attempt-b")
+            .begin_close_foundation(
+                &parent.product_conversation_id,
+                &transcript_id(&parent.id),
+                "attempt-b"
+            )
             .await
             .is_ok());
         let member_ids: Vec<String> = db
@@ -4866,9 +6710,13 @@ mod tests {
         create_root(&db, "not-user-init").await;
         set_user_initiated(&db, "not-user-init", false).await;
         assert!(matches!(
-            db.begin_close_foundation(&product_id("not-user-init"), "attempt-c")
-                .await
-                .unwrap_err(),
+            db.begin_close_foundation(
+                &product_id("not-user-init"),
+                &transcript_id("not-user-init"),
+                "attempt-c"
+            )
+            .await
+            .unwrap_err(),
             DbError::CloseFoundationPrecondition(_)
         ));
     }
@@ -4929,7 +6777,7 @@ mod tests {
         create_root(&db, "root").await;
         create_child(&db, "leaf", "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-1")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("leaf"), "attempt-1")
             .await
             .unwrap();
         set_close_phase(&db, "attempt-1", ClosePhase::AwaitingRetirementInspection).await;
@@ -4988,9 +6836,13 @@ mod tests {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-concurrent-inspection")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-concurrent-inspection",
+        )
+        .await
+        .unwrap();
         set_close_phase(
             &db,
             "attempt-concurrent-inspection",
@@ -5034,7 +6886,7 @@ mod tests {
             .unwrap()
             .attached_work_scope_id
             .unwrap();
-        db.begin_close_foundation(&product_id("root"), "attempt-1")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("leaf"), "attempt-1")
             .await
             .unwrap();
         set_close_phase(&db, "attempt-1", ClosePhase::AwaitingRetirementInspection).await;
@@ -5060,14 +6912,19 @@ mod tests {
         assert!(err.to_string().contains("CHECK constraint failed"));
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn inspection_reentry_invalidates_prior_snapshot_and_rows() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-reentry")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-reentry",
+        )
+        .await
+        .unwrap();
         set_close_phase(
             &db,
             "attempt-reentry",
@@ -5169,12 +7026,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn changed_loss_confirmation_inspection_replaces_evidence_and_token_atomically() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let scope = allocate_scope_worktree(&db, "root").await;
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-changed-confirmation",
+        )
+        .await
+        .unwrap();
+        set_close_phase(
+            &db,
+            "attempt-changed-confirmation",
+            ClosePhase::AwaitingRetirementInspection,
+        )
+        .await;
+
+        let first_loss = CloseLossItem::UntrackedNonIgnoredPath(GitPathIdentity::from_bytes(
+            b"first-path".to_vec(),
+        ));
+        db.replace_close_inspection(ReplaceCloseInspectionRequest {
+            attempt_id: CloseAttemptId::parse("attempt-changed-confirmation").unwrap(),
+            scopes: vec![ReplaceCloseInspectionScopeRequest {
+                scope: scope.clone(),
+                snapshot: CloseRetirementSnapshot::parse("first-generation", "first-fingerprint")
+                    .unwrap(),
+                losses: vec![first_loss],
+            }],
+        })
+        .await
+        .unwrap();
+        let first_token = db
+            .get_close_obligation("attempt-changed-confirmation")
+            .await
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .clone();
+
+        let second_loss =
+            CloseLossItem::StagedTrackedPath(GitPathIdentity::from_bytes(b"second-path".to_vec()));
+        db.replace_close_inspection(ReplaceCloseInspectionRequest {
+            attempt_id: CloseAttemptId::parse("attempt-changed-confirmation").unwrap(),
+            scopes: vec![ReplaceCloseInspectionScopeRequest {
+                scope,
+                snapshot: CloseRetirementSnapshot::parse("second-generation", "second-fingerprint")
+                    .unwrap(),
+                losses: vec![second_loss.clone()],
+            }],
+        })
+        .await
+        .unwrap();
+
+        let refreshed = db
+            .get_close_obligation("attempt-changed-confirmation")
+            .await
+            .unwrap();
+        assert_eq!(refreshed.phase(), ClosePhase::AwaitingLossConfirmation);
+        let second_token = refreshed.snapshot().unwrap().clone();
+        assert_ne!(first_token, second_token);
+        assert_eq!(
+            db.list_close_retirement_losses("attempt-changed-confirmation")
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|loss| loss.item)
+                .collect::<Vec<_>>(),
+            vec![second_loss]
+        );
+
+        let attempt_id = CloseAttemptId::parse("attempt-changed-confirmation").unwrap();
+        let stale = db
+            .confirm_close_loss_retirement(&attempt_id, &first_token)
+            .await
+            .unwrap_err();
+        assert!(stale.to_string().contains("snapshot is stale"));
+        let confirmed = db
+            .confirm_close_loss_retirement(&attempt_id, &second_token)
+            .await
+            .unwrap();
+        assert_eq!(confirmed.phase(), ClosePhase::RetirementRequested);
+    }
+
+    #[tokio::test]
     async fn replace_close_inspection_clean_scopes_skip_loss_confirmation() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "leaf", "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-clean")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("leaf"), "attempt-clean")
             .await
             .unwrap();
         set_close_phase(
@@ -5209,7 +7151,7 @@ mod tests {
     async fn replace_close_inspection_no_scopes_skip_loss_confirmation() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-empty")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("root"), "attempt-empty")
             .await
             .unwrap();
         set_close_phase(
@@ -5229,6 +7171,42 @@ mod tests {
         assert_eq!(obligation.phase(), ClosePhase::RetirementRequested);
         let snapshot = obligation.snapshot().expect("no-worktree snapshot");
         assert_eq!(snapshot.generation(), "no-worktree");
+        assert_eq!(snapshot.fingerprint(), "no-worktree");
+    }
+
+    #[tokio::test]
+    async fn retry_no_worktree_inspection_rotates_inventory_generation() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-empty-retry",
+        )
+        .await
+        .unwrap();
+        set_close_phase(
+            &db,
+            "attempt-empty-retry",
+            ClosePhase::AwaitingRetirementInspection,
+        )
+        .await;
+        db.replace_close_inspection_with_empty_generation(
+            ReplaceCloseInspectionRequest {
+                attempt_id: CloseAttemptId::parse("attempt-empty-retry").unwrap(),
+                scopes: Vec::new(),
+            },
+            Some("server_git_status_v2_retry_test"),
+        )
+        .await
+        .unwrap();
+
+        let obligation = db
+            .get_close_obligation("attempt-empty-retry")
+            .await
+            .unwrap();
+        let snapshot = obligation.snapshot().expect("rotated no-worktree snapshot");
+        assert_eq!(snapshot.generation(), "server_git_status_v2_retry_test");
         assert_eq!(snapshot.fingerprint(), "no-worktree");
     }
 
@@ -5276,7 +7254,7 @@ mod tests {
             .unwrap();
         assert_eq!(leaf_scope, none_scope);
 
-        db.begin_close_foundation(&product_id("root"), "attempt-1")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("leaf"), "attempt-1")
             .await
             .unwrap();
         let captured = db.list_close_attempt_scopes("attempt-1").await.unwrap();
@@ -5336,7 +7314,7 @@ mod tests {
             .await
             .unwrap();
 
-        db.begin_close_foundation(&product_id("root"), "attempt-1")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("leaf"), "attempt-1")
             .await
             .unwrap();
         set_close_phase(&db, "attempt-1", ClosePhase::AwaitingRetirementInspection).await;
@@ -5474,7 +7452,7 @@ mod tests {
             .await
             .unwrap();
 
-        db.begin_close_foundation(&product_id("root"), "attempt-1")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("leaf"), "attempt-1")
             .await
             .unwrap();
         set_close_phase(&db, "attempt-1", ClosePhase::AwaitingRetirementInspection).await;
@@ -5515,7 +7493,7 @@ mod tests {
     async fn replace_close_inspection_rejects_untargeted_scope() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-1")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("root"), "attempt-1")
             .await
             .unwrap();
         set_close_phase(&db, "attempt-1", ClosePhase::AwaitingRetirementInspection).await;
@@ -5551,6 +7529,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pre_quarantine_change_returns_to_reinspection_and_uses_new_inventory() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let scope = allocate_scope_worktree(&db, "root").await;
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-reinspect",
+        )
+        .await
+        .unwrap();
+        set_close_phase(
+            &db,
+            "attempt-reinspect",
+            ClosePhase::AwaitingRetirementInspection,
+        )
+        .await;
+        let old_snapshot = CloseRetirementSnapshot::parse("old", "old-fingerprint").unwrap();
+        db.replace_close_inspection(ReplaceCloseInspectionRequest {
+            attempt_id: CloseAttemptId::parse("attempt-reinspect").unwrap(),
+            scopes: vec![ReplaceCloseInspectionScopeRequest {
+                scope: scope.clone(),
+                snapshot: old_snapshot.clone(),
+                losses: Vec::new(),
+            }],
+        })
+        .await
+        .unwrap();
+        let old_aggregate = current_test_snapshot(&db, "attempt-reinspect").await;
+        capture_test_inventory(&db, "attempt-reinspect", &scope, &old_aggregate, Vec::new()).await;
+
+        db.return_close_attempt_to_reinspection(
+            &CloseAttemptId::parse("attempt-reinspect").unwrap(),
+        )
+        .await
+        .unwrap();
+        let new_snapshot = CloseRetirementSnapshot::parse("new", "new-fingerprint").unwrap();
+        db.replace_close_inspection(ReplaceCloseInspectionRequest {
+            attempt_id: CloseAttemptId::parse("attempt-reinspect").unwrap(),
+            scopes: vec![ReplaceCloseInspectionScopeRequest {
+                scope: scope.clone(),
+                snapshot: new_snapshot.clone(),
+                losses: Vec::new(),
+            }],
+        })
+        .await
+        .unwrap();
+        let new_aggregate = current_test_snapshot(&db, "attempt-reinspect").await;
+        capture_test_inventory(&db, "attempt-reinspect", &scope, &new_aggregate, Vec::new()).await;
+
+        let resources = db
+            .list_close_expected_retirement_resources("attempt-reinspect")
+            .await
+            .unwrap();
+        assert!(!resources.is_empty());
+        assert!(resources
+            .iter()
+            .all(|resource| resource.snapshot == new_aggregate));
+    }
+
+    #[tokio::test]
     async fn retirement_inventory_rejects_terminal_unarchived_root_on_scope() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
@@ -5562,16 +7601,23 @@ mod tests {
             .attached_work_scope_id
             .unwrap();
         create_root(&db, "other-root").await;
-        sqlx::query("UPDATE conversations SET work_scope_id = ?2 WHERE id = ?1")
+        let conflict = sqlx::query("UPDATE conversations SET work_scope_id = ?2 WHERE id = ?1")
             .bind("other-root")
             .bind(scope.as_str())
             .execute(db.pool())
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(conflict
+            .to_string()
+            .contains("different ordinary product conversation"));
         set_state(&db, "other-root", ConvState::Terminal).await;
-        db.begin_close_foundation(&product_id("root"), "attempt-terminal-owner")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-terminal-owner",
+        )
+        .await
+        .unwrap();
         set_close_phase(
             &db,
             "attempt-terminal-owner",
@@ -5587,6 +7633,7 @@ mod tests {
                 scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
                     scope,
                     inventory: CloseOwnedResourceInventory {
+                        work_scopes: std::collections::BTreeSet::new(),
                         worktree: None,
                         bash_process_groups: std::collections::BTreeSet::default(),
                         tmux_servers: std::collections::BTreeSet::default(),
@@ -5611,9 +7658,13 @@ mod tests {
             .unwrap();
         create_root(&db, "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-concurrent-inventory")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-concurrent-inventory",
+        )
+        .await
+        .unwrap();
         set_close_phase(
             &db,
             "attempt-concurrent-inventory",
@@ -5628,6 +7679,7 @@ mod tests {
                 scope,
                 inventory: CloseOwnedResourceInventory {
                     worktree: Some(worktree),
+                    work_scopes: std::collections::BTreeSet::default(),
                     bash_process_groups: std::collections::BTreeSet::default(),
                     tmux_servers: std::collections::BTreeSet::default(),
                     pty_sessions: std::collections::BTreeSet::default(),
@@ -5648,7 +7700,7 @@ mod tests {
     async fn zero_scope_inventory_requires_exact_authorized_snapshot() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-zero")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("root"), "attempt-zero")
             .await
             .unwrap();
         let request = CaptureCloseRetirementInventoryRequest {
@@ -5678,7 +7730,7 @@ mod tests {
             .unwrap()
             .attached_work_scope_id
             .unwrap();
-        db.begin_close_foundation(&product_id("root"), "attempt-1")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("root"), "attempt-1")
             .await
             .unwrap();
         set_close_phase(&db, "attempt-1", ClosePhase::RetirementRequested).await;
@@ -5696,6 +7748,7 @@ mod tests {
                 scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
                     scope: scope.clone(),
                     inventory: CloseOwnedResourceInventory {
+                        work_scopes: std::collections::BTreeSet::new(),
                         worktree: match worktree.identity() {
                             LossItemIdentity::Worktree(identity) => Some(identity.clone()),
                             LossItemIdentity::GitPath(_)
@@ -5712,10 +7765,15 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(resources.len(), 1);
-        assert_eq!(resources[0].scope, scope);
-        assert_eq!(resources[0].snapshot, snapshot);
-        assert_eq!(resources[0].resource, worktree);
+        assert_eq!(resources.len(), 2);
+        assert!(resources.iter().any(|resource| {
+            resource.scope == scope
+                && resource.snapshot == snapshot
+                && resource.resource == worktree
+        }));
+        assert!(resources.iter().any(|resource| {
+            resource.scope == scope && resource.resource.kind() == RetiredResourceKind::WorkScope
+        }));
         let replayed = db
             .capture_close_retirement_inventory(CaptureCloseRetirementInventoryRequest {
                 attempt_id: CloseAttemptId::parse("attempt-1").unwrap(),
@@ -5723,6 +7781,7 @@ mod tests {
                 scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
                     scope: scope.clone(),
                     inventory: CloseOwnedResourceInventory {
+                        work_scopes: std::collections::BTreeSet::new(),
                         worktree: match worktree.identity() {
                             LossItemIdentity::Worktree(identity) => Some(identity.clone()),
                             LossItemIdentity::GitPath(_)
@@ -5775,7 +7834,7 @@ mod tests {
             .unwrap()
             .attached_work_scope_id
             .unwrap();
-        db2.begin_close_foundation(&product_id("root-2"), "attempt-2")
+        db2.begin_close_foundation(&product_id("root-2"), &transcript_id("root-2"), "attempt-2")
             .await
             .unwrap();
         set_close_phase(&db2, "attempt-2", ClosePhase::RetirementRequested).await;
@@ -5786,6 +7845,7 @@ mod tests {
                 scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
                     scope: scope2,
                     inventory: CloseOwnedResourceInventory {
+                        work_scopes: std::collections::BTreeSet::new(),
                         worktree: match wrong_worktree.identity() {
                             LossItemIdentity::Worktree(identity) => Some(identity.clone()),
                             LossItemIdentity::GitPath(_)
@@ -5824,9 +7884,13 @@ mod tests {
             .unwrap()
             .attached_work_scope_id
             .unwrap();
-        db.begin_close_foundation(&product_id("root"), "attempt-partial")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-partial",
+        )
+        .await
+        .unwrap();
         set_close_phase(&db, "attempt-partial", ClosePhase::RetirementRequested).await;
         let snapshot = current_test_snapshot(&db, "attempt-partial").await;
         sqlx::query(
@@ -5865,6 +7929,7 @@ mod tests {
                 scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
                     scope: scope.clone(),
                     inventory: CloseOwnedResourceInventory {
+                        work_scopes: std::collections::BTreeSet::new(),
                         worktree: Some(current_test_worktree(&db, &scope).await),
                         bash_process_groups: std::collections::BTreeSet::default(),
                         tmux_servers: std::collections::BTreeSet::default(),
@@ -5894,9 +7959,13 @@ mod tests {
             .unwrap()
             .attached_work_scope_id
             .unwrap();
-        db.begin_close_foundation(&product_id("root"), "attempt-incomplete")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-incomplete",
+        )
+        .await
+        .unwrap();
         set_close_phase(&db, "attempt-incomplete", ClosePhase::RetirementRequested).await;
         let snapshot = current_test_snapshot(&db, "attempt-incomplete").await;
         sqlx::query(
@@ -5953,23 +8022,32 @@ mod tests {
             .attached_work_scope_id
             .unwrap();
         create_root(&db, "other-root").await;
-        sqlx::query("UPDATE conversations SET work_scope_id = ?1 WHERE id = 'other-root'")
-            .bind(scope.as_str())
-            .execute(db.pool())
-            .await
-            .unwrap();
-        db.begin_close_foundation(&product_id("root"), "attempt-shared")
-            .await
-            .unwrap();
+        let conflict =
+            sqlx::query("UPDATE conversations SET work_scope_id = ?1 WHERE id = 'other-root'")
+                .bind(scope.as_str())
+                .execute(db.pool())
+                .await
+                .unwrap_err();
+        assert!(conflict
+            .to_string()
+            .contains("different ordinary product conversation"));
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-shared",
+        )
+        .await
+        .unwrap();
         set_close_phase(&db, "attempt-shared", ClosePhase::RetirementRequested).await;
 
-        let error = db
+        let result = db
             .capture_close_retirement_inventory(CaptureCloseRetirementInventoryRequest {
                 attempt_id: CloseAttemptId::parse("attempt-shared").unwrap(),
                 snapshot: current_test_snapshot(&db, "attempt-shared").await,
                 scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
                     scope: scope.clone(),
                     inventory: CloseOwnedResourceInventory {
+                        work_scopes: std::collections::BTreeSet::new(),
                         worktree: Some(current_test_worktree(&db, &scope).await),
                         bash_process_groups: std::collections::BTreeSet::default(),
                         tmux_servers: std::collections::BTreeSet::default(),
@@ -5979,18 +8057,21 @@ mod tests {
                     },
                 }],
             })
-            .await
-            .unwrap_err();
-        assert!(matches!(error, DbError::CloseFoundationPrecondition(_)));
+            .await;
+        assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn cancelled_completion_round_trips_typed_outcome() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-cancelled")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-cancelled",
+        )
+        .await
+        .unwrap();
         sqlx::query(
             "UPDATE close_obligations
              SET phase = 'completed', completed_at = ?2, close_outcome = 'cancelled'
@@ -6010,6 +8091,152 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn retirement_completion_persists_outcome_before_history_transition() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let scope = allocate_scope_worktree(&db, "root").await;
+        create_child(&db, "latest", "root").await;
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("latest"),
+            "attempt-complete",
+        )
+        .await
+        .unwrap();
+        set_close_phase(
+            &db,
+            "attempt-complete",
+            ClosePhase::AwaitingRetirementInspection,
+        )
+        .await;
+        db.replace_close_inspection(ReplaceCloseInspectionRequest {
+            attempt_id: CloseAttemptId::parse("attempt-complete").unwrap(),
+            scopes: vec![ReplaceCloseInspectionScopeRequest {
+                scope: scope.clone(),
+                snapshot: CloseRetirementSnapshot::parse("complete-gen", "complete-fp").unwrap(),
+                losses: Vec::new(),
+            }],
+        })
+        .await
+        .unwrap();
+        let snapshot = current_test_snapshot(&db, "attempt-complete").await;
+        capture_test_inventory(&db, "attempt-complete", &scope, &snapshot, Vec::new()).await;
+        for expected in db
+            .list_close_expected_retirement_resources("attempt-complete")
+            .await
+            .unwrap()
+        {
+            db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
+                attempt_id: CloseAttemptId::parse("attempt-complete").unwrap(),
+                snapshot: snapshot.clone(),
+                scope: expected.scope,
+                resource: expected.resource,
+                outcome: RetirementOutcome::Retired,
+                detail: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        let completed = db
+            .complete_close_retirement(&CloseAttemptId::parse("attempt-complete").unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(completed.phase(), ClosePhase::Completed);
+        assert_eq!(
+            completed.close_outcome(),
+            Some(CloseCompletionOutcome::Archived)
+        );
+        let lifecycle: String = sqlx::query_scalar(
+            "SELECT ordinary_lifecycle FROM product_conversations WHERE id = ?1",
+        )
+        .bind("root")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(lifecycle, "history");
+        let outcome: (String, String, String) = sqlx::query_as(
+            "SELECT message_id, message_type, content
+             FROM messages WHERE conversation_id = ?1",
+        )
+        .bind("latest")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(outcome.0, "close-outcome:attempt-complete");
+        assert_eq!(outcome.1, "system");
+        assert!(outcome.2.contains("attempt-complete"));
+    }
+
+    #[tokio::test]
+    async fn successful_retirement_completion_replay_is_idempotent() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let scope = allocate_scope_worktree(&db, "root").await;
+        create_child(&db, "latest", "root").await;
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("latest"),
+            "attempt-replay-complete",
+        )
+        .await
+        .unwrap();
+        set_close_phase(
+            &db,
+            "attempt-replay-complete",
+            ClosePhase::AwaitingRetirementInspection,
+        )
+        .await;
+        db.replace_close_inspection(ReplaceCloseInspectionRequest {
+            attempt_id: CloseAttemptId::parse("attempt-replay-complete").unwrap(),
+            scopes: vec![ReplaceCloseInspectionScopeRequest {
+                scope: scope.clone(),
+                snapshot: CloseRetirementSnapshot::parse("complete-gen", "complete-fp").unwrap(),
+                losses: Vec::new(),
+            }],
+        })
+        .await
+        .unwrap();
+        let snapshot = current_test_snapshot(&db, "attempt-replay-complete").await;
+        capture_test_inventory(
+            &db,
+            "attempt-replay-complete",
+            &scope,
+            &snapshot,
+            Vec::new(),
+        )
+        .await;
+        for expected in db
+            .list_close_expected_retirement_resources("attempt-replay-complete")
+            .await
+            .unwrap()
+        {
+            db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
+                attempt_id: CloseAttemptId::parse("attempt-replay-complete").unwrap(),
+                snapshot: snapshot.clone(),
+                scope: expected.scope,
+                resource: expected.resource,
+                outcome: RetirementOutcome::Retired,
+                detail: None,
+            })
+            .await
+            .unwrap();
+        }
+        let attempt = CloseAttemptId::parse("attempt-replay-complete").unwrap();
+        let first = db.complete_close_retirement(&attempt).await.unwrap();
+        let replay = db.complete_close_retirement(&attempt).await.unwrap();
+        assert_eq!(first, replay);
+        let outcome_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages WHERE message_id = 'close-outcome:attempt-replay-complete'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(outcome_count, 1);
+    }
+
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn retirement_evidence_round_trips_and_rejects_divergent_replay() {
@@ -6024,7 +8251,7 @@ mod tests {
             .unwrap()
             .attached_work_scope_id
             .unwrap();
-        db.begin_close_foundation(&product_id("root"), "attempt-1")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("leaf"), "attempt-1")
             .await
             .unwrap();
         set_close_phase(&db, "attempt-1", ClosePhase::RetirementRequested).await;
@@ -6209,6 +8436,192 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worktree_cleanup_plan_round_trips_exact_path_and_rejects_divergence() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let scope = allocate_scope_worktree(&db, "root").await;
+        db.begin_close_foundation(&product_id("root"), &transcript_id("root"), "attempt-1")
+            .await
+            .unwrap();
+        set_close_phase(&db, "attempt-1", ClosePhase::RetirementRequested).await;
+        let snapshot = current_test_snapshot(&db, "attempt-1").await;
+        let worktree = current_test_worktree(&db, &scope).await;
+        let resource = RetiredResourceIdentity::parse(
+            RetiredResourceKind::Worktree,
+            LossItemIdentity::Worktree(worktree),
+        )
+        .unwrap();
+        capture_test_inventory(&db, "attempt-1", &scope, &snapshot, vec![resource.clone()]).await;
+        let attempt_id = CloseAttemptId::parse("attempt-1").unwrap();
+        db.record_close_retirement_dispatch(RecordCloseRetirementDispatchRequest {
+            attempt_id: attempt_id.clone(),
+            scope: scope.clone(),
+            snapshot: snapshot.clone(),
+            resource: resource.clone(),
+        })
+        .await
+        .unwrap();
+        let administrative_dir = std::path::PathBuf::from("/tmp/git/worktrees/exact");
+        let request = RecordCloseWorktreeCleanupPlanRequest {
+            attempt_id: attempt_id.clone(),
+            scope: scope.clone(),
+            snapshot: snapshot.clone(),
+            resource: resource.clone(),
+            administrative_dir: administrative_dir.clone(),
+            administrative_dir_incarnation: "admin-v1".to_string(),
+        };
+        db.record_close_worktree_cleanup_plan(request.clone())
+            .await
+            .unwrap();
+        db.record_close_worktree_cleanup_plan(request)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.close_worktree_cleanup_plan(&attempt_id, &scope, &snapshot, &resource)
+                .await
+                .unwrap(),
+            Some(CloseWorktreeCleanupPlan {
+                administrative_dir,
+                administrative_dir_incarnation: "admin-v1".to_string(),
+                final_tombstone: None,
+            })
+        );
+        let timestamp_types: (String, String, i64, i64) = sqlx::query_as(
+            "SELECT typeof(dispatch.dispatched_at_us), typeof(plan.planned_at_us),
+                    dispatch.dispatched_at_us, plan.planned_at_us
+             FROM close_retirement_resource_dispatches dispatch
+             JOIN close_worktree_cleanup_plans plan
+               ON plan.attempt_id = dispatch.attempt_id
+              AND plan.scope = dispatch.scope
+              AND plan.inspection_generation = dispatch.inspection_generation
+              AND plan.inspection_fingerprint = dispatch.inspection_fingerprint
+              AND plan.resource_kind = dispatch.resource_kind
+              AND plan.identity_kind = dispatch.identity_kind
+              AND plan.identity_value = dispatch.identity_value",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(timestamp_types.0, "integer");
+        assert_eq!(timestamp_types.1, "integer");
+        assert!(timestamp_types.2 >= 0);
+        assert!(timestamp_types.3 >= 0);
+        assert!(sqlx::query(
+            "UPDATE close_retirement_resource_dispatches SET dispatched_at_us = -1"
+        )
+        .execute(db.pool())
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            "UPDATE close_worktree_cleanup_plans SET planned_at_us = 'not-a-timestamp'"
+        )
+        .execute(db.pool())
+        .await
+        .is_err());
+
+        let divergent = db
+            .record_close_worktree_cleanup_plan(RecordCloseWorktreeCleanupPlanRequest {
+                attempt_id,
+                scope,
+                snapshot,
+                resource,
+                administrative_dir: std::path::PathBuf::from("/tmp/git/worktrees/replacement"),
+                administrative_dir_incarnation: "admin-v2".to_string(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(divergent, DbError::CloseFoundationPrecondition(_)));
+    }
+
+    #[tokio::test]
+    async fn interrupted_worktree_cleanup_adopts_absence_only_with_exact_durable_plan() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let scope = allocate_scope_worktree(&db, "root").await;
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-crash-boundary",
+        )
+        .await
+        .unwrap();
+        set_close_phase(
+            &db,
+            "attempt-crash-boundary",
+            ClosePhase::RetirementRequested,
+        )
+        .await;
+        let attempt_id = CloseAttemptId::parse("attempt-crash-boundary").unwrap();
+        let snapshot = current_test_snapshot(&db, attempt_id.as_str()).await;
+        let resource = RetiredResourceIdentity::parse(
+            RetiredResourceKind::Worktree,
+            LossItemIdentity::Worktree(current_test_worktree(&db, &scope).await),
+        )
+        .unwrap();
+        capture_test_inventory(
+            &db,
+            attempt_id.as_str(),
+            &scope,
+            &snapshot,
+            vec![resource.clone()],
+        )
+        .await;
+        db.record_close_retirement_dispatch(RecordCloseRetirementDispatchRequest {
+            attempt_id: attempt_id.clone(),
+            scope: scope.clone(),
+            snapshot: snapshot.clone(),
+            resource: resource.clone(),
+        })
+        .await
+        .unwrap();
+        let absence = || RecordCloseRetirementEvidenceRequest {
+            attempt_id: attempt_id.clone(),
+            scope: scope.clone(),
+            snapshot: snapshot.clone(),
+            resource: resource.clone(),
+            outcome: RetirementOutcome::AbsenceAdopted {
+                absence_basis: AbsenceBasis::SameAttemptPriorRetirement,
+            },
+            detail: Some("restart observed completed planned cleanup".to_string()),
+        };
+
+        let missing_plan = db
+            .record_close_retirement_evidence(absence())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            missing_plan,
+            DbError::CloseFoundationPrecondition(_)
+        ));
+
+        db.record_close_worktree_cleanup_plan(RecordCloseWorktreeCleanupPlanRequest {
+            attempt_id: attempt_id.clone(),
+            scope: scope.clone(),
+            snapshot: snapshot.clone(),
+            resource: resource.clone(),
+            administrative_dir: std::path::PathBuf::from("/tmp/crash-boundary-admin"),
+            administrative_dir_incarnation: "admin-crash-v1".to_string(),
+        })
+        .await
+        .unwrap();
+        db.record_close_retirement_evidence(absence())
+            .await
+            .unwrap();
+
+        let evidence = db
+            .list_close_retirement_evidence("attempt-crash-boundary")
+            .await
+            .unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(
+            evidence[0].outcome,
+            RetirementOutcome::AbsenceAdopted {
+                absence_basis: AbsenceBasis::SameAttemptPriorRetirement,
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn retirement_absence_requires_retained_exact_identity_evidence() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
@@ -6220,7 +8633,7 @@ mod tests {
             .unwrap()
             .attached_work_scope_id
             .unwrap();
-        db.begin_close_foundation(&product_id("root"), "attempt-1")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("root"), "attempt-1")
             .await
             .unwrap();
         set_close_phase(&db, "attempt-1", ClosePhase::RetirementRequested).await;
@@ -6303,9 +8716,13 @@ mod tests {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-concurrent-evidence")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-concurrent-evidence",
+        )
+        .await
+        .unwrap();
         set_close_phase(
             &db,
             "attempt-concurrent-evidence",
@@ -6363,7 +8780,7 @@ mod tests {
             .unwrap()
             .attached_work_scope_id
             .unwrap();
-        db.begin_close_foundation(&product_id("root"), "attempt-1")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("leaf"), "attempt-1")
             .await
             .unwrap();
 
@@ -6405,7 +8822,10 @@ mod tests {
         db.record_close_retirement_evidence(req.clone())
             .await
             .unwrap();
-        set_close_phase(&db, "attempt-1", ClosePhase::NeedsRepair).await;
+        assert_eq!(
+            db.get_close_obligation("attempt-1").await.unwrap().phase(),
+            ClosePhase::NeedsRepair
+        );
         db.record_close_retirement_evidence(req.clone())
             .await
             .unwrap();
@@ -6423,318 +8843,57 @@ mod tests {
     async fn retirement_evidence_is_monotonic_after_first_proof() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
-        create_child(&db, "leaf", "root").await;
-        allocate_scope_worktree(&db, "root").await;
-
-        let scope = db
-            .get_conversation("root")
-            .await
-            .unwrap()
-            .attached_work_scope_id
-            .unwrap();
-        let tmux_identity = LossItemIdentity::Opaque(OpaqueIdentity::parse("tmux:1").unwrap());
-        db.begin_close_foundation(&product_id("root"), "prior-attempt")
-            .await
-            .unwrap();
-        set_close_phase(&db, "prior-attempt", ClosePhase::RetirementRequested).await;
-        let prior_snapshot = current_test_snapshot(&db, "prior-attempt").await;
-        capture_test_inventory(
-            &db,
-            "prior-attempt",
-            &scope,
-            &prior_snapshot,
-            vec![RetiredResourceIdentity::parse(
-                RetiredResourceKind::TmuxServer,
-                tmux_identity.clone(),
-            )
-            .unwrap()],
-        )
-        .await;
-        db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
-            attempt_id: CloseAttemptId::parse("prior-attempt").unwrap(),
-            snapshot: current_test_snapshot(&db, "prior-attempt").await,
-            scope: scope.clone(),
-            resource: RetiredResourceIdentity::parse(
-                RetiredResourceKind::TmuxServer,
-                tmux_identity.clone(),
-            )
-            .unwrap(),
-            outcome: RetirementOutcome::Retired,
-            detail: Some("prior exact proof".to_string()),
-        })
-        .await
-        .unwrap();
-        set_close_phase(&db, "prior-attempt", ClosePhase::Completed).await;
-        sqlx::query(
-            "UPDATE conversations SET archived = 0
-             WHERE id IN (
-                 SELECT conversation_id FROM close_attempt_members WHERE attempt_id = 'prior-attempt'
-             )",
-        )
-        .execute(db.pool())
-        .await
-        .unwrap();
-
-        db.begin_close_foundation(&product_id("root"), "attempt-1")
+        let scope = allocate_scope_worktree(&db, "root").await;
+        db.begin_close_foundation(&product_id("root"), &transcript_id("root"), "attempt-1")
             .await
             .unwrap();
         set_close_phase(&db, "attempt-1", ClosePhase::RetirementRequested).await;
-
-        let worktree_identity =
-            LossItemIdentity::Worktree(current_test_worktree(&db, &scope).await);
-        let browser_identity =
-            LossItemIdentity::Opaque(OpaqueIdentity::parse("browser:1").unwrap());
-        let current_snapshot = current_test_snapshot(&db, "attempt-1").await;
+        let snapshot = current_test_snapshot(&db, "attempt-1").await;
         capture_test_inventory(
             &db,
             "attempt-1",
             &scope,
-            &current_snapshot,
-            vec![
-                RetiredResourceIdentity::parse(
-                    RetiredResourceKind::Worktree,
-                    worktree_identity.clone(),
-                )
-                .unwrap(),
-                RetiredResourceIdentity::parse(
-                    RetiredResourceKind::BrowserSession,
-                    browser_identity.clone(),
-                )
-                .unwrap(),
-                RetiredResourceIdentity::parse(
-                    RetiredResourceKind::TmuxServer,
-                    tmux_identity.clone(),
-                )
-                .unwrap(),
-            ],
+            &snapshot,
+            vec![RetiredResourceIdentity::parse(
+                RetiredResourceKind::Worktree,
+                LossItemIdentity::Worktree(current_test_worktree(&db, &scope).await),
+            )
+            .unwrap()],
         )
         .await;
-        db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
+        let worktree = current_test_worktree(&db, &scope).await;
+        let resource = RetiredResourceIdentity::parse(
+            RetiredResourceKind::Worktree,
+            LossItemIdentity::Worktree(worktree),
+        )
+        .unwrap();
+        let request = RecordCloseRetirementEvidenceRequest {
             attempt_id: CloseAttemptId::parse("attempt-1").unwrap(),
-            snapshot: current_test_snapshot(&db, "attempt-1").await,
-            scope: scope.clone(),
-            resource: RetiredResourceIdentity::parse(
-                RetiredResourceKind::Worktree,
-                worktree_identity.clone(),
-            )
-            .unwrap(),
+            snapshot: snapshot.clone(),
+            scope,
+            resource,
             outcome: RetirementOutcome::Retired,
-            detail: Some("retired first".to_string()),
-        })
-        .await
-        .unwrap();
-        assert!(db
-            .record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
-                attempt_id: CloseAttemptId::parse("attempt-1").unwrap(),
-                snapshot: current_test_snapshot(&db, "attempt-1").await,
-                scope: scope.clone(),
-                resource: RetiredResourceIdentity::parse(
-                    RetiredResourceKind::Worktree,
-                    worktree_identity.clone(),
-                )
-                .unwrap(),
-                outcome: RetirementOutcome::Residual {
-                    residual_reason: RetirementFailureReason::RemovalFailed,
-                },
-                detail: Some("later residual".to_string()),
-            })
-            .await
-            .is_err());
-
-        db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
-            attempt_id: CloseAttemptId::parse("attempt-1").unwrap(),
-            snapshot: current_test_snapshot(&db, "attempt-1").await,
-            scope: scope.clone(),
-            resource: RetiredResourceIdentity::parse(
-                RetiredResourceKind::BrowserSession,
-                browser_identity.clone(),
-            )
-            .unwrap(),
-            outcome: RetirementOutcome::Residual {
-                residual_reason: RetirementFailureReason::ManualRepairRequired,
-            },
-            detail: Some("residual first".to_string()),
-        })
-        .await
-        .unwrap();
-        db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
-            attempt_id: CloseAttemptId::parse("attempt-1").unwrap(),
-            snapshot: current_test_snapshot(&db, "attempt-1").await,
-            scope: scope.clone(),
-            resource: RetiredResourceIdentity::parse(
-                RetiredResourceKind::BrowserSession,
-                browser_identity.clone(),
-            )
-            .unwrap(),
-            outcome: RetirementOutcome::Retired,
-            detail: Some("retired later".to_string()),
-        })
-        .await
-        .unwrap();
-        let history_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM close_retirement_resource_history
-             WHERE attempt_id = 'attempt-1' AND resource_kind = 'browser_session'",
-        )
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-        assert_eq!(history_count, 2);
-        db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
-            attempt_id: CloseAttemptId::parse("attempt-1").unwrap(),
-            snapshot: current_test_snapshot(&db, "attempt-1").await,
-            scope: scope.clone(),
-            resource: RetiredResourceIdentity::parse(
-                RetiredResourceKind::BrowserSession,
-                browser_identity.clone(),
-            )
-            .unwrap(),
-            outcome: RetirementOutcome::Retired,
-            detail: Some("retired later".to_string()),
-        })
-        .await
-        .unwrap();
-        let replay_history_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM close_retirement_resource_history
-             WHERE attempt_id = 'attempt-1' AND resource_kind = 'browser_session'",
-        )
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-        assert_eq!(replay_history_count, 2);
-        let invalid_history_timestamp = sqlx::query(
-            "INSERT INTO close_retirement_resource_history (
-                 attempt_id, scope, inspection_generation, inspection_fingerprint,
-                 resource_kind, identity_kind, identity_codec, identity_value,
-                 proof_kind, absence_basis, residual_reason, detail, recorded_at
-             )
-             SELECT attempt_id, scope, inspection_generation, inspection_fingerprint,
-                    resource_kind, identity_kind, identity_codec, identity_value,
-                    proof_kind, absence_basis, residual_reason, 'invalid timestamp replay',
-                    'not-rfc3339'
-             FROM close_retirement_resource_history
-             WHERE attempt_id = 'attempt-1'
-             LIMIT 1",
-        )
-        .execute(db.pool())
-        .await
-        .unwrap_err();
-        assert!(invalid_history_timestamp
-            .to_string()
-            .contains("must be valid RFC 3339"));
-        let invalid_history_codec = sqlx::query(
-            "INSERT INTO close_retirement_resource_history (
-                 attempt_id, scope, inspection_generation, inspection_fingerprint,
-                 resource_kind, identity_kind, identity_codec, identity_value,
-                 proof_kind, absence_basis, residual_reason, detail, recorded_at
-             )
-             SELECT attempt_id, scope, inspection_generation, inspection_fingerprint,
-                    resource_kind, identity_kind, 'opaque_string_v1', identity_value,
-                    proof_kind, absence_basis, residual_reason, 'invalid codec replay',
-                    recorded_at
-             FROM close_retirement_resource_history
-             WHERE attempt_id = 'attempt-1' AND identity_kind = 'worktree'
-             LIMIT 1",
-        )
-        .execute(db.pool())
-        .await
-        .unwrap_err();
-        assert!(invalid_history_codec
-            .to_string()
-            .contains("CHECK constraint"));
-
-        db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
-            attempt_id: CloseAttemptId::parse("attempt-1").unwrap(),
-            snapshot: current_test_snapshot(&db, "attempt-1").await,
-            scope: scope.clone(),
-            resource: RetiredResourceIdentity::parse(
-                RetiredResourceKind::TmuxServer,
-                tmux_identity.clone(),
-            )
-            .unwrap(),
-            outcome: RetirementOutcome::AbsenceAdopted {
-                absence_basis: AbsenceBasis::PreexistingExactIdentityEvidence,
-            },
-            detail: Some("absence first".to_string()),
-        })
-        .await
-        .unwrap();
-        assert!(db
-            .record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
-                attempt_id: CloseAttemptId::parse("attempt-1").unwrap(),
-                snapshot: current_test_snapshot(&db, "attempt-1").await,
-                scope: scope.clone(),
-                resource: RetiredResourceIdentity::parse(
-                    RetiredResourceKind::TmuxServer,
-                    tmux_identity.clone(),
-                )
-                .unwrap(),
-                outcome: RetirementOutcome::Residual {
-                    residual_reason: RetirementFailureReason::ManualRepairRequired,
-                },
-                detail: Some("residual later".to_string()),
-            })
-            .await
-            .is_err());
-
-        let evidence = db
-            .list_close_retirement_evidence("attempt-1")
+            detail: Some("exact retired proof".to_string()),
+        };
+        db.record_close_retirement_evidence(request.clone())
             .await
             .unwrap();
-        assert!(evidence
-            .iter()
-            .any(|item| item.resource.identity() == &worktree_identity
-                && item.outcome == RetirementOutcome::Retired
-                && item.detail.as_deref() == Some("retired first")));
-        assert!(evidence
-            .iter()
-            .any(|item| item.resource.identity() == &browser_identity
-                && item.outcome == RetirementOutcome::Retired
-                && item.detail.as_deref() == Some("retired later")));
-        assert!(evidence
-            .iter()
-            .any(|item| item.resource.identity() == &tmux_identity
-                && item.outcome
-                    == RetirementOutcome::AbsenceAdopted {
-                        absence_basis: AbsenceBasis::PreexistingExactIdentityEvidence
-                    }
-                && item.detail.as_deref() == Some("absence first")));
-        assert!(sqlx::query(
-            "DELETE FROM close_retirement_resources
-             WHERE attempt_id = 'prior-attempt' AND identity_value = ?1",
-        )
-        .bind(tmux_identity.value())
-        .execute(db.pool())
+        db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
+            outcome: RetirementOutcome::AbsenceAdopted {
+                absence_basis: AbsenceBasis::SameAttemptPriorRetirement,
+            },
+            detail: Some("already retired is absent on replay".to_string()),
+            ..request
+        })
         .await
-        .is_err());
-        assert!(sqlx::query(
-            "UPDATE close_retirement_resources
-             SET proof_kind = 'residual', residual_reason = 'manual_repair_required'
-             WHERE attempt_id = 'prior-attempt' AND identity_value = ?1",
-        )
-        .bind(tmux_identity.value())
-        .execute(db.pool())
-        .await
-        .is_err());
-        assert!(
-            sqlx::query("DELETE FROM close_obligations WHERE attempt_id = 'prior-attempt'",)
-                .execute(db.pool())
+        .unwrap();
+        assert_eq!(
+            db.list_close_retirement_evidence("attempt-1")
                 .await
-                .is_err()
+                .unwrap()
+                .len(),
+            1
         );
-        assert!(sqlx::query(
-            "UPDATE close_obligations
-             SET inspection_generation = 'other-gen', inspection_fingerprint = 'other-fp'
-             WHERE attempt_id = 'prior-attempt'",
-        )
-        .execute(db.pool())
-        .await
-        .is_err());
-        assert!(sqlx::query("DELETE FROM conversations WHERE id = 'root'")
-            .execute(db.pool())
-            .await
-            .is_err());
-        assert!(db.get_close_obligation("prior-attempt").await.is_ok());
-        assert!(db.get_close_obligation("attempt-1").await.is_ok());
     }
 
     #[tokio::test]
@@ -6765,7 +8924,7 @@ mod tests {
             .execute(db.pool())
             .await
             .unwrap();
-        db.begin_close_foundation(&product_id("root"), "attempt-1")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("leaf"), "attempt-1")
             .await
             .unwrap();
         set_close_phase(&db, "attempt-1", ClosePhase::AwaitingRetirementInspection).await;
@@ -6855,12 +9014,211 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancel_close_before_retirement_clears_snapshot_and_completes() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let scope = allocate_scope_worktree(&db, "root").await;
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-cancel-before-retirement",
+        )
+        .await
+        .unwrap();
+        set_close_phase(
+            &db,
+            "attempt-cancel-before-retirement",
+            ClosePhase::AwaitingRetirementInspection,
+        )
+        .await;
+        db.replace_close_inspection(ReplaceCloseInspectionRequest {
+            attempt_id: CloseAttemptId::parse("attempt-cancel-before-retirement").unwrap(),
+            scopes: vec![ReplaceCloseInspectionScopeRequest {
+                scope,
+                snapshot: CloseRetirementSnapshot::parse("scope-gen", "scope-fp").unwrap(),
+                losses: vec![CloseLossItem::UntrackedNonIgnoredPath(
+                    GitPathIdentity::from_bytes(b"dirty.txt".to_vec()),
+                )],
+            }],
+        })
+        .await
+        .unwrap();
+        let awaiting = db
+            .get_close_obligation("attempt-cancel-before-retirement")
+            .await
+            .unwrap();
+        assert_eq!(awaiting.phase(), ClosePhase::AwaitingLossConfirmation);
+        assert!(awaiting.snapshot().is_some());
+
+        let cancelled = db
+            .cancel_close_before_retirement("attempt-cancel-before-retirement")
+            .await
+            .unwrap();
+        assert_eq!(cancelled.phase(), ClosePhase::Completed);
+        assert_eq!(
+            cancelled.close_outcome(),
+            Some(CloseCompletionOutcome::Cancelled)
+        );
+        assert!(cancelled.snapshot().is_none());
+
+        let stored = db
+            .get_close_obligation("attempt-cancel-before-retirement")
+            .await
+            .unwrap();
+        assert_eq!(stored.phase(), ClosePhase::Completed);
+        assert_eq!(
+            stored.close_outcome(),
+            Some(CloseCompletionOutcome::Cancelled)
+        );
+        assert!(stored.snapshot().is_none());
+        let snapshot_columns: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT inspection_generation, inspection_fingerprint
+             FROM close_obligations WHERE attempt_id = ?1",
+        )
+        .bind("attempt-cancel-before-retirement")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(snapshot_columns, (None, None));
+    }
+
+    #[tokio::test]
+    async fn cancel_close_before_retirement_covers_every_pre_retirement_phase() {
+        for stop_work_confirmed in [false, true] {
+            let db = Database::open_in_memory().await.unwrap();
+            create_root(&db, "root").await;
+            let attempt_id = format!("attempt-cancel-stop-{stop_work_confirmed}");
+            db.begin_close_foundation(&product_id("root"), &transcript_id("root"), &attempt_id)
+                .await
+                .unwrap();
+            if stop_work_confirmed {
+                db.confirm_close_stop_work(&attempt_id).await.unwrap();
+            }
+            let cancelled = db
+                .cancel_close_before_retirement(&attempt_id)
+                .await
+                .unwrap();
+            assert_eq!(cancelled.phase(), ClosePhase::Completed);
+            assert_eq!(
+                cancelled.close_outcome(),
+                Some(CloseCompletionOutcome::Cancelled)
+            );
+        }
+
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let attempt_id = "attempt-cancel-settling-all-phases";
+        db.begin_close_foundation(&product_id("root"), &transcript_id("root"), attempt_id)
+            .await
+            .unwrap();
+        db.confirm_close_stop_work(attempt_id).await.unwrap();
+        db.begin_close_active_work_settlement(attempt_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.cancel_close_before_retirement(attempt_id)
+                .await
+                .unwrap()
+                .phase(),
+            ClosePhase::CancelRequestedDuringSettlement
+        );
+        assert_eq!(
+            db.cancel_close_before_retirement(attempt_id)
+                .await
+                .unwrap()
+                .phase(),
+            ClosePhase::CancelRequestedDuringSettlement
+        );
+
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let attempt_id = "attempt-cancel-inspection";
+        db.begin_close_foundation(&product_id("root"), &transcript_id("root"), attempt_id)
+            .await
+            .unwrap();
+        db.confirm_close_stop_work(attempt_id).await.unwrap();
+        db.begin_close_active_work_settlement(attempt_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.advance_close_settlement_when_quiescent(attempt_id)
+                .await
+                .unwrap()
+                .phase(),
+            ClosePhase::AwaitingRetirementInspection
+        );
+        assert_eq!(
+            db.cancel_close_before_retirement(attempt_id)
+                .await
+                .unwrap()
+                .phase(),
+            ClosePhase::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn loss_confirmation_requires_the_exact_persisted_snapshot() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let scope = allocate_scope_worktree(&db, "root").await;
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-confirm-loss",
+        )
+        .await
+        .unwrap();
+        set_close_phase(
+            &db,
+            "attempt-confirm-loss",
+            ClosePhase::AwaitingRetirementInspection,
+        )
+        .await;
+        let scope_snapshot = CloseRetirementSnapshot::parse("scope-gen", "scope-fp").unwrap();
+        db.replace_close_inspection(ReplaceCloseInspectionRequest {
+            attempt_id: CloseAttemptId::parse("attempt-confirm-loss").unwrap(),
+            scopes: vec![ReplaceCloseInspectionScopeRequest {
+                scope,
+                snapshot: scope_snapshot,
+                losses: vec![CloseLossItem::UntrackedNonIgnoredPath(
+                    GitPathIdentity::from_bytes(b"new.txt".to_vec()),
+                )],
+            }],
+        })
+        .await
+        .unwrap();
+        let obligation = db
+            .get_close_obligation("attempt-confirm-loss")
+            .await
+            .unwrap();
+        let stale =
+            CloseRetirementSnapshot::parse("stale", obligation.snapshot().unwrap().fingerprint())
+                .unwrap();
+        assert!(matches!(
+            db.confirm_close_loss_retirement(
+                &CloseAttemptId::parse("attempt-confirm-loss").unwrap(),
+                &stale,
+            )
+            .await,
+            Err(DbError::CloseFoundationPrecondition(message)) if message.contains("snapshot is stale")
+        ));
+        let confirmed = db
+            .confirm_close_loss_retirement(
+                &CloseAttemptId::parse("attempt-confirm-loss").unwrap(),
+                obligation.snapshot().unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(confirmed.phase(), ClosePhase::RetirementRequested);
+    }
+
+    #[tokio::test]
     async fn awaiting_retirement_inspection_cannot_skip_loss_confirmation_when_losses_persist() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "leaf", "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-lossy")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("leaf"), "attempt-lossy")
             .await
             .unwrap();
         set_close_phase(
@@ -6911,9 +9269,13 @@ mod tests {
         create_root(&db, "root").await;
         create_child(&db, "leaf", "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-clean-branch")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("leaf"),
+            "attempt-clean-branch",
+        )
+        .await
+        .unwrap();
         set_close_phase(
             &db,
             "attempt-clean-branch",
@@ -7067,6 +9429,170 @@ mod tests {
         assert_eq!(pending[0].attempt_id().as_str(), "later-instant");
     }
 
+    #[tokio::test]
+    async fn retry_reopens_reinspection_so_resources_admitted_during_repair_are_resealed() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let scope = allocate_scope_worktree(&db, "root").await;
+        let attempt = CloseAttemptId::parse("attempt-reseal-after-repair").unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            attempt.as_str(),
+        )
+        .await
+        .unwrap();
+        set_close_phase(&db, attempt.as_str(), ClosePhase::RetirementRequested).await;
+        let snapshot = current_test_snapshot(&db, attempt.as_str()).await;
+        let resources = db
+            .capture_close_retirement_inventory(CaptureCloseRetirementInventoryRequest {
+                attempt_id: attempt.clone(),
+                snapshot: snapshot.clone(),
+                scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
+                    scope: scope.clone(),
+                    inventory: CloseOwnedResourceInventory {
+                        worktree: Some(current_test_worktree(&db, &scope).await),
+                        work_scopes: std::collections::BTreeSet::default(),
+                        bash_process_groups: std::collections::BTreeSet::default(),
+                        tmux_servers: std::collections::BTreeSet::default(),
+                        pty_sessions: std::collections::BTreeSet::default(),
+                        browser_sessions: std::collections::BTreeSet::default(),
+                        equivalent_live_resources: std::collections::BTreeSet::default(),
+                    },
+                }],
+            })
+            .await
+            .unwrap();
+        let worktree = resources
+            .into_iter()
+            .find(|resource| resource.resource.kind() == RetiredResourceKind::Worktree)
+            .unwrap();
+        db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
+            attempt_id: attempt.clone(),
+            snapshot: snapshot.clone(),
+            scope,
+            resource: worktree.resource,
+            outcome: RetirementOutcome::Residual {
+                residual_reason: RetirementFailureReason::RemovalFailed,
+            },
+            detail: Some("repair remains required".to_string()),
+        })
+        .await
+        .unwrap();
+
+        let retried = db.retry_close_retirement(&attempt).await.unwrap();
+        assert_eq!(retried.phase(), ClosePhase::AwaitingRetirementInspection);
+        assert_eq!(retried.snapshot(), Some(&snapshot));
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn dispatched_absence_retry_resumes_retirement_with_retained_snapshot() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let scope = allocate_scope_worktree(&db, "root").await;
+        let attempt = CloseAttemptId::parse("attempt-dispatched-absence-retry").unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            attempt.as_str(),
+        )
+        .await
+        .unwrap();
+        set_close_phase(&db, attempt.as_str(), ClosePhase::RetirementRequested).await;
+        let snapshot = current_test_snapshot(&db, attempt.as_str()).await;
+        let resources = db
+            .capture_close_retirement_inventory(CaptureCloseRetirementInventoryRequest {
+                attempt_id: attempt.clone(),
+                snapshot: snapshot.clone(),
+                scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
+                    scope: scope.clone(),
+                    inventory: CloseOwnedResourceInventory {
+                        worktree: Some(current_test_worktree(&db, &scope).await),
+                        work_scopes: std::collections::BTreeSet::default(),
+                        bash_process_groups: std::collections::BTreeSet::default(),
+                        tmux_servers: std::collections::BTreeSet::default(),
+                        pty_sessions: std::collections::BTreeSet::default(),
+                        browser_sessions: std::collections::BTreeSet::default(),
+                        equivalent_live_resources: std::collections::BTreeSet::default(),
+                    },
+                }],
+            })
+            .await
+            .unwrap();
+        let worktree = resources
+            .into_iter()
+            .find(|resource| resource.resource.kind() == RetiredResourceKind::Worktree)
+            .unwrap();
+        db.record_close_retirement_dispatch(RecordCloseRetirementDispatchRequest {
+            attempt_id: attempt.clone(),
+            snapshot: snapshot.clone(),
+            scope: scope.clone(),
+            resource: worktree.resource.clone(),
+        })
+        .await
+        .unwrap();
+        let cleanup_dir = std::path::PathBuf::from("/tmp/dispatched-absence-admin");
+        db.record_close_worktree_cleanup_plan(RecordCloseWorktreeCleanupPlanRequest {
+            attempt_id: attempt.clone(),
+            snapshot: snapshot.clone(),
+            scope: scope.clone(),
+            resource: worktree.resource.clone(),
+            administrative_dir: cleanup_dir.clone(),
+            administrative_dir_incarnation: "admin-cleanup-v1".to_string(),
+        })
+        .await
+        .unwrap();
+        db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
+            attempt_id: attempt.clone(),
+            snapshot: snapshot.clone(),
+            scope: scope.clone(),
+            resource: worktree.resource.clone(),
+            outcome: RetirementOutcome::Residual {
+                residual_reason: RetirementFailureReason::RemovalFailed,
+            },
+            detail: Some("later cleanup requires repair".to_string()),
+        })
+        .await
+        .unwrap();
+        db.retry_close_retirement(&attempt).await.unwrap();
+
+        let replacement = db
+            .resume_close_retirement_after_dispatched_absence(
+                &attempt,
+                &snapshot,
+                "server_git_status_v2_retry_dispatched_absence",
+            )
+            .await
+            .unwrap();
+        let resumed = db.get_close_obligation(attempt.as_str()).await.unwrap();
+        assert_eq!(resumed.phase(), ClosePhase::RetirementRequested);
+        assert_eq!(resumed.snapshot(), Some(&replacement));
+        assert!(db
+            .close_retirement_resource_was_dispatched(
+                &attempt,
+                &scope,
+                &replacement,
+                &worktree.resource,
+            )
+            .await
+            .unwrap());
+        assert_eq!(
+            db.close_worktree_cleanup_plan(&attempt, &scope, &replacement, &worktree.resource,)
+                .await
+                .unwrap(),
+            Some(CloseWorktreeCleanupPlan {
+                administrative_dir: cleanup_dir,
+                administrative_dir_incarnation: "admin-cleanup-v1".to_string(),
+                final_tombstone: None,
+            }),
+        );
+        assert!(db
+            .close_retirement_inventory_is_complete(attempt.as_str())
+            .await
+            .unwrap());
+    }
+
     #[test]
     fn retirement_evidence_request_requires_typed_resource_identity() {
         assert!(RetiredResourceIdentity::parse(
@@ -7080,7 +9606,7 @@ mod tests {
     async fn retirement_evidence_rejects_untargeted_scope() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
-        db.begin_close_foundation(&product_id("root"), "attempt-1")
+        db.begin_close_foundation(&product_id("root"), &transcript_id("root"), "attempt-1")
             .await
             .unwrap();
         let other_scope = WorkScopeId::parse("close-scope-other").unwrap();

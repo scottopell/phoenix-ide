@@ -210,6 +210,18 @@ describe('InputArea compact composer layout', () => {
     expect(textarea).toHaveAttribute('rows', '1');
   });
 
+  it('uses concise queue copy when the agent is working', () => {
+    renderInput({
+      cwd: 'conv-working',
+      convState: { type: 'llm_requesting', attempt: 1 },
+      draft: '',
+    });
+
+    expect(screen.getByRole('textbox')).toHaveAttribute('placeholder', 'Queue follow-up...');
+    expect(screen.getByRole('button', { name: 'Stop' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Queue follow-up' })).toBeInTheDocument();
+  });
+
   it('uses icon-only action buttons with preserved accessible names and titles', () => {
     renderInput({
       cwd: 'conv-icons',

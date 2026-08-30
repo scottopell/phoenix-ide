@@ -4,7 +4,7 @@ import type { SseInitData } from '../api';
 import type { SSEAction, InitPayload } from '../conversation/atom';
 import { parseConversationState } from '../utils';
 import { generateUUID } from '../utils/uuid';
-import { notifyConversationStateChange } from '../notifications';
+import { notifyCloseSnapshotChanged, notifyConversationStateChange } from '../notifications';
 import {
   SseInitDataSchema,
   SseMessageDataSchema,
@@ -666,6 +666,7 @@ export function useConnection({
               sequenceId: res.data.sequence_id,
               inventory: res.data.inventory,
             });
+            notifyCloseSnapshotChanged(convId);
           });
 
           // REQ-BED-032 step 6: hard-delete cascade emits this on the

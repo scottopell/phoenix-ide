@@ -3,16 +3,19 @@ use axum::{
     Json,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+#[cfg(test)]
+use phoenix_core::domain::close::TranscriptConversationId;
 use phoenix_core::domain::product_conversation::OrdinaryProductConversationLifecycle;
 use serde::{Deserialize, Serialize};
 
 use super::handlers::AppError;
 use super::types::{
     OrdinaryProductConversationLifecycleView, ProductConversationChainQaCompatibilityView,
-    ProductConversationClosePhaseView, ProductConversationCloseView,
-    ProductConversationCreationAllowedActionView, ProductConversationCreationRecoveryResponse,
-    ProductConversationCreationRecoveryRow, ProductConversationHandoffView,
-    ProductConversationListResponse, ProductConversationListRow,
+    ProductConversationCloseInspectionView, ProductConversationCloseLossView,
+    ProductConversationClosePhaseView, ProductConversationCloseResidualView,
+    ProductConversationCloseView, ProductConversationCreationAllowedActionView,
+    ProductConversationCreationRecoveryResponse, ProductConversationCreationRecoveryRow,
+    ProductConversationHandoffView, ProductConversationListResponse, ProductConversationListRow,
     ProductConversationPresentationView, ProductConversationSegmentView,
     ProductConversationSnapshotView, ProductConversationSourceRelationView,
     ProductConversationSourceView, ProductConversationTranscriptRowView,
@@ -265,10 +268,9 @@ async fn snapshot_view(
     );
     let close = state
         .db
-        .get_active_close_obligation_for_product(aggregate.product_conversation.id())
+        .get_active_close_projection_for_product(aggregate.product_conversation.id())
         .await
         .map_err(db_to_app)?
-        .as_ref()
         .map(close_view);
     let generation = aggregate_generation(&aggregate);
     let segment_ceilings = cursor.as_ref().map_or_else(
@@ -625,10 +627,10 @@ fn validate_cursor(
     Ok(())
 }
 
-fn close_view(
-    obligation: &phoenix_core::domain::close::CloseObligation,
-) -> ProductConversationCloseView {
+fn close_view(projection: crate::db::CloseProjection) -> ProductConversationCloseView {
     use phoenix_core::domain::close::ClosePhase;
+
+    let obligation = projection.obligation;
 
     let phase = match obligation.phase() {
         ClosePhase::AwaitingBlockerResolution => {
@@ -654,6 +656,61 @@ fn close_view(
     ProductConversationCloseView {
         attempt_id: obligation.attempt_id().to_string(),
         phase,
+        confirmation_snapshot: obligation.snapshot().map(|snapshot| {
+            ProductConversationCloseInspectionView {
+                scope: "aggregate".to_string(),
+                generation: snapshot.generation().to_string(),
+                fingerprint: snapshot.fingerprint().to_string(),
+            }
+        }),
+        inspections: projection
+            .inspections
+            .into_iter()
+            .map(|inspection| ProductConversationCloseInspectionView {
+                scope: inspection.target.scope.as_str().to_string(),
+                generation: inspection.snapshot.generation().to_string(),
+                fingerprint: inspection.snapshot.fingerprint().to_string(),
+            })
+            .collect(),
+        losses: projection
+            .losses
+            .into_iter()
+            .map(|loss| ProductConversationCloseLossView {
+                scope: loss.scope.as_str().to_string(),
+                generation: loss.snapshot.generation().to_string(),
+                category: loss.item.category().as_str().to_string(),
+                identity: match loss.item.identity() {
+                    phoenix_core::domain::close::LossItemIdentity::GitPath(path) => path.encode(),
+                    phoenix_core::domain::close::LossItemIdentity::GitOid(oid) => {
+                        oid.as_str().to_string()
+                    }
+                    phoenix_core::domain::close::LossItemIdentity::Opaque(identity) => {
+                        identity.as_str().to_string()
+                    }
+                    phoenix_core::domain::close::LossItemIdentity::Worktree(identity) => {
+                        format!("{identity:?}")
+                    }
+                },
+            })
+            .collect(),
+        residuals: projection
+            .residuals
+            .into_iter()
+            .filter_map(|residual| {
+                let phoenix_core::domain::close::RetirementOutcome::Residual { residual_reason } =
+                    residual.outcome
+                else {
+                    return None;
+                };
+                Some(ProductConversationCloseResidualView {
+                    scope: residual.scope.as_str().to_string(),
+                    resource_kind: residual.resource.kind().as_str().to_string(),
+                    identity: residual.resource.identity().value(),
+                    reason: residual_reason.as_str().to_string(),
+                    detail: residual.detail,
+                })
+            })
+            .collect(),
     }
 }
 
@@ -957,7 +1014,11 @@ mod tests {
 
         state
             .db
-            .begin_close_foundation(&root.product_conversation_id, "snapshot-close")
+            .begin_close_foundation(
+                &root.product_conversation_id,
+                &TranscriptConversationId::parse(successor.id.clone()).unwrap(),
+                "snapshot-close",
+            )
             .await
             .unwrap();
 

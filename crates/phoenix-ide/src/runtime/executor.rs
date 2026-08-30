@@ -8106,6 +8106,7 @@ where
                     task_title: None,
                     work_scope_key: None,
                     model: None,
+                    archived: None,
                 },
             });
 
@@ -8302,6 +8303,7 @@ where
                             task_title: Some(approval_result.task_title.clone()),
                             work_scope_key: Some(self.context.resource_scope.stable_key()),
                             model: None,
+                            archived: None,
                         },
                     });
 

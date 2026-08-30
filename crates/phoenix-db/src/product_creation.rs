@@ -895,14 +895,6 @@ impl Database {
         )
         .await?;
         insert_conversation_tx(&mut tx, &input.conversation).await?;
-        sqlx::query(
-            "INSERT INTO product_conversation_work_scopes (product_conversation_id, work_scope_id)
-             VALUES (?1, ?2)",
-        )
-        .bind(input.conversation.product_conversation_id.as_str())
-        .bind(scope_id.as_str())
-        .execute(&mut *tx)
-        .await?;
         let commit_now = unix_micros_now();
         let updated = sqlx::query(
             "UPDATE product_creation_jobs

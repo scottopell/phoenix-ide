@@ -162,14 +162,20 @@ impl ClosePhase {
             Self::CancelRequestedDuringSettlement => next == Self::Completed,
             Self::AwaitingRetirementInspection => matches!(
                 next,
-                Self::AwaitingLossConfirmation | Self::RetirementRequested | Self::Completed
+                Self::AwaitingLossConfirmation
+                    | Self::RetirementRequested
+                    | Self::NeedsRepair
+                    | Self::Completed
             ),
             Self::AwaitingLossConfirmation => matches!(
                 next,
                 Self::AwaitingRetirementInspection | Self::RetirementRequested | Self::Completed
             ),
             Self::RetirementRequested => matches!(next, Self::NeedsRepair | Self::Completed),
-            Self::NeedsRepair => matches!(next, Self::RetirementRequested | Self::Completed),
+            Self::NeedsRepair => matches!(
+                next,
+                Self::AwaitingRetirementInspection | Self::RetirementRequested | Self::Completed
+            ),
             Self::Completed => false,
         }
     }
@@ -228,6 +234,7 @@ impl LossCategory {
 #[serde(rename_all = "snake_case")]
 pub enum RetiredResourceKind {
     Worktree,
+    WorkScope,
     BashProcessGroup,
     TmuxServer,
     PtySession,
@@ -240,7 +247,8 @@ impl RetiredResourceKind {
     pub fn admits_identity_kind(self, identity: &LossItemIdentity) -> bool {
         match self {
             Self::Worktree => matches!(identity, LossItemIdentity::Worktree(_)),
-            Self::BashProcessGroup
+            Self::WorkScope
+            | Self::BashProcessGroup
             | Self::TmuxServer
             | Self::PtySession
             | Self::BrowserSession
@@ -254,6 +262,7 @@ impl RetiredResourceKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Worktree => "worktree",
+            Self::WorkScope => "work_scope",
             Self::BashProcessGroup => "bash_process_group",
             Self::TmuxServer => "tmux_server",
             Self::PtySession => "pty_session",
@@ -522,6 +531,11 @@ impl<'de> Deserialize<'de> for GitOidIdentity {
 }
 
 impl GitOidIdentity {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
     /// Parses a SHA-1 or SHA-256 Git object identifier and normalizes it to lowercase.
     ///
     /// # Errors
@@ -746,6 +760,20 @@ impl CapturedConversationStateKind {
             "seeded_llm_requesting" => Self::SeededLlmRequesting,
             _ => return None,
         })
+    }
+
+    #[must_use]
+    pub const fn is_busy(self) -> bool {
+        matches!(
+            self,
+            Self::LlmRequesting
+                | Self::SeededLlmRequesting
+                | Self::Provisioning
+                | Self::ToolExecuting
+                | Self::CancellingTool
+                | Self::AwaitingSubAgents
+                | Self::CancellingSubAgents
+        )
     }
 }
 
@@ -1084,6 +1112,7 @@ impl std::error::Error for RetiredResourceIdentityError {}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloseOwnedResourceInventory {
     pub worktree: Option<WorktreeIdentity>,
+    pub work_scopes: std::collections::BTreeSet<OpaqueIdentity>,
     pub bash_process_groups: std::collections::BTreeSet<OpaqueIdentity>,
     pub tmux_servers: std::collections::BTreeSet<OpaqueIdentity>,
     pub pty_sessions: std::collections::BTreeSet<OpaqueIdentity>,
@@ -1111,6 +1140,12 @@ impl CloseOwnedResourceInventory {
                 )
                 .expect("worktree identity pairing is structural")
             })
+            .chain(
+                self.work_scopes
+                    .iter()
+                    .cloned()
+                    .map(|identity| Self::opaque(RetiredResourceKind::WorkScope, identity)),
+            )
             .chain(
                 self.bash_process_groups
                     .iter()
@@ -1271,6 +1306,7 @@ mod tests {
                         to,
                         ClosePhase::AwaitingLossConfirmation
                             | ClosePhase::RetirementRequested
+                            | ClosePhase::NeedsRepair
                             | ClosePhase::Completed
                     ),
                     ClosePhase::AwaitingLossConfirmation => matches!(
@@ -1282,9 +1318,12 @@ mod tests {
                     ClosePhase::RetirementRequested => {
                         matches!(to, ClosePhase::NeedsRepair | ClosePhase::Completed)
                     }
-                    ClosePhase::NeedsRepair => {
-                        matches!(to, ClosePhase::RetirementRequested | ClosePhase::Completed)
-                    }
+                    ClosePhase::NeedsRepair => matches!(
+                        to,
+                        ClosePhase::AwaitingRetirementInspection
+                            | ClosePhase::RetirementRequested
+                            | ClosePhase::Completed
+                    ),
                     ClosePhase::Completed => false,
                 };
                 assert_eq!(
@@ -1322,6 +1361,7 @@ mod tests {
         );
 
         assert_eq!(RetiredResourceKind::Worktree.as_str(), "worktree");
+        assert_eq!(RetiredResourceKind::WorkScope.as_str(), "work_scope");
         assert_eq!(
             RetiredResourceKind::BashProcessGroup.as_str(),
             "bash_process_group"
@@ -1509,6 +1549,10 @@ mod tests {
         assert!(!RetiredResourceKind::Worktree.admits_identity_kind(&git_path));
         assert!(!RetiredResourceKind::Worktree.admits_identity_kind(&opaque));
         assert!(!RetiredResourceKind::Worktree.admits_identity_kind(&git_oid));
+        assert!(RetiredResourceKind::WorkScope.admits_identity_kind(&opaque));
+        assert!(!RetiredResourceKind::WorkScope.admits_identity_kind(&worktree));
+        assert!(!RetiredResourceKind::WorkScope.admits_identity_kind(&git_path));
+        assert!(!RetiredResourceKind::WorkScope.admits_identity_kind(&git_oid));
         assert!(RetiredResourceKind::BrowserSession.admits_identity_kind(&opaque));
         assert!(!RetiredResourceKind::BrowserSession.admits_identity_kind(&git_path));
         assert!(!RetiredResourceKind::BrowserSession.admits_identity_kind(&worktree));

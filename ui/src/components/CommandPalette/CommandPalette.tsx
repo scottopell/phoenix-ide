@@ -14,6 +14,7 @@ import { createCodeSource } from './sources/CodeSource';
 import { createConversationContentSource } from './sources/ConversationContentSource';
 import { createBuiltInActions } from './actions/builtInActions';
 import { useFileExplorer } from '../../hooks/useFileExplorer';
+import { notifyArchiveCloseConflict } from '../../notifications';
 import { computeChainRoots } from '../../utils/chains';
 import { useFocusScope } from '../../hooks/useFocusScope';
 import { useIsDesktop } from '../../hooks/useMediaQuery';
@@ -119,7 +120,15 @@ export function CommandPalette({ conversations, productConversations = [], activ
               const activeRoute = activeConvId ?? currentSlug;
               const conv = conversations.find(c => c.id === activeRoute || c.slug === activeRoute);
               if (!conv || computeChainRoots(conversations).get(conv.id) != null) return undefined;
-              return () => api.archiveConversation(conv.id).then(() => navigate('/'));
+              return async () => {
+                try {
+                  await api.archiveConversation(conv.id);
+                  navigate('/');
+                } catch (error) {
+                  notifyArchiveCloseConflict(conv.id, error);
+                  throw error;
+                }
+              };
             })()
           : undefined,
       }),

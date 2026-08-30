@@ -50,8 +50,12 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [036](036_local-sqlite-authority-loss-fails-stop.md) | Local SQLite authority loss fails stop | Accepted | REQ-DWF-043, REQ-DWF-CHAT-013, REQ-BED-033 |
 | [037](037_legacy-direct-turn-terminal-ambiguity-is-retired.md) | Legacy direct-turn terminal ambiguity is retired as failure | Accepted | REQ-DWF-CHAT-013, REQ-DWF-CHAT-014, REQ-COMP-004 |
 | [038](038_commission-review-is-retired-with-forward-history-recovery.md) | Commission review is retired with forward history recovery | Accepted | REQ-CR-001–018, REQ-COMP-001–005, REQ-VS-006/016 |
-| [039](039_creation-publication-uses-request-bound-identity-and-immutable-pins.md) | Creation publication uses request-bound identity and immutable starting pins | Accepted | REQ-CCR-001/002/003/005/005A/006A, REQ-DWF-CREATE-001/002/003/004, REQ-PROJ-017/022, REQ-GITREP-003 |
-| [040](040_creation-staging-uses-a-private-locked-namespace.md) | Creation staging uses a private locked namespace | Accepted | REQ-CCR-005; product-creation worktree ownership and cleanup |
+| [039](039_durable-runtime-resource-identity-fails-closed.md) | Durable runtime resource identity fails closed outside proven containment | Accepted | REQ-WL-002b, REQ-WL-002d, REQ-COMP-001 |
+| [040](040_close-uses-scope-gates-and-tmux-only-durable-identity.md) | Close uses WorkScope gates and tmux-only durable identity | Accepted | REQ-WL-002b, REQ-WL-002d, REQ-PROJ-WS-001 |
+| [041](041_minimal-history-finalization.md) | Minimal History finalization | Accepted | REQ-WL-002b, REQ-CONV-001 |
+| [042](042_close-directory-retirement-trusts-private-namespace.md) | Close directory retirement trusts its private namespace | Accepted | REQ-WL-002b |
+| [043](043_creation-staging-uses-a-private-locked-namespace.md) | Creation staging uses a private locked namespace | Accepted | REQ-CCR-005; product-creation worktree ownership and cleanup |
+| [044](044_creation-publication-uses-request-bound-identity-and-immutable-pins.md) | Creation publication uses request-bound identity and immutable starting pins | Accepted | REQ-CCR-001/002/003/005/005A/006A, REQ-DWF-CREATE-001/002/003/004, REQ-PROJ-017/022, REQ-GITREP-003 |
 
 ## For agents: which decisions bind your task
 
@@ -69,7 +73,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Deciding which tools a user may invoke directly (user tool invocation eligibility) | 005 |
 | Specifying wake contracts, async terminal waits, or sub-agent terminal wake delivery | 006 |
 | Specifying durable conversation creation, worker claims, retries, or provisioning cleanup | 007 |
-| Specifying request-bound creation identity, immutable creation pins, atomic creation publication, or staging cleanup ownership | 040 for the private staging boundary, then 039, 007, and 031 |
+| Specifying request-bound creation identity, immutable creation pins, atomic creation publication, or staging cleanup ownership | 043 for the private staging boundary, then 044, 007, and 031 |
 | Specifying multi-PR branch observation, active PR targeting, or bash terminal-edge reconciliation | 008 |
 | Specifying native process resource sampling, Work Scope health, or resource-observation freshness | 009 |
 | Specifying native macOS self-deployment, activation, or rollback | 010 |
@@ -106,8 +110,6 @@ ADR-000 (adopt spEARS v2 for new work)
       ├── ADR-009 (Native process metrics use shared demand-driven observation generations)
       ├── ADR-034 (Compatibility guarantees are explicit and data-aware)
       │   └── ADR-038 (Commission review is retired with forward history recovery)
-      ├── ADR-039 (Creation publication uses request-bound identity and immutable starting pins)
-      │   └── ADR-040 (Creation staging uses a private locked namespace)
       ├── ADR-036 (Local SQLite authority loss fails stop)
       │   └── applies ADR-014, ADR-020, ADR-024, and ADR-034 at the local persistence-health boundary
       ├── ADR-037 (Legacy direct-turn terminal ambiguity is retired as failure)
@@ -135,6 +137,8 @@ ADR-000 (adopt spEARS v2 for new work)
           │   └── ADR-029 (iOS companion uses session-scoped prose feedback)
           │       └── ADR-030 (iOS prose-review authority survives the composer handoff)
           └── ADR-031 (ProductConversation persistence uses staged single authority)
+              ├── ADR-043 (Creation staging uses a private locked namespace)
+              ├── ADR-044 (Creation publication uses request-bound identity and immutable starting pins)
               └── ADR-032 (GitRepository is hidden infrastructure; Project is retired)
                   ├── ADR-033 (Database rollback is offline and Foundation observations use relational scalar storage)
                   └── ADR-035 (Repository authority activation is consumer-triggered and offline)

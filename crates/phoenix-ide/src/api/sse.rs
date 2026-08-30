@@ -960,6 +960,7 @@ mod tests {
                 task_title: None,
                 work_scope_key: None,
                 model: None,
+                archived: None,
             },
         };
         assert_parity(&event);

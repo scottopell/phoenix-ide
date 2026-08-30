@@ -5,7 +5,12 @@
 //! not domain types — they shell out and inspect the working copy. They live in
 //! `phoenix-core` because both the persistence layer and the runtime need them.
 
+use sha2::Digest as _;
+use std::fmt::Write as _;
+use std::io::Read as _;
 use std::path::Path;
+
+const MAX_GIT_POINTER_BYTES: u64 = libc::PATH_MAX as u64 + 10;
 
 const NONINTERACTIVE_GIT_CONFIG: &[(&str, &str)] = &[
     ("commit.gpgsign", "false"),
@@ -22,6 +27,82 @@ const NONINTERACTIVE_GIT_ENV: &[(&str, &str)] = &[
     ("PAGER", "cat"),
     ("GIT_TERMINAL_PROMPT", "0"),
 ];
+
+/// Observe the current administrative incarnation of a Git worktree.
+///
+/// The fingerprint is intentionally independent of filesystem birth-time support.
+/// On Unix the marker device/inode identifies the marker while normalized pointer
+/// contents bind linked worktrees to their exact administrative directory. On
+/// other platforms normalized linked-worktree pointers or ordinary-repository
+/// administrative content preserve a portable comparison.
+#[must_use]
+pub fn observe_worktree_fingerprint(path: &Path) -> Option<String> {
+    let marker = path.join(".git");
+    let metadata = std::fs::symlink_metadata(&marker).ok()?;
+    let marker_bytes = if metadata.is_file() {
+        if metadata.len() > MAX_GIT_POINTER_BYTES {
+            return None;
+        }
+        let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).ok()?);
+        std::fs::File::open(&marker)
+            .ok()?
+            .take(MAX_GIT_POINTER_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        if u64::try_from(bytes.len()).ok()? > MAX_GIT_POINTER_BYTES {
+            return None;
+        }
+        let pointer = std::str::from_utf8(&bytes).ok()?;
+        let git_dir = pointer
+            .strip_suffix("\r\n")
+            .or_else(|| pointer.strip_suffix('\n'))
+            .unwrap_or(pointer)
+            .strip_prefix("gitdir: ")?;
+        if git_dir.is_empty() || git_dir.contains(['\n', '\r']) {
+            return None;
+        }
+        git_dir.as_bytes().to_vec()
+    } else if metadata.is_dir() {
+        ordinary_repository_identity(&marker)?
+    } else {
+        return None;
+    };
+    let mut encoded = String::with_capacity(marker_bytes.len() * 2);
+    for byte in marker_bytes {
+        write!(&mut encoded, "{byte:02x}").ok()?;
+    }
+    Some(worktree_fingerprint_from_metadata(&metadata, &encoded))
+}
+
+fn ordinary_repository_identity(git_dir: &Path) -> Option<Vec<u8>> {
+    let mut identity = Vec::new();
+    let head = std::fs::read(git_dir.join("HEAD")).ok()?;
+    if u64::try_from(head.len()).ok()? > MAX_GIT_POINTER_BYTES {
+        return None;
+    }
+    identity.extend_from_slice(&head);
+    let config = std::fs::read(git_dir.join("config")).unwrap_or_default();
+    identity.extend_from_slice(&config);
+    Some(sha2::Sha256::digest(identity).to_vec())
+}
+
+#[cfg(unix)]
+fn worktree_fingerprint_from_metadata(metadata: &std::fs::Metadata, encoded: &str) -> String {
+    use std::os::unix::fs::MetadataExt as _;
+    format!(
+        "git_admin_incarnation_v2:{}:{}:{encoded}",
+        metadata.dev(),
+        metadata.ino()
+    )
+}
+
+#[cfg(not(unix))]
+fn worktree_fingerprint_from_metadata(metadata: &std::fs::Metadata, encoded: &str) -> String {
+    format!(
+        "git_admin_incarnation_v2:portable:{}:{encoded}",
+        metadata.len()
+    )
+}
 
 /// Construct a Git subprocess with Phoenix's process-level safety defaults.
 ///
@@ -788,5 +869,20 @@ mod tests {
             );
             handle.join().unwrap();
         });
+    }
+}
+
+#[cfg(test)]
+mod worktree_fingerprint_tests {
+    use super::observe_worktree_fingerprint;
+
+    #[test]
+    fn fingerprint_tracks_pointer_target_without_birth_timestamp() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join(".git"), "gitdir: /tmp/first\n").unwrap();
+        let first = observe_worktree_fingerprint(root.path()).unwrap();
+        std::fs::write(root.path().join(".git"), "gitdir: /tmp/second\n").unwrap();
+        let second = observe_worktree_fingerprint(root.path()).unwrap();
+        assert_ne!(first, second);
     }
 }

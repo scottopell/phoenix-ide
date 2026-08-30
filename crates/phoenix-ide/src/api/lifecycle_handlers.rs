@@ -1,27 +1,26 @@
 #![allow(clippy::wildcard_enum_match_arm)]
 //! Conversation lifecycle HTTP handlers: task approval, abandon, mark-merged.
 
-use super::handlers::{
-    reopen_bash_after_failed_lifecycle_mutation, run_resource_cleanup_cascade, AppError,
-};
+use super::handlers::AppError;
 use super::types::{
-    ConflictErrorResponse, ForkDismissResponse, ForkPromoteResponse, ForkProposalListResponse,
-    ForkProposalSummary, ForkSpawnResponse, RequestChangesRequest, SuccessResponse,
-    TaskApprovalRequest, TaskApprovalResponse, TaskFeedbackRequest,
+    CancelCloseBeforeRetirementRequest, ConfirmCloseLossRetirementRequest,
+    ConfirmCloseStopWorkRequest, ConflictErrorResponse, ForkDismissResponse, ForkPromoteResponse,
+    ForkProposalListResponse, ForkProposalSummary, ForkSpawnResponse, RequestChangesRequest,
+    RetryCloseRetirementRequest, SuccessResponse, TaskApprovalRequest, TaskApprovalResponse,
+    TaskFeedbackRequest,
 };
 use super::AppState;
-use crate::db::{ConvMode, Conversation, MessageContent};
-use crate::git_ops::capture_branch_diff;
+#[cfg(test)]
+use crate::db::Conversation;
 use crate::runtime::fork_resolve::ForkResolveError;
 use crate::state_machine::state::TaskApprovalOutcome;
 use crate::state_machine::{ConvState, Event};
-use std::fmt::Write as _;
+use phoenix_core::domain::close::TranscriptConversationId;
 
 use axum::{
     extract::{Path, State},
     Json,
 };
-use std::path::{Path as StdPath, PathBuf};
 
 // ============================================================
 // Terminal-action gate (REQ-BED-031)
@@ -38,6 +37,7 @@ use std::path::{Path as StdPath, PathBuf};
 /// Returns 409 Conflict with `error_type = "continuation_exists"` so
 /// the frontend can dispatch on it (Phase 5) — e.g. offer to route to
 /// the continuation instead of showing the raw error text.
+#[cfg(test)]
 fn reject_if_continued(conv: &Conversation, action: &str) -> Result<(), AppError> {
     if let Some(continuation_id) = conv.continued_in_conv_id.as_deref() {
         return Err(AppError::Conflict(Box::new(
@@ -54,6 +54,7 @@ fn reject_if_continued(conv: &Conversation, action: &str) -> Result<(), AppError
     Ok(())
 }
 
+#[cfg(test)]
 fn ensure_terminal_action_legal(conv: &Conversation, action: &str) -> Result<(), AppError> {
     reject_if_continued(conv, action)?;
 
@@ -308,307 +309,561 @@ pub(crate) async fn list_fork_proposals(
 /// capture diff snapshot, transition to Terminal.
 /// Single-phase endpoint -- the frontend confirms via a dialog before calling this.
 #[allow(clippy::too_many_lines)]
+/// Confirms destructive loss retirement against one exact persisted server
+/// inspection. This contract deliberately accepts no client path or inventory.
+pub(crate) async fn confirm_close_loss_retirement(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<ConfirmCloseLossRetirementRequest>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    let attempt_id = phoenix_core::domain::close::CloseAttemptId::parse(request.attempt_id)
+        .map_err(|error| AppError::TypedBadRequest {
+            message: error.to_string(),
+            error_type: "invalid_close_attempt".to_string(),
+        })?;
+    let snapshot = phoenix_core::domain::close::CloseRetirementSnapshot::parse(
+        request.inspection_generation,
+        request.inspection_fingerprint,
+    )
+    .map_err(|error| AppError::TypedBadRequest {
+        message: error.to_string(),
+        error_type: "invalid_close_snapshot".to_string(),
+    })?;
+    let attempt = state
+        .db
+        .get_close_obligation(attempt_id.as_str())
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    let aggregate = state
+        .db
+        .get_ordinary_product_conversation(attempt.product_conversation_id())
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    let active_transcript = aggregate
+        .segments
+        .last()
+        .map(|segment| segment.transcript_row.conversation.id.as_str());
+    if active_transcript != Some(id.as_str()) {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Close confirmation is accepted only from the active aggregate transcript",
+            "inactive_close_transcript",
+        ))));
+    }
+    let fresh_snapshot = state
+        .runtime
+        .inspect_close_retirement_only(attempt_id.clone())
+        .await
+        .map_err(|error| {
+            AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                error,
+                "close_inspection_failed",
+            )))
+        })?;
+    if fresh_snapshot == snapshot {
+        state
+            .db
+            .confirm_close_loss_retirement(&attempt_id, &fresh_snapshot)
+            .await
+            .map_err(|error| {
+                AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                    error.to_string(),
+                    "stale_close_inspection",
+                )))
+            })?;
+    } else {
+        let fresh_obligation = state
+            .db
+            .get_close_obligation(attempt_id.as_str())
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+        if fresh_obligation.phase() != phoenix_core::domain::close::ClosePhase::RetirementRequested
+        {
+            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                "Close confirmation does not match fresh server inspection",
+                "stale_close_inspection",
+            ))));
+        }
+    }
+    state
+        .runtime
+        .retire_close_runtime_resources(attempt_id)
+        .await
+        .map_err(|error| {
+            AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                error,
+                "close_retirement_needs_repair",
+            )))
+        })?;
+    Ok(Json(SuccessResponse { success: true }))
+}
+
+pub(crate) async fn confirm_close_stop_work(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<ConfirmCloseStopWorkRequest>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    let admission = state.runtime.conversation_admission(&id).await;
+    let _guard = admission.lock().await;
+    let transcript = state
+        .db
+        .get_conversation(&id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    let aggregate = state
+        .db
+        .get_ordinary_product_conversation(&transcript.product_conversation_id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    if aggregate
+        .segments
+        .last()
+        .map(|segment| segment.transcript_row.conversation.id.as_str())
+        != Some(id.as_str())
+    {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Stop-work confirmation is accepted only from the active aggregate transcript",
+            "inactive_close_transcript",
+        ))));
+    }
+    let obligation = state
+        .db
+        .get_active_close_obligation_for_product(&transcript.product_conversation_id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+        .ok_or_else(|| {
+            AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                "No active Close attempt",
+                "close_attempt_not_active",
+            )))
+        })?;
+    if obligation.attempt_id().as_str() != request.attempt_id {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Close attempt changed; refresh before confirming stop-work",
+            "stale_close_attempt",
+        ))));
+    }
+    state
+        .db
+        .begin_close_active_work_settlement(obligation.attempt_id().as_str())
+        .await
+        .map_err(|error| {
+            AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                error.to_string(),
+                "close_stop_work_confirmation_failed",
+            )))
+        })?;
+    state
+        .runtime
+        .resume_pending_close_settlements()
+        .await
+        .map_err(|error| {
+            AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                error,
+                "close_settlement_in_progress",
+            )))
+        })?;
+    let refreshed = state
+        .db
+        .get_close_obligation(obligation.attempt_id().as_str())
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    match refreshed.phase() {
+        phoenix_core::domain::close::ClosePhase::SettlingActiveWork
+        | phoenix_core::domain::close::ClosePhase::CancelRequestedDuringSettlement => {
+            Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                "Close settlement remains in progress",
+                "close_settlement_in_progress",
+            ))))
+        }
+        phoenix_core::domain::close::ClosePhase::AwaitingLossConfirmation => {
+            Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                "Close requires confirmation of the freshly inspected loss inventory",
+                "close_loss_confirmation_required",
+            ))))
+        }
+        _ => Ok(Json(SuccessResponse { success: true })),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn cancel_close_before_retirement(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<CancelCloseBeforeRetirementRequest>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    let admission = state.runtime.conversation_admission(&id).await;
+    let _guard = admission.lock().await;
+    let transcript = state
+        .db
+        .get_conversation(&id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    let aggregate = state
+        .db
+        .get_ordinary_product_conversation(&transcript.product_conversation_id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    if aggregate
+        .segments
+        .last()
+        .map(|segment| segment.transcript_row.conversation.id.as_str())
+        != Some(id.as_str())
+    {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Close cancellation is accepted only from the active aggregate transcript",
+            "inactive_close_transcript",
+        ))));
+    }
+    let obligation = state
+        .db
+        .get_active_close_obligation_for_product(&transcript.product_conversation_id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+        .ok_or_else(|| {
+            AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                "No active Close attempt",
+                "close_attempt_not_active",
+            )))
+        })?;
+    if obligation.attempt_id().as_str() != request.attempt_id {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Close attempt changed; refresh before cancelling",
+            "stale_close_attempt",
+        ))));
+    }
+    state
+        .runtime
+        .cancel_close_before_retirement(obligation.attempt_id())
+        .await
+        .map_err(|error| {
+            AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                error.clone(),
+                "close_cancel_failed",
+            )))
+        })?;
+    Ok(Json(SuccessResponse { success: true }))
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn retry_close_retirement(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<RetryCloseRetirementRequest>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    let transcript = state
+        .db
+        .get_conversation(&id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    let aggregate = state
+        .db
+        .get_ordinary_product_conversation(&transcript.product_conversation_id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    let active_transcript = aggregate
+        .segments
+        .last()
+        .map(|segment| segment.transcript_row.conversation.id.as_str());
+    if active_transcript != Some(id.as_str()) {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Close retry is accepted only from the active aggregate transcript",
+            "inactive_close_transcript",
+        ))));
+    }
+    let attempt = state
+        .db
+        .get_active_close_obligation_for_product(&transcript.product_conversation_id)
+        .await
+        .map_err(|error| {
+            AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                error.to_string(),
+                "close_retry_unavailable",
+            )))
+        })?;
+    let attempt = attempt.ok_or_else(|| {
+        AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "No active Close attempt is available for retry",
+            "close_retry_unavailable",
+        )))
+    })?;
+    if attempt.attempt_id().as_str() != request.attempt_id {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Close attempt changed; refresh before retrying",
+            "stale_close_attempt",
+        ))));
+    }
+    let retried = state
+        .db
+        .retry_close_retirement(attempt.attempt_id())
+        .await
+        .map_err(|error| {
+            AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                error.to_string(),
+                "close_retry_unavailable",
+            )))
+        })?;
+    let retry_result = if retried.phase()
+        == phoenix_core::domain::close::ClosePhase::AwaitingRetirementInspection
+    {
+        state
+            .runtime
+            .inspect_close_retirement(retried.attempt_id().clone())
+            .await
+            .map(|_| ())
+    } else {
+        state
+            .runtime
+            .retire_close_runtime_resources(retried.attempt_id().clone())
+            .await
+    };
+    if let Err(error) = retry_result {
+        let authoritative = state
+            .db
+            .get_close_obligation(retried.attempt_id().as_str())
+            .await
+            .map_err(|reload_error| AppError::Internal(reload_error.to_string()))?;
+        if authoritative.phase() == phoenix_core::domain::close::ClosePhase::RetirementRequested {
+            let scope = state
+                .db
+                .list_close_attempt_scopes(retried.attempt_id().as_str())
+                .await
+                .map_err(|route_error| AppError::Internal(route_error.to_string()))?
+                .into_iter()
+                .next()
+                .ok_or_else(|| AppError::Internal("Close retry has no captured scope".to_string()))?
+                .scope;
+            state
+                .runtime
+                .route_close_attempt_to_repair::<()>(
+                    retried.attempt_id(),
+                    &scope,
+                    phoenix_core::domain::close::RetirementFailureReason::ManualRepairRequired,
+                    error.clone(),
+                )
+                .await
+                .expect_err("repair routing returns the persisted repair detail");
+        }
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            error,
+            "close_retirement_needs_repair",
+        ))));
+    }
+    let authoritative = state
+        .db
+        .get_close_obligation(retried.attempt_id().as_str())
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    if authoritative.phase() == phoenix_core::domain::close::ClosePhase::AwaitingLossConfirmation {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Close requires confirmation of the freshly inspected loss inventory",
+            "close_loss_confirmation_required",
+        ))));
+    }
+    Ok(Json(SuccessResponse { success: true }))
+}
+
+#[allow(clippy::too_many_lines, clippy::single_match_else)]
+async fn run_legacy_close_compat(state: &AppState, id: &str, action: &str) -> Result<(), AppError> {
+    use phoenix_core::domain::close::{CloseAttemptId, ClosePhase};
+
+    let transcript = state
+        .db
+        .get_conversation(id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    if transcript.conv_mode.worktree_path().is_none() {
+        return Err(AppError::BadRequest(format!(
+            "Conversation must own an allocated worktree to {action}"
+        )));
+    }
+    let aggregate = state
+        .db
+        .get_ordinary_product_conversation(&transcript.product_conversation_id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    let active_transcript = aggregate
+        .segments
+        .last()
+        .map(|segment| segment.transcript_row.conversation.id.as_str());
+    if active_transcript != Some(id) {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Close is accepted only from the active aggregate transcript",
+            "inactive_close_transcript",
+        ))));
+    }
+    let expected_latest_transcript = TranscriptConversationId::parse(id.to_string())
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    let mut obligation = match state
+        .db
+        .get_active_close_obligation_for_product(&transcript.product_conversation_id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+    {
+        Some(obligation) => obligation,
+        None => {
+            let attempt_id = CloseAttemptId::parse(uuid::Uuid::new_v4().to_string())
+                .expect("UUID is a valid Close attempt id");
+            state
+                .db
+                .begin_close_foundation(
+                    &transcript.product_conversation_id,
+                    &expected_latest_transcript,
+                    attempt_id.as_str(),
+                )
+                .await
+                .map_err(|error| {
+                    AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                        error.to_string(),
+                        "close_start_failed",
+                    )))
+                })?
+        }
+    };
+    loop {
+        obligation = match obligation.phase() {
+            ClosePhase::AwaitingBlockerResolution => {
+                if state
+                    .db
+                    .close_attempt_latest_was_busy(obligation.attempt_id().as_str())
+                    .await
+                    .map_err(|error| AppError::Internal(error.to_string()))?
+                {
+                    let awaiting_confirmation = state
+                        .db
+                        .confirm_close_stop_work(obligation.attempt_id().as_str())
+                        .await
+                        .map_err(|error| {
+                            AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                                error.to_string(),
+                                "close_start_failed",
+                            )))
+                        })?;
+                    return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                        format!(
+                            "Close attempt {} requires explicit stop-work confirmation",
+                            awaiting_confirmation.attempt_id()
+                        ),
+                        "close_stop_work_confirmation_required",
+                    ))));
+                }
+                state
+                    .db
+                    .begin_close_idle_settlement(obligation.attempt_id().as_str())
+                    .await
+                    .map_err(|error| {
+                        AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                            error.to_string(),
+                            "close_start_failed",
+                        )))
+                    })?
+            }
+            ClosePhase::AwaitingStopWorkConfirmation => {
+                return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                    format!(
+                        "Close attempt {} still requires explicit stop-work confirmation",
+                        obligation.attempt_id()
+                    ),
+                    "close_stop_work_confirmation_required",
+                ))));
+            }
+            ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement => {
+                state
+                    .runtime
+                    .resume_pending_close_settlements()
+                    .await
+                    .map_err(|error| {
+                        AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                            error,
+                            "close_settlement_in_progress",
+                        )))
+                    })?;
+                let advanced = state
+                    .db
+                    .get_close_obligation(obligation.attempt_id().as_str())
+                    .await
+                    .map_err(|error| AppError::Internal(error.to_string()))?;
+                if matches!(
+                    advanced.phase(),
+                    ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement
+                ) {
+                    return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                        "Close settlement remains in progress",
+                        "close_settlement_in_progress",
+                    ))));
+                }
+                advanced
+            }
+            ClosePhase::AwaitingRetirementInspection => {
+                if let Err(error) = state
+                    .runtime
+                    .inspect_close_retirement(obligation.attempt_id().clone())
+                    .await
+                {
+                    let current = state
+                        .db
+                        .get_close_obligation(obligation.attempt_id().as_str())
+                        .await
+                        .map_err(|db_error| AppError::Internal(db_error.to_string()))?;
+                    let error_type = if current.phase() == ClosePhase::NeedsRepair {
+                        "close_retirement_needs_repair"
+                    } else {
+                        "close_inspection_failed"
+                    };
+                    return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                        error, error_type,
+                    ))));
+                }
+                state
+                    .db
+                    .get_close_obligation(obligation.attempt_id().as_str())
+                    .await
+                    .map_err(|error| AppError::Internal(error.to_string()))?
+            }
+            ClosePhase::AwaitingLossConfirmation => {
+                return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                    "Close requires confirmation of the exact persisted loss inventory",
+                    "close_loss_confirmation_required",
+                ))));
+            }
+            ClosePhase::RetirementRequested => {
+                state
+                    .runtime
+                    .retire_close_runtime_resources(obligation.attempt_id().clone())
+                    .await
+                    .map_err(|error| {
+                        AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                            error,
+                            "close_retirement_needs_repair",
+                        )))
+                    })?;
+                return Ok(());
+            }
+            ClosePhase::NeedsRepair => {
+                return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                    "Close retirement requires repair before it can continue",
+                    "close_retirement_needs_repair",
+                ))));
+            }
+            ClosePhase::Completed => return Ok(()),
+        };
+    }
+}
+
+pub(crate) async fn close_legacy_compat(
+    state: &AppState,
+    id: &str,
+    action: &str,
+) -> Result<(), AppError> {
+    run_legacy_close_compat(state, id, action).await
+}
+
 pub(crate) async fn abandon_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
     let admission = state.runtime.conversation_admission(&id).await;
     let _admission = admission.lock().await;
-    let mut authority = state.runtime.acquire_local_authority_pass().map_err(|()| {
-        AppError::Internal(
-            "task abandonment rejected after fatal local authority closure".to_string(),
-        )
-    })?;
-    if state
-        .db
-        .wake_repository()
-        .has_owed_work_for_conversation(&id)
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?
-    {
-        return Err(AppError::Conflict(Box::new(
-            crate::api::ConflictErrorResponse::new(
-                "Conversation has pending background work",
-                "pending_wake",
-            ),
-        )));
-    }
-    if state
-        .runtime
-        .effective_conversation_state(&id)
-        .await
-        .is_some_and(|runtime_state| !runtime_state.allows_terminal_action())
-    {
-        return Err(AppError::BadRequest(
-            "Conversation has active work; wait for it to settle before abandoning".to_string(),
-        ));
-    }
-    // 1. Validate conversation exists, is Work or Branch mode, Idle state, project-scoped
-    let conv = state
-        .runtime
-        .db()
-        .get_conversation(&id)
-        .await
-        .map_err(|e| AppError::NotFound(e.to_string()))?;
-
-    // REQ-BED-031: terminal actions belong on the live continuation when one
-    // exists, and otherwise are limited to settled disposable states.
-    ensure_terminal_action_legal(&conv, "abandon a task")?;
-
-    // Accept both Work and Branch mode
-    let (worktree_path, base_branch, branch_name, is_work_mode) = match &conv.conv_mode {
-        ConvMode::Work {
-            worktree_path,
-            base_branch,
-            branch_name,
-            ..
-        } => (
-            worktree_path.to_string(),
-            base_branch.to_string(),
-            branch_name.to_string(),
-            true,
-        ),
-        ConvMode::Branch {
-            worktree_path,
-            base_branch,
-            branch_name,
-            ..
-        } => (
-            worktree_path.to_string(),
-            base_branch.to_string(),
-            branch_name.to_string(),
-            false,
-        ),
-        _ => {
-            return Err(AppError::BadRequest(
-                "Conversation must be in Work or Branch mode to abandon".to_string(),
-            ));
-        }
-    };
-
-    let project_id = conv
-        .project_id
-        .as_deref()
-        .ok_or_else(|| AppError::BadRequest("Conversation is not project-scoped".to_string()))?;
-
-    let project = state
-        .db
-        .get_project(project_id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    let repo_root = PathBuf::from(&project.canonical_path);
-
-    // 2a. Capture diff snapshot from worktree BEFORE deleting it (blocking).
-    // The 100 KiB cap is enforced by capture_branch_diff via streaming
-    // reads — git stdout never fully materialises in memory.
-    let worktree_path_clone = worktree_path.clone();
-    let base_branch_clone = base_branch.clone();
-    let diff_snapshot: Option<String> = tokio::task::spawn_blocking(move || {
-        const MAX_DIFF_BYTES: usize = 100 * 1024; // 100KiB
-
-        let wt = PathBuf::from(&worktree_path_clone);
-        if !wt.exists() {
-            tracing::warn!(worktree = %worktree_path_clone, "Worktree gone before diff capture");
-            return None;
-        }
-
-        let captured = capture_branch_diff(&wt, &base_branch_clone, MAX_DIFF_BYTES);
-
-        if captured.committed_diff.is_empty() && captured.uncommitted_diff.is_empty() {
-            return None;
-        }
-
-        let mut snapshot = String::from("## Abandoned work snapshot\n");
-
-        let append_section =
-            |out: &mut String, header: &str, body: &str, total_bytes: u64, saturated: bool| {
-                out.push_str(header);
-                out.push_str(body);
-                let body_len_u64 = body.len() as u64;
-                if body_len_u64 < total_bytes || saturated {
-                    let kib = total_bytes / 1024;
-                    let lower_bound = if saturated { "≥" } else { "" };
-                    let _ = write!(
-                        out,
-                        "\n\n[truncated -- diff was {lower_bound}{kib}KiB, showing first {}KiB]",
-                        body.len() / 1024
-                    );
-                }
-                out.push_str("\n```\n");
-            };
-
-        if !captured.committed_diff.is_empty() {
-            append_section(
-                &mut snapshot,
-                &format!(
-                    "\n### Committed changes (vs `{}`)\n```diff\n",
-                    captured.comparator
-                ),
-                &captured.committed_diff,
-                captured.committed_total_bytes,
-                captured.committed_saturated,
-            );
-        }
-
-        if !captured.uncommitted_diff.is_empty() {
-            append_section(
-                &mut snapshot,
-                "\n### Uncommitted changes\n```diff\n",
-                &captured.uncommitted_diff,
-                captured.uncommitted_total_bytes,
-                captured.uncommitted_saturated,
-            );
-        }
-
-        Some(snapshot)
-    })
-    .await
-    .map_err(|e| AppError::Internal(format!("Diff capture failed: {e}")))?;
-
-    // 2b. Write diff snapshot as a system message (before worktree deletion).
-    //
-    // Pre-allocate the seq from the conversation's broadcaster so this
-    // message orders strictly after any ephemeral events already emitted
-    // on the stream. See PersistBeforeBroadcast in
-    // specs/sse_wire/sse_wire.allium. The handle obtained here is reused
-    // at step 3 to actually broadcast the persisted message.
-    let snapshot_msg = if let Some(ref snapshot) = diff_snapshot {
-        let snap_msg_id = uuid::Uuid::new_v4().to_string();
-        match state.runtime.get_or_create(&id).await {
-            Ok(handle) => {
-                let seq = handle.broadcast_tx.next_seq();
-                match state
-                    .db
-                    .add_message_with_seq(
-                        &snap_msg_id,
-                        &id,
-                        seq,
-                        &MessageContent::system(snapshot),
-                        None,
-                        None,
-                    )
-                    .await
-                {
-                    Ok(msg) => Some((handle, msg)),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Failed to persist diff snapshot (non-fatal)");
-                        None
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "Failed to obtain broadcaster for diff snapshot; persisting without broadcast (client will see on next init)"
-                );
-                // Persist with a DB-allocated seq. No broadcast follows,
-                // so the seq-ordering concern doesn't apply.
-                if let Err(e) = state
-                    .db
-                    .add_message(
-                        &snap_msg_id,
-                        &id,
-                        &MessageContent::system(snapshot),
-                        None,
-                        None,
-                    )
-                    .await
-                {
-                    tracing::warn!(error = %e, "Failed to persist diff snapshot (non-fatal)");
-                }
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    let pr_scope = conv
-        .attached_work_scope_id
-        .as_ref()
-        .expect("persisted conversation has work scope");
-    if StdPath::new(&worktree_path).is_dir() {
-        let refresh_worktree = PathBuf::from(&worktree_path);
-        let refresh_branch = branch_name.clone();
-        let refresh_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let refresh = tokio::task::spawn_blocking(move || {
-            crate::api::pr_monitoring::get_pr_status_for_branch_with_deadline(
-                &refresh_worktree,
-                &refresh_branch,
-                refresh_deadline,
-            )
-        })
-        .await;
-        match refresh {
-            Ok(refresh) if !refresh.observations.is_empty() => {
-                if let Err(e) = state
-                    .db
-                    .upsert_work_scope_pr_observations(pr_scope, &refresh.observations)
-                    .await
-                {
-                    tracing::warn!(error = %e, "Best-effort PR association refresh before abandon failed");
-                }
-            }
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!(error = %e, "Best-effort PR refresh task failed before abandon");
-            }
-        }
-    }
-
-    // 2c. Resource cleanup: bash kill, tmux kill, worktree remove, branch
-    // delete (Work mode only), browser kill. Shared with hard-delete and
-    // archive so any attached terminal/process group is torn down here
-    // too. Work mode task files live on the deleted branch and go with it.
-    // Only fatal error is a continuation-row lookup failure (returned as
-    // 500 so the user can retry).
-    let cleanup = run_resource_cleanup_cascade(&state, &conv).await?;
-
-    // 3. Broadcast diff snapshot (persisted above, before state transition).
-    // Reuses the handle obtained during seq pre-allocation at step 2b.
-    if let Some((handle, snap_msg)) = snapshot_msg {
-        let _ = handle
-            .broadcast_tx
-            .admitted_publication(&mut authority)
-            .persisted_message(snap_msg);
-    }
-
-    // 4. Route through state machine (REQ-BED-029, REQ-BED-001)
-    let repo_root_str = repo_root.display().to_string();
-    let mode_label = if is_work_mode { "Work" } else { "Branch" };
-    let pr_hint = state
-        .db
-        .primary_work_scope_pr_association(pr_scope)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?
-        .map(|pr| format!(" PR #{} preserves history.", pr.pr_number))
-        .unwrap_or_default();
-    let system_message = if is_work_mode {
-        format!("Task abandoned. Worktree and branch deleted.{pr_hint}")
-    } else {
-        format!("Abandoned. Worktree removed, branch kept.{pr_hint}")
-    };
-    tracing::info!(
-        conversation_id = %id,
-        mode = mode_label,
-        "Abandon complete"
-    );
-    if let Err(error) = state
-        .runtime
-        .send_event_and_wait_for_state(
-            &id,
-            Event::TaskResolved {
-                system_message,
-                repo_root: repo_root_str,
-            },
-            |settled| matches!(settled, ConvState::Terminal),
-        )
-        .await
-    {
-        reopen_bash_after_failed_lifecycle_mutation(&state, &conv, &cleanup).await;
-        return Err(AppError::BadRequest(error));
-    }
-
+    run_legacy_close_compat(&state, &id, "abandon").await?;
     Ok(Json(SuccessResponse { success: true }))
 }
 
@@ -625,103 +880,7 @@ pub(crate) async fn mark_merged(
 ) -> Result<Json<SuccessResponse>, AppError> {
     let admission = state.runtime.conversation_admission(&id).await;
     let _admission = admission.lock().await;
-    if state
-        .db
-        .wake_repository()
-        .has_owed_work_for_conversation(&id)
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?
-    {
-        return Err(AppError::Conflict(Box::new(
-            crate::api::ConflictErrorResponse::new(
-                "Conversation has pending background work",
-                "pending_wake",
-            ),
-        )));
-    }
-    if state
-        .runtime
-        .effective_conversation_state(&id)
-        .await
-        .is_some_and(|runtime_state| !runtime_state.allows_terminal_action())
-    {
-        return Err(AppError::BadRequest(
-            "Conversation has active work; wait for it to settle before marking merged".to_string(),
-        ));
-    }
-    // 1. Validate conversation exists, is Work or Branch mode, Idle state
-    let conv = state
-        .runtime
-        .db()
-        .get_conversation(&id)
-        .await
-        .map_err(|e| AppError::NotFound(e.to_string()))?;
-
-    // REQ-BED-031: terminal actions belong on the live continuation when one
-    // exists, and otherwise are limited to settled disposable states.
-    ensure_terminal_action_legal(&conv, "mark as merged")?;
-
-    let is_work_mode = match &conv.conv_mode {
-        ConvMode::Work { .. } => true,
-        ConvMode::Branch { .. } => false,
-        _ => {
-            return Err(AppError::BadRequest(
-                "Conversation must be in Work or Branch mode to mark as merged".to_string(),
-            ));
-        }
-    };
-
-    let project_id = conv
-        .project_id
-        .as_deref()
-        .ok_or_else(|| AppError::BadRequest("Conversation is not project-scoped".to_string()))?;
-
-    let project = state
-        .db
-        .get_project(project_id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    let repo_root = PathBuf::from(&project.canonical_path);
-    let repo_root_str = repo_root.display().to_string();
-
-    // 2. Resource cleanup: bash kill, tmux kill, worktree remove, branch
-    // delete (Work mode only), browser kill. Shared with hard-delete and
-    // archive. Only fatal error is a continuation-row lookup failure
-    // (returned as 500 so the user can retry).
-    let cleanup = run_resource_cleanup_cascade(&state, &conv).await?;
-
-    // 3. Route through state machine -> Terminal
-    let mode_label = if is_work_mode { "Work" } else { "Branch" };
-    let system_message = format!(
-        "Marked as merged. Worktree removed{}.",
-        if is_work_mode {
-            ", task branch deleted"
-        } else {
-            ""
-        }
-    );
-    tracing::info!(
-        conversation_id = %id,
-        mode = mode_label,
-        "Mark-merged complete"
-    );
-
-    if let Err(error) = state
-        .runtime
-        .send_event_and_wait_for_state(
-            &id,
-            Event::TaskResolved {
-                system_message,
-                repo_root: repo_root_str,
-            },
-            |settled| matches!(settled, ConvState::Terminal),
-        )
-        .await
-    {
-        reopen_bash_after_failed_lifecycle_mutation(&state, &conv, &cleanup).await;
-        return Err(AppError::BadRequest(error));
-    }
-
+    run_legacy_close_compat(&state, &id, "mark as merged").await?;
     Ok(Json(SuccessResponse { success: true }))
 }
 

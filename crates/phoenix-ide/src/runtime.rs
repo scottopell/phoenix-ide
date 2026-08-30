@@ -9,6 +9,7 @@
 //! REQ-BED-008: Sub-Agent Spawning
 //! REQ-BED-009: Sub-Agent Isolation
 
+pub(crate) mod close_retirement;
 pub(crate) mod creation_worker;
 pub mod deny_gate;
 pub(crate) mod direct_turn_worker;
@@ -36,6 +37,8 @@ use crate::tools::{
     BashHandleRegistry, BashLifecycleEvent, BashTerminalEffect, BrowserSessionManager,
     ExploreToolPolicy, TmuxLifecycleEvent, TmuxRegistry, ToolRegistry, WakeRegistrar,
 };
+#[cfg(test)]
+use phoenix_core::domain::close::TranscriptConversationId;
 use phoenix_core::domain::llm_types::ServiceTier;
 use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
 
@@ -482,6 +485,9 @@ pub struct RuntimeManager {
     mcp_manager: Arc<crate::tools::mcp::McpClientManager>,
     /// Active PTY terminal sessions — threaded into `ToolContext` for `read_terminal`.
     pub terminals: crate::terminal::ActiveTerminals,
+    pub(crate) close_retirement_leases:
+        AsyncMutex<HashMap<(String, WorkScopeId), close_retirement::CloseResourceLease>>,
+    close_retirement_execution: ConversationMutexGates,
     runtimes: RwLock<HashMap<String, ConversationHandle>>,
     /// Per-conversation single-flight results for slow runtime materialization.
     /// The mutex protects only map admission/removal; unrelated conversations
@@ -1564,6 +1570,8 @@ pub struct ConversationMetadataUpdate {
     pub work_scope_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archived: Option<bool>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -2128,6 +2136,8 @@ impl RuntimeManager {
             tmux_registry: Arc::new(TmuxRegistry::with_lifecycle_sink(Some(tmux_lifecycle_tx))),
             mcp_manager,
             terminals: crate::terminal::ActiveTerminals::new(),
+            close_retirement_leases: AsyncMutex::new(HashMap::new()),
+            close_retirement_execution: ConversationMutexGates::default(),
             runtimes: RwLock::new(HashMap::new()),
             runtime_creations: AsyncMutex::new(HashMap::new()),
             conversation_admissions: AsyncMutex::new(HashMap::new()),
@@ -2617,6 +2627,15 @@ impl RuntimeManager {
                         }
                         BashLifecycleBridgeAction::Broadcast => {
                             manager.broadcast_work_scope_update(&event.owner).await;
+                            if event.phase == phoenix_tools::bash::BashLifecyclePhase::Terminal {
+                                if let Err(error) = manager.resume_pending_close_settlements().await
+                                {
+                                    tracing::warn!(
+                                        error = %error,
+                                        "failed to recheck Close settlement after bash exit"
+                                    );
+                                }
+                            }
                         }
                         BashLifecycleBridgeAction::Reconcile => {
                             manager.broadcast_work_scope_update(&event.owner).await;
@@ -2877,10 +2896,7 @@ impl RuntimeManager {
     /// every live runtime handle whose conversation resolves to it. Factored
     /// out of [`Self::start_work_scope_bridge`] so the bash and browser signal
     /// arms share one routing path.
-    pub(crate) async fn broadcast_work_scope_update(
-        self: &Arc<Self>,
-        work_scope: &ResourceScopeKey,
-    ) {
+    pub(crate) async fn broadcast_work_scope_update(&self, work_scope: &ResourceScopeKey) {
         // Same resolution as the browser lifecycle bridge: enumerate live
         // runtime handles, resolve each conversation's scope, match.
         let conv_ids: Vec<String> = {
@@ -3121,6 +3137,103 @@ impl RuntimeManager {
         Ok(())
     }
 
+    /// Rebuilds persisted server-owned loss inspection. Inspection is recovery
+    /// only: it never confirms loss or begins destructive retirement.
+    pub async fn resume_pending_close_inspections(self: &Arc<Self>) -> Result<usize, String> {
+        let obligations = self
+            .db
+            .list_pending_close_obligations()
+            .await
+            .map_err(|error| error.to_string())?;
+        let manager = Arc::clone(self);
+        self.run_authority_units(obligations, move |obligation| {
+            let manager = Arc::clone(&manager);
+            async move {
+                if !matches!(
+                    obligation.phase(),
+                    phoenix_core::domain::close::ClosePhase::AwaitingRetirementInspection
+                ) {
+                    return Ok(false);
+                }
+                match manager
+                    .inspect_close_retirement(obligation.attempt_id().clone())
+                    .await
+                {
+                    Ok(_) => Ok(true),
+                    Err(error) => {
+                        tracing::warn!(attempt_id = %obligation.attempt_id(), %error,
+                            "Close retirement inspection could not be rebuilt");
+                        Ok(false)
+                    }
+                }
+            }
+        })
+        .await
+    }
+
+    /// Replays exact runtime-resource permits for sealed Close retirements. It
+    /// never finalizes product lifecycle or unblocks History.
+    pub async fn resume_pending_close_runtime_retirements(
+        self: &Arc<Self>,
+    ) -> Result<usize, String> {
+        let obligations = self
+            .db
+            .list_pending_close_obligations()
+            .await
+            .map_err(|error| error.to_string())?;
+        let manager = Arc::clone(self);
+        self.run_authority_units(obligations, move |obligation| {
+            let manager = Arc::clone(&manager);
+            async move {
+                if !matches!(
+                    obligation.phase(),
+                    phoenix_core::domain::close::ClosePhase::RetirementRequested
+                        | phoenix_core::domain::close::ClosePhase::NeedsRepair
+                ) {
+                    return Ok(false);
+                }
+                let retried = if obligation.phase()
+                    == phoenix_core::domain::close::ClosePhase::NeedsRepair
+                {
+                    manager
+                        .db
+                        .retry_close_retirement(obligation.attempt_id())
+                        .await
+                        .map_err(|error| error.to_string())?
+                } else {
+                    obligation.clone()
+                };
+                if retried.phase()
+                    == phoenix_core::domain::close::ClosePhase::AwaitingRetirementInspection
+                {
+                    return match manager
+                        .inspect_close_retirement(retried.attempt_id().clone())
+                        .await
+                    {
+                        Ok(_) => Ok(true),
+                        Err(error) => {
+                            tracing::warn!(attempt_id = %retried.attempt_id(), %error,
+                                "Close retirement inspection could not be rebuilt during repair recovery");
+                            Ok(false)
+                        }
+                    };
+                }
+                match manager
+                    .retire_close_runtime_resources(retried.attempt_id().clone())
+                    .await
+                {
+                    Ok(()) => Ok(true),
+                    Err(error) => {
+                        tracing::warn!(attempt_id = %obligation.attempt_id(), %error,
+                            "Close runtime-resource retirement remains in repair state");
+                        Ok(false)
+                    }
+                }
+            }
+        })
+        .await
+    }
+
     pub async fn resume_pending_close_settlements(self: &Arc<Self>) -> Result<usize, String> {
         let obligations = self
             .db
@@ -3167,7 +3280,16 @@ impl RuntimeManager {
                     .advance_close_settlement_when_quiescent(obligation.attempt_id().as_str())
                     .await
                 {
-                    Ok(_) => Ok(true),
+                    Ok(advanced) => {
+                        if advanced.phase()
+                            == phoenix_core::domain::close::ClosePhase::AwaitingRetirementInspection
+                        {
+                            manager
+                                .inspect_close_retirement(advanced.attempt_id().clone())
+                                .await?;
+                        }
+                        Ok(true)
+                    }
                     Err(crate::db::DbError::CloseFoundationPrecondition(_)) => Ok(false),
                     Err(error) => Err(error.to_string()),
                 }
@@ -5482,31 +5604,6 @@ impl RuntimeManager {
         Ok(outcome)
     }
 
-    pub async fn send_event_and_wait_for_state(
-        self: &Arc<Self>,
-        conversation_id: &str,
-        event: Event,
-        _accepted: impl Fn(&ConvState) -> bool,
-    ) -> Result<(), String> {
-        let handle = self.get_or_create(conversation_id).await?;
-        deposit_turn_trigger(&handle);
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        let (_retirement_tx, retirement_rx) = tokio::sync::oneshot::channel();
-        handle
-            .acknowledged_event_tx
-            .send(AcknowledgedEventRequest {
-                event,
-                acknowledgement: ack_tx,
-                retirement: retirement_rx,
-            })
-            .await
-            .map_err(|error| error.to_string())?;
-        ack_rx
-            .await
-            .map_err(|_| "runtime stopped before event settled".to_string())?
-            .map(|_| ())
-    }
-
     pub async fn admit_continuation_retry(
         self: &Arc<Self>,
         conversation_id: &str,
@@ -7158,6 +7255,7 @@ mod scope_liveness_tests {
     use super::*;
     use crate::platform::PlatformCapability;
     use crate::tools::mcp::McpClientManager;
+    use phoenix_core::domain::close::CloseAttemptId;
     use phoenix_core::domain::db_schema::{ConvMode, NonEmptyString};
     use phoenix_core::domain::sm_state::ConvState;
     use phoenix_llm::ModelRegistry;
@@ -7262,7 +7360,11 @@ mod scope_liveness_tests {
         .expect("insert active turn");
         manager
             .db()
-            .begin_close_foundation(&conversation.product_conversation_id, "live-attempt")
+            .begin_close_foundation(
+                &conversation.product_conversation_id,
+                &TranscriptConversationId::parse(conversation_id).unwrap(),
+                "live-attempt",
+            )
             .await
             .expect("begin close");
         manager
@@ -7299,6 +7401,494 @@ mod scope_liveness_tests {
             terminal_kind.is_none(),
             "Close must leave live runtime terminalization to its executor"
         );
+    }
+
+    async fn prepare_clean_close_with_tmux(
+        manager: &RuntimeManager,
+        owner: &phoenix_tools::tmux::test_server::TestTmuxServerOwner,
+        conversation_id: &str,
+        attempt: &str,
+    ) -> (
+        tempfile::TempDir,
+        CloseAttemptId,
+        WorkScopeId,
+        std::path::PathBuf,
+        String,
+    ) {
+        let repository = tempfile::tempdir().unwrap();
+        let output = phoenix_core::git::command()
+            .args(["init", "--quiet"])
+            .current_dir(repository.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        std::fs::write(repository.path().join("tracked"), "initial\n").unwrap();
+        let git = |arguments: &[&str]| {
+            let output = phoenix_core::git::command()
+                .args(arguments)
+                .current_dir(repository.path())
+                .env("GIT_AUTHOR_NAME", "Close Test")
+                .env("GIT_AUTHOR_EMAIL", "close@example.invalid")
+                .env("GIT_COMMITTER_NAME", "Close Test")
+                .env("GIT_COMMITTER_EMAIL", "close@example.invalid")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {arguments:?}: {output:?}");
+        };
+        git(&["add", "tracked"]);
+        git(&["commit", "--quiet", "-m", "initial"]);
+        let worktree = repository.path().join("worktree");
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            &format!("test-{conversation_id}"),
+            worktree.to_str().unwrap(),
+        ]);
+        let resource_scope =
+            create_handleless_work_conv(manager, conversation_id, worktree.to_str().unwrap(), None)
+                .await;
+        let ResourceScopeKey::Work(scope) = resource_scope else {
+            unreachable!()
+        };
+        let server = manager
+            .tmux_registry()
+            .ensure_live(
+                &ResourceScopeKey::Work(scope.clone()),
+                owner.path(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let socket = server.read().await.socket_path.clone();
+        let token = server.read().await.server_token.clone();
+        let conversation = manager
+            .db()
+            .get_conversation(conversation_id)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE conversations SET user_initiated = 1 WHERE id = ?1")
+            .bind(conversation_id)
+            .execute(manager.db().pool())
+            .await
+            .unwrap();
+        let attempt_id = CloseAttemptId::parse(attempt).unwrap();
+        manager
+            .db()
+            .begin_close_foundation(
+                &conversation.product_conversation_id,
+                &TranscriptConversationId::parse(conversation_id).unwrap(),
+                attempt_id.as_str(),
+            )
+            .await
+            .unwrap();
+        manager
+            .db()
+            .confirm_close_stop_work(attempt_id.as_str())
+            .await
+            .unwrap();
+        manager
+            .db()
+            .begin_close_active_work_settlement(attempt_id.as_str())
+            .await
+            .unwrap();
+        manager
+            .db()
+            .advance_close_settlement_when_quiescent(attempt_id.as_str())
+            .await
+            .unwrap();
+        let snapshot = manager
+            .inspect_close_retirement_only(attempt_id.clone())
+            .await
+            .unwrap();
+        manager
+            .capture_close_retirement_inventory(attempt_id.clone(), snapshot)
+            .await
+            .unwrap();
+        (repository, attempt_id, scope, socket, token)
+    }
+
+    async fn prepare_close_attempt_ready_for_completion(
+        manager: &RuntimeManager,
+        conversation_id: &str,
+        attempt: &str,
+    ) -> CloseAttemptId {
+        let conversation = manager
+            .db()
+            .create_conversation(conversation_id, conversation_id, "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        let attempt_id = CloseAttemptId::parse(attempt).unwrap();
+        manager
+            .db()
+            .begin_close_foundation(
+                &conversation.product_conversation_id,
+                &TranscriptConversationId::parse(conversation_id).unwrap(),
+                attempt_id.as_str(),
+            )
+            .await
+            .expect("begin close");
+        manager
+            .db()
+            .confirm_close_stop_work(attempt_id.as_str())
+            .await
+            .expect("confirm stop work");
+        manager
+            .db()
+            .begin_close_active_work_settlement(attempt_id.as_str())
+            .await
+            .expect("begin settlement");
+        manager
+            .db()
+            .advance_close_settlement_when_quiescent(attempt_id.as_str())
+            .await
+            .expect("advance settlement to retirement inspection");
+        let snapshot = manager
+            .inspect_close_retirement_only(attempt_id.clone())
+            .await
+            .expect("inspect retirement");
+        manager
+            .capture_close_retirement_inventory(attempt_id.clone(), snapshot)
+            .await
+            .expect("capture retirement inventory");
+        attempt_id
+    }
+
+    #[tokio::test]
+    async fn complete_close_retirement_and_publish_persists_archive_before_emitting_update() {
+        use phoenix_core::domain::product_conversation::OrdinaryProductConversationLifecycle;
+
+        let manager = test_manager().await;
+        let conversation_id = "close-retirement-publish-success";
+        let attempt_id = prepare_close_attempt_ready_for_completion(
+            &manager,
+            conversation_id,
+            "close-retirement-publish-success-attempt",
+        )
+        .await;
+
+        let broadcaster = manager.conversation_broadcaster(conversation_id).await;
+        let mut receiver = broadcaster.subscribe();
+
+        manager
+            .retire_close_runtime_resources(attempt_id.clone())
+            .await
+            .expect("retire resources, complete Close, and publish");
+
+        let persisted = manager
+            .db()
+            .get_conversation(conversation_id)
+            .await
+            .expect("reload conversation");
+        assert!(
+            persisted.archived,
+            "conversation should be archived before SSE consumption"
+        );
+
+        let aggregate = manager
+            .db()
+            .get_ordinary_product_conversation(&persisted.product_conversation_id)
+            .await
+            .expect("read product conversation");
+        assert_eq!(
+            aggregate.product_conversation.ordinary_lifecycle(),
+            Some(OrdinaryProductConversationLifecycle::History),
+            "product conversation should already be in History before SSE consumption"
+        );
+
+        let mut published_history = false;
+        while let Ok(event) = receiver.try_recv() {
+            if matches!(
+                event,
+                SseEvent::ConversationUpdate {
+                    update: ConversationMetadataUpdate {
+                        archived: Some(true),
+                        ..
+                    },
+                    ..
+                }
+            ) {
+                published_history = true;
+            }
+        }
+        assert!(
+            published_history,
+            "completion must publish the History transition"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_close_retirement_and_publish_failure_emits_no_update() {
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let manager = test_manager().await;
+        let conversation_id = "close-retirement-publish-failure";
+        manager
+            .db()
+            .create_conversation(conversation_id, conversation_id, "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        let broadcaster = manager.conversation_broadcaster(conversation_id).await;
+        let mut receiver = broadcaster.subscribe();
+        let attempt_id = CloseAttemptId::parse("close-retirement-publish-failure-attempt").unwrap();
+
+        let error = manager
+            .complete_close_retirement_and_publish(&attempt_id)
+            .await
+            .expect_err("completion should fail before publication");
+        assert!(!error.is_empty());
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    async fn replace_tmux_server(
+        manager: &RuntimeManager,
+        owner: &phoenix_tools::tmux::test_server::TestTmuxServerOwner,
+        scope: &WorkScopeId,
+        socket: &std::path::Path,
+        stale_token: &str,
+    ) -> String {
+        manager
+            .tmux_registry()
+            .reopen_after_repair(&ResourceScopeKey::Work(scope.clone()))
+            .await;
+        let output = tokio::process::Command::new("tmux")
+            .args(["-S", &socket.to_string_lossy(), "kill-server"])
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success(), "kill stale server: {output:?}");
+        let replacement = manager
+            .tmux_registry()
+            .ensure_live(
+                &ResourceScopeKey::Work(scope.clone()),
+                owner.path(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let replacement_token = replacement.read().await.server_token.clone();
+        assert_ne!(replacement_token, stale_token);
+        replacement_token
+    }
+
+    async fn assert_tmux_absence_proof(manager: &RuntimeManager, attempt_id: &CloseAttemptId) {
+        let proof_kind: String = sqlx::query_scalar(
+            "SELECT proof_kind FROM close_retirement_resources
+             WHERE attempt_id = ?1 AND resource_kind = 'tmux_server'",
+        )
+        .bind(attempt_id.as_str())
+        .fetch_one(manager.db().pool())
+        .await
+        .unwrap();
+        assert_eq!(proof_kind, "absence_adopted");
+    }
+
+    #[tokio::test]
+    async fn live_tmux_replacement_persists_absence_proof_and_survives() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let owner = phoenix_tools::tmux::test_server::TestTmuxServerOwner::new();
+        let mut manager = test_manager().await;
+        manager.tmux_registry = Arc::new(owner.registry());
+        let (_repository, attempt_id, scope, socket, stale_token) =
+            prepare_clean_close_with_tmux(&manager, &owner, "live-tmux-close", "live-tmux-attempt")
+                .await;
+        let replacement_token =
+            replace_tmux_server(&manager, &owner, &scope, &socket, &stale_token).await;
+
+        manager
+            .retire_close_runtime_resources(attempt_id.clone())
+            .await
+            .unwrap();
+
+        assert_tmux_absence_proof(&manager, &attempt_id).await;
+        assert_eq!(
+            manager
+                .tmux_registry()
+                .get_existing(&ResourceScopeKey::Work(scope))
+                .await
+                .unwrap()
+                .read()
+                .await
+                .server_token,
+            replacement_token
+        );
+        owner.shutdown();
+    }
+
+    #[tokio::test]
+    async fn restarted_tmux_rehydration_persists_absence_proof_and_leaves_replacement_untouched() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let owner = phoenix_tools::tmux::test_server::TestTmuxServerOwner::new();
+        let mut manager = test_manager().await;
+        manager.tmux_registry = Arc::new(owner.registry());
+        let (_repository, attempt_id, scope, socket, stale_token) = prepare_clean_close_with_tmux(
+            &manager,
+            &owner,
+            "restart-tmux-close",
+            "restart-tmux-attempt",
+        )
+        .await;
+        replace_tmux_server(&manager, &owner, &scope, &socket, &stale_token).await;
+        manager
+            .close_retirement_leases
+            .lock()
+            .await
+            .retain(|(lease_attempt, _), _| lease_attempt != attempt_id.as_str());
+        manager.tmux_registry = Arc::new(owner.registry());
+
+        manager
+            .retire_close_runtime_resources(attempt_id.clone())
+            .await
+            .unwrap();
+
+        assert_tmux_absence_proof(&manager, &attempt_id).await;
+        let output = tokio::process::Command::new("tmux")
+            .args(["-S", &socket.to_string_lossy(), "list-sessions"])
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "replacement was retired: {output:?}"
+        );
+        owner.shutdown();
+    }
+
+    #[tokio::test]
+    async fn failed_pre_runtime_worktree_reinspection_persists_typed_residual() {
+        #![allow(clippy::too_many_lines)]
+        use phoenix_core::domain::close::{
+            CapturedWorktreeIdentity, CloseAttemptId, ClosePhase, RetiredResourceKind,
+            RetirementFailureReason, RetirementOutcome,
+        };
+
+        let manager = test_manager().await;
+        let repository = tempfile::tempdir().unwrap();
+        let git = |arguments: &[&str]| {
+            let output = phoenix_core::git::command()
+                .args(arguments)
+                .current_dir(repository.path())
+                .env("GIT_AUTHOR_NAME", "Close Test")
+                .env("GIT_AUTHOR_EMAIL", "close@example.invalid")
+                .env("GIT_COMMITTER_NAME", "Close Test")
+                .env("GIT_COMMITTER_EMAIL", "close@example.invalid")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {arguments:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--quiet"]);
+        std::fs::write(repository.path().join("tracked"), "initial\n").unwrap();
+        git(&["add", "tracked"]);
+        git(&["commit", "--quiet", "-m", "initial"]);
+
+        let conversation_id = "failed-close-reinspection";
+        create_handleless_work_conv(
+            &manager,
+            conversation_id,
+            repository.path().to_str().unwrap(),
+            None,
+        )
+        .await;
+        sqlx::query("UPDATE conversations SET user_initiated = 1 WHERE id = ?1")
+            .bind(conversation_id)
+            .execute(manager.db().pool())
+            .await
+            .unwrap();
+        let conversation = manager
+            .db()
+            .get_conversation(conversation_id)
+            .await
+            .unwrap();
+        let attempt_id = CloseAttemptId::parse("failed-close-reinspection-attempt").unwrap();
+        manager
+            .db()
+            .begin_close_foundation(
+                &conversation.product_conversation_id,
+                &TranscriptConversationId::parse(conversation_id).unwrap(),
+                attempt_id.as_str(),
+            )
+            .await
+            .unwrap();
+        manager
+            .db()
+            .confirm_close_stop_work(attempt_id.as_str())
+            .await
+            .unwrap();
+        manager
+            .db()
+            .begin_close_active_work_settlement(attempt_id.as_str())
+            .await
+            .unwrap();
+        manager
+            .db()
+            .advance_close_settlement_when_quiescent(attempt_id.as_str())
+            .await
+            .unwrap();
+        manager
+            .inspect_close_retirement_only(attempt_id.clone())
+            .await
+            .unwrap();
+        let captured = manager
+            .db()
+            .list_close_attempt_scopes(attempt_id.as_str())
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let CapturedWorktreeIdentity::Resolved(captured_worktree) =
+            captured.captured_worktree.unwrap()
+        else {
+            panic!("test worktree identity must be resolved");
+        };
+
+        std::fs::remove_dir_all(repository.path().join(".git")).unwrap();
+        let error = manager
+            .retire_close_runtime_resources(attempt_id.clone())
+            .await
+            .unwrap_err();
+        assert!(error.contains("worktree cannot be reinspected before live resource retirement"));
+
+        let obligation = manager
+            .db()
+            .get_close_obligation(attempt_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(obligation.phase(), ClosePhase::NeedsRepair);
+        let evidence = manager
+            .db()
+            .list_close_retirement_evidence(attempt_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(evidence.len(), 1);
+        let residual = &evidence[0];
+        assert_eq!(residual.scope, captured.scope);
+        assert_eq!(residual.resource.kind(), RetiredResourceKind::Worktree);
+        assert_eq!(
+            residual.resource.identity(),
+            &phoenix_core::domain::close::LossItemIdentity::Worktree(captured_worktree)
+        );
+        assert_eq!(
+            residual.outcome,
+            RetirementOutcome::Residual {
+                residual_reason: RetirementFailureReason::IdentityNotProven,
+            }
+        );
+        assert!(residual
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("worktree cannot be reinspected")));
     }
 
     #[tokio::test]

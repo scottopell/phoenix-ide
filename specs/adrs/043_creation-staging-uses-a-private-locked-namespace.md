@@ -1,4 +1,4 @@
-# ADR-040: Creation staging uses a private locked namespace
+# ADR-043: Creation staging uses a private locked namespace
 
 - **Status:** Accepted
 - **Date:** 2026-08-29
@@ -36,5 +36,5 @@ Arbitrary hostile mutation by another same-user process outside supported Phoeni
 - `specs/conversation-creation/requirements.md` — REQ-CCR-005
 - `specs/conversation-creation/conversation-creation.allium`
 - ADR-007: Conversation creation uses fenced reconciliation
-- ADR-039: Creation publication uses request-bound identity and immutable starting pins
+- ADR-044: Creation publication uses request-bound identity and immutable starting pins
 - ADR-035: Repository authority activation is consumer-triggered and offline

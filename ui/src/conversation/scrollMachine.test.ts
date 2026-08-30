@@ -4,6 +4,7 @@ import {
   SETTLE_WATCH_MS,
   initialScrollMachineState,
   reduceScrollMachine,
+  snapshotIsPinned,
   type ScrollEffect,
   type ScrollEvent,
   type ScrollMachineState,
@@ -39,8 +40,14 @@ function liveFollowing(): Extract<ScrollMachineState, { kind: 'live' }> {
   return result.state as Extract<ScrollMachineState, { kind: 'live' }>;
 }
 
+// Reading state whose geometry sits far above the pin-to-bottom zone; the
+// off-bottom snapshot matters because gesture ends and pinned downward
+// movement release reading ownership when geometry is at the bottom.
 function reading(): Extract<ScrollMachineState, { kind: 'live' }> {
-  return reduceScrollMachine(liveFollowing(), { type: 'upwardIntent' }).state as Extract<ScrollMachineState, { kind: 'live' }>;
+  return reduceScrollMachine(liveFollowing(), {
+    type: 'upwardIntent',
+    snapshot: snap(1_000, 100, 400),
+  }).state as Extract<ScrollMachineState, { kind: 'live' }>;
 }
 
 const effectTypes = (effects: ScrollEffect[]) => effects.map((effect) => effect.type);
@@ -96,7 +103,7 @@ describe('scrollMachine durable follow policy', () => {
     expect(result.effects).toEqual([{ type: 'clearUnread' }]);
   });
 
-  it('a bottom callback during a moved touch cannot release ownership', () => {
+  it('a bottom callback during a moved touch cannot release ownership mid-gesture', () => {
     let state: ScrollMachineState = reduceScrollMachine(reading(), {
       type: 'viewportPinnedChanged',
       atBottom: false,
@@ -106,7 +113,32 @@ describe('scrollMachine durable follow policy', () => {
     state = reduceScrollMachine(state, { type: 'viewportPinnedChanged', atBottom: true }).state;
     expectLiveMode(state, 'reading');
     expect(state.kind === 'live' && state.gesture.kind === 'touch' && state.gesture.departedBottom).toBe(true);
+  });
 
+  it('a moved touch ending at the bottom confirms tail return and clears unread', () => {
+    let state: ScrollMachineState = reduceScrollMachine(reading(), { type: 'tailContentAdvanced' }).state;
+    expect(state.kind === 'live' && state.unread).toBe(true);
+    state = reduceScrollMachine(state, { type: 'touchStarted' }).state;
+    state = reduceScrollMachine(state, { type: 'touchMoved' }).state;
+    // The drag carries the viewport back to the tail. A pinned callback may
+    // also fire and be blocked mid-gesture; the arrival is legible from the
+    // movement either way.
+    state = reduceScrollMachine(state, {
+      type: 'downwardMovement',
+      snapshot: snap(1_000, 600, 400),
+    }).state;
+    state = reduceScrollMachine(state, { type: 'viewportPinnedChanged', atBottom: true }).state;
+    expectLiveMode(state, 'reading');
+
+    const result = reduceScrollMachine(state, { type: 'touchEnded', remainingTouches: 0 });
+    expectLiveMode(result.state, 'following');
+    expect(result.state.kind === 'live' && result.state.unread).toBe(false);
+    expect(effectTypes(result.effects)).toContain('clearUnread');
+  });
+
+  it('a moved touch ending away from the bottom keeps reading ownership', () => {
+    let state: ScrollMachineState = reduceScrollMachine(reading(), { type: 'touchStarted' }).state;
+    state = reduceScrollMachine(state, { type: 'touchMoved' }).state;
     state = reduceScrollMachine(state, { type: 'touchEnded', remainingTouches: 0 }).state;
     expectLiveMode(state, 'reading');
 
@@ -114,11 +146,292 @@ describe('scrollMachine durable follow policy', () => {
       type: 'heightChanged',
       totalHeight: 1_100,
       unitCount: 5,
-      snapshot: snap(1_100, 700, 400),
+      snapshot: snap(1_100, 100, 400),
       tailActivity: 'active',
     });
     expectLiveMode(tailGrowth.state, 'reading');
     expect(effectTypes(tailGrowth.effects)).not.toContain('snapToLastIndex');
+  });
+
+  it('downward movement into the pin zone confirms tail return without a pinned edge', () => {
+    const state: ScrollMachineState = reduceScrollMachine(reading(), { type: 'tailContentAdvanced' }).state;
+    expect(state.kind === 'live' && state.unread).toBe(true);
+
+    const midway = reduceScrollMachine(state, {
+      type: 'downwardMovement',
+      snapshot: snap(1_000, 300, 400),
+    });
+    expectLiveMode(midway.state, 'reading');
+    expect(midway.effects).toEqual([]);
+
+    const arrival = reduceScrollMachine(midway.state, {
+      type: 'downwardMovement',
+      snapshot: snap(1_000, 520, 400),
+    });
+    expectLiveMode(arrival.state, 'following');
+    expect(arrival.state.kind === 'live' && arrival.state.unread).toBe(false);
+    expect(effectTypes(arrival.effects)).toContain('clearUnread');
+  });
+
+  it('a moved touch whose geometry leaves the pin zone before lift keeps reading', () => {
+    let state: ScrollMachineState = reduceScrollMachine(reading(), { type: 'tailContentAdvanced' }).state;
+    state = reduceScrollMachine(state, { type: 'touchStarted' }).state;
+    state = reduceScrollMachine(state, { type: 'touchMoved' }).state;
+    state = reduceScrollMachine(state, { type: 'viewportPinnedChanged', atBottom: true }).state;
+
+    // Streaming grows the tail past the pin threshold before the finger
+    // lifts; the fresher height snapshot supersedes the stale at-bottom flag.
+    state = reduceScrollMachine(state, {
+      type: 'heightChanged',
+      totalHeight: 1_500,
+      unitCount: 6,
+      snapshot: snap(1_500, 600, 400),
+      tailActivity: 'active',
+    }).state;
+
+    const result = reduceScrollMachine(state, { type: 'touchEnded', remainingTouches: 0 });
+    expectLiveMode(result.state, 'reading');
+    expect(result.state.kind === 'live' && result.state.unread).toBe(true);
+  });
+
+  it('a zone arrival restores following without asserting the physical edge', () => {
+    // The reader has left the tail, so the physical edge reads false.
+    const departed = reduceScrollMachine(reading(), {
+      type: 'viewportPinnedChanged',
+      atBottom: false,
+    }).state;
+    const state = reduceScrollMachine(departed, {
+      type: 'downwardMovement',
+      snapshot: snap(1_000, 520, 400),
+    }).state;
+    expectLiveMode(state, 'following');
+    // 1000 - 520 - 400 = 80: inside the pin zone, but the viewport never
+    // crossed the physical edge, so the edge must still read false. Recording
+    // it as true would survive as a stale value that a later navigation reads
+    // as permission to resume following.
+    expect(state.kind === 'live' && state.geometry.atBottom).toBe(false);
+
+    // Concretely: navigate away, then interact. A stale edge would confirm
+    // the tail return here and let streaming snap the reader to the bottom.
+    let navigated = reduceScrollMachine(state, { type: 'navigationJumped' }).state;
+    navigated = reduceScrollMachine(navigated, { type: 'interactionStarted' }).state;
+    expectLiveMode(navigated, 'navigating');
+    expect(navigated.kind === 'live' && navigated.follow.kind === 'navigating' && navigated.follow.phase).toBe('user-returning');
+  });
+
+  it('a second finger extends the gesture instead of restarting it', () => {
+    let state: ScrollMachineState = reduceScrollMachine(reading(), { type: 'tailContentAdvanced' }).state;
+    state = reduceScrollMachine(state, { type: 'touchStarted' }).state;
+    state = reduceScrollMachine(state, { type: 'touchMoved' }).state;
+    state = reduceScrollMachine(state, {
+      type: 'downwardMovement',
+      snapshot: snap(1_000, 600, 400),
+    }).state;
+
+    // A second finger lands. Restarting the interaction would reseed the
+    // travelled maximum from the current position, erasing the evidence that
+    // the viewport came back from farther away.
+    state = reduceScrollMachine(state, { type: 'touchStarted' }).state;
+    expect(state.kind === 'live' && state.gesture.kind === 'touch' && state.gesture.moved).toBe(true);
+
+    state = reduceScrollMachine(state, { type: 'touchEnded', remainingTouches: 1 }).state;
+    const result = reduceScrollMachine(state, { type: 'touchEnded', remainingTouches: 0 });
+    expectLiveMode(result.state, 'following');
+    expect(result.state.kind === 'live' && result.state.unread).toBe(false);
+  });
+
+  it('navigation ownership survives a gesture ending at the tail', () => {
+    let state: ScrollMachineState = reduceScrollMachine(reading(), { type: 'touchStarted' }).state;
+    state = reduceScrollMachine(state, { type: 'touchMoved' }).state;
+    state = reduceScrollMachine(state, {
+      type: 'downwardMovement',
+      snapshot: snap(1_000, 600, 400),
+    }).state;
+
+    // Navigation takes the viewport mid-gesture. The lift must not hand it
+    // back: navigation ownership is released only by its own rules.
+    state = reduceScrollMachine(state, { type: 'navigationJumped' }).state;
+    expectLiveMode(state, 'navigating');
+
+    const result = reduceScrollMachine(state, { type: 'touchEnded', remainingTouches: 0 });
+    expectLiveMode(result.state, 'navigating');
+    expect(effectTypes(result.effects)).not.toContain('clearUnread');
+
+    // A cancellation ends the interaction for reasons of the platform's own —
+    // a system gesture, a container claiming the pan — none of which say
+    // anything about ownership either.
+    const cancelled = reduceScrollMachine(state, { type: 'touchCancelled', remainingTouches: 0 });
+    expectLiveMode(cancelled.state, 'navigating');
+    expect(effectTypes(cancelled.effects)).not.toContain('clearUnread');
+  });
+
+  it('a pending navigation measurement leaves the physical edge unobserved', () => {
+    let result = reduceScrollMachine(initialScrollMachineState('conv'), { type: 'navigationJumped' });
+    result = reduceScrollMachine(result.state, {
+      type: 'conversationMeasured',
+      conversationId: 'conv',
+      totalHeight: 1_000,
+      unitCount: 5,
+      // 1000 - 550 - 400 = 50: inside the pin zone, but no pinned callback
+      // has been observed, so the edge must not be asserted from it.
+      snapshot: snap(1_000, 550, 400),
+      nowMs: 1_000,
+    });
+    expectLiveMode(result.state, 'navigating');
+    expect(result.state.kind === 'live' && result.state.geometry.atBottom).toBe(false);
+
+    // Otherwise the first interaction would release navigation ownership.
+    const interacted = reduceScrollMachine(result.state, { type: 'interactionStarted' });
+    expectLiveMode(interacted.state, 'navigating');
+  });
+
+  it('a gesture that never moved the viewport does not confirm on lift', () => {
+    // iOS delivers touchmove before, or without, the scroll events that would
+    // show where the viewport went. With no observed travel there is nothing
+    // to distinguish an arrival from a finger that never shifted anything, so
+    // ownership stays with the reader.
+    let state: ScrollMachineState = reduceScrollMachine(liveFollowing(), { type: 'touchStarted' }).state;
+    state = reduceScrollMachine(state, { type: 'touchMoved' }).state;
+    const result = reduceScrollMachine(state, { type: 'touchEnded', remainingTouches: 0 });
+    expectLiveMode(result.state, 'reading');
+  });
+
+  it('tail growth under a held touch is not travel and does not confirm on lift', () => {
+    // The viewport never moves here: content grows away beneath a stationary
+    // finger and then reflows back. Distance-from-tail rises and falls, but
+    // the reader travelled nothing, so this must resolve exactly like the
+    // never-moved case above. Letting layout raise the travel maximum would
+    // manufacture the one precondition the lift derivation depends on.
+    let state: ScrollMachineState = reduceScrollMachine(liveFollowing(), { type: 'touchStarted' }).state;
+    state = reduceScrollMachine(state, { type: 'touchMoved' }).state;
+    state = reduceScrollMachine(state, {
+      type: 'heightChanged',
+      totalHeight: 1_400,
+      unitCount: 5,
+      snapshot: snap(1_400, 600, 400),
+      tailActivity: 'active',
+    }).state;
+    state = reduceScrollMachine(state, {
+      type: 'heightChanged',
+      totalHeight: 1_000,
+      unitCount: 5,
+      snapshot: snap(1_000, 600, 400),
+      tailActivity: 'active',
+    }).state;
+
+    const result = reduceScrollMachine(state, { type: 'touchEnded', remainingTouches: 0 });
+    expectLiveMode(result.state, 'reading');
+  });
+
+  it('content shrinking toward a held touch is not travel and does not confirm on lift', () => {
+    // The mirror of the growth case: the reader is 500px up, holds still, and
+    // content below them collapses until the tail is 50px away. The viewport
+    // never moved, so the gesture ending near the tail is the content's doing
+    // and must not hand the viewport back.
+    let state: ScrollMachineState = reduceScrollMachine(reading(), { type: 'touchStarted' }).state;
+    state = reduceScrollMachine(state, { type: 'touchMoved' }).state;
+    state = reduceScrollMachine(state, {
+      type: 'heightChanged',
+      totalHeight: 550,
+      unitCount: 5,
+      snapshot: snap(550, 100, 400),
+      tailActivity: 'none',
+    }).state;
+
+    const result = reduceScrollMachine(state, { type: 'touchEnded', remainingTouches: 0 });
+    expectLiveMode(result.state, 'reading');
+  });
+
+  it('an abandoned gesture keeps ownership and drops its evidence', () => {
+    let state: ScrollMachineState = reduceScrollMachine(reading(), { type: 'touchStarted' }).state;
+    state = reduceScrollMachine(state, { type: 'touchMoved' }).state;
+    state = reduceScrollMachine(state, { type: 'downwardMovement', snapshot: snap(1_000, 450, 400) }).state;
+
+    // The lift is never observed, so there is no position to confirm from.
+    // Ownership stays where the movement put it and the evidence is dropped.
+    const abandoned = reduceScrollMachine(state, { type: 'gestureAbandoned' });
+    expectLiveMode(abandoned.state, 'reading');
+    expect(abandoned.state.kind === 'live' && abandoned.state.gesture.kind).toBe('idle');
+    expect(effectTypes(abandoned.effects)).toEqual([]);
+
+    // A later gesture that ends in the return zone without travelling of its
+    // own cannot borrow the abandoned one's.
+    let next: ScrollMachineState = reduceScrollMachine(abandoned.state, { type: 'touchStarted' }).state;
+    next = reduceScrollMachine(next, { type: 'touchMoved' }).state;
+    next = reduceScrollMachine(next, {
+      type: 'heightChanged',
+      totalHeight: 900,
+      unitCount: 5,
+      snapshot: snap(900, 450, 400),
+      tailActivity: 'none',
+    }).state;
+    expectLiveMode(reduceScrollMachine(next, { type: 'touchEnded', remainingTouches: 0 }).state, 'reading');
+  });
+
+  it('the pinned edge does not confirm while a finger is on the screen', () => {
+    // A stationary touch has claimed the viewport even though it has not
+    // moved yet. Content shifting beneath it can reach the physical edge, and
+    // confirming there would hand the tail back mid-interaction.
+    const state: ScrollMachineState = reduceScrollMachine(reading(), { type: 'touchStarted' }).state;
+    const during = reduceScrollMachine(state, { type: 'viewportPinnedChanged', atBottom: true });
+    expectLiveMode(during.state, 'reading');
+    expect(effectTypes(during.effects)).not.toContain('clearUnread');
+
+    // The lift decides, from the endpoint it measures for itself. Here the
+    // gesture never travelled, so ownership stays with the reader.
+    const lifted = reduceScrollMachine(during.state, {
+      type: 'touchEnded',
+      remainingTouches: 0,
+      snapshot: snap(1_000, 100, 400),
+    });
+    expectLiveMode(lifted.state, 'reading');
+  });
+
+  it('a braking touch that rides momentum to the tail still confirms on lift', () => {
+    // The companion case: the same stationary touch, but momentum carried the
+    // viewport down under it. That travel is observed, so the lift confirms —
+    // which is why withholding the pinned confirmation costs nothing here.
+    let state: ScrollMachineState = reduceScrollMachine(reading(), { type: 'touchStarted' }).state;
+    state = reduceScrollMachine(state, { type: 'tailContentAdvanced' }).state;
+    expect(state.kind === 'live' && state.unread).toBe(true);
+    state = reduceScrollMachine(state, { type: 'downwardMovement', snapshot: snap(1_000, 600, 400) }).state;
+    state = reduceScrollMachine(state, { type: 'viewportPinnedChanged', atBottom: true }).state;
+
+    const lifted = reduceScrollMachine(state, {
+      type: 'touchEnded',
+      remainingTouches: 0,
+      snapshot: snap(1_000, 600, 400),
+    });
+    expectLiveMode(lifted.state, 'following');
+    expect(lifted.state.kind === 'live' && lifted.state.unread).toBe(false);
+  });
+
+  it('a gesture that departs the tail and returns to it confirms on lift', () => {
+    // The same start and end position as the case above; only the travel in
+    // between distinguishes them, which is why the maximum is recorded.
+    let state: ScrollMachineState = reduceScrollMachine(liveFollowing(), { type: 'touchStarted' }).state;
+    state = reduceScrollMachine(state, { type: 'touchMoved' }).state;
+    state = reduceScrollMachine(state, { type: 'upwardIntent', snapshot: snap(1_000, 100, 400) }).state;
+    state = reduceScrollMachine(state, { type: 'tailContentAdvanced' }).state;
+    expect(state.kind === 'live' && state.unread).toBe(true);
+    state = reduceScrollMachine(state, { type: 'downwardMovement', snapshot: snap(1_000, 600, 400) }).state;
+
+    const result = reduceScrollMachine(state, { type: 'touchEnded', remainingTouches: 0 });
+    expectLiveMode(result.state, 'following');
+    expect(result.state.kind === 'live' && result.state.unread).toBe(false);
+  });
+
+  it('downward movement in the pin zone during a moved touch defers to gesture end', () => {
+    let state: ScrollMachineState = reduceScrollMachine(reading(), { type: 'touchStarted' }).state;
+    state = reduceScrollMachine(state, { type: 'touchMoved' }).state;
+    const during = reduceScrollMachine(state, {
+      type: 'downwardMovement',
+      snapshot: snap(1_000, 520, 400),
+    });
+    expectLiveMode(during.state, 'reading');
+
+    const released = reduceScrollMachine(during.state, { type: 'touchEnded', remainingTouches: 0 });
+    expectLiveMode(released.state, 'following');
   });
 
   it('tap-only touch restores the mode from before the gesture', () => {
@@ -137,7 +450,11 @@ describe('scrollMachine durable follow policy', () => {
   });
 
   it('moved touch blocks follow without requiring a scroll event', () => {
-    let state: ScrollMachineState = reduceScrollMachine(liveFollowing(), { type: 'touchStarted' }).state;
+    let state: ScrollMachineState = reduceScrollMachine(liveFollowing(), {
+      type: 'viewportPinnedChanged',
+      atBottom: false,
+    }).state;
+    state = reduceScrollMachine(state, { type: 'touchStarted' }).state;
     state = reduceScrollMachine(state, { type: 'touchMoved' }).state;
     state = reduceScrollMachine(state, { type: 'touchEnded', remainingTouches: 0 }).state;
     const result = reduceScrollMachine(state, {
@@ -153,7 +470,11 @@ describe('scrollMachine durable follow policy', () => {
   });
 
   it('touch cancellation has an explicit durable-reading outcome after movement', () => {
-    let state: ScrollMachineState = reduceScrollMachine(liveFollowing(), { type: 'touchStarted' }).state;
+    let state: ScrollMachineState = reduceScrollMachine(liveFollowing(), {
+      type: 'viewportPinnedChanged',
+      atBottom: false,
+    }).state;
+    state = reduceScrollMachine(state, { type: 'touchStarted' }).state;
     state = reduceScrollMachine(state, { type: 'touchMoved' }).state;
     state = reduceScrollMachine(state, { type: 'touchCancelled', remainingTouches: 0 }).state;
     expectLiveMode(state, 'reading');
@@ -440,7 +761,11 @@ describe('scrollMachine durable follow policy', () => {
   });
 
   it('keeps a multi-touch gesture active until the final touch ends or cancels', () => {
-    let state: ScrollMachineState = reduceScrollMachine(liveFollowing(), { type: 'touchStarted' }).state;
+    let state: ScrollMachineState = reduceScrollMachine(liveFollowing(), {
+      type: 'viewportPinnedChanged',
+      atBottom: false,
+    }).state;
+    state = reduceScrollMachine(state, { type: 'touchStarted' }).state;
     state = reduceScrollMachine(state, { type: 'touchMoved' }).state;
     state = reduceScrollMachine(state, { type: 'touchEnded', remainingTouches: 2 }).state;
     expect(state.kind === 'live' && state.gesture.kind).toBe('touch');
@@ -497,6 +822,10 @@ const commandArb: fc.Arbitrary<ScrollEvent> = fc.oneof(
     remainingTouches: fc.integer({ min: 0, max: 4 }),
   }),
   fc.constant({ type: 'upwardIntent' } as const),
+  fc.record({
+    type: fc.constant('downwardMovement' as const),
+    snapshot: fc.constantFrom(snap(1_000, 100, 400), snap(1_000, 520, 400), snap(1_000, 600, 400)),
+  }),
   fc.constant({ type: 'navigationJumped' } as const),
   fc.constant({ type: 'tailContentAdvanced' } as const),
   fc.record({ type: fc.constant('viewportPinnedChanged' as const), atBottom: fc.boolean() }),
@@ -504,7 +833,7 @@ const commandArb: fc.Arbitrary<ScrollEvent> = fc.oneof(
     type: fc.constant('heightChanged' as const),
     totalHeight: fc.integer({ min: 1, max: 100_000 }),
     unitCount: fc.integer({ min: 1, max: 200 }),
-    snapshot: fc.constant(snap(1_000, 600, 400)),
+    snapshot: fc.constantFrom(snap(1_000, 600, 400), snap(1_000, 100, 400)),
     tailActivity: fc.constantFrom<'none' | 'active'>('none', 'active'),
   }),
   fc.record({
@@ -555,10 +884,16 @@ describe('scrollMachine reachable-history properties', () => {
   });
 
   it('never returns reading ownership merely because more events or time pass', () => {
+    // Excluded events are the legitimate release paths: bottom confirmation,
+    // explicit jump, navigation, and downward arrival in the pin zone. Any
+    // pinned-snapshot event marks geometry at-bottom, which a later gesture
+    // end is then allowed to confirm — so pinned snapshots are excluded too.
     const nonReleaseArb = commandArb.filter((event) =>
       event.type !== 'viewportPinnedChanged' &&
       event.type !== 'jumpToNewestRequested' &&
-      event.type !== 'navigationJumped',
+      event.type !== 'navigationJumped' &&
+      !(event.type === 'downwardMovement' && snapshotIsPinned(event.snapshot)) &&
+      !(event.type === 'heightChanged' && event.snapshot !== null && snapshotIsPinned(event.snapshot)),
     );
     fc.assert(
       fc.property(fc.array(nonReleaseArb, { maxLength: 100 }), (events) => {

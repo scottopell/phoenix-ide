@@ -29,7 +29,7 @@ use phoenix_core::work_scope::ResourceScopeKey;
 use thiserror::Error;
 use tokio::sync::{Notify, RwLock};
 
-use super::handle::{Handle, HandleId};
+use super::handle::{BashLaunchIdentity, Handle, HandleId};
 use super::ring::RING_BUFFER_BYTES;
 
 /// Per-`ResourceScopeKey` cap on `running` handles (REQ-BASH-005:
@@ -67,7 +67,19 @@ pub struct LiveHandleProcessGroup {
     pub work_scope: ResourceScopeKey,
     pub control_scope: ResourceScopeKey,
     pub handle_id: HandleId,
+    pub launch_identity: BashLaunchIdentity,
     pub pgid: i32,
+}
+
+impl LiveHandleProcessGroup {
+    #[must_use]
+    pub fn stable_resource_identity(&self) -> String {
+        format!(
+            "handle:{}:launch:{}",
+            self.handle_id,
+            self.launch_identity.stable_identity()
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +115,69 @@ impl BashTeardownFence {
     #[must_use]
     pub fn generation(&self) -> BashTeardownGeneration {
         self.generation
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BashRetirementTarget {
+    pub handle_id: HandleId,
+    pub launch_identity: BashLaunchIdentity,
+    pub pgid: i32,
+    pub pid: Option<u32>,
+    pub kill_pending_kernel: bool,
+}
+
+impl BashRetirementTarget {
+    #[must_use]
+    pub fn stable_resource_identity(&self) -> String {
+        format!(
+            "handle:{}:launch:{}",
+            self.handle_id,
+            self.launch_identity.stable_identity()
+        )
+    }
+}
+
+#[derive(Debug)]
+pub struct BashRetirementPermit {
+    pub work_scope: ResourceScopeKey,
+    pub exact_process_groups: Vec<BashRetirementTarget>,
+    generation: BashTeardownGeneration,
+    had_handles: bool,
+    entry: Arc<RwLock<ResourceScopeKeyHandles>>,
+    removed_handles: Vec<Arc<Handle>>,
+}
+
+impl BashRetirementPermit {
+    #[must_use]
+    pub fn generation(&self) -> BashTeardownGeneration {
+        self.generation
+    }
+
+    fn into_removed_handles(self) -> Vec<Arc<Handle>> {
+        self.removed_handles
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BashRetirementOutcome {
+    Retired(CascadeBashReport),
+    AbsenceVerified(CascadeBashReport),
+}
+
+impl BashRetirementOutcome {
+    #[must_use]
+    pub fn report(&self) -> &CascadeBashReport {
+        match self {
+            Self::Retired(report) | Self::AbsenceVerified(report) => report,
+        }
+    }
+
+    #[must_use]
+    pub fn into_report(self) -> CascadeBashReport {
+        match self {
+            Self::Retired(report) | Self::AbsenceVerified(report) => report,
+        }
     }
 }
 
@@ -630,6 +705,7 @@ impl BashHandleRegistry {
                         work_scope: owner.clone(),
                         control_scope: handle.controller_scope.clone(),
                         handle_id: handle.handle_id.clone(),
+                        launch_identity: handle.launch_identity.clone(),
                         pgid,
                     });
                 }
@@ -690,14 +766,173 @@ impl BashHandleRegistry {
         }
     }
 
-    async fn drain_owner(
+    pub async fn begin_retirement(&self, work_scope: &ResourceScopeKey) -> BashRetirementPermit {
+        let Some(fence) = self.begin_teardown(work_scope).await else {
+            unreachable!("begin_teardown always installs or reuses a fenced owner table")
+        };
+        let removed_handles = {
+            let mut table = fence.entry.write().await;
+            table.take_all()
+        };
+        self.remove_from_global_index(&removed_handles).await;
+        let exact_process_groups = snapshot_retirement_targets(&removed_handles).await;
+        BashRetirementPermit {
+            work_scope: work_scope.clone(),
+            exact_process_groups,
+            generation: fence.generation(),
+            had_handles: !removed_handles.is_empty(),
+            entry: fence.entry,
+            removed_handles,
+        }
+    }
+
+    async fn verify_exact_absence(&self, permit: &BashRetirementPermit) -> BashRetirementOutcome {
+        let mut report = CascadeBashReport {
+            teardown_generation: Some(permit.generation()),
+            ..CascadeBashReport::default()
+        };
+        let table = permit.entry.read().await;
+        if table.teardown_started && table.teardown_generation == permit.generation().0 {
+            for target in &permit.exact_process_groups {
+                record_retirement_target_in_report(&mut report, target);
+            }
+            #[cfg(target_os = "linux")]
+            for target in &permit.exact_process_groups {
+                match linux_retirement_target_has_live_member(target) {
+                    Ok(true) => report.kill_failures.push((
+                        target.pgid,
+                        "exact process group remains live after retirement".to_string(),
+                    )),
+                    Ok(false) => {}
+                    Err(error) => report.kill_failures.push((target.pgid, error.to_string())),
+                }
+            }
+            #[cfg(all(unix, not(target_os = "linux")))]
+            for target in &permit.exact_process_groups {
+                // Unsupported Unix hosts cannot distinguish an exited but
+                // unreaped group leader from a signalable process group.
+                let rc = unsafe { libc::kill(-target.pgid, 0) };
+                if rc == 0 {
+                    report.kill_failures.push((
+                        target.pgid,
+                        "exact process group remains live after retirement".to_string(),
+                    ));
+                } else {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::ESRCH) {
+                        report.kill_failures.push((target.pgid, error.to_string()));
+                    }
+                }
+            }
+            if !report.kill_failures.is_empty() {
+                BashRetirementOutcome::AbsenceVerified(report)
+            } else if permit.had_handles {
+                BashRetirementOutcome::Retired(report)
+            } else {
+                BashRetirementOutcome::AbsenceVerified(report)
+            }
+        } else {
+            BashRetirementOutcome::AbsenceVerified(report)
+        }
+    }
+
+    /// Releases an uncommitted exact retirement permit and restores its handles.
+    ///
+    /// This is only valid before a retirement outcome is durably recorded. It is
+    /// used when Close cannot atomically seal the inventory after fencing
+    /// admission, so a failed persistence attempt does not silently strand a
+    /// still-live process group outside the registry.
+    pub async fn cancel_retirement(&self, permit: BashRetirementPermit) {
+        let BashRetirementPermit {
+            work_scope,
+            generation,
+            entry,
+            removed_handles,
+            ..
+        } = permit;
+        let restored = {
+            let mut table = entry.write().await;
+            if !table.teardown_started || table.teardown_generation != generation.0 {
+                return;
+            }
+            table.teardown_started = false;
+            for handle in &removed_handles {
+                table.insert(Arc::clone(handle));
+            }
+            removed_handles
+        };
+        let mut by_id = self.handles_by_id.write().await;
+        for handle in restored {
+            by_id.insert(
+                handle.handle_id.clone(),
+                RegisteredHandle {
+                    owner: work_scope.clone(),
+                    handle,
+                },
+            );
+        }
+    }
+
+    pub async fn complete_retirement(
+        &self,
+        permit: &BashRetirementPermit,
+    ) -> BashRetirementOutcome {
+        let mut report = CascadeBashReport {
+            teardown_generation: Some(permit.generation()),
+            ..CascadeBashReport::default()
+        };
+        {
+            let table = permit.entry.write().await;
+            if !table.teardown_started || table.teardown_generation != permit.generation().0 {
+                return BashRetirementOutcome::AbsenceVerified(report);
+            }
+            for target in &permit.exact_process_groups {
+                record_retirement_target_in_report(&mut report, target);
+            }
+            for handle in &permit.removed_handles {
+                if handle.live_pgid().await.is_none() {
+                    continue;
+                }
+                #[cfg(unix)]
+                if let Err(error) = handle.signal_live_incarnation(libc::SIGKILL).await {
+                    report.kill_failures.push((
+                        i32::try_from(handle.launch_identity.process.pid).unwrap_or(i32::MAX),
+                        error.to_string(),
+                    ));
+                }
+            }
+        }
+
+        let verified = self.verify_exact_absence(permit).await;
+        if permit.had_handles {
+            self.emit_lifecycle(
+                &permit.work_scope,
+                None,
+                BashLifecyclePhase::Terminal,
+                None,
+                Some(BashTerminalEffect::InventoryOnly),
+            );
+        }
+        match verified {
+            BashRetirementOutcome::Retired(verification) => {
+                report.kill_failures.extend(verification.kill_failures);
+                BashRetirementOutcome::Retired(report)
+            }
+            BashRetirementOutcome::AbsenceVerified(verification) => {
+                report.kill_failures.extend(verification.kill_failures);
+                BashRetirementOutcome::AbsenceVerified(report)
+            }
+        }
+    }
+
+    pub async fn remove(
         &self,
         work_scope: &ResourceScopeKey,
-    ) -> Option<(Arc<RwLock<ResourceScopeKeyHandles>>, BashTeardownGeneration)> {
-        let fence = self.begin_teardown(work_scope).await?;
-        let removed_handles = fence.entry.write().await.take_all();
-        self.remove_from_global_index(&removed_handles).await;
-
+    ) -> Option<Arc<RwLock<ResourceScopeKeyHandles>>> {
+        let removed_handles = self
+            .begin_retirement(work_scope)
+            .await
+            .into_removed_handles();
         let removed = Arc::new(RwLock::new(ResourceScopeKeyHandles::new()));
         {
             let mut table = removed.write().await;
@@ -705,16 +940,7 @@ impl BashHandleRegistry {
                 table.insert(handle);
             }
         }
-        Some((removed, fence.generation()))
-    }
-
-    pub async fn remove(
-        &self,
-        work_scope: &ResourceScopeKey,
-    ) -> Option<Arc<RwLock<ResourceScopeKeyHandles>>> {
-        self.drain_owner(work_scope)
-            .await
-            .map(|(removed, _)| removed)
+        Some(removed)
     }
 
     async fn remove_from_global_index(&self, handles: &[Arc<Handle>]) {
@@ -736,7 +962,7 @@ impl BashHandleRegistry {
 /// orchestrator logs at WARN; nothing here is fatal — the conversation
 /// row is removed regardless. The orchestrator already knows the
 /// `ResourceScopeKey` (it's an argument), so it is not duplicated here.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CascadeBashReport {
     /// pids that were live at snapshot time (informational; kills target
     /// the pgid). One per live handle.
@@ -810,46 +1036,8 @@ pub async fn teardown_bash_owner(
     registry: &Arc<BashHandleRegistry>,
     work_scope: &ResourceScopeKey,
 ) -> CascadeBashReport {
-    let mut report = CascadeBashReport::default();
-    let Some((removed, generation)) = registry.drain_owner(work_scope).await else {
-        return report;
-    };
-    report.teardown_generation = Some(generation);
-    let handles: Vec<_> = removed.read().await.all().cloned().collect();
-
-    for h in &handles {
-        let Some(group_id) = h.live_pgid().await else {
-            continue;
-        };
-        let process_id = h.live_pid().await;
-        let kill_pending = h.is_kill_pending_kernel().await;
-        record_handle_in_report(&mut report, group_id, process_id, kill_pending);
-
-        #[cfg(unix)]
-        {
-            // SAFETY: kill(2) with negative pid signals the process group;
-            // no memory implications. ESRCH (group already gone) is expected.
-            let rc = unsafe { libc::kill(-group_id, libc::SIGKILL) };
-            if rc != 0 {
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() != Some(libc::ESRCH) {
-                    report.kill_failures.push((group_id, err.to_string()));
-                }
-            }
-        }
-    }
-
-    if !handles.is_empty() {
-        registry.emit_lifecycle(
-            work_scope,
-            None,
-            BashLifecyclePhase::Terminal,
-            None,
-            Some(BashTerminalEffect::InventoryOnly),
-        );
-    }
-
-    report
+    let permit = registry.begin_retirement(work_scope).await;
+    registry.complete_retirement(&permit).await.into_report()
 }
 
 async fn kill_selected_handles(
@@ -913,10 +1101,97 @@ fn record_handle_in_report(
     }
 }
 
+#[cfg(target_os = "linux")]
+fn linux_retirement_target_has_live_member(
+    target: &BashRetirementTarget,
+) -> Result<bool, std::io::Error> {
+    let group_exists = unsafe { libc::kill(-target.pgid, 0) } == 0
+        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    if !group_exists {
+        return Ok(false);
+    }
+    let mut unreadable_process = false;
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let stat = match std::fs::read(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                unreadable_process = true;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let Some((state, member_pgid)) = parse_linux_proc_stat(&stat) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("malformed /proc/{pid}/stat"),
+            ));
+        };
+        if member_pgid == target.pgid && state != b'Z' && state != b'X' {
+            return Ok(true);
+        }
+    }
+    if unreadable_process {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "process group {} still exists but /proc was not fully readable",
+                target.pgid
+            ),
+        ));
+    }
+    Ok(false)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_proc_stat(stat: &[u8]) -> Option<(u8, i32)> {
+    let close = stat.iter().rposition(|byte| *byte == b')')?;
+    let mut fields = stat
+        .get(close + 1..)?
+        .split(u8::is_ascii_whitespace)
+        .filter(|field| !field.is_empty());
+    let state = *fields.next()?.first()?;
+    let pgid = std::str::from_utf8(fields.nth(1)?).ok()?.parse().ok()?;
+    Some((state, pgid))
+}
+
+fn record_retirement_target_in_report(
+    report: &mut CascadeBashReport,
+    target: &BashRetirementTarget,
+) {
+    record_handle_in_report(report, target.pgid, target.pid, target.kill_pending_kernel);
+}
+
+async fn snapshot_retirement_targets(handles: &[Arc<Handle>]) -> Vec<BashRetirementTarget> {
+    let mut targets = Vec::new();
+    for handle in handles {
+        let Some(pgid) = handle.live_pgid().await else {
+            continue;
+        };
+        targets.push(BashRetirementTarget {
+            handle_id: handle.handle_id.clone(),
+            launch_identity: handle.launch_identity.clone(),
+            pgid,
+            pid: handle.live_pid().await,
+            kill_pending_kernel: handle.is_kill_pending_kernel().await,
+        });
+    }
+    targets
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bash::handle::{FinalCause, Handle};
+    use crate::bash::handle::{BashLaunchIdentity, FinalCause, Handle};
+    use phoenix_core::process_identity::ProcessIdentity;
 
     fn scope(name: &str) -> ResourceScopeKey {
         ResourceScopeKey::Work(phoenix_core::work_scope::WorkScopeId::parse(name).unwrap())
@@ -936,6 +1211,62 @@ mod tests {
             12345,
             ring_bytes_cap,
         )
+    }
+
+    fn launch_identity(pid: u32, launch_uuid: &str) -> BashLaunchIdentity {
+        BashLaunchIdentity {
+            process: ProcessIdentity {
+                pid,
+                start_time: u128::from(pid).saturating_mul(100),
+            },
+            launch_uuid: launch_uuid.to_string(),
+        }
+    }
+
+    fn make_handle_with_identity(
+        scope_name: &str,
+        id: &str,
+        launch_uuid: &str,
+        process_group_id: i32,
+        process_id: u32,
+        ring_bytes_cap: usize,
+    ) -> Arc<Handle> {
+        Handle::new_live_for_actor_with_owner_and_launch_identity(
+            scope(scope_name),
+            HandleId::new(id),
+            launch_identity(process_id, launch_uuid),
+            "system".to_string(),
+            phoenix_core::work_scope::ResourceAuthority::Work,
+            format!("cmd for {id}"),
+            None,
+            process_group_id,
+            process_id,
+            ring_bytes_cap,
+        )
+    }
+
+    fn make_handle_with_process(
+        scope_name: &str,
+        id: &str,
+        process_group_id: i32,
+        process_id: u32,
+        ring_bytes_cap: usize,
+    ) -> Arc<Handle> {
+        make_handle_with_identity(
+            scope_name,
+            id,
+            &format!("launch-{id}"),
+            process_group_id,
+            process_id,
+            ring_bytes_cap,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_stat_parser_accepts_non_utf8_comm() {
+        let stat = b"123 (bad-\xff-name) S 1 77 77 0";
+        assert_eq!(parse_linux_proc_stat(stat), Some((b'S', 77)));
     }
 
     /// REQ-WSUI-007: `emit_lifecycle` publishes a `BashLifecycleEvent`
@@ -1352,6 +1683,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn begin_retirement_snapshots_exact_handle_ids_and_pgids() {
+        let registry = BashHandleRegistry::new();
+        let owner = scope("conv-retire-snapshot");
+        let handles = registry.get_or_create(&owner).await;
+        {
+            let mut table = handles.write().await;
+            table.insert(make_handle_with_process(
+                "conv-retire-snapshot",
+                "b-1",
+                1111,
+                2111,
+                RING_BUFFER_BYTES,
+            ));
+            table.insert(make_handle_with_process(
+                "conv-retire-snapshot",
+                "b-2",
+                2222,
+                3222,
+                RING_BUFFER_BYTES,
+            ));
+        }
+
+        let permit = registry.begin_retirement(&owner).await;
+        let mut exact = permit.exact_process_groups.clone();
+        exact.sort_by(|a, b| a.handle_id.cmp(&b.handle_id));
+        assert_eq!(permit.work_scope, owner);
+        assert_eq!(exact.len(), 2);
+        assert_eq!(exact[0].handle_id, HandleId::new("b-1"));
+        assert_eq!(
+            exact[0].launch_identity,
+            launch_identity(2111, "launch-b-1")
+        );
+        assert_eq!(exact[0].pgid, 1111);
+        assert_eq!(exact[0].pid, Some(2111));
+        assert_eq!(exact[1].handle_id, HandleId::new("b-2"));
+        assert_eq!(
+            exact[1].launch_identity,
+            launch_identity(3222, "launch-b-2")
+        );
+        assert_eq!(exact[1].pgid, 2222);
+        assert_eq!(exact[1].pid, Some(3222));
+        assert!(registry.get_by_id(&HandleId::new("b-1")).await.is_none());
+        assert!(registry.get_by_id(&HandleId::new("b-2")).await.is_none());
+        assert!(matches!(
+            registry.reserve_spawn(&owner).await,
+            Err(BashHandleError::SpawnFenced)
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_retirement_permit_does_not_clear_newer_fence() {
+        let registry = BashHandleRegistry::new();
+        let owner = scope("conv-stale-retire");
+        let stale = registry.begin_retirement(&owner).await;
+        let current = registry.begin_retirement(&owner).await;
+
+        assert!(matches!(
+            registry.complete_retirement(&stale).await,
+            BashRetirementOutcome::AbsenceVerified(_)
+        ));
+        assert!(matches!(
+            registry.reserve_spawn(&owner).await,
+            Err(BashHandleError::SpawnFenced)
+        ));
+        assert!(matches!(
+            registry.complete_retirement(&current).await,
+            BashRetirementOutcome::AbsenceVerified(_)
+        ));
+    }
+
+    #[tokio::test]
     async fn work_scope_teardown_removes_coordinator_controlled_handle() {
         let registry = Arc::new(BashHandleRegistry::new());
         let lifecycle_scope = scope("inspected-work");
@@ -1538,11 +1940,6 @@ mod tests {
 
     #[tokio::test]
     async fn cascade_bash_on_delete_records_live_pgids_and_drops_entry() {
-        // The fake handle uses pgid 12345 (a process group that almost
-        // certainly does not exist on the test host). `kill(-12345, …)`
-        // will return ESRCH, which the cascade swallows — so this test
-        // verifies the bookkeeping side: the pgid is recorded in the
-        // report and the registry entry is removed.
         let registry = Arc::new(BashHandleRegistry::new());
         let handles_arc = registry.get_or_create(&scope("conv-1")).await;
         {
@@ -1555,14 +1952,203 @@ mod tests {
             cascade_bash_on_delete(&registry, &scope("conv-1"), &work_actor("owner"), None).await;
         assert_eq!(report.live_handle_pgids.len(), 2);
         assert!(report.live_handle_pgids.iter().all(|&p| p == 12345));
-        assert!(report.kill_failures.is_empty(), "ESRCH must be swallowed");
+        #[cfg(target_os = "linux")]
+        assert!(
+            report.kill_failures.is_empty(),
+            "already-absent synthetic process identities are a verified absence: {report:?}"
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(report.kill_failures.len(), 2);
         assert_eq!(registry.scope_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn stable_resource_identity_uses_launch_identity_not_handle_pointer_or_pgid() {
+        let a = make_handle_with_identity(
+            "conv-ident",
+            "b-same",
+            "launch-a",
+            777,
+            1234,
+            RING_BUFFER_BYTES,
+        );
+        let b = make_handle_with_identity(
+            "conv-ident",
+            "b-same",
+            "launch-b",
+            777,
+            1234,
+            RING_BUFFER_BYTES,
+        );
+        assert_ne!(a.stable_resource_identity(), b.stable_resource_identity());
+        assert_ne!(a.launch_identity, b.launch_identity);
+    }
+
+    #[tokio::test]
+    async fn snapshot_live_process_groups_carries_launch_identity_and_stable_resource_identity() {
+        let registry = BashHandleRegistry::new();
+        let owner = scope("conv-live-ident");
+        registry
+            .register_existing_handle(
+                &owner,
+                make_handle_with_identity(
+                    "conv-live-ident",
+                    "b-live",
+                    "launch-live",
+                    4444,
+                    5444,
+                    RING_BUFFER_BYTES,
+                ),
+            )
+            .await;
+
+        let groups = registry.snapshot_live_process_groups().await;
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].handle_id, HandleId::new("b-live"));
+        assert_eq!(
+            groups[0].launch_identity,
+            launch_identity(5444, "launch-live")
+        );
+        assert_eq!(
+            groups[0].stable_resource_identity(),
+            "handle:b-live:launch:pid:5444:start:544400:launch:launch-live"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::similar_names)]
+    async fn stale_retirement_permit_does_not_kill_replacement_process_group() {
+        use std::os::unix::process::CommandExt as _;
+        use std::process::Stdio;
+
+        fn spawn_sleep() -> std::process::Child {
+            let mut cmd = std::process::Command::new("sleep");
+            cmd.arg("60");
+            cmd.stdin(Stdio::null());
+            cmd.stdout(Stdio::null());
+            cmd.stderr(Stdio::null());
+            unsafe {
+                cmd.pre_exec(|| {
+                    if libc::setpgid(0, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            cmd.spawn().expect("spawn sleep")
+        }
+
+        let registry = Arc::new(BashHandleRegistry::new());
+        let owner = scope("conv-replacement");
+
+        let mut stale_child = spawn_sleep();
+        #[allow(clippy::cast_possible_wrap)]
+        let stale_pgid = stale_child.id() as i32;
+        let stale_pid = stale_child.id();
+        registry
+            .register_existing_handle(
+                &owner,
+                Handle::new_live(
+                    owner.clone(),
+                    HandleId::new("b-stale"),
+                    "sleep 60".to_string(),
+                    None,
+                    stale_pgid,
+                    stale_pid,
+                    RING_BUFFER_BYTES,
+                ),
+            )
+            .await;
+
+        let stale = registry.begin_retirement(&owner).await;
+        assert!(
+            registry
+                .reopen_spawn_admission(&owner, stale.generation())
+                .await
+        );
+
+        let mut replacement_child = spawn_sleep();
+        #[allow(clippy::cast_possible_wrap)]
+        let replacement_pgid = replacement_child.id() as i32;
+        let replacement_pid = replacement_child.id();
+        registry
+            .register_existing_handle(
+                &owner,
+                Handle::new_live(
+                    owner.clone(),
+                    HandleId::new("b-replacement"),
+                    "sleep 60".to_string(),
+                    None,
+                    replacement_pgid,
+                    replacement_pid,
+                    RING_BUFFER_BYTES,
+                ),
+            )
+            .await;
+
+        let current = registry.begin_retirement(&owner).await;
+        assert_ne!(
+            stale.exact_process_groups[0].stable_resource_identity(),
+            current.exact_process_groups[0].stable_resource_identity(),
+            "replacement must get a distinct durable identity even if a later process reuses fields"
+        );
+        let stale_outcome = registry.complete_retirement(&stale).await;
+        assert!(matches!(
+            stale_outcome,
+            BashRetirementOutcome::AbsenceVerified(_)
+        ));
+        assert!(
+            replacement_child
+                .try_wait()
+                .expect("try_wait replacement")
+                .is_none(),
+            "stale permit must not kill any process group once a newer fence exists"
+        );
+        assert!(
+            replacement_child
+                .try_wait()
+                .expect("try_wait replacement")
+                .is_none(),
+            "stale permit must not kill replacement process group"
+        );
+
+        let current_outcome = registry.complete_retirement(&current).await;
+        assert!(matches!(
+            current_outcome,
+            BashRetirementOutcome::Retired(_) | BashRetirementOutcome::AbsenceVerified(_)
+        ));
+        #[cfg(target_os = "linux")]
+        {
+            let replacement_status = replacement_child.wait().expect("wait replacement");
+            assert_eq!(
+                std::os::unix::process::ExitStatusExt::signal(&replacement_status),
+                Some(libc::SIGKILL),
+                "current permit must stop its exact removed handle"
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert!(replacement_child
+                .try_wait()
+                .expect("try_wait replacement")
+                .is_none());
+            unsafe {
+                let _ = libc::kill(replacement_pgid, libc::SIGKILL);
+            }
+            let _ = replacement_child.wait();
+        }
+        unsafe {
+            let _ = libc::kill(stale_pgid, libc::SIGKILL);
+        }
+        let _ = stale_child.wait();
     }
 
     #[cfg(unix)]
     #[tokio::test]
     #[allow(clippy::similar_names)] // pgid/pid mirror spec field names
-    async fn cascade_bash_on_delete_actually_kills_a_real_subprocess() {
+    async fn cascade_bash_on_delete_fails_closed_for_live_process_group() {
         // Spawn a real `sleep` in its own process group, register a
         // matching Handle, and verify the cascade SIGKILLs it. We then
         // `wait()` on the child (which reaps the zombie) and assert the
@@ -1570,9 +2156,7 @@ mod tests {
         // outliving the cascade would have it still in `Running` state
         // and `try_wait()` would return Ok(None).
         use std::os::unix::process::CommandExt as _;
-        use std::os::unix::process::ExitStatusExt as _;
         use std::process::Stdio;
-        use tokio::time::{sleep, Duration};
 
         let mut cmd = std::process::Command::new("sleep");
         cmd.arg("60");
@@ -1608,9 +2192,17 @@ mod tests {
         let handles_arc = registry.get_or_create(&real_scope).await;
         {
             let mut g = handles_arc.write().await;
-            let h = Handle::new_live(
+            let process = phoenix_core::process_identity::current_process_identity(pid)
+                .expect("capture real child identity");
+            let h = Handle::new_live_for_actor_with_owner_and_launch_identity(
                 real_scope.clone(),
                 HandleId::new("b-1"),
+                BashLaunchIdentity {
+                    process,
+                    launch_uuid: "owned-real-child".to_string(),
+                },
+                "system".to_string(),
+                phoenix_core::work_scope::ResourceAuthority::Work,
                 "sleep 60".to_string(),
                 None,
                 pgid,
@@ -1623,27 +2215,24 @@ mod tests {
         let report =
             cascade_bash_on_delete(&registry, &real_scope, &work_actor("owner"), None).await;
         assert!(report.live_handle_pgids.contains(&pgid));
-        assert!(report.kill_failures.is_empty());
-        assert_eq!(registry.scope_count().await, 1);
-
-        // Wait briefly for the kernel to deliver SIGKILL, then reap the
-        // child. The exit status's `signal()` should be `Some(SIGKILL)`.
-        for _ in 0..20 {
-            if let Some(status) = child.try_wait().expect("try_wait") {
-                assert_eq!(
-                    status.signal(),
-                    Some(libc::SIGKILL),
-                    "subprocess must have been terminated by SIGKILL"
-                );
-                return;
+        #[cfg(target_os = "linux")]
+        {
+            assert!(report.kill_failures.is_empty(), "{report:?}");
+            let status = child.wait().expect("reap signaled child");
+            assert_eq!(
+                std::os::unix::process::ExitStatusExt::signal(&status),
+                Some(libc::SIGKILL)
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert!(!report.kill_failures.is_empty(), "{report:?}");
+            assert!(child.try_wait().expect("try_wait").is_none());
+            unsafe {
+                let _ = libc::kill(pgid, libc::SIGKILL);
             }
-            sleep(Duration::from_millis(50)).await;
+            let _ = child.wait();
         }
-        // Best-effort cleanup if the kernel never delivered.
-        unsafe {
-            let _ = libc::kill(pgid, libc::SIGKILL);
-        }
-        let _ = child.wait();
-        panic!("subprocess survived cascade SIGKILL within 1s");
+        assert_eq!(registry.scope_count().await, 1);
     }
 }

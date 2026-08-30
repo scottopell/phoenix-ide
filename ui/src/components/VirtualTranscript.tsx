@@ -49,6 +49,13 @@ export interface VirtualTranscriptHandle {
     targetSelector?: string,
   ): void;
   scrollToTail(): void;
+  /** Grant or withdraw tail-following. The scroll policy owns this intent;
+   *  the physical layer only executes it when the viewport is at the tail. */
+  setTailFollowAllowed(allowed: boolean): void;
+  /** Whether a scroll event at this scrollTop is the echo of a write this
+   *  component made (anchor compensation, drift reconcile, tail snap) rather
+   *  than user movement. */
+  isProgrammaticScroll(scrollTop: number): boolean;
   captureVisibleAnchor(): VirtualTranscriptAnchor | null;
   preserveViewportOnNextItemsChange(): void;
   measureOffsetForIndex(index: number): number | null;
@@ -68,6 +75,9 @@ export interface VirtualTranscriptProps<T> {
   estimatedExtent: number | ((item: T, index: number) => number);
   className?: string;
   scrollerId?: string;
+  /** Names the scroll region. Required: it is a landmark and a focus stop, and
+   *  an unnamed one is an anonymous stop (REQ-VT-013). */
+  ariaLabel: string;
   scrollerRef?: (element: HTMLDivElement | null) => void;
   onRangeChange?: (snapshot: VirtualTranscriptRangeChange) => void;
   onTotalExtentChange?: (totalExtent: number) => void;
@@ -102,6 +112,36 @@ interface PhysicalStore<T> {
   } | null;
   pinned: boolean;
   revision: number;
+  /** Physical-minus-layout offset of the rendered block, rendered through
+   *  the top spacer (mid-scroll anchor compensation, REQ-VT-004). */
+  drift: number;
+  lastScrollAtMs: number;
+  /** Identifiers of touches that began inside this scroller and have not
+   *  been reported up. No event source is fully reliable here: a touch whose
+   *  row is unmounted mid-gesture has its touchend dispatched at a detached
+   *  node that nothing observes, while pointer events are cancelled the
+   *  moment a native pan takes over and then never report the lift at all.
+   *  Touch events are therefore the primary signal, pruned against each
+   *  event's live list and bounded by GESTURE_STALE_MS so an unobservable
+   *  lift cannot hold reconciliation open forever. */
+  activeTouchIds: Set<number>;
+  /** Last touch activity (down or move) on this scroller. */
+  lastGestureAtMs: number;
+  /** Whether the scroll policy currently grants tail-following. The physical
+   *  layer does not infer this: `pinned` describes where the viewport is, not
+   *  who owns it, and the two disagree whenever a reader is holding a
+   *  position that happens to still be at the tail. */
+  tailFollowAllowed: boolean;
+  /** Absolute position a computed correction still owes the viewport, applied
+   *  in a layout effect so the spacer change and the write land in one paint. Stored
+   *  as a position, not an offset: anything that resynchronizes geometry from
+   *  the DOM in the interval — or a browser clamping the viewport as the
+   *  spacer shrinks — would otherwise re-base the offset and apply part of
+   *  the shift twice (REQ-VT-004). */
+  pendingScrollTop: number | null;
+  /** ScrollTop value this component last wrote; cleared by the first
+   *  non-matching scroll event. */
+  pendingProgrammaticTop: number | null;
 }
 
 interface StorePublisher<T> {
@@ -111,6 +151,30 @@ interface StorePublisher<T> {
 
 const DEFAULT_ESTIMATED_EXTENT = 1;
 const PINNED_EPSILON = 1;
+export const SCROLL_SETTLE_MS = 150;
+/** Bound on how long a touch alone may defer reconciliation (REQ-VT-004). */
+export const GESTURE_STALE_MS = 2000;
+
+function scrollIsActive<T>(store: PhysicalStore<T>): boolean {
+  const now = Date.now();
+  if (now - store.lastScrollAtMs < SCROLL_SETTLE_MS) return true;
+  return store.activeTouchIds.size > 0 && now - store.lastGestureAtMs < GESTURE_STALE_MS;
+}
+
+/** Whether a change should follow the tail rather than hold position: the
+ *  viewport is at the tail and the policy still owns it. */
+function tailFollows<T>(store: PhysicalStore<T>): boolean {
+  return store.pinned && store.tailFollowAllowed;
+}
+
+/** Null selects tail-following; an anchor preserves the current position. */
+function anchorForChange<T>(store: PhysicalStore<T>): VirtualTranscriptAnchor | null {
+  return tailFollows(store) ? null : (store.activeAnchor ?? captureTopAnchor(store));
+}
+
+function topAnchorForChange<T>(store: PhysicalStore<T>): VirtualTranscriptAnchor | null {
+  return tailFollows(store) ? null : captureTopAnchor(store);
+}
 
 function clampNonNegative(value: number): number {
   return Number.isFinite(value) && value > 0 ? value : 0;
@@ -121,12 +185,13 @@ function normalizeRange(range: TranscriptRange | null): VirtualTranscriptRange |
 }
 
 function computeVisibleRange<T>(store: PhysicalStore<T>): TranscriptRange | null {
-  const viewportStart = Math.max(store.viewportTop, store.headerExtent);
-  const viewportEnd = Math.min(store.viewportTop + store.viewportExtent, totalPhysicalExtent(store));
+  const settledTop = settledViewportTop(store);
+  const viewportStart = Math.max(settledTop, store.headerExtent + store.drift);
+  const viewportEnd = Math.min(settledTop + store.viewportExtent, totalPhysicalExtent(store));
   const clippedExtent = viewportEnd - viewportStart;
   if (clippedExtent <= 0) return null;
   return store.layout.rangeForViewport({
-    viewportOffset: viewportStart - store.headerExtent,
+    viewportOffset: viewportStart - store.headerExtent - store.drift,
     viewportExtent: clippedExtent,
     overscanExtent: 0,
   });
@@ -160,7 +225,7 @@ function buildPhysicalSnapshot<T>(
   return {
     ...baseSnapshot,
     targetIndex,
-    targetOffset: offset === undefined ? null : offset - store.viewportTop,
+    targetOffset: offset === undefined ? null : offset - settledViewportTop(store),
     targetMeasured: store.measuredExtents.has(key) && (!targetSelector || targetElement !== null),
   };
 }
@@ -235,26 +300,33 @@ function buildStoreLayout<T>(store: PhysicalStore<T>): TranscriptLayout {
 }
 
 function totalPhysicalExtent<T>(store: PhysicalStore<T>): number {
-  return store.headerExtent + store.layout.totalExtent;
+  return store.headerExtent + store.layout.totalExtent + store.drift;
+}
+
+/** Viewport position with any correction still owed counted as applied. Read
+ *  this, not `viewportTop`, for anything describing where the reader sits
+ *  relative to content (REQ-VT-004). */
+function settledViewportTop<T>(store: PhysicalStore<T>): number {
+  return store.pendingScrollTop ?? store.viewportTop;
 }
 
 function rowViewportOffset<T>(store: PhysicalStore<T>): number {
-  return Math.max(0, store.viewportTop - store.headerExtent);
+  return Math.max(0, settledViewportTop(store) - store.headerExtent - store.drift);
 }
 
 function itemPhysicalOffset<T>(store: PhysicalStore<T>, index: number): number | undefined {
   const item = store.layout.itemAt(index);
-  return item ? store.headerExtent + item.offset : undefined;
+  return item ? store.headerExtent + item.offset + store.drift : undefined;
 }
 
 function itemPhysicalEnd<T>(store: PhysicalStore<T>, index: number): number | undefined {
   const item = store.layout.itemAt(index);
-  return item ? store.headerExtent + item.end : undefined;
+  return item ? store.headerExtent + item.end + store.drift : undefined;
 }
 
 function computePinned<T>(store: PhysicalStore<T>): boolean {
   const maxScrollTop = Math.max(0, totalPhysicalExtent(store) - store.viewportExtent);
-  return maxScrollTop - store.viewportTop <= PINNED_EPSILON;
+  return maxScrollTop - settledViewportTop(store) <= PINNED_EPSILON;
 }
 
 function computeRange<T>(store: PhysicalStore<T>): TranscriptRange | null {
@@ -269,10 +341,21 @@ function setScrollerScrollTop<T>(store: PhysicalStore<T>, nextTop: number): void
   const scroller = store.scroller;
   const maxScrollTop = Math.max(0, totalPhysicalExtent(store) - store.viewportExtent);
   const scrollTop = Math.max(0, Math.min(nextTop, maxScrollTop));
+  // A pending correction is relative to the position it was computed against.
+  // Placing the viewport somewhere absolute retires that position, so the
+  // correction goes with it — applied afterwards it would displace the
+  // caller's chosen position by the drift (REQ-VT-004).
+  store.pendingScrollTop = null;
   store.viewportTop = scrollTop;
   if (scroller && scroller.scrollTop !== scrollTop) {
+    store.pendingProgrammaticTop = scrollTop;
     scroller.scrollTop = scrollTop;
   }
+}
+
+function isProgrammaticScrollTop<T>(store: PhysicalStore<T>, scrollTop: number): boolean {
+  return store.pendingProgrammaticTop !== null
+    && Math.abs(scrollTop - store.pendingProgrammaticTop) <= 1;
 }
 
 function captureTopAnchor<T>(store: PhysicalStore<T>): VirtualTranscriptAnchor | null {
@@ -283,21 +366,34 @@ function captureTopAnchor<T>(store: PhysicalStore<T>): VirtualTranscriptAnchor |
   return {
     index,
     key: unit.key,
-    offset: store.headerExtent + unit.offset - store.viewportTop,
+    offset: store.headerExtent + unit.offset + store.drift - settledViewportTop(store),
   };
 }
 
 function applyAnchor<T>(store: PhysicalStore<T>, anchor: VirtualTranscriptAnchor | null): void {
   if (!anchor) {
-    setScrollerScrollTop(store, store.viewportTop);
+    setScrollerScrollTop(store, settledViewportTop(store));
     return;
   }
   const nextOffset = store.layout.offsetForKey(anchor.key);
   if (nextOffset === undefined) {
-    setScrollerScrollTop(store, store.viewportTop);
+    setScrollerScrollTop(store, settledViewportTop(store));
     return;
   }
-  setScrollerScrollTop(store, store.headerExtent + nextOffset - anchor.offset);
+  const target = store.headerExtent + nextOffset + store.drift - anchor.offset;
+  const delta = target - settledViewportTop(store);
+  // Mid-scroll absorption (REQ-VT-004); requires leading-spacer room and no
+  // correction already owed as a write — a correction lives in the spacer or
+  // in a pending write, never both.
+  if (delta !== 0 && scrollIsActive(store) && store.pendingScrollTop === null) {
+    const driftNext = store.drift - delta;
+    const firstOffset = store.range ? store.layout.itemAt(store.range.startIndex)?.offset ?? 0 : 0;
+    if (firstOffset + driftNext >= 0) {
+      store.drift = driftNext;
+      return;
+    }
+  }
+  setScrollerScrollTop(store, target);
 }
 
 function recompute<T>(store: PhysicalStore<T>): void {
@@ -319,7 +415,8 @@ function updateMeasuredExtent<T>(store: PhysicalStore<T>, key: string, nextExten
 
 function applyPhysicalChange<T>(store: PhysicalStore<T>, anchor: VirtualTranscriptAnchor | null, wasPinned: boolean): void {
   store.layout = buildStoreLayout(store);
-  if (store.scroller && (wasPinned || store.initialTailPending)) {
+  const followTail = wasPinned && store.tailFollowAllowed;
+  if (store.scroller && (followTail || store.initialTailPending)) {
     store.initialTailPending = false;
     setScrollerScrollTop(store, totalPhysicalExtent(store));
   } else if (!store.initialTailPending) {
@@ -332,7 +429,7 @@ function applyPhysicalChange<T>(store: PhysicalStore<T>, anchor: VirtualTranscri
 function handleResizeEntries<T>({ store, publish }: StorePublisher<T>, entries: ResizeObserverEntry[]): void {
   let physicalChanged = false;
   let viewportChanged = false;
-  const anchor = store.pinned ? null : (store.activeAnchor ?? captureTopAnchor(store));
+  const anchor = anchorForChange(store);
   const wasPinned = store.pinned;
 
   for (const entry of entries) {
@@ -421,6 +518,13 @@ function createStore<T>(props: VirtualTranscriptProps<T>): PhysicalStore<T> {
     pendingTarget: null,
     pinned: true,
     revision: 0,
+    drift: 0,
+    lastScrollAtMs: Number.NEGATIVE_INFINITY,
+    activeTouchIds: new Set(),
+    lastGestureAtMs: Number.NEGATIVE_INFINITY,
+    tailFollowAllowed: true,
+    pendingScrollTop: null,
+    pendingProgrammaticTop: null,
   };
   recompute(store);
   return store;
@@ -440,6 +544,7 @@ function VirtualTranscriptInner<T>(
     estimatedExtent,
     className,
     scrollerId,
+    ariaLabel,
     scrollerRef,
     onRangeChange,
     onTotalExtentChange,
@@ -464,7 +569,7 @@ function VirtualTranscriptInner<T>(
     store.estimatedExtent !== estimatedExtent ||
     store.overscan !== clampNonNegative(overscan)
   ) {
-    const anchor = store.pinned ? null : captureTopAnchor(store);
+    const anchor = topAnchorForChange(store);
     const wasPinned = store.pinned;
     store.items = items;
     store.getKey = getKey;
@@ -506,7 +611,7 @@ function VirtualTranscriptInner<T>(
       }
       if (!element) return;
       current.rowElements.set(key, element);
-      const anchor = current.pinned ? null : (current.activeAnchor ?? captureTopAnchor(current));
+      const anchor = anchorForChange(current);
       const wasPinned = current.pinned;
       const changed = updateMeasuredExtent(current, key, measureElementExtent(element));
       observeElement(current, publish, element);
@@ -521,8 +626,8 @@ function VirtualTranscriptInner<T>(
         if (targetElement && unit) {
           current.pendingTarget = null;
           const intraRowOffset = targetElement.getBoundingClientRect().top - element.getBoundingClientRect().top;
-          const physicalOffset = current.headerExtent + unit.offset;
-          const physicalEnd = current.headerExtent + unit.end;
+          const physicalOffset = current.headerExtent + unit.offset + current.drift;
+          const physicalEnd = current.headerExtent + unit.end + current.drift;
           const target = pending.align === 'end'
             ? physicalEnd - current.viewportExtent + pending.viewportStartOffset
             : physicalOffset + intraRowOffset - pending.viewportStartOffset;
@@ -544,7 +649,7 @@ function VirtualTranscriptInner<T>(
       unobserveElement(current, current.headerElement);
     }
     current.headerElement = element;
-    const anchor = current.pinned ? null : captureTopAnchor(current);
+    const anchor = topAnchorForChange(current);
     const wasPinned = current.pinned;
     const nextExtent = element ? measureElementExtent(element) : 0;
     const changed = current.headerExtent !== nextExtent;
@@ -556,12 +661,18 @@ function VirtualTranscriptInner<T>(
     }
   }, [publish]);
 
+  const detachTouchListenersRef = useRef<(() => void) | null>(null);
+
   const scrollerCallback = useCallback((element: HTMLDivElement | null) => {
     const current = storeRef.current;
     if (!current) return;
     if (current.scroller && current.scroller !== element) {
       unobserveElement(current, current.scroller);
     }
+    detachTouchListenersRef.current?.();
+    detachTouchListenersRef.current = null;
+    current.activeTouchIds.clear();
+
     current.scroller = element;
     if (element) {
       current.viewportTop = element.scrollTop;
@@ -571,6 +682,47 @@ function VirtualTranscriptInner<T>(
         current.initialTailPending = false;
         setScrollerScrollTop(current, totalPhysicalExtent(current));
       }
+      // Anything the browser no longer lists as down is released, whether or
+      // not its own end event ever reached a listener.
+      const pruneToLive = (store: PhysicalStore<T>, event: TouchEvent) => {
+        const live = new Set(Array.from(event.touches).map((touch) => touch.identifier));
+        for (const id of Array.from(store.activeTouchIds)) {
+          if (!live.has(id)) store.activeTouchIds.delete(id);
+        }
+      };
+      const onTouchStart = (event: TouchEvent) => {
+        const store = storeRef.current;
+        if (!store) return;
+        pruneToLive(store, event);
+        for (const touch of Array.from(event.changedTouches)) {
+          store.activeTouchIds.add(touch.identifier);
+        }
+        store.lastGestureAtMs = Date.now();
+      };
+      const onTouchMove = () => {
+        const store = storeRef.current;
+        if (!store) return;
+        store.lastGestureAtMs = Date.now();
+      };
+      const onTouchStop = (event: TouchEvent) => {
+        const store = storeRef.current;
+        if (!store) return;
+        for (const touch of Array.from(event.changedTouches)) {
+          store.activeTouchIds.delete(touch.identifier);
+        }
+        pruneToLive(store, event);
+        store.lastGestureAtMs = Date.now();
+      };
+      element.addEventListener('touchstart', onTouchStart, { passive: true });
+      element.addEventListener('touchmove', onTouchMove, { passive: true });
+      element.addEventListener('touchend', onTouchStop, { passive: true });
+      element.addEventListener('touchcancel', onTouchStop, { passive: true });
+      detachTouchListenersRef.current = () => {
+        element.removeEventListener('touchstart', onTouchStart);
+        element.removeEventListener('touchmove', onTouchMove);
+        element.removeEventListener('touchend', onTouchStop);
+        element.removeEventListener('touchcancel', onTouchStop);
+      };
     }
     recompute(current);
     scrollerRef?.(element);
@@ -589,7 +741,7 @@ function VirtualTranscriptInner<T>(
       current.preservedViewport = null;
       current.viewportTop = preserved.top;
     }
-    const anchor = prefixInserted || current.pinned ? null : captureTopAnchor(current);
+    const anchor = prefixInserted ? null : topAnchorForChange(current);
     const wasPinned = !prefixInserted && current.pinned;
     current.items = items;
     current.getKey = getKey;
@@ -607,6 +759,12 @@ function VirtualTranscriptInner<T>(
   useLayoutEffect(() => {
     const current = storeRef.current;
     return () => {
+      if (reconcileTimerRef.current !== 0) {
+        clearTimeout(reconcileTimerRef.current);
+        reconcileTimerRef.current = 0;
+      }
+      detachTouchListenersRef.current?.();
+      detachTouchListenersRef.current = null;
       current?.resizeObserver?.disconnect();
       current?.rowElements.clear();
       if (current) {
@@ -646,8 +804,8 @@ function VirtualTranscriptInner<T>(
       current.pendingTarget = targetSelector && !targetElement
         ? { index, key: unit.key, align, viewportStartOffset, selector: targetSelector }
         : null;
-      const physicalOffset = current.headerExtent + unit.offset;
-      const physicalEnd = current.headerExtent + unit.end;
+      const physicalOffset = current.headerExtent + unit.offset + current.drift;
+      const physicalEnd = current.headerExtent + unit.end + current.drift;
       const target = align === 'end'
         ? physicalEnd - current.viewportExtent + viewportStartOffset
         : physicalOffset + intraRowOffset - viewportStartOffset;
@@ -663,6 +821,14 @@ function VirtualTranscriptInner<T>(
       setScrollerScrollTop(current, totalPhysicalExtent(current));
       recompute(current);
       publish();
+    },
+    setTailFollowAllowed(allowed) {
+      const current = storeRef.current;
+      if (current) current.tailFollowAllowed = allowed;
+    },
+    isProgrammaticScroll(scrollTop) {
+      const current = storeRef.current;
+      return current ? isProgrammaticScrollTop(current, scrollTop) : false;
     },
     captureVisibleAnchor() {
       const current = storeRef.current;
@@ -712,6 +878,16 @@ function VirtualTranscriptInner<T>(
   const handleScroll = useCallback(() => {
     const current = storeRef.current;
     if (!current?.scroller) return;
+    // Own-write echo (REQ-VT-004): geometry only, no scroll-active marking.
+    if (isProgrammaticScrollTop(current, current.scroller.scrollTop)) {
+      current.viewportTop = current.scroller.scrollTop;
+      if (current.preservedViewport) current.preservedViewport.top = current.viewportTop;
+      recompute(current);
+      publish();
+      return;
+    }
+    current.pendingProgrammaticTop = null;
+    current.lastScrollAtMs = Date.now();
     current.viewportTop = current.scroller.scrollTop;
     if (current.preservedViewport) current.preservedViewport.top = current.viewportTop;
     current.viewportExtent = current.scroller.clientHeight;
@@ -720,23 +896,80 @@ function VirtualTranscriptInner<T>(
     publish();
   }, [publish]);
 
+  const reconcileTimerRef = useRef(0);
+
+  // Drift reconciliation (REQ-VT-004). The owed position is written in a
+  // layout effect: spacer change and scrollTop write must share one paint.
+  useLayoutEffect(() => {
+    const current = storeRef.current;
+    if (!current) return;
+    if (current.pendingScrollTop !== null) {
+      const target = current.pendingScrollTop;
+      current.pendingScrollTop = null;
+      setScrollerScrollTop(current, target);
+      recompute(current);
+      publish();
+      return;
+    }
+    if (current.drift !== 0) {
+      // Spacer exhausted: immediate direct-write fallback (REQ-VT-004).
+      const firstOffset = current.range
+        ? current.layout.itemAt(current.range.startIndex)?.offset ?? 0
+        : 0;
+      if (firstOffset + current.drift < 0) {
+        const drift = current.drift;
+        current.drift = 0;
+        current.pendingScrollTop = current.viewportTop - drift;
+        recompute(current);
+        publish();
+        return;
+      }
+    }
+    if (current.drift === 0 || reconcileTimerRef.current !== 0) return;
+    const arm = () => {
+      reconcileTimerRef.current = window.setTimeout(() => {
+        reconcileTimerRef.current = 0;
+        const store = storeRef.current;
+        if (!store || store.drift === 0) return;
+        if (scrollIsActive(store)) {
+          arm();
+          return;
+        }
+        const drift = store.drift;
+        store.drift = 0;
+        store.pendingScrollTop = store.viewportTop - drift;
+        recompute(store);
+        publish();
+      }, SCROLL_SETTLE_MS);
+    };
+    arm();
+  });
+
   const range = store.range;
   const visibleItems = range
     ? items.slice(range.startIndex, range.endIndex + 1)
     : [];
-  const topSpacer = range ? store.layout.itemAt(range.startIndex)?.offset ?? 0 : 0;
+  const topSpacer = range
+    ? Math.max(0, (store.layout.itemAt(range.startIndex)?.offset ?? 0) + store.drift)
+    : 0;
   const rangePhysicalEnd = range ? itemPhysicalEnd(store, range.endIndex) ?? store.headerExtent : store.headerExtent;
   const bottomSpacer = range
     ? Math.max(0, totalPhysicalExtent(store) - rangePhysicalEnd)
     : Math.max(0, totalPhysicalExtent(store) - store.headerExtent);
   const rootClassName = className ? `virtual-transcript ${className}` : 'virtual-transcript';
 
+  // tabIndex: keys scroll the nearest scrollable ancestor of the focused
+  // element, so without a tab stop here the transcript is unreachable from the
+  // keyboard (REQ-VT-013).
   return (
     <div
       ref={scrollerCallback}
       id={scrollerId}
       className={rootClassName}
       style={{ overflowAnchor: 'none' }}
+      role="region"
+      aria-label={ariaLabel}
+      tabIndex={0}
       onScroll={handleScroll}
     >
       <div className="virtual-transcript__inner" style={{ height: totalExtent }}>

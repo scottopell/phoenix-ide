@@ -306,11 +306,57 @@ pub enum OrdinaryProductConversationLifecycleView {
     History,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct CancelCloseBeforeRetirementRequest {
+    pub attempt_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConfirmCloseStopWorkRequest {
+    pub attempt_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RetryCloseRetirementRequest {
+    pub attempt_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct ProductConversationCloseView {
     pub attempt_id: String,
     pub phase: ProductConversationClosePhaseView,
+    pub confirmation_snapshot: Option<ProductConversationCloseInspectionView>,
+    pub inspections: Vec<ProductConversationCloseInspectionView>,
+    pub losses: Vec<ProductConversationCloseLossView>,
+    pub residuals: Vec<ProductConversationCloseResidualView>,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProductConversationCloseInspectionView {
+    pub scope: String,
+    pub generation: String,
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProductConversationCloseLossView {
+    pub scope: String,
+    pub generation: String,
+    pub category: String,
+    pub identity: String,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProductConversationCloseResidualView {
+    pub scope: String,
+    pub resource_kind: String,
+    pub identity: String,
+    pub reason: String,
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, TS)]
@@ -556,6 +602,15 @@ pub struct CancelResponse {
 #[derive(Debug, Serialize)]
 pub struct SuccessResponse {
     pub success: bool,
+}
+
+/// Exact server-observed inspection snapshot required to confirm destructive
+/// loss retirement. The request intentionally carries no filesystem path.
+#[derive(Debug, Deserialize)]
+pub struct ConfirmCloseLossRetirementRequest {
+    pub attempt_id: String,
+    pub inspection_generation: String,
+    pub inspection_fingerprint: String,
 }
 
 /// Opening handoff submitted while creating a context continuation.
@@ -1089,6 +1144,7 @@ impl ConflictErrorResponse {
         self
     }
 
+    #[cfg(test)]
     pub fn with_continuation_id(mut self, id: impl Into<String>) -> Self {
         self.continuation_id = Some(id.into());
         self

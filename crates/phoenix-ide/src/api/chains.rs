@@ -42,7 +42,7 @@ use super::types::{ConflictErrorResponse, SuccessResponse};
 use super::wire::ChainSseWireEvent;
 use super::AppState;
 use crate::chain_qa::ChainQaError;
-use crate::db::{ChainQaRow, Conversation, DbError};
+use crate::db::{ChainQaRow, ConvMode, Conversation, DbError};
 use crate::state_machine::ConvState;
 
 /// Maximum length (in chars) of a user-set chain name. The cap is arbitrary
@@ -424,8 +424,27 @@ pub async fn archive_chain_handler(
         }
     }
 
-    for id in &member_ids {
-        run_archive_cascade(&state, id).await?;
+    let active_id = member_ids
+        .last()
+        .ok_or_else(|| AppError::NotFound("chain has no members".to_string()))?;
+    let active = state
+        .db
+        .get_conversation(active_id)
+        .await
+        .map_err(db_to_app)?;
+    if matches!(
+        active.conv_mode,
+        ConvMode::Explore {
+            worktree_path: Some(_),
+            ..
+        } | ConvMode::Work { .. }
+            | ConvMode::Branch { .. }
+    ) {
+        super::lifecycle_handlers::close_legacy_compat(&state, active_id, "archive chain").await?;
+    } else {
+        for id in &member_ids {
+            run_archive_cascade(&state, id).await?;
+        }
     }
 
     Ok(Json(SuccessResponse { success: true }))

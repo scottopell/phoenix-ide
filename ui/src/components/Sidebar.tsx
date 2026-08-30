@@ -11,7 +11,11 @@ import { useTheme } from '../hooks';
 import type { CodexLoginPreflight } from '../api';
 import { subscribeModels } from '../modelsPoller';
 import { ConversationContext } from '../conversation/ConversationContext';
-import { getProductConversationListRevision, subscribeProductConversationListRevision } from '../notifications';
+import {
+  getProductConversationListRevision,
+  notifyArchiveCloseConflict,
+  subscribeProductConversationListRevision,
+} from '../notifications';
 import { beginNewProductConversationIntent } from '../hooks/useCreateConversation';
 
 const COLLAPSED_DOT_LIMIT = 9;
@@ -231,6 +235,7 @@ export function Sidebar({
       await api.archiveConversation(conv.id);
       onConversationCreated();
     } catch (err) {
+      notifyArchiveCloseConflict(conv.id, err);
       console.error('Failed to archive:', err);
     }
   }, [onConversationCreated]);

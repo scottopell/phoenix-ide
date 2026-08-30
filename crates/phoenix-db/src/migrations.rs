@@ -397,82 +397,93 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 76,
-        name: "persist_product_creation_jobs",
+        name: "add_work_scope_close_retirement_resource_kind",
         sql: MIGRATION_076,
     },
     Migration {
         version: 77,
-        name: "persist_conversation_creation_exact_checkout_oid",
-        sql: "ALTER TABLE conversation_creation_jobs ADD COLUMN exact_checkout_oid TEXT;
-ALTER TABLE conversation_creation_jobs ADD COLUMN exact_checkout_logical_base TEXT;
-CREATE TRIGGER conversation_creation_checkout_pin_insert
-BEFORE INSERT ON conversation_creation_jobs
-WHEN (NEW.exact_checkout_oid IS NULL) <> (NEW.exact_checkout_logical_base IS NULL)
-  OR (NEW.exact_checkout_oid IS NOT NULL AND trim(NEW.exact_checkout_oid) = '')
-  OR (NEW.exact_checkout_logical_base IS NOT NULL AND trim(NEW.exact_checkout_logical_base) = '')
-BEGIN
-    SELECT RAISE(ABORT, 'conversation creation checkout pin must be a non-empty pair');
-END;
-CREATE TRIGGER conversation_creation_checkout_pin_update
-BEFORE UPDATE OF exact_checkout_oid, exact_checkout_logical_base ON conversation_creation_jobs
-WHEN (NEW.exact_checkout_oid IS NULL) <> (NEW.exact_checkout_logical_base IS NULL)
-  OR (NEW.exact_checkout_oid IS NOT NULL AND trim(NEW.exact_checkout_oid) = '')
-  OR (NEW.exact_checkout_logical_base IS NOT NULL AND trim(NEW.exact_checkout_logical_base) = '')
-  OR (OLD.exact_checkout_oid IS NOT NULL AND (
-        NEW.exact_checkout_oid IS NULL
-        OR NEW.exact_checkout_oid <> OLD.exact_checkout_oid
-        OR NEW.exact_checkout_logical_base <> OLD.exact_checkout_logical_base
-      ))
-BEGIN
-    SELECT RAISE(ABORT, 'conversation creation checkout pin must be a non-empty immutable pair');
-END;
-ALTER TABLE product_conversation_sources ADD COLUMN approved_title TEXT;
-ALTER TABLE product_conversation_sources ADD COLUMN approved_priority TEXT;
-ALTER TABLE product_conversation_sources ADD COLUMN approved_artifact_body TEXT;
-ALTER TABLE product_conversation_sources ADD COLUMN approved_task_title TEXT;
-ALTER TABLE product_conversation_sources ADD COLUMN approved_plan TEXT;
-ALTER TABLE product_conversation_sources ADD COLUMN approved_task_file TEXT;
-CREATE TABLE approved_task_creation_bindings (
-    job_id TEXT PRIMARY KEY REFERENCES conversation_creation_jobs(id) ON DELETE CASCADE,
-    source_product_conversation_id TEXT NOT NULL REFERENCES product_conversations(id),
-    source_conversation_id TEXT NOT NULL CHECK (trim(source_conversation_id) <> ''),
-    task_id TEXT NOT NULL CHECK (trim(task_id) <> ''),
-    task_title TEXT NOT NULL CHECK (trim(task_title) <> ''),
-    approved_title TEXT NOT NULL CHECK (trim(approved_title) <> ''),
-    approved_priority TEXT NOT NULL CHECK (trim(approved_priority) <> ''),
-    approved_plan TEXT NOT NULL,
-    approved_task_file TEXT NOT NULL CHECK (trim(approved_task_file) <> ''),
-    approved_artifact_body TEXT NOT NULL,
-    UNIQUE(source_product_conversation_id, task_id)
-);
-CREATE TABLE conversation_approved_task_objectives (
-    conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
-    task_id TEXT NOT NULL CHECK (trim(task_id) <> ''),
-    task_title TEXT NOT NULL CHECK (trim(task_title) <> ''),
-    approved_title TEXT NOT NULL CHECK (trim(approved_title) <> ''),
-    approved_priority TEXT NOT NULL CHECK (trim(approved_priority) <> ''),
-    approved_plan TEXT NOT NULL,
-    approved_task_file TEXT NOT NULL CHECK (trim(approved_task_file) <> ''),
-    approved_artifact_body TEXT NOT NULL,
-    created_at_us INTEGER NOT NULL CHECK (created_at_us >= 0)
-);
-CREATE TABLE work_scope_approved_task_authorities (
-    work_scope_id TEXT PRIMARY KEY REFERENCES work_scopes(id) ON DELETE CASCADE,
-    objective_conversation_id TEXT NOT NULL UNIQUE
-        REFERENCES conversation_approved_task_objectives(conversation_id) ON DELETE CASCADE,
-    created_at_us INTEGER NOT NULL CHECK (created_at_us >= 0)
-);",
+        name: "record_close_retirement_resource_dispatches",
+        sql: MIGRATION_077,
     },
     Migration {
         version: 78,
+        name: "persist_runtime_resource_instances",
+        sql: MIGRATION_078,
+    },
+    Migration {
+        version: 79,
+        name: "bind_close_resources_to_runtime_instances",
+        sql: MIGRATION_079,
+    },
+    Migration {
+        version: 80,
+        name: "simplify_close_runtime_authority_and_scope_owners",
+        sql: MIGRATION_080,
+    },
+    Migration {
+        version: 81,
+        name: "repair_scope_owner_foreign_keys_and_absence_proof",
+        sql: MIGRATION_081,
+    },
+    Migration {
+        version: 82,
+        name: "return_changed_close_worktree_to_reinspection",
+        sql: MIGRATION_082,
+    },
+    Migration {
+        version: 83,
+        name: "retry_preinspection_close_repair_via_reinspection",
+        sql: MIGRATION_083,
+    },
+    Migration {
+        version: 84,
+        name: "persist_close_worktree_cleanup_plans",
+        sql: MIGRATION_084,
+    },
+    Migration {
+        version: 85,
+        name: "preserve_close_reinspection_authority",
+        sql: MIGRATION_085,
+    },
+    Migration {
+        version: 86,
+        name: "rotate_worktree_less_close_retry_inventory",
+        sql: MIGRATION_086,
+    },
+    Migration {
+        version: 87,
+        name: "require_worktree_cleanup_plan_for_adopted_absence",
+        sql: MIGRATION_087,
+    },
+    Migration {
+        version: 88,
+        name: "bind_worktree_cleanup_plan_to_admin_incarnation",
+        sql: MIGRATION_088,
+    },
+    Migration {
+        version: 89,
+        name: "require_residual_for_all_close_repair_transitions",
+        sql: MIGRATION_089,
+    },
+    Migration {
+        version: 90,
+        name: "bind_close_worktree_final_tombstone",
+        sql: MIGRATION_090,
+    },
+    Migration {
+        version: 91,
+        name: "persist_product_creation_jobs",
+        sql: MIGRATION_091,
+    },
+    Migration {
+        version: 92,
+        name: "persist_conversation_creation_exact_checkout_oid",
+        sql: MIGRATION_092,
+    },
+    Migration {
+        version: 93,
         name: "persist_product_creation_resource_ownership",
-        sql: "ALTER TABLE product_creation_resource_reservations
-ADD COLUMN ownership_token TEXT
-CHECK (ownership_token IS NULL OR (
-    typeof(ownership_token) = 'text'
-    AND trim(ownership_token) <> ''
-    AND instr(ownership_token, char(0)) = 0
-));",
+        sql: MIGRATION_093,
     },
 ];
 
@@ -2160,165 +2171,6 @@ BEGIN
 END;
 
 CREATE UNIQUE INDEX close_obligations_one_active_per_product ON close_obligations(product_conversation_id) WHERE phase <> 'completed';
-";
-
-const MIGRATION_076: &str = r"
-PRAGMA writable_schema = ON;
-UPDATE sqlite_schema
-SET sql = replace(
-    sql,
-    'authority_kind IN (''restricted_explore'', ''work'')',
-    'authority_kind IN (''direct'', ''restricted_explore'', ''work'')'
-)
-WHERE type = 'table' AND name = 'work_scopes';
-PRAGMA writable_schema = RESET;
-
-CREATE TABLE product_creation_jobs (
-    request_id TEXT PRIMARY KEY CHECK (typeof(request_id) = 'text' AND trim(request_id) <> ''),
-    product_conversation_id TEXT NOT NULL UNIQUE
-        CHECK (typeof(product_conversation_id) = 'text' AND trim(product_conversation_id) <> ''),
-    cwd TEXT NOT NULL CHECK (typeof(cwd) = 'text' AND trim(cwd) <> '' AND instr(cwd, char(0)) = 0),
-    objective TEXT NOT NULL CHECK (typeof(objective) = 'text'),
-    model TEXT CHECK (model IS NULL OR (typeof(model) = 'text' AND trim(model) <> '')),
-    effort TEXT CHECK (effort IS NULL OR (typeof(effort) = 'text' AND trim(effort) <> '')),
-    llm_language TEXT NOT NULL CHECK (llm_language IN ('phoenix-native', 'caveman')),
-    status TEXT NOT NULL CHECK (status IN ('accepted', 'claimed', 'retry_scheduled', 'cancelling', 'cancelled', 'deletion_pending', 'delivery_pending', 'delivery_failed', 'published', 'failed', 'cleanup_ambiguous')),
-    accepted_at_unix_micros INTEGER NOT NULL CHECK (typeof(accepted_at_unix_micros) = 'integer' AND accepted_at_unix_micros >= 0),
-    updated_at_unix_micros INTEGER NOT NULL CHECK (typeof(updated_at_unix_micros) = 'integer' AND updated_at_unix_micros >= 0),
-    attempt_count INTEGER NOT NULL DEFAULT 1 CHECK (typeof(attempt_count) = 'integer' AND attempt_count >= 1 AND attempt_count <= 4),
-    claim_generation INTEGER NOT NULL DEFAULT 0 CHECK (typeof(claim_generation) = 'integer' AND claim_generation >= 0),
-    claim_worker_id TEXT CHECK (claim_worker_id IS NULL OR (typeof(claim_worker_id) = 'text' AND trim(claim_worker_id) <> '')),
-    claim_token TEXT CHECK (claim_token IS NULL OR (typeof(claim_token) = 'text' AND trim(claim_token) <> '')),
-    claim_lease_until_unix_micros INTEGER CHECK (claim_lease_until_unix_micros IS NULL OR (typeof(claim_lease_until_unix_micros) = 'integer' AND claim_lease_until_unix_micros >= 0)),
-    retry_at_unix_micros INTEGER CHECK (retry_at_unix_micros IS NULL OR (typeof(retry_at_unix_micros) = 'integer' AND retry_at_unix_micros >= 0)),
-    cleanup_worker_id TEXT CHECK (cleanup_worker_id IS NULL OR (typeof(cleanup_worker_id) = 'text' AND trim(cleanup_worker_id) <> '')),
-    cleanup_token TEXT CHECK (cleanup_token IS NULL OR (typeof(cleanup_token) = 'text' AND trim(cleanup_token) <> '')),
-    cleanup_lease_until_unix_micros INTEGER CHECK (cleanup_lease_until_unix_micros IS NULL OR (typeof(cleanup_lease_until_unix_micros) = 'integer' AND cleanup_lease_until_unix_micros >= 0)),
-    delivery_attempt_count INTEGER NOT NULL DEFAULT 1 CHECK (typeof(delivery_attempt_count) = 'integer' AND delivery_attempt_count >= 1 AND delivery_attempt_count <= 4),
-    delivery_retry_at_unix_micros INTEGER CHECK (delivery_retry_at_unix_micros IS NULL OR (typeof(delivery_retry_at_unix_micros) = 'integer' AND delivery_retry_at_unix_micros >= 0)),
-    pin_exact_checkout_oid TEXT CHECK (pin_exact_checkout_oid IS NULL OR (typeof(pin_exact_checkout_oid) = 'text' AND trim(pin_exact_checkout_oid) <> '')),
-    pin_logical_base TEXT CHECK (pin_logical_base IS NULL OR (typeof(pin_logical_base) = 'text' AND trim(pin_logical_base) <> '')),
-    pin_freshness TEXT CHECK (pin_freshness IS NULL OR pin_freshness = 'fresh'),
-    staging_path TEXT CHECK (staging_path IS NULL OR (typeof(staging_path) = 'text' AND trim(staging_path) <> '' AND instr(staging_path, char(0)) = 0)),
-    staging_repo_root TEXT CHECK (staging_repo_root IS NULL OR (typeof(staging_repo_root) = 'text' AND trim(staging_repo_root) <> '' AND instr(staging_repo_root, char(0)) = 0)),
-    staging_exact_oid TEXT CHECK (staging_exact_oid IS NULL OR (typeof(staging_exact_oid) = 'text' AND trim(staging_exact_oid) <> '')),
-    published_product_id TEXT UNIQUE REFERENCES product_conversations(id) ON DELETE CASCADE,
-    published_conversation_id TEXT UNIQUE REFERENCES conversations(id) ON DELETE CASCADE,
-    last_error TEXT CHECK (last_error IS NULL OR typeof(last_error) = 'text'),
-    cancelled_at_unix_micros INTEGER CHECK (cancelled_at_unix_micros IS NULL OR (typeof(cancelled_at_unix_micros) = 'integer' AND cancelled_at_unix_micros >= 0)),
-    deletion_requested_at_unix_micros INTEGER CHECK (deletion_requested_at_unix_micros IS NULL OR (typeof(deletion_requested_at_unix_micros) = 'integer' AND deletion_requested_at_unix_micros >= 0)),
-    CHECK ((status = 'accepted' AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until_unix_micros IS NULL AND retry_at_unix_micros IS NULL AND cleanup_worker_id IS NULL AND cleanup_token IS NULL AND cleanup_lease_until_unix_micros IS NULL AND published_product_id IS NULL AND published_conversation_id IS NULL AND cancelled_at_unix_micros IS NULL AND deletion_requested_at_unix_micros IS NULL)
-        OR (status = 'claimed' AND claim_worker_id IS NOT NULL AND claim_token IS NOT NULL AND claim_lease_until_unix_micros IS NOT NULL AND retry_at_unix_micros IS NULL AND cleanup_worker_id IS NULL AND cleanup_token IS NULL AND cleanup_lease_until_unix_micros IS NULL AND published_product_id IS NULL AND published_conversation_id IS NULL AND cancelled_at_unix_micros IS NULL AND deletion_requested_at_unix_micros IS NULL)
-        OR (status = 'retry_scheduled' AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until_unix_micros IS NULL AND retry_at_unix_micros IS NOT NULL AND cleanup_worker_id IS NULL AND cleanup_token IS NULL AND cleanup_lease_until_unix_micros IS NULL AND published_product_id IS NULL AND published_conversation_id IS NULL AND cancelled_at_unix_micros IS NULL AND deletion_requested_at_unix_micros IS NULL)
-        OR (status = 'cancelling' AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until_unix_micros IS NULL AND retry_at_unix_micros IS NULL AND published_product_id IS NULL AND published_conversation_id IS NULL AND cancelled_at_unix_micros IS NULL AND deletion_requested_at_unix_micros IS NULL)
-        OR (status = 'cancelled' AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until_unix_micros IS NULL AND retry_at_unix_micros IS NULL AND published_product_id IS NULL AND published_conversation_id IS NULL AND cancelled_at_unix_micros IS NOT NULL)
-        OR (status = 'deletion_pending' AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until_unix_micros IS NULL AND retry_at_unix_micros IS NULL AND published_product_id IS NULL AND published_conversation_id IS NULL AND deletion_requested_at_unix_micros IS NOT NULL)
-        OR (status = 'delivery_pending' AND ((claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until_unix_micros IS NULL) OR (claim_worker_id IS NOT NULL AND claim_token IS NOT NULL AND claim_lease_until_unix_micros IS NOT NULL)) AND retry_at_unix_micros IS NULL AND cleanup_worker_id IS NULL AND cleanup_token IS NULL AND cleanup_lease_until_unix_micros IS NULL AND published_product_id IS NOT NULL AND published_conversation_id IS NOT NULL AND cancelled_at_unix_micros IS NULL AND deletion_requested_at_unix_micros IS NULL)
-        OR (status = 'delivery_failed' AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until_unix_micros IS NULL AND retry_at_unix_micros IS NULL AND cleanup_worker_id IS NULL AND cleanup_token IS NULL AND cleanup_lease_until_unix_micros IS NULL AND delivery_retry_at_unix_micros IS NULL AND published_product_id IS NOT NULL AND published_conversation_id IS NOT NULL AND cancelled_at_unix_micros IS NULL AND deletion_requested_at_unix_micros IS NULL)
-        OR (status = 'published' AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until_unix_micros IS NULL AND retry_at_unix_micros IS NULL AND cleanup_worker_id IS NULL AND cleanup_token IS NULL AND cleanup_lease_until_unix_micros IS NULL AND published_product_id IS NOT NULL AND published_conversation_id IS NOT NULL AND cancelled_at_unix_micros IS NULL AND deletion_requested_at_unix_micros IS NULL)
-        OR (status IN ('failed', 'cleanup_ambiguous') AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until_unix_micros IS NULL AND retry_at_unix_micros IS NULL AND cleanup_worker_id IS NULL AND cleanup_token IS NULL AND cleanup_lease_until_unix_micros IS NULL AND published_product_id IS NULL AND published_conversation_id IS NULL AND cancelled_at_unix_micros IS NULL AND deletion_requested_at_unix_micros IS NULL))
-);
-CREATE INDEX product_creation_jobs_claim_order
-    ON product_creation_jobs(status, accepted_at_unix_micros, request_id);
-CREATE INDEX product_creation_jobs_retry_order
-    ON product_creation_jobs(status, retry_at_unix_micros, accepted_at_unix_micros, request_id);
-CREATE INDEX product_creation_jobs_cleanup_order
-    ON product_creation_jobs(status, cleanup_lease_until_unix_micros, updated_at_unix_micros, request_id);
-CREATE INDEX product_creation_jobs_delivery_order
-    ON product_creation_jobs(status, delivery_retry_at_unix_micros, updated_at_unix_micros, request_id);
-CREATE INDEX product_creation_jobs_published_cwd
-    ON product_creation_jobs(status, cwd, updated_at_unix_micros DESC, request_id DESC);
-
-CREATE TABLE product_creation_job_images (
-    request_id TEXT NOT NULL REFERENCES product_creation_jobs(request_id) ON DELETE CASCADE,
-    ordinal INTEGER NOT NULL CHECK (typeof(ordinal) = 'integer' AND ordinal >= 0),
-    media_type TEXT NOT NULL CHECK (typeof(media_type) = 'text' AND trim(media_type) <> ''),
-    data TEXT NOT NULL CHECK (typeof(data) = 'text' AND trim(data) <> ''),
-    PRIMARY KEY (request_id, ordinal)
-);
-
-CREATE TABLE product_creation_resource_reservations (
-    id TEXT PRIMARY KEY CHECK (typeof(id) = 'text' AND trim(id) <> ''),
-    request_id TEXT NOT NULL REFERENCES product_creation_jobs(request_id) ON DELETE CASCADE,
-    generation INTEGER NOT NULL CHECK (typeof(generation) = 'integer' AND generation > 0),
-    repository_identity TEXT NOT NULL CHECK (typeof(repository_identity) = 'text' AND trim(repository_identity) <> ''),
-    resource_identity TEXT NOT NULL CHECK (typeof(resource_identity) = 'text' AND trim(resource_identity) <> ''),
-    status TEXT NOT NULL CHECK (status IN ('reserved', 'present', 'cleanup_required', 'released', 'conflict')),
-    created_at_unix_micros INTEGER NOT NULL CHECK (typeof(created_at_unix_micros) = 'integer' AND created_at_unix_micros >= 0),
-    updated_at_unix_micros INTEGER NOT NULL CHECK (typeof(updated_at_unix_micros) = 'integer' AND updated_at_unix_micros >= 0),
-    UNIQUE(request_id, resource_identity)
-);
-CREATE INDEX product_creation_resource_reservations_job
-    ON product_creation_resource_reservations(request_id, status);
-
-CREATE TABLE product_conversation_work_scopes (
-    product_conversation_id TEXT PRIMARY KEY REFERENCES product_conversations(id) ON DELETE CASCADE,
-    work_scope_id TEXT NOT NULL UNIQUE REFERENCES work_scopes(id) ON DELETE RESTRICT
-);
-CREATE TABLE conflicting_product_conversation_work_scopes AS
-SELECT product_conversation_id
-FROM conversations
-WHERE product_conversation_id IS NOT NULL
-  AND work_scope_id IS NOT NULL
-  AND runtime_role = 'user'
-GROUP BY product_conversation_id
-HAVING COUNT(DISTINCT work_scope_id) > 1;
-INSERT INTO product_conversation_work_scopes (product_conversation_id, work_scope_id)
-SELECT c.product_conversation_id, MIN(c.work_scope_id)
-FROM conversations c
-WHERE c.product_conversation_id IS NOT NULL
-  AND c.work_scope_id IS NOT NULL
-  AND c.runtime_role = 'user'
-  AND NOT EXISTS (
-      SELECT 1 FROM conflicting_product_conversation_work_scopes conflict
-      WHERE conflict.product_conversation_id = c.product_conversation_id
-  )
-GROUP BY c.product_conversation_id;
-DROP TABLE conflicting_product_conversation_work_scopes;
-
-CREATE TRIGGER product_conversation_work_scopes_insert_conversation_owner_match
-BEFORE INSERT ON product_conversation_work_scopes
-WHEN EXISTS (
-    SELECT 1 FROM conversations c
-    WHERE c.work_scope_id = NEW.work_scope_id
-      AND c.product_conversation_id <> NEW.product_conversation_id
-)
-BEGIN
-    SELECT RAISE(ABORT, 'work scope already belongs to another product');
-END;
-CREATE TRIGGER product_conversation_work_scopes_insert_subagent_owner_match
-BEFORE INSERT ON product_conversation_work_scopes
-WHEN EXISTS (
-    SELECT 1
-    FROM conversations child
-    JOIN conversations parent ON parent.id = child.parent_conversation_id
-    WHERE child.work_scope_id = NEW.work_scope_id
-      AND child.runtime_role = 'sub_agent'
-      AND parent.product_conversation_id <> NEW.product_conversation_id
-)
-BEGIN
-    SELECT RAISE(ABORT, 'sub-agent scope belongs to another product');
-END;
-CREATE TRIGGER conversations_product_scope_insert_enforce
-BEFORE INSERT ON conversations
-WHEN NEW.work_scope_id IS NOT NULL AND EXISTS (
-    SELECT 1 FROM product_conversation_work_scopes owner
-    WHERE owner.work_scope_id = NEW.work_scope_id
-      AND owner.product_conversation_id <> NEW.product_conversation_id
-)
-BEGIN
-    SELECT RAISE(ABORT, 'conversation work scope belongs to another product');
-END;
-CREATE TRIGGER conversations_product_scope_update_enforce
-BEFORE UPDATE OF product_conversation_id, work_scope_id ON conversations
-WHEN NEW.work_scope_id IS NOT NULL AND EXISTS (
-    SELECT 1 FROM product_conversation_work_scopes owner
-    WHERE owner.work_scope_id = NEW.work_scope_id
-      AND owner.product_conversation_id <> NEW.product_conversation_id
-)
-BEGIN
-    SELECT RAISE(ABORT, 'conversation work scope belongs to another product');
-END;
 ";
 
 const MIGRATION_075: &str = r"
@@ -7736,6 +7588,481 @@ CREATE INDEX idx_creation_cleanup_due
     ON conversation_creation_jobs(status, cleanup_lease_until, updated_at);
 ";
 
+const MIGRATION_080: &str = r"
+DROP TRIGGER close_obligations_transition_graph;
+CREATE TRIGGER close_obligations_transition_graph
+BEFORE UPDATE OF phase ON close_obligations
+FOR EACH ROW
+WHEN NOT (
+    (OLD.phase = 'awaiting_blocker_resolution' AND NEW.phase IN ('awaiting_stop_work_confirmation', 'settling_active_work', 'completed'))
+    OR (OLD.phase = 'awaiting_stop_work_confirmation' AND NEW.phase IN ('settling_active_work', 'completed'))
+    OR (OLD.phase = 'settling_active_work' AND NEW.phase IN ('cancel_requested_during_settlement', 'awaiting_retirement_inspection'))
+    OR (OLD.phase = 'cancel_requested_during_settlement' AND NEW.phase = 'completed')
+    OR (OLD.phase = 'awaiting_retirement_inspection' AND NEW.phase IN ('awaiting_loss_confirmation', 'retirement_requested', 'needs_repair', 'completed'))
+    OR (OLD.phase = 'awaiting_loss_confirmation' AND NEW.phase IN ('awaiting_retirement_inspection', 'retirement_requested', 'completed'))
+    OR (OLD.phase = 'retirement_requested' AND NEW.phase IN ('needs_repair', 'completed'))
+    OR (OLD.phase = 'needs_repair' AND NEW.phase IN ('retirement_requested', 'completed'))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid close obligation phase transition');
+END;
+
+DROP TRIGGER close_obligations_reject_missing_inspection_on_update;
+CREATE TRIGGER close_obligations_reject_missing_inspection_on_update
+BEFORE UPDATE ON close_obligations
+FOR EACH ROW
+WHEN NEW.phase IN ('awaiting_loss_confirmation', 'retirement_requested')
+  AND NEW.inspection_generation IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'close_obligations inspection required for phase');
+END;
+
+DROP TRIGGER IF EXISTS close_expected_runtime_instance_kind_scope_matches;
+DROP TRIGGER IF EXISTS close_expected_runtime_instance_required;
+ALTER TABLE close_expected_retirement_resources DROP COLUMN runtime_resource_instance_id;
+DROP TRIGGER IF EXISTS runtime_resource_instances_preserve_identity;
+DROP INDEX IF EXISTS runtime_resource_instances_live_exact_identity;
+DROP TABLE runtime_resource_instances;
+DROP TRIGGER IF EXISTS close_expected_retirement_resources_reject_standalone_delete;
+DROP TRIGGER IF EXISTS close_retirement_resource_history_reject_delete;
+DELETE FROM close_retirement_resource_history
+WHERE resource_kind IN ('bash_process_group', 'pty_session', 'browser_session');
+DELETE FROM close_retirement_resource_dispatches
+WHERE resource_kind IN ('bash_process_group', 'pty_session', 'browser_session');
+DELETE FROM close_expected_retirement_resources
+WHERE resource_kind IN ('bash_process_group', 'pty_session', 'browser_session');
+CREATE TRIGGER close_expected_retirement_resources_reject_standalone_delete
+BEFORE DELETE ON close_expected_retirement_resources
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM close_obligations obligation
+    JOIN product_conversations product ON product.id = obligation.product_conversation_id
+    WHERE obligation.attempt_id = OLD.attempt_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'expected retirement resource can only be deleted with its root');
+END;
+
+CREATE TRIGGER close_retirement_resource_history_reject_delete
+BEFORE DELETE ON close_retirement_resource_history
+WHEN EXISTS (SELECT 1 FROM close_obligations WHERE attempt_id = OLD.attempt_id)
+BEGIN
+    SELECT RAISE(ABORT, 'retirement resource history belongs to its Close aggregate');
+END;
+
+CREATE TABLE product_conversation_work_scope_repairs (
+    work_scope_id TEXT PRIMARY KEY,
+    first_product_conversation_id TEXT NOT NULL,
+    second_product_conversation_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state = 'needs_repair'),
+    CHECK (first_product_conversation_id <> second_product_conversation_id)
+);
+
+INSERT INTO product_conversation_work_scope_repairs (
+    work_scope_id, first_product_conversation_id, second_product_conversation_id, state
+)
+SELECT c.work_scope_id, MIN(c.product_conversation_id), MAX(c.product_conversation_id), 'needs_repair'
+FROM conversations c
+JOIN product_conversations product ON product.id = c.product_conversation_id
+WHERE c.work_scope_id IS NOT NULL
+  AND c.runtime_role <> 'coordinator'
+  AND product.kind = 'ordinary'
+GROUP BY c.work_scope_id
+HAVING COUNT(DISTINCT c.product_conversation_id) > 1;
+
+CREATE TABLE product_conversation_work_scope_missing_owners (
+    work_scope_id TEXT PRIMARY KEY,
+    state TEXT NOT NULL CHECK (state = 'needs_repair')
+);
+
+INSERT INTO product_conversation_work_scope_missing_owners (work_scope_id, state)
+SELECT scope.id, 'needs_repair'
+FROM work_scopes scope
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM conversations c
+    JOIN product_conversations product ON product.id = c.product_conversation_id
+    WHERE c.work_scope_id = scope.id
+      AND c.runtime_role = 'user'
+      AND product.kind = 'ordinary'
+);
+
+CREATE TABLE product_conversation_work_scopes (
+    work_scope_id TEXT PRIMARY KEY REFERENCES work_scopes(id) ON DELETE RESTRICT,
+    product_conversation_id TEXT NOT NULL REFERENCES product_conversations(id) ON DELETE CASCADE,
+    UNIQUE (product_conversation_id, work_scope_id)
+);
+
+INSERT INTO product_conversation_work_scopes (work_scope_id, product_conversation_id)
+SELECT c.work_scope_id, MIN(c.product_conversation_id)
+FROM conversations c
+JOIN product_conversations product ON product.id = c.product_conversation_id
+WHERE c.work_scope_id IS NOT NULL
+  AND c.runtime_role = 'user'
+  AND product.kind = 'ordinary'
+GROUP BY c.work_scope_id
+HAVING COUNT(DISTINCT c.product_conversation_id) = 1;
+
+CREATE TRIGGER conversations_reject_repair_scope_owner
+BEFORE INSERT ON conversations
+FOR EACH ROW
+WHEN NEW.work_scope_id IS NOT NULL
+ AND NEW.runtime_role <> 'coordinator'
+ AND (
+    EXISTS (
+        SELECT 1 FROM product_conversation_work_scope_repairs
+        WHERE work_scope_id = NEW.work_scope_id
+    )
+    OR EXISTS (
+        SELECT 1 FROM product_conversation_work_scope_missing_owners
+        WHERE work_scope_id = NEW.work_scope_id
+    )
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'work scope has unresolved product conversation ownership repair');
+END;
+
+CREATE TRIGGER conversations_reject_repair_scope_owner_on_update
+BEFORE UPDATE OF product_conversation_id, work_scope_id, runtime_role ON conversations
+FOR EACH ROW
+WHEN NEW.work_scope_id IS NOT NULL
+ AND NEW.runtime_role <> 'coordinator'
+ AND (
+    EXISTS (
+        SELECT 1 FROM product_conversation_work_scope_repairs
+        WHERE work_scope_id = NEW.work_scope_id
+    )
+    OR EXISTS (
+        SELECT 1 FROM product_conversation_work_scope_missing_owners
+        WHERE work_scope_id = NEW.work_scope_id
+    )
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'work scope has unresolved product conversation ownership repair');
+END;
+
+CREATE TRIGGER conversations_assign_or_validate_work_scope_owner
+BEFORE INSERT ON conversations
+FOR EACH ROW
+WHEN NEW.work_scope_id IS NOT NULL AND NEW.runtime_role = 'user'
+BEGIN
+    INSERT OR IGNORE INTO product_conversation_work_scopes (work_scope_id, product_conversation_id)
+    SELECT NEW.work_scope_id, NEW.product_conversation_id
+    WHERE EXISTS (
+        SELECT 1 FROM product_conversations
+        WHERE id = NEW.product_conversation_id AND kind = 'ordinary'
+    );
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1 FROM product_conversation_work_scopes
+        WHERE work_scope_id = NEW.work_scope_id
+          AND product_conversation_id = NEW.product_conversation_id
+    ) THEN RAISE(ABORT, 'work scope belongs to a different ordinary product conversation') END;
+END;
+
+CREATE TRIGGER conversations_validate_participant_work_scope_owner
+BEFORE INSERT ON conversations
+FOR EACH ROW
+WHEN NEW.work_scope_id IS NOT NULL AND NEW.runtime_role = 'sub_agent'
+BEGIN
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1 FROM product_conversation_work_scopes
+        WHERE work_scope_id = NEW.work_scope_id
+          AND product_conversation_id = NEW.product_conversation_id
+    ) THEN RAISE(ABORT, 'work scope participant belongs to a different product conversation') END;
+END;
+
+CREATE TRIGGER conversations_validate_participant_work_scope_owner_on_update
+BEFORE UPDATE OF product_conversation_id, work_scope_id, runtime_role ON conversations
+FOR EACH ROW
+WHEN NEW.work_scope_id IS NOT NULL AND NEW.runtime_role = 'sub_agent'
+BEGIN
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1 FROM product_conversation_work_scopes
+        WHERE work_scope_id = NEW.work_scope_id
+          AND product_conversation_id = NEW.product_conversation_id
+    ) THEN RAISE(ABORT, 'work scope participant belongs to a different product conversation') END;
+END;
+
+CREATE TRIGGER conversations_validate_work_scope_owner_on_update
+BEFORE UPDATE OF product_conversation_id, work_scope_id, runtime_role ON conversations
+FOR EACH ROW
+WHEN NEW.work_scope_id IS NOT NULL AND NEW.runtime_role = 'user'
+BEGIN
+    INSERT OR IGNORE INTO product_conversation_work_scopes (work_scope_id, product_conversation_id)
+    SELECT NEW.work_scope_id, NEW.product_conversation_id
+    WHERE EXISTS (
+        SELECT 1 FROM product_conversations
+        WHERE id = NEW.product_conversation_id AND kind = 'ordinary'
+    );
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1 FROM product_conversation_work_scopes
+        WHERE work_scope_id = NEW.work_scope_id
+          AND product_conversation_id = NEW.product_conversation_id
+    ) THEN RAISE(ABORT, 'work scope belongs to a different ordinary product conversation') END;
+END;
+";
+
+const MIGRATION_079: &str = r"
+ALTER TABLE close_expected_retirement_resources
+ADD COLUMN runtime_resource_instance_id TEXT REFERENCES runtime_resource_instances(instance_id) ON DELETE RESTRICT;
+
+CREATE TRIGGER close_expected_runtime_instance_kind_scope_matches
+BEFORE UPDATE OF runtime_resource_instance_id ON close_expected_retirement_resources
+FOR EACH ROW
+WHEN NEW.runtime_resource_instance_id IS NOT NULL
+ AND NOT EXISTS (
+    SELECT 1 FROM runtime_resource_instances instance
+    WHERE instance.instance_id = NEW.runtime_resource_instance_id
+      AND instance.work_scope_id = NEW.scope
+      AND (
+        (NEW.resource_kind = 'bash_process_group' AND instance.resource_kind = 'bash')
+        OR (NEW.resource_kind = 'tmux_server' AND instance.resource_kind = 'tmux')
+        OR (NEW.resource_kind = 'pty_session' AND instance.resource_kind = 'pty')
+        OR (NEW.resource_kind = 'browser_session' AND instance.resource_kind = 'browser')
+      )
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'close expected runtime resource must bind matching scope and kind instance');
+END;
+
+CREATE TRIGGER close_expected_runtime_instance_required
+BEFORE UPDATE OF runtime_resource_instance_id ON close_expected_retirement_resources
+FOR EACH ROW
+WHEN NEW.resource_kind IN ('bash_process_group', 'tmux_server', 'pty_session', 'browser_session')
+ AND NEW.runtime_resource_instance_id IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'close runtime resource instance binding cannot be removed');
+END;
+";
+
+const MIGRATION_078: &str = r"
+CREATE TABLE runtime_resource_instances (
+    instance_id TEXT PRIMARY KEY NOT NULL,
+    work_scope_id TEXT NOT NULL REFERENCES work_scopes(id) ON DELETE RESTRICT,
+    resource_kind TEXT NOT NULL CHECK (resource_kind IN ('bash', 'tmux', 'pty', 'browser')),
+    state TEXT NOT NULL CHECK (state IN ('live', 'retirement_pending', 'retired', 'needs_repair')),
+    launch_uuid TEXT NOT NULL CHECK (length(trim(launch_uuid)) > 0),
+    pid INTEGER,
+    process_birth TEXT,
+    pgid INTEGER,
+    tmux_socket_path TEXT,
+    tmux_server_token TEXT,
+    browser_session_key TEXT,
+    browser_audience TEXT,
+    browser_profile_path TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (
+        (resource_kind = 'bash'
+         AND pid IS NOT NULL AND process_birth IS NOT NULL AND pgid IS NOT NULL
+         AND tmux_socket_path IS NULL AND tmux_server_token IS NULL
+         AND browser_session_key IS NULL AND browser_audience IS NULL AND browser_profile_path IS NULL)
+        OR
+        (resource_kind = 'tmux'
+         AND pid IS NULL AND process_birth IS NULL AND pgid IS NULL
+         AND tmux_socket_path IS NOT NULL AND tmux_server_token IS NOT NULL
+         AND browser_session_key IS NULL AND browser_audience IS NULL AND browser_profile_path IS NULL)
+        OR
+        (resource_kind = 'pty'
+         AND pid IS NOT NULL AND process_birth IS NOT NULL AND pgid IS NULL
+         AND tmux_socket_path IS NULL AND tmux_server_token IS NULL
+         AND browser_session_key IS NULL AND browser_audience IS NULL AND browser_profile_path IS NULL)
+        OR
+        (resource_kind = 'browser'
+         AND pid IS NOT NULL AND process_birth IS NOT NULL AND pgid IS NULL
+         AND tmux_socket_path IS NULL AND tmux_server_token IS NULL
+         AND browser_session_key IS NOT NULL AND browser_audience IS NOT NULL AND browser_profile_path IS NOT NULL)
+    )
+);
+
+CREATE UNIQUE INDEX runtime_resource_instances_live_exact_identity
+ON runtime_resource_instances (
+    work_scope_id, resource_kind, launch_uuid,
+    COALESCE(pid, -1), COALESCE(process_birth, ''), COALESCE(pgid, -1),
+    COALESCE(tmux_socket_path, ''), COALESCE(tmux_server_token, ''),
+    COALESCE(browser_session_key, ''), COALESCE(browser_audience, ''), COALESCE(browser_profile_path, '')
+)
+WHERE state <> 'retired';
+
+CREATE TRIGGER runtime_resource_instances_preserve_identity
+BEFORE UPDATE ON runtime_resource_instances
+FOR EACH ROW
+WHEN NEW.instance_id <> OLD.instance_id
+  OR NEW.work_scope_id <> OLD.work_scope_id
+  OR NEW.resource_kind <> OLD.resource_kind
+  OR NEW.launch_uuid <> OLD.launch_uuid
+  OR NEW.pid IS NOT OLD.pid
+  OR NEW.process_birth IS NOT OLD.process_birth
+  OR NEW.pgid IS NOT OLD.pgid
+  OR NEW.tmux_socket_path IS NOT OLD.tmux_socket_path
+  OR NEW.tmux_server_token IS NOT OLD.tmux_server_token
+  OR NEW.browser_session_key IS NOT OLD.browser_session_key
+  OR NEW.browser_audience IS NOT OLD.browser_audience
+  OR NEW.browser_profile_path IS NOT OLD.browser_profile_path
+BEGIN
+    SELECT RAISE(ABORT, 'runtime resource instance identity is immutable');
+END;
+";
+
+const MIGRATION_077: &str = r"
+CREATE TABLE close_retirement_resource_dispatches (
+    attempt_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    inspection_generation TEXT NOT NULL,
+    inspection_fingerprint TEXT NOT NULL,
+    resource_kind TEXT NOT NULL,
+    identity_kind TEXT NOT NULL,
+    identity_codec TEXT NOT NULL,
+    identity_value TEXT NOT NULL,
+    dispatched_at_us INTEGER NOT NULL
+        CHECK (typeof(dispatched_at_us) = 'integer' AND dispatched_at_us >= 0),
+    PRIMARY KEY (
+        attempt_id, scope, inspection_generation, inspection_fingerprint,
+        resource_kind, identity_kind, identity_value
+    ),
+    FOREIGN KEY (
+        attempt_id, scope, inspection_generation, inspection_fingerprint,
+        resource_kind, identity_kind, identity_value
+    ) REFERENCES close_expected_retirement_resources (
+        attempt_id, scope, inspection_generation, inspection_fingerprint,
+        resource_kind, identity_kind, identity_value
+    ) ON DELETE RESTRICT,
+    CHECK (resource_kind IN (
+        'worktree', 'work_scope', 'bash_process_group', 'tmux_server',
+        'pty_session', 'browser_session', 'equivalent_live_resource'
+    )),
+    CHECK (
+        (resource_kind = 'worktree' AND identity_kind = 'worktree')
+        OR (resource_kind <> 'worktree' AND identity_kind = 'opaque')
+    )
+);
+
+CREATE TRIGGER close_retirement_resource_dispatches_require_authority
+BEFORE INSERT ON close_retirement_resource_dispatches
+FOR EACH ROW
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM close_obligations obligation
+    JOIN close_retirement_inventories inventory
+      ON inventory.attempt_id = obligation.attempt_id
+    WHERE obligation.attempt_id = NEW.attempt_id
+      AND obligation.phase IN ('retirement_requested', 'needs_repair')
+      AND obligation.inspection_generation = NEW.inspection_generation
+      AND obligation.inspection_fingerprint = NEW.inspection_fingerprint
+      AND inventory.scope = NEW.scope
+      AND inventory.inspection_generation = NEW.inspection_generation
+      AND inventory.inspection_fingerprint = NEW.inspection_fingerprint
+      AND inventory.sealed = 1
+)
+BEGIN
+    SELECT RAISE(ABORT, 'close retirement dispatch lacks exact active authority');
+END;
+";
+
+const MIGRATION_076: &str = "SELECT 1;";
+
+async fn migration_076_extend_close_retirement_resource_kinds(
+    tx: &mut Transaction<'_, Sqlite>,
+) -> DbResult<()> {
+    const TABLES: [&str; 3] = [
+        "close_expected_retirement_resources",
+        "close_retirement_resources",
+        "close_retirement_resource_history",
+    ];
+    const RESOURCE_KIND_TAIL: &str =
+        "'browser_session',\n        'equivalent_live_resource'\n    ))";
+    const EXTENDED_RESOURCE_KIND_TAIL: &str =
+        "'browser_session',\n        'equivalent_live_resource',\n        'work_scope'\n    ))";
+    const HISTORY_FOREIGN_KEY: &str = "    FOREIGN KEY (\n        attempt_id, scope, inspection_generation, inspection_fingerprint,";
+    const HISTORY_CONSTRAINTS: &str = "    CHECK (resource_kind IN (\n        'worktree',\n        'bash_process_group',\n        'tmux_server',\n        'pty_session',\n        'browser_session',\n        'equivalent_live_resource',\n        'work_scope'\n    )),\n    CHECK (\n        (resource_kind = 'worktree' AND identity_kind = 'worktree')\n        OR (resource_kind <> 'worktree' AND identity_kind = 'opaque')\n    ),\n";
+
+    let mut table_sql = Vec::with_capacity(TABLES.len());
+    for table in TABLES {
+        let sql: String =
+            sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1")
+                .bind(table)
+                .fetch_optional(&mut **tx)
+                .await?
+                .ok_or_else(|| {
+                    DbError::Serialization(format!("missing {table} for migration 76"))
+                })?;
+        table_sql.push((table, sql));
+    }
+
+    let objects: Vec<(String, String)> = sqlx::query_as(
+        "SELECT name, sql FROM sqlite_master\n         WHERE sql IS NOT NULL\n           AND (\n             (type = 'index' AND tbl_name IN (\n                 'close_expected_retirement_resources',\n                 'close_retirement_resources',\n                 'close_retirement_resource_history'\n             ))\n             OR (type = 'trigger' AND (\n                 tbl_name IN (\n                     'close_expected_retirement_resources',\n                     'close_retirement_resources',\n                     'close_retirement_resource_history'\n                 )\n                 OR sql LIKE '%close_expected_retirement_resources%'\n                 OR sql LIKE '%close_retirement_resources%'\n                 OR sql LIKE '%close_retirement_resource_history%'\n             ))\n           )\n         ORDER BY CASE type WHEN 'index' THEN 0 ELSE 1 END, name",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    for (name, _) in &objects {
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP INDEX IF EXISTS {name};")))
+            .execute(&mut **tx)
+            .await?;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP TRIGGER IF EXISTS {name};"
+        )))
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    for table in TABLES.iter().rev() {
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "ALTER TABLE {table} RENAME TO {table}_migration_076_old;"
+        )))
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    for (table, sql) in &table_sql {
+        let sql = if *table == "close_retirement_resource_history" {
+            sql.replacen(
+                HISTORY_FOREIGN_KEY,
+                &(HISTORY_CONSTRAINTS.to_string() + HISTORY_FOREIGN_KEY),
+                1,
+            )
+        } else {
+            sql.replacen(RESOURCE_KIND_TAIL, EXTENDED_RESOURCE_KIND_TAIL, 1)
+        };
+        if sql
+            == *table_sql
+                .iter()
+                .find_map(|(candidate, original)| (*candidate == *table).then_some(original))
+                .expect("captured table SQL must contain the current table")
+        {
+            return Err(DbError::Serialization(format!(
+                "unexpected {table} definition for migration 76"
+            )));
+        }
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+            .execute(&mut **tx)
+            .await?;
+    }
+
+    for table in TABLES {
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO {table} SELECT * FROM {table}_migration_076_old;"
+        )))
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    for table in TABLES.iter().rev() {
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP TABLE {table}_migration_076_old;"
+        )))
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    for (_, sql) in objects {
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+            .execute(&mut **tx)
+            .await?;
+    }
+
+    Ok(())
+}
+
 async fn migration_065_preflight(tx: &mut Transaction<'_, Sqlite>) -> DbResult<()> {
     let work_scope_id: Option<String> = sqlx::query_scalar(
         "SELECT work_scope_id
@@ -7779,6 +8106,18 @@ async fn migration_065_preflight(tx: &mut Transaction<'_, Sqlite>) -> DbResult<(
                 .map_err(|error| DbError::Serialization(error.to_string()))?,
         ],
     })
+}
+
+async fn migration_080_prepare(tx: &mut Transaction<'_, Sqlite>) -> DbResult<bool> {
+    let has_product_conversation: bool = sqlx::query_scalar(
+        "SELECT EXISTS(\n            SELECT 1 FROM pragma_table_info('conversations')\n            WHERE name = 'product_conversation_id'\n        )",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    if !has_product_conversation {
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 /// Run all pending migrations against the database.
@@ -7844,8 +8183,23 @@ pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
         // column) and abort startup.
         let mut tx = pool.begin().await?;
 
+        if migration.version == 76 {
+            migration_076_extend_close_retirement_resource_kinds(&mut tx).await?;
+        }
+
         if migration.version == 65 {
             migration_065_preflight(&mut tx).await?;
+        }
+
+        if migration.version == 80 && !migration_080_prepare(&mut tx).await? {
+            sqlx::query("INSERT INTO _migrations (version, name) VALUES (?, ?)")
+                .bind(migration.version)
+                .bind(migration.name)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            applied += 1;
+            continue;
         }
 
         if migration.version == 59 {
@@ -7926,6 +8280,609 @@ CREATE INDEX IF NOT EXISTS idx_global_recall_messages_session_ordinal
     ON global_recall_messages(session_id, ordinal);
 ";
 
+const MIGRATION_081: &str = r"
+DROP TRIGGER close_retirement_resources_require_absence_proof_on_insert;
+CREATE TRIGGER close_retirement_resources_require_absence_proof_on_insert
+BEFORE INSERT ON close_retirement_resources
+FOR EACH ROW
+WHEN NEW.proof_kind = 'absence_adopted' AND NOT EXISTS (
+    SELECT 1 FROM close_retirement_resources proof
+    WHERE proof.scope = NEW.scope
+      AND proof.resource_kind = NEW.resource_kind
+      AND proof.identity_kind = NEW.identity_kind
+      AND proof.identity_codec = NEW.identity_codec
+      AND proof.identity_value = NEW.identity_value
+      AND NEW.absence_basis = 'preexisting_exact_identity_evidence'
+      AND proof.attempt_id <> NEW.attempt_id
+      AND EXISTS (
+          SELECT 1
+          FROM close_attempt_members proof_member
+          JOIN conversations proof_conversation ON proof_conversation.id = proof_member.conversation_id
+          JOIN close_attempt_members current_member ON current_member.attempt_id = NEW.attempt_id
+          JOIN conversations current_conversation ON current_conversation.id = current_member.conversation_id
+          WHERE proof_member.attempt_id = proof.attempt_id
+            AND proof_conversation.product_conversation_id = current_conversation.product_conversation_id
+      )
+      AND proof.proof_kind IN ('retired', 'absence_adopted')
+    UNION ALL
+    SELECT 1 FROM close_retirement_resources proof
+    WHERE NEW.absence_basis = 'same_attempt_prior_retirement'
+      AND proof.attempt_id = NEW.attempt_id
+      AND proof.scope = NEW.scope
+      AND proof.inspection_generation = NEW.inspection_generation
+      AND proof.inspection_fingerprint = NEW.inspection_fingerprint
+      AND proof.resource_kind = NEW.resource_kind
+      AND proof.identity_kind = NEW.identity_kind
+      AND proof.identity_codec = NEW.identity_codec
+      AND proof.identity_value = NEW.identity_value
+      AND proof.proof_kind = 'retired'
+    UNION ALL
+    SELECT 1 FROM close_retirement_resource_dispatches dispatch
+    WHERE NEW.absence_basis = 'same_attempt_prior_retirement'
+      AND dispatch.attempt_id = NEW.attempt_id
+      AND dispatch.scope = NEW.scope
+      AND dispatch.inspection_generation = NEW.inspection_generation
+      AND dispatch.inspection_fingerprint = NEW.inspection_fingerprint
+      AND dispatch.resource_kind = NEW.resource_kind
+      AND dispatch.identity_kind = NEW.identity_kind
+      AND dispatch.identity_codec = NEW.identity_codec
+      AND dispatch.identity_value = NEW.identity_value
+)
+BEGIN
+    SELECT RAISE(ABORT, 'adopted absence requires exact retained proof');
+END;
+
+DROP TRIGGER close_retirement_resources_require_absence_proof_on_update;
+CREATE TRIGGER close_retirement_resources_require_absence_proof_on_update
+BEFORE UPDATE ON close_retirement_resources
+FOR EACH ROW
+WHEN NEW.proof_kind = 'absence_adopted'
+ AND (
+     OLD.proof_kind <> 'absence_adopted' OR OLD.absence_basis IS NOT NEW.absence_basis
+     OR OLD.attempt_id <> NEW.attempt_id OR OLD.scope <> NEW.scope
+     OR OLD.inspection_generation <> NEW.inspection_generation
+     OR OLD.inspection_fingerprint <> NEW.inspection_fingerprint
+     OR OLD.resource_kind <> NEW.resource_kind OR OLD.identity_kind <> NEW.identity_kind
+     OR OLD.identity_codec <> NEW.identity_codec OR OLD.identity_value <> NEW.identity_value
+ )
+ AND NOT EXISTS (
+    SELECT 1 FROM close_retirement_resources proof
+    WHERE proof.scope = NEW.scope
+      AND proof.resource_kind = NEW.resource_kind
+      AND proof.identity_kind = NEW.identity_kind
+      AND proof.identity_codec = NEW.identity_codec
+      AND proof.identity_value = NEW.identity_value
+      AND NEW.absence_basis = 'preexisting_exact_identity_evidence'
+      AND proof.attempt_id <> NEW.attempt_id
+      AND EXISTS (
+          SELECT 1
+          FROM close_attempt_members proof_member
+          JOIN conversations proof_conversation ON proof_conversation.id = proof_member.conversation_id
+          JOIN close_attempt_members current_member ON current_member.attempt_id = NEW.attempt_id
+          JOIN conversations current_conversation ON current_conversation.id = current_member.conversation_id
+          WHERE proof_member.attempt_id = proof.attempt_id
+            AND proof_conversation.product_conversation_id = current_conversation.product_conversation_id
+      )
+      AND proof.proof_kind IN ('retired', 'absence_adopted')
+    UNION ALL
+    SELECT 1 FROM close_retirement_resources proof
+    WHERE NEW.absence_basis = 'same_attempt_prior_retirement'
+      AND proof.attempt_id = NEW.attempt_id AND proof.scope = NEW.scope
+      AND proof.inspection_generation = NEW.inspection_generation
+      AND proof.inspection_fingerprint = NEW.inspection_fingerprint
+      AND proof.resource_kind = NEW.resource_kind AND proof.identity_kind = NEW.identity_kind
+      AND proof.identity_codec = NEW.identity_codec AND proof.identity_value = NEW.identity_value
+      AND proof.proof_kind = 'retired'
+    UNION ALL
+    SELECT 1 FROM close_retirement_resource_dispatches dispatch
+    WHERE NEW.absence_basis = 'same_attempt_prior_retirement'
+      AND dispatch.attempt_id = NEW.attempt_id AND dispatch.scope = NEW.scope
+      AND dispatch.inspection_generation = NEW.inspection_generation
+      AND dispatch.inspection_fingerprint = NEW.inspection_fingerprint
+      AND dispatch.resource_kind = NEW.resource_kind AND dispatch.identity_kind = NEW.identity_kind
+      AND dispatch.identity_codec = NEW.identity_codec AND dispatch.identity_value = NEW.identity_value
+)
+BEGIN
+    SELECT RAISE(ABORT, 'adopted absence requires exact retained proof');
+END;
+
+";
+
+const MIGRATION_082: &str = r"
+DROP TRIGGER close_obligations_transition_graph;
+CREATE TRIGGER close_obligations_transition_graph
+BEFORE UPDATE OF phase ON close_obligations
+FOR EACH ROW
+WHEN NOT (
+    (OLD.phase = 'awaiting_blocker_resolution' AND NEW.phase IN ('awaiting_stop_work_confirmation', 'settling_active_work', 'completed'))
+    OR (OLD.phase = 'awaiting_stop_work_confirmation' AND NEW.phase IN ('settling_active_work', 'completed'))
+    OR (OLD.phase = 'settling_active_work' AND NEW.phase IN ('cancel_requested_during_settlement', 'awaiting_retirement_inspection'))
+    OR (OLD.phase = 'cancel_requested_during_settlement' AND NEW.phase = 'completed')
+    OR (OLD.phase = 'awaiting_retirement_inspection' AND NEW.phase IN ('awaiting_loss_confirmation', 'retirement_requested', 'needs_repair', 'completed'))
+    OR (OLD.phase = 'awaiting_loss_confirmation' AND NEW.phase IN ('awaiting_retirement_inspection', 'retirement_requested', 'completed'))
+    OR (OLD.phase = 'retirement_requested' AND NEW.phase IN ('awaiting_retirement_inspection', 'needs_repair', 'completed'))
+    OR (OLD.phase = 'needs_repair' AND NEW.phase IN ('retirement_requested', 'completed'))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid close obligation phase transition');
+END;
+";
+
+const MIGRATION_084: &str = r"
+CREATE TABLE close_worktree_cleanup_plans (
+    attempt_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    inspection_generation TEXT NOT NULL,
+    inspection_fingerprint TEXT NOT NULL,
+    resource_kind TEXT NOT NULL CHECK (resource_kind = 'worktree'),
+    identity_kind TEXT NOT NULL CHECK (identity_kind = 'worktree'),
+    identity_codec TEXT NOT NULL,
+    identity_value TEXT NOT NULL,
+    administrative_dir_codec TEXT NOT NULL CHECK (administrative_dir_codec = 'hex_path_v1'),
+    administrative_dir_value TEXT NOT NULL CHECK (length(administrative_dir_value) > 0),
+    planned_at_us INTEGER NOT NULL
+        CHECK (typeof(planned_at_us) = 'integer' AND planned_at_us >= 0),
+    PRIMARY KEY (
+        attempt_id, scope, inspection_generation, inspection_fingerprint,
+        resource_kind, identity_kind, identity_value
+    ),
+    FOREIGN KEY (
+        attempt_id, scope, inspection_generation, inspection_fingerprint,
+        resource_kind, identity_kind, identity_value
+    ) REFERENCES close_retirement_resource_dispatches (
+        attempt_id, scope, inspection_generation, inspection_fingerprint,
+        resource_kind, identity_kind, identity_value
+    ) ON DELETE RESTRICT
+);
+";
+
+const MIGRATION_083: &str = r"
+DROP TRIGGER close_obligations_transition_graph;
+CREATE TRIGGER close_obligations_transition_graph
+BEFORE UPDATE OF phase ON close_obligations
+FOR EACH ROW
+WHEN NOT (
+    (OLD.phase = 'awaiting_blocker_resolution' AND NEW.phase IN ('awaiting_stop_work_confirmation', 'settling_active_work', 'completed'))
+    OR (OLD.phase = 'awaiting_stop_work_confirmation' AND NEW.phase IN ('settling_active_work', 'completed'))
+    OR (OLD.phase = 'settling_active_work' AND NEW.phase IN ('cancel_requested_during_settlement', 'awaiting_retirement_inspection'))
+    OR (OLD.phase = 'cancel_requested_during_settlement' AND NEW.phase = 'completed')
+    OR (OLD.phase = 'awaiting_retirement_inspection' AND NEW.phase IN ('awaiting_loss_confirmation', 'retirement_requested', 'needs_repair', 'completed'))
+    OR (OLD.phase = 'awaiting_loss_confirmation' AND NEW.phase IN ('awaiting_retirement_inspection', 'retirement_requested', 'completed'))
+    OR (OLD.phase = 'retirement_requested' AND NEW.phase IN ('awaiting_retirement_inspection', 'needs_repair', 'completed'))
+    OR (OLD.phase = 'needs_repair' AND NEW.phase IN ('awaiting_retirement_inspection', 'retirement_requested', 'completed'))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid close obligation phase transition');
+END;
+";
+
+const MIGRATION_085: &str = r"
+DROP TRIGGER close_obligations_invalidate_inspection_on_reentry;
+CREATE TRIGGER close_obligations_invalidate_inspection_on_reentry
+AFTER UPDATE OF phase ON close_obligations
+FOR EACH ROW
+WHEN NEW.phase = 'awaiting_retirement_inspection'
+  AND OLD.phase <> 'awaiting_retirement_inspection'
+  AND OLD.phase <> 'needs_repair'
+BEGIN
+    DELETE FROM close_retirement_inspections WHERE attempt_id = NEW.attempt_id;
+    UPDATE close_obligations
+    SET inspection_generation = NULL, inspection_fingerprint = NULL
+    WHERE attempt_id = NEW.attempt_id;
+END;
+";
+
+const MIGRATION_088: &str = r"
+ALTER TABLE close_worktree_cleanup_plans
+ADD COLUMN administrative_dir_incarnation TEXT NOT NULL DEFAULT 'legacy_unknown'
+CHECK (length(administrative_dir_incarnation) > 0);
+";
+
+const MIGRATION_087: &str = r"
+CREATE TRIGGER close_worktree_absence_requires_cleanup_plan_on_insert
+BEFORE INSERT ON close_retirement_resources
+FOR EACH ROW
+WHEN NEW.resource_kind = 'worktree'
+ AND NEW.proof_kind = 'absence_adopted'
+ AND NEW.absence_basis = 'same_attempt_prior_retirement'
+ AND NOT EXISTS (
+    SELECT 1 FROM close_retirement_resources proof
+    WHERE proof.attempt_id = NEW.attempt_id AND proof.scope = NEW.scope
+      AND proof.inspection_generation = NEW.inspection_generation
+      AND proof.inspection_fingerprint = NEW.inspection_fingerprint
+      AND proof.resource_kind = NEW.resource_kind AND proof.identity_kind = NEW.identity_kind
+      AND proof.identity_codec = NEW.identity_codec AND proof.identity_value = NEW.identity_value
+      AND proof.proof_kind = 'retired'
+ )
+ AND NOT EXISTS (
+    SELECT 1 FROM close_worktree_cleanup_plans plan
+    WHERE plan.attempt_id = NEW.attempt_id AND plan.scope = NEW.scope
+      AND plan.inspection_generation = NEW.inspection_generation
+      AND plan.inspection_fingerprint = NEW.inspection_fingerprint
+      AND plan.resource_kind = NEW.resource_kind AND plan.identity_kind = NEW.identity_kind
+      AND plan.identity_codec = NEW.identity_codec AND plan.identity_value = NEW.identity_value
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'adopted worktree absence requires exact cleanup plan');
+END;
+
+CREATE TRIGGER close_worktree_absence_requires_cleanup_plan_on_update
+BEFORE UPDATE ON close_retirement_resources
+FOR EACH ROW
+WHEN NEW.resource_kind = 'worktree'
+ AND NEW.proof_kind = 'absence_adopted'
+ AND NEW.absence_basis = 'same_attempt_prior_retirement'
+ AND (
+     OLD.proof_kind <> 'absence_adopted' OR OLD.absence_basis IS NOT NEW.absence_basis
+     OR OLD.attempt_id <> NEW.attempt_id OR OLD.scope <> NEW.scope
+     OR OLD.inspection_generation <> NEW.inspection_generation
+     OR OLD.inspection_fingerprint <> NEW.inspection_fingerprint
+     OR OLD.resource_kind <> NEW.resource_kind OR OLD.identity_kind <> NEW.identity_kind
+     OR OLD.identity_codec <> NEW.identity_codec OR OLD.identity_value <> NEW.identity_value
+ )
+ AND NOT EXISTS (
+    SELECT 1 FROM close_worktree_cleanup_plans plan
+    WHERE plan.attempt_id = NEW.attempt_id AND plan.scope = NEW.scope
+      AND plan.inspection_generation = NEW.inspection_generation
+      AND plan.inspection_fingerprint = NEW.inspection_fingerprint
+      AND plan.resource_kind = NEW.resource_kind AND plan.identity_kind = NEW.identity_kind
+      AND plan.identity_codec = NEW.identity_codec AND plan.identity_value = NEW.identity_value
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'adopted worktree absence requires exact cleanup plan');
+END;
+";
+
+const MIGRATION_086: &str = r"
+DROP TRIGGER close_obligations_snapshot_matches_inspection_aggregate;
+CREATE TRIGGER close_obligations_snapshot_matches_inspection_aggregate
+BEFORE UPDATE OF inspection_generation, inspection_fingerprint ON close_obligations
+FOR EACH ROW
+WHEN (
+    OLD.inspection_generation IS NOT NEW.inspection_generation
+    OR OLD.inspection_fingerprint IS NOT NEW.inspection_fingerprint
+) AND NOT (
+    NEW.phase = 'completed'
+    AND NEW.close_outcome = 'cancelled'
+    AND NEW.inspection_generation IS NULL
+    AND NEW.inspection_fingerprint IS NULL
+) AND (
+    OLD.phase <> 'awaiting_retirement_inspection'
+    OR NEW.inspection_generation <> CASE
+        WHEN EXISTS (
+            SELECT 1 FROM close_retirement_inspections
+            WHERE attempt_id = NEW.attempt_id
+        ) THEN (
+            SELECT 'v1' || COALESCE(GROUP_CONCAT(component, ''), '')
+            FROM (
+                SELECT generation,
+                       LENGTH(CAST(scope AS BLOB)) || ':' || scope ||
+                       LENGTH(CAST(generation AS BLOB)) || ':' || generation AS component
+                FROM close_retirement_inspections
+                WHERE attempt_id = NEW.attempt_id
+                ORDER BY scope
+            )
+        )
+        WHEN NEW.inspection_generation LIKE 'server_git_status_v2_retry_%'
+            THEN NEW.inspection_generation
+        ELSE 'no-worktree'
+    END
+    OR NEW.inspection_fingerprint <> CASE
+        WHEN EXISTS (
+            SELECT 1 FROM close_retirement_inspections
+            WHERE attempt_id = NEW.attempt_id
+        ) THEN (
+            SELECT 'v1' || COALESCE(GROUP_CONCAT(component, ''), '')
+            FROM (
+                SELECT fingerprint,
+                       LENGTH(CAST(scope AS BLOB)) || ':' || scope ||
+                       LENGTH(CAST(fingerprint AS BLOB)) || ':' || fingerprint AS component
+                FROM close_retirement_inspections
+                WHERE attempt_id = NEW.attempt_id
+                ORDER BY scope
+            )
+        ) ELSE 'no-worktree'
+    END
+)
+BEGIN
+    SELECT RAISE(ABORT, 'close obligation snapshot must match atomic inspection replacement');
+END;
+";
+
+const MIGRATION_090: &str = r"
+ALTER TABLE close_worktree_cleanup_plans
+ADD COLUMN final_tombstone_root_codec TEXT
+CHECK (final_tombstone_root_codec IS NULL OR final_tombstone_root_codec = 'hex_path_v1');
+ALTER TABLE close_worktree_cleanup_plans
+ADD COLUMN final_tombstone_root_value TEXT;
+ALTER TABLE close_worktree_cleanup_plans
+ADD COLUMN final_tombstone_root_device TEXT;
+ALTER TABLE close_worktree_cleanup_plans
+ADD COLUMN final_tombstone_root_inode TEXT;
+ALTER TABLE close_worktree_cleanup_plans
+ADD COLUMN final_tombstone_object_device TEXT;
+ALTER TABLE close_worktree_cleanup_plans
+ADD COLUMN final_tombstone_object_inode TEXT;
+CREATE TRIGGER close_worktree_final_tombstone_is_complete_on_insert
+BEFORE INSERT ON close_worktree_cleanup_plans
+FOR EACH ROW
+WHEN (NEW.final_tombstone_root_codec IS NULL) <> (NEW.final_tombstone_root_value IS NULL)
+  OR (NEW.final_tombstone_root_codec IS NULL) <> (NEW.final_tombstone_root_device IS NULL)
+  OR (NEW.final_tombstone_root_codec IS NULL) <> (NEW.final_tombstone_root_inode IS NULL)
+  OR (NEW.final_tombstone_root_value IS NOT NULL AND length(NEW.final_tombstone_root_value) = 0)
+  OR (NEW.final_tombstone_root_device IS NOT NULL AND length(NEW.final_tombstone_root_device) = 0)
+  OR (NEW.final_tombstone_root_inode IS NOT NULL AND length(NEW.final_tombstone_root_inode) = 0)
+  OR (NEW.final_tombstone_object_device IS NULL) <> (NEW.final_tombstone_object_inode IS NULL)
+  OR (NEW.final_tombstone_object_device IS NOT NULL AND NEW.final_tombstone_root_codec IS NULL)
+  OR (NEW.final_tombstone_object_device IS NOT NULL AND length(NEW.final_tombstone_object_device) = 0)
+  OR (NEW.final_tombstone_object_inode IS NOT NULL AND length(NEW.final_tombstone_object_inode) = 0)
+BEGIN
+    SELECT RAISE(ABORT, 'final worktree tombstone binding must be complete');
+END;
+CREATE TRIGGER close_worktree_final_tombstone_is_complete_on_update
+BEFORE UPDATE OF final_tombstone_root_codec, final_tombstone_root_value,
+                 final_tombstone_root_device, final_tombstone_root_inode,
+                 final_tombstone_object_device, final_tombstone_object_inode
+ON close_worktree_cleanup_plans
+FOR EACH ROW
+WHEN (NEW.final_tombstone_root_codec IS NULL) <> (NEW.final_tombstone_root_value IS NULL)
+  OR (NEW.final_tombstone_root_codec IS NULL) <> (NEW.final_tombstone_root_device IS NULL)
+  OR (NEW.final_tombstone_root_codec IS NULL) <> (NEW.final_tombstone_root_inode IS NULL)
+  OR (NEW.final_tombstone_root_value IS NOT NULL AND length(NEW.final_tombstone_root_value) = 0)
+  OR (NEW.final_tombstone_root_device IS NOT NULL AND length(NEW.final_tombstone_root_device) = 0)
+  OR (NEW.final_tombstone_root_inode IS NOT NULL AND length(NEW.final_tombstone_root_inode) = 0)
+  OR (NEW.final_tombstone_object_device IS NULL) <> (NEW.final_tombstone_object_inode IS NULL)
+  OR (NEW.final_tombstone_object_device IS NOT NULL AND NEW.final_tombstone_root_codec IS NULL)
+  OR (NEW.final_tombstone_object_device IS NOT NULL AND length(NEW.final_tombstone_object_device) = 0)
+  OR (NEW.final_tombstone_object_inode IS NOT NULL AND length(NEW.final_tombstone_object_inode) = 0)
+BEGIN
+    SELECT RAISE(ABORT, 'final worktree tombstone binding must be complete');
+END;
+";
+const MIGRATION_089: &str = r"
+DROP TRIGGER close_retirement_inventories_require_exact_snapshot;
+CREATE TRIGGER close_retirement_inventories_require_exact_snapshot
+BEFORE INSERT ON close_retirement_inventories
+FOR EACH ROW
+WHEN NOT EXISTS (
+    SELECT 1 FROM close_obligations obligation
+    WHERE obligation.attempt_id = NEW.attempt_id
+      AND (
+          (obligation.phase IN ('retirement_requested', 'needs_repair')
+           AND obligation.inspection_generation = NEW.inspection_generation
+           AND obligation.inspection_fingerprint = NEW.inspection_fingerprint)
+          OR (obligation.phase = 'awaiting_retirement_inspection'
+              AND obligation.inspection_generation IS NULL
+              AND obligation.inspection_fingerprint IS NULL
+              AND NEW.inspection_generation = 'no-worktree'
+              AND NEW.inspection_fingerprint = 'no-worktree')
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'retirement inventory requires the exact active snapshot');
+END;
+
+DROP TRIGGER close_retirement_inventories_require_allocated_worktree_before_seal;
+CREATE TRIGGER close_retirement_inventories_require_allocated_worktree_before_seal
+BEFORE UPDATE OF sealed ON close_retirement_inventories
+FOR EACH ROW
+WHEN OLD.sealed = 0
+  AND NEW.sealed = 1
+  AND EXISTS (
+      SELECT 1
+      FROM close_attempt_scopes target
+      WHERE target.attempt_id = NEW.attempt_id
+        AND target.scope = NEW.scope
+        AND (
+            (target.captured_worktree_identity IS NOT NULL AND (
+                (SELECT COUNT(*) FROM close_expected_retirement_resources expected
+                 WHERE expected.attempt_id = NEW.attempt_id
+                   AND expected.scope = NEW.scope
+                   AND expected.inspection_generation = NEW.inspection_generation
+                   AND expected.inspection_fingerprint = NEW.inspection_fingerprint
+                   AND expected.resource_kind = 'worktree'
+                   AND expected.identity_kind = 'worktree'
+                   AND expected.identity_codec = 'worktree_id_v1'
+                   AND expected.identity_value = target.captured_worktree_identity) <> 1
+            ))
+            OR
+            (target.captured_worktree_identity IS NULL AND EXISTS (
+                SELECT 1 FROM close_expected_retirement_resources expected
+                WHERE expected.attempt_id = NEW.attempt_id
+                  AND expected.scope = NEW.scope
+                  AND expected.inspection_generation = NEW.inspection_generation
+                  AND expected.inspection_fingerprint = NEW.inspection_fingerprint
+                  AND expected.resource_kind = 'worktree'
+            ))
+        )
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'retirement inventory worktree rows must match the captured environment');
+END;
+
+DROP TRIGGER close_retirement_resources_require_authority_on_insert;
+CREATE TRIGGER close_retirement_resources_require_authority_on_insert
+BEFORE INSERT ON close_retirement_resources
+FOR EACH ROW
+WHEN NOT EXISTS (
+    SELECT 1 FROM close_obligations obligation
+    WHERE obligation.attempt_id = NEW.attempt_id
+      AND obligation.phase IN ('awaiting_retirement_inspection', 'retirement_requested', 'needs_repair')
+      AND COALESCE(obligation.inspection_generation, 'no-worktree') = NEW.inspection_generation
+      AND COALESCE(obligation.inspection_fingerprint, 'no-worktree') = NEW.inspection_fingerprint
+)
+BEGIN
+    SELECT RAISE(ABORT, 'retirement evidence requires authorized phase and snapshot');
+END;
+
+DROP TRIGGER close_obligations_require_residual_before_needs_repair;
+CREATE TRIGGER close_obligations_require_residual_before_needs_repair
+BEFORE UPDATE OF phase ON close_obligations
+FOR EACH ROW
+WHEN NEW.phase = 'needs_repair'
+  AND OLD.phase <> 'needs_repair'
+  AND NOT EXISTS (
+      SELECT 1 FROM close_retirement_resources resource
+      WHERE resource.attempt_id = OLD.attempt_id
+        AND resource.inspection_generation = COALESCE(NEW.inspection_generation, 'no-worktree')
+        AND resource.inspection_fingerprint = COALESCE(NEW.inspection_fingerprint, 'no-worktree')
+        AND resource.proof_kind = 'residual'
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'needs_repair requires current-snapshot residual evidence');
+END;
+";
+
+const MIGRATION_091: &str = r"
+PRAGMA writable_schema = ON;
+UPDATE sqlite_schema
+SET sql = replace(
+    sql,
+    'authority_kind IN (''restricted_explore'', ''work'')',
+    'authority_kind IN (''direct'', ''restricted_explore'', ''work'')'
+)
+WHERE type = 'table' AND name = 'work_scopes';
+PRAGMA writable_schema = RESET;
+
+CREATE TABLE product_creation_jobs (
+    request_id TEXT PRIMARY KEY CHECK (typeof(request_id) = 'text' AND trim(request_id) <> ''),
+    product_conversation_id TEXT NOT NULL UNIQUE
+        CHECK (typeof(product_conversation_id) = 'text' AND trim(product_conversation_id) <> ''),
+    cwd TEXT NOT NULL CHECK (typeof(cwd) = 'text' AND trim(cwd) <> '' AND instr(cwd, char(0)) = 0),
+    objective TEXT NOT NULL CHECK (typeof(objective) = 'text'),
+    model TEXT CHECK (model IS NULL OR (typeof(model) = 'text' AND trim(model) <> '')),
+    effort TEXT CHECK (effort IS NULL OR (typeof(effort) = 'text' AND trim(effort) <> '')),
+    llm_language TEXT NOT NULL CHECK (llm_language IN ('phoenix-native', 'caveman')),
+    status TEXT NOT NULL CHECK (status IN ('accepted', 'claimed', 'retry_scheduled', 'cancelling', 'cancelled', 'deletion_pending', 'delivery_pending', 'delivery_failed', 'published', 'failed', 'cleanup_ambiguous')),
+    accepted_at_unix_micros INTEGER NOT NULL CHECK (typeof(accepted_at_unix_micros) = 'integer' AND accepted_at_unix_micros >= 0),
+    updated_at_unix_micros INTEGER NOT NULL CHECK (typeof(updated_at_unix_micros) = 'integer' AND updated_at_unix_micros >= 0),
+    attempt_count INTEGER NOT NULL DEFAULT 1 CHECK (typeof(attempt_count) = 'integer' AND attempt_count >= 1 AND attempt_count <= 4),
+    claim_generation INTEGER NOT NULL DEFAULT 0 CHECK (typeof(claim_generation) = 'integer' AND claim_generation >= 0),
+    claim_worker_id TEXT CHECK (claim_worker_id IS NULL OR (typeof(claim_worker_id) = 'text' AND trim(claim_worker_id) <> '')),
+    claim_token TEXT CHECK (claim_token IS NULL OR (typeof(claim_token) = 'text' AND trim(claim_token) <> '')),
+    claim_lease_until_unix_micros INTEGER CHECK (claim_lease_until_unix_micros IS NULL OR (typeof(claim_lease_until_unix_micros) = 'integer' AND claim_lease_until_unix_micros >= 0)),
+    retry_at_unix_micros INTEGER CHECK (retry_at_unix_micros IS NULL OR (typeof(retry_at_unix_micros) = 'integer' AND retry_at_unix_micros >= 0)),
+    cleanup_worker_id TEXT CHECK (cleanup_worker_id IS NULL OR (typeof(cleanup_worker_id) = 'text' AND trim(cleanup_worker_id) <> '')),
+    cleanup_token TEXT CHECK (cleanup_token IS NULL OR (typeof(cleanup_token) = 'text' AND trim(cleanup_token) <> '')),
+    cleanup_lease_until_unix_micros INTEGER CHECK (cleanup_lease_until_unix_micros IS NULL OR (typeof(cleanup_lease_until_unix_micros) = 'integer' AND cleanup_lease_until_unix_micros >= 0)),
+    delivery_attempt_count INTEGER NOT NULL DEFAULT 1 CHECK (typeof(delivery_attempt_count) = 'integer' AND delivery_attempt_count >= 1 AND delivery_attempt_count <= 4),
+    delivery_retry_at_unix_micros INTEGER CHECK (delivery_retry_at_unix_micros IS NULL OR (typeof(delivery_retry_at_unix_micros) = 'integer' AND delivery_retry_at_unix_micros >= 0)),
+    pin_exact_checkout_oid TEXT CHECK (pin_exact_checkout_oid IS NULL OR (typeof(pin_exact_checkout_oid) = 'text' AND trim(pin_exact_checkout_oid) <> '')),
+    pin_logical_base TEXT CHECK (pin_logical_base IS NULL OR (typeof(pin_logical_base) = 'text' AND trim(pin_logical_base) <> '')),
+    pin_freshness TEXT CHECK (pin_freshness IS NULL OR pin_freshness = 'fresh'),
+    staging_path TEXT CHECK (staging_path IS NULL OR (typeof(staging_path) = 'text' AND trim(staging_path) <> '' AND instr(staging_path, char(0)) = 0)),
+    staging_repo_root TEXT CHECK (staging_repo_root IS NULL OR (typeof(staging_repo_root) = 'text' AND trim(staging_repo_root) <> '' AND instr(staging_repo_root, char(0)) = 0)),
+    staging_exact_oid TEXT CHECK (staging_exact_oid IS NULL OR (typeof(staging_exact_oid) = 'text' AND trim(staging_exact_oid) <> '')),
+    published_product_id TEXT UNIQUE REFERENCES product_conversations(id) ON DELETE CASCADE,
+    published_conversation_id TEXT UNIQUE REFERENCES conversations(id) ON DELETE CASCADE,
+    last_error TEXT CHECK (last_error IS NULL OR typeof(last_error) = 'text'),
+    cancelled_at_unix_micros INTEGER CHECK (cancelled_at_unix_micros IS NULL OR (typeof(cancelled_at_unix_micros) = 'integer' AND cancelled_at_unix_micros >= 0)),
+    deletion_requested_at_unix_micros INTEGER CHECK (deletion_requested_at_unix_micros IS NULL OR (typeof(deletion_requested_at_unix_micros) = 'integer' AND deletion_requested_at_unix_micros >= 0)),
+    CHECK ((status = 'accepted' AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until_unix_micros IS NULL AND retry_at_unix_micros IS NULL AND cleanup_worker_id IS NULL AND cleanup_token IS NULL AND cleanup_lease_until_unix_micros IS NULL AND published_product_id IS NULL AND published_conversation_id IS NULL AND cancelled_at_unix_micros IS NULL AND deletion_requested_at_unix_micros IS NULL)
+        OR (status = 'claimed' AND claim_worker_id IS NOT NULL AND claim_token IS NOT NULL AND claim_lease_until_unix_micros IS NOT NULL AND retry_at_unix_micros IS NULL AND cleanup_worker_id IS NULL AND cleanup_token IS NULL AND cleanup_lease_until_unix_micros IS NULL AND published_product_id IS NULL AND published_conversation_id IS NULL AND cancelled_at_unix_micros IS NULL AND deletion_requested_at_unix_micros IS NULL)
+        OR (status = 'retry_scheduled' AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until_unix_micros IS NULL AND retry_at_unix_micros IS NOT NULL AND cleanup_worker_id IS NULL AND cleanup_token IS NULL AND cleanup_lease_until_unix_micros IS NULL AND published_product_id IS NULL AND published_conversation_id IS NULL AND cancelled_at_unix_micros IS NULL AND deletion_requested_at_unix_micros IS NULL)
+        OR (status = 'cancelling' AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until_unix_micros IS NULL AND retry_at_unix_micros IS NULL AND published_product_id IS NULL AND published_conversation_id IS NULL AND cancelled_at_unix_micros IS NULL AND deletion_requested_at_unix_micros IS NULL)
+        OR (status = 'cancelled' AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until_unix_micros IS NULL AND retry_at_unix_micros IS NULL AND published_product_id IS NULL AND published_conversation_id IS NULL AND cancelled_at_unix_micros IS NOT NULL)
+        OR (status = 'deletion_pending' AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until_unix_micros IS NULL AND retry_at_unix_micros IS NULL AND published_product_id IS NULL AND published_conversation_id IS NULL AND deletion_requested_at_unix_micros IS NOT NULL)
+        OR (status = 'delivery_pending' AND ((claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until_unix_micros IS NULL) OR (claim_worker_id IS NOT NULL AND claim_token IS NOT NULL AND claim_lease_until_unix_micros IS NOT NULL)) AND retry_at_unix_micros IS NULL AND cleanup_worker_id IS NULL AND cleanup_token IS NULL AND cleanup_lease_until_unix_micros IS NULL AND published_product_id IS NOT NULL AND published_conversation_id IS NOT NULL AND cancelled_at_unix_micros IS NULL AND deletion_requested_at_unix_micros IS NULL)
+        OR (status = 'delivery_failed' AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until_unix_micros IS NULL AND retry_at_unix_micros IS NULL AND cleanup_worker_id IS NULL AND cleanup_token IS NULL AND cleanup_lease_until_unix_micros IS NULL AND delivery_retry_at_unix_micros IS NULL AND published_product_id IS NOT NULL AND published_conversation_id IS NOT NULL AND cancelled_at_unix_micros IS NULL AND deletion_requested_at_unix_micros IS NULL)
+        OR (status = 'published' AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until_unix_micros IS NULL AND retry_at_unix_micros IS NULL AND cleanup_worker_id IS NULL AND cleanup_token IS NULL AND cleanup_lease_until_unix_micros IS NULL AND published_product_id IS NOT NULL AND published_conversation_id IS NOT NULL AND cancelled_at_unix_micros IS NULL AND deletion_requested_at_unix_micros IS NULL)
+        OR (status IN ('failed', 'cleanup_ambiguous') AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until_unix_micros IS NULL AND retry_at_unix_micros IS NULL AND cleanup_worker_id IS NULL AND cleanup_token IS NULL AND cleanup_lease_until_unix_micros IS NULL AND published_product_id IS NULL AND published_conversation_id IS NULL AND cancelled_at_unix_micros IS NULL AND deletion_requested_at_unix_micros IS NULL))
+);
+CREATE INDEX product_creation_jobs_claim_order
+    ON product_creation_jobs(status, accepted_at_unix_micros, request_id);
+CREATE INDEX product_creation_jobs_retry_order
+    ON product_creation_jobs(status, retry_at_unix_micros, accepted_at_unix_micros, request_id);
+CREATE INDEX product_creation_jobs_cleanup_order
+    ON product_creation_jobs(status, cleanup_lease_until_unix_micros, updated_at_unix_micros, request_id);
+CREATE INDEX product_creation_jobs_delivery_order
+    ON product_creation_jobs(status, delivery_retry_at_unix_micros, updated_at_unix_micros, request_id);
+CREATE INDEX product_creation_jobs_published_cwd
+    ON product_creation_jobs(status, cwd, updated_at_unix_micros DESC, request_id DESC);
+
+CREATE TABLE product_creation_job_images (
+    request_id TEXT NOT NULL REFERENCES product_creation_jobs(request_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (typeof(ordinal) = 'integer' AND ordinal >= 0),
+    media_type TEXT NOT NULL CHECK (typeof(media_type) = 'text' AND trim(media_type) <> ''),
+    data TEXT NOT NULL CHECK (typeof(data) = 'text' AND trim(data) <> ''),
+    PRIMARY KEY (request_id, ordinal)
+);
+
+CREATE TABLE product_creation_resource_reservations (
+    id TEXT PRIMARY KEY CHECK (typeof(id) = 'text' AND trim(id) <> ''),
+    request_id TEXT NOT NULL REFERENCES product_creation_jobs(request_id) ON DELETE CASCADE,
+    generation INTEGER NOT NULL CHECK (typeof(generation) = 'integer' AND generation > 0),
+    repository_identity TEXT NOT NULL CHECK (typeof(repository_identity) = 'text' AND trim(repository_identity) <> ''),
+    resource_identity TEXT NOT NULL CHECK (typeof(resource_identity) = 'text' AND trim(resource_identity) <> ''),
+    status TEXT NOT NULL CHECK (status IN ('reserved', 'present', 'cleanup_required', 'released', 'conflict')),
+    created_at_unix_micros INTEGER NOT NULL CHECK (typeof(created_at_unix_micros) = 'integer' AND created_at_unix_micros >= 0),
+    updated_at_unix_micros INTEGER NOT NULL CHECK (typeof(updated_at_unix_micros) = 'integer' AND updated_at_unix_micros >= 0),
+    UNIQUE(request_id, resource_identity)
+);
+CREATE INDEX product_creation_resource_reservations_job
+    ON product_creation_resource_reservations(request_id, status);
+
+";
+
+const MIGRATION_092: &str = r"ALTER TABLE conversation_creation_jobs ADD COLUMN exact_checkout_oid TEXT;
+ALTER TABLE conversation_creation_jobs ADD COLUMN exact_checkout_logical_base TEXT;
+CREATE TRIGGER conversation_creation_checkout_pin_insert
+BEFORE INSERT ON conversation_creation_jobs
+WHEN (NEW.exact_checkout_oid IS NULL) <> (NEW.exact_checkout_logical_base IS NULL)
+  OR (NEW.exact_checkout_oid IS NOT NULL AND trim(NEW.exact_checkout_oid) = '')
+  OR (NEW.exact_checkout_logical_base IS NOT NULL AND trim(NEW.exact_checkout_logical_base) = '')
+BEGIN
+    SELECT RAISE(ABORT, 'conversation creation checkout pin must be a non-empty pair');
+END;
+CREATE TRIGGER conversation_creation_checkout_pin_update
+BEFORE UPDATE OF exact_checkout_oid, exact_checkout_logical_base ON conversation_creation_jobs
+WHEN (NEW.exact_checkout_oid IS NULL) <> (NEW.exact_checkout_logical_base IS NULL)
+  OR (NEW.exact_checkout_oid IS NOT NULL AND trim(NEW.exact_checkout_oid) = '')
+  OR (NEW.exact_checkout_logical_base IS NOT NULL AND trim(NEW.exact_checkout_logical_base) = '')
+  OR (OLD.exact_checkout_oid IS NOT NULL AND (
+        NEW.exact_checkout_oid IS NULL
+        OR NEW.exact_checkout_oid <> OLD.exact_checkout_oid
+        OR NEW.exact_checkout_logical_base <> OLD.exact_checkout_logical_base
+      ))
+BEGIN
+    SELECT RAISE(ABORT, 'conversation creation checkout pin must be a non-empty immutable pair');
+END;
+ALTER TABLE product_conversation_sources ADD COLUMN approved_title TEXT;
+ALTER TABLE product_conversation_sources ADD COLUMN approved_priority TEXT;
+ALTER TABLE product_conversation_sources ADD COLUMN approved_artifact_body TEXT;
+ALTER TABLE product_conversation_sources ADD COLUMN approved_task_title TEXT;
+ALTER TABLE product_conversation_sources ADD COLUMN approved_plan TEXT;
+ALTER TABLE product_conversation_sources ADD COLUMN approved_task_file TEXT;
+CREATE TABLE approved_task_creation_bindings (
+    job_id TEXT PRIMARY KEY REFERENCES conversation_creation_jobs(id) ON DELETE CASCADE,
+    source_product_conversation_id TEXT NOT NULL REFERENCES product_conversations(id),
+    source_conversation_id TEXT NOT NULL CHECK (trim(source_conversation_id) <> ''),
+    task_id TEXT NOT NULL CHECK (trim(task_id) <> ''), task_title TEXT NOT NULL CHECK (trim(task_title) <> ''),
+    approved_title TEXT NOT NULL CHECK (trim(approved_title) <> ''), approved_priority TEXT NOT NULL CHECK (trim(approved_priority) <> ''),
+    approved_plan TEXT NOT NULL, approved_task_file TEXT NOT NULL CHECK (trim(approved_task_file) <> ''), approved_artifact_body TEXT NOT NULL,
+    UNIQUE(source_product_conversation_id, task_id)
+);
+CREATE TABLE conversation_approved_task_objectives (
+    conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL CHECK (trim(task_id) <> ''), task_title TEXT NOT NULL CHECK (trim(task_title) <> ''),
+    approved_title TEXT NOT NULL CHECK (trim(approved_title) <> ''), approved_priority TEXT NOT NULL CHECK (trim(approved_priority) <> ''),
+    approved_plan TEXT NOT NULL, approved_task_file TEXT NOT NULL CHECK (trim(approved_task_file) <> ''), approved_artifact_body TEXT NOT NULL,
+    created_at_us INTEGER NOT NULL CHECK (created_at_us >= 0)
+);
+CREATE TABLE work_scope_approved_task_authorities (
+    work_scope_id TEXT PRIMARY KEY REFERENCES work_scopes(id) ON DELETE CASCADE,
+    objective_conversation_id TEXT NOT NULL UNIQUE REFERENCES conversation_approved_task_objectives(conversation_id) ON DELETE CASCADE,
+    created_at_us INTEGER NOT NULL CHECK (created_at_us >= 0)
+);";
+
+const MIGRATION_093: &str = r"ALTER TABLE product_creation_resource_reservations
+ADD COLUMN ownership_token TEXT
+CHECK (ownership_token IS NULL OR (
+    typeof(ownership_token) = 'text'
+    AND trim(ownership_token) <> ''
+    AND instr(ownership_token, char(0)) = 0
+));";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7986,6 +8943,53 @@ mod tests {
             .connect_with(opts)
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn migration_088_backfills_and_requires_admin_incarnation() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE close_worktree_cleanup_plans (
+                 attempt_id TEXT PRIMARY KEY,
+                 administrative_dir_value TEXT NOT NULL
+             );
+             INSERT INTO close_worktree_cleanup_plans (
+                 attempt_id, administrative_dir_value
+             ) VALUES ('legacy-attempt', '2f746d70');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(MIGRATION_088).execute(&pool).await.unwrap();
+
+        let legacy_incarnation: String = sqlx::query_scalar(
+            "SELECT administrative_dir_incarnation
+             FROM close_worktree_cleanup_plans
+             WHERE attempt_id = 'legacy-attempt'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(legacy_incarnation, "legacy_unknown");
+
+        assert!(sqlx::query(
+            "INSERT INTO close_worktree_cleanup_plans (
+                 attempt_id, administrative_dir_value, administrative_dir_incarnation
+             ) VALUES ('empty-incarnation', '2f746d70', '')",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+
+        sqlx::query(
+            "INSERT INTO close_worktree_cleanup_plans (
+                 attempt_id, administrative_dir_value, administrative_dir_incarnation
+             ) VALUES ('bound-incarnation', '2f746d70', 'git_admin_dir_v1:1:2')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
     }
 
     async fn setup_legacy_conversations_table(pool: &SqlitePool) {
@@ -12521,9 +13525,9 @@ mod tests {
                     (72, 'temporarily_skip_product_conversation_lifecycle_retention'),
                     (73, 'temporarily_skip_recursive_subordinate_parent_invariant'),
                     (74, 'temporarily_skip_completed_continuation_handoffs'),
-                    (76, 'temporarily_skip_product_creation_publication'),
-                    (77, 'temporarily_skip_creation_authority_persistence'),
-                    (78, 'temporarily_skip_product_creation_resource_ownership')",
+                    (91, 'temporarily_skip_product_creation_jobs'),
+                    (92, 'temporarily_skip_creation_checkout_pin'),
+                    (93, 'temporarily_skip_product_creation_ownership')",
         )
         .execute(&pool)
         .await
@@ -13412,9 +14416,9 @@ mod tests {
                     (72, 'temporarily_skip_product_conversation_lifecycle_retention'),
                     (73, 'temporarily_skip_recursive_subordinate_parent_invariant'),
                     (74, 'temporarily_skip_completed_continuation_handoffs'),
-                    (76, 'temporarily_skip_product_creation_publication'),
-                    (77, 'temporarily_skip_creation_authority_persistence'),
-                    (78, 'temporarily_skip_product_creation_resource_ownership')",
+                    (91, 'temporarily_skip_product_creation_jobs'),
+                    (92, 'temporarily_skip_creation_checkout_pin'),
+                    (93, 'temporarily_skip_product_creation_ownership')",
         )
         .execute(pool)
         .await

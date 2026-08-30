@@ -30,6 +30,13 @@ continuation inherits its predecessor's `WorkScope` — but a Phoenix restart
 drops them: the agent will see `handle_not_found` on a previously-known handle.
 Persistence across Phoenix restart is what `tmux` is for.
 
+WHEN Close seals a WorkScope admission gate
+THE SYSTEM SHALL stop bash handles owned by that gate through the live Phoenix process's exact handle permit
+AND SHALL NOT persist a bash launch identity, Close receipt, or restart-cleanup authority
+
+WHEN Phoenix restarts before that stop completes
+THE SYSTEM SHALL leave the former process epoch's bash resources untouched rather than inferring ownership from a PID, process group, cwd, or handle identifier.
+
 ## Requirements
 
 ### REQ-PROJ-013: Platform Capability Detection

@@ -2059,6 +2059,10 @@ export const api = {
     const resp = await fetch(`/api/conversations/${convId}/archive`, {
       method: 'POST',
     });
+    if (resp.status === 409) {
+      const err = await resp.json();
+      throw new ConflictError(err as ConflictErrorDetail);
+    }
     if (!resp.ok) throw new Error('Failed to archive');
     return resp.json();
   },
@@ -2277,13 +2281,74 @@ export const api = {
 
   async abandonTask(convId: string): Promise<{ success: boolean }> {
     const resp = await fetch(`/api/conversations/${convId}/abandon-task`, { method: 'POST' });
-    if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to abandon task'); }
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({})) as { error?: string; error_type?: string };
+      throw new ApiResponseError(err.error ?? 'Failed to abandon task', resp.status, err.error_type);
+    }
     return resp.json();
   },
 
   async markMerged(conversationId: string): Promise<{ success: boolean }> {
     const resp = await fetch(`/api/conversations/${conversationId}/mark-merged`, { method: 'POST' });
-    if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to mark as merged'); }
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({})) as { error?: string; error_type?: string };
+      throw new ApiResponseError(err.error ?? 'Failed to mark as merged', resp.status, err.error_type);
+    }
+    return resp.json();
+  },
+
+  async confirmCloseStopWork(conversationId: string, attemptId: string): Promise<{ success: boolean }> {
+    const resp = await fetch(`/api/conversations/${conversationId}/close/confirm-stop-work`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ attempt_id: attemptId }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({})) as { error?: string; error_type?: string };
+      throw new ApiResponseError(err.error ?? 'Failed to confirm stop-work', resp.status, err.error_type);
+    }
+    return resp.json();
+  },
+
+  async confirmCloseLossRetirement(
+    conversationId: string,
+    request: { attempt_id: string; inspection_generation: string; inspection_fingerprint: string },
+  ): Promise<{ success: boolean }> {
+    const resp = await fetch(`/api/conversations/${conversationId}/close/confirm-loss-retirement`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({})) as { error?: string; error_type?: string };
+      throw new ApiResponseError(err.error ?? 'Failed to confirm Close losses', resp.status, err.error_type);
+    }
+    return resp.json();
+  },
+
+  async cancelCloseBeforeRetirement(conversationId: string, attemptId: string): Promise<{ success: boolean }> {
+    const resp = await fetch(`/api/conversations/${conversationId}/close/cancel-before-retirement`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ attempt_id: attemptId }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({})) as { error?: string; error_type?: string };
+      throw new ApiResponseError(err.error ?? 'Failed to cancel Close', resp.status, err.error_type);
+    }
+    return resp.json();
+  },
+
+  async retryCloseRetirement(conversationId: string, attemptId: string): Promise<{ success: boolean }> {
+    const resp = await fetch(`/api/conversations/${conversationId}/close/retry-retirement`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ attempt_id: attemptId }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({})) as { error?: string; error_type?: string };
+      throw new ApiResponseError(err.error ?? 'Failed to retry Close retirement', resp.status, err.error_type);
+    }
     return resp.json();
   },
 

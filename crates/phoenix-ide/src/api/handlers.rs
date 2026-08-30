@@ -18,8 +18,10 @@ use super::git_handlers::{
 };
 use super::global_read;
 use super::lifecycle_handlers::{
-    abandon_task, approve_fork_proposal, approve_task, dismiss_fork_proposal, list_fork_proposals,
-    mark_merged, reject_task, request_changes_on_fork_proposal, task_feedback,
+    abandon_task, approve_fork_proposal, approve_task, cancel_close_before_retirement,
+    confirm_close_loss_retirement, confirm_close_stop_work, dismiss_fork_proposal,
+    list_fork_proposals, mark_merged, reject_task, request_changes_on_fork_proposal,
+    retry_close_retirement, task_feedback,
 };
 use super::product_conversations::{
     get_product_conversation, list_product_conversation_creations, list_product_conversations,
@@ -293,6 +295,22 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/conversations/:id/abandon-task", post(abandon_task))
         // Mark as merged (REQ-PROJ-026)
         .route("/api/conversations/:id/mark-merged", post(mark_merged))
+        .route(
+            "/api/conversations/:id/close/confirm-stop-work",
+            post(confirm_close_stop_work),
+        )
+        .route(
+            "/api/conversations/:id/close/confirm-loss-retirement",
+            post(confirm_close_loss_retirement),
+        )
+        .route(
+            "/api/conversations/:id/close/cancel-before-retirement",
+            post(cancel_close_before_retirement),
+        )
+        .route(
+            "/api/conversations/:id/close/retry-retirement",
+            post(retry_close_retirement),
+        )
         // Lifecycle (REQ-API-006). Archive and delete are both terminal
         // transitions that run the resource-cleanup cascade (REQ-BED-032);
         // archive preserves the row, delete removes it. There is no
@@ -5627,7 +5645,25 @@ async fn archive_conversation(
     refuse_if_chain_member(&state, &id, "archive").await?;
     let admission = state.runtime.conversation_admission(&id).await;
     let _admission_guard = admission.lock().await;
-    run_archive_cascade(&state, &id).await?;
+    let conversation = state
+        .db
+        .get_conversation(&id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    let has_allocated_worktree = matches!(
+        conversation.conv_mode,
+        ConvMode::Work { .. }
+            | ConvMode::Branch { .. }
+            | ConvMode::Explore {
+                worktree_path: Some(_),
+                ..
+            }
+    );
+    if has_allocated_worktree {
+        super::lifecycle_handlers::close_legacy_compat(&state, &id, "archive").await?;
+    } else {
+        run_archive_cascade(&state, &id).await?;
+    }
     Ok(Json(SuccessResponse { success: true }))
 }
 
@@ -13569,13 +13605,9 @@ pub(crate) mod hard_delete_cascade_tests {
         (tmp, repo, worktree, branch)
     }
 
-    /// Chain archive must tear down the chain's shared worktree + branch
-    /// exactly once (from the leaf's cascade) and flip `archived = 1` on
-    /// every member. Verifies the correct-by-construction continuation
-    /// preservation: root + mid skip worktree cleanup, leaf actually
-    /// removes it. End state: shared resources gone, all rows archived.
+    /// A first-pass Work-mode Close captures its inventory before retirement.
     #[tokio::test]
-    async fn archive_chain_cleans_shared_worktree_and_branch_once() {
+    async fn archive_chain_captures_first_pass_close_inventory() {
         let state = make_test_state().await;
         let ids = ["sc-a", "sc-a2", "sc-a3"];
         let (_tmp, repo, worktree, branch) =
@@ -13592,23 +13624,20 @@ pub(crate) mod hard_delete_cascade_tests {
             axum::extract::Path("sc-a".to_string()),
         )
         .await
-        .expect("chain archive");
+        .expect("first-pass Close must capture inventory and converge");
 
+        assert!(!worktree.exists(), "Close must retire the shared worktree");
         assert!(
-            !worktree.exists(),
-            "shared worktree must be removed after chain archive"
-        );
-        assert!(
-            crate::git_ops::run_git(&repo, &["rev-parse", "--verify", &branch]).is_err(),
-            "shared task branch must be deleted after chain archive (Work mode)"
+            crate::git_ops::run_git(&repo, &["rev-parse", "--verify", &branch]).is_ok(),
+            "archive preserves the shared task branch"
         );
         for id in ids {
             let conv = state
                 .db
                 .get_conversation(id)
                 .await
-                .unwrap_or_else(|_| panic!("{id} row preserved"));
-            assert!(conv.archived, "{id} must be archived");
+                .unwrap_or_else(|_| panic!("{id} row preserved in History"));
+            assert!(conv.archived, "{id} must be archived after Close");
         }
     }
 

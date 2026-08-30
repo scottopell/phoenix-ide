@@ -211,7 +211,7 @@ entity CloseObligation {
         awaiting_loss_confirmation -> retirement_requested
         awaiting_loss_confirmation -> completed
         retirement_requested -> needs_repair
-        needs_repair -> retirement_requested
+        needs_repair -> awaiting_retirement_inspection
         retirement_requested -> completed
         needs_repair -> completed
         terminal: completed
@@ -1771,19 +1771,19 @@ rule CloseRetirementFailureLeavesOpenNeedsRepair {
     ensures: CloseNeedsRepairVisible(product_conversation, attempt_id)
 }
 
-rule CloseNeedsRepairCanRetryRetirement {
+rule CloseNeedsRepairRetriesThroughReinspection {
     when: CloseRetirementRetryRequested(product_conversation, attempt_id)
     requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = needs_repair
     requires: CloseNeedsRepairVisible(product_conversation, attempt_id)
-    ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = retirement_requested
-    ensures: ResourceRetirementRequested(product_conversation, attempt_id)
+    ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_retirement_inspection
+    ensures: RetirementInspectionRequested(product_conversation, attempt_id)
 
     @guidance
-        -- Retry is exposed on the same visible needs-repair attempt the user sees.
-        -- It carries the exact attempt_id and requests retirement again without any
-        -- local ProductConversation lifecycle mutation. Automatic operator repair may also
-        -- complete by driving the same exact-attempt retirement request path, but no
-        -- hidden synthetic attempt or phase change bypasses this authority.
+        -- Retry preserves exact-attempt retirement and dispatch evidence while reinspection
+        -- refreshes the worktree snapshot and reseals resources admitted during repair.
+        -- User retry and startup recovery use this same exact-attempt branch. Recovery
+        -- dispatches inspection immediately after reopening the attempt; it does not wait
+        -- for another restart or synthesize a replacement Close attempt.
 }
 
 ------------------------------------------------------------
@@ -2089,6 +2089,18 @@ rule ModeChangeNotification {
 --
 -- Allium has no formal helper-function declaration; rules call these
 -- predicates by bare identifier. This block defines their complete semantics.
+--
+--   retirement_inventory_is_complete_and_sealed(
+--       product_conversation: ProductConversation,
+--       attempt_id: String
+--   ) -> Boolean
+--       True exactly when the active CloseObligation for the exact product
+--       conversation and attempt has one sealed retirement target row for every
+--       resource required by every attached WorkScope, has no missing target or
+--       incomplete inspection row, and retains the same attempt-bound WorkScope,
+--       tmux, and worktree identities captured before retirement began. False
+--       when any target or inspection is absent, unsealed, superseded, or belongs
+--       to another attempt.
 --
 --   user_resumable(error_kind: ConversationErrorKind) -> Boolean
 --       True exactly for auth, rate_limit, usage_limit_reached, network,

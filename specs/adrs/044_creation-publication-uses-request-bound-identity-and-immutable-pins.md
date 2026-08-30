@@ -1,4 +1,4 @@
-# ADR-039: Creation publication uses request-bound identity and immutable starting pins
+# ADR-044: Creation publication uses request-bound identity and immutable starting pins
 
 - **Status:** Accepted
 - **Date:** 2026-08-26

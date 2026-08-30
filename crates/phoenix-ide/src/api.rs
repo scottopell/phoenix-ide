@@ -125,6 +125,23 @@ async fn reconcile_startup_continuations(
     if settled > 0 {
         tracing::info!(settled, "recovered pending Close active-work settlements");
     }
+    let inspected = runtime
+        .resume_pending_close_inspections()
+        .await
+        .map_err(std::io::Error::other)?;
+    if inspected > 0 {
+        tracing::info!(inspected, "rebuilt pending Close retirement inspections");
+    }
+    let runtime_retired = runtime
+        .resume_pending_close_runtime_retirements()
+        .await
+        .map_err(std::io::Error::other)?;
+    if runtime_retired > 0 {
+        tracing::info!(
+            runtime_retired,
+            "replayed pending Close runtime-resource retirements"
+        );
+    }
     Ok(())
 }
 
@@ -171,6 +188,10 @@ impl AppState {
                 "retired automatic wake obligations before runtime startup"
             );
         }
+        // Close inspection and exact retirement must fence resources before any
+        // resource-producing bridge or worker begins admitting new instances.
+        reconcile_startup_continuations(&runtime).await?;
+        runtime.require_startup_local_authority()?;
         runtime.start_sub_agent_handler().await;
         runtime.start_browser_lifecycle_bridge().await;
         runtime.start_work_scope_bridge().await;
@@ -183,8 +204,6 @@ impl AppState {
             .start_wake_worker()
             .await
             .map_err(std::io::Error::other)?;
-        runtime.require_startup_local_authority()?;
-        reconcile_startup_continuations(&runtime).await?;
         runtime.require_startup_local_authority()?;
         tokio::spawn(crate::runtime::pr_status_poll::run(runtime.clone()));
         runtime.start_creation_worker().await?;
