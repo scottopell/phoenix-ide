@@ -6,6 +6,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::runtime::RuntimeManager;
+#[cfg(test)]
+use phoenix_core::domain::close::TranscriptConversationId;
 use phoenix_core::work_scope::ResourceScopeKey;
 use phoenix_db::workflow::wake::{
     MaterializePendingDeliveryMessageInput, MaterializePendingDeliveryMessageOutcome,
@@ -1385,9 +1387,13 @@ mod tests {
             .await
             .unwrap()
             .product_conversation_id;
-        db.begin_close_foundation(&product_conversation_id, "wake-production-fence")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_conversation_id,
+            &TranscriptConversationId::parse("conv").unwrap(),
+            "wake-production-fence",
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             registrar

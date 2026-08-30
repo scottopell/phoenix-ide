@@ -350,6 +350,17 @@ THE `ToolContext.browser()` method SHALL:
 
 Browser sessions use the same opaque persisted WorkScope identity as the other work-affine resources. Conversations share one Chrome window only when they retain the same `work_scope_id`; filesystem paths and conversation ids do not define browser ownership.
 
+### REQ-BROWSER-000: Browser Sessions Are Process-Epoch Close Resources
+
+WHEN Close seals a WorkScope admission gate
+THE SYSTEM SHALL stop browser sessions owned by that gate through the live Phoenix process's exact session permit
+AND SHALL NOT persist a browser launch identity, profile-based Close receipt, or restart-cleanup authority
+
+WHEN Phoenix restarts before that stop completes
+THE SYSTEM SHALL leave the former process epoch's browser session and profile untouched unless another explicit non-Close ownership contract authorizes it.
+
+---
+
 ### REQ-BROWSER-WS-001: Sessions Keyed by WorkScope
 
 WHEN `BrowserSessionManager::get_session` resolves a session

@@ -1826,28 +1826,56 @@ mod tests {
         project_id: Option<&str>,
     ) {
         let slug = format!("slug-{id}");
-        db.create_conversation_with_project(
-            id,
-            &slug,
-            "/tmp",
-            true,
-            None,
-            None,
-            project_id,
-            &ConvMode::Direct,
-            None,
-            None,
-            None,
-            LlmLanguage::default(),
+        let parent: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM conversations\n             WHERE work_scope_id = ?1 AND runtime_role = 'user'\n             LIMIT 1",
         )
+        .bind(scope.as_str())
+        .fetch_optional(db.pool())
         .await
         .unwrap();
-        sqlx::query("UPDATE conversations SET work_scope_id = ?1 WHERE id = ?2")
-            .bind(scope.as_str())
-            .bind(id)
-            .execute(db.pool())
+        if let Some(parent) = parent {
+            db.create_subagent_conversation(
+                id,
+                &slug,
+                "/tmp",
+                &parent,
+                "test",
+                &ConvMode::Direct,
+                LlmLanguage::default(),
+                Some(scope),
+            )
             .await
             .unwrap();
+            sqlx::query("UPDATE conversations SET project_id = ?1 WHERE id = ?2")
+                .bind(project_id)
+                .bind(id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        } else {
+            db.create_conversation_with_project(
+                id,
+                &slug,
+                "/tmp",
+                true,
+                None,
+                None,
+                project_id,
+                &ConvMode::Direct,
+                None,
+                None,
+                None,
+                LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+            sqlx::query("UPDATE conversations SET work_scope_id = ?1 WHERE id = ?2")
+                .bind(scope.as_str())
+                .bind(id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
     }
 
     async fn insert_attachment(db: &Database, scope: &WorkScopeId, repository_id: &str) {

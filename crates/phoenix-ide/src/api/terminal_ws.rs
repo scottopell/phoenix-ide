@@ -20,13 +20,11 @@ use nix::sys::wait::waitpid;
 use phoenix_core::domain::db_schema::ConvMode;
 use phoenix_core::work_scope::ResourceScopeKey;
 use phoenix_terminal::relay::{run_relay, PtyMasterIo, RelayConfig, RelayExit};
-use phoenix_terminal::session::{ActiveTerminals, Dims, StopReason, TerminalHandle};
-use phoenix_terminal::spawn::{set_nonblocking, set_winsize_raw, spawn_pty, PtyExecPlan};
-use std::{
-    os::unix::io::{AsRawFd, FromRawFd},
-    sync::Arc,
-    time::Duration,
+use phoenix_terminal::session::{
+    ActiveTerminals, Dims, RelayTeardownOwnership, StopReason, TerminalHandle,
 };
+use phoenix_terminal::spawn::{set_nonblocking, set_winsize_raw, spawn_pty, PtyExecPlan};
+use std::{os::unix::io::FromRawFd, sync::Arc, time::Duration};
 use tokio::sync::OwnedSemaphorePermit;
 
 /// How long to wait for the sitting relay to release the `attach_permit`
@@ -177,7 +175,10 @@ async fn handle_socket(
     let child_pid = arc_handle.child_pid;
     tracing::info!(conv_id = %conversation_id, pid = %child_pid, "Terminal session attached");
 
-    let master_fd_raw = arc_handle.master_fd.as_raw_fd();
+    let Some(master_fd_raw) = arc_handle.master_fd_raw() else {
+        tracing::warn!(conv_id = %conversation_id, "Terminal session retired before relay setup");
+        return;
+    };
 
     // Apply the new client's dims to the existing PTY (reclaim path) or confirm
     // the freshly-spawned PTY matches them (fresh path — spawn already used these).
@@ -197,16 +198,26 @@ async fn handle_socket(
         Err(reason) => {
             tracing::error!(conv_id = %conversation_id, error = %reason, "Terminal: fd setup failed");
             // Full teardown — we failed before the relay started.
-            full_teardown(&terminals, &conversation_id, &scope, arc_handle, child_pid).await;
+            finish_destructive_relay_exit(
+                &terminals,
+                &conversation_id,
+                &scope,
+                arc_handle,
+                attach_permit,
+            )
+            .await;
             return;
         }
     };
 
-    // Reset the stop channel to `Running` before the relay starts. A
-    // reclaimer may have just transitioned it Running → Detach to evict the
-    // previous relay; without this reset the new relay could observe the
-    // stale `Detach` and exit immediately.
-    let _ = arc_handle.stop_tx.send(StopReason::Running);
+    // Reset only through the registry's attach gate. A Close fence may have
+    // issued TearDown after permit acquisition; never overwrite that signal.
+    if !terminals.prepare_relay(&scope, &arc_handle) {
+        drop(arc_handle);
+        drop(attach_permit);
+        tracing::debug!(conv_id = %conversation_id, scope = %scope, "Terminal relay setup yielded to retirement");
+        return;
+    }
     let stop_rx = arc_handle.stop_tx.subscribe();
 
     if teardown_on_terminal {
@@ -291,18 +302,20 @@ async fn handle_socket(
     //                             can recover the session.
     match exit {
         RelayExit::PtyEof | RelayExit::Stopped(StopReason::TearDown) => {
-            full_teardown(&terminals, &conversation_id, &scope, arc_handle, child_pid).await;
+            finish_destructive_relay_exit(
+                &terminals,
+                &conversation_id,
+                &scope,
+                arc_handle,
+                attach_permit,
+            )
+            .await;
         }
         RelayExit::Stopped(StopReason::Detach | StopReason::Running) | RelayExit::WsClosed => {
             detach_only(&conversation_id, arc_handle);
+            drop(attach_permit);
         }
     }
-    // Release the single-attach permit AFTER cleanup runs. This wakes the
-    // next reclaimer's `acquire_owned()` at the earliest point that the
-    // slot is actually free. `drop` is explicit here so the ordering is
-    // obvious at the call site; the code is correct without it, but the
-    // lint-free discipline helps anyone tracing the release point.
-    drop(attach_permit);
 }
 
 /// Acquire an `Arc<TerminalHandle>` AND the single `attach_permit` for the
@@ -343,8 +356,18 @@ async fn acquire_handle(
     // reclaim path does not consult the tmux registry because the existing
     // PTY is already running whatever it was originally given (tmux attach
     // or $SHELL); switching mid-session would require killing the child.
-    if let Some(existing) = terminals.get(scope) {
+    if let Some(existing) = terminals.get_for_attach(scope) {
         return reclaim(conversation_id, existing).await;
+    }
+
+    // Reserve admission before tmux planning or PTY spawn. Retirement revokes
+    // this reservation atomically with fencing, so no untracked child can be
+    // created after the WorkScope gate is sealed.
+    if terminals.reserve_spawn(scope).is_err() {
+        let _ = ws_sender
+            .send(Message::Text("error: terminal unavailable".to_string()))
+            .await;
+        return None;
     }
 
     // Slow path: spawn a new PTY. Resolve the exec plan first
@@ -361,10 +384,12 @@ async fn acquire_handle(
     {
         Ok(Ok(h)) => h,
         Ok(Err(e)) => {
+            terminals.release_spawn(scope);
             tracing::error!(conv_id = %conversation_id, error = %e, "Terminal: PTY spawn failed");
             return None;
         }
         Err(e) => {
+            terminals.release_spawn(scope);
             tracing::error!(conv_id = %conversation_id, error = %e, "Terminal: spawn_blocking panicked");
             return None;
         }
@@ -372,32 +397,20 @@ async fn acquire_handle(
 
     let child_pid = handle.child_pid;
 
-    // Atomic check-and-insert. If we lose the race, the handle we just spawned
-    // is dropped (closing master_fd → SIGHUP), and we fall back to reclaiming
-    // the winner so the caller still gets an attached session.
-    if let Some(arc_handle) = terminals.try_insert(scope.clone(), handle) {
-        // Fresh handle — permit is available immediately (initialized with 1).
-        return acquire_permit(conversation_id, arc_handle).await;
-    }
-
-    tracing::warn!(conv_id = %conversation_id, scope = %scope, "Terminal: post-spawn race lost, reclaiming winner");
-    // Reap the child from the losing spawn to avoid a zombie. The handle was
-    // consumed by try_insert (on loss it was dropped), so master_fd is closed
-    // and the child will receive SIGHUP.
-    let _ = tokio::task::spawn_blocking(move || {
-        let _ = waitpid(child_pid, None);
-    })
-    .await;
-
-    let Some(existing) = terminals.get(scope) else {
-        // Winner removed itself between try_insert and get. Report back to
-        // the client and bail — retrying again could loop on edge-case timing.
+    // Publish only through the pre-spawn reservation. A concurrent retirement
+    // can revoke it; dropping the rejected handle closes the PTY master.
+    if let Ok(arc_handle) = terminals.insert_reserved(scope.clone(), handle) {
+        acquire_permit(conversation_id, arc_handle).await
+    } else {
+        tracing::warn!(conv_id = %conversation_id, scope = %scope, "Terminal: spawn reservation revoked before publish");
+        // Never wait unboundedly for a child that may ignore PTY hangup.
+        let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGKILL);
+        let _ = tokio::task::spawn_blocking(move || waitpid(child_pid, None)).await;
         let _ = ws_sender
             .send(Message::Text("error: terminal unavailable".to_string()))
             .await;
-        return None;
-    };
-    reclaim(conversation_id, existing).await
+        None
+    }
 }
 
 /// Decide whether the freshly-spawned PTY should run `tmux attach`
@@ -490,22 +503,35 @@ async fn acquire_permit(
     }
 }
 
-/// Full teardown: shell must die, registry entry goes away, child reaped.
-async fn full_teardown(
+/// Transfer destructive relay cleanup to the single typed retirement owner.
+/// The relay never removes or reaps while holding the attach permit. Close can
+/// therefore acquire the permit and prove its exact instance; an ordinary
+/// shell exit creates its own bounded permit and completes it only after the
+/// relay has released every PTY/attach capability.
+async fn finish_destructive_relay_exit(
     terminals: &ActiveTerminals,
     conversation_id: &str,
     scope: &ResourceScopeKey,
     arc_handle: Arc<TerminalHandle>,
-    child_pid: nix::unistd::Pid,
+    attach_permit: OwnedSemaphorePermit,
 ) {
-    terminals.remove(scope);
-    // When this and any other Arc clones drop, master_fd closes → SIGHUP → shell exits.
+    let ownership = terminals.claim_relay_teardown(scope, &arc_handle);
     drop(arc_handle);
-    let _ = tokio::task::spawn_blocking(move || {
-        let _ = waitpid(child_pid, None);
-    })
-    .await;
-    tracing::info!(conv_id = %conversation_id, scope = %scope, "Terminal session ended");
+    drop(attach_permit);
+
+    match ownership {
+        RelayTeardownOwnership::RelayInitiated(permit) => {
+            let completion = terminals.complete_relay_retirement(permit).await;
+            let outcome = terminals.reopen_after_relay_completion(completion);
+            tracing::info!(conv_id = %conversation_id, scope = %scope, ?outcome, "Terminal session ended");
+        }
+        RelayTeardownOwnership::ExistingRetirementOwner => {
+            tracing::debug!(conv_id = %conversation_id, scope = %scope, "Terminal teardown released to Close retirement owner");
+        }
+        RelayTeardownOwnership::StaleRelay => {
+            tracing::debug!(conv_id = %conversation_id, scope = %scope, "Stale terminal relay released without touching current instance");
+        }
+    }
 }
 
 /// Detach only: release our Arc clone but leave the registry entry intact so
@@ -572,8 +598,10 @@ mod reclaim_tests {
     use super::{acquire_permit, ATTACH_PERMIT_TIMEOUT};
     use futures::channel::mpsc;
     use futures::StreamExt;
+    use phoenix_core::process_identity::ProcessIdentity;
     use phoenix_terminal::command_tracker::CommandTracker;
     use phoenix_terminal::relay::{run_relay, RelayConfig, RelayExit};
+    use phoenix_terminal::session::TerminalLaunchIdentity;
     use phoenix_terminal::session::{ShellIntegrationStatus, StopReason, TerminalHandle};
     use phoenix_terminal::test_helpers::full_command;
     use std::sync::{Arc, Mutex};
@@ -599,8 +627,15 @@ mod reclaim_tests {
         let (stop_tx, _stop_rx) = watch::channel(StopReason::Running);
 
         Arc::new(TerminalHandle {
-            master_fd: owned_fd,
+            master_fd: std::sync::Mutex::new(Some(owned_fd)),
             child_pid: nix::unistd::Pid::from_raw(1),
+            launch_identity: TerminalLaunchIdentity {
+                process: ProcessIdentity {
+                    pid: 1,
+                    start_time: 1,
+                },
+                launch_uuid: "reclaim-test-launch".to_string(),
+            },
             child_kind: phoenix_terminal::TerminalChildKind::Shell,
             tracker: Arc::new(Mutex::new(CommandTracker::new("reclaim-test".to_string()))),
             shell_integration_status: Arc::new(Mutex::new(ShellIntegrationStatus::Unknown)),

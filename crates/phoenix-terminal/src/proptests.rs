@@ -15,8 +15,14 @@
 
 use proptest::prelude::*;
 
-use super::session::{ActiveTerminals, Dims};
+use super::session::{
+    ActiveTerminalInsertError, ActiveTerminals, Dims, TerminalLaunchIdentity,
+    TerminalRetirementOutcome,
+};
+use phoenix_core::process_identity::ProcessIdentity;
 use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
+
+static REAL_CHILD_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -28,15 +34,30 @@ fn arb_work_scope() -> impl Strategy<Value = ResourceScopeKey> {
     "[a-z0-9]{8}-[a-z0-9]{4}".prop_map(|id| scope(&id))
 }
 
+fn dummy_launch_identity(pid: u32) -> TerminalLaunchIdentity {
+    TerminalLaunchIdentity {
+        process: ProcessIdentity {
+            pid,
+            start_time: u128::from(pid) * 10,
+        },
+        launch_uuid: format!("launch-{pid}"),
+    }
+}
+
 /// Build a minimal `TerminalHandle` for registry tests.
 /// Uses /dev/null as a stand-in fd since these tests never do PTY I/O.
 fn dummy_handle(dims: Dims) -> super::session::TerminalHandle {
-    dummy_handle_kind(dims, super::session::TerminalChildKind::Shell)
+    dummy_handle_with_pid(dims, 1)
+}
+
+fn dummy_handle_with_pid(dims: Dims, pid: i32) -> super::session::TerminalHandle {
+    dummy_handle_kind(dims, super::session::TerminalChildKind::Shell, pid)
 }
 
 fn dummy_handle_kind(
     _dims: Dims,
     child_kind: super::session::TerminalChildKind,
+    pid: i32,
 ) -> super::session::TerminalHandle {
     use crate::command_tracker::CommandTracker;
     use crate::session::{ShellIntegrationStatus, StopReason};
@@ -56,8 +77,9 @@ fn dummy_handle_kind(
     let (stop_tx, _stop_rx) = tokio::sync::watch::channel(StopReason::Running);
 
     super::session::TerminalHandle {
-        master_fd: owned_fd,
-        child_pid: nix::unistd::Pid::from_raw(1), // init — never reaped in tests
+        master_fd: std::sync::Mutex::new(Some(owned_fd)),
+        child_pid: nix::unistd::Pid::from_raw(pid), // synthetic test pid — never reaped
+        launch_identity: dummy_launch_identity(pid.cast_unsigned()),
         child_kind,
         tracker: std::sync::Arc::new(std::sync::Mutex::new(CommandTracker::new(
             "test-session".to_string(),
@@ -88,13 +110,13 @@ fn shell_session_snapshot_excludes_tmux_clients() {
     registry
         .try_insert(
             shell_scope,
-            dummy_handle_kind(dims, TerminalChildKind::Shell),
+            dummy_handle_kind(dims, TerminalChildKind::Shell, 1),
         )
         .expect("shell insert");
     registry
         .try_insert(
             tmux_scope,
-            dummy_handle_kind(dims, TerminalChildKind::TmuxClient),
+            dummy_handle_kind(dims, TerminalChildKind::TmuxClient, 1),
         )
         .expect("tmux insert");
 
@@ -129,10 +151,551 @@ fn remove_allows_reinsertion() {
     registry
         .try_insert(scope.clone(), dummy_handle(dims))
         .unwrap();
-    registry.remove(&scope);
+    registry.remove_unfenced(&scope);
 
     let third = registry.try_insert(scope.clone(), dummy_handle(dims));
     assert!(third.is_some(), "insert after remove must succeed");
+}
+
+#[test]
+fn relay_teardown_transfers_to_existing_close_owner() {
+    use crate::session::RelayTeardownOwnership;
+
+    let registry = ActiveTerminals::default();
+    let scope = scope("relay-fence");
+    let handle = registry
+        .try_insert(scope.clone(), dummy_handle(Dims::try_new(80, 24).unwrap()))
+        .expect("insert terminal");
+    let _permit = registry.begin_retirement(&scope);
+
+    assert_eq!(
+        registry.claim_relay_teardown(&scope, &handle),
+        RelayTeardownOwnership::ExistingRetirementOwner
+    );
+
+    assert!(registry.is_retirement_fenced(&scope));
+    assert!(
+        registry
+            .get(&scope)
+            .is_some_and(|current| std::sync::Arc::ptr_eq(&current, &handle)),
+        "relay must leave the exact handle and reap authority with Close"
+    );
+}
+
+#[tokio::test]
+async fn stale_relay_completion_cannot_reopen_newer_close_fence() {
+    use crate::session::RelayTeardownOwnership;
+
+    let registry = ActiveTerminals::new();
+    let scope = scope("stale-relay-close-fence");
+    let dims = Dims::try_new(80, 24).unwrap();
+    let handle = registry
+        .try_insert_exact(scope.clone(), dummy_handle(dims))
+        .expect("insert terminal");
+    let relay = match registry.claim_relay_teardown(&scope, &handle) {
+        RelayTeardownOwnership::RelayInitiated(permit) => permit,
+        ownership @ (RelayTeardownOwnership::ExistingRetirementOwner
+        | RelayTeardownOwnership::StaleRelay) => {
+            panic!("relay should own generation N, got {ownership:?}")
+        }
+    };
+    let close = registry.begin_retirement(&scope);
+    assert_eq!(close.generation().get(), relay.generation().get() + 1);
+
+    let completion = registry.complete_relay_retirement(relay).await;
+    assert!(matches!(
+        registry.reopen_after_relay_completion(completion),
+        TerminalRetirementOutcome::Residual { .. }
+    ));
+
+    assert!(registry.is_retirement_fenced(&scope));
+    assert!(matches!(
+        registry.try_insert_exact(scope.clone(), dummy_handle(dims)),
+        Err(ActiveTerminalInsertError::RetirementFenced)
+    ));
+    registry.cancel_retirement(close);
+}
+
+#[tokio::test]
+async fn current_relay_completion_reopens_its_own_fence() {
+    use crate::session::RelayTeardownOwnership;
+
+    let registry = ActiveTerminals::new();
+    let scope = scope("relay-only-reopen");
+    let dims = Dims::try_new(80, 24).unwrap();
+    let handle = registry
+        .try_insert_exact(scope.clone(), dummy_handle(dims))
+        .expect("insert terminal");
+    let relay = match registry.claim_relay_teardown(&scope, &handle) {
+        RelayTeardownOwnership::RelayInitiated(permit) => permit,
+        ownership @ (RelayTeardownOwnership::ExistingRetirementOwner
+        | RelayTeardownOwnership::StaleRelay) => {
+            panic!("relay should own its retirement, got {ownership:?}")
+        }
+    };
+
+    let completion = registry.complete_relay_retirement(relay).await;
+    let outcome = registry.reopen_after_relay_completion(completion);
+    assert!(matches!(
+        outcome,
+        TerminalRetirementOutcome::Retired | TerminalRetirementOutcome::Residual { .. }
+    ));
+    assert!(!registry.is_retirement_fenced(&scope));
+}
+
+#[test]
+fn close_fence_prevents_relay_setup_from_overwriting_teardown() {
+    let registry = ActiveTerminals::default();
+    let scope = scope("relay-setup-fence");
+    let handle = registry
+        .try_insert(scope.clone(), dummy_handle(Dims::try_new(80, 24).unwrap()))
+        .expect("insert terminal");
+    let _permit = registry.begin_retirement(&scope);
+
+    assert!(!registry.prepare_relay(&scope, &handle));
+}
+
+#[test]
+fn retirement_revokes_pre_spawn_reservation() {
+    let registry = ActiveTerminals::new();
+    let scope = scope("reserved-before-fence");
+    let dims = Dims { cols: 80, rows: 24 };
+
+    registry.reserve_spawn(&scope).expect("reserve admission");
+    let permit = registry.begin_retirement(&scope);
+
+    assert!(permit.instance.is_none());
+    assert!(matches!(
+        registry.insert_reserved(scope.clone(), dummy_handle(dims)),
+        Err(ActiveTerminalInsertError::RetirementFenced)
+    ));
+    assert!(registry.get(&scope).is_none());
+}
+
+#[test]
+fn begin_retirement_fences_admission_until_reopened() {
+    let registry = ActiveTerminals::new();
+    let scope = scope("retirement-fence");
+    let dims = Dims { cols: 80, rows: 24 };
+
+    registry
+        .try_insert(scope.clone(), dummy_handle(dims))
+        .expect("initial insert");
+
+    let permit = registry.begin_retirement(&scope);
+    assert_eq!(permit.work_scope, scope);
+    assert_eq!(permit.generation().get(), 1);
+    assert!(
+        permit.instance.is_some(),
+        "live terminal should stamp exact identity"
+    );
+    assert!(registry.is_retirement_fenced(&scope));
+    assert!(matches!(
+        registry.try_insert_exact(scope.clone(), dummy_handle(dims)),
+        Err(ActiveTerminalInsertError::RetirementFenced)
+    ));
+
+    registry.cancel_retirement(permit);
+    assert!(!registry.is_retirement_fenced(&scope));
+    registry.remove_unfenced(&scope);
+    assert!(
+        registry
+            .try_insert(scope.clone(), dummy_handle(dims))
+            .is_some(),
+        "repair reopen must restore admission"
+    );
+}
+
+#[tokio::test]
+async fn complete_retirement_requires_exact_instance_and_reopen_for_admission() {
+    let registry = ActiveTerminals::new();
+    let scope = scope("retirement-exact");
+    let dims = Dims { cols: 80, rows: 24 };
+
+    let first = registry
+        .try_insert_exact(scope.clone(), dummy_handle(dims))
+        .expect("first insert");
+    let first_identity = super::session::TerminalInstanceIdentity::from_handle(&first);
+    let permit = registry.begin_retirement(&scope);
+    let second_permit = registry.begin_retirement(&scope);
+    assert_eq!(permit.generation().get(), 1);
+    assert_eq!(second_permit.generation().get(), 2);
+
+    assert_eq!(
+        registry.complete_retirement(&permit).await,
+        TerminalRetirementOutcome::Residual {
+            reason: format!(
+                "exact terminal instance {} remained current after teardown",
+                first_identity.stable_identity()
+            ),
+        },
+        "stale generation must not retire the still-current instance"
+    );
+    assert!(
+        registry.get(&scope).is_some(),
+        "stale permit must leave entry intact"
+    );
+
+    assert_eq!(
+        registry
+            .complete_retirement_by_observing(
+                &second_permit,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+                |pid| async move { Ok(nix::sys::wait::WaitStatus::Exited(pid, 0)) },
+                |_| None,
+            )
+            .await,
+        TerminalRetirementOutcome::Retired,
+        "current permit must retire the exact current instance"
+    );
+    assert!(
+        registry.get(&scope).is_none(),
+        "exact retirement removes live entry"
+    );
+    assert!(
+        registry.is_retirement_fenced(&scope),
+        "scope stays fenced until repair reopen"
+    );
+    assert!(matches!(
+        registry.try_insert_exact(scope.clone(), dummy_handle(dims)),
+        Err(ActiveTerminalInsertError::RetirementFenced)
+    ));
+
+    registry.cancel_retirement(second_permit);
+    assert!(
+        registry
+            .try_insert(scope.clone(), dummy_handle(dims))
+            .is_some(),
+        "exact Close cancellation must permit a fresh terminal after teardown"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn retirement_waits_for_attach_release_without_consuming_a_second_budget() {
+    let registry = ActiveTerminals::new();
+    let scope = scope("retirement-shared-deadline");
+    let handle = registry
+        .try_insert_exact(scope.clone(), dummy_handle(Dims::try_new(80, 24).unwrap()))
+        .expect("insert terminal");
+    let relay_authority = handle.attach_permit.clone().acquire_owned().await.unwrap();
+    let permit = registry.begin_retirement(&scope);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let completing = {
+        let registry = registry.clone();
+        tokio::spawn(async move {
+            registry
+                .complete_retirement_by_observing(
+                    &permit,
+                    deadline,
+                    |pid| async move { Ok(nix::sys::wait::WaitStatus::Exited(pid, 0)) },
+                    |_| None,
+                )
+                .await
+        })
+    };
+
+    tokio::task::yield_now().await;
+    assert!(!completing.is_finished());
+    tokio::time::advance(std::time::Duration::from_secs(9)).await;
+    assert!(!completing.is_finished());
+
+    // Permit release is the causal notification; no sleep or polling is needed.
+    drop(relay_authority);
+    tokio::task::yield_now().await;
+    assert_eq!(
+        completing.await.unwrap(),
+        TerminalRetirementOutcome::Retired
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn retirement_attach_wait_uses_declared_outer_deadline() {
+    let registry = ActiveTerminals::new();
+    let scope = scope("retirement-outer-deadline");
+    let handle = registry
+        .try_insert_exact(scope.clone(), dummy_handle(Dims::try_new(80, 24).unwrap()))
+        .expect("insert terminal");
+    let _relay_authority = handle.attach_permit.clone().acquire_owned().await.unwrap();
+    let permit = registry.begin_retirement(&scope);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let completing = {
+        let registry = registry.clone();
+        tokio::spawn(async move { registry.complete_retirement_by(&permit, deadline).await })
+    };
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(std::time::Duration::from_secs(10)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        completing.await.unwrap(),
+        TerminalRetirementOutcome::Residual {
+            reason: "terminal relay did not release after teardown request".to_string(),
+        }
+    );
+}
+
+#[tokio::test]
+async fn attached_relay_close_transfers_authority_and_completes_exact_teardown() {
+    use crate::session::{RelayTeardownOwnership, StopReason};
+    use crate::spawn::{spawn_pty, PtyExecPlan};
+
+    let _real_child_guard = REAL_CHILD_TEST_LOCK.lock().await;
+    let registry = ActiveTerminals::new();
+    let scope = scope("attached-close");
+    let handle = registry
+        .try_insert_exact(
+            scope.clone(),
+            spawn_pty(
+                std::path::Path::new("/tmp"),
+                Dims::try_new(80, 24).unwrap(),
+                PtyExecPlan::Shell,
+            )
+            .expect("spawn attached PTY"),
+        )
+        .expect("publish attached PTY");
+    let relay_permit = handle.attach_permit.clone().acquire_owned().await.unwrap();
+    let mut stop_rx = handle.stop_tx.subscribe();
+    let permit = registry.begin_retirement_by(
+        &scope,
+        tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+    );
+    let close = {
+        let registry = registry.clone();
+        tokio::spawn(async move {
+            let outcome = registry.complete_retirement(&permit).await;
+            (outcome, permit)
+        })
+    };
+
+    stop_rx.changed().await.unwrap();
+    assert_eq!(*stop_rx.borrow(), StopReason::TearDown);
+    assert_eq!(
+        registry.claim_relay_teardown(&scope, &handle),
+        RelayTeardownOwnership::ExistingRetirementOwner,
+        "attached relay must transfer exact teardown authority to Close"
+    );
+    drop(relay_permit);
+    drop(handle);
+
+    assert_eq!(close.await.unwrap().0, TerminalRetirementOutcome::Retired);
+    assert!(registry.get(&scope).is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn sighup_resistant_attached_child_times_out_bounded_with_retry_authority() {
+    use crate::command_tracker::CommandTracker;
+    use crate::session::{ShellIntegrationStatus, StopReason, TerminalChildKind, TerminalHandle};
+    use nix::unistd::{fork, ForkResult};
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    let _real_child_guard = REAL_CHILD_TEST_LOCK.lock().await;
+    let mut ready_pipe = [0; 2];
+    assert_eq!(unsafe { libc::pipe(ready_pipe.as_mut_ptr()) }, 0);
+    // SAFETY: the child performs only async-signal-safe libc operations before
+    // `_exit`; the parent owns and reaps the exact returned PID.
+    let child = match unsafe { fork() }.expect("fork resistant child") {
+        ForkResult::Child => unsafe {
+            libc::close(ready_pipe[0]);
+            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+            let ready = [1_u8];
+            libc::write(ready_pipe[1], ready.as_ptr().cast(), ready.len());
+            libc::close(ready_pipe[1]);
+            loop {
+                libc::pause();
+            }
+        },
+        ForkResult::Parent { child } => child,
+    };
+    unsafe {
+        libc::close(ready_pipe[1]);
+        let mut ready = [0_u8];
+        assert_eq!(
+            libc::read(ready_pipe[0], ready.as_mut_ptr().cast(), ready.len()),
+            1
+        );
+        libc::close(ready_pipe[0]);
+    }
+    let process =
+        phoenix_core::process_identity::current_process_identity(child.as_raw().cast_unsigned())
+            .expect("capture child identity");
+    let raw = unsafe { libc::dup(libc::STDERR_FILENO) };
+    assert!(raw >= 0);
+    let master_fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let (stop_tx, _stop_rx) = tokio::sync::watch::channel(StopReason::Running);
+    let registry = ActiveTerminals::new();
+    let scope = scope("resistant-timeout");
+    let handle = registry
+        .try_insert_exact(
+            scope.clone(),
+            TerminalHandle {
+                master_fd: std::sync::Mutex::new(Some(master_fd)),
+                child_pid: child,
+                launch_identity: TerminalLaunchIdentity {
+                    process,
+                    launch_uuid: "resistant-child".to_string(),
+                },
+                child_kind: TerminalChildKind::Shell,
+                tracker: std::sync::Arc::new(std::sync::Mutex::new(CommandTracker::new(
+                    "resistant-child".to_string(),
+                ))),
+                shell_integration_status: std::sync::Arc::new(std::sync::Mutex::new(
+                    ShellIntegrationStatus::Unknown,
+                )),
+                stop_tx,
+                attach_permit: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            },
+        )
+        .expect("publish resistant child");
+    let relay_permit = handle.attach_permit.clone().acquire_owned().await.unwrap();
+    let mut stop_rx = handle.stop_tx.subscribe();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(100);
+    let permit = registry.begin_retirement_by(&scope, deadline);
+    let completing = {
+        let registry = registry.clone();
+        tokio::spawn(async move {
+            let outcome = registry.complete_retirement(&permit).await;
+            (outcome, permit)
+        })
+    };
+    let started = std::time::Instant::now();
+
+    stop_rx.changed().await.unwrap();
+    assert_eq!(*stop_rx.borrow(), StopReason::TearDown);
+    assert_eq!(
+        registry.claim_relay_teardown(&scope, &handle),
+        crate::session::RelayTeardownOwnership::ExistingRetirementOwner
+    );
+    drop(relay_permit);
+    let (outcome, permit) = completing.await.unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    assert_eq!(
+        outcome,
+        TerminalRetirementOutcome::Residual {
+            reason: "terminal child exit was not authoritatively observed; exact handle retained for retry"
+                .to_string(),
+        }
+    );
+    assert!(
+        registry
+            .get(&scope)
+            .is_some_and(|current| std::sync::Arc::ptr_eq(&current, &handle)),
+        "timeout must retain the exact handle and retry authority"
+    );
+    assert_eq!(
+        registry.complete_retirement(&permit).await,
+        outcome,
+        "retry must reuse the expired absolute budget rather than reset it"
+    );
+
+    nix::sys::signal::kill(child, nix::sys::signal::Signal::SIGKILL).unwrap();
+    nix::sys::wait::waitpid(child, None).unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn deadline_with_unobservable_identity_retains_exact_handle_for_retry() {
+    let registry = ActiveTerminals::new();
+    let scope = scope("retirement-unobservable-identity");
+    let handle = registry
+        .try_insert_exact(
+            scope.clone(),
+            dummy_handle_with_pid(Dims::try_new(80, 24).unwrap(), 41),
+        )
+        .expect("insert terminal");
+    let permit = registry.begin_retirement(&scope);
+
+    let outcome = registry
+        .complete_retirement_by_observing(
+            &permit,
+            tokio::time::Instant::now(),
+            |_| std::future::pending(),
+            |_| None,
+        )
+        .await;
+
+    assert_eq!(
+        outcome,
+        TerminalRetirementOutcome::Residual {
+            reason: "terminal child exit was not authoritatively observed; exact handle retained for retry"
+                .to_string(),
+        }
+    );
+    assert!(
+        registry
+            .get(&scope)
+            .is_some_and(|current| std::sync::Arc::ptr_eq(&current, &handle)),
+        "an unproven observation must preserve exact handle and retry ownership"
+    );
+}
+
+#[tokio::test]
+async fn failed_wait_with_reused_pid_retires_exact_handle() {
+    let registry = ActiveTerminals::new();
+    let scope = scope("retirement-reused-pid");
+    let handle = registry
+        .try_insert_exact(
+            scope.clone(),
+            dummy_handle_with_pid(Dims::try_new(80, 24).unwrap(), 42),
+        )
+        .expect("insert terminal");
+    let expected = handle.launch_identity.process;
+    let permit = registry.begin_retirement(&scope);
+    let reused = ProcessIdentity {
+        start_time: expected.start_time + 1,
+        ..expected
+    };
+
+    let outcome = registry
+        .complete_retirement_by_observing(
+            &permit,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+            |_| async { Err(nix::errno::Errno::ECHILD) },
+            |_| Some(reused),
+        )
+        .await;
+
+    assert_eq!(outcome, TerminalRetirementOutcome::Retired);
+    assert!(
+        registry.get(&scope).is_none(),
+        "a different identity at the PID proves the exact child absent"
+    );
+}
+
+#[tokio::test]
+async fn complete_retirement_exits_and_reaps_long_lived_detached_direct_pty() {
+    use crate::session::TerminalRetirementOutcome;
+    use crate::spawn::{spawn_pty, PtyExecPlan};
+
+    let _real_child_guard = REAL_CHILD_TEST_LOCK.lock().await;
+    let registry = ActiveTerminals::new();
+    let scope = scope("detached-direct-pty");
+    let handle = spawn_pty(
+        std::path::Path::new("/tmp"),
+        Dims::try_new(80, 24).unwrap(),
+        PtyExecPlan::Shell,
+    )
+    .expect("spawn real direct-shell PTY");
+    let process = handle.launch_identity.process;
+    registry
+        .try_insert_exact(scope.clone(), handle)
+        .expect("publish detached PTY");
+
+    assert!(
+        phoenix_core::process_identity::process_identity_matches(process),
+        "direct PTY child must remain live while its detached master is owned"
+    );
+
+    let permit = registry.begin_retirement(&scope);
+    assert_eq!(
+        registry.complete_retirement(&permit).await,
+        TerminalRetirementOutcome::Retired
+    );
+    assert!(registry.get(&scope).is_none());
+    assert!(
+        !phoenix_core::process_identity::process_identity_matches(process),
+        "retirement must close the detached master and reap the exact child"
+    );
 }
 
 /// `get` returns `Some` for registered scopes, `None` otherwise.
@@ -184,13 +747,19 @@ fn global_scope_is_disjoint_and_singleton() {
 /// Mirrors the tmux/browser cascade pattern.
 #[tokio::test]
 async fn cascade_on_delete_removes_entry_for_scope() {
-    let registry = ActiveTerminals::new();
-    let dims = Dims { cols: 80, rows: 24 };
-    let scope = scope("cascade-remove");
+    use crate::spawn::{spawn_pty, PtyExecPlan};
 
-    registry
-        .try_insert(scope.clone(), dummy_handle(dims))
-        .unwrap();
+    let _real_child_guard = REAL_CHILD_TEST_LOCK.lock().await;
+    let registry = ActiveTerminals::new();
+    let scope = scope("cascade-remove");
+    let handle = spawn_pty(
+        std::path::Path::new("/tmp"),
+        Dims::try_new(80, 24).unwrap(),
+        PtyExecPlan::Shell,
+    )
+    .expect("spawn real direct-shell PTY");
+
+    registry.try_insert(scope.clone(), handle).unwrap();
     assert!(registry.get(&scope).is_some());
 
     registry.cascade_on_delete(&scope, None).await;
@@ -253,12 +822,11 @@ proptest! {
                 // try_insert either succeeds or returns None — never panics.
                 let _ = registry.try_insert(scope.clone(), dummy_handle(dims));
             } else {
-                registry.remove(&scope);
+                registry.remove_unfenced(&scope);
             }
 
             // Invariant: count per scope must be 0 or 1.
-            let map = registry.0.lock().unwrap();
-            let count = map.iter().filter(|(k, _)| **k == scope).count();
+            let count = registry.active_count_for_scope(&scope);
             prop_assert!(count <= 1,
                 "OneTerminalPerResourceScopeKey violated: {} active for {:?}",
                 count, scope);
@@ -366,7 +934,7 @@ proptest! {
 fn build_env_contains_required_variables() {
     use super::spawn::build_env;
 
-    let env = build_env("/bin/bash");
+    let env = build_env("/bin/bash", "test-launch");
     let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
 
     for required in &["TERM", "COLORTERM", "HOME", "USER", "SHELL", "PATH", "LANG"] {
@@ -380,7 +948,7 @@ fn build_env_contains_required_variables() {
 #[test]
 fn build_env_term_is_xterm_256color() {
     use super::spawn::build_env;
-    let env = build_env("/bin/bash");
+    let env = build_env("/bin/bash", "test-launch");
     let term = env
         .iter()
         .find(|(k, _)| k == "TERM")
@@ -395,7 +963,7 @@ fn build_env_term_is_xterm_256color() {
 #[test]
 fn build_env_colorterm_is_truecolor() {
     use super::spawn::build_env;
-    let env = build_env("/bin/bash");
+    let env = build_env("/bin/bash", "test-launch");
     let ct = env
         .iter()
         .find(|(k, _)| k == "COLORTERM")
@@ -406,7 +974,7 @@ fn build_env_colorterm_is_truecolor() {
 #[test]
 fn build_env_shell_matches_argument() {
     use super::spawn::build_env;
-    let env = build_env("/usr/bin/zsh");
+    let env = build_env("/usr/bin/zsh", "test-launch");
     let shell = env
         .iter()
         .find(|(k, _)| k == "SHELL")
@@ -421,7 +989,7 @@ fn build_env_shell_matches_argument() {
 #[test]
 fn build_env_lang_is_utf8() {
     use super::spawn::build_env;
-    let env = build_env("/bin/bash");
+    let env = build_env("/bin/bash", "test-launch");
     let lang = env
         .iter()
         .find(|(k, _)| k == "LANG")
@@ -432,7 +1000,7 @@ fn build_env_lang_is_utf8() {
 #[test]
 fn build_env_no_duplicate_keys() {
     use super::spawn::build_env;
-    let env = build_env("/bin/bash");
+    let env = build_env("/bin/bash", "test-launch");
     let mut keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
     let original_len = keys.len();
     keys.dedup();
@@ -447,6 +1015,46 @@ fn build_env_no_duplicate_keys() {
 //
 // These proptests verify REQ-TERM-021 invariants under adversarial byte
 // sequences and arbitrary delivery chunking.
+
+#[test]
+fn terminal_instance_stable_identity_excludes_arc_address_but_exact_match_keeps_it() {
+    let dims = Dims { cols: 80, rows: 24 };
+    let handle = std::sync::Arc::new(dummy_handle(dims));
+    let identity = super::session::TerminalInstanceIdentity::from_handle(&handle);
+
+    let cloned_handle = std::sync::Arc::clone(&handle);
+    assert!(identity.matches_handle(&cloned_handle));
+
+    let same_launch_new_arc = std::sync::Arc::new(dummy_handle(dims));
+    let same_launch_identity =
+        super::session::TerminalInstanceIdentity::from_handle(&same_launch_new_arc);
+    assert_eq!(
+        identity.stable_identity(),
+        same_launch_identity.stable_identity(),
+        "stable identity must come from durable launch identity, not Arc address"
+    );
+    assert!(
+        !identity.matches_handle(&same_launch_new_arc),
+        "exact in-process matching must still distinguish different Arc instances"
+    );
+    assert_eq!(
+        identity.process_identity(),
+        same_launch_identity.process_identity(),
+        "durable process identity should be separable from in-process handle identity"
+    );
+}
+
+#[test]
+fn build_env_carries_terminal_launch_uuid_marker() {
+    use super::spawn::{build_env, TERMINAL_LAUNCH_UUID_ENV_VAR};
+
+    let env = build_env("/bin/bash", "launch-uuid-test");
+    let launch_uuid = env
+        .iter()
+        .find(|(k, _)| k == TERMINAL_LAUNCH_UUID_ENV_VAR)
+        .map(|(_, v)| v.as_str());
+    assert_eq!(launch_uuid, Some("launch-uuid-test"));
+}
 
 #[cfg(test)]
 mod command_tracker_proptest {

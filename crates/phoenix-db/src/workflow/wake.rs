@@ -11,6 +11,8 @@ use super::{
 use crate::sqlite_telemetry::SqliteOperation;
 use crate::{admit_product_conversation_operation_tx, ProductConversationAdmission};
 use chrono::{DateTime, Utc};
+#[cfg(test)]
+use phoenix_core::domain::close::TranscriptConversationId;
 use phoenix_core::domain::{
     db_schema::{Message, MessageContent, UserContent},
     sm_state::ConvState,
@@ -5015,9 +5017,13 @@ mod tests {
             .await
             .unwrap()
             .product_conversation_id;
-        db.begin_close_foundation(&product_conversation_id, "wake-fence")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_conversation_id,
+            &TranscriptConversationId::parse("wake-fenced").unwrap(),
+            "wake-fence",
+        )
+        .await
+        .unwrap();
         let repo = WakeRepository::new(db.pool().clone());
         let mut input = intent();
         input.conversation_id = "wake-fenced".into();
@@ -5200,7 +5206,11 @@ mod tests {
              (id, product_conversation_id, slug, title, user_initiated, state_updated_at,
               created_at, updated_at, runtime_role, work_scope_id)
              SELECT ?1, ?2, ?1, ?1, 1, '2025-01-01', '2025-01-01', '2025-01-01',
-                    'user', work_scope_id
+                    'user', COALESCE(
+                        (SELECT work_scope_id FROM product_conversation_work_scopes
+                         WHERE product_conversation_id = ?2 LIMIT 1),
+                        work_scope_id
+                    )
              FROM conversations
              WHERE id = 'conv-1'",
         )
@@ -5223,16 +5233,41 @@ mod tests {
     }
 
     async fn insert_conversation(pool: &sqlx::SqlitePool, id: &str) {
-        let product_conversation_id = format!("product-{id}");
         sqlx::query(
-            "INSERT OR IGNORE INTO product_conversations (id, kind, ordinary_lifecycle)
-             VALUES (?1, 'ordinary', 'open')",
+            "INSERT OR IGNORE INTO conversations
+             (id, product_conversation_id, slug, title, parent_conversation_id,
+              user_initiated, state_updated_at, created_at, updated_at, runtime_role, work_scope_id)
+             SELECT ?1, product_conversation_id, ?1, ?1, 'conv-1',
+                    0, '2025-01-01', '2025-01-01', '2025-01-01', 'sub_agent', work_scope_id
+             FROM conversations
+             WHERE id = 'conv-1'",
         )
-        .bind(&product_conversation_id)
+        .bind(id)
         .execute(pool)
         .await
         .unwrap();
-        insert_conversation_in_product(pool, id, &product_conversation_id, None).await;
+    }
+
+    #[tokio::test]
+    async fn wake_discovery_fixture_participant_is_same_aggregate_subagent() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        insert_conversation(&repo.workflow_repo.pool, "wake-subagent").await;
+        let (product, role, scope): (String, String, String) = sqlx::query_as(
+            "SELECT product_conversation_id, runtime_role, work_scope_id
+             FROM conversations WHERE id = 'wake-subagent'",
+        )
+        .fetch_one(&repo.workflow_repo.pool)
+        .await
+        .unwrap();
+        let owner_product: String = sqlx::query_scalar(
+            "SELECT product_conversation_id FROM conversations WHERE id = 'conv-1'",
+        )
+        .fetch_one(&repo.workflow_repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(product, owner_product);
+        assert_eq!(role, "sub_agent");
+        assert_eq!(scope, "conv-1");
     }
 
     async fn external_acceptance_identity(
@@ -6378,9 +6413,13 @@ mod tests {
             .await
             .unwrap()
             .product_conversation_id;
-        db.begin_close_foundation(&product_conversation_id, "wake-existing-fence")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_conversation_id,
+            &TranscriptConversationId::parse("conv-1").unwrap(),
+            "wake-existing-fence",
+        )
+        .await
+        .unwrap();
 
         assert!(matches!(
             repo.register(&input, "exact", Timestamp(10)).await.unwrap(),
@@ -6449,9 +6488,13 @@ mod tests {
             .await
             .unwrap()
             .product_conversation_id;
-        db.begin_close_foundation(&product_conversation_id, "wake-terminal-fence")
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_conversation_id,
+            &TranscriptConversationId::parse("conv-1").unwrap(),
+            "wake-terminal-fence",
+        )
+        .await
+        .unwrap();
         sqlx::query("UPDATE workflows SET status = 'Completed' WHERE workflow_id = ?1")
             .bind(to_i64(workflow_id.0, "workflow_id").unwrap())
             .execute(db.pool())
@@ -6490,9 +6533,13 @@ mod tests {
                 .await
                 .unwrap()
                 .product_conversation_id;
-            db.begin_close_foundation(&product_conversation_id, "wake-registration-fence")
-                .await
-                .unwrap();
+            db.begin_close_foundation(
+                &product_conversation_id,
+                &TranscriptConversationId::parse("conv-1").unwrap(),
+                "wake-registration-fence",
+            )
+            .await
+            .unwrap();
             db.update_conversation_state("conv-1", &state)
                 .await
                 .unwrap();
@@ -8974,7 +9021,13 @@ mod tests {
         let workflow_id = WorkflowId(703);
         let mut input = intent();
         input.conversation_id = "conv-wt".into();
-        insert_conversation(&first.workflow_repo.pool, "conv-wt").await;
+        sqlx::query(
+            "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
+             VALUES ('product-conv-wt', 'ordinary', 'open')",
+        )
+        .execute(&first.workflow_repo.pool)
+        .await
+        .unwrap();
         let opaque_scope = "0196f15d-f1ac-7d4c-a3b2-88d90f414bcc";
         sqlx::query(
             "INSERT INTO work_scopes
@@ -8985,11 +9038,21 @@ mod tests {
         .execute(&first.workflow_repo.pool)
         .await
         .unwrap();
-        sqlx::query("UPDATE conversations SET work_scope_id = ?1 WHERE id = 'conv-wt'")
-            .bind(opaque_scope)
-            .execute(&first.workflow_repo.pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO product_conversation_work_scopes (work_scope_id, product_conversation_id)
+             VALUES (?1, 'product-conv-wt')",
+        )
+        .bind(opaque_scope)
+        .execute(&first.workflow_repo.pool)
+        .await
+        .unwrap();
+        insert_conversation_in_product(
+            &first.workflow_repo.pool,
+            "conv-wt",
+            "product-conv-wt",
+            None,
+        )
+        .await;
 
         input.registration_scope = wake_types::WorkScopeIdentity(opaque_scope.into());
         input.resource = WakeResourceIdentity::Bash(wake_types::BashResourceIdentity {

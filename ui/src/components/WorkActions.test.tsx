@@ -11,8 +11,8 @@
 //     the #288 freshness (.work-actions-pr-freshness) + coverage
 //     (.work-actions-pr-coverage[--auth] ⚠) spans.
 //   - merge-pr-link / open-pr-link — honest <a> links to the PR url.
-//   - clean-up-button ("Clean up" / "Cleaning...") — single click → api.markMerged.
-//   - abandon-button ("Abandon" / "Abandoning...") — window.confirm → api.abandonTask.
+//   - clean-up-button / abandon-button initiate the server-authoritative Close contract.
+//   - persisted loss-confirmation and repair phases surface exact follow-up actions.
 //   - Exactly one element carries work-actions-btn--primary.
 //   - Notes are muted spans, never buttons.
 
@@ -26,6 +26,7 @@ import { StateBar } from './StateBar';
 import { api, type AssociatedPrStatusEnvelope, type PrStatusResponse } from '../api';
 import { ViewerSlotProvider, useViewerSlot } from '../contexts/ViewerSlotContext';
 import { requestActivePrSelectorOpen } from './activePrSelectorIntent';
+import { notifyCloseSnapshotChanged } from '../notifications';
 
 // WorkControlBar reads the unified viewer slot; MemoryRouter backs the slot's
 // URL contract.
@@ -53,6 +54,11 @@ vi.mock('../api', () => ({
   api: {
     abandonTask: vi.fn().mockResolvedValue({ success: true }),
     markMerged: vi.fn().mockResolvedValue({ success: true }),
+    getProductConversationSnapshot: vi.fn().mockResolvedValue({ close: null }),
+    confirmCloseStopWork: vi.fn().mockResolvedValue({ success: true }),
+    confirmCloseLossRetirement: vi.fn().mockResolvedValue({ success: true }),
+    cancelCloseBeforeRetirement: vi.fn().mockResolvedValue({ success: true }),
+    retryCloseRetirement: vi.fn().mockResolvedValue({ success: true }),
     getConversationDiff: vi.fn(),
     getPrStatus: vi.fn(),
     createPrAutoFixContext: vi
@@ -152,6 +158,7 @@ function primaryCount() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.mocked(api.getProductConversationSnapshot).mockResolvedValue({ close: null } as never);
   Object.defineProperty(window, 'matchMedia', {
     writable: true,
     value: vi.fn().mockImplementation((query: string) => ({
@@ -170,6 +177,190 @@ beforeEach(() => {
     refresh: { state: 'fresh', stale: false, last_attempted_at: '', last_refreshed_at: '' },
     associated_prs: [],
     work_change: cleanWorkChange(),
+  });
+});
+
+describe('WorkControlBar — persisted Close recovery', () => {
+  const closeSnapshot = (phase: string, residuals: Array<Record<string, string | null>> = []) => ({
+    close: {
+      attempt_id: 'attempt-close',
+      phase,
+      confirmation_snapshot: null,
+      inspections: [],
+      losses: [],
+      residuals,
+    },
+  });
+
+  it('refreshes the active Close projection when another surface starts Close', async () => {
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce({ close: null } as never)
+      .mockResolvedValueOnce(closeSnapshot('awaiting_stop_work_confirmation') as never);
+
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-sidebar-close" convModeLabel="Explore" phaseType="idle" continuedInConvId={null} prStatusHandle={prStatusHandle()} />,
+    );
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(1));
+
+    notifyCloseSnapshotChanged('different-conversation');
+    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(1);
+    notifyCloseSnapshotChanged('conv-sidebar-close');
+
+    expect(await screen.findByRole('button', { name: 'Stop work and continue closing' })).toBeVisible();
+    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2);
+  });
+
+  it('ignores a stale snapshot response after a newer refresh completes', async () => {
+    let resolveInitial!: (value: unknown) => void;
+    const initial = new Promise((resolve) => { resolveInitial = resolve; });
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockReturnValueOnce(initial as never)
+      .mockResolvedValueOnce(closeSnapshot('awaiting_stop_work_confirmation') as never);
+
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-racing-close" convModeLabel="Explore" phaseType="idle" continuedInConvId={null} prStatusHandle={prStatusHandle()} />,
+    );
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(1));
+    notifyCloseSnapshotChanged('conv-racing-close');
+    expect(await screen.findByRole('button', { name: 'Stop work and continue closing' })).toBeVisible();
+
+    resolveInitial({ close: null });
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Stop work and continue closing' })).toBeVisible());
+  });
+
+  it('conflict refresh invalidates an older effect snapshot response', async () => {
+    let resolveInitial!: (value: unknown) => void;
+    const initial = new Promise((resolve) => { resolveInitial = resolve; });
+    const conflict = Object.assign(new Error('repair required'), {
+      code: 'close_retirement_needs_repair',
+    });
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockReturnValueOnce(initial as never)
+      .mockResolvedValueOnce(closeSnapshot('needs_repair', [{
+        scope: 'scope-race',
+        resource_kind: 'terminal',
+        identity: 'terminal:exact',
+        reason: 'removal_failed',
+        detail: 'child retained',
+      }]) as never);
+    vi.mocked(api.abandonTask).mockRejectedValueOnce(conflict);
+
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-conflict-race" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={prStatusHandle({ found: false })} />,
+    );
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByTestId('abandon-button'));
+    expect(await screen.findByLabelText('Close repair required')).toHaveTextContent('child retained');
+
+    resolveInitial({ close: null });
+    await waitFor(() => expect(screen.getByLabelText('Close repair required')).toBeVisible());
+  });
+
+  it('inspection failure refreshes the monotonic Close projection', async () => {
+    let resolveInitial!: (value: unknown) => void;
+    const initial = new Promise((resolve) => { resolveInitial = resolve; });
+    const conflict = Object.assign(new Error('inspection failed'), {
+      code: 'close_inspection_failed',
+    });
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockReturnValueOnce(initial as never)
+      .mockResolvedValueOnce(closeSnapshot('needs_repair', [{
+        scope: 'scope-inspection',
+        resource_kind: 'worktree',
+        identity: 'worktree:exact',
+        reason: 'inspection_failed',
+        detail: 'git metadata unreadable',
+      }]) as never);
+    vi.mocked(api.abandonTask).mockRejectedValueOnce(conflict);
+
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-inspection-race" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={prStatusHandle({ found: false })} />,
+    );
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByTestId('abandon-button'));
+    expect(await screen.findByLabelText('Close repair required')).toHaveTextContent('git metadata unreadable');
+
+    resolveInitial({ close: null });
+    await waitFor(() => expect(screen.getByLabelText('Close repair required')).toBeVisible());
+  });
+
+  it('renders exact residual repair evidence after reload', async () => {
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(closeSnapshot('needs_repair', [{
+      scope: 'scope-1',
+      resource_kind: 'tmux_server',
+      identity: 'server:owned',
+      reason: 'ownership_conflict',
+      detail: 'different server incarnation is live',
+    }]) as never);
+
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-repair" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={prStatusHandle()} />,
+    );
+
+    expect(await screen.findByLabelText('Close repair required')).toHaveTextContent(
+      'scope-1: tmux server · server:owned · ownership conflict — different server incarnation is live',
+    );
+  });
+
+  it('requires the attempt-bound stop-work action before settlement', async () => {
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(
+      closeSnapshot('awaiting_stop_work_confirmation') as never,
+    );
+
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-stop-work" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={prStatusHandle()} />,
+    );
+
+    const confirm = await screen.findByRole('button', { name: 'Stop work and continue closing' });
+    fireEvent.click(confirm);
+    await waitFor(() => expect(api.confirmCloseStopWork).toHaveBeenCalledWith(
+      'conv-stop-work',
+      'attempt-close',
+    ));
+    expect(api.markMerged).not.toHaveBeenCalled();
+    expect(api.abandonTask).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['Explore', 'idle'],
+    ['Work', 'llm_requesting'],
+  ])('renders active Close controls outside disposition gating for %s/%s', async (convModeLabel, phaseType) => {
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(
+      closeSnapshot('awaiting_stop_work_confirmation') as never,
+    );
+
+    renderWithProviders(
+      <WorkControlBar
+        conversationId={`conv-${convModeLabel}-${phaseType}`}
+        convModeLabel={convModeLabel}
+        phaseType={phaseType}
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle()}
+      />,
+    );
+
+    expect(await screen.findByRole('button', { name: 'Stop work and continue closing' })).toBeVisible();
+    expect(screen.queryByTestId('view-diff-button')).not.toBeInTheDocument();
+  });
+
+  it.each([
+    'awaiting_blocker_resolution',
+    'settling_active_work',
+    'cancel_requested_during_settlement',
+    'awaiting_retirement_inspection',
+  ])('offers attempt-bound cancellation in %s', async (phase) => {
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(closeSnapshot(phase) as never);
+
+    renderWithProviders(
+      <WorkControlBar conversationId={`conv-${phase}`} convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={prStatusHandle()} />,
+    );
+
+    const cancel = await screen.findByRole('button', { name: 'Keep work and cancel Close' });
+    fireEvent.click(cancel);
+    await waitFor(() => expect(api.cancelCloseBeforeRetirement).toHaveBeenCalledWith(
+      `conv-${phase}`,
+      'attempt-close',
+    ));
   });
 });
 
@@ -199,6 +390,35 @@ describe('WorkControlBar — visibility (REQ-WAB-001)', () => {
       />,
     );
     expect(screen.queryByTestId('abandon-button')).not.toBeInTheDocument();
+  });
+
+  it('keeps an in-flight action error visible if the action rail becomes hidden', async () => {
+    let rejectClose!: (reason: Error) => void;
+    vi.mocked(api.markMerged).mockReturnValueOnce(new Promise((_, reject) => {
+      rejectClose = reject;
+    }));
+    const handle = prStatusHandle();
+    const tree = (phaseType: 'idle' | 'running') => (
+      <MemoryRouter>
+        <ViewerSlotProvider browserSessionActive={false}>
+          <WorkControlBar
+            conversationId="conv-hidden-error"
+            convModeLabel="Work"
+            phaseType={phaseType}
+            continuedInConvId={null}
+            prStatusHandle={handle}
+          />
+        </ViewerSlotProvider>
+      </MemoryRouter>
+    );
+    const { rerender } = render(tree('idle'));
+
+    fireEvent.click(screen.getByTestId('clean-up-button'));
+    await waitFor(() => expect(api.markMerged).toHaveBeenCalledWith('conv-hidden-error'));
+    rerender(tree('running'));
+    rejectClose(new Error('Close failed after the phase changed'));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Close failed after the phase changed');
   });
 
   it.each(['idle', 'error'] as const)(
@@ -661,48 +881,57 @@ describe('WorkControlBar — terminal cleanup actions', () => {
     expect(api.markMerged).toHaveBeenCalledWith('conv-1');
   });
 
-  it('Abandon confirms then calls api.abandonTask', async () => {
-    const confirmSpy = vi.fn().mockReturnValue(true);
-    const prevConfirm = window.confirm;
+  it('Abandon starts the server-authoritative Close contract without a generic browser confirmation', async () => {
+    const confirmSpy = vi.fn();
+    const previousConfirm = window.confirm;
     window.confirm = confirmSpy;
-    try {
-      renderWithProviders(
-        <WorkControlBar
-          conversationId="conv-1"
-          convModeLabel="Work"
-          phaseType="idle"
-          continuedInConvId={null}
-          prStatusHandle={prStatusHandle({ found: false })}
-        />,
-      );
-      fireEvent.click(screen.getByTestId('abandon-button'));
-      expect(confirmSpy).toHaveBeenCalled();
-      await waitFor(() => expect(api.abandonTask).toHaveBeenCalledWith('conv-1'));
-    } finally {
-      window.confirm = prevConfirm;
-    }
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-1"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle({ found: false })}
+      />,
+    );
+    fireEvent.click(screen.getByTestId('abandon-button'));
+    await waitFor(() => expect(api.abandonTask).toHaveBeenCalledWith('conv-1'));
+    expect(confirmSpy).not.toHaveBeenCalled();
+    window.confirm = previousConfirm;
   });
 
-  it('Abandon does NOT call api.abandonTask when the confirm is declined', () => {
-    const confirmSpy = vi.fn().mockReturnValue(false);
-    const prevConfirm = window.confirm;
-    window.confirm = confirmSpy;
-    try {
-      renderWithProviders(
-        <WorkControlBar
-          conversationId="conv-1"
-          convModeLabel="Work"
-          phaseType="idle"
-          continuedInConvId={null}
-          prStatusHandle={prStatusHandle({ found: false })}
-        />,
-      );
-      fireEvent.click(screen.getByTestId('abandon-button'));
-      expect(confirmSpy).toHaveBeenCalled();
-      expect(api.abandonTask).not.toHaveBeenCalled();
-    } finally {
-      window.confirm = prevConfirm;
-    }
+  it('reloads the Close snapshot when settlement remains in progress', async () => {
+    const settlementError = Object.assign(new Error('Close settlement is still in progress'), {
+      code: 'close_settlement_in_progress',
+    });
+    vi.mocked(api.abandonTask).mockRejectedValueOnce(settlementError);
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce({ close: null } as never)
+      .mockResolvedValueOnce({
+      close: {
+        attempt_id: 'attempt-settling',
+        phase: 'settling_active_work',
+        confirmation_snapshot: null,
+        inspections: [],
+        losses: [],
+        residuals: [],
+      },
+    } as never);
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-settling"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle({ found: false })}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId('abandon-button'));
+
+    expect(await screen.findByRole('button', { name: 'Keep work and cancel Close' })).toBeInTheDocument();
+    expect(api.getProductConversationSnapshot).toHaveBeenCalledWith('conv-settling');
+    expect(screen.queryByText('Close settlement is still in progress')).not.toBeInTheDocument();
   });
 });
 
@@ -822,42 +1051,6 @@ describe('WorkControlBar — active PR interactions', () => {
     expect(screen.queryByTestId('active-pr-selector-trigger')).not.toBeInTheDocument();
     expect(screen.getByTestId('mobile-work-controls')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /#12 open/i })).toBeInTheDocument();
-  });
-
-  it('commits a newly ambiguous safety refresh before opening the selector', async () => {
-    const latest = {
-      found: false,
-      refresh: { state: 'fresh' as const, stale: false, last_attempted_at: '', last_refreshed_at: '' },
-      work_change: cleanWorkChange(),
-      associated_prs: [
-        { repo_owner: 'o', repo_name: 'r', pr_number: 12, title: 'Fix CI', url: 'https://gh/pr/12', state: 'OPEN', draft: false, display_state: 'open' as const, base: 'main', head: 'task-123', feedback_status: 'open' as const },
-        { repo_owner: 'o', repo_name: 'r', pr_number: 34, title: 'Follow-up', url: 'https://gh/pr/34', state: 'OPEN', draft: false, display_state: 'open' as const, base: 'task-123', head: 'follow-up', feedback_status: 'open' as const },
-      ],
-    };
-    const handle = prStatusHandle({ found: false }, {
-      refreshForSafety: vi.fn().mockResolvedValue(latest),
-    });
-
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-1"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        prStatusHandle={handle}
-      />,
-    );
-
-    fireEvent.click(screen.getByTestId('clean-up-button'));
-
-    await waitFor(() => expect(handle.refreshForSafety).toHaveBeenCalledTimes(1));
-    expect(api.markMerged).not.toHaveBeenCalled();
-    expect(screen.getAllByLabelText(/Mark as merged\. Deletes the worktree/)).toHaveLength(2);
-    expect(screen.getAllByText('ⓘ')).toHaveLength(2);
-    expect(screen.getByText('Select an active PR before cleaning up or abandoning this task.')).toBeInTheDocument();
-    const alert = screen.getByRole('alert');
-    expect(alert.closest('.desktop-work-actions-rail')).toBeNull();
-    expect(alert.closest('.desktop-work-actions-compact')).toBeInTheDocument();
   });
 
   it('shows mixed associated PR cleanup summary while keeping cleanup task-scoped', () => {
@@ -1468,6 +1661,20 @@ describe('WorkControlBar — desktop multi-PR rail', () => {
 });
 
 describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
+  it('shows one Close conversation terminal verb when legacy dispositions expose both inputs', () => {
+    enableMobile();
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-one-close"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } })}
+      />,
+    );
+    expect(screen.getAllByRole('button', { name: /^Close conversation\./ })).toHaveLength(1);
+  });
+
   const enableMobile = () => {
     Object.defineProperty(window, 'matchMedia', {
       writable: true,
@@ -1519,7 +1726,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.getByRole('button', { name: 'PR #12 diff' })).toHaveTextContent('PR diff');
     expect(screen.getByRole('button', { name: 'Workspace diff' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Clean up' })).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /^Abandon\./ })).toHaveClass('mobile-pr-action--danger');
+    expect(screen.getByRole('button', { name: /^Close conversation\./ })).toHaveClass('mobile-pr-action--danger');
   });
 
   it('falls back to disposition lifecycle actions when no actionable PR exists', () => {
@@ -1530,7 +1737,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     );
 
     expect(screen.getByTestId('mobile-work-fallback')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /^Clean up\./ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^Close conversation\./ })).toBeInTheDocument();
     expect(screen.queryByLabelText('Open pull requests')).not.toBeInTheDocument();
   });
 
@@ -1549,12 +1756,12 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(dock).toHaveTextContent('Uncommitted changes');
     expect(screen.getByRole('button', { name: 'Review workspace changes' })).toHaveTextContent('Review changes');
     expect(screen.queryByText(/Review, commit, and push/)).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /^Abandon\./ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^Close conversation\./ })).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: 'Work status details' }));
     const details = screen.getByRole('status');
     expect(details).toHaveTextContent('Review, commit, and push before opening a PR.');
-    expect(details).toHaveTextContent('Captures a diff snapshot');
+    expect(details).toHaveTextContent('Closes this conversation');
     const infoTrigger = screen.getByRole('button', { name: 'Work status details' });
     fireEvent.click(infoTrigger);
     expect(screen.queryByRole('status')).not.toBeInTheDocument();
@@ -1563,7 +1770,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Work status details' }));
     expect(screen.queryByRole('status')).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
-    expect(screen.getByRole('button', { name: /^Abandon\./ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^Close conversation\./ })).toBeInTheDocument();
   });
 
   it('closes the fallback overflow with Escape and returns focus to its trigger', () => {
@@ -1584,94 +1791,6 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     fireEvent.keyDown(document, { key: 'Escape' });
     expect(screen.queryByLabelText('More work actions', { selector: 'div' })).not.toBeInTheDocument();
     expect(trigger).toHaveFocus();
-  });
-
-  it('keeps overflow open and focus in place when Abandon confirmation is declined', async () => {
-    enableMobile();
-    const prevConfirm = window.confirm;
-    const confirmSpy = vi.fn(() => false);
-    window.confirm = confirmSpy;
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-mobile-cancel"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        prStatusHandle={prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } })}
-      />,
-    );
-
-    fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
-    const abandon = screen.getByRole('button', { name: /^Abandon\./ });
-    abandon.focus();
-    fireEvent.click(abandon);
-
-    await waitFor(() => expect(confirmSpy).toHaveBeenCalledTimes(1));
-    expect(screen.getByLabelText('More work actions', { selector: 'div' })).toBeInTheDocument();
-    expect(abandon).toHaveFocus();
-    expect(api.abandonTask).not.toHaveBeenCalled();
-    window.confirm = prevConfirm;
-  });
-
-  it('keeps overflow open and focus in place when Abandon fails', async () => {
-    enableMobile();
-    const prevConfirm = window.confirm;
-    window.confirm = vi.fn(() => true);
-    vi.mocked(api.abandonTask).mockRejectedValueOnce(new Error('abandon failed'));
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-mobile-abandon-failure"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        prStatusHandle={prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } })}
-      />,
-    );
-
-    fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
-    const abandon = screen.getByRole('button', { name: /^Abandon\./ });
-    abandon.focus();
-    fireEvent.click(abandon);
-
-    expect(await screen.findByRole('alert')).toHaveTextContent('abandon failed');
-    expect(screen.getByLabelText('More work actions', { selector: 'div' })).toBeInTheDocument();
-    expect(abandon).toHaveFocus();
-    window.confirm = prevConfirm;
-  });
-
-  it('keeps overflow open when Abandon safety refresh requires PR selection', async () => {
-    enableMobile();
-    const prevConfirm = window.confirm;
-    window.confirm = vi.fn(() => true);
-    const handle = prStatusHandle(
-      { found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } },
-      {
-        refreshForSafety: vi.fn().mockResolvedValue({
-          found: false,
-          associated_prs: twoOpenPrSelection(false).associated_prs,
-        }),
-      },
-    );
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-mobile-abandon-safety"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        prStatusHandle={handle}
-      />,
-    );
-
-    fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
-    const abandon = screen.getByRole('button', { name: /^Abandon\./ });
-    abandon.focus();
-    fireEvent.click(abandon);
-
-    expect(await screen.findByRole('alert')).toHaveTextContent('Select an active PR');
-    expect(screen.getByLabelText('More work actions', { selector: 'div' })).toBeInTheDocument();
-    expect(abandon).toHaveFocus();
-    expect(api.abandonTask).not.toHaveBeenCalled();
-    window.confirm = prevConfirm;
   });
 
   it('returns Escape focus to the info trigger that opened the details panel', () => {
@@ -1718,28 +1837,6 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.queryByLabelText('More work actions', { selector: 'div' })).not.toBeInTheDocument();
   });
 
-  it('restores owned overflow focus after the conversation identity changes', async () => {
-    enableMobile();
-    const handle = prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } });
-    const renderBar = (conversationId: string) => (
-      <MemoryRouter>
-        <ViewerSlotProvider browserSessionActive={false}>
-          <WorkControlBar conversationId={conversationId} convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />
-        </ViewerSlotProvider>
-      </MemoryRouter>
-    );
-    const { rerender } = render(renderBar('conv-focus-a'));
-
-    fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
-    const abandon = screen.getByRole('button', { name: /^Abandon\./ });
-    abandon.focus();
-    fireEvent.focusIn(abandon);
-    rerender(renderBar('conv-focus-b'));
-
-    expect(screen.queryByLabelText('More work actions', { selector: 'div' })).not.toBeInTheDocument();
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Work status details' })).toHaveFocus());
-  });
-
   it('resets open details while the Work Actions bar is hidden during an LLM turn', () => {
     enableMobile();
     const handle = prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } });
@@ -1760,7 +1857,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     rerender(renderBar('idle'));
     expect(screen.getByTestId('mobile-work-fallback')).toBeInTheDocument();
     expect(screen.queryByRole('status')).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /^Clean up\./ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^Close conversation\./ })).toBeInTheDocument();
   });
 
   it('does not reopen overflow after the PR rail temporarily replaces the fallback', () => {
@@ -1942,34 +2039,6 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.queryByLabelText('More work actions', { selector: 'div' })).not.toBeInTheDocument();
     expect(screen.getByTestId('mobile-work-fallback')).toHaveClass('mobile-work-fallback--status-only');
     expect(screen.queryByRole('button', { name: 'More work actions' })).not.toBeInTheDocument();
-  });
-
-  it('closes overflow when its secondary terminal action changes identity', async () => {
-    enableMobile();
-    const renderBar = (phaseType: 'idle' | 'stuck') => (
-      <MemoryRouter>
-        <ViewerSlotProvider browserSessionActive={false}>
-          <WorkControlBar
-            conversationId="conv-changing-secondary"
-            convModeLabel="Work"
-            phaseType={phaseType}
-            continuedInConvId={null}
-            prStatusHandle={prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } })}
-          />
-        </ViewerSlotProvider>
-      </MemoryRouter>
-    );
-    const { rerender } = render(renderBar('idle'));
-
-    const trigger = screen.getByRole('button', { name: 'More work actions' });
-    fireEvent.click(trigger);
-    const abandon = screen.getByRole('button', { name: /^Abandon\./ });
-    abandon.focus();
-    fireEvent.focusIn(abandon);
-    rerender(renderBar('stuck'));
-
-    expect(screen.queryByLabelText('More work actions', { selector: 'div' })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /^Clean up\./ })).not.toBeInTheDocument();
   });
 
   it('replaces Address feedback with PR selection recovery when its target is unresolved', () => {
@@ -2292,8 +2361,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
       />,
     );
 
-    expect(screen.queryByRole('button', { name: /^Clean up\./ })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /^Abandon\./ })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^Close conversation\./ })).toBeInTheDocument();
     expect(screen.getByTestId('mobile-work-fallback')).toHaveTextContent('Active PR unavailable');
     fireEvent.click(screen.getByRole('button', { name: 'Select active PR' }));
     expect(requestActivePrSelectorOpen).toHaveBeenCalledTimes(1);
@@ -2329,6 +2397,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     );
 
     expect(screen.queryByRole('button', { name: 'Select active PR' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^Close conversation\./ })).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Resume PR inference' }));
     await waitFor(() => expect(resumeInference).toHaveBeenCalledTimes(1));
     expect(api.markMerged).not.toHaveBeenCalled();
@@ -2393,7 +2462,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Resume PR inference' }));
     await waitFor(() => expect(resumeInference).toHaveBeenCalledTimes(1));
-    expect(screen.queryByTestId('clean-up-button')).not.toBeInTheDocument();
+    expect(screen.getByTestId('clean-up-button')).toBeInTheDocument();
     expect(screen.queryByRole('link', { name: /Open PR #12/ })).not.toBeInTheDocument();
     expect(screen.getByTestId('view-diff-button')).not.toHaveClass('work-actions-btn--primary');
     expect(screen.getByRole('button', { name: 'Resume PR inference' })).toHaveClass('work-actions-btn--primary');
@@ -2485,51 +2554,6 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.getByTestId('mobile-work-fallback')).not.toHaveTextContent('PR feedback ready');
   });
 
-  it('keeps overflow cleanup and focus available when cleanup fails', async () => {
-    enableMobile();
-    vi.mocked(api.markMerged).mockRejectedValueOnce(new Error('cleanup failed'));
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-cleanup-failure"
-        convModeLabel="Work"
-        phaseType="error"
-        continuedInConvId={null}
-        prStatusHandle={prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } })}
-      />,
-    );
-
-    fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
-    const cleanup = screen.getByRole('button', { name: /^Clean up\./ });
-    cleanup.focus();
-    fireEvent.click(cleanup);
-
-    expect(await screen.findByRole('alert')).toHaveTextContent('cleanup failed');
-    expect(screen.getByLabelText('More work actions', { selector: 'div' })).toBeInTheDocument();
-    expect(cleanup).toHaveFocus();
-  });
-
-  it('keeps a terminal-action error visible while details are open', async () => {
-    enableMobile();
-    vi.mocked(api.markMerged).mockRejectedValueOnce(new Error('cleanup remains visible'));
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-error-details"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        prStatusHandle={prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } })}
-      />,
-    );
-
-    fireEvent.click(screen.getByRole('button', { name: /^Clean up\./ }));
-    expect(await screen.findByRole('alert')).toHaveTextContent('cleanup remains visible');
-    fireEvent.click(screen.getByRole('button', { name: 'Work status details' }));
-
-    expect(screen.getByRole('status')).toBeInTheDocument();
-    expect(screen.getByRole('alert')).toHaveTextContent('cleanup remains visible');
-    expect(screen.getByRole('status').nextElementSibling).toBe(screen.getByRole('alert'));
-  });
-
   it('keeps the primary and overflow actions available while details are open', () => {
     enableMobile();
     renderWithProviders(
@@ -2542,11 +2566,11 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
       />,
     );
 
-    expect(screen.getByRole('button', { name: /^Clean up\./ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^Close conversation\./ })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'More work actions' })).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Work status details' }));
     expect(screen.getByRole('status')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /^Clean up\./ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^Close conversation\./ })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'More work actions' })).toBeInTheDocument();
   });
 
@@ -2567,7 +2591,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Work status details' }));
     const details = screen.getByRole('status');
     expect(details).toHaveTextContent('Open PR #12 on GitHub to review its current state.');
-    expect(details).toHaveTextContent('Captures a diff snapshot');
+    expect(details).toHaveTextContent('Closes this conversation');
     expect(details).not.toHaveTextContent('Mark as merged');
   });
 
@@ -2588,7 +2612,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /#12 open/ }));
     expect(screen.queryByRole('button', { name: 'Clean up' })).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /^Abandon\./ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^Close conversation\./ })).toBeInTheDocument();
   });
 
   it('renders feedback coverage warnings on the mobile Address feedback hero', () => {
@@ -2628,7 +2652,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: /#12 open/ }));
-    expect(screen.getByRole('button', { name: /^Abandon\./ })).toHaveAttribute('title', expect.stringContaining('Captures a diff snapshot'));
+    expect(screen.getByRole('button', { name: /^Close conversation\./ })).toHaveAttribute('title', expect.stringContaining('Closes this conversation'));
   });
 
   it('uses lifecycle fallback when the active PR is terminal but another PR is open', () => {
@@ -2645,7 +2669,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     );
 
     expect(screen.getByTestId('mobile-work-fallback')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /^Clean up\./ })).toHaveAttribute('title', expect.stringContaining('No confirmation'));
+    expect(screen.getByRole('button', { name: /^Close conversation\./ })).toHaveAttribute('title', expect.stringContaining('Exact tracked, untracked'));
     expect(screen.queryByLabelText('Open pull requests')).not.toBeInTheDocument();
   });
 
@@ -2671,40 +2695,6 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
 
     expect(screen.getByTestId('mobile-work-fallback')).toBeInTheDocument();
     expect(screen.getByTestId('mobile-primary-address-feedback')).toHaveTextContent('Address feedback');
-  });
-
-  it('keeps stuck-phase Abandon as the mobile hero action', () => {
-    enableMobile();
-    const handle = prStatusHandle({
-      found: true,
-      number: 12,
-      url: 'https://github.com/o/r/pull/12',
-      display_state: 'open',
-      selection: twoOpenPrSelection(),
-    });
-    renderWithProviders(
-      <WorkControlBar conversationId="conv-mobile-stuck" convModeLabel="Work" phaseType="error" continuedInConvId={null} prStatusHandle={handle} />,
-    );
-
-    fireEvent.click(screen.getByRole('button', { name: /#12 open/ }));
-    expect(screen.getByRole('button', { name: 'Abandon' })).toHaveClass('mobile-pr-action--hero');
-    expect(screen.getByRole('button', { name: /^Clean up\./ })).not.toHaveClass('mobile-pr-action--hero');
-  });
-
-  it('keeps terminal cleanup primary in the mobile fallback', () => {
-    enableMobile();
-    const terminalSelection = selection({
-      associated_prs: [{ ...selection().associated_prs[0]!, state: 'MERGED', display_state: 'merged' }],
-    });
-    const handle = prStatusHandle({ found: true, number: 12, display_state: 'merged', selection: terminalSelection });
-    renderWithProviders(
-      <WorkControlBar conversationId="conv-mobile-merged" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
-    );
-
-    expect(screen.getByRole('button', { name: /^Clean up\./ })).toHaveClass('mobile-pr-action--hero');
-    expect(screen.getByTestId('mobile-work-fallback')).toHaveTextContent('PR merged');
-    expect(screen.getByRole('button', { name: 'More work actions' })).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /^Abandon\./ })).not.toBeInTheDocument();
   });
 
   it('lets a pinned mobile selection resume automatic inference', async () => {

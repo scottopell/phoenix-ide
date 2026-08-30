@@ -50,6 +50,10 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [036](036_local-sqlite-authority-loss-fails-stop.md) | Local SQLite authority loss fails stop | Accepted | REQ-DWF-043, REQ-DWF-CHAT-013, REQ-BED-033 |
 | [037](037_legacy-direct-turn-terminal-ambiguity-is-retired.md) | Legacy direct-turn terminal ambiguity is retired as failure | Accepted | REQ-DWF-CHAT-013, REQ-DWF-CHAT-014, REQ-COMP-004 |
 | [038](038_commission-review-is-retired-with-forward-history-recovery.md) | Commission review is retired with forward history recovery | Accepted | REQ-CR-001–018, REQ-COMP-001–005, REQ-VS-006/016 |
+| [039](039_durable-runtime-resource-identity-fails-closed.md) | Durable runtime resource identity fails closed outside proven containment | Accepted | REQ-WL-002b, REQ-WL-002d, REQ-COMP-001 |
+| [040](040_close-uses-scope-gates-and-tmux-only-durable-identity.md) | Close uses WorkScope gates and tmux-only durable identity | Accepted | REQ-WL-002b, REQ-WL-002d, REQ-PROJ-WS-001 |
+| [041](041_minimal-history-finalization.md) | Minimal History finalization | Accepted | REQ-WL-002b, REQ-CONV-001 |
+| [042](042_close-directory-retirement-trusts-private-namespace.md) | Close directory retirement trusts its private namespace | Accepted | REQ-WL-002b |
 
 ## For agents: which decisions bind your task
 

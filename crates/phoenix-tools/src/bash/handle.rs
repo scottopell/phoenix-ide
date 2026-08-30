@@ -24,6 +24,7 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use phoenix_core::process_identity::{current_process_identity, ProcessIdentity};
 use phoenix_core::work_scope::{ResourceAuthority, ResourceScopeKey};
 use tokio::sync::watch;
 use tokio::sync::{Mutex, RwLock};
@@ -32,6 +33,26 @@ use super::ring::{RingBuffer, RingLine};
 
 /// Default tombstone tail size (REQ-BASH-006: `TOMBSTONE_TAIL_LINES`).
 pub const TOMBSTONE_TAIL_LINES: usize = 2000;
+
+/// Child-environment marker that binds a spawned bash process to its durable
+/// Phoenix launch identity.
+pub const BASH_LAUNCH_UUID_ENV_VAR: &str = "PHOENIX_BASH_LAUNCH_UUID";
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BashLaunchIdentity {
+    pub process: ProcessIdentity,
+    pub launch_uuid: String,
+}
+
+impl BashLaunchIdentity {
+    #[must_use]
+    pub fn stable_identity(&self) -> String {
+        format!(
+            "pid:{}:start:{}:launch:{}",
+            self.process.pid, self.process.start_time, self.launch_uuid
+        )
+    }
+}
 
 /// Globally unique opaque Bash handle identifier.
 ///
@@ -179,6 +200,7 @@ pub enum ExitState {
 pub struct Handle {
     pub controller_scope: ResourceScopeKey,
     pub handle_id: HandleId,
+    pub launch_identity: BashLaunchIdentity,
     pub creator_conversation_id: String,
     pub authority: ResourceAuthority,
     pub cmd: String,
@@ -208,10 +230,29 @@ impl std::fmt::Debug for Handle {
         f.debug_struct("Handle")
             .field("controller_scope", &self.controller_scope)
             .field("handle_id", &self.handle_id)
+            .field("launch_identity", &self.launch_identity)
             .field("cmd", &self.cmd)
             .field("label", &self.label)
             .field("started_at", &self.started_at)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn successful_group_signal_outcome(
+    pgid: i32,
+    resume_result: libc::c_long,
+    resume_error: Option<std::io::Error>,
+) -> Result<Option<i32>, std::io::Error> {
+    match resume_error {
+        None if resume_result == 0 => Ok(Some(pgid)),
+        Some(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(Some(pgid)),
+        Some(error) => Err(std::io::Error::other(format!(
+            "group signal succeeded but incarnation-bound resume failed: {error}"
+        ))),
+        None => Err(std::io::Error::other(
+            "group signal succeeded but incarnation-bound resume failed without an OS error",
+        )),
     }
 }
 
@@ -286,6 +327,34 @@ impl Handle {
         pid: u32,
         ring_bytes_cap: usize,
     ) -> Arc<Self> {
+        Self::new_live_for_actor_with_owner_and_launch_identity(
+            controller_scope,
+            handle_id,
+            Self::synthetic_launch_identity(pid),
+            creator_conversation_id,
+            authority,
+            cmd,
+            label,
+            pgid,
+            pid,
+            ring_bytes_cap,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::similar_names)]
+    #[must_use]
+    pub fn new_live_for_actor_with_owner_and_launch_identity(
+        controller_scope: ResourceScopeKey,
+        handle_id: HandleId,
+        launch_identity: BashLaunchIdentity,
+        creator_conversation_id: String,
+        authority: ResourceAuthority,
+        cmd: String,
+        label: Option<String>,
+        pgid: i32,
+        pid: u32,
+        ring_bytes_cap: usize,
+    ) -> Arc<Self> {
         let live = LiveData {
             pgid,
             pid,
@@ -295,6 +364,7 @@ impl Handle {
         Arc::new(Self {
             controller_scope,
             handle_id,
+            launch_identity,
             creator_conversation_id,
             authority,
             cmd,
@@ -305,6 +375,14 @@ impl Handle {
             exit_signal: tx,
             exit_observer: rx,
         })
+    }
+
+    fn synthetic_launch_identity(pid: u32) -> BashLaunchIdentity {
+        BashLaunchIdentity {
+            process: current_process_identity(pid)
+                .unwrap_or(ProcessIdentity { pid, start_time: 0 }),
+            launch_uuid: format!("synthetic-{}", uuid::Uuid::new_v4()),
+        }
     }
 
     /// Snapshot the current state. Cloning the `Arc` is cheap; callers
@@ -320,6 +398,15 @@ impl Handle {
     /// [`Self::transition_to_terminal`]).
     pub async fn kill_attempt(&self) -> Option<KillAttempt> {
         *self.kill_attempt.read().await
+    }
+
+    #[must_use]
+    pub fn stable_resource_identity(&self) -> String {
+        format!(
+            "handle:{}:launch:{}",
+            self.handle_id,
+            self.launch_identity.stable_identity()
+        )
     }
 
     /// Receiver for the exit watch. Each `wait`/`run` call clones a fresh
@@ -457,6 +544,157 @@ impl Handle {
         }
     }
 
+    /// Signal the exact live leader incarnation through a kernel-owned PID handle.
+    ///
+    /// A raw PID or PGID can be reused after the waiter reaps the leader. Linux
+    /// `pidfd` first stops the captured incarnation and observes that exact stopped
+    /// state without reaping it before the numeric group signal is delivered. Unsupported Unix
+    /// platforms fail closed rather than signaling a potentially reused number.
+    ///
+    /// # Errors
+    ///
+    /// Returns an OS error when opening or signaling the exact process incarnation,
+    /// signaling its process group, or closing the kernel-owned PID handle fails.
+    #[cfg_attr(target_os = "linux", allow(clippy::too_many_lines))]
+    #[cfg(target_os = "linux")]
+    pub async fn signal_live_incarnation(
+        &self,
+        signal: i32,
+    ) -> Result<Option<i32>, std::io::Error> {
+        let state = self.state.read().await;
+        let HandleState::Live(live) = state.as_ref() else {
+            return Ok(None);
+        };
+        let pid =
+            i32::try_from(live.pid).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if pidfd < 0 {
+            let error = std::io::Error::last_os_error();
+            return if error.raw_os_error() == Some(libc::ESRCH) {
+                Ok(None)
+            } else {
+                Err(error)
+            };
+        }
+        if current_process_identity(live.pid) != Some(self.launch_identity.process) {
+            let pidfd = i32::try_from(pidfd)
+                .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+            if unsafe { libc::close(pidfd) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            return Ok(None);
+        }
+        let stopped = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                pidfd,
+                libc::SIGSTOP,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        let result = if stopped != 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            let pidfd_id = libc::id_t::try_from(pidfd)
+                .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+            loop {
+                let mut stop_state = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+                let observed = unsafe {
+                    libc::waitid(
+                        libc::P_PIDFD,
+                        pidfd_id,
+                        stop_state.as_mut_ptr(),
+                        libc::WSTOPPED | libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+                    )
+                };
+                if observed != 0 {
+                    let error = std::io::Error::last_os_error();
+                    break if error.raw_os_error() == Some(libc::ECHILD) {
+                        Ok(None)
+                    } else {
+                        Err(error)
+                    };
+                }
+                let stop_state = unsafe { stop_state.assume_init() };
+                if unsafe { stop_state.si_pid() } != 0 {
+                    break if stop_state.si_code == libc::CLD_STOPPED
+                        && unsafe { stop_state.si_status() } == libc::SIGSTOP
+                    {
+                        let rc = unsafe { libc::kill(-live.pgid, signal) };
+                        let signal_error = (rc != 0).then(std::io::Error::last_os_error);
+                        let resumed = unsafe {
+                            libc::syscall(
+                                libc::SYS_pidfd_send_signal,
+                                pidfd,
+                                libc::SIGCONT,
+                                std::ptr::null::<libc::siginfo_t>(),
+                                0,
+                            )
+                        };
+                        if let Some(error) = signal_error {
+                            Err(error)
+                        } else {
+                            successful_group_signal_outcome(
+                                live.pgid,
+                                resumed,
+                                (resumed != 0).then(std::io::Error::last_os_error),
+                            )
+                        }
+                    } else {
+                        Ok(None)
+                    };
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    let resumed = unsafe {
+                        libc::syscall(
+                            libc::SYS_pidfd_send_signal,
+                            pidfd,
+                            libc::SIGCONT,
+                            std::ptr::null::<libc::siginfo_t>(),
+                            0,
+                        )
+                    };
+                    break if resumed == 0 {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "process incarnation did not reach stopped state before deadline",
+                        ))
+                    } else {
+                        Err(std::io::Error::other(format!(
+                            "stop observation timed out and incarnation-bound resume failed: {}",
+                            std::io::Error::last_os_error()
+                        )))
+                    };
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        };
+        let pidfd =
+            i32::try_from(pidfd).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+        if unsafe { libc::close(pidfd) } != 0 && result.is_ok() {
+            return Err(std::io::Error::last_os_error());
+        }
+        result
+    }
+
+    /// # Errors
+    ///
+    /// Always returns [`std::io::ErrorKind::Unsupported`] because this platform
+    /// has no incarnation-bound signaling primitive.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    pub async fn signal_live_incarnation(
+        &self,
+        _signal: i32,
+    ) -> Result<Option<i32>, std::io::Error> {
+        std::future::ready(Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "incarnation-bound process signaling is unavailable",
+        )))
+        .await
+    }
+
     /// Return the live `LiveData`'s native pid if the handle is currently
     /// live. Used by the hard-delete cascade's structured report — the
     /// pid is informational (the kill targets the pgid) but operators
@@ -543,6 +781,18 @@ mod tests {
             12345,
             super::super::ring::RING_BUFFER_BYTES,
         )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn successful_group_signal_ignores_resume_esrch() {
+        let outcome = successful_group_signal_outcome(
+            42,
+            -1,
+            Some(std::io::Error::from_raw_os_error(libc::ESRCH)),
+        )
+        .unwrap();
+        assert_eq!(outcome, Some(42));
     }
 
     #[tokio::test]

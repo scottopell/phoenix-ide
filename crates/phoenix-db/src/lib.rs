@@ -17,6 +17,9 @@ pub mod workflow;
 // …) moved to the phoenix-core domain crate to break the db↔state_machine
 // cycle. Alias the module back as `schema` so the persistence logic in this
 // file and `phoenix_db::*` call sites resolve unchanged.
+use phoenix_core::domain::close::CloseAttemptId;
+#[cfg(test)]
+use phoenix_core::domain::close::TranscriptConversationId;
 use phoenix_core::domain::creation_protocol::{
     CreationClaim, CreationClaimToken, CreationError, CreationKind, CreationProtocolState,
     CreationStage, CreationStatus, CreationWorkerId,
@@ -1342,9 +1345,6 @@ async fn insert_creation_job_images_tx(
     Ok(())
 }
 
-const GIT_POINTER_FORMAT_OVERHEAD: u64 = b"gitdir: \r\n".len() as u64;
-const MAX_GIT_POINTER_BYTES: u64 = libc::PATH_MAX as u64 + GIT_POINTER_FORMAT_OVERHEAD;
-
 enum ExpectedParentScope<'a> {
     NotChecked,
     Snapshot(Option<&'a WorkScopeId>),
@@ -1515,59 +1515,7 @@ impl Database {
     }
 
     fn observe_worktree_fingerprint(worktree_path: &str) -> Option<String> {
-        use std::fmt::Write as _;
-        use std::io::Read as _;
-        use std::os::unix::fs::MetadataExt as _;
-
-        let marker = std::path::Path::new(worktree_path).join(".git");
-        let metadata = std::fs::symlink_metadata(&marker).ok()?;
-        let marker_is_file = metadata.is_file();
-        let marker_bytes = if marker_is_file {
-            if metadata.len() > MAX_GIT_POINTER_BYTES {
-                return None;
-            }
-            let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).ok()?);
-            std::fs::File::open(&marker)
-                .ok()?
-                .take(MAX_GIT_POINTER_BYTES + 1)
-                .read_to_end(&mut bytes)
-                .ok()?;
-            if u64::try_from(bytes.len()).ok()? > MAX_GIT_POINTER_BYTES {
-                return None;
-            }
-            let pointer = std::str::from_utf8(&bytes).ok()?;
-            let git_dir = pointer
-                .strip_suffix("\r\n")
-                .or_else(|| pointer.strip_suffix('\n'))
-                .unwrap_or(pointer)
-                .strip_prefix("gitdir: ")?;
-            if git_dir.is_empty() || git_dir.contains('\n') || git_dir.contains('\r') {
-                return None;
-            }
-            git_dir.as_bytes().to_vec()
-        } else if metadata.is_dir() {
-            Vec::new()
-        } else {
-            return None;
-        };
-        let mut encoded = String::with_capacity(marker_bytes.len() * 2);
-        for byte in marker_bytes {
-            write!(&mut encoded, "{byte:02x}").ok()?;
-        }
-        let created_nanos = metadata
-            .created()
-            .ok()
-            .and_then(|created| created.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|duration| duration.as_nanos().to_string());
-        if created_nanos.is_none() && !marker_is_file {
-            return None;
-        }
-        let created_nanos = created_nanos.unwrap_or_else(|| "unavailable".to_string());
-        Some(format!(
-            "git_admin_incarnation_v1:{}:{}:{created_nanos}:{encoded}",
-            metadata.dev(),
-            metadata.ino()
-        ))
+        phoenix_core::git::observe_worktree_fingerprint(std::path::Path::new(worktree_path))
     }
 
     async fn insert_work_scope_tx(
@@ -1816,13 +1764,22 @@ impl Database {
     async fn conversation_retirement_blocker(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         scope_id: &WorkScopeId,
+        close_attempt_id: Option<&CloseAttemptId>,
     ) -> DbResult<Option<WorkScopeRetirementBlocker>> {
         let owners = sqlx::query(
-            "SELECT runtime_role, state, continued_in_conv_id
-             FROM conversations
-             WHERE work_scope_id = ?1 AND archived = 0",
+            "SELECT owner.runtime_role, owner.state, owner.continued_in_conv_id
+             FROM conversations owner
+             WHERE owner.work_scope_id = ?1
+               AND owner.archived = 0
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM close_attempt_members captured
+                   WHERE captured.attempt_id = ?2
+                     AND captured.conversation_id = owner.id
+               )",
         )
         .bind(scope_id.as_str())
+        .bind(close_attempt_id.map(CloseAttemptId::as_str))
         .fetch_all(&mut **tx)
         .await?;
         for owner in owners {
@@ -1861,6 +1818,59 @@ impl Database {
         precondition: WorkScopeRetirementPrecondition,
         reason: &str,
     ) -> DbResult<WorkScopeRetirementOutcome> {
+        self.retire_work_scope_with_close_attempt(precondition, reason, None)
+            .await
+    }
+
+    /// Report whether persisted `ProductConversation` ownership repair blocks
+    /// destructive Close work for this exact captured scope.
+    /// # Errors
+    /// Returns a [`DbError`] when the repair tables cannot be read.
+    pub async fn work_scope_has_unresolved_product_ownership(
+        &self,
+        scope_id: &WorkScopeId,
+    ) -> DbResult<bool> {
+        sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM product_conversation_work_scope_repairs
+                 WHERE work_scope_id = ?1 AND state = 'needs_repair'
+                 UNION ALL
+                 SELECT 1 FROM product_conversation_work_scope_missing_owners
+                 WHERE work_scope_id = ?1 AND state = 'needs_repair'
+             )",
+        )
+        .bind(scope_id.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Retire a scope under an exact active Close attempt's captured authority.
+    ///
+    /// The attempt must have sealed its topology and captured the target scope.
+    /// Only conversations captured by that exact attempt are exempt from ownership
+    /// blockers. Every uncaptured active participant remains a blocker, including one
+    /// owned by the same product-conversation aggregate.
+    /// # Errors
+    /// Returns a [`DbError`] when the supplied Close attempt is not active and
+    /// topology-sealed for the target scope, or the ordinary retirement operation fails.
+    pub async fn retire_work_scope_for_close_attempt(
+        &self,
+        attempt_id: &CloseAttemptId,
+        precondition: WorkScopeRetirementPrecondition,
+        reason: &str,
+    ) -> DbResult<WorkScopeRetirementOutcome> {
+        self.retire_work_scope_with_close_attempt(precondition, reason, Some(attempt_id))
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn retire_work_scope_with_close_attempt(
+        &self,
+        precondition: WorkScopeRetirementPrecondition,
+        reason: &str,
+        close_attempt_id: Option<&CloseAttemptId>,
+    ) -> DbResult<WorkScopeRetirementOutcome> {
         if reason.trim().is_empty() {
             return Err(DbError::Serialization(
                 "work scope retirement reason must not be empty".to_string(),
@@ -1868,6 +1878,63 @@ impl Database {
         }
         let scope_id = precondition.scope_id();
         let mut tx = self.pool.begin().await?;
+        if let Some(attempt_id) = close_attempt_id {
+            let authorized: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                     SELECT 1
+                     FROM close_obligations obligation
+                     JOIN close_attempt_scopes captured
+                       ON captured.attempt_id = obligation.attempt_id
+                     WHERE obligation.attempt_id = ?1
+                       AND obligation.phase <> 'completed'
+                       AND obligation.topology_sealed = 1
+                       AND captured.scope = ?2
+                 )",
+            )
+            .bind(attempt_id.as_str())
+            .bind(scope_id.as_str())
+            .fetch_one(&mut *tx)
+            .await?;
+            if !authorized {
+                return Err(DbError::CloseFoundationPrecondition(format!(
+                    "Close attempt {attempt_id} is not active with a sealed topology capturing work scope {scope_id}"
+                )));
+            }
+            let resources_retired: bool = sqlx::query_scalar(
+                "SELECT NOT EXISTS(
+                     SELECT 1
+                     FROM close_expected_retirement_resources expected
+                     JOIN close_obligations obligation
+                       ON obligation.attempt_id = expected.attempt_id
+                      AND obligation.inspection_generation = expected.inspection_generation
+                      AND obligation.inspection_fingerprint = expected.inspection_fingerprint
+                     WHERE expected.attempt_id = ?1
+                       AND expected.scope = ?2
+                       AND expected.resource_kind <> 'work_scope'
+                       AND NOT EXISTS (
+                           SELECT 1
+                           FROM close_retirement_resources receipt
+                           WHERE receipt.attempt_id = expected.attempt_id
+                             AND receipt.scope = expected.scope
+                             AND receipt.inspection_generation = expected.inspection_generation
+                             AND receipt.inspection_fingerprint = expected.inspection_fingerprint
+                             AND receipt.resource_kind = expected.resource_kind
+                             AND receipt.identity_kind = expected.identity_kind
+                             AND receipt.identity_value = expected.identity_value
+                             AND receipt.proof_kind IN ('retired', 'absence_adopted')
+                       )
+                 )",
+            )
+            .bind(attempt_id.as_str())
+            .bind(scope_id.as_str())
+            .fetch_one(&mut *tx)
+            .await?;
+            if !resources_retired {
+                return Err(DbError::CloseFoundationPrecondition(format!(
+                    "Close attempt {attempt_id} has unresolved exact retirement resources for work scope {scope_id}"
+                )));
+            }
+        }
         let lifecycle =
             sqlx::query_scalar::<_, String>("SELECT lifecycle FROM work_scopes WHERE id = ?1")
                 .bind(scope_id.as_str())
@@ -1879,7 +1946,28 @@ impl Database {
             return Ok(WorkScopeRetirementOutcome::AlreadyRetired);
         }
 
-        if let Some(blocker) = Self::conversation_retirement_blocker(&mut tx, scope_id).await? {
+        let unresolved_product_ownership: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM product_conversation_work_scope_repairs
+                 WHERE work_scope_id = ?1 AND state = 'needs_repair'
+                 UNION ALL
+                 SELECT 1 FROM product_conversation_work_scope_missing_owners
+                 WHERE work_scope_id = ?1 AND state = 'needs_repair'
+             )",
+        )
+        .bind(scope_id.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+        if unresolved_product_ownership {
+            tx.rollback().await?;
+            return Ok(WorkScopeRetirementOutcome::Blocked(
+                WorkScopeRetirementBlocker::UnresolvedProductConversationOwnership,
+            ));
+        }
+
+        if let Some(blocker) =
+            Self::conversation_retirement_blocker(&mut tx, scope_id, close_attempt_id).await?
+        {
             tx.rollback().await?;
             return Ok(WorkScopeRetirementOutcome::Blocked(blocker));
         }
@@ -1892,6 +1980,11 @@ impl Database {
                     JOIN conversations predecessor ON predecessor.continued_in_conv_id = successor.id
                     WHERE successor.work_scope_id = ?1 AND successor.runtime_role = 'user'
                       AND successor.archived = 0
+                      AND (?2 IS NULL OR NOT EXISTS (
+                          SELECT 1 FROM close_attempt_members member
+                          WHERE member.attempt_id = ?2
+                            AND member.conversation_id = successor.id
+                      ))
                  )",
             ),
             (
@@ -1915,6 +2008,7 @@ impl Database {
         for (blocker, query) in blockers {
             if sqlx::query_scalar::<_, i64>(query)
                 .bind(scope_id.as_str())
+                .bind(close_attempt_id.map(CloseAttemptId::as_str))
                 .fetch_one(&mut *tx)
                 .await?
                 != 0
@@ -8586,6 +8680,34 @@ impl Database {
         product_conversation_id: &str,
     ) -> DbResult<()> {
         sqlx::query(
+            "DELETE FROM close_worktree_cleanup_plans
+             WHERE attempt_id IN (
+                 SELECT attempt_id FROM close_obligations
+                 WHERE product_conversation_id = ?1
+             )
+               AND NOT EXISTS (
+                   SELECT 1 FROM conversations
+                   WHERE product_conversation_id = ?1
+               )",
+        )
+        .bind(product_conversation_id)
+        .execute(&mut *connection)
+        .await?;
+        sqlx::query(
+            "DELETE FROM close_retirement_resource_dispatches
+             WHERE attempt_id IN (
+                 SELECT attempt_id FROM close_obligations
+                 WHERE product_conversation_id = ?1
+             )
+               AND NOT EXISTS (
+                   SELECT 1 FROM conversations
+                   WHERE product_conversation_id = ?1
+               )",
+        )
+        .bind(product_conversation_id)
+        .execute(&mut *connection)
+        .await?;
+        sqlx::query(
             "DELETE FROM product_conversations
              WHERE id = ?1
                AND NOT EXISTS (
@@ -8603,6 +8725,14 @@ impl Database {
         connection: &mut sqlx::SqliteConnection,
         work_scope_id: &str,
     ) -> DbResult<()> {
+        sqlx::query(
+            "DELETE FROM product_conversation_work_scopes
+             WHERE work_scope_id = ?1
+               AND NOT EXISTS (SELECT 1 FROM conversations WHERE work_scope_id = ?1)",
+        )
+        .bind(work_scope_id)
+        .execute(&mut *connection)
+        .await?;
         sqlx::query(
             "DELETE FROM work_scopes
              WHERE id = ?1
@@ -12706,7 +12836,7 @@ mod tests {
         std::fs::write(&marker, "gitdir: /tmp/second\n").unwrap();
         let replacement = Database::observe_worktree_fingerprint(root.to_str().unwrap()).unwrap();
         assert_ne!(first, replacement);
-        let max_pointer_bytes = usize::try_from(MAX_GIT_POINTER_BYTES).unwrap();
+        let max_pointer_bytes = usize::try_from(libc::PATH_MAX).unwrap() + b"gitdir: \r\n".len();
         let mut maximum_pointer = b"gitdir: ".to_vec();
         maximum_pointer.resize(max_pointer_bytes - 1, b'x');
         maximum_pointer.push(b'\n');
@@ -13616,6 +13746,24 @@ mod tests {
         assert!(db.get_conversation("conv-cancel").await.unwrap().archived);
         let deletion = claim_test_cleanup(&db).await;
         assert_eq!(deletion.status, "deletion_pending");
+        sqlx::query(
+            "INSERT INTO product_conversation_work_scope_missing_owners (work_scope_id, state)
+             VALUES (?1, 'needs_repair')",
+        )
+        .bind(work_scope_id.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO product_conversation_work_scope_repairs (
+                 work_scope_id, first_product_conversation_id, second_product_conversation_id, state
+             ) VALUES (?1, ?2, 'former-product-conversation', 'needs_repair')",
+        )
+        .bind(work_scope_id.as_str())
+        .bind(product_conversation_id.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
         db.finish_conversation_creation_cleanup(&deletion, now)
             .await
             .unwrap();
@@ -13641,6 +13789,31 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(scope_after_delete, 0);
+        let evidence_after_delete: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM product_conversation_work_scope_missing_owners
+             WHERE work_scope_id = ?1 AND state = 'needs_repair'",
+        )
+        .bind(work_scope_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(evidence_after_delete, 1);
+        let repair_evidence_after_delete: (String, String, String, String) = sqlx::query_as(
+            "SELECT work_scope_id, first_product_conversation_id, second_product_conversation_id, state
+             FROM product_conversation_work_scope_repairs",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            repair_evidence_after_delete,
+            (
+                work_scope_id.to_string(),
+                product_conversation_id.to_string(),
+                "former-product-conversation".to_string(),
+                "needs_repair".to_string(),
+            )
+        );
     }
 
     #[tokio::test]
@@ -17331,7 +17504,11 @@ mod tests {
         let close_writer = close_db.clone();
         let close = tokio::spawn(async move {
             close_writer
-                .begin_close_foundation(&product_conversation_id, "close-vs-steering")
+                .begin_close_foundation(
+                    &product_conversation_id,
+                    &TranscriptConversationId::parse("close-steering").unwrap(),
+                    "close-vs-steering",
+                )
                 .await
         });
         transaction_entered.await;
@@ -19699,19 +19876,23 @@ mod tests {
             )
             .await
             .unwrap();
-        sqlx::query("UPDATE conversations SET work_scope_id = ?1 WHERE id = 'scope-parent'")
-            .bind(
-                replacement_parent
-                    .attached_work_scope_id
-                    .as_ref()
-                    .unwrap()
-                    .as_str(),
-            )
-            .execute(db.pool())
-            .await
-            .unwrap();
+        let conflict =
+            sqlx::query("UPDATE conversations SET work_scope_id = ?1 WHERE id = 'scope-parent'")
+                .bind(
+                    replacement_parent
+                        .attached_work_scope_id
+                        .as_ref()
+                        .unwrap()
+                        .as_str(),
+                )
+                .execute(db.pool())
+                .await
+                .unwrap_err();
+        assert!(conflict
+            .to_string()
+            .contains("different ordinary product conversation"));
 
-        let error = db
+        let child = db
             .create_subagent_conversation(
                 "rejected-child",
                 "rejected-child",
@@ -19726,14 +19907,14 @@ mod tests {
                 Some(&captured_scope),
             )
             .await
-            .unwrap_err();
-        assert!(matches!(error, DbError::CloseFoundationConflict(_)));
+            .unwrap();
+        assert_eq!(child.attached_work_scope_id.as_ref(), Some(&captured_scope));
         let child_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM conversations WHERE id = 'rejected-child'")
                 .fetch_one(db.pool())
                 .await
                 .unwrap();
-        assert_eq!(child_count, 0);
+        assert_eq!(child_count, 1);
     }
 
     #[tokio::test]
@@ -22697,27 +22878,11 @@ mod tests {
             .unwrap();
         db.delete_conversation("origin-10").await.unwrap();
         // Breadcrumb to the now-gone origin is a raw, dangle-tolerant id.
-        let standalone_product_conversation_id =
-            phoenix_core::domain::product_conversation::ProductConversationId::new();
-        sqlx::query(
-            "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
-             VALUES (?1, 'ordinary', 'open')",
-        )
-        .bind(standalone_product_conversation_id.as_str())
-        .execute(&db.pool)
-        .await
-        .unwrap();
-        let standalone = Conversation {
-            id: "dangle-conv".to_string(),
-            product_conversation_id: standalone_product_conversation_id,
-            slug: Some("dangle-conv".to_string()),
-            spawned_from_conversation_id: Some("origin-10".to_string()),
-            ..db.get_conversation("late-fork").await.unwrap()
-        };
-        let mut tx = db.pool.begin().await.unwrap();
-        insert_conversation_tx(&mut tx, &standalone).await.unwrap();
-        tx.commit().await.unwrap();
-        let got = db.get_conversation("dangle-conv").await.unwrap();
+        sqlx::query("UPDATE conversations SET spawned_from_conversation_id = 'origin-10' WHERE id = 'late-fork'")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let got = db.get_conversation("late-fork").await.unwrap();
         assert_eq!(
             got.spawned_from_conversation_id.as_deref(),
             Some("origin-10")
@@ -22914,6 +23079,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retirement_blocks_persisted_product_ownership_repair() {
+        let db = Database::open_in_memory().await.unwrap();
+        let scope = retirement_fixture(
+            &db,
+            "ownership-repair-owner",
+            RuntimeRole::User,
+            &ConvState::Terminal,
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO product_conversation_work_scope_missing_owners (work_scope_id, state)
+             VALUES (?1, 'needs_repair')",
+        )
+        .bind(scope.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.retire_work_scope(no_live_resource(scope), "repair blocks retirement")
+                .await
+                .unwrap(),
+            WorkScopeRetirementOutcome::Blocked(
+                WorkScopeRetirementBlocker::UnresolvedProductConversationOwnership
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn retirement_blocks_current_user_owner() {
         let db = Database::open_in_memory().await.unwrap();
         let scope = retirement_fixture(&db, "owner", RuntimeRole::User, &ConvState::Idle).await;
@@ -22923,6 +23117,171 @@ mod tests {
                 .unwrap(),
             WorkScopeRetirementOutcome::Blocked(WorkScopeRetirementBlocker::CurrentUserOwner)
         );
+    }
+
+    #[tokio::test]
+    async fn close_attempt_retires_its_captured_active_user_owner_scope() {
+        let db = Database::open_in_memory().await.unwrap();
+        let scope =
+            retirement_fixture(&db, "close-owner", RuntimeRole::User, &ConvState::Idle).await;
+        let owner = db.get_conversation("close-owner").await.unwrap();
+        let attempt = CloseAttemptId::parse("close-owner-attempt").unwrap();
+        db.begin_close_foundation(
+            &owner.product_conversation_id,
+            &TranscriptConversationId::parse(owner.id.clone()).unwrap(),
+            attempt.as_str(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.retire_work_scope_for_close_attempt(
+                &attempt,
+                no_live_resource(scope),
+                "Close retired captured scope",
+            )
+            .await
+            .unwrap(),
+            WorkScopeRetirementOutcome::Retired
+        );
+    }
+
+    #[tokio::test]
+    async fn close_attempt_blocks_same_aggregate_active_subagent_absent_from_capture() {
+        let db = Database::open_in_memory().await.unwrap();
+        let scope = retirement_fixture(
+            &db,
+            "captured-terminal-owner",
+            RuntimeRole::User,
+            &ConvState::Terminal,
+        )
+        .await;
+        let owner = db
+            .get_conversation("captured-terminal-owner")
+            .await
+            .unwrap();
+        let attempt = CloseAttemptId::parse("captured-owner-attempt").unwrap();
+        db.begin_close_foundation(
+            &owner.product_conversation_id,
+            &TranscriptConversationId::parse(owner.id.clone()).unwrap(),
+            attempt.as_str(),
+        )
+        .await
+        .unwrap();
+        db.create_conversation_with_project(
+            "uncaptured-active-child",
+            "uncaptured-active-child",
+            "/tmp/retirement",
+            false,
+            Some("captured-terminal-owner"),
+            None,
+            None,
+            &ConvMode::Direct,
+            None,
+            None,
+            None,
+            phoenix_core::llm_language::LlmLanguage::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.retire_work_scope_for_close_attempt(
+                &attempt,
+                no_live_resource(scope),
+                "Close rejects uncaptured subordinate participant scope",
+            )
+            .await
+            .unwrap(),
+            WorkScopeRetirementOutcome::Blocked(WorkScopeRetirementBlocker::ActiveSubAgent)
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_close_attempt_cannot_authorize_scope_retirement() {
+        let db = Database::open_in_memory().await.unwrap();
+        let scope =
+            retirement_fixture(&db, "completed-owner", RuntimeRole::User, &ConvState::Idle).await;
+        let owner = db.get_conversation("completed-owner").await.unwrap();
+        let attempt = CloseAttemptId::parse("completed-attempt").unwrap();
+        db.begin_close_foundation(
+            &owner.product_conversation_id,
+            &TranscriptConversationId::parse(owner.id.clone()).unwrap(),
+            attempt.as_str(),
+        )
+        .await
+        .unwrap();
+        for phase in [
+            "awaiting_stop_work_confirmation",
+            "settling_active_work",
+            "cancel_requested_during_settlement",
+        ] {
+            sqlx::query("UPDATE close_obligations SET phase = ?2 WHERE attempt_id = ?1")
+                .bind(attempt.as_str())
+                .bind(phase)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "UPDATE close_obligations
+             SET phase = 'completed', close_outcome = 'cancelled', completed_at = ?2
+             WHERE attempt_id = ?1",
+        )
+        .bind(attempt.as_str())
+        .bind(Utc::now().to_rfc3339())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let error = db
+            .retire_work_scope_for_close_attempt(
+                &attempt,
+                no_live_resource(scope),
+                "completed Close cannot retire scope",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DbError::CloseFoundationPrecondition(_)));
+    }
+
+    #[tokio::test]
+    async fn close_attempt_cannot_authorize_uncaptured_scope_retirement() {
+        let db = Database::open_in_memory().await.unwrap();
+        let captured_scope = retirement_fixture(
+            &db,
+            "captured-scope-owner",
+            RuntimeRole::User,
+            &ConvState::Terminal,
+        )
+        .await;
+        let uncaptured_scope = retirement_fixture(
+            &db,
+            "uncaptured-scope-owner",
+            RuntimeRole::User,
+            &ConvState::Idle,
+        )
+        .await;
+        let owner = db.get_conversation("captured-scope-owner").await.unwrap();
+        let attempt = CloseAttemptId::parse("single-scope-attempt").unwrap();
+        db.begin_close_foundation(
+            &owner.product_conversation_id,
+            &TranscriptConversationId::parse(owner.id.clone()).unwrap(),
+            attempt.as_str(),
+        )
+        .await
+        .unwrap();
+        assert_ne!(captured_scope, uncaptured_scope);
+
+        let error = db
+            .retire_work_scope_for_close_attempt(
+                &attempt,
+                no_live_resource(uncaptured_scope),
+                "Close cannot retire uncaptured scope",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DbError::CloseFoundationPrecondition(_)));
     }
 
     #[tokio::test]

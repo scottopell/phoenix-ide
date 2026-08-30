@@ -245,13 +245,10 @@ WHEN a conversation completes Close conversation or permanent Delete
 THE SYSTEM SHALL invoke `cascade_tmux_on_delete` with the same
 scope-equality preservation rule as hard-delete, as narrowed by the
 work-lifecycle distinct-open-aggregate rule (REQ-TMUX-WS-002)
-AND SHALL preserve the tmux server only when a distinct still-Open
-ProductConversation shares that same `WorkScope` or when identity
-conflict prevents Phoenix from proving whether such a distinct
-ProductConversation exists
-AND SHALL NOT let same-aggregate continuation rows or subordinate
-execution conversations within that one ProductConversation veto
-retirement
+AND SHALL retire the server when its owning ordinary ProductConversation completes Close
+AND SHALL treat a distinct ordinary ProductConversation attachment to that `WorkScope` as structurally invalid repair input rather than a preservation case
+AND SHALL NOT let same-aggregate continuation rows or subordinate execution conversations within that one ProductConversation veto retirement
+AND SHALL preserve an ambiguously identified persistent server rather than signaling it
 
 **Rationale:** "Comes back tomorrow, dev server still running" applies across
 UI noise such as closing a tab, blurring it, or restarting Phoenix. Close or

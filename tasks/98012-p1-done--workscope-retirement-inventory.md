@@ -1,0 +1,1 @@
+Implement the next Close child: server-owned WorkScope loss inspection, evidence-bound confirmation, aggregate resource inventory, fenced idempotent retirement receipts, and crash recovery. Excludes History finalization, FTS/permanent deletion, and UI activation.

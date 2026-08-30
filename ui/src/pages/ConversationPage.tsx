@@ -198,6 +198,7 @@ interface EmbeddedConversationHostProps {
   suppressMessageViewerOwner?: boolean;
   suppressTaskApprovalOwner?: boolean;
   onProjectionChange?: (projection: EmbeddedConversationProjection | null) => void;
+  onCloseCompleted?: () => void;
 }
 
 interface EmbeddedConversationPageProps extends ConversationPageProps, EmbeddedConversationHostProps {
@@ -221,6 +222,7 @@ export function EmbeddedConversationPage({
   ordinaryComposerEnabled = true,
   onProjectionChange,
   suppressMessageViewerOwner = false,
+  onCloseCompleted,
   suppressTaskApprovalOwner = false,
 }: EmbeddedConversationPageProps) {
   const navigate = useNavigate();
@@ -256,6 +258,7 @@ export function EmbeddedConversationPage({
         suppressMessageViewerOwner={suppressMessageViewerOwner}
         suppressTaskApprovalOwner={suppressTaskApprovalOwner}
         {...(onProjectionChange ? { onProjectionChange } : {})}
+        {...(onCloseCompleted ? { onCloseCompleted } : {})}
       />
     </ReviewNotesProvider>
   );
@@ -286,6 +289,7 @@ function ConversationPageContent({
   suppressCanonicalization,
   onProjectionChange,
   suppressMessageViewerOwner,
+  onCloseCompleted,
   suppressTaskApprovalOwner,
 }: {
   slug: string;
@@ -296,6 +300,7 @@ function ConversationPageContent({
   suppressCanonicalization: boolean;
   onProjectionChange?: (projection: EmbeddedConversationProjection | null) => void;
   suppressMessageViewerOwner: boolean;
+  onCloseCompleted?: () => void;
   suppressTaskApprovalOwner: boolean;
 }) {
   const { setConversationReadiness } = useConversationReadiness();
@@ -2392,6 +2397,16 @@ function ConversationPageContent({
           </button>
         </div>
       )}
+      {!isArchived && <WorkControlBar
+        conversationId={conversation.id}
+        convModeLabel={conversation.conv_mode_label}
+        phaseType={convStateForChildren.type}
+        continuedInConvId={conversation.continued_in_conv_id}
+        {...(ordinaryComposerEnabled && ordinaryComposerEligible ? { onSendMessage: handleSendTextOnly } : {})}
+        showError={showError}
+        prStatusHandle={prStatusHandle}
+        {...(onCloseCompleted ? { onCloseCompleted } : {})}
+      />}
       {convStateForChildren.type === 'awaiting_recovery' && isArchived ? (
         <RecoveryBanner message={convStateForChildren.message} recoveryKind={convStateForChildren.recovery_kind} />
       ) : convStateForChildren.type === 'awaiting_recovery' ? (
@@ -2429,14 +2444,6 @@ function ConversationPageContent({
         </>
       ) : convStateForChildren.type === 'error' ? (
         <>
-        {!isArchived && <WorkControlBar
-          conversationId={conversation.id}
-          convModeLabel={conversation.conv_mode_label}
-          phaseType={convStateForChildren.type}
-          continuedInConvId={conversation.continued_in_conv_id}
-          showError={showError}
-          prStatusHandle={prStatusHandle}
-        />}
         <ErrorBanner
           message={convStateForChildren.message}
           error={convStateForChildren.error}
@@ -2491,17 +2498,6 @@ function ConversationPageContent({
         />
       ) : ordinaryComposerEnabled && ordinaryComposerEligible ? (
         <>
-        {conversationId && (
-          <WorkControlBar
-            conversationId={conversationId}
-            convModeLabel={conversation.conv_mode_label}
-            phaseType={convStateForChildren.type}
-            continuedInConvId={conversation.continued_in_conv_id}
-            onSendMessage={handleSendTextOnly}
-            showError={showError}
-            prStatusHandle={prStatusHandle}
-          />
-        )}
         {credentialStatus && credentialStatus !== 'not_configured' && credentialStatus !== 'valid' && (
           <Suspense fallback={null}>
             <CredentialHelperPanel

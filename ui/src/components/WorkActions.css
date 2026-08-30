@@ -614,3 +614,25 @@
     justify-content: flex-start;
   }
 }
+
+.work-actions-close-status {
+  flex: 1 1 100%;
+  margin-top: 0.5rem;
+  padding: 0.65rem 0.75rem;
+  border: 1px solid var(--color-warning-border, #8a6d1d);
+  border-radius: 6px;
+  background: var(--color-warning-surface, rgb(138 109 29 / 10%));
+  color: var(--text-primary);
+}
+
+.work-actions-close-status ul {
+  max-height: 10rem;
+  margin: 0.5rem 0;
+  padding-left: 1.25rem;
+  overflow: auto;
+}
+
+.work-actions-close-status p {
+  margin: 0.5rem 0;
+  color: var(--text-secondary);
+}

@@ -28,7 +28,11 @@ import { useToast } from '../hooks/useToast';
 import { CredentialHelperPanel } from '../components/CredentialHelperPanel';
 import { SettingsDropdown } from '../components/SettingsDropdown';
 import { effectiveVisibleConversationCount } from './conversationListCount';
-import { getProductConversationListRevision, subscribeProductConversationListRevision } from '../notifications';
+import {
+  getProductConversationListRevision,
+  notifyArchiveCloseConflict,
+  subscribeProductConversationListRevision,
+} from '../notifications';
 
 const MOBILE_LIST_SCROLL_KEY = 'phoenix:mobile-conversation-list-scroll:v1';
 const MOBILE_ARCHIVED_LIST_SCROLL_KEY = 'phoenix:mobile-archived-list-scroll:v1';
@@ -256,6 +260,7 @@ export function ConversationListPage() {
         // SSE eventually sends.
       }
     } catch (err) {
+      notifyArchiveCloseConflict(conv.id, err);
       console.error('Failed to archive:', err);
     }
   };

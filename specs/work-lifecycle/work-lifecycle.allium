@@ -419,6 +419,21 @@ rule DistinctOpenAggregateOrIdentityConflictPreventsDestructiveRetirement {
         -- whether such a distinct aggregate exists because identity evidence conflicts.
 }
 
+rule AmbiguousPrivateDirectoryIdentityPreservesSafeLeftover {
+    when: ResourceRetirementRequested(product_conversation, attempt_id)
+    requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: AttachedWorkScope.scope}
+    requires: phoenix_private_retirement_directory_identity_is_ambiguous(product_conversation, attempt_id)
+    ensures: safe_retirement_leftover_is_preserved(product_conversation, attempt_id)
+    ensures: ResourceRetirementFailed(product_conversation, attempt_id)
+
+    @guidance
+        -- Normal Close authority comes from the sealed WorkScope gate plus a random,
+        -- Phoenix-owned owner-only directory. Final removal validates both the opened
+        -- directory and object identities. Post-crash or external ambiguity preserves
+        -- a safe leftover for repair. Concurrent malicious mutation inside that private
+        -- namespace and mutation outside Phoenix ownership are unsupported.
+}
+
 rule RetirementStepSuccessRecordsTypedEvidence {
     when: ResourceRetirementRequested(product_conversation, attempt_id)
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
@@ -530,6 +545,32 @@ rule ResourceRetirementFailureProducesResidualRepairState {
         -- repair information rather than silently succeeding. Residual rows are bound
         -- to the same exact RetirementAttempt as any earlier RetiredResource evidence,
         -- so partial completion remains visible across retries.
+}
+
+rule RestartRetirementLeavesProcessEpochResourcesUntouched {
+    when: ResourceRetirementRequested(product_conversation, attempt_id)
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
+        retirement_requested,
+        needs_repair
+    }
+    requires: process_epoch_resource_has_no_live_retirement_permit(product_conversation, attempt_id)
+    ensures: ResourceRetirementProgressRecorded(product_conversation, attempt_id)
+
+    @guidance
+        -- Bash, PTY, browser, and equivalent ordinary execution resources are owned
+        -- by the live Phoenix process epoch. A restarted runtime neither discovers
+        -- nor signals a former epoch's resource.
+}
+
+rule RestartRetirementRequiresExactTmuxIdentity {
+    when: ResourceRetirementRequested(product_conversation, attempt_id)
+    requires: pending_tmux_identity_is_ambiguous(product_conversation, attempt_id)
+    ensures: ResourceRetirementFailed(product_conversation, attempt_id)
+
+    @guidance
+        -- Tmux is the intentionally persistent runtime resource. Its sealed socket
+        -- path and Phoenix server token must jointly identify the live server; a
+        -- socket path alone is never destructive authority.
 }
 
 rule ExactAttemptAdoptsRestartRepairAbsenceEvidence {
@@ -810,6 +851,11 @@ invariant CleanupAuthorityComesFromCommittedCloseOperation {
     for a in AttachedWorkScope:
         exists CloseRetirementAuthority{product_conversation: a.product_conversation, scope: a.scope}
         implies a.owns_git_worktree or a.scope.kind = conversation
+}
+
+invariant WorkScopeHasOneOrdinaryProductConversationOwner {
+    for attachment in AttachedWorkScope:
+        product_conversation_owner_for_scope(attachment.scope) = attachment.product_conversation
 }
 
 invariant NoAutomaticRecoveryArtifactFromRetirement {
