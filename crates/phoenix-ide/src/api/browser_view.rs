@@ -24,7 +24,6 @@ use axum::{
     response::IntoResponse,
 };
 use futures::{SinkExt, StreamExt};
-use phoenix_core::domain::db_schema::ConvMode;
 use std::sync::Arc;
 use tokio::sync::broadcast::error::RecvError;
 
@@ -201,19 +200,19 @@ async fn resolve_viewer_work_scope(
 )> {
     match state.runtime.db().get_conversation(conversation_id).await {
         Ok(conv) => {
-            let authority = match conv.conv_mode {
-                ConvMode::Explore { .. } => crate::work_scope::ResourceAuthority::Restricted,
-                ConvMode::Direct
-                | ConvMode::Work { .. }
-                | ConvMode::Branch { .. }
-                | ConvMode::DetachedApprovedTask { .. } => {
-                    crate::work_scope::ResourceAuthority::Work
+            match crate::resource_authority::resolve_resource_authority(state.runtime.db(), &conv)
+                .await
+            {
+                Ok(resolved) => Some((resolved.scope, resolved.actor)),
+                Err(error) => {
+                    tracing::debug!(
+                        conv_id = %conversation_id,
+                        %error,
+                        "browser-view: resource authority lookup failed"
+                    );
+                    None
                 }
-            };
-            Some((
-                crate::work_scope::ResourceScopeKey::Work(conv.attached_work_scope_id?),
-                crate::work_scope::EffectiveResourceAccess::new(conversation_id, authority),
-            ))
+            }
         }
         Err(e) => {
             tracing::debug!(
@@ -274,5 +273,29 @@ mod tests {
         let p = status_frame("started");
         assert_eq!(p[0], TAG_STATUS);
         assert_eq!(&p[1..], b"started");
+    }
+
+    #[tokio::test]
+    async fn approved_explore_viewer_resolves_work_authority() {
+        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let id = "approved-explore-browser-view";
+        state
+            .db
+            .create_conversation(id, id, "/tmp", true, None, None)
+            .await
+            .expect("conversation");
+        state
+            .db
+            .persist_approved_task_authority(id, &crate::resource_authority::tests::approval())
+            .await
+            .expect("approved authority");
+
+        let (_, actor) = resolve_viewer_work_scope(&state, id)
+            .await
+            .expect("viewer authority");
+        assert_eq!(
+            actor.authority(),
+            crate::work_scope::ResourceAuthority::Work
+        );
     }
 }

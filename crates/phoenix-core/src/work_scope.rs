@@ -156,11 +156,33 @@ impl AuthorityKind {
     }
 }
 
+impl TryFrom<&str> for AuthorityKind {
+    type Error = String;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "direct" => Ok(Self::Direct),
+            "restricted_explore" => Ok(Self::RestrictedExplore),
+            "work" => Ok(Self::Work),
+            other => Err(format!("unknown WorkScope authority kind: {other}")),
+        }
+    }
+}
+
 /// Authority stamped onto same-scope process and browser resources.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ResourceAuthority {
     Restricted,
     Work,
+}
+
+impl From<AuthorityKind> for ResourceAuthority {
+    fn from(value: AuthorityKind) -> Self {
+        match value {
+            AuthorityKind::RestrictedExplore => Self::Restricted,
+            AuthorityKind::Direct | AuthorityKind::Work => Self::Work,
+        }
+    }
 }
 
 /// The actor identity and effective authority presented to a resource manager.

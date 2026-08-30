@@ -736,7 +736,12 @@ async fn lookup_durable_steering_replay(
             .await
             .map_err(|error| map_db_internal_error(&error))?
         {
-            validate_steering_fingerprint(&receipt, request_fingerprint)?;
+            match receipt {
+                SteeringAcceptanceFingerprint::Exact(_) => {
+                    validate_steering_fingerprint(&receipt, request_fingerprint)?;
+                }
+                SteeringAcceptanceFingerprint::LegacyUnknown => {}
+            }
         }
         return Ok(Some(outcome));
     }
@@ -932,6 +937,7 @@ mod tests {
         SendChatOutcome, SendChatRequest, SendChatServiceError,
     };
     use crate::api::{FileAttachment, ImageAttachment};
+    use crate::db::SteeringAcceptanceFingerprint;
     use phoenix_core::domain::db_schema::SkillContent;
     use phoenix_core::domain::sm_event::{
         PreparedDirectTurnDelivery, PreparedDirectTurnPayload, SubmittedDirectTurnExpansionPolicy,
@@ -1415,6 +1421,73 @@ mod tests {
                 .unwrap(),
             Some(SendChatOutcome::QueuedAsSteering)
         );
+    }
+
+    async fn persist_drained_legacy_steering(db: &crate::db::Database, req: &SendChatRequest) {
+        let entry = phoenix_core::domain::sm_event::SteerEntry {
+            text: req.text.clone(),
+            llm_text: None,
+            images: Vec::new(),
+            files: Vec::new(),
+            message_id: req.message_id.clone(),
+            user_agent: req.user_agent.clone(),
+            skill_invocation: None,
+        };
+        db.update_steering_queue(&req.conversation_id, &[entry])
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_steering_acceptance_fingerprint(&req.conversation_id, &req.message_id)
+                .await
+                .unwrap(),
+            Some(SteeringAcceptanceFingerprint::LegacyUnknown)
+        );
+        db.add_message(
+            &req.message_id,
+            &req.conversation_id,
+            &crate::db::MessageContent::user(&req.text),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(db
+            .remove_steering_entry(&req.conversation_id, &req.message_id)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn drained_legacy_steering_replays_when_durable_transcript_matches() {
+        let req = request();
+        let db = db_with_conversation(&req.conversation_id).await;
+        persist_drained_legacy_steering(&db, &req).await;
+
+        assert_eq!(
+            lookup_durable_steering_replay(&db, &req, &super::request_fingerprint(&req).unwrap())
+                .await
+                .unwrap(),
+            Some(SendChatOutcome::AlreadyPersisted)
+        );
+    }
+
+    #[tokio::test]
+    async fn drained_legacy_steering_conflicts_when_durable_transcript_differs() {
+        let req = request();
+        let db = db_with_conversation(&req.conversation_id).await;
+        persist_drained_legacy_steering(&db, &req).await;
+        let mut changed = req;
+        changed.text = "different durable content".to_string();
+
+        assert!(matches!(
+            lookup_durable_steering_replay(
+                &db,
+                &changed,
+                &super::request_fingerprint(&changed).unwrap(),
+            )
+            .await,
+            Err(SendChatServiceError::IdempotencyConflict)
+        ));
     }
 
     #[test]

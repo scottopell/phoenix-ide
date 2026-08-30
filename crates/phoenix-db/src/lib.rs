@@ -6991,6 +6991,29 @@ impl Database {
         Ok(())
     }
 
+    /// Load the non-null authority persisted on a conversation's attached `WorkScope`.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] when the conversation or scope is missing, the stored
+    /// authority is invalid, or the query fails.
+    pub async fn get_conversation_work_scope_authority(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<AuthorityKind> {
+        let authority: Option<String> = sqlx::query_scalar(
+            "SELECT scope.authority_kind
+             FROM conversations conversation
+             JOIN work_scopes scope ON scope.id = conversation.work_scope_id
+             WHERE conversation.id = ?1",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let authority =
+            authority.ok_or_else(|| DbError::ConversationNotFound(conversation_id.to_string()))?;
+        AuthorityKind::try_from(authority.as_str()).map_err(DbError::Serialization)
+    }
+
     /// Persist an approved-task objective and the existing scope's write authority atomically.
     ///
     /// # Errors

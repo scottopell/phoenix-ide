@@ -1953,26 +1953,15 @@ pub enum SseEvent {
     },
 }
 
-/// Pick the tool registry for a sub-agent runtime on (re-)creation from
-/// its persisted `conv_mode`.
-///
-/// Explore sub-agents are always persisted as `ConvMode::Explore`
-/// (see `handle_spawn_request`); Work sub-agents inherit the parent's
-/// `conv_mode`, which is one of Direct, Work, or Branch (never Explore --
-/// an Explore parent cannot spawn a Work sub-agent, guarded at spawn
-/// time). So `Explore` variant means an Explore sub-agent, anything
-/// else means a Work sub-agent. See subagents.allium
-/// `SubAgentRegistryOnResume`.
-fn sub_agent_registry_for_conv_mode(
-    conv_mode: &ConvMode,
+fn sub_agent_registry_for_authority(
+    authority: crate::work_scope::ResourceAuthority,
     policy: ExploreToolPolicy,
 ) -> ToolRegistry {
-    match conv_mode {
-        ConvMode::Explore { .. } => ToolRegistry::for_subagent_explore(policy),
-        ConvMode::Direct
-        | ConvMode::Work { .. }
-        | ConvMode::Branch { .. }
-        | ConvMode::DetachedApprovedTask { .. } => ToolRegistry::for_subagent_work(),
+    match authority {
+        crate::work_scope::ResourceAuthority::Restricted => {
+            ToolRegistry::for_subagent_explore(policy)
+        }
+        crate::work_scope::ResourceAuthority::Work => ToolRegistry::for_subagent_work(),
     }
 }
 
@@ -2922,17 +2911,12 @@ impl RuntimeManager {
             let Some(broadcaster) = broadcaster else {
                 continue;
             };
-            let authority = match conv.conv_mode {
-                ConvMode::Explore { .. } => crate::work_scope::ResourceAuthority::Restricted,
-                _ => crate::work_scope::ResourceAuthority::Work,
+            let Ok(resolved) =
+                crate::resource_authority::resolve_resource_authority(self.db(), &conv).await
+            else {
+                continue;
             };
-            let actor = if authority == crate::work_scope::ResourceAuthority::Restricted
-                && conv.runtime_role == crate::work_scope::RuntimeRole::User
-            {
-                crate::work_scope::EffectiveResourceAccess::shared_restricted(&conv_id)
-            } else {
-                crate::work_scope::EffectiveResourceAccess::new(&conv_id, authority)
-            };
+            let actor = resolved.actor;
             let inventory = phoenix_tools::work_scope_inventory::assemble_inventory(
                 work_scope,
                 Some(&actor),
@@ -4913,16 +4897,11 @@ impl RuntimeManager {
             }
             None => return Err("ordinary conversation is missing its work scope".to_string()),
         };
-        context.resource_authority = match conv.conv_mode {
-            ConvMode::Explore { .. } if approved_task_objective.is_none() => {
-                crate::work_scope::ResourceAuthority::Restricted
-            }
-            ConvMode::Explore { .. }
-            | ConvMode::Direct
-            | ConvMode::Work { .. }
-            | ConvMode::Branch { .. }
-            | ConvMode::DetachedApprovedTask { .. } => crate::work_scope::ResourceAuthority::Work,
-        };
+        context.resource_authority =
+            crate::resource_authority::resolve_resource_authority(self.db(), &conv)
+                .await
+                .map_err(|error| format!("Failed to load resource authority: {error}"))?
+                .authority;
         context.mode_context = Some(mode_context);
         context.effort = conv.effort;
         context.service_tier = self
@@ -5008,8 +4987,8 @@ impl RuntimeManager {
         context.is_coordinator = is_coordinator;
 
         let tool_executor = if is_sub_agent {
-            let registry = sub_agent_registry_for_conv_mode(
-                &conv.conv_mode,
+            let registry = sub_agent_registry_for_authority(
+                context.resource_authority,
                 ExploreToolPolicy::from_platform(&self.platform),
             );
             ToolRegistryExecutor::with_mcp(
@@ -6348,70 +6327,32 @@ mod bash_lifecycle_bridge_tests {
 
 #[cfg(test)]
 mod sub_agent_registry_resume_tests {
-    //! Regression coverage for the resume-path tool-registry selection
-    //! (`runtime.rs` ~1267, subagents.allium `SubAgentRegistryOnResume`).
-    //!
-    //! Before task 13010 this branch hard-coded `for_subagent_explore()`,
-    //! silently stripping `patch` from a re-created Work sub-agent. The
-    //! `sub_agent_registry_for_conv_mode` helper now picks the right
-    //! registry from the persisted `conv_mode`; these tests pin that
-    //! contract so a future refactor cannot quietly regress it.
-    use super::sub_agent_registry_for_conv_mode;
-    use crate::db::{ConvMode, NonEmptyString};
+    use super::sub_agent_registry_for_authority;
     use crate::platform::PlatformCapability;
     use crate::tools::ExploreToolPolicy;
+    use crate::work_scope::ResourceAuthority;
 
-    fn registry_has(conv_mode: &ConvMode, tool: &str) -> bool {
-        sub_agent_registry_for_conv_mode(
-            conv_mode,
+    fn registry_has(authority: ResourceAuthority, tool: &str) -> bool {
+        sub_agent_registry_for_authority(
+            authority,
             ExploreToolPolicy::from_platform(&PlatformCapability::None {
                 details: "test".into(),
             }),
         )
         .definitions()
         .iter()
-        .any(|d| d.name == tool)
+        .any(|definition| definition.name == tool)
     }
 
     #[test]
-    fn explore_subagent_resume_excludes_patch() {
-        let mode = ConvMode::Explore {
-            worktree_path: None,
-            next_taskmd_id_hint: None,
-        };
-        assert!(!registry_has(&mode, "patch"));
-        assert!(registry_has(&mode, "submit_result"));
+    fn restricted_subagent_resume_excludes_patch() {
+        assert!(!registry_has(ResourceAuthority::Restricted, "patch"));
+        assert!(registry_has(ResourceAuthority::Restricted, "submit_result"));
     }
 
     #[test]
-    fn direct_subagent_resume_keeps_patch() {
-        // A Work sub-agent spawned from a Direct parent persists as
-        // ConvMode::Direct (Work sub-agents inherit parent conv_mode).
-        // The previous bug mapped Direct -> Explore registry; the
-        // resumed sub-agent must keep `patch`.
-        assert!(registry_has(&ConvMode::Direct, "patch"));
-    }
-
-    #[test]
-    fn work_subagent_resume_keeps_patch() {
-        let mode = ConvMode::Work {
-            branch_name: NonEmptyString::new("task-0001-x").unwrap(),
-            worktree_path: NonEmptyString::new("/tmp/wt").unwrap(),
-            base_branch: NonEmptyString::new("main").unwrap(),
-            task_id: NonEmptyString::new("0001").unwrap(),
-            task_title: NonEmptyString::new("x").unwrap(),
-        };
-        assert!(registry_has(&mode, "patch"));
-    }
-
-    #[test]
-    fn branch_subagent_resume_keeps_patch() {
-        let mode = ConvMode::Branch {
-            branch_name: NonEmptyString::new("feature-x").unwrap(),
-            worktree_path: NonEmptyString::new("/tmp/wt").unwrap(),
-            base_branch: NonEmptyString::new("feature-x").unwrap(),
-        };
-        assert!(registry_has(&mode, "patch"));
+    fn work_authority_subagent_resume_keeps_patch() {
+        assert!(registry_has(ResourceAuthority::Work, "patch"));
     }
 }
 

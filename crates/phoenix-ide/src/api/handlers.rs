@@ -800,18 +800,13 @@ async fn enrich_conversation_with_seed(
     // Sessions are keyed by `ResourceScopeKey` (REQ-BROWSER-WS-001), so a
     // continuation of a worktree-backed conversation sees `true` here as
     // soon as its predecessor's session is live.
-    let work_scope = conversation_resource_scope(conv);
-    let actor = crate::work_scope::EffectiveResourceAccess::new(
-        conv.id.clone(),
-        match &conv.conv_mode {
-            crate::db::ConvMode::Explore { .. } => crate::work_scope::ResourceAuthority::Restricted,
-            _ => crate::work_scope::ResourceAuthority::Work,
-        },
-    );
+    let resolved = crate::resource_authority::resolve_resource_authority(state.runtime.db(), conv)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
     enriched.browser_session_active = state
         .runtime
         .browser_sessions()
-        .is_active_for_actor(&work_scope, &actor)
+        .is_active_for_actor(&resolved.scope, &resolved.actor)
         .await;
     Ok(enriched)
 }
@@ -870,15 +865,6 @@ fn conversation_resource_scope(
         }
         None => panic!("ordinary persisted conversation is missing its work scope"),
     }
-}
-
-fn conversation_work_scope(
-    conv: &crate::db::Conversation,
-) -> Result<crate::work_scope::ResourceScopeKey, AppError> {
-    conv.attached_work_scope_id
-        .clone()
-        .map(crate::work_scope::ResourceScopeKey::Work)
-        .ok_or_else(|| AppError::Forbidden("conversation has no work scope".to_string()))
 }
 
 fn sidebar_cached_pr_summary(
@@ -3800,19 +3786,10 @@ async fn work_scope_actor(
             "conversation does not belong to the requested work scope".to_string(),
         ));
     }
-    let authority = match conversation.conv_mode {
-        crate::db::ConvMode::Explore { .. } => crate::work_scope::ResourceAuthority::Restricted,
-        _ => crate::work_scope::ResourceAuthority::Work,
-    };
-    Ok(
-        if authority == crate::work_scope::ResourceAuthority::Restricted
-            && conversation.runtime_role == crate::work_scope::RuntimeRole::User
-        {
-            crate::work_scope::EffectiveResourceAccess::shared_restricted(conversation.id)
-        } else {
-            crate::work_scope::EffectiveResourceAccess::new(conversation.id, authority)
-        },
-    )
+    crate::resource_authority::resolve_resource_authority(state.runtime.db(), &conversation)
+        .await
+        .map(|resolved| resolved.actor)
+        .map_err(|error| AppError::Internal(error.to_string()))
 }
 
 async fn get_work_scope_inventory(
@@ -3873,14 +3850,12 @@ async fn stop_conversation_browser_session(
         .get_conversation(&id)
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
-    let work_scope = conversation_work_scope(&conversation)?;
-    let current_actor = crate::work_scope::EffectiveResourceAccess::new(
-        conversation.id.clone(),
-        match conversation.conv_mode {
-            crate::db::ConvMode::Explore { .. } => crate::work_scope::ResourceAuthority::Restricted,
-            _ => crate::work_scope::ResourceAuthority::Work,
-        },
-    );
+    let resolved =
+        crate::resource_authority::resolve_resource_authority(state.runtime.db(), &conversation)
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+    let work_scope = resolved.scope;
+    let current_actor = resolved.actor;
     let browser_sessions = state.runtime.browser_sessions();
     browser_sessions
         .request_kill_session_for_actor(&work_scope, &current_actor)
@@ -3952,18 +3927,12 @@ async fn inspect_bash_handle(
         .get_conversation(&query.conversation_id)
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
-    let authority = match conversation.conv_mode {
-        crate::db::ConvMode::Explore { .. } => crate::work_scope::ResourceAuthority::Restricted,
-        _ => crate::work_scope::ResourceAuthority::Work,
-    };
-    let actor = if authority == crate::work_scope::ResourceAuthority::Restricted
-        && conversation.runtime_role == crate::work_scope::RuntimeRole::User
-    {
-        crate::work_scope::EffectiveResourceAccess::shared_restricted(conversation.id.clone())
-    } else {
-        crate::work_scope::EffectiveResourceAccess::new(conversation.id.clone(), authority)
-    };
-    let actor_scope = conversation_resource_scope(&conversation);
+    let resolved =
+        crate::resource_authority::resolve_resource_authority(state.runtime.db(), &conversation)
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+    let actor = resolved.actor;
+    let actor_scope = resolved.scope;
 
     let mut assembly = phoenix_tools::process_inspection::assemble_inspection(
         &handle_id,
@@ -5806,21 +5775,15 @@ async fn cleanup_browser_with_retry(
     runtime: &crate::runtime::RuntimeManager,
     conv: &crate::db::Conversation,
     work_scope: &crate::work_scope::ResourceScopeKey,
+    browser_actor: &crate::work_scope::EffectiveResourceAccess,
     inheritor_scope: Option<&crate::work_scope::ResourceScopeKey>,
 ) {
     let browser_manager = runtime.browser_sessions();
-    let browser_actor = crate::work_scope::EffectiveResourceAccess::new(
-        conv.id.clone(),
-        match conv.conv_mode {
-            crate::db::ConvMode::Explore { .. } => crate::work_scope::ResourceAuthority::Restricted,
-            _ => crate::work_scope::ResourceAuthority::Work,
-        },
-    );
     let cleanup = || {
         crate::tools::browser::session::cascade_browser_on_delete(
             browser_manager,
             work_scope,
-            &browser_actor,
+            browser_actor,
             inheritor_scope,
         )
     };
@@ -5908,7 +5871,11 @@ pub(crate) async fn run_runtime_resource_cleanup_cascade(
     conv: &crate::db::Conversation,
 ) -> Result<ResourceCleanupReceipt, AppError> {
     let id = conv.id.as_str();
-    let work_scope = conversation_resource_scope(conv);
+    let resolved_authority =
+        crate::resource_authority::resolve_resource_authority(runtime.db(), conv)
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+    let work_scope = resolved_authority.scope;
 
     // `inheritor_scope = Some(work_scope)` means "preserve"; `None` means
     // "tear down". Threaded to every scope-keyed cascade (bash, tmux,
@@ -5921,15 +5888,7 @@ pub(crate) async fn run_runtime_resource_cleanup_cascade(
     let bash_report = crate::tools::bash::registry::cascade_bash_on_delete(
         runtime.bash_handles(),
         &work_scope,
-        &crate::work_scope::EffectiveResourceAccess::new(
-            conv.id.clone(),
-            match conv.conv_mode {
-                crate::db::ConvMode::Explore { .. } => {
-                    crate::work_scope::ResourceAuthority::Restricted
-                }
-                _ => crate::work_scope::ResourceAuthority::Work,
-            },
-        ),
+        &resolved_authority.actor,
         inheritor_scope,
     )
     .await;
@@ -6001,7 +5960,14 @@ pub(crate) async fn run_runtime_resource_cleanup_cascade(
 
     // Step 6: browser session. Same any-live-owner rule as tmux
     // (REQ-BROWSER-WS-002, REQ-BROWSER-WS-003).
-    cleanup_browser_with_retry(runtime, conv, &work_scope, inheritor_scope).await;
+    cleanup_browser_with_retry(
+        runtime,
+        conv,
+        &work_scope,
+        &resolved_authority.actor,
+        inheritor_scope,
+    )
+    .await;
 
     Ok(ResourceCleanupReceipt {
         work_scope,
@@ -9156,6 +9122,68 @@ pub(crate) mod hard_delete_cascade_tests {
                 .attached_work_scope_id
                 .expect("conversation has work scope"),
         )
+    }
+
+    async fn create_approved_explore(
+        state: &AppState,
+        id: &str,
+    ) -> crate::work_scope::ResourceScopeKey {
+        state
+            .db
+            .create_conversation(id, id, "/tmp", true, None, None)
+            .await
+            .expect("create Explore conversation");
+        state
+            .db
+            .persist_approved_task_authority(id, &crate::resource_authority::tests::approval())
+            .await
+            .expect("promote persisted scope authority");
+        conversation_scope(state, id).await
+    }
+
+    #[tokio::test]
+    async fn approved_explore_actor_is_work_for_inventory_and_stop_consumers() {
+        let state = make_test_state().await;
+        let id = "approved-explore-resource-consumers";
+        let scope = create_approved_explore(&state, id).await;
+
+        let inventory_actor = super::work_scope_actor(&state, &scope, id)
+            .await
+            .expect("inventory actor");
+        assert_eq!(
+            inventory_actor.authority(),
+            crate::work_scope::ResourceAuthority::Work
+        );
+
+        let Json(response) = super::stop_work_scope_browser_session(
+            State(state),
+            Path(scope.stable_key()),
+            Query(super::WorkScopeActorQuery {
+                conversation_id: id.to_string(),
+            }),
+        )
+        .await
+        .expect("stop consumer");
+        assert!(response.success);
+    }
+
+    #[tokio::test]
+    async fn approved_explore_lifecycle_cleanup_uses_work_actor() {
+        let state = make_test_state().await;
+        let id = "approved-explore-lifecycle";
+        create_approved_explore(&state, id).await;
+        let conversation = state.db.get_conversation(id).await.expect("conversation");
+
+        let receipt = super::run_runtime_resource_cleanup_cascade(&state.runtime, &conversation)
+            .await
+            .expect("lifecycle cleanup");
+        assert_eq!(
+            receipt.work_scope,
+            crate::resource_authority::resolve_resource_authority(&state.db, &conversation)
+                .await
+                .expect("authority")
+                .scope
+        );
     }
 
     fn bump_generation_after_next_stable_read_value(conversation_id: &'static str) {
