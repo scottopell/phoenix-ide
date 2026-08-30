@@ -8726,22 +8726,6 @@ impl Database {
         work_scope_id: &str,
     ) -> DbResult<()> {
         sqlx::query(
-            "DELETE FROM product_conversation_work_scope_repairs
-             WHERE work_scope_id = ?1
-               AND NOT EXISTS (SELECT 1 FROM conversations WHERE work_scope_id = ?1)",
-        )
-        .bind(work_scope_id)
-        .execute(&mut *connection)
-        .await?;
-        sqlx::query(
-            "DELETE FROM product_conversation_work_scope_missing_owners
-             WHERE work_scope_id = ?1
-               AND NOT EXISTS (SELECT 1 FROM conversations WHERE work_scope_id = ?1)",
-        )
-        .bind(work_scope_id)
-        .execute(&mut *connection)
-        .await?;
-        sqlx::query(
             "DELETE FROM product_conversation_work_scopes
              WHERE work_scope_id = ?1
                AND NOT EXISTS (SELECT 1 FROM conversations WHERE work_scope_id = ?1)",
@@ -13770,6 +13754,16 @@ mod tests {
         .execute(db.pool())
         .await
         .unwrap();
+        sqlx::query(
+            "INSERT INTO product_conversation_work_scope_repairs (
+                 work_scope_id, first_product_conversation_id, second_product_conversation_id, state
+             ) VALUES (?1, ?2, 'former-product-conversation', 'needs_repair')",
+        )
+        .bind(work_scope_id.as_str())
+        .bind(product_conversation_id.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
         db.finish_conversation_creation_cleanup(&deletion, now)
             .await
             .unwrap();
@@ -13795,6 +13789,31 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(scope_after_delete, 0);
+        let evidence_after_delete: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM product_conversation_work_scope_missing_owners
+             WHERE work_scope_id = ?1 AND state = 'needs_repair'",
+        )
+        .bind(work_scope_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(evidence_after_delete, 1);
+        let repair_evidence_after_delete: (String, String, String, String) = sqlx::query_as(
+            "SELECT work_scope_id, first_product_conversation_id, second_product_conversation_id, state
+             FROM product_conversation_work_scope_repairs",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            repair_evidence_after_delete,
+            (
+                work_scope_id.to_string(),
+                product_conversation_id.to_string(),
+                "former-product-conversation".to_string(),
+                "needs_repair".to_string(),
+            )
+        );
     }
 
     #[tokio::test]

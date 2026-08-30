@@ -7631,9 +7631,9 @@ BEGIN
 END;
 
 CREATE TABLE product_conversation_work_scope_repairs (
-    work_scope_id TEXT PRIMARY KEY REFERENCES work_scopes(id) ON DELETE RESTRICT,
-    first_product_conversation_id TEXT NOT NULL REFERENCES product_conversations(id) ON DELETE RESTRICT,
-    second_product_conversation_id TEXT NOT NULL REFERENCES product_conversations(id) ON DELETE RESTRICT,
+    work_scope_id TEXT PRIMARY KEY,
+    first_product_conversation_id TEXT NOT NULL,
+    second_product_conversation_id TEXT NOT NULL,
     state TEXT NOT NULL CHECK (state = 'needs_repair'),
     CHECK (first_product_conversation_id <> second_product_conversation_id)
 );
@@ -7651,7 +7651,7 @@ GROUP BY c.work_scope_id
 HAVING COUNT(DISTINCT c.product_conversation_id) > 1;
 
 CREATE TABLE product_conversation_work_scope_missing_owners (
-    work_scope_id TEXT PRIMARY KEY REFERENCES work_scopes(id) ON DELETE RESTRICT,
+    work_scope_id TEXT PRIMARY KEY,
     state TEXT NOT NULL CHECK (state = 'needs_repair')
 );
 
@@ -7894,7 +7894,8 @@ CREATE TABLE close_retirement_resource_dispatches (
     identity_kind TEXT NOT NULL,
     identity_codec TEXT NOT NULL,
     identity_value TEXT NOT NULL,
-    dispatched_at TEXT NOT NULL,
+    dispatched_at_us INTEGER NOT NULL
+        CHECK (typeof(dispatched_at_us) = 'integer' AND dispatched_at_us >= 0),
     PRIMARY KEY (
         attempt_id, scope, inspection_generation, inspection_fingerprint,
         resource_kind, identity_kind, identity_value
@@ -8399,7 +8400,8 @@ CREATE TABLE close_worktree_cleanup_plans (
     identity_value TEXT NOT NULL,
     administrative_dir_codec TEXT NOT NULL CHECK (administrative_dir_codec = 'hex_path_v1'),
     administrative_dir_value TEXT NOT NULL CHECK (length(administrative_dir_value) > 0),
-    planned_at TEXT NOT NULL,
+    planned_at_us INTEGER NOT NULL
+        CHECK (typeof(planned_at_us) = 'integer' AND planned_at_us >= 0),
     PRIMARY KEY (
         attempt_id, scope, inspection_generation, inspection_fingerprint,
         resource_kind, identity_kind, identity_value

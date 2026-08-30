@@ -2784,11 +2784,11 @@ impl Database {
         sqlx::query(
             "INSERT INTO close_retirement_resource_dispatches (
                  attempt_id, scope, inspection_generation, inspection_fingerprint,
-                 resource_kind, identity_kind, identity_codec, identity_value, dispatched_at
+                 resource_kind, identity_kind, identity_codec, identity_value, dispatched_at_us
              )
              SELECT dispatch.attempt_id, dispatch.scope, ?3, ?4,
                     dispatch.resource_kind, dispatch.identity_kind, dispatch.identity_codec,
-                    dispatch.identity_value, dispatch.dispatched_at
+                    dispatch.identity_value, dispatch.dispatched_at_us
              FROM close_retirement_resource_dispatches dispatch
              JOIN close_expected_retirement_resources expected
                ON expected.attempt_id = dispatch.attempt_id
@@ -2814,12 +2814,12 @@ impl Database {
                  attempt_id, scope, inspection_generation, inspection_fingerprint,
                  resource_kind, identity_kind, identity_codec, identity_value,
                  administrative_dir_codec, administrative_dir_value,
-                 administrative_dir_incarnation, planned_at
+                 administrative_dir_incarnation, planned_at_us
              )
              SELECT plan.attempt_id, plan.scope, ?3, ?4, plan.resource_kind,
                     plan.identity_kind, plan.identity_codec, plan.identity_value,
                     plan.administrative_dir_codec, plan.administrative_dir_value,
-                    plan.administrative_dir_incarnation, plan.planned_at
+                    plan.administrative_dir_incarnation, plan.planned_at_us
              FROM close_worktree_cleanup_plans plan
              WHERE plan.attempt_id = ?1
                AND plan.inspection_generation = ?2
@@ -3169,7 +3169,7 @@ impl Database {
         let inserted = sqlx::query(
             "INSERT OR IGNORE INTO close_retirement_resource_dispatches (
                  attempt_id, scope, inspection_generation, inspection_fingerprint,
-                 resource_kind, identity_kind, identity_codec, identity_value, dispatched_at
+                 resource_kind, identity_kind, identity_codec, identity_value, dispatched_at_us
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )
         .bind(request.attempt_id.as_str())
@@ -3180,7 +3180,7 @@ impl Database {
         .bind(identity.identity_kind())
         .bind(identity.codec())
         .bind(identity.value())
-        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now().timestamp_micros())
         .execute(&mut *tx)
         .await?;
         if inserted.rows_affected() == 0 {
@@ -3236,7 +3236,7 @@ impl Database {
                  attempt_id, scope, inspection_generation, inspection_fingerprint,
                  resource_kind, identity_kind, identity_codec, identity_value,
                  administrative_dir_codec, administrative_dir_value,
-                 administrative_dir_incarnation, planned_at
+                 administrative_dir_incarnation, planned_at_us
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT DO NOTHING",
         )
@@ -3251,7 +3251,7 @@ impl Database {
         .bind("hex_path_v1")
         .bind(&administrative_dir_value)
         .bind(&request.administrative_dir_incarnation)
-        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now().timestamp_micros())
         .execute(&self.pool)
         .await?;
         if result.rows_affected() == 0 {
@@ -8226,6 +8226,39 @@ mod tests {
                 administrative_dir_incarnation: "admin-v1".to_string(),
             })
         );
+        let timestamp_types: (String, String, i64, i64) = sqlx::query_as(
+            "SELECT typeof(dispatch.dispatched_at_us), typeof(plan.planned_at_us),
+                    dispatch.dispatched_at_us, plan.planned_at_us
+             FROM close_retirement_resource_dispatches dispatch
+             JOIN close_worktree_cleanup_plans plan
+               ON plan.attempt_id = dispatch.attempt_id
+              AND plan.scope = dispatch.scope
+              AND plan.inspection_generation = dispatch.inspection_generation
+              AND plan.inspection_fingerprint = dispatch.inspection_fingerprint
+              AND plan.resource_kind = dispatch.resource_kind
+              AND plan.identity_kind = dispatch.identity_kind
+              AND plan.identity_value = dispatch.identity_value",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(timestamp_types.0, "integer");
+        assert_eq!(timestamp_types.1, "integer");
+        assert!(timestamp_types.2 >= 0);
+        assert!(timestamp_types.3 >= 0);
+        assert!(sqlx::query(
+            "UPDATE close_retirement_resource_dispatches SET dispatched_at_us = -1"
+        )
+        .execute(db.pool())
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            "UPDATE close_worktree_cleanup_plans SET planned_at_us = 'not-a-timestamp'"
+        )
+        .execute(db.pool())
+        .await
+        .is_err());
+
         let divergent = db
             .record_close_worktree_cleanup_plan(RecordCloseWorktreeCleanupPlanRequest {
                 attempt_id,
