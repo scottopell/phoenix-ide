@@ -2361,8 +2361,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
       />,
     );
 
-    expect(screen.queryByRole('button', { name: /^Close conversation\./ })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /^Close conversation\./ })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^Close conversation\./ })).toBeInTheDocument();
     expect(screen.getByTestId('mobile-work-fallback')).toHaveTextContent('Active PR unavailable');
     fireEvent.click(screen.getByRole('button', { name: 'Select active PR' }));
     expect(requestActivePrSelectorOpen).toHaveBeenCalledTimes(1);
@@ -2398,6 +2397,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     );
 
     expect(screen.queryByRole('button', { name: 'Select active PR' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^Close conversation\./ })).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Resume PR inference' }));
     await waitFor(() => expect(resumeInference).toHaveBeenCalledTimes(1));
     expect(api.markMerged).not.toHaveBeenCalled();
@@ -2462,7 +2462,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Resume PR inference' }));
     await waitFor(() => expect(resumeInference).toHaveBeenCalledTimes(1));
-    expect(screen.queryByTestId('clean-up-button')).not.toBeInTheDocument();
+    expect(screen.getByTestId('clean-up-button')).toBeInTheDocument();
     expect(screen.queryByRole('link', { name: /Open PR #12/ })).not.toBeInTheDocument();
     expect(screen.getByTestId('view-diff-button')).not.toHaveClass('work-actions-btn--primary');
     expect(screen.getByRole('button', { name: 'Resume PR inference' })).toHaveClass('work-actions-btn--primary');

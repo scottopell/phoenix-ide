@@ -404,7 +404,7 @@ export function WorkControlBar({
   );
 
   const explicitSelectionUnresolved = prStatusHandle.activeSelection?.active_pr !== undefined && activePr === null;
-  const cleanupBlockedByAmbiguity = explicitSelectionUnresolved
+  const prSelectionUnresolved = explicitSelectionUnresolved
     || (prStatusHandle.ambiguous && actionablePrs.length > 1 && !activePr);
   useEffect(() => {
     if (!openSelectorAfterRefresh || !prStatusHandle.ambiguous) return;
@@ -458,9 +458,9 @@ export function WorkControlBar({
     workChange: prStatus?.work_change ?? null,
   });
 
-  const fallbackOverflowAction = !cleanupBlockedByAmbiguity && disposition.showCleanUp && disposition.primary !== 'clean_up'
+  const fallbackOverflowAction = disposition.showCleanUp && disposition.primary !== 'clean_up'
     ? 'clean_up'
-    : !cleanupBlockedByAmbiguity && disposition.showAbandon && disposition.primary !== 'abandon'
+    : disposition.showAbandon && disposition.primary !== 'abandon'
       ? 'abandon'
       : null;
   const fallbackHasOverflowActions = fallbackOverflowAction !== null;
@@ -779,7 +779,7 @@ export function WorkControlBar({
         </div>
 
         {(disposition.primary !== 'none' || fallbackHasOverflowActions) && <div className="mobile-work-fallback-actions">
-          {cleanupBlockedByAmbiguity && (disposition.primary === 'clean_up' || disposition.primary === 'abandon') && (
+          {prSelectionUnresolved && (disposition.primary === 'clean_up' || disposition.primary === 'abandon') && (
             actionablePrs.length > 0 ? (
               <button
                 type="button"
@@ -884,7 +884,7 @@ export function WorkControlBar({
               </button>
             )
           )}
-          {disposition.primary === 'clean_up' && !cleanupBlockedByAmbiguity && (
+          {disposition.primary === 'clean_up' && (
             <button
               type="button"
               className="mobile-pr-action mobile-pr-action--cleanup mobile-pr-action--hero"
@@ -896,7 +896,7 @@ export function WorkControlBar({
               {markingMerged ? 'Closing…' : 'Close conversation'}
             </button>
           )}
-          {disposition.primary === 'abandon' && !cleanupBlockedByAmbiguity && (
+          {disposition.primary === 'abandon' && (
             <button
               type="button"
               className="mobile-pr-action mobile-pr-action--danger mobile-pr-action--hero"
@@ -942,7 +942,7 @@ export function WorkControlBar({
         )}
         {fallbackMenuIsOpen && fallbackHasOverflowActions && (
           <div ref={fallbackMenuRef} id="mobile-work-fallback-more-actions" className="mobile-work-fallback-menu" aria-label="More work actions">
-            {disposition.showCleanUp && disposition.primary !== 'clean_up' && !cleanupBlockedByAmbiguity && (
+            {disposition.showCleanUp && disposition.primary !== 'clean_up' && (
               <button
                 type="button"
                 className="mobile-pr-action mobile-pr-action--cleanup"
@@ -956,7 +956,7 @@ export function WorkControlBar({
                 Close conversation
               </button>
             )}
-            {disposition.showAbandon && disposition.primary !== 'abandon' && !cleanupBlockedByAmbiguity && (
+            {disposition.showAbandon && disposition.primary !== 'abandon' && (
               <button
                 type="button"
                 className="mobile-pr-action mobile-pr-action--danger"
@@ -983,7 +983,7 @@ export function WorkControlBar({
       ? `${activePr.repo_owner}/${activePr.repo_name}#${activePr.pr_number}`
       : null;
     const expanded = activeIdentity !== null && expandedPrIdentity === activeIdentity;
-    const mobileHero = disposition.primary === 'clean_up' && !cleanupBlockedByAmbiguity ? (
+    const mobileHero = disposition.primary === 'clean_up' ? (
       <button
         type="button"
         className="mobile-pr-action mobile-pr-action--hero mobile-pr-action--cleanup"
@@ -992,7 +992,7 @@ export function WorkControlBar({
       >
         Close conversation
       </button>
-    ) : disposition.primary === 'abandon' && !cleanupBlockedByAmbiguity ? (
+    ) : disposition.primary === 'abandon' ? (
       <button
         type="button"
         className="mobile-pr-action mobile-pr-action--hero mobile-pr-action--danger"
@@ -1049,7 +1049,7 @@ export function WorkControlBar({
                   <span className="mobile-pr-action-icon" aria-hidden="true">↗</span><span>GitHub</span>
                 </a>
               )}
-              {!cleanupBlockedByAmbiguity && disposition.showCleanUp && disposition.primary !== 'clean_up' && (
+              {disposition.showCleanUp && disposition.primary !== 'clean_up' && (
                 <button
                   type="button"
                   className="mobile-pr-action mobile-pr-action--cleanup"
@@ -1061,7 +1061,7 @@ export function WorkControlBar({
                   <span className="mobile-pr-action-icon" aria-hidden="true">—</span><span>Close conversation</span>
                 </button>
               )}
-              {!cleanupBlockedByAmbiguity && disposition.showAbandon && disposition.primary !== 'abandon' && (
+              {disposition.showAbandon && disposition.primary !== 'abandon' && (
                 <button
                   type="button"
                   className="mobile-pr-action mobile-pr-action--danger"
@@ -1199,7 +1199,7 @@ export function WorkControlBar({
         {!prStatusHandle.ambiguous && !explicitSelectionUnresolved && disposition.secondaryResolve && (
           <ResolveLink verb={disposition.secondaryResolve} primary={false} coverageMarker={coverageMarker} />
         )}
-        {!cleanupBlockedByAmbiguity && disposition.showCleanUp && (
+        {disposition.showCleanUp && (
           <div className="desktop-work-actions-terminal">
             <button
               className={`work-actions-btn work-actions-clean-up${primaryClass('clean_up')}`}
@@ -1214,7 +1214,7 @@ export function WorkControlBar({
             <InfoHint text={closeHintText()} />
           </div>
         )}
-        {!cleanupBlockedByAmbiguity && disposition.showAbandon && (
+        {disposition.showAbandon && (
           <div className="desktop-work-actions-terminal">
             <button
               className={`work-actions-btn work-actions-abandon${primaryClass('abandon')}`}

@@ -1784,6 +1784,9 @@ async fn observe_detached_head_and_submodules(
                 .as_ref()
                 .ok_or_else(|| "detached worktree has no resolved HEAD".to_string())?;
             for oid in detached_unreachable_commits(&loss_path, head)? {
+                observation.extend_from_slice(b"DETACHED_UNREACHABLE\0");
+                observation.extend_from_slice(&oid);
+                observation.push(0);
                 losses.push(CloseLossItem::DetachedUnreachableCommit(
                     GitOidIdentity::parse_hex(String::from_utf8_lossy(&oid).trim())
                         .map_err(|error| error.to_string())?,
@@ -1849,7 +1852,14 @@ fn detached_unreachable_commits(
     head_oid: &[u8],
 ) -> Result<Vec<Vec<u8>>, String> {
     let head_text = std::str::from_utf8(head_oid).map_err(|error| error.to_string())?;
-    let output = phoenix_core::git::command()
+    let stash_exists = phoenix_core::git::command()
+        .args(["show-ref", "--verify", "--quiet", "refs/stash"])
+        .current_dir(repository)
+        .status()
+        .map_err(|error| error.to_string())?
+        .success();
+    let mut command = phoenix_core::git::command();
+    command
         .args([
             "rev-list",
             head_text,
@@ -1857,11 +1867,12 @@ fn detached_unreachable_commits(
             "--branches",
             "--remotes",
             "--tags",
-            "--glob=refs/stash*",
         ])
-        .current_dir(repository)
-        .output()
-        .map_err(|error| error.to_string())?;
+        .current_dir(repository);
+    if stash_exists {
+        command.arg("refs/stash");
+    }
+    let output = command.output().map_err(|error| error.to_string())?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
@@ -1948,7 +1959,7 @@ fn run_bounded_git_status_until(
     repository: &Path,
     deadline: std::time::Instant,
 ) -> Result<std::process::Output, String> {
-    let mut command = phoenix_core::git::command();
+    let mut command = phoenix_core::git::command_with_config(&[("core.fsmonitor", "false")]);
     command
         .args([
             "status",
@@ -2018,7 +2029,13 @@ fn run_bounded_git_status_until(
     })
 }
 
-type IndexedGitlinks = (Vec<u8>, Vec<(GitPathIdentity, Vec<u8>)>);
+struct IndexedGitlink {
+    path: GitPathIdentity,
+    stage_zero_oid: Option<Vec<u8>>,
+    has_unmerged_stage: bool,
+}
+
+type IndexedGitlinks = (Vec<u8>, Vec<IndexedGitlink>);
 
 fn index_gitlinks(repository: &Path) -> Result<IndexedGitlinks, String> {
     let output = phoenix_core::git::command()
@@ -2032,7 +2049,7 @@ fn index_gitlinks(repository: &Path) -> Result<IndexedGitlinks, String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    let mut gitlinks = Vec::new();
+    let mut gitlinks = std::collections::BTreeMap::<Vec<u8>, IndexedGitlink>::new();
     for record in output.stdout.split(|byte| *byte == 0) {
         if record.is_empty() {
             continue;
@@ -2051,14 +2068,24 @@ fn index_gitlinks(repository: &Path) -> Result<IndexedGitlinks, String> {
         let stage = fields
             .next()
             .ok_or_else(|| "malformed index entry: missing stage".to_string())?;
-        if mode == b"160000" && stage == b"0" {
-            gitlinks.push((
-                git_path_from_observation(&record[separator + 1..])?,
-                oid.to_vec(),
-            ));
+        if mode == b"160000" {
+            let path = git_path_from_observation(&record[separator + 1..])?;
+            let gitlink =
+                gitlinks
+                    .entry(path.as_bytes().to_vec())
+                    .or_insert_with(|| IndexedGitlink {
+                        path,
+                        stage_zero_oid: None,
+                        has_unmerged_stage: false,
+                    });
+            if stage == b"0" {
+                gitlink.stage_zero_oid = Some(oid.to_vec());
+            } else {
+                gitlink.has_unmerged_stage = true;
+            }
         }
     }
-    Ok((output.stdout, gitlinks))
+    Ok((output.stdout, gitlinks.into_values().collect()))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2077,12 +2104,12 @@ fn observe_initialized_submodules(
         [b"SUBMODULE_GITLINK_INDEX\0".as_slice(), relative_prefix].concat(),
         index_observation,
     ));
-    for (path_identity, index_oid) in gitlinks {
+    for gitlink in gitlinks {
         if std::time::Instant::now() >= deadline {
             return Err("Git submodule inspection exceeded its aggregate deadline".to_string());
         }
-        let relative_path = join_git_paths(relative_prefix, path_identity.as_bytes())?;
-        let submodule_path = repository.join(path_buf_from_git_bytes(path_identity.as_bytes()));
+        let relative_path = join_git_paths(relative_prefix, gitlink.path.as_bytes())?;
+        let submodule_path = repository.join(path_buf_from_git_bytes(gitlink.path.as_bytes()));
         if !submodule_path.is_dir() {
             continue;
         }
@@ -2109,7 +2136,7 @@ fn observe_initialized_submodules(
                 if populated {
                     observation.push((
                         [b"SUBMODULE_METADATA_MISSING\0".as_slice(), &relative_path].concat(),
-                        index_oid,
+                        gitlink.stage_zero_oid.unwrap_or_default(),
                     ));
                     observation.push((
                         [
@@ -2168,12 +2195,17 @@ fn observe_initialized_submodules(
         let submodule_head_oid = submodule_head.stdout.trim_ascii();
         observation.push((
             [b"SUBMODULE_GITLINK\0".as_slice(), relative_path.as_slice()].concat(),
-            [index_oid.as_slice(), b"\0", submodule_head_oid].concat(),
+            [
+                gitlink.stage_zero_oid.as_deref().unwrap_or_default(),
+                b"\0",
+                submodule_head_oid,
+            ]
+            .concat(),
         ));
         let detached_loss =
             detached_head_is_unreachable(&submodule_path, observation, &relative_path)?;
-        let gitlink_changed = submodule_head_oid != index_oid;
-        if gitlink_changed {
+        let gitlink_changed = gitlink.stage_zero_oid.as_deref() != Some(submodule_head_oid);
+        if gitlink_changed || gitlink.has_unmerged_stage {
             observation.push((
                 [
                     b"SUBMODULE_LOSS\0submodule\0".as_slice(),
@@ -3832,6 +3864,13 @@ fn observe_dirty_content(repository: &Path, losses: &[CloseLossItem]) -> Result<
             }
             Ok(metadata) if metadata.is_file() => {
                 observation.extend_from_slice(b"FILE_SHA256\0");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    observation.extend_from_slice(b"EXECUTABLE\0");
+                    observation.push(u8::from(metadata.permissions().mode() & 0o111 != 0));
+                    observation.push(0);
+                }
                 let mut file = std::fs::File::open(&filesystem_path)
                     .map_err(|error| format!("cannot open dirty file contents: {error}"))?;
                 let mut digest = Sha256::new();
@@ -4958,6 +4997,68 @@ mod tests {
         assert_ne!(first, second);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dirty_executable_bit_changes_invalidate_snapshot_without_content_change() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        initialize_repository(temp.path());
+        let tracked = temp.path().join("tracked");
+        std::fs::write(&tracked, "unchanged dirty payload\n").unwrap();
+        let identity = inspection_identity(temp.path());
+        let (first, first_losses) = inspect_worktree(&identity).await.unwrap();
+
+        let mut permissions = std::fs::metadata(&tracked).unwrap().permissions();
+        permissions.set_mode(permissions.mode() | 0o111);
+        std::fs::set_permissions(&tracked, permissions).unwrap();
+        let (second, second_losses) = inspect_worktree(&identity).await.unwrap();
+
+        assert_eq!(first_losses, second_losses);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn detached_unreachable_commits_excludes_the_exact_stash_ref() {
+        let temp = tempfile::tempdir().unwrap();
+        initialize_repository(temp.path());
+        std::fs::write(temp.path().join("tracked"), "stash me\n").unwrap();
+        run_git(
+            temp.path(),
+            &["stash", "push", "--quiet", "-m", "close-test"],
+        );
+        run_git(
+            temp.path(),
+            &["checkout", "--quiet", "--detach", "refs/stash"],
+        );
+        let head = phoenix_core::git::command()
+            .args(["rev-parse", "HEAD"])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+        assert!(head.status.success());
+
+        assert!(
+            super::detached_unreachable_commits(temp.path(), head.stdout.trim_ascii())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn detached_unreachable_commits_tolerates_an_absent_stash_ref() {
+        let temp = tempfile::tempdir().unwrap();
+        initialize_repository(temp.path());
+        let head = phoenix_core::git::command()
+            .args(["rev-parse", "HEAD"])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+        assert!(head.status.success());
+
+        assert!(super::detached_unreachable_commits(temp.path(), head.stdout.trim_ascii()).is_ok());
+    }
+
     #[tokio::test]
     async fn untracked_file_content_changes_invalidate_snapshot_without_status_shape_change() {
         let temp = tempfile::tempdir().unwrap();
@@ -5036,6 +5137,66 @@ mod tests {
             loss,
             CloseLossItem::UntrackedNonIgnoredPath(path)
                 if path.as_bytes() == b"deps/child/untracked"
+        )));
+    }
+
+    #[tokio::test]
+    async fn initialized_unmerged_gitlink_is_inspected_and_reported_as_loss() {
+        let temp = tempfile::tempdir().unwrap();
+        let child = temp.path().join("child-unmerged-gitlink");
+        let parent = temp.path().join("parent-unmerged-gitlink");
+        initialize_repository(&child);
+        initialize_repository(&parent);
+        let output = phoenix_core::git::command()
+            .args([
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "--quiet",
+                child.to_str().unwrap(),
+                "deps/child",
+            ])
+            .current_dir(&parent)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        run_git(&parent, &["commit", "--quiet", "-am", "add submodule"]);
+
+        let submodule = parent.join("deps/child");
+        std::fs::write(submodule.join("nested-untracked"), "must be inventoried\n").unwrap();
+        let oid = phoenix_core::git::command()
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&submodule)
+            .output()
+            .unwrap();
+        assert!(oid.status.success());
+        let oid = std::str::from_utf8(oid.stdout.trim_ascii()).unwrap();
+        run_git(&parent, &["update-index", "--remove", "deps/child"]);
+        for stage in [1, 2, 3] {
+            run_git(
+                &parent,
+                &[
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    &format!("160000,{oid},{stage}"),
+                    "deps/child",
+                ],
+            );
+        }
+
+        let (_, losses) = inspect_worktree(&inspection_identity(&parent))
+            .await
+            .unwrap();
+        assert!(losses.iter().any(|loss| matches!(
+            loss,
+            CloseLossItem::InitializedSubmoduleState(path) if path.as_bytes() == b"deps/child"
+        )));
+        assert!(losses.iter().any(|loss| matches!(
+            loss,
+            CloseLossItem::UntrackedNonIgnoredPath(path)
+                if path.as_bytes() == b"deps/child/nested-untracked"
         )));
     }
 
@@ -5506,7 +5667,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn top_level_status_probe_kills_git_at_its_deadline() {
+    fn top_level_status_probe_disables_configured_fsmonitor() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let temp = tempfile::tempdir().unwrap();
@@ -5532,36 +5693,18 @@ mod tests {
             &["config", "core.fsmonitor", hook.to_str().unwrap()],
         );
 
-        let error = run_bounded_git_status_until(
+        let status = run_bounded_git_status_until(
             temp.path(),
             std::time::Instant::now() + std::time::Duration::from_secs(2),
         )
-        .unwrap_err();
-        let marker_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while !marker.exists() && std::time::Instant::now() < marker_deadline {
-            // test-timing-allow: polling for the observable fsmonitor marker is the bounded process-start handshake
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        std::fs::remove_file(&gate).unwrap();
+        .unwrap();
 
-        assert_eq!(error, "Git status inspection exceeded its deadline");
-        assert!(marker.exists(), "fsmonitor hook was not exercised");
-        let hook_pid: i32 = std::fs::read_to_string(marker)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        let reaped_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while unsafe { libc::kill(hook_pid, 0) } == 0 && std::time::Instant::now() < reaped_deadline
-        {
-            // test-timing-allow: process absence is the observable deadline behavior under test
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        assert_ne!(
-            unsafe { libc::kill(hook_pid, 0) },
-            0,
-            "fsmonitor hook survived the Git status deadline"
+        assert!(status.status.success());
+        assert!(
+            !marker.exists(),
+            "authoritative Close inspection must not invoke the configured fsmonitor hook"
         );
+        assert!(gate.exists());
     }
 
     #[tokio::test]
