@@ -1228,7 +1228,7 @@ impl RuntimeManager {
             | ConvMode::Branch { .. }
             | ConvMode::Direct
             | ConvMode::DetachedApprovedTask { .. } => {}
-            ConvMode::Explore { .. } => {
+            ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. } => {
                 return Err(ForkResolveError::Conflict(
                     "the originating conversation is in Explore mode and cannot have a fork proposal"
                         .to_string(),

@@ -372,9 +372,10 @@ async fn process_claimed_product_creation(
         }
         (
             worktree.clone(),
-            ConvMode::Explore {
-                worktree_path: Some(non_empty),
-                next_taskmd_id_hint: None,
+            ConvMode::DetachedProductCreation {
+                worktree_path: non_empty,
+                base_branch: NonEmptyString::new(logical_base.clone())
+                    .map_err(|_| "logical base was empty".to_string())?,
             },
             phoenix_core::work_scope::AuthorityKind::RestrictedExplore,
             phoenix_core::work_scope::EnvironmentContext::AllocatedWorktree {
@@ -471,6 +472,27 @@ async fn process_claimed_product_creation(
     deliver_product_creation_objective(manager, &claimed).await
 }
 
+async fn expand_product_creation_objective(
+    manager: &RuntimeManager,
+    conversation_id: &str,
+    objective: &str,
+) -> Result<crate::send_chat_service::ExpandedDispatchMessage, String> {
+    let conversation = manager
+        .db()
+        .get_conversation(conversation_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    crate::send_chat_service::expand_message(
+        manager.db(),
+        conversation_id,
+        &conversation.cwd,
+        objective,
+        crate::send_chat_service::MessageExpansionPolicy::ExpandReferences,
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
 #[allow(clippy::too_many_lines)]
 async fn deliver_product_creation_objective(
     manager: &Arc<RuntimeManager>,
@@ -536,18 +558,20 @@ async fn deliver_product_creation_objective(
             media_type: image.media_type.clone(),
         })
         .collect();
+    let expanded =
+        expand_product_creation_objective(manager, &conversation_id, &job.intent.objective).await?;
     let enqueue_result = tokio::time::timeout(
         std::time::Duration::from_secs(15),
         manager.enqueue_steer_message(
             &conversation_id,
             Event::SteerMessage {
-                text: job.intent.objective.clone(),
-                llm_text: None,
+                text: expanded.display_text,
+                llm_text: expanded.llm_text,
                 images,
                 files: Vec::new(),
                 message_id: job.request_id.clone(),
                 user_agent: None,
-                skill_invocation: None,
+                skill_invocation: expanded.skill_invocation,
             },
             &format!("product-create:{}", job.request_id),
         ),
@@ -636,12 +660,6 @@ async fn cleanup_and_retry_unpublished_product_creation(
     } else {
         fallback_job
     };
-    let cleanup_lock = match cleanup_job.staging_repo_root.as_deref() {
-        Some(repo_root) => {
-            Some(RepositoryMutationLock::acquire(Path::new(repo_root)).map_err(|error| error.0)?)
-        }
-        None => None,
-    };
     if !manager
         .db()
         .renew_product_creation_claim(
@@ -666,9 +684,7 @@ async fn cleanup_and_retry_unpublished_product_creation(
             .find(|reservation| reservation.resource_identity == path)
             .and_then(|reservation| reservation.ownership_token.as_deref())
     });
-    let cleaned =
-        cleanup_unpublished_product_staging(manager, cleanup_job, ownership_token, cleanup_lock)
-            .await;
+    let cleaned = cleanup_unpublished_product_staging(manager, cleanup_job, ownership_token).await;
     if !cleaned {
         return Ok(());
     }
@@ -700,13 +716,11 @@ async fn cleanup_unpublished_product_staging(
     manager: &Arc<RuntimeManager>,
     job: &crate::db::ProductCreationJobRecord,
     ownership_token: Option<&str>,
-    cleanup_lock: Option<RepositoryMutationLock>,
 ) -> bool {
     let cleanup = cleanup_unpublished_product_staging_path(
         job.staging_path.as_deref(),
         job.staging_repo_root.as_deref(),
         ownership_token,
-        cleanup_lock,
     )
     .await;
     if matches!(
@@ -739,7 +753,6 @@ async fn cleanup_unpublished_product_staging_path(
     staging_path: Option<&str>,
     staging_repo_root: Option<&str>,
     ownership_token: Option<&str>,
-    cleanup_lock: Option<RepositoryMutationLock>,
 ) -> Result<Result<StagingCleanupOutcome, String>, tokio::task::JoinError> {
     let (Some(path), Some(repo_root)) = (
         staging_path.map(ToOwned::to_owned),
@@ -760,7 +773,15 @@ async fn cleanup_unpublished_product_staging_path(
                 ));
             }
         }
-        let _lock = cleanup_lock.ok_or_else(|| "cleanup repository lock missing".to_string())?;
+        let _lock = match RepositoryMutationLock::acquire(Path::new(&repo_root)) {
+            Ok(lock) => lock,
+            Err((_, _))
+                if missing_repository_and_resource(Path::new(&repo_root), Path::new(&path)) =>
+            {
+                return Ok(StagingCleanupOutcome::AlreadyAbsent);
+            }
+            Err((message, _)) => return Err(message),
+        };
         let Some(expected_owner) = ownership_token else {
             return Ok(StagingCleanupOutcome::OwnershipConflict(
                 StagingOwnershipConflict::MissingDurableToken,
@@ -827,24 +848,10 @@ async fn reconcile_product_creation_cleanup(
         if reservation.status == "released" {
             continue;
         }
-        let cleanup_lock =
-            match RepositoryMutationLock::acquire(Path::new(&reservation.repository_identity)) {
-                Ok(lock) => Some(lock),
-                Err((_, _))
-                    if missing_repository_and_resource(
-                        Path::new(&reservation.repository_identity),
-                        Path::new(&reservation.resource_identity),
-                    ) =>
-                {
-                    None
-                }
-                Err((message, _)) => return Err(message),
-            };
         let cleaned = cleanup_unpublished_product_staging_path(
             Some(&reservation.resource_identity),
             Some(&reservation.repository_identity),
             reservation.ownership_token.as_deref(),
-            cleanup_lock,
         )
         .await
         .map_err(|error| error.to_string())??;
@@ -2765,6 +2772,45 @@ mod product_creation_delivery_replay_tests {
     }
 
     #[tokio::test]
+    async fn initial_objective_expands_against_published_conversation_root() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("notes.md"), "published root contents").unwrap();
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation(
+            "expanded-product-objective",
+            "expanded-product-objective",
+            root.path().to_string_lossy().as_ref(),
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let manager = RuntimeManager::new(
+            db,
+            Arc::new(ModelRegistry::new_empty()),
+            PlatformCapability::None {
+                details: "test".into(),
+            },
+            Arc::new(McpClientManager::new()),
+            None,
+        );
+
+        let expanded = expand_product_creation_objective(
+            &manager,
+            "expanded-product-objective",
+            "Read @notes.md",
+        )
+        .await
+        .unwrap();
+        assert_eq!(expanded.display_text, "Read @notes.md");
+        assert!(expanded
+            .llm_text
+            .as_deref()
+            .is_some_and(|text| text.contains("published root contents")));
+    }
+
+    #[tokio::test]
     async fn exact_fingerprint_replay_with_stale_delivery_claim_remains_pending() {
         let db = Database::open_in_memory().await.unwrap();
         let intent = ProductCreationIntent {
@@ -3007,13 +3053,11 @@ mod product_creation_staging_ownership_tests {
         let path = repo.path().join(".phoenix/worktrees/owned");
         add_detached_worktree(repo.path(), &path);
         write_product_creation_owner_marker(&path, "owner-token").unwrap();
-        let lock = RepositoryMutationLock::acquire(repo.path()).unwrap();
 
         let outcome = cleanup_unpublished_product_staging_path(
             Some(path.to_string_lossy().as_ref()),
             Some(repo.path().to_string_lossy().as_ref()),
             Some("owner-token"),
-            Some(lock),
         )
         .await
         .unwrap()
@@ -3032,7 +3076,6 @@ mod product_creation_staging_ownership_tests {
             Some(path.to_string_lossy().as_ref()),
             Some(root.path().to_string_lossy().as_ref()),
             Some("owner-token"),
-            None,
         )
         .await
         .unwrap()
@@ -3060,13 +3103,11 @@ mod product_creation_staging_ownership_tests {
         add_detached_worktree(repo.path(), &path);
         let replacement_file = path.join("replacement-owned-by-user");
         std::fs::write(&replacement_file, "preserve me").unwrap();
-        let lock = RepositoryMutationLock::acquire(repo.path()).unwrap();
 
         let outcome = cleanup_unpublished_product_staging_path(
             Some(path.to_string_lossy().as_ref()),
             Some(repo.path().to_string_lossy().as_ref()),
             Some("original-owner"),
-            Some(lock),
         )
         .await
         .unwrap()

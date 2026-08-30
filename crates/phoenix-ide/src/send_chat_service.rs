@@ -432,10 +432,10 @@ fn active_turn_fences_direct_acceptance(state: &ConvState, active_turn: bool) ->
     active_turn && matches!(state, ConvState::Idle)
 }
 
-struct ExpandedDispatchMessage {
-    display_text: String,
-    llm_text: Option<String>,
-    skill_invocation: Option<SkillInvocation>,
+pub(crate) struct ExpandedDispatchMessage {
+    pub(crate) display_text: String,
+    pub(crate) llm_text: Option<String>,
+    pub(crate) skill_invocation: Option<SkillInvocation>,
 }
 
 async fn validate_files(
@@ -461,7 +461,7 @@ async fn expand_request(
     .await
 }
 
-async fn expand_message(
+pub(crate) async fn expand_message(
     db: &crate::db::Database,
     conversation_id: &str,
     cwd: &str,
@@ -740,7 +740,11 @@ async fn lookup_durable_steering_replay(
                 SteeringAcceptanceFingerprint::Exact(_) => {
                     validate_steering_fingerprint(&receipt, request_fingerprint)?;
                 }
-                SteeringAcceptanceFingerprint::LegacyUnknown => {}
+                SteeringAcceptanceFingerprint::LegacyUnknown => {
+                    if req.expansion_policy != MessageExpansionPolicy::ExpandReferences {
+                        return Err(SendChatServiceError::IdempotencyConflict);
+                    }
+                }
             }
         }
         return Ok(Some(outcome));
@@ -1478,6 +1482,25 @@ mod tests {
         persist_drained_legacy_steering(&db, &req).await;
         let mut changed = req;
         changed.text = "different durable content".to_string();
+
+        assert!(matches!(
+            lookup_durable_steering_replay(
+                &db,
+                &changed,
+                &super::request_fingerprint(&changed).unwrap(),
+            )
+            .await,
+            Err(SendChatServiceError::IdempotencyConflict)
+        ));
+    }
+
+    #[tokio::test]
+    async fn drained_legacy_steering_conflicts_when_expansion_policy_changes() {
+        let req = request();
+        let db = db_with_conversation(&req.conversation_id).await;
+        persist_drained_legacy_steering(&db, &req).await;
+        let mut changed = req;
+        changed.expansion_policy = MessageExpansionPolicy::LiteralText;
 
         assert!(matches!(
             lookup_durable_steering_replay(

@@ -78,6 +78,7 @@ mod tests {
                 ConvMode::Explore { .. }
                 | ConvMode::Direct
                 | ConvMode::Branch { .. }
+                | ConvMode::DetachedProductCreation { .. }
                 | ConvMode::DetachedApprovedTask { .. } => {
                     prop_assert!(false, "Expected Work mode");
                 }
@@ -95,6 +96,7 @@ mod tests {
                 ConvMode::Explore { .. }
                 | ConvMode::Direct
                 | ConvMode::Branch { .. }
+                | ConvMode::DetachedProductCreation { .. }
                 | ConvMode::DetachedApprovedTask { .. } => {
                     prop_assert!(false, "Expected Work mode");
                 }
@@ -112,6 +114,7 @@ mod tests {
                 ConvMode::Explore { .. }
                 | ConvMode::Direct
                 | ConvMode::Branch { .. }
+                | ConvMode::DetachedProductCreation { .. }
                 | ConvMode::DetachedApprovedTask { .. } => {
                     prop_assert!(false, "Expected Work mode");
                 }
@@ -138,6 +141,7 @@ mod tests {
                 ConvMode::Explore { .. }
                 | ConvMode::Direct
                 | ConvMode::Work { .. }
+                | ConvMode::DetachedProductCreation { .. }
                 | ConvMode::DetachedApprovedTask { .. } => {
                     prop_assert!(false, "Expected Branch mode");
                 }
@@ -155,6 +159,7 @@ mod tests {
                 ConvMode::Explore { .. }
                 | ConvMode::Direct
                 | ConvMode::Work { .. }
+                | ConvMode::DetachedProductCreation { .. }
                 | ConvMode::DetachedApprovedTask { .. } => {
                     prop_assert!(false, "Expected Branch mode");
                 }

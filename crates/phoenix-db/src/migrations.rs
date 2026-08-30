@@ -8778,6 +8778,8 @@ CREATE TABLE product_creation_jobs (
     last_error TEXT CHECK (last_error IS NULL OR typeof(last_error) = 'text'),
     cancelled_at_unix_micros INTEGER CHECK (cancelled_at_unix_micros IS NULL OR (typeof(cancelled_at_unix_micros) = 'integer' AND cancelled_at_unix_micros >= 0)),
     deletion_requested_at_unix_micros INTEGER CHECK (deletion_requested_at_unix_micros IS NULL OR (typeof(deletion_requested_at_unix_micros) = 'integer' AND deletion_requested_at_unix_micros >= 0)),
+    CHECK ((pin_exact_checkout_oid IS NULL AND pin_logical_base IS NULL AND pin_freshness IS NULL)
+        OR (pin_exact_checkout_oid IS NOT NULL AND pin_logical_base IS NOT NULL AND pin_freshness = 'fresh')),
     CHECK ((status = 'accepted' AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until_unix_micros IS NULL AND retry_at_unix_micros IS NULL AND cleanup_worker_id IS NULL AND cleanup_token IS NULL AND cleanup_lease_until_unix_micros IS NULL AND published_product_id IS NULL AND published_conversation_id IS NULL AND cancelled_at_unix_micros IS NULL AND deletion_requested_at_unix_micros IS NULL)
         OR (status = 'claimed' AND claim_worker_id IS NOT NULL AND claim_token IS NOT NULL AND claim_lease_until_unix_micros IS NOT NULL AND retry_at_unix_micros IS NULL AND cleanup_worker_id IS NULL AND cleanup_token IS NULL AND cleanup_lease_until_unix_micros IS NULL AND published_product_id IS NULL AND published_conversation_id IS NULL AND cancelled_at_unix_micros IS NULL AND deletion_requested_at_unix_micros IS NULL)
         OR (status = 'retry_scheduled' AND claim_worker_id IS NULL AND claim_token IS NULL AND claim_lease_until_unix_micros IS NULL AND retry_at_unix_micros IS NOT NULL AND cleanup_worker_id IS NULL AND cleanup_token IS NULL AND cleanup_lease_until_unix_micros IS NULL AND published_product_id IS NULL AND published_conversation_id IS NULL AND cancelled_at_unix_micros IS NULL AND deletion_requested_at_unix_micros IS NULL)
@@ -8799,6 +8801,17 @@ CREATE INDEX product_creation_jobs_delivery_order
     ON product_creation_jobs(status, delivery_retry_at_unix_micros, updated_at_unix_micros, request_id);
 CREATE INDEX product_creation_jobs_published_cwd
     ON product_creation_jobs(status, cwd, updated_at_unix_micros DESC, request_id DESC);
+CREATE TRIGGER product_creation_checkout_pin_immutable
+BEFORE UPDATE OF pin_exact_checkout_oid, pin_logical_base, pin_freshness ON product_creation_jobs
+WHEN OLD.pin_exact_checkout_oid IS NOT NULL AND (
+    NEW.pin_exact_checkout_oid IS NULL
+    OR NEW.pin_exact_checkout_oid <> OLD.pin_exact_checkout_oid
+    OR NEW.pin_logical_base <> OLD.pin_logical_base
+    OR NEW.pin_freshness <> OLD.pin_freshness
+)
+BEGIN
+    SELECT RAISE(ABORT, 'product creation checkout pin is immutable after first set');
+END;
 
 CREATE TABLE product_creation_job_images (
     request_id TEXT NOT NULL REFERENCES product_creation_jobs(request_id) ON DELETE CASCADE,

@@ -2009,6 +2009,7 @@ pub(crate) fn cleanup_branch_for_unretained_work_scope<'a>(
         ConvMode::Explore { .. }
         | ConvMode::Direct
         | ConvMode::Branch { .. }
+        | ConvMode::DetachedProductCreation { .. }
         | ConvMode::DetachedApprovedTask { .. } => None,
     }) {
         if crate::git_ops::run_git(worktree_path, &["symbolic-ref", "-q", "HEAD"]).is_err() {
@@ -3918,6 +3919,7 @@ impl RuntimeManager {
             ConvMode::Direct => ModeKind::Direct,
             ConvMode::Explore { .. }
             | ConvMode::Work { .. }
+            | ConvMode::DetachedProductCreation { .. }
             | ConvMode::DetachedApprovedTask { .. } => ModeKind::Managed,
             ConvMode::Branch { .. } => ModeKind::Branch,
         };
@@ -4915,6 +4917,7 @@ impl RuntimeManager {
             ConvMode::Direct => ModeKind::Direct,
             ConvMode::Explore { .. }
             | ConvMode::Work { .. }
+            | ConvMode::DetachedProductCreation { .. }
             | ConvMode::DetachedApprovedTask { .. } => ModeKind::Managed,
             ConvMode::Branch { .. } => ModeKind::Branch,
         };
@@ -5035,7 +5038,7 @@ impl RuntimeManager {
                             .map_err(|error| error.clone())?,
                         None,
                     ),
-                    ConvMode::Explore { .. } => (
+                    ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. } => (
                         ToolRegistry::explore(
                             &context.tasks_dir_name,
                             agent_catalog.to_vec(),
@@ -6234,6 +6237,9 @@ pub(crate) fn conv_mode_to_context(mode: &ConvMode) -> ModeContext {
             branch_name: branch_name.to_string(),
             base_branch: base_branch.to_string(),
             worktree_path: worktree_path.to_string(),
+        },
+        ConvMode::DetachedProductCreation { .. } => ModeContext::Explore {
+            next_taskmd_id_hint: None,
         },
         ConvMode::DetachedApprovedTask {
             base_branch,

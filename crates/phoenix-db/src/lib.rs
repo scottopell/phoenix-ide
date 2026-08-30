@@ -6801,7 +6801,9 @@ impl Database {
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
         let authority = match mode {
-            ConvMode::Explore { .. } => AuthorityKind::RestrictedExplore,
+            ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. } => {
+                AuthorityKind::RestrictedExplore
+            }
             ConvMode::Direct
             | ConvMode::Work { .. }
             | ConvMode::Branch { .. }
@@ -8889,7 +8891,9 @@ impl Database {
                     }
 
                     let authority = match mode {
-                        ConvMode::Explore { .. } => AuthorityKind::RestrictedExplore,
+                        ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. } => {
+                            AuthorityKind::RestrictedExplore
+                        }
                         ConvMode::Direct
                         | ConvMode::Work { .. }
                         | ConvMode::Branch { .. }
@@ -11718,6 +11722,18 @@ fn conv_mode_columns(mode: &ConvMode) -> ConvModeCols<'_> {
             task_title: None,
             next_taskmd_id_hint: None,
         },
+        ConvMode::DetachedProductCreation {
+            worktree_path,
+            base_branch,
+        } => ConvModeCols {
+            kind: "detached_product_creation",
+            branch_name: None,
+            worktree_path: Some(worktree_path.as_str()),
+            base_branch: Some(base_branch.as_str()),
+            task_id: None,
+            task_title: None,
+            next_taskmd_id_hint: None,
+        },
         ConvMode::DetachedApprovedTask {
             worktree_path,
             base_branch,
@@ -11786,6 +11802,19 @@ fn conv_mode_from_row(row: &SqliteRow, conv_id: &str) -> ConvMode {
                 }
             } else {
                 tracing::warn!(conv_id = %conv_id, "branch conv_mode row missing required fields, defaulting to Explore");
+                ConvMode::default()
+            }
+        }
+        Some("detached_product_creation") => {
+            if let (Some(worktree_path), Some(base_branch)) =
+                (ne_env("env_worktree_path"), ne_env("env_base_branch"))
+            {
+                ConvMode::DetachedProductCreation {
+                    worktree_path,
+                    base_branch,
+                }
+            } else {
+                tracing::warn!(conv_id = %conv_id, "detached product creation row missing required fields, defaulting to Explore");
                 ConvMode::default()
             }
         }

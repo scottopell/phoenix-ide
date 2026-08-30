@@ -52,15 +52,24 @@ pub(crate) async fn resolve_resource_authority(
             let (authority, lifecycle, environment) = db
                 .get_conversation_work_scope_context(&conversation.id)
                 .await?;
+            let authority = if conversation.runtime_role == RuntimeRole::SubAgent
+                && matches!(conversation.conv_mode, ConvMode::Explore { .. })
+            {
+                ResourceAuthority::Restricted
+            } else {
+                authority.into()
+            };
             (
                 ResourceScopeKey::Work(work_scope_id.clone()),
-                authority.into(),
+                authority,
                 Some(lifecycle),
                 Some(environment),
             )
         } else {
             let authority = match conversation.conv_mode {
-                ConvMode::Explore { .. } => ResourceAuthority::Restricted,
+                ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. } => {
+                    ResourceAuthority::Restricted
+                }
                 ConvMode::Direct
                 | ConvMode::Work { .. }
                 | ConvMode::Branch { .. }
@@ -179,6 +188,40 @@ pub(crate) mod tests {
             resolved.scope,
             ResourceScopeKey::Unattached(child.id.clone())
         );
+        assert_eq!(resolved.authority, ResourceAuthority::Restricted);
+    }
+
+    #[tokio::test]
+    async fn attached_explore_subagent_stays_restricted_on_work_scope() {
+        let db = Database::open_in_memory().await.unwrap();
+        let parent_id = uuid::Uuid::new_v4().to_string();
+        db.create_conversation(&parent_id, "parent", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.persist_approved_task_authority(&parent_id, &approval())
+            .await
+            .unwrap();
+        let parent = db.get_conversation(&parent_id).await.unwrap();
+        let scope = parent.attached_work_scope_id.clone().unwrap();
+        let child = db
+            .create_subagent_conversation(
+                "attached-explore-child",
+                "attached-explore-child",
+                "/tmp",
+                &parent_id,
+                "gpt-5.4",
+                &ConvMode::Explore {
+                    worktree_path: None,
+                    next_taskmd_id_hint: None,
+                },
+                phoenix_core::llm_language::LlmLanguage::default(),
+                Some(&scope),
+            )
+            .await
+            .unwrap();
+
+        let resolved = resolve_resource_authority(&db, &child).await.unwrap();
+        assert_eq!(resolved.scope, ResourceScopeKey::Work(scope));
         assert_eq!(resolved.authority, ResourceAuthority::Restricted);
     }
 
