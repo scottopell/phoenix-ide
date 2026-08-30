@@ -434,7 +434,11 @@ pub async fn archive_chain_handler(
         .map_err(db_to_app)?;
     if matches!(
         active.conv_mode,
-        ConvMode::Work { .. } | ConvMode::Branch { .. }
+        ConvMode::Explore {
+            worktree_path: Some(_),
+            ..
+        } | ConvMode::Work { .. }
+            | ConvMode::Branch { .. }
     ) {
         super::lifecycle_handlers::close_legacy_compat(&state, active_id, "archive chain").await?;
     } else {

@@ -30,10 +30,12 @@ use phoenix_tools::{
 use super::creation_worker::RepositoryMutationLock;
 use super::RuntimeManager;
 use crate::db::{
+    BindCloseWorktreeFinalTombstoneObjectRequest, BindCloseWorktreeFinalTombstoneRequest,
     CaptureCloseRetirementInventoryRequest, CaptureCloseRetirementInventoryScopeRequest,
-    RecordCloseRetirementDispatchRequest, RecordCloseRetirementEvidenceRequest,
-    RecordCloseWorktreeCleanupPlanRequest, ReplaceCloseInspectionRequest,
-    ReplaceCloseInspectionScopeRequest, RouteCloseAttemptToRepairRequest,
+    CloseWorktreeFinalTombstone, RecordCloseRetirementDispatchRequest,
+    RecordCloseRetirementEvidenceRequest, RecordCloseWorktreeCleanupPlanRequest,
+    ReplaceCloseInspectionRequest, ReplaceCloseInspectionScopeRequest,
+    RouteCloseAttemptToRepairRequest,
 };
 
 /// Process-local capability retained from inventory sealing through per-resource
@@ -1179,6 +1181,55 @@ impl RuntimeManager {
                     };
                     let captured_path = worktree_path(identity);
                     let quarantine_path = worktree_quarantine_path(identity)?;
+                    let existing_cleanup_plan = self
+                        .db()
+                        .close_worktree_cleanup_plan(attempt_id, &scope, snapshot, &target.resource)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    if let Some(cleanup_plan) = existing_cleanup_plan
+                        .as_ref()
+                        .filter(|plan| plan.final_tombstone.is_some())
+                    {
+                        let identity = identity.clone();
+                        let cleanup_plan = cleanup_plan.clone();
+                        let recovery = tokio::task::spawn_blocking(move || {
+                            resume_final_worktree_tombstone(
+                                cleanup_plan
+                                    .final_tombstone
+                                    .as_ref()
+                                    .expect("filtered above"),
+                                identity.fingerprint().as_str(),
+                            )?;
+                            complete_persisted_worktree_administrative_cleanup(
+                                &identity,
+                                &cleanup_plan.administrative_dir,
+                                &cleanup_plan.administrative_dir_incarnation,
+                            )
+                        })
+                        .await
+                        .map_err(|error| error.to_string())?;
+                        if let Err(detail) = recovery {
+                            return self
+                                .record_close_residual(
+                                    attempt_id,
+                                    snapshot,
+                                    &scope,
+                                    target.resource.clone(),
+                                    RetirementFailureReason::IdentityNotProven,
+                                    &detail,
+                                )
+                                .await;
+                        }
+                        self.record_close_absence_adopted(
+                            attempt_id,
+                            snapshot,
+                            &scope,
+                            target.resource.clone(),
+                            "resumed the exact recorded private final tombstone and administrative cleanup",
+                        )
+                        .await?;
+                        continue;
+                    }
                     let worktree_absent =
                         match both_worktree_paths_absent(&captured_path, &quarantine_path) {
                             Ok(absent) => absent,
@@ -1242,6 +1293,12 @@ impl RuntimeManager {
                         }
                         let identity = identity.clone();
                         let recovery = tokio::task::spawn_blocking(move || {
+                            if let Some(tombstone) = &cleanup_plan.final_tombstone {
+                                resume_final_worktree_tombstone(
+                                    tombstone,
+                                    identity.fingerprint().as_str(),
+                                )?;
+                            }
                             complete_persisted_worktree_administrative_cleanup(
                                 &identity,
                                 &cleanup_plan.administrative_dir,
@@ -1321,17 +1378,7 @@ impl RuntimeManager {
                                 .await;
                             }
                         }
-                        let cleanup_plan = if let Some(plan) = self
-                            .db()
-                            .close_worktree_cleanup_plan(
-                                attempt_id,
-                                &scope,
-                                snapshot,
-                                &target.resource,
-                            )
-                            .await
-                            .map_err(|error| error.to_string())?
-                        {
+                        let cleanup_plan = if let Some(plan) = existing_cleanup_plan {
                             plan
                         } else {
                             let identity = identity.clone();
@@ -1368,22 +1415,65 @@ impl RuntimeManager {
                             crate::db::CloseWorktreeCleanupPlan {
                                 administrative_dir: discovered.0,
                                 administrative_dir_incarnation: discovered.1,
+                                final_tombstone: None,
                             }
                         };
                         let identity = identity.clone();
                         let confirmed_snapshot = confirmed.snapshot.clone();
+                        let db = self.db().clone();
+                        let attempt = attempt_id.clone();
+                        let scope_for_tombstone = scope.clone();
+                        let resource_for_tombstone = target.resource.clone();
+                        let snapshot_for_tombstone = snapshot.clone();
                         let runtime = tokio::runtime::Handle::current();
-                        let final_removal = tokio::task::spawn_blocking(move || {
-                            inspect_and_remove_exact_worktree(
-                                &runtime,
-                                &identity,
-                                &confirmed_snapshot,
-                                &cleanup_plan.administrative_dir,
-                                &cleanup_plan.administrative_dir_incarnation,
-                            )
-                        })
-                        .await
-                        .map_err(|error| error.to_string())?;
+                        let persistence_runtime = runtime.clone();
+                        let final_removal =
+                            tokio::task::spawn_blocking(move || {
+                                inspect_and_remove_exact_worktree(
+                                    &runtime,
+                                    &identity,
+                                    &confirmed_snapshot,
+                                    &cleanup_plan.administrative_dir,
+                                    &cleanup_plan.administrative_dir_incarnation,
+                                    cleanup_plan.final_tombstone.as_ref(),
+                                    move |root, (device, inode), object| {
+                                        if let Some((object_device, object_inode)) = object {
+                                            persistence_runtime
+                                            .block_on(db.bind_close_worktree_final_tombstone_object(
+                                                BindCloseWorktreeFinalTombstoneObjectRequest {
+                                                    attempt_id: attempt.clone(),
+                                                    scope: scope_for_tombstone.clone(),
+                                                    snapshot: snapshot_for_tombstone.clone(),
+                                                    resource: resource_for_tombstone.clone(),
+                                                    object_device,
+                                                    object_inode,
+                                                },
+                                            ))
+                                            .map_err(|error| error.to_string())
+                                        } else {
+                                            persistence_runtime
+                                                .block_on(db.bind_close_worktree_final_tombstone(
+                                                    BindCloseWorktreeFinalTombstoneRequest {
+                                                        attempt_id: attempt.clone(),
+                                                        scope: scope_for_tombstone.clone(),
+                                                        snapshot: snapshot_for_tombstone.clone(),
+                                                        resource: resource_for_tombstone.clone(),
+                                                        tombstone: CloseWorktreeFinalTombstone {
+                                                            root: root.to_path_buf(),
+                                                            device,
+                                                            inode,
+                                                            object_device: None,
+                                                            object_inode: None,
+                                                        },
+                                                    },
+                                                ))
+                                                .map_err(|error| error.to_string())
+                                        }
+                                    },
+                                )
+                            })
+                            .await
+                            .map_err(|error| error.to_string())?;
                         let fresh_snapshot: Option<CloseRetirementSnapshot> = match final_removal {
                             Ok(ExactWorktreeRemoval::Retired) => {
                                 self.record_close_retired(
@@ -1715,6 +1805,19 @@ async fn inspect_worktree_at(
     }
     let mut observation = canonical_status_observation(&output.stdout);
     let mut losses = parse_status_losses(&output.stdout);
+    let hidden_path = path.clone();
+    let hidden_dirty =
+        tokio::task::spawn_blocking(move || observe_hidden_worktree_changes(&hidden_path))
+            .await
+            .map_err(|error| error.to_string())??;
+    for path in hidden_dirty {
+        observation.extend_from_slice(b"HIDDEN_UNSTAGED\\0");
+        observation.extend_from_slice(path.as_bytes());
+        observation.push(0);
+        losses.push(CloseLossItem::UnstagedTrackedPath(path));
+    }
+    losses.sort_by_key(|loss| (loss.category().as_str(), loss.identity().value()));
+    losses.dedup();
     let content_path = path.clone();
     let content_losses = losses.clone();
     let content_observation =
@@ -1977,15 +2080,70 @@ fn run_bounded_git_status_until(
         use std::os::unix::process::CommandExt as _;
         command.process_group(0);
     }
+    run_bounded_spawned_git(command, deadline, "Git status inspection")
+}
+
+fn run_bounded_git_command_until(
+    repository: &Path,
+    arguments: &[&str],
+    index: Option<&Path>,
+    deadline: std::time::Instant,
+    operation: &str,
+) -> Result<std::process::Output, String> {
+    let mut command = phoenix_core::git::command_with_config(&[("core.fsmonitor", "false")]);
+    command
+        .args(arguments)
+        .current_dir(repository)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(index) = index {
+        command.env("GIT_INDEX_FILE", index);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    run_bounded_spawned_git(command, deadline, operation)
+}
+
+fn run_bounded_git_paths_until(
+    repository: &Path,
+    arguments: &[&str],
+    paths: &[Vec<u8>],
+    literal_pathspec: bool,
+    index: &Path,
+    deadline: std::time::Instant,
+    operation: &str,
+) -> Result<std::process::Output, String> {
+    // `Command::args` accepts path OsStrings, preserving bytes on Unix.
+    let mut command = phoenix_core::git::command_with_config(&[("core.fsmonitor", "false")]);
+    command
+        .args(arguments)
+        .args(paths.iter().map(|path| path_buf_from_git_bytes(path)))
+        .current_dir(repository)
+        .env("GIT_INDEX_FILE", index)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if literal_pathspec {
+        command.env("GIT_LITERAL_PATHSPECS", "1");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    run_bounded_spawned_git(command, deadline, operation)
+}
+
+fn run_bounded_spawned_git(
+    mut command: std::process::Command,
+    deadline: std::time::Instant,
+    operation: &str,
+) -> Result<std::process::Output, String> {
     let mut child = command.spawn().map_err(|error| error.to_string())?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or("Git status stdout was not piped")?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or("Git status stderr was not piped")?;
+    let stdout = child.stdout.take().ok_or("Git stdout was not piped")?;
+    let stderr = child.stderr.take().ok_or("Git stderr was not piped")?;
     let stdout_reader = std::thread::spawn(move || {
         let mut bytes = Vec::new();
         std::io::Read::read_to_end(&mut std::io::BufReader::new(stdout), &mut bytes).map(|_| bytes)
@@ -2002,7 +2160,7 @@ fn run_bounded_git_status_until(
             #[cfg(unix)]
             unsafe {
                 let process_group = i32::try_from(child.id())
-                    .map_err(|error| format!("Git status process id overflow: {error}"))?;
+                    .map_err(|error| format!("Git process id overflow: {error}"))?;
                 libc::kill(-process_group, libc::SIGKILL);
             }
             #[cfg(not(unix))]
@@ -2010,17 +2168,17 @@ fn run_bounded_git_status_until(
             child.wait().map_err(|error| error.to_string())?;
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
-            return Err("Git status inspection exceeded its deadline".to_string());
+            return Err(format!("{operation} exceeded its deadline"));
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
     let stdout = stdout_reader
         .join()
-        .map_err(|_| "Git status stdout reader panicked".to_string())?
+        .map_err(|_| "Git stdout reader panicked".to_string())?
         .map_err(|error| error.to_string())?;
     let stderr = stderr_reader
         .join()
-        .map_err(|_| "Git status stderr reader panicked".to_string())?
+        .map_err(|_| "Git stderr reader panicked".to_string())?
         .map_err(|error| error.to_string())?;
     Ok(std::process::Output {
         status,
@@ -2159,7 +2317,7 @@ fn observe_initialized_submodules(
         let canonical = submodule_path
             .canonicalize()
             .map_err(|error| error.to_string())?;
-        if !visited.insert(canonical) {
+        if !visited.insert(canonical.clone()) {
             return Err("initialized submodule graph contains a cycle".to_string());
         }
 
@@ -2171,7 +2329,13 @@ fn observe_initialized_submodules(
                 String::from_utf8_lossy(&status.stderr).trim()
             ));
         }
-        let submodule_losses = parse_status_losses(&status.stdout);
+        let mut submodule_losses = parse_status_losses(&status.stdout);
+        for hidden in observe_hidden_worktree_changes(&submodule_path)? {
+            let loss = CloseLossItem::UnstagedTrackedPath(hidden);
+            if !submodule_losses.contains(&loss) {
+                submodule_losses.push(loss);
+            }
+        }
         let mut submodule_status = canonical_status_observation(&status.stdout);
         submodule_status
             .extend_from_slice(&observe_dirty_content(&submodule_path, &submodule_losses)?);
@@ -2180,11 +2344,28 @@ fn observe_initialized_submodules(
             submodule_status,
         ));
 
+        let symbolic_head = phoenix_core::git::command()
+            .args(["symbolic-ref", "-q", "HEAD"])
+            .current_dir(&submodule_path)
+            .output()
+            .map_err(|error| error.to_string())?;
         let submodule_head = phoenix_core::git::command()
             .args(["rev-parse", "--verify", "HEAD"])
             .current_dir(&submodule_path)
             .output()
             .map_err(|error| error.to_string())?;
+        if !submodule_head.status.success() && symbolic_head.status.success() {
+            observation.push((
+                [
+                    b"SUBMODULE_HEAD_SYMBOLIC\0".as_slice(),
+                    relative_path.as_slice(),
+                ]
+                .concat(),
+                symbolic_head.stdout.trim_ascii().to_vec(),
+            ));
+            visited.remove(&canonical);
+            continue;
+        }
         if !submodule_head.status.success() {
             return Err(format!(
                 "cannot inspect initialized submodule gitlink {}: {}",
@@ -2342,19 +2523,26 @@ enum ExactWorktreeRemoval {
     Residual { detail: String },
 }
 
-fn inspect_and_remove_exact_worktree(
+fn inspect_and_remove_exact_worktree<B>(
     runtime: &tokio::runtime::Handle,
     identity: &WorktreeIdentity,
     confirmed_snapshot: &CloseRetirementSnapshot,
     administrative_dir: &Path,
     administrative_dir_incarnation: &str,
-) -> Result<ExactWorktreeRemoval, String> {
+    final_tombstone: Option<&CloseWorktreeFinalTombstone>,
+    bind_tombstone: B,
+) -> Result<ExactWorktreeRemoval, String>
+where
+    B: FnMut(&Path, (u64, u64), Option<(u64, u64)>) -> Result<(), String> + Send + 'static,
+{
     inspect_and_remove_exact_worktree_with_hook_and_plan(
         runtime,
         identity,
         confirmed_snapshot,
         administrative_dir,
         administrative_dir_incarnation,
+        final_tombstone,
+        bind_tombstone,
         |_| {},
     )
 }
@@ -2382,20 +2570,26 @@ where
         confirmed_snapshot,
         &administrative_dir,
         &administrative_dir_incarnation,
+        None,
+        |_, _, _| Ok(()),
         after_quarantine,
     )
 }
 
-fn inspect_and_remove_exact_worktree_with_hook_and_plan<F>(
+#[allow(clippy::too_many_arguments)]
+fn inspect_and_remove_exact_worktree_with_hook_and_plan<F, B>(
     runtime: &tokio::runtime::Handle,
     identity: &WorktreeIdentity,
     confirmed_snapshot: &CloseRetirementSnapshot,
     administrative_dir: &Path,
     administrative_dir_incarnation: &str,
+    final_tombstone: Option<&CloseWorktreeFinalTombstone>,
+    bind_tombstone: B,
     after_quarantine: F,
 ) -> Result<ExactWorktreeRemoval, String>
 where
     F: FnOnce(&Path) + Send + 'static,
+    B: FnMut(&Path, (u64, u64), Option<(u64, u64)>) -> Result<(), String> + Send + 'static,
 {
     let path = worktree_path(identity);
     let quarantine = worktree_quarantine_path(identity)?;
@@ -2429,6 +2623,8 @@ where
         identity,
         administrative_dir.to_path_buf(),
         administrative_dir_incarnation.to_string(),
+        final_tombstone.cloned(),
+        bind_tombstone,
         after_quarantine,
     ))
 }
@@ -2717,38 +2913,69 @@ where
     result
 }
 
-#[allow(
-    clippy::cast_sign_loss,
-    clippy::too_many_lines,
-    clippy::unnecessary_cast,
-    reason = "libc stat field signedness and width vary across supported Unix targets"
-)]
-fn remove_identity_bound_directory<F, A, O>(
-    deletion_target: &Path,
-    expected_identity: &str,
-    observe_identity: O,
-    before_final_move: F,
-    after_identity_observation: A,
-    description: &str,
-) -> Result<(), String>
-where
-    F: FnOnce(&Path),
-    A: FnOnce(&Path, &Path),
-    O: Fn(&Path) -> Result<String, String>,
-{
-    before_final_move(deletion_target);
-    let parent = deletion_target
-        .parent()
-        .ok_or_else(|| format!("{description} has no parent directory"))?;
-    let tombstone_root = parent.join(format!(".phoenix-delete-{}", uuid::Uuid::new_v4().simple()));
+fn reserve_private_tombstone(root: &Path, description: &str) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt as _;
         let mut builder = std::fs::DirBuilder::new();
         builder
             .mode(0o700)
-            .create(&tombstone_root)
-            .map_err(|error| format!("cannot reserve private {description} tombstone: {error}"))?;
+            .create(root)
+            .map_err(|error| format!("cannot reserve private {description} tombstone: {error}"))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, description);
+        Err("identity-bound deletion is unsupported on this platform".to_string())
+    }
+}
+
+#[cfg(unix)]
+fn tombstone_identity(root: &Path) -> Result<(u64, u64), String> {
+    use std::os::unix::fs::MetadataExt as _;
+    let metadata = std::fs::symlink_metadata(root)
+        .map_err(|error| format!("cannot identify private final tombstone: {error}"))?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+#[allow(
+    clippy::cast_sign_loss,
+    clippy::too_many_lines,
+    clippy::unnecessary_cast,
+    reason = "libc stat field signedness and width vary across supported Unix targets"
+)]
+#[allow(clippy::too_many_arguments)]
+fn remove_identity_bound_directory<F, B, A, O>(
+    deletion_target: &Path,
+    tombstone_root: Option<&Path>,
+    expected_identity: &str,
+    observe_identity: O,
+    before_final_move: F,
+    mut bind_root: B,
+    after_identity_observation: A,
+    description: &str,
+) -> Result<(), String>
+where
+    F: FnOnce(&Path),
+    B: FnMut(&Path, (u64, u64), Option<(u64, u64)>) -> Result<(), String>,
+    A: FnOnce(&Path, &Path) -> Result<(), String>,
+    O: Fn(&Path) -> Result<String, String>,
+{
+    before_final_move(deletion_target);
+    let parent = deletion_target
+        .parent()
+        .ok_or_else(|| format!("{description} has no parent directory"))?;
+    let tombstone_root = tombstone_root.map_or_else(
+        || parent.join(format!(".phoenix-delete-{}", uuid::Uuid::new_v4().simple())),
+        Path::to_path_buf,
+    );
+    if tombstone_root.parent() != Some(parent) {
+        return Err(format!(
+            "private {description} tombstone is outside deletion parent"
+        ));
+    }
+    if !tombstone_root.exists() {
+        reserve_private_tombstone(&tombstone_root, description)?;
     }
     #[cfg(not(unix))]
     {
@@ -2758,12 +2985,12 @@ where
     }
     let tombstone = tombstone_root.join("object");
     #[cfg(unix)]
-    let verified_root = {
-        use std::os::unix::fs::MetadataExt as _;
-        let metadata = std::fs::symlink_metadata(&tombstone_root)
-            .map_err(|error| format!("cannot identify private {description} tombstone: {error}"))?;
-        (metadata.dev(), metadata.ino())
-    };
+    let verified_root = tombstone_identity(&tombstone_root)
+        .map_err(|error| format!("cannot identify private {description} tombstone: {error}"))?;
+    if let Err(error) = bind_root(&tombstone_root, verified_root, None) {
+        let _ = std::fs::remove_dir(&tombstone_root);
+        return Err(error);
+    }
     if let Err(error) = std::fs::rename(deletion_target, &tombstone) {
         let _ = std::fs::remove_dir(&tombstone_root);
         return Err(format!(
@@ -2777,13 +3004,14 @@ where
             .map_err(|error| format!("cannot identify identity-bound {description}: {error}"))?;
         (metadata.dev(), metadata.ino())
     };
+    bind_root(&tombstone_root, verified_root, Some(verified_object))?;
     if observe_identity(&tombstone)? != expected_identity {
         return Err(format!(
             "{description} identity changed before final deletion; replacement preserved at {}",
             tombstone.display()
         ));
     }
-    after_identity_observation(&tombstone_root, &tombstone);
+    after_identity_observation(&tombstone_root, &tombstone)?;
     #[cfg(unix)]
     {
         use std::ffi::CString;
@@ -2888,6 +3116,119 @@ where
         .map_err(|error| format!("cannot remove empty {description} tombstone: {error}"))
 }
 
+#[cfg(unix)]
+#[allow(
+    clippy::useless_conversion,
+    reason = "libc stat device width differs across supported Unix targets"
+)]
+fn resume_final_worktree_tombstone(
+    tombstone: &CloseWorktreeFinalTombstone,
+    expected_identity: &str,
+) -> Result<(), String> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let root = CString::new(tombstone.root.as_os_str().as_bytes())
+        .map_err(|_| "recorded final tombstone path contains NUL".to_string())?;
+    // SAFETY: root is a valid C path and O_NOFOLLOW rejects replacement links.
+    let fd = unsafe {
+        libc::open(
+            root.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(format!(
+            "recorded final tombstone is missing or inaccessible: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: fd is newly owned on success above.
+    let root_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    let mut root_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: root_fd is open and fstat initializes root_stat on success.
+    if unsafe { libc::fstat(root_fd.as_raw_fd(), root_stat.as_mut_ptr()) } < 0 {
+        return Err(format!(
+            "cannot identify recorded final tombstone: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: fstat succeeded.
+    let root_stat = unsafe { root_stat.assume_init() };
+    let root_device = u64::try_from(root_stat.st_dev)
+        .map_err(|error| format!("final tombstone root device is invalid: {error}"))?;
+    if (root_device, root_stat.st_ino) != (tombstone.device, tombstone.inode) {
+        return Err(
+            "recorded final tombstone root was replaced; preserved for manual repair".to_string(),
+        );
+    }
+    let name = CString::new("object").expect("static name contains no NUL");
+    let (Some(expected_object_device), Some(expected_object_inode)) =
+        (tombstone.object_device, tombstone.object_inode)
+    else {
+        return Err(
+            "recorded final tombstone object identity is absent; preserved for manual repair"
+                .to_string(),
+        );
+    };
+    // SAFETY: openat is rooted in the verified descriptor and O_NOFOLLOW rejects replacement links.
+    let object_fd = unsafe {
+        libc::openat(
+            root_fd.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if object_fd < 0 {
+        return Err(format!(
+            "recorded final tombstone object is missing or inaccessible: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: object_fd is newly owned on success above.
+    let object_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(object_fd) };
+    let mut object_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: object_fd is valid and object_stat is writable.
+    if unsafe { libc::fstat(object_fd.as_raw_fd(), object_stat.as_mut_ptr()) } != 0 {
+        return Err(format!(
+            "cannot inspect recorded final tombstone object: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: fstat succeeded.
+    let object_stat = unsafe { object_stat.assume_init() };
+    let object_device = u64::try_from(object_stat.st_dev)
+        .map_err(|error| format!("final tombstone object device is invalid: {error}"))?;
+    if (object_device, object_stat.st_ino) != (expected_object_device, expected_object_inode) {
+        return Err(
+            "recorded final tombstone object was replaced; preserved for manual repair".to_string(),
+        );
+    }
+    let object = tombstone.root.join("object");
+    if observe_worktree_fingerprint(&object).as_deref() != Some(expected_identity) {
+        return Err("recorded final tombstone object does not match captured worktree identity; preserved for manual repair".to_string());
+    }
+    remove_directory_contents_at(&object_fd)?;
+    // SAFETY: unlinkat is rooted at verified root and targets its fixed object name.
+    if unsafe { libc::unlinkat(root_fd.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } < 0 {
+        return Err(format!(
+            "cannot remove recorded final tombstone object: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    std::fs::remove_dir(&tombstone.root)
+        .map_err(|error| format!("cannot remove empty recorded final tombstone: {error}"))
+}
+
+#[cfg(not(unix))]
+fn resume_final_worktree_tombstone(
+    _tombstone: &CloseWorktreeFinalTombstone,
+    _expected_identity: &str,
+) -> Result<(), String> {
+    Err("recorded final tombstone deletion is unsupported on this platform".to_string())
+}
+
 fn administrative_dir_quarantine_path(
     administrative_dir: &Path,
     incarnation: &str,
@@ -2953,10 +3294,12 @@ where
     }
     remove_identity_bound_directory(
         &deletion_target,
+        None,
         expected_incarnation,
         observe_administrative_dir_incarnation,
         before_final_move,
-        |_, _| {},
+        |_, _, _| Ok(()),
+        |_, _| Ok(()),
         "retired worktree administrative directory",
     )
 }
@@ -3626,14 +3969,17 @@ fn decode_hex_bytes(encoded: &str) -> Option<Vec<u8>> {
 }
 
 #[allow(clippy::too_many_lines)]
-async fn quarantine_and_remove_exact_worktree<F>(
+async fn quarantine_and_remove_exact_worktree<F, B>(
     identity: &WorktreeIdentity,
     planned_administrative_dir: PathBuf,
     planned_administrative_dir_incarnation: String,
+    final_tombstone: Option<CloseWorktreeFinalTombstone>,
+    bind_tombstone: B,
     after_quarantine: F,
 ) -> Result<ExactWorktreeRemoval, String>
 where
     F: FnOnce(&Path) + Send + 'static,
+    B: FnMut(&Path, (u64, u64), Option<(u64, u64)>) -> Result<(), String> + Send + 'static,
 {
     let path = worktree_path(identity);
     let quarantine = worktree_quarantine_path(identity)?;
@@ -3743,11 +4089,28 @@ where
                     .to_string(),
             );
         }
-        remove_quarantine_then_administrative_dir(
+        let expected = observe_worktree_fingerprint(&quarantine).ok_or_else(|| {
+            "cannot observe quarantined worktree identity before final deletion".to_string()
+        })?;
+        remove_identity_bound_directory(
             &quarantine,
+            final_tombstone
+                .as_ref()
+                .map(|binding| binding.root.as_path()),
+            &expected,
+            |path| {
+                observe_worktree_fingerprint(path).ok_or_else(|| {
+                    "cannot observe worktree identity in final tombstone".to_string()
+                })
+            },
+            |_| {},
+            bind_tombstone,
+            |_, _| Ok(()),
+            "quarantined worktree",
+        )?;
+        remove_exact_worktree_administrative_dir(
             &administrative_dir,
             &planned_administrative_dir_incarnation,
-            || {},
         )?;
         Ok(ExactWorktreeRemoval::Retired)
     })
@@ -3755,6 +4118,7 @@ where
     .map_err(|error| error.to_string())?
 }
 
+#[cfg(test)]
 fn remove_quarantine_then_administrative_dir<F>(
     quarantine: &Path,
     administrative_dir: &Path,
@@ -3773,6 +4137,7 @@ where
     )
 }
 
+#[cfg(test)]
 fn remove_quarantine_then_administrative_dir_with_hooks<B, A>(
     quarantine: &Path,
     administrative_dir: &Path,
@@ -3789,6 +4154,7 @@ where
     })?;
     remove_identity_bound_directory(
         quarantine,
+        None,
         &expected,
         |path| {
             observe_worktree_fingerprint(path).ok_or_else(|| {
@@ -3796,7 +4162,8 @@ where
             })
         },
         before_final_move,
-        |_, _| {},
+        |_, _, _| Ok(()),
+        |_, _| Ok(()),
         "quarantined worktree",
     )?;
     after_quarantine_removal();
@@ -3820,6 +4187,149 @@ fn canonical_status_observation(status: &[u8]) -> Vec<u8> {
         }
     }
     observation
+}
+
+/// Detect modifications that `git status` intentionally suppresses for index entries
+/// marked assume-unchanged or skip-worktree. All index mutations happen in a copied index.
+fn observe_hidden_worktree_changes(repository: &Path) -> Result<Vec<GitPathIdentity>, String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let index_path = git_index_path(repository, deadline)?;
+    if !index_path.exists() {
+        return Ok(Vec::new());
+    }
+    let private_index = tempfile::NamedTempFile::new_in(
+        index_path
+            .parent()
+            .ok_or("Git index has no parent directory")?,
+    )
+    .map_err(|error| error.to_string())?;
+    std::fs::copy(&index_path, private_index.path())
+        .map_err(|error| format!("cannot copy Git index for hidden-change inspection: {error}"))?;
+    let private_index = private_index.path();
+    let flags = run_bounded_git_command_until(
+        repository,
+        &["ls-files", "-v", "-z", "--"],
+        Some(private_index),
+        deadline,
+        "hidden-index inspection",
+    )?;
+    if !flags.status.success() {
+        return Err(format!(
+            "cannot inspect hidden index flags: {}",
+            String::from_utf8_lossy(&flags.stderr).trim()
+        ));
+    }
+    let candidates = hidden_index_candidates(&flags.stdout);
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut dirty = BTreeSet::new();
+    for batch in candidates.chunks(256) {
+        // Path arguments are OsStrings below so non-UTF-8 paths remain literal.
+        let clear = run_bounded_git_paths_until(
+            repository,
+            &["update-index", "--no-assume-unchanged", "--"],
+            batch,
+            true,
+            private_index,
+            deadline,
+            "hidden-index flag clearing",
+        )?;
+        if !clear.status.success() {
+            return Err(format!(
+                "cannot clear hidden flags in private index: {}",
+                String::from_utf8_lossy(&clear.stderr).trim()
+            ));
+        }
+        let clear_skip = run_bounded_git_paths_until(
+            repository,
+            &["update-index", "--no-skip-worktree", "--"],
+            batch,
+            true,
+            private_index,
+            deadline,
+            "hidden-index flag clearing",
+        )?;
+        if !clear_skip.status.success() {
+            return Err(format!(
+                "cannot clear hidden flags in private index: {}",
+                String::from_utf8_lossy(&clear_skip.stderr).trim()
+            ));
+        }
+        let diff = run_bounded_git_command_until(
+            repository,
+            &["diff-files", "--raw", "-z", "--no-ext-diff"],
+            Some(private_index),
+            deadline,
+            "hidden worktree comparison",
+        )?;
+        if !diff.status.success() {
+            return Err(format!(
+                "cannot compare hidden worktree changes: {}",
+                String::from_utf8_lossy(&diff.stderr).trim()
+            ));
+        }
+        let batch = batch.iter().collect::<BTreeSet<_>>();
+        dirty.extend(
+            raw_diff_paths(&diff.stdout)
+                .into_iter()
+                .filter(|path| batch.contains(path)),
+        );
+    }
+    Ok(dirty.into_iter().map(GitPathIdentity::from_bytes).collect())
+}
+
+fn hidden_index_candidates(entries: &[u8]) -> Vec<Vec<u8>> {
+    entries
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| {
+            let (flag, path) = entry.split_first()?;
+            matches!(flag, b'h' | b'S' | b's')
+                .then(|| path.strip_prefix(b" "))
+                .flatten()
+                .map(<[u8]>::to_vec)
+        })
+        .collect()
+}
+
+fn raw_diff_paths(raw: &[u8]) -> Vec<Vec<u8>> {
+    let mut paths = Vec::new();
+    let mut records = raw.split(|byte| *byte == 0);
+    while let Some(header) = records.next() {
+        if header.is_empty() {
+            continue;
+        }
+        if header.starts_with(b":") {
+            if let Some(path) = records.next() {
+                paths.push(path.to_vec());
+            }
+        }
+    }
+    paths
+}
+
+fn git_index_path(repository: &Path, deadline: std::time::Instant) -> Result<PathBuf, String> {
+    let output = run_bounded_git_command_until(
+        repository,
+        &["rev-parse", "--git-path", "index"],
+        None,
+        deadline,
+        "Git index path inspection",
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "cannot locate Git index: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let output = output.stdout.trim_ascii();
+    let path = path_buf_from_git_bytes(output);
+    Ok(if path.is_absolute() {
+        path
+    } else {
+        repository.join(path)
+    })
 }
 
 fn observe_dirty_content(repository: &Path, losses: &[CloseLossItem]) -> Result<Vec<u8>, String> {
@@ -4116,15 +4626,16 @@ mod tests {
         both_worktree_paths_absent, canonical_status_observation,
         complete_persisted_worktree_administrative_cleanup, exact_worktree_administrative_dir,
         git_path_from_observation, inspect_and_remove_exact_worktree_with_hook, inspect_worktree,
-        observe_administrative_dir_incarnation, parse_status_losses,
+        observe_administrative_dir_incarnation, observe_worktree_fingerprint, parse_status_losses,
         planned_administrative_dir_is_absent, quarantine_and_remove_exact_worktree,
         remove_directory_contents_at_with_hook, remove_exact_worktree_administrative_dir_with_hook,
         remove_identity_bound_directory, remove_quarantine_then_administrative_dir,
-        remove_quarantine_then_administrative_dir_with_hooks, rotate_inspection_generation,
-        run_bounded_git_status_until, snapshot_for, staged_index_entries_by_path,
-        staged_index_entries_for_paths, worktree_quarantine_path, CloseLeaseFailure,
-        ExactWorktreeRemoval,
+        remove_quarantine_then_administrative_dir_with_hooks, resume_final_worktree_tombstone,
+        rotate_inspection_generation, run_bounded_git_status_until, snapshot_for,
+        staged_index_entries_by_path, staged_index_entries_for_paths, worktree_quarantine_path,
+        CloseLeaseFailure, ExactWorktreeRemoval,
     };
+    use crate::db::CloseWorktreeFinalTombstone;
     use phoenix_core::domain::close::{
         CloseLossItem, GitPathIdentity, WorktreeFingerprint, WorktreeId, WorktreeIdentity,
     };
@@ -4292,6 +4803,8 @@ mod tests {
             &identity,
             administrative_dir.clone(),
             observe_administrative_dir_incarnation(&administrative_dir).unwrap(),
+            None,
+            |_, _, _| Ok(()),
             |_| {},
         )
         .await
@@ -4548,13 +5061,16 @@ mod tests {
 
         let error = remove_identity_bound_directory(
             &target,
+            None,
             &identity,
             observe_administrative_dir_incarnation,
             |_| {},
+            |_, _, _| Ok(()),
             |_, object| {
                 std::fs::rename(object, &displaced).unwrap();
                 std::fs::create_dir(object).unwrap();
                 std::fs::write(object.join("replacement-marker"), "must survive\n").unwrap();
+                Ok(())
             },
             "test directory",
         )
@@ -4586,15 +5102,18 @@ mod tests {
 
         let error = remove_identity_bound_directory(
             &target,
+            None,
             &identity,
             observe_administrative_dir_incarnation,
             |_| {},
+            |_, _, _| Ok(()),
             |root, _| {
                 std::fs::rename(root, &displaced_root).unwrap();
                 std::fs::create_dir(root).unwrap();
                 let replacement = root.join("object");
                 std::fs::create_dir(&replacement).unwrap();
                 std::fs::write(replacement.join("replacement-marker"), "must survive\n").unwrap();
+                Ok(())
             },
             "test directory",
         )
@@ -4614,6 +5133,109 @@ mod tests {
             .unwrap(),
             "must survive\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorded_final_tombstone_resumes_after_failure_following_rename() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        initialize_repository(&target);
+        std::fs::write(target.join("original"), "original\n").unwrap();
+        run_git(&target, &["add", "original"]);
+        run_git(&target, &["commit", "--quiet", "-m", "original"]);
+        let identity = observe_worktree_fingerprint(&target).unwrap();
+        let recorded = std::sync::Mutex::new(None::<CloseWorktreeFinalTombstone>);
+
+        let error = remove_identity_bound_directory(
+            &target,
+            None,
+            &identity,
+            |path| {
+                observe_worktree_fingerprint(path)
+                    .ok_or_else(|| "missing worktree identity".to_string())
+            },
+            |_| {},
+            |root, (device, inode), object| {
+                let mut recorded = recorded.lock().unwrap();
+                if let Some((object_device, object_inode)) = object {
+                    let binding = recorded.as_mut().expect("root bound before object");
+                    binding.object_device = Some(object_device);
+                    binding.object_inode = Some(object_inode);
+                } else {
+                    *recorded = Some(CloseWorktreeFinalTombstone {
+                        root: root.to_path_buf(),
+                        device,
+                        inode,
+                        object_device: None,
+                        object_inode: None,
+                    });
+                }
+                Ok(())
+            },
+            |_, _| Err("injected failure after final rename".to_string()),
+            "test directory",
+        )
+        .unwrap_err();
+        assert!(error.contains("injected failure"));
+        assert!(!target.exists());
+        let recorded = recorded.into_inner().unwrap().unwrap();
+        assert!(recorded.root.join("object/original").is_file());
+
+        resume_final_worktree_tombstone(&recorded, &identity).unwrap();
+        assert!(!recorded.root.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorded_final_tombstone_root_mismatch_preserves_both_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        initialize_repository(&target);
+        std::fs::write(target.join("original"), "original\n").unwrap();
+        run_git(&target, &["add", "original"]);
+        run_git(&target, &["commit", "--quiet", "-m", "original"]);
+        let identity = observe_worktree_fingerprint(&target).unwrap();
+        let recorded = std::sync::Mutex::new(None::<CloseWorktreeFinalTombstone>);
+        let _ = remove_identity_bound_directory(
+            &target,
+            None,
+            &identity,
+            |path| {
+                observe_worktree_fingerprint(path)
+                    .ok_or_else(|| "missing worktree identity".to_string())
+            },
+            |_| {},
+            |root, (device, inode), object| {
+                let mut recorded = recorded.lock().unwrap();
+                if let Some((object_device, object_inode)) = object {
+                    let binding = recorded.as_mut().expect("root bound before object");
+                    binding.object_device = Some(object_device);
+                    binding.object_inode = Some(object_inode);
+                } else {
+                    *recorded = Some(CloseWorktreeFinalTombstone {
+                        root: root.to_path_buf(),
+                        device,
+                        inode,
+                        object_device: None,
+                        object_inode: None,
+                    });
+                }
+                Ok(())
+            },
+            |_, _| Err("injected failure after final rename".to_string()),
+            "test directory",
+        );
+        let recorded = recorded.into_inner().unwrap().unwrap();
+        let displaced = temp.path().join("recorded-root");
+        std::fs::rename(&recorded.root, &displaced).unwrap();
+        std::fs::create_dir(&recorded.root).unwrap();
+        std::fs::write(recorded.root.join("replacement-marker"), "preserve\n").unwrap();
+
+        let error = resume_final_worktree_tombstone(&recorded, &identity).unwrap_err();
+        assert!(error.contains("root was replaced"));
+        assert!(displaced.join("object/original").is_file());
+        assert!(recorded.root.join("replacement-marker").is_file());
     }
 
     #[test]
@@ -4873,6 +5495,8 @@ mod tests {
                 &confirmed,
                 &planned_administrative_dir,
                 &planned_administrative_dir_incarnation,
+                None,
+                |_, _, _| Ok(()),
                 |_| {},
             )
         })
@@ -4980,6 +5604,114 @@ mod tests {
             temp.path(),
             &["worktree", "remove", "--force", sibling.to_str().unwrap()],
         );
+    }
+
+    #[tokio::test]
+    async fn hidden_assume_unchanged_content_is_loss_and_preserves_real_index_flag() {
+        let temp = tempfile::tempdir().unwrap();
+        initialize_repository(temp.path());
+        run_git(
+            temp.path(),
+            &["update-index", "--assume-unchanged", "tracked"],
+        );
+        std::fs::write(temp.path().join("tracked"), "hidden content\n").unwrap();
+
+        let (_, losses) = inspect_worktree(&inspection_identity(temp.path()))
+            .await
+            .unwrap();
+
+        assert!(losses.iter().any(|loss| matches!(loss,
+            CloseLossItem::UnstagedTrackedPath(path) if path.as_bytes() == b"tracked"
+        )));
+        let flags = phoenix_core::git::command()
+            .args(["ls-files", "-v", "--", "tracked"])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+        assert!(flags.stdout.starts_with(b"h "));
+    }
+
+    #[tokio::test]
+    async fn hidden_skip_worktree_content_is_loss_and_clean_path_is_not() {
+        let temp = tempfile::tempdir().unwrap();
+        initialize_repository(temp.path());
+        std::fs::write(temp.path().join("clean"), "clean\n").unwrap();
+        run_git(temp.path(), &["add", "clean"]);
+        run_git(temp.path(), &["commit", "--quiet", "-m", "add clean"]);
+        run_git(
+            temp.path(),
+            &["update-index", "--skip-worktree", "tracked", "clean"],
+        );
+        std::fs::write(temp.path().join("tracked"), "hidden content\n").unwrap();
+
+        let (_, losses) = inspect_worktree(&inspection_identity(temp.path()))
+            .await
+            .unwrap();
+
+        assert!(losses.iter().any(|loss| matches!(loss,
+            CloseLossItem::UnstagedTrackedPath(path) if path.as_bytes() == b"tracked"
+        )));
+        assert!(!losses.iter().any(|loss| matches!(loss,
+            CloseLossItem::UnstagedTrackedPath(path) if path.as_bytes() == b"clean"
+        )));
+        let flags = phoenix_core::git::command()
+            .args(["ls-files", "-v", "--", "tracked", "clean"])
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+        assert!(flags
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .all(|line| line.starts_with(b"S ")));
+    }
+
+    #[tokio::test]
+    async fn hidden_pathspec_magic_name_is_treated_literally() {
+        let temp = tempfile::tempdir().unwrap();
+        initialize_repository(temp.path());
+        let name = ":(exclude)hidden.txt";
+        std::fs::write(temp.path().join(name), "original\n").unwrap();
+        run_git(temp.path(), &["add", "--", name]);
+        run_git(temp.path(), &["commit", "--quiet", "-m", "tracked"]);
+        run_git(
+            temp.path(),
+            &["update-index", "--assume-unchanged", "--", name],
+        );
+        std::fs::write(temp.path().join(name), "changed\n").unwrap();
+
+        let (_, losses) = inspect_worktree(&inspection_identity(temp.path()))
+            .await
+            .unwrap();
+
+        assert!(losses.iter().any(|loss| matches!(
+            loss,
+            CloseLossItem::UnstagedTrackedPath(path) if path.as_bytes() == name.as_bytes()
+        )));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hidden_assume_unchanged_executable_mode_is_loss() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        initialize_repository(temp.path());
+        run_git(
+            temp.path(),
+            &["update-index", "--assume-unchanged", "tracked"],
+        );
+        let tracked = temp.path().join("tracked");
+        let mut permissions = std::fs::metadata(&tracked).unwrap().permissions();
+        permissions.set_mode(permissions.mode() | 0o111);
+        std::fs::set_permissions(&tracked, permissions).unwrap();
+
+        let (_, losses) = inspect_worktree(&inspection_identity(temp.path()))
+            .await
+            .unwrap();
+        assert!(losses.iter().any(|loss| matches!(loss,
+            CloseLossItem::UnstagedTrackedPath(path) if path.as_bytes() == b"tracked"
+        )));
     }
 
     #[tokio::test]
@@ -5309,6 +6041,8 @@ mod tests {
             &identity,
             administrative_dir.clone(),
             observe_administrative_dir_incarnation(&administrative_dir).unwrap(),
+            None,
+            |_, _, _| Ok(()),
             |_| {},
         )
         .await
@@ -5644,6 +6378,8 @@ mod tests {
             &identity,
             administrative_dir.clone(),
             observe_administrative_dir_incarnation(&administrative_dir).unwrap(),
+            None,
+            |_, _, _| Ok(()),
             move |_| {
                 descriptor.write_all(b"after\n").unwrap();
                 descriptor.flush().unwrap();

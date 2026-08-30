@@ -726,9 +726,38 @@ pub struct RecordCloseWorktreeCleanupPlanRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseWorktreeFinalTombstone {
+    pub root: std::path::PathBuf,
+    pub device: u64,
+    pub inode: u64,
+    pub object_device: Option<u64>,
+    pub object_inode: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BindCloseWorktreeFinalTombstoneRequest {
+    pub attempt_id: CloseAttemptId,
+    pub scope: WorkScopeId,
+    pub snapshot: CloseRetirementSnapshot,
+    pub resource: RetiredResourceIdentity,
+    pub tombstone: CloseWorktreeFinalTombstone,
+}
+
+#[derive(Debug, Clone)]
+pub struct BindCloseWorktreeFinalTombstoneObjectRequest {
+    pub attempt_id: CloseAttemptId,
+    pub scope: WorkScopeId,
+    pub snapshot: CloseRetirementSnapshot,
+    pub resource: RetiredResourceIdentity,
+    pub object_device: u64,
+    pub object_inode: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CloseWorktreeCleanupPlan {
     pub administrative_dir: std::path::PathBuf,
     pub administrative_dir_incarnation: String,
+    pub final_tombstone: Option<CloseWorktreeFinalTombstone>,
 }
 
 async fn close_obligation_for_update(
@@ -3141,6 +3170,26 @@ fn decode_host_path(codec: &str, value: &str) -> DbResult<std::path::PathBuf> {
     }
 }
 
+type OptionalFinalTombstoneColumns = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+type WorktreeCleanupPlanColumns = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 impl Database {
     /// Durably records intent to remove one exact sealed resource before external
     /// teardown begins. A restart can adopt absence only from this same-attempt
@@ -3289,6 +3338,166 @@ impl Database {
         Ok(())
     }
 
+    /// Binds the private final tombstone to an exact worktree cleanup plan.
+    ///
+    /// A replay is accepted only when it presents the identical path and filesystem identity.
+    ///
+    /// # Errors
+    /// Returns a database error or a precondition error when the exact plan is absent
+    /// or already binds a different path or filesystem identity.
+    pub async fn bind_close_worktree_final_tombstone(
+        &self,
+        request: BindCloseWorktreeFinalTombstoneRequest,
+    ) -> DbResult<()> {
+        let identity = request.resource.identity();
+        let root = encode_host_path(&request.tombstone.root);
+        let device = request.tombstone.device.to_string();
+        let inode = request.tombstone.inode.to_string();
+        let result = sqlx::query(
+            "UPDATE close_worktree_cleanup_plans
+             SET final_tombstone_root_codec = 'hex_path_v1',
+                 final_tombstone_root_value = ?1,
+                 final_tombstone_root_device = ?2,
+                 final_tombstone_root_inode = ?3
+             WHERE attempt_id = ?4 AND scope = ?5
+               AND inspection_generation = ?6 AND inspection_fingerprint = ?7
+               AND resource_kind = ?8 AND identity_kind = ?9
+               AND identity_codec = ?10 AND identity_value = ?11
+               AND final_tombstone_root_codec IS NULL",
+        )
+        .bind(&root)
+        .bind(&device)
+        .bind(&inode)
+        .bind(request.attempt_id.as_str())
+        .bind(request.scope.as_str())
+        .bind(request.snapshot.generation())
+        .bind(request.snapshot.fingerprint())
+        .bind(request.resource.kind().as_str())
+        .bind(identity.identity_kind())
+        .bind(identity.codec())
+        .bind(identity.value())
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 1 {
+            return Ok(());
+        }
+        let prior: Option<OptionalFinalTombstoneColumns> = sqlx::query_as(
+            "SELECT final_tombstone_root_codec, final_tombstone_root_value,
+                    final_tombstone_root_device, final_tombstone_root_inode,
+                    final_tombstone_object_device, final_tombstone_object_inode
+             FROM close_worktree_cleanup_plans
+             WHERE attempt_id = ?1 AND scope = ?2
+               AND inspection_generation = ?3 AND inspection_fingerprint = ?4
+               AND resource_kind = ?5 AND identity_kind = ?6
+               AND identity_codec = ?7 AND identity_value = ?8",
+        )
+        .bind(request.attempt_id.as_str())
+        .bind(request.scope.as_str())
+        .bind(request.snapshot.generation())
+        .bind(request.snapshot.fingerprint())
+        .bind(request.resource.kind().as_str())
+        .bind(identity.identity_kind())
+        .bind(identity.codec())
+        .bind(identity.value())
+        .fetch_optional(&self.pool)
+        .await?;
+        if prior
+            .as_ref()
+            .map(|(codec, value, prior_device, prior_inode, _, _)| {
+                match (
+                    codec.as_deref(),
+                    value.as_deref(),
+                    prior_device.as_deref(),
+                    prior_inode.as_deref(),
+                ) {
+                    (Some(codec), Some(value), Some(device), Some(inode)) => {
+                        (codec, value, device, inode)
+                    }
+                    _ => ("", "", "", ""),
+                }
+            })
+            == Some((
+                "hex_path_v1",
+                root.as_str(),
+                device.as_str(),
+                inode.as_str(),
+            ))
+        {
+            Ok(())
+        } else {
+            Err(close_precondition(
+                "exact worktree final tombstone conflicts with durable plan",
+            ))
+        }
+    }
+
+    /// Binds the moved final tombstone object after rename and before deletion.
+    ///
+    /// # Errors
+    /// Returns a database or precondition error when the exact root plan is absent
+    /// or the object identity conflicts with an earlier binding.
+    pub async fn bind_close_worktree_final_tombstone_object(
+        &self,
+        request: BindCloseWorktreeFinalTombstoneObjectRequest,
+    ) -> DbResult<()> {
+        let identity = request.resource.identity();
+        let device = request.object_device.to_string();
+        let inode = request.object_inode.to_string();
+        let result = sqlx::query(
+            "UPDATE close_worktree_cleanup_plans
+             SET final_tombstone_object_device = ?1,
+                 final_tombstone_object_inode = ?2
+             WHERE attempt_id = ?3 AND scope = ?4
+               AND inspection_generation = ?5 AND inspection_fingerprint = ?6
+               AND resource_kind = ?7 AND identity_kind = ?8
+               AND identity_codec = ?9 AND identity_value = ?10
+               AND final_tombstone_root_codec IS NOT NULL
+               AND final_tombstone_object_device IS NULL",
+        )
+        .bind(&device)
+        .bind(&inode)
+        .bind(request.attempt_id.as_str())
+        .bind(request.scope.as_str())
+        .bind(request.snapshot.generation())
+        .bind(request.snapshot.fingerprint())
+        .bind(request.resource.kind().as_str())
+        .bind(identity.identity_kind())
+        .bind(identity.codec())
+        .bind(identity.value())
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 1 {
+            return Ok(());
+        }
+        let prior: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT final_tombstone_object_device, final_tombstone_object_inode
+             FROM close_worktree_cleanup_plans
+             WHERE attempt_id = ?1 AND scope = ?2
+               AND inspection_generation = ?3 AND inspection_fingerprint = ?4
+               AND resource_kind = ?5 AND identity_kind = ?6
+               AND identity_codec = ?7 AND identity_value = ?8",
+        )
+        .bind(request.attempt_id.as_str())
+        .bind(request.scope.as_str())
+        .bind(request.snapshot.generation())
+        .bind(request.snapshot.fingerprint())
+        .bind(request.resource.kind().as_str())
+        .bind(identity.identity_kind())
+        .bind(identity.codec())
+        .bind(identity.value())
+        .fetch_optional(&self.pool)
+        .await?;
+        if prior.as_ref().map(|(d, i)| (d.as_deref(), i.as_deref()))
+            == Some((Some(device.as_str()), Some(inode.as_str())))
+        {
+            Ok(())
+        } else {
+            Err(close_precondition(
+                "exact worktree final tombstone object conflicts with durable plan",
+            ))
+        }
+    }
+
     /// Returns the administrative directory from an exact durable worktree cleanup plan.
     ///
     /// # Errors
@@ -3301,9 +3510,12 @@ impl Database {
         resource: &RetiredResourceIdentity,
     ) -> DbResult<Option<CloseWorktreeCleanupPlan>> {
         let identity = resource.identity();
-        let rows: Vec<(String, String, String)> = sqlx::query_as(
+        let rows: Vec<WorktreeCleanupPlanColumns> = sqlx::query_as(
             "SELECT DISTINCT administrative_dir_codec, administrative_dir_value,
-                             administrative_dir_incarnation
+                             administrative_dir_incarnation, final_tombstone_root_codec,
+                             final_tombstone_root_value, final_tombstone_root_device,
+                             final_tombstone_root_inode, final_tombstone_object_device,
+                             final_tombstone_object_inode
              FROM close_worktree_cleanup_plans
              WHERE attempt_id = ?1 AND scope = ?2
                AND resource_kind = ?3 AND identity_kind = ?4
@@ -3322,10 +3534,57 @@ impl Database {
         .await?;
         match rows.as_slice() {
             [] => Ok(None),
-            [(codec, value, incarnation)] => Ok(Some(CloseWorktreeCleanupPlan {
-                administrative_dir: decode_host_path(codec, value)?,
-                administrative_dir_incarnation: incarnation.clone(),
-            })),
+            [(
+                codec,
+                value,
+                incarnation,
+                tombstone_codec,
+                tombstone_value,
+                tombstone_device,
+                tombstone_inode,
+                object_device,
+                object_inode,
+            )] => {
+                let final_tombstone = match (
+                    tombstone_codec.as_deref(),
+                    tombstone_value.as_deref(),
+                    tombstone_device.as_deref(),
+                    tombstone_inode.as_deref(),
+                ) {
+                    (None, None, None, None) => None,
+                    (Some(tombstone_codec), Some(tombstone_value), Some(device), Some(inode)) => {
+                        Some(CloseWorktreeFinalTombstone {
+                            root: decode_host_path(tombstone_codec, tombstone_value)?,
+                            device: device.parse().map_err(|_| {
+                                close_precondition("invalid final tombstone device")
+                            })?,
+                            inode: inode
+                                .parse()
+                                .map_err(|_| close_precondition("invalid final tombstone inode"))?,
+                            object_device: object_device
+                                .as_deref()
+                                .map(str::parse)
+                                .transpose()
+                                .map_err(|_| {
+                                    close_precondition("invalid final tombstone object device")
+                                })?,
+                            object_inode: object_inode
+                                .as_deref()
+                                .map(str::parse)
+                                .transpose()
+                                .map_err(|_| {
+                                    close_precondition("invalid final tombstone object inode")
+                                })?,
+                        })
+                    }
+                    _ => return Err(close_precondition("incomplete final tombstone binding")),
+                };
+                Ok(Some(CloseWorktreeCleanupPlan {
+                    administrative_dir: decode_host_path(codec, value)?,
+                    administrative_dir_incarnation: incarnation.clone(),
+                    final_tombstone,
+                }))
+            }
             _ => Err(close_precondition(
                 "exact worktree cleanup authority has conflicting plans",
             )),
@@ -8224,6 +8483,7 @@ mod tests {
             Some(CloseWorktreeCleanupPlan {
                 administrative_dir,
                 administrative_dir_incarnation: "admin-v1".to_string(),
+                final_tombstone: None,
             })
         );
         let timestamp_types: (String, String, i64, i64) = sqlx::query_as(
@@ -9324,6 +9584,7 @@ mod tests {
             Some(CloseWorktreeCleanupPlan {
                 administrative_dir: cleanup_dir,
                 administrative_dir_incarnation: "admin-cleanup-v1".to_string(),
+                final_tombstone: None,
             }),
         );
         assert!(db

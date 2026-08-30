@@ -465,6 +465,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "require_residual_for_all_close_repair_transitions",
         sql: MIGRATION_089,
     },
+    Migration {
+        version: 90,
+        name: "bind_close_worktree_final_tombstone",
+        sql: MIGRATION_090,
+    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -8569,6 +8574,56 @@ BEGIN
 END;
 ";
 
+const MIGRATION_090: &str = r"
+ALTER TABLE close_worktree_cleanup_plans
+ADD COLUMN final_tombstone_root_codec TEXT
+CHECK (final_tombstone_root_codec IS NULL OR final_tombstone_root_codec = 'hex_path_v1');
+ALTER TABLE close_worktree_cleanup_plans
+ADD COLUMN final_tombstone_root_value TEXT;
+ALTER TABLE close_worktree_cleanup_plans
+ADD COLUMN final_tombstone_root_device TEXT;
+ALTER TABLE close_worktree_cleanup_plans
+ADD COLUMN final_tombstone_root_inode TEXT;
+ALTER TABLE close_worktree_cleanup_plans
+ADD COLUMN final_tombstone_object_device TEXT;
+ALTER TABLE close_worktree_cleanup_plans
+ADD COLUMN final_tombstone_object_inode TEXT;
+CREATE TRIGGER close_worktree_final_tombstone_is_complete_on_insert
+BEFORE INSERT ON close_worktree_cleanup_plans
+FOR EACH ROW
+WHEN (NEW.final_tombstone_root_codec IS NULL) <> (NEW.final_tombstone_root_value IS NULL)
+  OR (NEW.final_tombstone_root_codec IS NULL) <> (NEW.final_tombstone_root_device IS NULL)
+  OR (NEW.final_tombstone_root_codec IS NULL) <> (NEW.final_tombstone_root_inode IS NULL)
+  OR (NEW.final_tombstone_root_value IS NOT NULL AND length(NEW.final_tombstone_root_value) = 0)
+  OR (NEW.final_tombstone_root_device IS NOT NULL AND length(NEW.final_tombstone_root_device) = 0)
+  OR (NEW.final_tombstone_root_inode IS NOT NULL AND length(NEW.final_tombstone_root_inode) = 0)
+  OR (NEW.final_tombstone_object_device IS NULL) <> (NEW.final_tombstone_object_inode IS NULL)
+  OR (NEW.final_tombstone_object_device IS NOT NULL AND NEW.final_tombstone_root_codec IS NULL)
+  OR (NEW.final_tombstone_object_device IS NOT NULL AND length(NEW.final_tombstone_object_device) = 0)
+  OR (NEW.final_tombstone_object_inode IS NOT NULL AND length(NEW.final_tombstone_object_inode) = 0)
+BEGIN
+    SELECT RAISE(ABORT, 'final worktree tombstone binding must be complete');
+END;
+CREATE TRIGGER close_worktree_final_tombstone_is_complete_on_update
+BEFORE UPDATE OF final_tombstone_root_codec, final_tombstone_root_value,
+                 final_tombstone_root_device, final_tombstone_root_inode,
+                 final_tombstone_object_device, final_tombstone_object_inode
+ON close_worktree_cleanup_plans
+FOR EACH ROW
+WHEN (NEW.final_tombstone_root_codec IS NULL) <> (NEW.final_tombstone_root_value IS NULL)
+  OR (NEW.final_tombstone_root_codec IS NULL) <> (NEW.final_tombstone_root_device IS NULL)
+  OR (NEW.final_tombstone_root_codec IS NULL) <> (NEW.final_tombstone_root_inode IS NULL)
+  OR (NEW.final_tombstone_root_value IS NOT NULL AND length(NEW.final_tombstone_root_value) = 0)
+  OR (NEW.final_tombstone_root_device IS NOT NULL AND length(NEW.final_tombstone_root_device) = 0)
+  OR (NEW.final_tombstone_root_inode IS NOT NULL AND length(NEW.final_tombstone_root_inode) = 0)
+  OR (NEW.final_tombstone_object_device IS NULL) <> (NEW.final_tombstone_object_inode IS NULL)
+  OR (NEW.final_tombstone_object_device IS NOT NULL AND NEW.final_tombstone_root_codec IS NULL)
+  OR (NEW.final_tombstone_object_device IS NOT NULL AND length(NEW.final_tombstone_object_device) = 0)
+  OR (NEW.final_tombstone_object_inode IS NOT NULL AND length(NEW.final_tombstone_object_inode) = 0)
+BEGIN
+    SELECT RAISE(ABORT, 'final worktree tombstone binding must be complete');
+END;
+";
 const MIGRATION_089: &str = r"
 DROP TRIGGER close_retirement_inventories_require_exact_snapshot;
 CREATE TRIGGER close_retirement_inventories_require_exact_snapshot
