@@ -134,48 +134,59 @@ fn directory_identity(
 }
 
 #[cfg(unix)]
-fn create_relative_directories_without_symlinks(
-    canonical_ancestor: &Path,
-    suffix: &Path,
-) -> Result<DirectoryIdentity, ConversationCwdError> {
+fn traverse_absolute_directory_without_symlinks(
+    path: &Path,
+    create_missing: bool,
+) -> Result<(PathBuf, DirectoryIdentity), ConversationCwdError> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
 
-    let ancestor = CString::new(canonical_ancestor.as_os_str().as_bytes()).map_err(|_| {
-        ConversationCwdError::NotAcceptable("directory path contains a NUL byte".to_string())
-    })?;
+    if !path.is_absolute() {
+        return Err(ConversationCwdError::NotAcceptable(
+            "selected directory must use an absolute path".to_string(),
+        ));
+    }
+    let root = CString::new("/").expect("root has no NUL");
     let fd = unsafe {
         libc::open(
-            ancestor.as_ptr(),
+            root.as_ptr(),
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
         )
     };
     if fd < 0 {
         return Err(ConversationCwdError::NotAcceptable(format!(
-            "failed to open accepted directory root: {}",
+            "failed to open filesystem root: {}",
             std::io::Error::last_os_error()
         )));
     }
     let mut current = unsafe { OwnedFd::from_raw_fd(fd) };
-    for component in suffix.components() {
-        let std::path::Component::Normal(segment) = component else {
-            return Err(ConversationCwdError::NotAcceptable(
-                "invalid selected directory segment".to_string(),
-            ));
+    let mut canonical = PathBuf::from("/");
+    for component in path.components() {
+        let segment = match component {
+            std::path::Component::RootDir | std::path::Component::CurDir => continue,
+            std::path::Component::Normal(segment) => segment,
+            std::path::Component::ParentDir | std::path::Component::Prefix(_) => {
+                return Err(ConversationCwdError::NotAcceptable(
+                    "invalid selected directory segment".to_string(),
+                ))
+            }
         };
-        let segment = CString::new(segment.as_bytes()).map_err(|_| {
+        let c_segment = CString::new(segment.as_bytes()).map_err(|_| {
             ConversationCwdError::NotAcceptable("directory path contains a NUL byte".to_string())
         })?;
         let mut next = unsafe {
             libc::openat(
                 current.as_raw_fd(),
-                segment.as_ptr(),
+                c_segment.as_ptr(),
                 libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
             )
         };
-        if next < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
-            let created = unsafe { libc::mkdirat(current.as_raw_fd(), segment.as_ptr(), 0o755) };
+        if create_missing
+            && next < 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT)
+        {
+            let created = unsafe { libc::mkdirat(current.as_raw_fd(), c_segment.as_ptr(), 0o755) };
             if created < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
                 return Err(ConversationCwdError::NotAcceptable(format!(
                     "failed to create directory after durable acceptance: {}",
@@ -185,7 +196,7 @@ fn create_relative_directories_without_symlinks(
             next = unsafe {
                 libc::openat(
                     current.as_raw_fd(),
-                    segment.as_ptr(),
+                    c_segment.as_ptr(),
                     libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
                 )
             };
@@ -197,40 +208,17 @@ fn create_relative_directories_without_symlinks(
             )));
         }
         current = unsafe { OwnedFd::from_raw_fd(next) };
+        canonical.push(segment);
     }
-    directory_identity(&current)
-}
-
-#[cfg(unix)]
-fn pathname_directory_identity(path: &Path) -> Result<DirectoryIdentity, ConversationCwdError> {
-    use std::ffi::CString;
-    use std::os::fd::{FromRawFd, OwnedFd};
-    use std::os::unix::ffi::OsStrExt;
-
-    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
-        ConversationCwdError::NotAcceptable("directory path contains a NUL byte".to_string())
-    })?;
-    let fd = unsafe {
-        libc::open(
-            path.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-        )
-    };
-    if fd < 0 {
-        return Err(ConversationCwdError::NotAcceptable(format!(
-            "selected directory path was replaced after creation: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    directory_identity(&fd)
+    let identity = directory_identity(&current)?;
+    Ok((canonical, identity))
 }
 
 #[cfg(not(unix))]
-fn create_relative_directories_without_symlinks(
-    _canonical_ancestor: &Path,
-    _suffix: &Path,
-) -> Result<(), ConversationCwdError> {
+fn traverse_absolute_directory_without_symlinks(
+    _path: &Path,
+    _create_missing: bool,
+) -> Result<(PathBuf, ()), ConversationCwdError> {
     Err(ConversationCwdError::NotAcceptable(
         "safe creation of missing selected directories is unsupported on this platform".to_string(),
     ))
@@ -242,28 +230,22 @@ pub(crate) fn ensure_product_creation_cwd(
 ) -> Result<ValidConversationCwd, ConversationCwdError> {
     let raw = cwd.as_ref();
     let path = Path::new(raw);
-    if path
-        .symlink_metadata()
-        .is_ok_and(|metadata| metadata.file_type().is_symlink())
-    {
-        return Err(ConversationCwdError::NotAcceptable(
-            "directory path contains a symlink".to_string(),
-        ));
-    }
-    if path.exists() {
-        let mut current = PathBuf::new();
-        for component in path.components() {
-            current.push(component);
-            if current
-                .symlink_metadata()
-                .is_ok_and(|metadata| metadata.file_type().is_symlink())
-            {
-                return Err(ConversationCwdError::NotAcceptable(
-                    "directory path contains a symlink".to_string(),
-                ));
+    if path.is_absolute() {
+        #[cfg(unix)]
+        match traverse_absolute_directory_without_symlinks(path, false) {
+            Ok((canonical, _identity)) => {
+                if canonical.parent().is_none() {
+                    return Err(ConversationCwdError::FilesystemRoot);
+                }
+                return Ok(ValidConversationCwd {
+                    raw: canonical.to_string_lossy().into_owned(),
+                    #[cfg(test)]
+                    canonical,
+                });
             }
+            Err(error) if path.exists() => return Err(error),
+            Err(_) => {}
         }
-        return validate_conversation_cwd(raw);
     }
     let ancestor = path
         .ancestors()
@@ -293,19 +275,16 @@ pub(crate) fn ensure_product_creation_cwd(
 
     #[cfg(unix)]
     {
-        let created_identity =
-            create_relative_directories_without_symlinks(&canonical_ancestor, suffix)?;
-        let valid = validate_conversation_cwd(raw)?;
-        if pathname_directory_identity(path)? != created_identity {
-            return Err(ConversationCwdError::NotAcceptable(
-                "selected directory path was replaced after creation".to_string(),
-            ));
-        }
-        Ok(valid)
+        let (canonical, _identity) = traverse_absolute_directory_without_symlinks(path, true)?;
+        Ok(ValidConversationCwd {
+            raw: canonical.to_string_lossy().into_owned(),
+            #[cfg(test)]
+            canonical,
+        })
     }
     #[cfg(not(unix))]
     {
-        create_relative_directories_without_symlinks(&canonical_ancestor, suffix)?;
+        traverse_absolute_directory_without_symlinks(path, true)?;
         validate_conversation_cwd(raw)
     }
 }
@@ -435,17 +414,15 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn relative_creator_rejects_symlinked_segment_without_mutating_target() {
+    fn descriptor_traversal_rejects_symlinked_segment_without_mutating_target() {
         let home = tempfile::tempdir().expect("home");
         let target = tempfile::tempdir().expect("target");
         std::os::unix::fs::symlink(target.path(), home.path().join("raced"))
             .expect("insert symlink");
 
-        let error = create_relative_directories_without_symlinks(
-            &home.path().canonicalize().expect("canonical home"),
-            Path::new("raced/child"),
-        )
-        .expect_err("symlinked segment rejected");
+        let error =
+            traverse_absolute_directory_without_symlinks(&home.path().join("raced/child"), true)
+                .expect_err("symlinked segment rejected");
 
         assert!(error.to_string().contains("symlinked segment"));
         assert!(!target.path().join("child").exists());
@@ -453,19 +430,26 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn pathname_identity_detects_replacement_after_descriptor_creation() {
+    fn existing_parent_replacement_with_symlink_is_rejected() {
         let home = tempfile::tempdir().expect("home");
-        let target = home.path().join("selected");
-        let created = create_relative_directories_without_symlinks(
-            &home.path().canonicalize().expect("canonical home"),
-            Path::new("selected"),
-        )
-        .expect("create selected directory");
+        let outside = tempfile::tempdir().expect("outside");
+        let parent = home.path().join("parent");
+        std::fs::create_dir(&parent).expect("parent");
+        let requested = parent.join("selected");
+        std::fs::create_dir(&requested).expect("selected");
         let displaced = home.path().join("displaced");
-        std::fs::rename(&target, &displaced).expect("displace selected directory");
-        std::fs::create_dir(&target).expect("replace selected directory");
+        std::fs::rename(&parent, &displaced).expect("displace parent");
+        std::os::unix::fs::symlink(outside.path(), &parent).expect("replace parent with symlink");
 
-        assert_ne!(pathname_directory_identity(&target).unwrap(), created);
+        let error = ensure_product_creation_cwd(requested.to_string_lossy(), home.path())
+            .expect_err("replaced parent symlink rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("symlink")
+                || message.contains("must remain under the server home directory or /tmp")
+                || message.contains("directory resolved outside the accepted canonical path"),
+            "unexpected rejection: {message}"
+        );
     }
 
     #[test]

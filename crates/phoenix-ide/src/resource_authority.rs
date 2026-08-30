@@ -1,38 +1,78 @@
 use crate::db::{ConvMode, Conversation, Database, DbError};
 use crate::work_scope::{
-    EffectiveResourceAccess, ResourceAuthority, ResourceScopeKey, RuntimeRole,
+    EffectiveResourceAccess, EnvironmentContext, ResourceAuthority, ResourceScopeKey, RuntimeRole,
+    WorkScopeLifecycle,
 };
 
 pub(crate) struct ResolvedResourceAuthority {
     pub(crate) scope: ResourceScopeKey,
     pub(crate) authority: ResourceAuthority,
     pub(crate) actor: EffectiveResourceAccess,
+    lifecycle: Option<WorkScopeLifecycle>,
+    environment: Option<EnvironmentContext>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TaskApprovalAuthority {
+    GitBackedActiveWorkScope,
+    NotGitBacked,
+    Retired,
+    Unattached,
+}
+
+impl ResolvedResourceAuthority {
+    pub(crate) fn task_approval_authority(&self) -> TaskApprovalAuthority {
+        match (&self.scope, self.lifecycle, &self.environment) {
+            (
+                ResourceScopeKey::Work(_),
+                Some(WorkScopeLifecycle::Active),
+                Some(EnvironmentContext::AllocatedWorktree { .. }),
+            ) => TaskApprovalAuthority::GitBackedActiveWorkScope,
+            (ResourceScopeKey::Work(_), Some(WorkScopeLifecycle::Retired), _) => {
+                TaskApprovalAuthority::Retired
+            }
+            (ResourceScopeKey::Work(_), _, _) => TaskApprovalAuthority::NotGitBacked,
+            (
+                ResourceScopeKey::Unattached(_)
+                | ResourceScopeKey::Coordinator
+                | ResourceScopeKey::GlobalTerminal,
+                _,
+                _,
+            ) => TaskApprovalAuthority::Unattached,
+        }
+    }
 }
 
 pub(crate) async fn resolve_resource_authority(
     db: &Database,
     conversation: &Conversation,
 ) -> Result<ResolvedResourceAuthority, DbError> {
-    let (scope, authority) = if let Some(work_scope_id) = &conversation.attached_work_scope_id {
-        (
-            ResourceScopeKey::Work(work_scope_id.clone()),
-            db.get_conversation_work_scope_authority(&conversation.id)
-                .await?
-                .into(),
-        )
-    } else {
-        let authority = match conversation.conv_mode {
-            ConvMode::Explore { .. } => ResourceAuthority::Restricted,
-            ConvMode::Direct
-            | ConvMode::Work { .. }
-            | ConvMode::Branch { .. }
-            | ConvMode::DetachedApprovedTask { .. } => ResourceAuthority::Work,
+    let (scope, authority, lifecycle, environment) =
+        if let Some(work_scope_id) = &conversation.attached_work_scope_id {
+            let (authority, lifecycle, environment) = db
+                .get_conversation_work_scope_context(&conversation.id)
+                .await?;
+            (
+                ResourceScopeKey::Work(work_scope_id.clone()),
+                authority.into(),
+                Some(lifecycle),
+                Some(environment),
+            )
+        } else {
+            let authority = match conversation.conv_mode {
+                ConvMode::Explore { .. } => ResourceAuthority::Restricted,
+                ConvMode::Direct
+                | ConvMode::Work { .. }
+                | ConvMode::Branch { .. }
+                | ConvMode::DetachedApprovedTask { .. } => ResourceAuthority::Work,
+            };
+            (
+                ResourceScopeKey::Unattached(conversation.id.clone()),
+                authority,
+                None,
+                None,
+            )
         };
-        (
-            ResourceScopeKey::Unattached(conversation.id.clone()),
-            authority,
-        )
-    };
     let actor = if authority == ResourceAuthority::Restricted
         && conversation.runtime_role == RuntimeRole::User
     {
@@ -44,6 +84,8 @@ pub(crate) async fn resolve_resource_authority(
         scope,
         authority,
         actor,
+        lifecycle,
+        environment,
     })
 }
 
@@ -52,6 +94,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::db::{ConvMode, Database};
     use phoenix_core::task_handoff::TaskApprovalHandoffData;
+    use phoenix_core::work_scope::WorkScopeId;
 
     pub(crate) fn approval() -> TaskApprovalHandoffData {
         TaskApprovalHandoffData {
@@ -63,6 +106,45 @@ pub(crate) mod tests {
             task_file: "tasks/12345-p1-in-progress--approved-objective.md".to_string(),
             artifact_body: "# Approved objective".to_string(),
         }
+    }
+
+    #[test]
+    fn task_approval_requires_active_allocated_worktree() {
+        let scope = ResourceScopeKey::Work(WorkScopeId::new());
+        let actor = EffectiveResourceAccess::new("approval", ResourceAuthority::Restricted);
+        let resolved = |lifecycle, environment| ResolvedResourceAuthority {
+            scope: scope.clone(),
+            authority: ResourceAuthority::Restricted,
+            actor: actor.clone(),
+            lifecycle: Some(lifecycle),
+            environment: Some(environment),
+        };
+        assert_eq!(
+            resolved(
+                WorkScopeLifecycle::Active,
+                EnvironmentContext::AllocatedWorktree {
+                    cwd: "/tmp/worktree".into(),
+                    worktree_path: "/tmp/worktree".into(),
+                    branch_name: Some("task-1".into()),
+                    base_branch: Some("main".into()),
+                },
+            )
+            .task_approval_authority(),
+            TaskApprovalAuthority::GitBackedActiveWorkScope
+        );
+        assert_eq!(
+            resolved(
+                WorkScopeLifecycle::Active,
+                EnvironmentContext::UnownedCwd { cwd: "/tmp".into() },
+            )
+            .task_approval_authority(),
+            TaskApprovalAuthority::NotGitBacked
+        );
+        assert_eq!(
+            resolved(WorkScopeLifecycle::Retired, EnvironmentContext::None)
+                .task_approval_authority(),
+            TaskApprovalAuthority::Retired
+        );
     }
 
     #[tokio::test]

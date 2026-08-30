@@ -29,8 +29,8 @@ use phoenix_core::domain::creation_protocol::{
 use phoenix_core::domain::db_schema as schema;
 use phoenix_core::domain::sm_state::LEGACY_CONTINUATION_OPERATION_ID;
 use phoenix_core::work_scope::{
-    AuthorityKind, EnvironmentContext, RuntimeRole, WorkScopeId, WorkScopeRetirementBlocker,
-    WorkScopeRetirementOutcome, WorkScopeRetirementPrecondition,
+    AuthorityKind, EnvironmentContext, RuntimeRole, WorkScopeId, WorkScopeLifecycle,
+    WorkScopeRetirementBlocker, WorkScopeRetirementOutcome, WorkScopeRetirementPrecondition,
 };
 
 pub use close_foundation::*;
@@ -6991,17 +6991,27 @@ impl Database {
         Ok(())
     }
 
-    /// Load the non-null authority persisted on a conversation's attached `WorkScope`.
+    /// Load the non-null context persisted on a conversation's attached `WorkScope`.
     ///
     /// # Errors
-    /// Returns [`DbError`] when the conversation or scope is missing, the stored
-    /// authority is invalid, or the query fails.
-    pub async fn get_conversation_work_scope_authority(
+    /// Returns [`DbError`] when the conversation or scope is missing, stored
+    /// context is invalid, or the query fails.
+    pub async fn get_conversation_work_scope_context(
         &self,
         conversation_id: &str,
-    ) -> DbResult<AuthorityKind> {
-        let authority: Option<String> = sqlx::query_scalar(
-            "SELECT scope.authority_kind
+    ) -> DbResult<(AuthorityKind, WorkScopeLifecycle, EnvironmentContext)> {
+        type ContextRow = (
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let row: Option<ContextRow> = sqlx::query_as(
+            "SELECT scope.authority_kind, scope.lifecycle, scope.environment_kind,
+                    scope.cwd, scope.worktree_path, scope.branch_name, scope.base_branch
              FROM conversations conversation
              JOIN work_scopes scope ON scope.id = conversation.work_scope_id
              WHERE conversation.id = ?1",
@@ -7009,9 +7019,45 @@ impl Database {
         .bind(conversation_id)
         .fetch_optional(&self.pool)
         .await?;
+        let (authority, lifecycle, environment, cwd, worktree_path, branch_name, base_branch) =
+            row.ok_or_else(|| DbError::ConversationNotFound(conversation_id.to_string()))?;
         let authority =
-            authority.ok_or_else(|| DbError::ConversationNotFound(conversation_id.to_string()))?;
-        AuthorityKind::try_from(authority.as_str()).map_err(DbError::Serialization)
+            AuthorityKind::try_from(authority.as_str()).map_err(DbError::Serialization)?;
+        let lifecycle = match lifecycle.as_str() {
+            "active" => WorkScopeLifecycle::Active,
+            "retired" => WorkScopeLifecycle::Retired,
+            other => {
+                return Err(DbError::Serialization(format!(
+                    "unknown WorkScope lifecycle: {other}"
+                )))
+            }
+        };
+        let environment = match environment.as_str() {
+            "allocated_worktree" => EnvironmentContext::AllocatedWorktree {
+                cwd: cwd.ok_or_else(|| {
+                    DbError::Serialization("allocated WorkScope is missing cwd".to_string())
+                })?,
+                worktree_path: worktree_path.ok_or_else(|| {
+                    DbError::Serialization(
+                        "allocated WorkScope is missing worktree path".to_string(),
+                    )
+                })?,
+                branch_name,
+                base_branch,
+            },
+            "unowned_cwd" => EnvironmentContext::UnownedCwd {
+                cwd: cwd.ok_or_else(|| {
+                    DbError::Serialization("unowned WorkScope is missing cwd".to_string())
+                })?,
+            },
+            "none" => EnvironmentContext::None,
+            other => {
+                return Err(DbError::Serialization(format!(
+                    "unknown WorkScope environment kind: {other}"
+                )))
+            }
+        };
+        Ok((authority, lifecycle, environment))
     }
 
     /// Persist an approved-task objective and the existing scope's write authority atomically.
