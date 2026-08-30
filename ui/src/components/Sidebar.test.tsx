@@ -5,6 +5,7 @@ import {
 } from '../notifications';
 import { render, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
+import { ConflictError } from '../api';
 import type { Conversation, ProductConversationListRow } from '../api';
 
 const { apiMock } = vi.hoisted(() => ({
@@ -235,7 +236,10 @@ describe('Sidebar — ProductConversation navigation', () => {
 
   it('notifies the active Close surface when Archive starts a server-authoritative attempt', async () => {
     apiMock.listProductConversations.mockRejectedValueOnce(new Error('offline'));
-    apiMock.archiveConversation.mockRejectedValueOnce(new Error('close_loss_confirmation_required'));
+    apiMock.archiveConversation.mockRejectedValueOnce(new ConflictError({
+      error: 'close loss confirmation required',
+      error_type: 'close_loss_confirmation_required',
+    }));
     const listener = vi.fn();
     const unsubscribe = subscribeCloseSnapshotChanged('cached-id', listener);
 
@@ -255,6 +259,35 @@ describe('Sidebar — ProductConversation navigation', () => {
     fireEvent.click(await waitFor(() => getByTitle('Actions')));
     fireEvent.click(await waitFor(() => getByTitle('Archive conversation "cached-slug"')));
     await waitFor(() => expect(listener).toHaveBeenCalledTimes(1));
+    unsubscribe();
+  });
+
+  it('does not notify the Close surface for non-close archive failures', async () => {
+    apiMock.listProductConversations.mockRejectedValueOnce(new Error('offline'));
+    apiMock.archiveConversation.mockRejectedValueOnce(new ConflictError({
+      error: 'other conflict',
+      error_type: 'proposal_resolved',
+    }));
+    const listener = vi.fn();
+    const unsubscribe = subscribeCloseSnapshotChanged('cached-id', listener);
+
+    const { getByTitle } = render(
+      <MemoryRouter initialEntries={['/c/cached-slug']}>
+        <Sidebar
+          collapsed={false}
+          onToggle={vi.fn()}
+          conversations={[makeConv('cached-id', 'cached-slug')]}
+          archivedConversations={[]}
+          activeSlug="cached-slug"
+          onConversationCreated={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(await waitFor(() => getByTitle('Actions')));
+    fireEvent.click(await waitFor(() => getByTitle('Archive conversation "cached-slug"')));
+    await waitFor(() => expect(apiMock.archiveConversation).toHaveBeenCalledTimes(1));
+    expect(listener).toHaveBeenCalledTimes(0);
     unsubscribe();
   });
 

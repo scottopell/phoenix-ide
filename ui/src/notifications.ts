@@ -9,6 +9,7 @@
 
 import { useCallback, useEffect, useSyncExternalStore } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { ConflictError } from './api';
 import type { Conversation, ConversationState, NotificationSettings } from './api';
 import { parseConversationState } from './utils';
 import {
@@ -170,6 +171,14 @@ export function notifyCloseSnapshotChanged(conversationId: string): void {
   window.dispatchEvent(new CustomEvent<string>(CLOSE_SNAPSHOT_CHANGED_EVENT, {
     detail: conversationId,
   }));
+}
+
+export function notifyArchiveCloseConflict(conversationId: string, error: unknown): boolean {
+  if (!(error instanceof ConflictError)) return false;
+  if (error.detail.error_type !== 'close_loss_confirmation_required') return false;
+  notifyCloseSnapshotChanged(conversationId);
+  notifyProductConversationListMayHaveChanged();
+  return true;
 }
 
 export function subscribeCloseSnapshotChanged(

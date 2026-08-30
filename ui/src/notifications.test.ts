@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { ConflictError } from './api';
 import type { Conversation } from './api';
 import { notificationRoute } from './notifications/store';
 import {
@@ -9,9 +10,11 @@ import {
   notifyCatchUp,
   notifyConversationStateChange,
   notifyConversationSnapshotChange,
+  notifyArchiveCloseConflict,
   notifyProductConversationListMayHaveChanged,
   registerCoordinatorForNotifications,
   resetNotificationRuntimeForTest,
+  subscribeCloseSnapshotChanged,
   subscribeProductConversationListRevision,
 } from './notifications';
 
@@ -103,6 +106,40 @@ describe('product conversation list revision notifications', () => {
     expect(listener).toHaveBeenCalledTimes(1);
     expect(getProductConversationListRevision()).toBe(startRevision + 1);
     unsubscribe();
+  });
+});
+
+describe('archive close conflict notifications', () => {
+  it('notifies only for close-loss confirmation conflicts', () => {
+    const closeListener = vi.fn();
+    const listListener = vi.fn();
+    const unsubscribeClose = subscribeCloseSnapshotChanged('conv-1', closeListener);
+    const unsubscribeList = subscribeProductConversationListRevision(listListener);
+    const startRevision = getProductConversationListRevision();
+
+    expect(notifyArchiveCloseConflict('conv-1', new Error('boom'))).toBe(false);
+    expect(notifyArchiveCloseConflict('conv-1', new ConflictError({
+      error: 'other conflict',
+      error_type: 'proposal_resolved',
+    }))).toBe(false);
+
+    expect(closeListener).toHaveBeenCalledTimes(0);
+    expect(listListener).toHaveBeenCalledTimes(0);
+    expect(getProductConversationListRevision()).toBe(startRevision);
+
+    expect(notifyArchiveCloseConflict('conv-1', new ConflictError({
+      error: 'close loss confirmation required',
+      error_type: 'close_loss_confirmation_required',
+    }))).toBe(true);
+    expect(closeListener).toHaveBeenCalledTimes(1);
+    expect(listListener).toHaveBeenCalledTimes(0);
+
+    vi.runAllTimers();
+
+    expect(listListener).toHaveBeenCalledTimes(1);
+    expect(getProductConversationListRevision()).toBe(startRevision + 1);
+    unsubscribeClose();
+    unsubscribeList();
   });
 });
 

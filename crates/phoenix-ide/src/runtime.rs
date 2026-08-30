@@ -1569,6 +1569,8 @@ pub struct ConversationMetadataUpdate {
     pub work_scope_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archived: Option<bool>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -7454,6 +7456,138 @@ mod scope_liveness_tests {
             .await
             .unwrap();
         (repository, attempt_id, scope, socket, token)
+    }
+
+    async fn prepare_close_attempt_ready_for_completion(
+        manager: &RuntimeManager,
+        conversation_id: &str,
+        attempt: &str,
+    ) -> CloseAttemptId {
+        let conversation = manager
+            .db()
+            .create_conversation(conversation_id, conversation_id, "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        let attempt_id = CloseAttemptId::parse(attempt).unwrap();
+        manager
+            .db()
+            .begin_close_foundation(
+                &conversation.product_conversation_id,
+                &TranscriptConversationId::parse(conversation_id).unwrap(),
+                attempt_id.as_str(),
+            )
+            .await
+            .expect("begin close");
+        manager
+            .db()
+            .confirm_close_stop_work(attempt_id.as_str())
+            .await
+            .expect("confirm stop work");
+        manager
+            .db()
+            .begin_close_active_work_settlement(attempt_id.as_str())
+            .await
+            .expect("begin settlement");
+        manager
+            .db()
+            .advance_close_settlement_when_quiescent(attempt_id.as_str())
+            .await
+            .expect("advance settlement to retirement inspection");
+        let snapshot = manager
+            .inspect_close_retirement_only(attempt_id.clone())
+            .await
+            .expect("inspect retirement");
+        manager
+            .capture_close_retirement_inventory(attempt_id.clone(), snapshot)
+            .await
+            .expect("capture retirement inventory");
+        attempt_id
+    }
+
+    #[tokio::test]
+    async fn complete_close_retirement_and_publish_persists_archive_before_emitting_update() {
+        use phoenix_core::domain::product_conversation::OrdinaryProductConversationLifecycle;
+
+        let manager = test_manager().await;
+        let conversation_id = "close-retirement-publish-success";
+        let attempt_id = prepare_close_attempt_ready_for_completion(
+            &manager,
+            conversation_id,
+            "close-retirement-publish-success-attempt",
+        )
+        .await;
+
+        let broadcaster = manager.conversation_broadcaster(conversation_id).await;
+        let mut receiver = broadcaster.subscribe();
+
+        manager
+            .retire_close_runtime_resources(attempt_id.clone())
+            .await
+            .expect("retire resources, complete Close, and publish");
+
+        let persisted = manager
+            .db()
+            .get_conversation(conversation_id)
+            .await
+            .expect("reload conversation");
+        assert!(
+            persisted.archived,
+            "conversation should be archived before SSE consumption"
+        );
+
+        let aggregate = manager
+            .db()
+            .get_ordinary_product_conversation(&persisted.product_conversation_id)
+            .await
+            .expect("read product conversation");
+        assert_eq!(
+            aggregate.product_conversation.ordinary_lifecycle(),
+            Some(OrdinaryProductConversationLifecycle::History),
+            "product conversation should already be in History before SSE consumption"
+        );
+
+        let mut published_history = false;
+        while let Ok(event) = receiver.try_recv() {
+            if matches!(
+                event,
+                SseEvent::ConversationUpdate {
+                    update: ConversationMetadataUpdate {
+                        archived: Some(true),
+                        ..
+                    },
+                    ..
+                }
+            ) {
+                published_history = true;
+            }
+        }
+        assert!(
+            published_history,
+            "completion must publish the History transition"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_close_retirement_and_publish_failure_emits_no_update() {
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let manager = test_manager().await;
+        let conversation_id = "close-retirement-publish-failure";
+        manager
+            .db()
+            .create_conversation(conversation_id, conversation_id, "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        let broadcaster = manager.conversation_broadcaster(conversation_id).await;
+        let mut receiver = broadcaster.subscribe();
+        let attempt_id = CloseAttemptId::parse("close-retirement-publish-failure-attempt").unwrap();
+
+        let error = manager
+            .complete_close_retirement_and_publish(&attempt_id)
+            .await
+            .expect_err("completion should fail before publication");
+        assert!(!error.is_empty());
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
     }
 
     async fn replace_tmux_server(

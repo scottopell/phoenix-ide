@@ -1995,6 +1995,10 @@ export const api = {
     const resp = await fetch(`/api/conversations/${convId}/archive`, {
       method: 'POST',
     });
+    if (resp.status === 409) {
+      const err = await resp.json();
+      throw new ConflictError(err as ConflictErrorDetail);
+    }
     if (!resp.ok) throw new Error('Failed to archive');
     return resp.json();
   },

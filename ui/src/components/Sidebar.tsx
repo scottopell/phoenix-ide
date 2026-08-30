@@ -13,7 +13,7 @@ import { subscribeModels } from '../modelsPoller';
 import { ConversationContext } from '../conversation/ConversationContext';
 import {
   getProductConversationListRevision,
-  notifyCloseSnapshotChanged,
+  notifyArchiveCloseConflict,
   subscribeProductConversationListRevision,
 } from '../notifications';
 
@@ -233,7 +233,7 @@ export function Sidebar({
       await api.archiveConversation(conv.id);
       onConversationCreated();
     } catch (err) {
-      notifyCloseSnapshotChanged(conv.id);
+      notifyArchiveCloseConflict(conv.id, err);
       console.error('Failed to archive:', err);
     }
   }, [onConversationCreated]);

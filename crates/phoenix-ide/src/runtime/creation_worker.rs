@@ -1006,6 +1006,7 @@ async fn provision_conversation(
                         .stable_key(),
                     ),
                     model: Some(resolved_model.clone()),
+                    archived: Some(persisted_conversation.archived),
                 },
             });
     }
