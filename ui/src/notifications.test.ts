@@ -136,13 +136,16 @@ describe('archive close conflict notifications', () => {
     for (const error_type of [
       'close_stop_work_confirmation_required',
       'close_settlement_in_progress',
+      'close_inspection_failed',
+      'close_retirement_needs_repair',
+      'stale_close_inspection',
     ]) {
       expect(notifyArchiveCloseConflict('conv-1', new ConflictError({
         error: 'durable Close requires attention',
         error_type,
       }))).toBe(true);
     }
-    expect(closeListener).toHaveBeenCalledTimes(3);
+    expect(closeListener).toHaveBeenCalledTimes(6);
 
     vi.runAllTimers();
 

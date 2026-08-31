@@ -24932,7 +24932,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_attempt_blocks_same_aggregate_active_subagent_absent_from_capture() {
+    async fn close_attempt_rejects_same_aggregate_subagent_creation() {
         let db = Database::open_in_memory().await.unwrap();
         let scope = retirement_fixture(
             &db,
@@ -24953,32 +24953,35 @@ mod tests {
         )
         .await
         .unwrap();
-        db.create_conversation_with_project(
-            "uncaptured-active-child",
-            "uncaptured-active-child",
-            "/tmp/retirement",
-            false,
-            Some("captured-terminal-owner"),
-            None,
-            None,
-            &ConvMode::Direct,
-            None,
-            None,
-            None,
-            phoenix_core::llm_language::LlmLanguage::default(),
-        )
-        .await
-        .unwrap();
-
+        let error = db
+            .create_conversation_with_project(
+                "uncaptured-active-child",
+                "uncaptured-active-child",
+                "/tmp/retirement",
+                false,
+                Some("captured-terminal-owner"),
+                None,
+                None,
+                &ConvMode::Direct,
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("active Close rejects new aggregate participants"));
         assert_eq!(
             db.retire_work_scope_for_close_attempt(
                 &attempt,
                 no_live_resource(scope),
-                "Close rejects uncaptured subordinate participant scope",
+                "Close retires sealed participant scope",
             )
             .await
             .unwrap(),
-            WorkScopeRetirementOutcome::Blocked(WorkScopeRetirementBlocker::ActiveSubAgent)
+            WorkScopeRetirementOutcome::Retired
         );
     }
 

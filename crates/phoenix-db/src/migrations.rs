@@ -7999,17 +7999,27 @@ mod migration_094_tests {
 }
 
 const MIGRATION_095: &str = r"
+CREATE TABLE close_attempt_participants (
+    attempt_id TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    captured_at TEXT NOT NULL,
+    PRIMARY KEY (attempt_id, conversation_id),
+    FOREIGN KEY (attempt_id) REFERENCES close_obligations(attempt_id) ON DELETE CASCADE,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE RESTRICT
+);
+INSERT INTO close_attempt_participants (attempt_id, conversation_id, captured_at)
+SELECT member.attempt_id, member.conversation_id, member.captured_at
+FROM close_attempt_members member;
+
 DROP TRIGGER close_attempt_direct_turn_settlement_target_requires_latest_member;
 CREATE TRIGGER close_attempt_direct_turn_settlement_target_requires_sealed_participant
 BEFORE INSERT ON close_attempt_direct_turn_settlements
 WHEN NOT EXISTS (
     SELECT 1
     FROM durable_turns turn
-    JOIN conversations participant ON participant.id = turn.conversation_id
-    JOIN close_obligations obligation
-      ON obligation.product_conversation_id = participant.product_conversation_id
-    WHERE obligation.attempt_id = NEW.attempt_id
-      AND participant.created_at <= obligation.created_at
+    JOIN close_attempt_participants participant
+      ON participant.conversation_id = turn.conversation_id
+    WHERE participant.attempt_id = NEW.attempt_id
       AND turn.turn_id = NEW.turn_id
       AND turn.generation = NEW.expected_generation
       AND turn.owns_conversation = 1
@@ -8017,6 +8027,18 @@ WHEN NOT EXISTS (
 )
 BEGIN
     SELECT RAISE(ABORT, 'close direct-turn settlement target must be a sealed active participant');
+END;
+
+CREATE TRIGGER conversations_reject_participant_insert_during_close
+BEFORE INSERT ON conversations
+WHEN NEW.product_conversation_id IS NOT NULL
+ AND EXISTS (
+    SELECT 1 FROM close_obligations obligation
+    WHERE obligation.product_conversation_id = NEW.product_conversation_id
+      AND obligation.phase <> 'completed'
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'active Close rejects new aggregate participants');
 END;
 
 UPDATE product_conversations

@@ -1075,8 +1075,8 @@ AND THE SYSTEM SHALL model Open/History lifecycle for ordinary ProductConversati
 AND SHALL make Open/History lifecycle structurally inapplicable to coordinator ProductConversations rather than representing coordinator lifecycle as an optionally absent ordinary value
 AND SHALL expose ProductConversation lifecycle through one writable authority rather than parallel writable aggregate and transcript-row values
 
-WHEN upgrading a database that may contain ordinary aggregate lifecycle drift from the released dormant-projection interval
-THE SYSTEM SHALL reconcile every ordinary ProductConversation lifecycle from the latest parent transcript row's preserved legacy archived truth before aggregate lifecycle becomes reader authority
+WHEN persisted ordinary aggregate lifecycle disagrees with the latest parent transcript row's preserved legacy archived truth at compatibility upgrade
+THE SYSTEM SHALL reconcile every ordinary ProductConversation lifecycle from that preserved truth before aggregate lifecycle becomes reader authority
 AND SHALL preserve every ProductConversation, transcript member, message, and subordinate participant row during reconciliation
 AND SHALL leave coordinator lifecycle structurally inapplicable
 

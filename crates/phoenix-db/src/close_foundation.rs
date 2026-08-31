@@ -1161,6 +1161,19 @@ impl Database {
         .execute(&mut *tx)
         .await?;
 
+        sqlx::query(
+            "INSERT INTO close_attempt_participants (
+                 attempt_id, conversation_id, captured_at
+             )
+             SELECT ?1, id, ?2 FROM conversations
+             WHERE product_conversation_id = ?3",
+        )
+        .bind(attempt_id)
+        .bind(&now)
+        .bind(product_conversation_id.as_str())
+        .execute(&mut *tx)
+        .await?;
+
         for (continuation_ordinal, member) in topology.members.iter().enumerate() {
             sqlx::query(
                 "INSERT INTO close_attempt_members (
@@ -1260,11 +1273,9 @@ impl Database {
              )
              SELECT ?1, turn.turn_id, turn.generation
              FROM durable_turns turn
-             JOIN conversations participant ON participant.id = turn.conversation_id
-             JOIN close_obligations obligation
-               ON obligation.product_conversation_id = participant.product_conversation_id
-             WHERE obligation.attempt_id = ?1
-               AND participant.created_at <= obligation.created_at
+             JOIN close_attempt_participants participant
+               ON participant.conversation_id = turn.conversation_id
+             WHERE participant.attempt_id = ?1
                AND turn.owns_conversation = 1 AND turn.terminal_kind IS NULL",
         )
         .bind(attempt_id)
@@ -1505,11 +1516,9 @@ impl Database {
         Self::reconcile_close_direct_turn_settlement_receipts_tx(&mut tx, attempt_id).await?;
         let active_members: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)
-             FROM close_obligations obligation
-             JOIN conversations participant
-               ON participant.product_conversation_id = obligation.product_conversation_id
-             WHERE obligation.attempt_id = ?1
-               AND participant.created_at <= obligation.created_at
+             FROM close_attempt_participants captured
+             JOIN conversations participant ON participant.id = captured.conversation_id
+             WHERE captured.attempt_id = ?1
                AND (
                  EXISTS (
                    SELECT 1 FROM durable_turns turn
@@ -1585,13 +1594,10 @@ impl Database {
         attempt_id: &str,
     ) -> DbResult<Vec<String>> {
         let rows = sqlx::query_scalar(
-            "SELECT participant.id
-             FROM close_obligations obligation
-             JOIN conversations participant
-               ON participant.product_conversation_id = obligation.product_conversation_id
-             WHERE obligation.attempt_id = ?1
-               AND participant.created_at <= obligation.created_at
-             ORDER BY participant.id",
+            "SELECT conversation_id
+             FROM close_attempt_participants
+             WHERE attempt_id = ?1
+             ORDER BY conversation_id",
         )
         .bind(attempt_id)
         .fetch_all(&self.pool)
@@ -1609,11 +1615,10 @@ impl Database {
         let phase: Option<String> = sqlx::query_scalar(
             "SELECT obligation.phase
              FROM wake_bindings binding
-             JOIN conversations participant ON participant.id = binding.conversation_id
-             JOIN close_obligations obligation
-               ON obligation.product_conversation_id = participant.product_conversation_id
+             JOIN close_attempt_participants participant
+               ON participant.conversation_id = binding.conversation_id
+             JOIN close_obligations obligation ON obligation.attempt_id = participant.attempt_id
              WHERE binding.workflow_id = ?1
-               AND participant.created_at <= obligation.created_at
                AND obligation.phase IN ('settling_active_work', 'cancel_requested_during_settlement')
              ORDER BY obligation.chronology_ordinal DESC
              LIMIT 1",
@@ -1635,18 +1640,9 @@ impl Database {
             "SELECT binding.workflow_id, binding.conversation_id, binding.contract_id
              FROM wake_bindings binding
              JOIN workflows workflow ON workflow.workflow_id = binding.workflow_id
-             JOIN close_obligations obligation
-               ON obligation.product_conversation_id = (
-                   SELECT conversation.product_conversation_id
-                   FROM conversations conversation
-                   WHERE conversation.id = binding.conversation_id
-               )
-             WHERE obligation.attempt_id = ?1
-               AND (
-                   SELECT conversation.created_at
-                   FROM conversations conversation
-                   WHERE conversation.id = binding.conversation_id
-               ) <= obligation.created_at
+             JOIN close_attempt_participants participant
+               ON participant.conversation_id = binding.conversation_id
+             WHERE participant.attempt_id = ?1
                AND binding.resolved_at IS NULL
                AND workflow.status IN ('Active', 'Cancelling', 'ManualResolution', 'Incompatible', 'DeletionPending')
              ORDER BY binding.workflow_id",
@@ -3959,12 +3955,9 @@ impl Database {
         sqlx::query(
             "UPDATE conversations
              SET archived = 1, updated_at = ?2
-             WHERE product_conversation_id = (
-                 SELECT product_conversation_id FROM close_obligations WHERE attempt_id = ?1
-             )
-               AND created_at <= (
-                   SELECT created_at FROM close_obligations WHERE attempt_id = ?1
-               )",
+             WHERE id IN (
+                 SELECT conversation_id FROM close_attempt_participants WHERE attempt_id = ?1
+             )",
         )
         .bind(attempt_id.as_str())
         .bind(&now)
@@ -5047,6 +5040,44 @@ mod tests {
                 .await
                 .unwrap_err(),
             DbError::CloseFoundationPrecondition(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn active_close_rejects_new_aggregate_participant() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-seals-participants",
+        )
+        .await
+        .unwrap();
+
+        let error = db
+            .create_subagent_conversation(
+                "late-subordinate",
+                "late-subordinate",
+                "/tmp",
+                "root",
+                "test-model",
+                &crate::ConvMode::Direct,
+                phoenix_core::llm_language::LlmLanguage::default(),
+                db.get_conversation("root")
+                    .await
+                    .unwrap()
+                    .attached_work_scope_id
+                    .as_ref(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("active Close rejects new aggregate participants"));
+        assert!(matches!(
+            db.get_conversation("late-subordinate").await,
+            Err(DbError::ConversationNotFound(_))
         ));
     }
 
