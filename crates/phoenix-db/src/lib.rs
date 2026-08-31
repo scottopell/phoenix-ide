@@ -18482,7 +18482,12 @@ mod tests {
 
     #[tokio::test]
     async fn steady_state_prompt_tail_has_constant_statement_shape_and_no_full_history_read() {
-        async fn measure(user_count: usize) -> (u64, u64) {
+        async fn measure(
+            user_count: usize,
+        ) -> (
+            Vec<crate::sqlite_workload::NativeStatementShape>,
+            Vec<crate::sqlite_workload::NativeStatementShape>,
+        ) {
             let db = Database::open_in_memory().await.unwrap();
             let conversation_id = format!("projection-shape-{user_count}");
             db.create_conversation(&conversation_id, &conversation_id, "/tmp", true, None, None)
@@ -18504,12 +18509,15 @@ mod tests {
                 .await
                 .unwrap();
             }
-            let before_snapshot = native_read_statements(&db);
+            db.sqlite_workload_collector
+                .take_native_statement_shapes_for_test();
             let snapshot = db
                 .load_hydrated_prompt_snapshot(&conversation_id)
                 .await
                 .unwrap();
-            let after_snapshot = native_read_statements(&db);
+            let snapshot_statements = db
+                .sqlite_workload_collector
+                .take_native_statement_shapes_for_test();
             db.add_message_with_seq(
                 "new-tail-row",
                 &conversation_id,
@@ -18524,7 +18532,8 @@ mod tests {
             )
             .await
             .unwrap();
-            let before_tail = native_read_statements(&db);
+            db.sqlite_workload_collector
+                .take_native_statement_shapes_for_test();
             let tail = db
                 .load_hydrated_prompt_tail(&conversation_id, snapshot.fenced_position())
                 .await
@@ -18536,19 +18545,32 @@ mod tests {
             assert_eq!(rows.messages()[0].message_id, "new-tail-row");
             let (images, files) = rows.messages()[0].content.attachments();
             assert_eq!((images.len(), files.len()), (1, 1));
-            let after_tail = native_read_statements(&db);
-            (after_snapshot - before_snapshot, after_tail - before_tail)
+            let tail_statements = db
+                .sqlite_workload_collector
+                .take_native_statement_shapes_for_test();
+            (snapshot_statements, tail_statements)
         }
 
-        let zero = measure(0).await;
-        let eight = measure(8).await;
-        let twenty_seven = measure(27).await;
-        for (snapshot_reads, tail_reads) in [zero, eight, twenty_seven] {
-            assert_eq!(snapshot_reads, 4);
-            assert!(
-                (4..=5).contains(&tail_reads),
-                "tail read shape must remain bounded, got {tail_reads}"
+        fn assert_prompt_read_shape(statements: &[crate::sqlite_workload::NativeStatementShape]) {
+            assert_eq!(statements.len(), 6, "prompt statements: {statements:#?}");
+            assert_eq!(
+                statements[0],
+                crate::sqlite_workload::NativeStatementShape::Begin,
+                "prompt statements: {statements:#?}"
             );
+            assert!(statements[1..5].iter().all(|statement| *statement
+                == crate::sqlite_workload::NativeStatementShape::OrdinaryRead));
+            // The final statement is the transaction boundary. Native metadata may
+            // conservatively classify it as an ordinary read after a cache collision;
+            // its bracket position, not that degraded category, excludes it.
+        }
+
+        for _ in 0..3 {
+            let (zero, eight, twenty_seven) = tokio::join!(measure(0), measure(8), measure(27));
+            for (snapshot_statements, tail_statements) in [zero, eight, twenty_seven] {
+                assert_prompt_read_shape(&snapshot_statements);
+                assert_prompt_read_shape(&tail_statements);
+            }
         }
     }
 
