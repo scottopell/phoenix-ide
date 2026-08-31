@@ -68,16 +68,6 @@ parent-only, same-aggregate, linear, and acyclic. Root and latest transcript
 identities are derived from that topology and are not stored as mutable aggregate
 columns.
 
-ProductConversation owns stable aggregate identity, membership and topology,
-canonical navigation, ordinary lifecycle, and aggregate presentation. Transcript
-members retain message persistence, SSE publication, runtime and provider
-sessions, and generation-fenced prompt projection. Phoenix does not add an
-aggregate-native message store, SSE stream, runtime/provider session, or prompt
-projection that would duplicate those member authorities.
-
-Phoenix continues using the current Project-backed repository model. Replacement
-is deferred until a named feature requires a different repository authority.
-
 `CloseObligation` references ProductConversation. Its immutable member snapshot
 references the ordered parent transcript-row continuation topology that belonged
 to that aggregate when the attempt was admitted; subordinate execution rows remain

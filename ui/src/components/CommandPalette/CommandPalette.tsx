@@ -119,7 +119,7 @@ export function CommandPalette({ conversations, productConversations = [], activ
           ? (() => {
               const activeRoute = activeConvId ?? currentSlug;
               const conv = conversations.find(c => c.id === activeRoute || c.slug === activeRoute);
-              if (!conv || computeChainRoots(conversations).get(conv.id) != null) return undefined;
+              if (!conv || conv.archived === true || computeChainRoots(conversations).get(conv.id) != null) return undefined;
               return async () => {
                 try {
                   await api.archiveConversation(conv.id);

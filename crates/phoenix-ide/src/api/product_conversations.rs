@@ -1380,9 +1380,9 @@ mod tests {
             .await
             .unwrap();
 
-        state
-            .db
-            .archive_conversation(&conversation.id)
+        sqlx::query("UPDATE conversations SET archived = 1 WHERE id = ?")
+            .bind(&conversation.id)
+            .execute(state.db.pool())
             .await
             .unwrap();
         assert_list_and_snapshot_lifecycle(&state, &conversation.id, "open").await;

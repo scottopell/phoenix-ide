@@ -23,7 +23,7 @@ export function createBuiltInActions(opts: {
   if (opts.currentSlug && opts.archiveCurrent) {
     actions.push({
       id: 'archive-current',
-      title: 'Archive Current Conversation',
+      title: 'Close Current Conversation',
       category: 'Conversation',
       handler: opts.archiveCurrent,
     });
