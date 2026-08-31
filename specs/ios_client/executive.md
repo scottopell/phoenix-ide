@@ -71,7 +71,7 @@ do not block that migration.
 |---|---|---|
 | Program completion owner | Blocked | `tasks/04011-p1-blocked--ios-vnext-productconversation-expansion.md` |
 | ProductConversation migration | Blocked | `tasks/04004-p1-blocked--ios-vnext-productconversation-migration.md` |
-| Deterministic rendering fixture harness | In progress | `tasks/04005-p1-in-progress--ios-vnext-rendering-fixture-harness.md` |
+| Deterministic rendering fixture harness | Complete | `tasks/04005-p1-done--ios-vnext-rendering-fixture-harness.md` |
 | Conversation status and actions | Blocked | `tasks/04006-p2-blocked--ios-vnext-conversation-status-actions.md` |
 | Tool-output rendering | Blocked | `tasks/04007-p2-blocked--ios-vnext-tool-output-rendering.md` |
 | Markdown rendering | Blocked | `tasks/04008-p2-blocked--ios-vnext-markdown-rendering.md` |
