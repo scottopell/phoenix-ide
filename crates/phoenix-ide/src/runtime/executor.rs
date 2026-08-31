@@ -5188,7 +5188,9 @@ where
                 }
                 let (reserved_broadcast_range, reserved_seqs) = self
                     .broadcast_tx
-                    .reserve_next_persisted_message_range(1)
+                    .persisted_message_reservation_authority()
+                    .await
+                    .reserve_next_range(1)
                     .expect("executor holds exclusive persisted-message reservation authority");
                 let _reserved_broadcast_range = reserved_broadcast_range;
                 let input = crate::runtime::traits::AuthoritativeUserMessageAdoptionInput {
@@ -5343,7 +5345,9 @@ where
             } => {
                 let (reserved_range, reserved_sequences) = self
                     .broadcast_tx
-                    .reserve_next_persisted_message_range(1)
+                    .persisted_message_reservation_authority()
+                    .await
+                    .reserve_next_range(1)
                     .expect("executor holds exclusive persisted-message reservation authority");
                 let sequence_id = reserved_sequences[0];
                 let message = crate::db::Message {
@@ -5545,7 +5549,9 @@ where
                 let operation_id = request.operation_id.clone();
                 let (reserved_range, reserved_sequences) = self
                     .broadcast_tx
-                    .reserve_next_persisted_message_range(1)
+                    .persisted_message_reservation_authority()
+                    .await
+                    .reserve_next_range(1)
                     .expect("executor holds exclusive persisted-message reservation authority");
                 let seq = reserved_sequences[0];
                 let content = crate::db::MessageContent::continuation(summary.clone());
@@ -5883,14 +5889,16 @@ where
                 message_id,
             } => {
                 let broadcaster = self.broadcast_tx.clone();
+                let mut reservation_authority =
+                    Some(broadcaster.persisted_message_reservation_authority().await);
                 let mut reserved_broadcast = None;
                 let materialization = {
                     let mut allocate_sequence = |persisted_sequence_max| {
-                        let (reservation, sequence_id) = broadcaster
-                            .reserve_next_persisted_message_after(persisted_sequence_max)
-                            .expect(
-                                "executor holds exclusive persisted-message reservation authority",
-                            );
+                        let (reservation, sequence_id) = reservation_authority
+                            .take()
+                            .expect("materialization allocates at most one persisted-message range")
+                            .reserve_next_after(persisted_sequence_max)
+                            .expect("single persisted-message reservation");
                         reserved_broadcast = Some((reservation, sequence_id));
                         sequence_id
                     };
@@ -6349,7 +6357,9 @@ where
         }
         let (reserved_range, sequences) = self
             .broadcast_tx
-            .reserve_next_persisted_message_range(messages.len())
+            .persisted_message_reservation_authority()
+            .await
+            .reserve_next_range(messages.len())
             .expect("executor holds exclusive persisted-message reservation authority");
         let created_at = Utc::now();
         let committed_messages: Vec<crate::db::Message> = messages
@@ -7391,7 +7401,9 @@ where
         let conv_id = self.context.conversation_id.clone();
         let (reserved_broadcast_range, reserved_seqs) = self
             .broadcast_tx
-            .reserve_next_persisted_message_range(1 + tool_results.len())
+            .persisted_message_reservation_authority()
+            .await
+            .reserve_next_range(1 + tool_results.len())
             .expect("executor holds exclusive persisted-message reservation authority");
         let _reserved_broadcast_range = reserved_broadcast_range;
         let agent_content = MessageContent::agent(assistant_message.content);
@@ -7484,7 +7496,9 @@ where
                 // never sees a shifted timestamp on the message the UI displays.
                 let (reserved_broadcast_range, reserved_seqs) = self
                     .broadcast_tx
-                    .reserve_next_persisted_message_range(1 + tool_results.len())
+                    .persisted_message_reservation_authority()
+                    .await
+                    .reserve_next_range(1 + tool_results.len())
                     .expect("executor holds exclusive persisted-message reservation authority");
                 let _reserved_broadcast_range = reserved_broadcast_range;
 
@@ -7592,7 +7606,9 @@ where
         // ephemeral event broadcast earlier (mirrors `persist_checkpoint`).
         let (reserved_broadcast_range, reserved_seqs) = self
             .broadcast_tx
-            .reserve_next_persisted_message_range(1 + tool_results.len())
+            .persisted_message_reservation_authority()
+            .await
+            .reserve_next_range(1 + tool_results.len())
             .expect("executor holds exclusive persisted-message reservation authority");
         let _reserved_broadcast_range = reserved_broadcast_range;
 

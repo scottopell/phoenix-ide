@@ -1394,6 +1394,17 @@ fn parent_creation_values(
     Ok((scope, effort, Some(product_conversation_id)))
 }
 
+const PROMPT_TAIL_EMPTY_SQL: &str =
+    "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+     FROM messages
+     WHERE conversation_id = ?1
+     ORDER BY sequence_id ASC";
+const PROMPT_TAIL_AFTER_SQL: &str =
+    "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+     FROM messages
+     WHERE conversation_id = ?1 AND sequence_id > ?2
+     ORDER BY sequence_id ASC";
+
 impl Database {
     /// Access the underlying connection pool (for migrations and testing).
     #[must_use]
@@ -10755,17 +10766,23 @@ impl Database {
             tx.commit().await?;
             return Ok(HydratedPromptTail::invalidated(current_generation));
         }
-        let mut messages = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
-             FROM messages
-             WHERE conversation_id = ?1 AND (?2 IS NULL OR sequence_id > ?2)
-             ORDER BY sequence_id ASC",
-        )
-        .bind(conversation_id)
-        .bind(after.position().lower_bound_for_tail())
-        .try_map(parse_prompt_message_row)
-        .fetch_all(&mut *tx)
-        .await?;
+        let mut messages = match after.position() {
+            PromptProjectionPosition::Empty => {
+                sqlx::query(PROMPT_TAIL_EMPTY_SQL)
+                    .bind(conversation_id)
+                    .try_map(parse_prompt_message_row)
+                    .fetch_all(&mut *tx)
+                    .await?
+            }
+            PromptProjectionPosition::At(sequence) => {
+                sqlx::query(PROMPT_TAIL_AFTER_SQL)
+                    .bind(conversation_id)
+                    .bind(sequence.value())
+                    .try_map(parse_prompt_message_row)
+                    .fetch_all(&mut *tx)
+                    .await?
+            }
+        };
         hydrate_attachments_conn(&mut tx, &mut messages).await?;
         let tail = HydratedPromptTail::try_current(conversation_id, after.position(), messages)?;
         tx.commit().await?;
@@ -18361,6 +18378,106 @@ mod tests {
             invalidated,
             HydratedPromptTail::Invalidated(current_generation) if current_generation.value() == 2
         ));
+    }
+
+    async fn explain_tail_plan(
+        db: &Database,
+        sql: &'static str,
+        conversation_id: &str,
+        sequence: Option<i64>,
+    ) -> Vec<String> {
+        let mut query = sqlx::query(sql).bind(conversation_id);
+        if let Some(sequence) = sequence {
+            query = query.bind(sequence);
+        }
+        query
+            .fetch_all(db.pool())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get("detail"))
+            .collect()
+    }
+
+    static EXPLAIN_PROMPT_TAIL_EMPTY_SQL: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| format!("EXPLAIN QUERY PLAN {PROMPT_TAIL_EMPTY_SQL}"));
+    static EXPLAIN_PROMPT_TAIL_AFTER_SQL: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| format!("EXPLAIN QUERY PLAN {PROMPT_TAIL_AFTER_SQL}"));
+
+    #[tokio::test]
+    async fn prompt_tail_query_plans_use_indexable_conversation_and_sequence_predicates() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation(
+            "prompt-tail-plan",
+            "prompt-tail-plan",
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        for (sequence, text) in [(1, "one"), (5, "five"), (9, "nine")] {
+            db.add_message_with_seq(
+                &format!("message-{sequence}"),
+                "prompt-tail-plan",
+                sequence,
+                &MessageContent::user(text),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let empty_plan = explain_tail_plan(
+            &db,
+            EXPLAIN_PROMPT_TAIL_EMPTY_SQL.as_str(),
+            "prompt-tail-plan",
+            None,
+        )
+        .await;
+        let empty_plan_text = empty_plan.join("\n");
+        assert!(
+            empty_plan_text.contains("conversation_id=?"),
+            "{}",
+            empty_plan_text
+        );
+        assert!(
+            empty_plan_text.contains("messages_conversation_sequence")
+                || empty_plan_text.contains("sqlite_autoindex_messages_2")
+                || empty_plan_text.contains("idx_messages_conversation_seq"),
+            "{}",
+            empty_plan_text
+        );
+        assert!(
+            !empty_plan_text.contains("SCAN messages"),
+            "{}",
+            empty_plan_text
+        );
+
+        let at_plan = explain_tail_plan(
+            &db,
+            EXPLAIN_PROMPT_TAIL_AFTER_SQL.as_str(),
+            "prompt-tail-plan",
+            Some(5),
+        )
+        .await;
+        let at_plan_text = at_plan.join("\n");
+        assert!(
+            at_plan_text.contains("conversation_id=?"),
+            "{}",
+            at_plan_text
+        );
+        assert!(at_plan_text.contains("sequence_id>?"), "{}", at_plan_text);
+        assert!(
+            at_plan_text.contains("messages_conversation_sequence")
+                || at_plan_text.contains("sqlite_autoindex_messages_2")
+                || at_plan_text.contains("idx_messages_conversation_seq"),
+            "{}",
+            at_plan_text
+        );
+        assert!(!at_plan_text.contains("SCAN messages"), "{}", at_plan_text);
     }
 
     #[tokio::test]

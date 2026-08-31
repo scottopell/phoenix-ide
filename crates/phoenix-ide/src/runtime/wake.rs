@@ -441,7 +441,9 @@ async fn execute_continuation_transfer(
                 .conversation_broadcaster(&preparation.to_conversation_id)
                 .await;
             let (reservation, sequences) = destination
-                .reserve_persisted_message_range_after(
+                .persisted_message_reservation_authority()
+                .await
+                .reserve_range_after(
                     preparation.materialized_message_count,
                     preparation.destination_sequence_floor,
                 )
@@ -613,7 +615,9 @@ async fn deliver_pending(
             };
             let (sequence_guard, sequence_ids) = handle
                 .broadcast_tx
-                .reserve_next_persisted_message_range(1)
+                .persisted_message_reservation_authority()
+                .await
+                .reserve_next_range(1)
                 .map_err(|error| error.to_string())?;
             let sequence_id = sequence_ids[0];
             let adopted_for_close = match repo
@@ -1793,17 +1797,25 @@ mod tests {
 
         let (reservation, reserved_destination_sequence_ids) = destination
             .broadcast_tx
-            .reserve_persisted_message_range_after(
+            .persisted_message_reservation_authority()
+            .await
+            .reserve_range_after(
                 preparation.materialized_message_count,
                 preparation.destination_sequence_floor,
             )
             .unwrap();
-        assert!(matches!(
-            destination
-                .broadcast_tx
-                .reserve_next_persisted_message_range(1),
-            Err(crate::runtime::ReservePersistedMessageRangeError::ReservationAlreadyActive)
-        ));
+        let competing = {
+            let broadcaster = destination.broadcast_tx.clone();
+            tokio::spawn(async move {
+                broadcaster
+                    .persisted_message_reservation_authority()
+                    .await
+                    .reserve_next_range(1)
+                    .expect("competing checkpoint reserves after transfer")
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!competing.is_finished());
         let transfer = phoenix_db::workflow::wake::WakeTransferInput {
             workflow_id: preparation.workflow_id,
             from_conversation_id: preparation.from_conversation_id,
@@ -1821,6 +1833,10 @@ mod tests {
             phoenix_db::workflow::wake::WakeTransferOutcome::Transferred
         );
         drop(reservation);
+        let (competing_reservation, competing_sequences) =
+            competing.await.expect("competing checkpoint progresses");
+        assert_eq!(competing_sequences, vec![2]);
+        drop(competing_reservation);
 
         let destination_messages = db.get_messages("conv-2").await.unwrap();
         let destination_sequences = destination_messages

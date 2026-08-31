@@ -63,16 +63,6 @@ pub enum PromptProjectionPosition {
     At(PersistedMessageSequence),
 }
 
-impl PromptProjectionPosition {
-    #[must_use]
-    pub const fn lower_bound_for_tail(self) -> Option<i64> {
-        match self {
-            Self::Empty => None,
-            Self::At(sequence) => Some(sequence.value()),
-        }
-    }
-}
-
 /// Tail boundary that cannot be separated from its transcript generation fence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GenerationFencedPromptPosition {

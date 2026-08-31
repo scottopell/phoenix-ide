@@ -58,7 +58,10 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex as AsyncMutex, Notify, RwLock};
+use tokio::sync::{
+    broadcast, mpsc, oneshot, watch, Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, RwLock,
+    Semaphore,
+};
 use tracing::Instrument;
 
 /// Shared slot carrying the trace identity of whatever triggered a
@@ -950,25 +953,76 @@ struct BroadcastGate {
     hard_deleted: bool,
 }
 
+pub struct PersistedMessageReservationAuthority {
+    broadcaster: SseBroadcaster,
+    permit: OwnedSemaphorePermit,
+}
+
 pub struct ReservedBroadcastRange {
     broadcaster: SseBroadcaster,
+    _permit: OwnedSemaphorePermit,
     active: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReservePersistedMessageRangeError {
     EmptyRange,
-    ReservationAlreadyActive,
 }
 
 impl std::fmt::Display for ReservePersistedMessageRangeError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmptyRange => formatter.write_str("persisted-message range must not be empty"),
-            Self::ReservationAlreadyActive => {
-                formatter.write_str("persisted-message reservation already active")
-            }
         }
+    }
+}
+
+impl PersistedMessageReservationAuthority {
+    pub fn reserve_next_range(
+        self,
+        count: usize,
+    ) -> Result<(ReservedBroadcastRange, Vec<i64>), ReservePersistedMessageRangeError> {
+        self.reserve_range_after(count, 0)
+    }
+
+    pub fn reserve_next_after(
+        self,
+        sequence_floor: i64,
+    ) -> Result<(ReservedBroadcastRange, i64), ReservePersistedMessageRangeError> {
+        let (reserved, mut seqs) = self.reserve_range_after(1, sequence_floor)?;
+        Ok((
+            reserved,
+            seqs.pop()
+                .expect("single persisted-message reservation has one sequence"),
+        ))
+    }
+
+    pub fn reserve_range_after(
+        self,
+        count: usize,
+        sequence_floor: i64,
+    ) -> Result<(ReservedBroadcastRange, Vec<i64>), ReservePersistedMessageRangeError> {
+        if count == 0 {
+            return Err(ReservePersistedMessageRangeError::EmptyRange);
+        }
+        let mut gate = self.broadcaster.gate.lock().expect("BroadcastGate mutex");
+        self.broadcaster
+            .last_seq
+            .fetch_max(sequence_floor, Ordering::AcqRel);
+        let mut seqs = Vec::with_capacity(count);
+        for _ in 0..count {
+            seqs.push(self.broadcaster.next_seq_unlocked());
+        }
+        gate.reserved_until = seqs.last().copied();
+        drop(gate);
+        Ok((
+            ReservedBroadcastRange {
+                broadcaster: self.broadcaster,
+                _permit: self.permit,
+                active: true,
+            },
+            seqs,
+        ))
     }
 }
 
@@ -1139,6 +1193,7 @@ pub struct SseBroadcaster {
     /// Queues higher-sequence broadcasts while checkpoint persistence holds a
     /// reserved persisted-message sequence range.
     gate: Arc<Mutex<BroadcastGate>>,
+    persisted_message_reservation: Arc<Semaphore>,
     fatal_local_authority_fence: Option<Arc<FatalLocalAuthorityFence>>,
 }
 
@@ -1161,6 +1216,7 @@ impl SseBroadcaster {
             last_seq: Arc::new(AtomicI64::new(initial_last_seq)),
             ring: Arc::new(Mutex::new(ring)),
             gate: Arc::new(Mutex::new(BroadcastGate::default())),
+            persisted_message_reservation: Arc::new(Semaphore::new(1)),
             fatal_local_authority_fence: None,
         }
     }
@@ -1321,50 +1377,19 @@ impl SseBroadcaster {
         result
     }
 
-    pub fn reserve_next_persisted_message_range(
+    pub async fn persisted_message_reservation_authority(
         &self,
-        count: usize,
-    ) -> Result<(ReservedBroadcastRange, Vec<i64>), ReservePersistedMessageRangeError> {
-        self.reserve_persisted_message_range_after(count, 0)
-    }
-
-    pub fn reserve_next_persisted_message_after(
-        &self,
-        sequence_floor: i64,
-    ) -> Result<(ReservedBroadcastRange, i64), ReservePersistedMessageRangeError> {
-        let (reserved, mut seqs) = self.reserve_persisted_message_range_after(1, sequence_floor)?;
-        Ok((
-            reserved,
-            seqs.pop()
-                .expect("single persisted-message reservation has one sequence"),
-        ))
-    }
-
-    fn reserve_persisted_message_range_after(
-        &self,
-        count: usize,
-        sequence_floor: i64,
-    ) -> Result<(ReservedBroadcastRange, Vec<i64>), ReservePersistedMessageRangeError> {
-        if count == 0 {
-            return Err(ReservePersistedMessageRangeError::EmptyRange);
+    ) -> PersistedMessageReservationAuthority {
+        let permit = self
+            .persisted_message_reservation
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("persisted-message reservation semaphore is never closed");
+        PersistedMessageReservationAuthority {
+            broadcaster: self.clone(),
+            permit,
         }
-        let mut gate = self.gate.lock().expect("BroadcastGate mutex");
-        if gate.reserved_until.is_some() {
-            return Err(ReservePersistedMessageRangeError::ReservationAlreadyActive);
-        }
-        self.last_seq.fetch_max(sequence_floor, Ordering::AcqRel);
-        let mut seqs = Vec::with_capacity(count);
-        for _ in 0..count {
-            seqs.push(self.next_seq_unlocked());
-        }
-        gate.reserved_until = seqs.last().copied();
-        Ok((
-            ReservedBroadcastRange {
-                broadcaster: self.clone(),
-                active: true,
-            },
-            seqs,
-        ))
     }
 
     fn release_reserved_range(&self) {
@@ -1393,7 +1418,7 @@ impl SseBroadcaster {
     }
 
     /// Emit an ephemeral event at a sequence allocated by
-    /// [`Self::reserve_next_persisted_message_range`]. This fills the reserved
+    /// [`Self::persisted_message_reservation_authority`]. This fills the reserved
     /// slot when the persistence operation resolves without a message, so live
     /// clients never observe an unfillable sequence gap.
     pub fn send_reserved_seq(
@@ -4316,7 +4341,9 @@ impl RuntimeManager {
         use crate::db::SystemContent;
 
         let (reserved_range, reserved_sequences) = broadcaster
-            .reserve_next_persisted_message_range(1)
+            .persisted_message_reservation_authority()
+            .await
+            .reserve_next_range(1)
             .expect("single checkpoint reservation");
 
         let message = self
@@ -6383,14 +6410,16 @@ mod sub_agent_registry_resume_tests {
 mod broadcaster_tests {
     use super::*;
 
-    #[test]
-    fn queued_publication_retains_admission_but_future_publication_is_rejected() {
+    #[tokio::test]
+    async fn queued_publication_retains_admission_but_future_publication_is_rejected() {
         let fence = FatalLocalAuthorityFence::new();
         let broadcaster =
             SseBroadcaster::new(16, 0).with_fatal_local_authority_fence(Arc::clone(&fence));
         let mut events = broadcaster.subscribe();
         let (reserved, reserved_seq) = broadcaster
-            .reserve_next_persisted_message_after(0)
+            .persisted_message_reservation_authority()
+            .await
+            .reserve_next_after(0)
             .expect("reserve one seq");
         let queued_seq = broadcaster.next_seq();
         broadcaster
@@ -6463,12 +6492,14 @@ mod broadcaster_tests {
         assert_eq!(broadcaster.current_seq(), 7);
     }
 
-    #[test]
-    fn fatal_authority_close_discards_queued_and_future_publication() {
+    #[tokio::test]
+    async fn fatal_authority_close_discards_queued_and_future_publication() {
         let broadcaster = SseBroadcaster::new(16, 0);
         let mut events = broadcaster.subscribe();
         let (reserved, _) = broadcaster
-            .reserve_next_persisted_message_after(0)
+            .persisted_message_reservation_authority()
+            .await
+            .reserve_next_after(0)
             .expect("reserve one seq");
         broadcaster
             .send_seq(|sequence_id| SseEvent::Token {
@@ -6528,12 +6559,14 @@ mod broadcaster_tests {
         ));
     }
 
-    #[test]
-    fn hard_delete_discards_publications_queued_behind_a_reserved_range() {
+    #[tokio::test]
+    async fn hard_delete_discards_publications_queued_behind_a_reserved_range() {
         let broadcaster = SseBroadcaster::new(16, 0);
         let mut events = broadcaster.subscribe();
         let (reserved, reserved_sequence) = broadcaster
-            .reserve_next_persisted_message_after(0)
+            .persisted_message_reservation_authority()
+            .await
+            .reserve_next_after(0)
             .expect("reserve one persisted sequence");
         broadcaster
             .send_seq(|sequence_id| SseEvent::Token {
@@ -6606,15 +6639,17 @@ mod broadcaster_tests {
         assert_eq!(message_seq, last_ephemeral + 1);
     }
 
-    #[test]
-    fn reserved_message_range_queues_higher_sequence_broadcasts_until_released() {
+    #[tokio::test]
+    async fn reserved_message_range_queues_higher_sequence_broadcasts_until_released() {
         use tokio::sync::broadcast::error::TryRecvError;
 
         let b = SseBroadcaster::new(16, 0);
         let mut rx = b.subscribe();
 
         let (guard, reserved_seqs) = b
-            .reserve_next_persisted_message_range(2)
+            .persisted_message_reservation_authority()
+            .await
+            .reserve_next_range(2)
             .expect("reserve two seqs");
         let first_seq = reserved_seqs[0];
         let second_seq = reserved_seqs[1];
@@ -6645,19 +6680,28 @@ mod broadcaster_tests {
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
     }
 
-    #[test]
-    fn persisted_message_reservation_queues_concurrent_event_above_db_floor() {
+    #[tokio::test]
+    async fn persisted_message_reservation_queues_concurrent_event_above_db_floor() {
         use tokio::sync::broadcast::error::TryRecvError;
 
         let b = SseBroadcaster::new(16, 7);
         let mut rx = b.subscribe();
         let (guard, message_seq) = b
-            .reserve_next_persisted_message_after(42)
+            .persisted_message_reservation_authority()
+            .await
+            .reserve_next_after(42)
             .expect("reserve one seq above floor");
-        assert!(matches!(
-            b.reserve_next_persisted_message_after(42),
-            Err(ReservePersistedMessageRangeError::ReservationAlreadyActive)
-        ));
+        let competing = {
+            let b = b.clone();
+            tokio::spawn(async move {
+                b.persisted_message_reservation_authority()
+                    .await
+                    .reserve_next_after(42)
+                    .expect("competing reservation progresses after release")
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!competing.is_finished());
 
         let _ = b.send_seq(|seq| token_event(seq, "concurrent"));
         assert_eq!(message_seq, 43);
@@ -6666,6 +6710,9 @@ mod broadcaster_tests {
 
         let _ = b.send_message(test_message(message_seq, "persisted"));
         drop(guard);
+        let (competing_guard, competing_seq) = competing.await.expect("competing task completes");
+        assert_eq!(competing_seq, 45);
+        drop(competing_guard);
 
         assert!(matches!(
             rx.try_recv().expect("reserved message arrives first"),
@@ -8895,7 +8942,9 @@ mod scope_liveness_tests {
             SseBroadcaster::new(16, 0).with_fatal_local_authority_fence(Arc::clone(&fence));
         let mut receiver = broadcaster.subscribe();
         let (reservation, _reserved_seq) = broadcaster
-            .reserve_next_persisted_message_after(0)
+            .persisted_message_reservation_authority()
+            .await
+            .reserve_next_after(0)
             .expect("reserve one seq");
         let mut admitted = fence.try_acquire().expect("admit publication");
         let queued_seq = broadcaster.next_seq();
@@ -8937,7 +8986,9 @@ mod scope_liveness_tests {
             SseBroadcaster::new(16, 0).with_fatal_local_authority_fence(Arc::clone(&fence));
         let mut receiver = broadcaster.subscribe();
         let (reservation, reserved_seq) = broadcaster
-            .reserve_next_persisted_message_after(0)
+            .persisted_message_reservation_authority()
+            .await
+            .reserve_next_after(0)
             .expect("reserve one seq");
         broadcaster
             .send_reserved_seq(reserved_seq, |sequence_id| SseEvent::Token {
