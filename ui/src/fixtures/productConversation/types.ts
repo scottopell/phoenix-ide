@@ -2,7 +2,7 @@ import type { ChainView, ProductConversationSnapshotView } from '../../api';
 
 export const productConversationScenarioDefinitions = [
   {
-    id: 'desktop-multi-segment-qa-work',
+    id: 'desktop-open-multi-segment-qa-work',
     title: 'Desktop open product conversation / multi-segment + Q&A + work metadata / presentation-only',
     viewport: 'desktop',
     state: 'ready',
@@ -14,9 +14,15 @@ export const productConversationScenarioDefinitions = [
     state: 'ready',
   },
   {
-    id: 'history-read-only',
-    title: 'History product conversation / read-only handoff history',
+    id: 'desktop-history-read-only',
+    title: 'Desktop history product conversation / read-only handoff history',
     viewport: 'desktop',
+    state: 'ready',
+  },
+  {
+    id: 'mobile-history-read-only',
+    title: 'Mobile history product conversation / read-only handoff history',
+    viewport: 'mobile',
     state: 'ready',
   },
   {

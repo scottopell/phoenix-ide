@@ -22,14 +22,14 @@ function pageHasSettled(root: HTMLElement, scenario: ProductConversationScenario
   if (scenario.state === 'error') {
     return root.textContent?.includes(scenario.snapshotError ?? 'Fixture failed to fetch product conversation snapshot') ?? false;
   }
-  const page = root.querySelector('[data-testid="product-conversation-page"]');
+  const page = root.querySelector<HTMLElement>('[data-testid="product-conversation-page"]');
   if (!page) return false;
   const title = page.querySelector('h1')?.textContent;
   const route = page.querySelector('.product-conversation-page__route')?.textContent;
-  const historyLabel = page.querySelector('.product-conversation-meta');
+  const metadata = page.querySelector('[aria-label="Product conversation metadata"]');
   return title === scenario.snapshot?.presentation.display_name
     && route === scenario.snapshot?.canonical_route
-    && historyLabel !== null;
+    && metadata !== null;
 }
 
 function ProductConversationFixtureBody({ scenario }: Props) {
@@ -51,19 +51,18 @@ function ProductConversationFixtureBody({ scenario }: Props) {
     const root = rootRef.current;
     if (!root) return undefined;
 
-    let frame = 0;
+    let interval = 0;
     const checkUntilSettled = () => {
-      if (pageHasSettled(root, scenario)) {
-        setReady(true);
-        document.documentElement.dataset['productConversationFixtureReady'] = scenario.id;
-        return;
-      }
-      frame = requestAnimationFrame(checkUntilSettled);
+      if (!pageHasSettled(root, scenario)) return;
+      setReady(true);
+      document.documentElement.dataset['productConversationFixtureReady'] = scenario.id;
+      window.clearInterval(interval);
     };
     setReady(false);
     checkUntilSettled();
+    interval = window.setInterval(checkUntilSettled, 16);
     return () => {
-      cancelAnimationFrame(frame);
+      window.clearInterval(interval);
       delete document.documentElement.dataset['productConversationFixtureReady'];
     };
   }, [scenario]);
@@ -72,6 +71,10 @@ function ProductConversationFixtureBody({ scenario }: Props) {
     <main
       ref={rootRef}
       data-product-conversation-fixture={scenario.id}
+      data-product-conversation-scenario={scenario.id}
+      data-product-conversation-viewport={scenario.viewport}
+      data-product-conversation-state={scenario.state}
+      data-product-conversation-surface="product-conversation"
       {...(ready ? { 'data-product-conversation-fixture-ready': scenario.id } : {})}
     >
       <MemoryRouter initialEntries={['/product-conversations/fixture-product-conversation']}>

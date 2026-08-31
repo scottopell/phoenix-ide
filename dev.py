@@ -3444,6 +3444,15 @@ def cmd_qa_product_conversation() -> None:
     )
 
 
+def cmd_qa_product_conversation_journeys() -> None:
+    """Run black-box ProductConversation journeys in an isolated Phoenix instance."""
+    subprocess.run(
+        ["uv", "run", "tests/e2e/product_conversation_journeys.py"],
+        cwd=ROOT,
+        check=True,
+    )
+
+
 def cmd_qa_message_list() -> None:
     """Capture message list Ladle screenshots into ignored local artifacts."""
     subprocess.run(
@@ -10057,6 +10066,7 @@ def main():
     qa_sub.add_parser("desktop-multi-pr-conversation", help="Capture a desktop conversation with multiple open PRs")
     qa_sub.add_parser("new-conversation", help="Capture the /new page at desktop and mobile sizes")
     qa_sub.add_parser("product-conversation", help="Capture ProductConversation Ladle screenshots at desktop and mobile sizes")
+    qa_sub.add_parser("product-conversation-journeys", help="Run ProductConversation journeys in an isolated Phoenix instance")
     qa_sub.add_parser("message-list", help="Capture message list Ladle screenshots")
     qa_sub.add_parser("tool-results", help="Capture tool-result Ladle screenshots at desktop and mobile sizes")
     qa_sub.add_parser("work-actions", help="Capture Work Actions Ladle screenshots")
@@ -10233,6 +10243,8 @@ def main():
             cmd_qa_new_conversation()
         elif args.qa_command == "product-conversation":
             cmd_qa_product_conversation()
+        elif args.qa_command == "product-conversation-journeys":
+            cmd_qa_product_conversation_journeys()
         elif args.qa_command == "message-list":
             cmd_qa_message_list()
         elif args.qa_command == "tool-results":

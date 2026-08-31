@@ -1,29 +1,106 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import { api, streamApi } from '../../api';
+import { cacheDB } from '../../cache';
+import { COORDINATOR_FIXTURE_SURFACE } from '../coordinator';
 import { ProductConversationFixture } from './renderFixture';
-import { getProductConversationScenario } from './scenarios';
+import {
+  FIXTURE_HANDOFF_SUMMARY,
+  FIXTURE_SUCCESSOR_FIRST_MESSAGE,
+  getProductConversationScenario,
+} from './scenarios';
 
-afterEach(() => cleanup());
+class FixtureEventSource {
+  readonly url: string;
+  onopen: ((this: EventSource, ev: Event) => unknown) | null = null;
+  onmessage: ((this: EventSource, ev: MessageEvent) => unknown) | null = null;
+  onerror: ((this: EventSource, ev: Event) => unknown) | null = null;
+  constructor(url: string | URL) {
+    this.url = String(url);
+  }
+  addEventListener() {}
+  removeEventListener() {}
+  close() {}
+}
+
+beforeEach(() => {
+  vi.spyOn(cacheDB, 'putConversation').mockResolvedValue(undefined);
+  Object.assign(globalThis, { EventSource: FixtureEventSource });
+});
+
+afterEach(() => {
+  cleanup();
+  // @ts-expect-error test-only cleanup
+  delete globalThis.EventSource;
+  vi.restoreAllMocks();
+});
+
+function handoffSummaries(scenario: ReturnType<typeof getProductConversationScenario>): string[] {
+  return scenario.snapshot?.segments.flatMap((segment) => segment.handoff ? [segment.handoff.summary] : []) ?? [];
+}
 
 describe('ProductConversationFixture', () => {
-  it('renders the real desktop page with metadata, Q&A history, and the latest-row runtime', async () => {
-    const scenario = getProductConversationScenario('desktop-multi-segment-qa-work');
+  it('renders the real desktop open page with metadata, Q&A history, the latest-row runtime, and one exact handoff', async () => {
+    const scenario = getProductConversationScenario('desktop-open-multi-segment-qa-work');
     const { container } = render(<ProductConversationFixture scenario={scenario} />);
 
     await waitFor(() => {
       expect(container.querySelector(`[data-product-conversation-fixture-ready="${scenario.id}"]`)).not.toBeNull();
     });
 
-    expect(screen.getByTestId('product-conversation-page')).toBeInTheDocument();
+    const page = screen.getByTestId('product-conversation-page');
+    expect(page).toBeInTheDocument();
     expect(screen.getAllByText('Product Alpha').length).toBeGreaterThan(0);
     expect(screen.getByText('Presentation')).toBeInTheDocument();
     expect(container.querySelector('[data-testid="product-conversation-composer"]')).not.toBeNull();
     expect(screen.getByText('What user-visible surfaces must remain stable?')).toBeInTheDocument();
     expect(screen.getByText(/The route, title, lineage metadata/)).toBeInTheDocument();
+    expect(handoffSummaries(scenario)).toEqual([FIXTURE_HANDOFF_SUMMARY]);
+    expect(scenario.snapshot?.segments.at(-1)?.messages[0]?.content).toEqual({ text: FIXTURE_SUCCESSOR_FIRST_MESSAGE });
+    expect(container.querySelectorAll('a[href*="product-handoff"]').length).toBe(1);
   });
 
-  it('restores mutable API hooks after unmount', async () => {
+  it.each(['desktop-history-read-only', 'mobile-history-read-only'] as const)(
+    'renders %s as read-only with a stable semantic ready marker',
+    async (id) => {
+      const scenario = getProductConversationScenario(id);
+      const view = render(<ProductConversationFixture scenario={scenario} />);
+
+      await waitFor(() => {
+        expect(view.container.querySelector(`[data-product-conversation-fixture-ready="${scenario.id}"]`)).not.toBeNull();
+      });
+
+      expect(screen.getByTestId('product-conversation-page')).toBeInTheDocument();
+      expect(view.container.querySelector(`[data-product-conversation-viewport="${scenario.viewport}"]`)).not.toBeNull();
+      expect(scenario.snapshot?.ordinary_lifecycle).toBe('history');
+      expect(scenario.snapshot?.writable_transcript_row_id).toBeNull();
+      expect(handoffSummaries(scenario)).toEqual([FIXTURE_HANDOFF_SUMMARY]);
+      expect(view.container.querySelectorAll('a[href*="product-handoff"]').length).toBe(1);
+    },
+  );
+
+  it('keeps exactly one handoff marker through rerender and long scrolling', async () => {
+    const scenario = getProductConversationScenario('long-history-110-messages');
+    const view = render(<ProductConversationFixture scenario={scenario} />);
+
+    await waitFor(() => {
+      expect(view.container.querySelector(`[data-product-conversation-fixture-ready="${scenario.id}"]`)).not.toBeNull();
+    });
+
+    expect(handoffSummaries(scenario)).toEqual([FIXTURE_HANDOFF_SUMMARY]);
+    expect(view.container.querySelectorAll('a[href*="product-handoff"]').length).toBe(1);
+
+    view.rerender(<ProductConversationFixture scenario={scenario} />);
+
+    await waitFor(() => {
+      expect(view.container.querySelector(`[data-product-conversation-fixture-ready="${scenario.id}"]`)).not.toBeNull();
+    });
+    expect(handoffSummaries(scenario)).toEqual([FIXTURE_HANDOFF_SUMMARY]);
+    expect(view.container.querySelectorAll('a[href*="product-handoff"]').length).toBe(1);
+    expect(screen.getAllByText('Long fixture conversation')).toHaveLength(2);
+  });
+
+  it('keeps the product fixture surface distinct from the coordinator fixture surface and restores mutable API hooks after unmount', async () => {
     const scenario = getProductConversationScenario('mobile-open');
     const originalGetSnapshot = api.getProductConversationSnapshot;
     const originalGetChain = api.getChain;
@@ -35,6 +112,9 @@ describe('ProductConversationFixture', () => {
       expect(container.querySelector(`[data-product-conversation-fixture-ready="${scenario.id}"]`)).not.toBeNull();
     });
 
+    expect(container.querySelector('[data-product-conversation-surface="product-conversation"]')).not.toBeNull();
+    expect(container.querySelector(`[data-product-conversation-surface="${COORDINATOR_FIXTURE_SURFACE}"]`)).toBeNull();
+    expect(document.documentElement.dataset['coordinatorFixtureReady']).toBeUndefined();
     expect(api.getProductConversationSnapshot).not.toBe(originalGetSnapshot);
     expect(streamApi.subscribeToChainStream).not.toBe(originalSubscribe);
 
