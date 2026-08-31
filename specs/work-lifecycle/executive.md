@@ -53,4 +53,4 @@ Current-reality verification for this reconciliation used:
 
 ## Provenance
 
-This spec supersedes the older abandon / mark-merged design at the normative layer, but the implementation has not been reconciled yet. Executives must therefore distinguish intended authority from shipped behavior rather than marking the unified lifecycle complete early.
+Durable Close retirement and aggregate History finalization are shipped through compatibility entrypoints. Dedicated Close-start replacement and removal of abandon, mark-merged, archive, and continuation compatibility edges remain incomplete, so the unified lifecycle is only partially implemented.

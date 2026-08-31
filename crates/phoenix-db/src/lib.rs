@@ -1881,7 +1881,7 @@ impl Database {
                AND owner.archived = 0
                AND NOT EXISTS (
                    SELECT 1
-                   FROM close_attempt_members captured
+                   FROM close_attempt_participants captured
                    WHERE captured.attempt_id = ?2
                      AND captured.conversation_id = owner.id
                )",
@@ -2089,7 +2089,7 @@ impl Database {
                     WHERE successor.work_scope_id = ?1 AND successor.runtime_role = 'user'
                       AND successor.archived = 0
                       AND (?2 IS NULL OR NOT EXISTS (
-                          SELECT 1 FROM close_attempt_members member
+                          SELECT 1 FROM close_attempt_participants member
                           WHERE member.attempt_id = ?2
                             AND member.conversation_id = successor.id
                       ))

@@ -13586,10 +13586,8 @@ pub(crate) mod hard_delete_cascade_tests {
         }
     }
 
-    /// If any member of a chain is busy, `archive_chain_handler` refuses
-    /// the whole operation up-front — no flags flipped, no cleanup.
     #[tokio::test]
-    async fn archive_chain_refuses_if_any_member_busy() {
+    async fn archive_chain_enters_durable_close_when_member_busy() {
         let state = make_test_state().await;
         build_chain_for_test(&state, &["cab-a", "cab-b"]).await;
         state
@@ -13603,11 +13601,20 @@ pub(crate) mod hard_delete_cascade_tests {
             axum::extract::Path("cab-a".to_string()),
         )
         .await
-        .expect_err("must refuse while busy");
+        .expect_err("must request durable stop-work confirmation");
         match err {
-            AppError::Conflict(detail) => assert_eq!(detail.error_type, "cancel_first"),
+            AppError::Conflict(detail) => {
+                assert_eq!(detail.error_type, "close_stop_work_confirmation_required");
+            }
             other => panic!("expected 409, got {other:?}"),
         }
+        let leaf = state.db.get_conversation("cab-b").await.unwrap();
+        assert!(state
+            .db
+            .get_active_close_obligation_for_product(&leaf.product_conversation_id)
+            .await
+            .unwrap()
+            .is_some());
 
         for id in ["cab-a", "cab-b"] {
             let conv = state.db.get_conversation(id).await.expect("row preserved");

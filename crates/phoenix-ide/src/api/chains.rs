@@ -384,32 +384,6 @@ pub async fn archive_chain_handler(
         super::handlers::refuse_if_coordinator(&state, id, "archive").await?;
     }
 
-    for id in &member_ids {
-        let conv = state.db.get_conversation(id).await.map_err(db_to_app)?;
-        if chain_member_blocks_cascade(&conv.state) {
-            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                format!(
-                    "Cannot archive chain: member {id} is busy. Cancel the in-flight \
-                     operation first, then retry.",
-                ),
-                "cancel_first",
-            ))));
-        }
-    }
-    let wake_repo = state.db.wake_repository();
-    for id in &member_ids {
-        if wake_repo
-            .has_owed_work_for_conversation(id)
-            .await
-            .map_err(|error| AppError::Internal(error.to_string()))?
-        {
-            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                format!("Cannot archive chain: member {id} has pending background work."),
-                "pending_wake",
-            ))));
-        }
-    }
-
     let active_id = member_ids
         .last()
         .ok_or_else(|| AppError::NotFound("chain has no members".to_string()))?;
