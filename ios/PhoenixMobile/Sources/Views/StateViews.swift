@@ -92,6 +92,10 @@ struct StateDetailView: View {
     @Environment(AppModel.self) private var model
     let session: ConversationSession
 
+    nonisolated static func fallbackErrorMessage(type: String, state: JSONValue?) -> String {
+        StateDetailBody.fallbackErrorMessage(type: type, state: state)
+    }
+
     var body: some View {
         StateDetailBody(
             state: session.typedState,

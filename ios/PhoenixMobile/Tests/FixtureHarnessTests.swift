@@ -29,7 +29,7 @@ final class FixtureHarnessTests: XCTestCase {
     }
 
     func testNormalFixtureCoversValidAndMalformedImages() {
-        let images = FixtureScenario.scenario(for: .normal).screen.messages[0].content?["images"]?.arrayValue
+        let images = FixtureScenario.scenario(for: .normal).screen.messages[0].content["images"]?.arrayValue
 
         XCTAssertEqual(images?.count, 2)
         XCTAssertNotNil(Data(base64Encoded: images?[0]["data"]?.stringValue ?? ""))
