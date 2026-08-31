@@ -2,4 +2,4 @@
 import type { SqliteReportReadFamily } from "./SqliteReportReadFamily";
 import type { SqliteWaitSummary } from "./SqliteWaitSummary";
 
-export type SqliteReadFamilyReport = { family: SqliteReportReadFamily, label: string, attempt_count: number, success_count: number, failure_count: number, abandoned_count: number, logical_elapsed: SqliteWaitSummary, };
+export type SqliteReadFamilyReport = { family: SqliteReportReadFamily, label: string, success_count: number, failure_count: number, abandoned_count: number, logical_elapsed: SqliteWaitSummary, };

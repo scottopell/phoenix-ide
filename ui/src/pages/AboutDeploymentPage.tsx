@@ -422,7 +422,7 @@ function SqliteDiagnostics({
   const hasTypedSamples = (report?.classification.typed_outcome_count ?? 0) > 0;
   const hasNativeLoad = report?.reads.some((row) => row.total_profiled_read_execution_ms > 0 || row.peak_concurrency > 0) ?? false;
   const hasWriterOccupancy = report?.writer_categories.some((row) => row.writer_occupancy_percent > 0 || row.peak_concurrency > 0) ?? false;
-  const hasReadFamilySamples = report?.read_families.some((row) => row.attempt_count > 0) ?? false;
+  const hasReadFamilySamples = report?.read_families.some((row) => row.success_count + row.failure_count + row.abandoned_count > 0) ?? false;
   const hasCoverage = (report?.covered_uptime_micros ?? 0) > 0;
   return (
     <section className="settings-section about-sqlite-section" aria-labelledby="sqlite-diagnostics-title">
@@ -564,7 +564,7 @@ function SqliteDiagnostics({
                   {report.read_families.map((row) => (
                     <tr key={row.family}>
                       <td>{row.label}</td>
-                      <td>{formatNumber(row.attempt_count)}</td>
+                      <td>{formatNumber(row.success_count + row.failure_count + row.abandoned_count)}</td>
                       <td>total {formatNumber(row.logical_elapsed.total_ms)} ms · avg {row.logical_elapsed.avg_ms ?? '—'} ms · p95≤ {row.logical_elapsed.p95_upper_bound_ms ?? '—'} ms</td>
                       <td>success {formatNumber(row.success_count)} · fail {formatNumber(row.failure_count)} · abandoned {formatNumber(row.abandoned_count)}</td>
                     </tr>

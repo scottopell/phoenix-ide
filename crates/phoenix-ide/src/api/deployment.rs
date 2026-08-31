@@ -282,7 +282,6 @@ pub struct SqliteReadCategoryReport {
 pub struct SqliteReadFamilyReport {
     pub family: SqliteReportReadFamily,
     pub label: String,
-    pub attempt_count: u64,
     pub success_count: u64,
     pub failure_count: u64,
     pub abandoned_count: u64,
@@ -814,9 +813,6 @@ fn sample_sqlite_workload_report(
             SqliteReadFamilyReport {
                 family: SqliteReportReadFamily::from(family),
                 label: sqlite_read_family_label(family).to_string(),
-                attempt_count: success_count
-                    .saturating_add(failure_count)
-                    .saturating_add(abandoned_count),
                 success_count,
                 failure_count,
                 abandoned_count,

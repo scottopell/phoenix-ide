@@ -199,7 +199,6 @@ function sqliteReadFamily() {
   return {
     family: 'active_list' as const,
     label: 'Active conversation list',
-    attempt_count: 0,
     success_count: 0,
     failure_count: 0,
     abandoned_count: 0,
@@ -344,7 +343,6 @@ describe('AboutDeploymentPage disk usage health', () => {
       .mockResolvedValueOnce(sqliteReport({
         read_families: [{
           ...sqliteReadFamily(),
-          attempt_count: 3,
           success_count: 2,
           failure_count: 1,
           logical_elapsed: { sample_count: 3, total_ms: 42, avg_ms: 14, p50_upper_bound_ms: 19, p95_upper_bound_ms: 49, p99_upper_bound_ms: 49 },

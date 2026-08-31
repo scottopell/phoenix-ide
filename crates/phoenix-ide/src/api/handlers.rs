@@ -16143,7 +16143,10 @@ mod wake_handler_tests {
         assert_eq!(writer_categories[0]["category"], "message_persistence");
         assert_eq!(read_categories[0]["category"], "message_persistence");
         assert_eq!(read_families[0]["family"], "active_list");
-        assert_eq!(read_families[0]["attempt_count"], 0);
+        assert_eq!(read_families[0]["success_count"], 0);
+        assert_eq!(read_families[0]["failure_count"], 0);
+        assert_eq!(read_families[0]["abandoned_count"], 0);
+        assert!(read_families[0].get("attempt_count").is_none());
         assert_eq!(read_families[0]["logical_elapsed"]["sample_count"], 0);
     }
 
