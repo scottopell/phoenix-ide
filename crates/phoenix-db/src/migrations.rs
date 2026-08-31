@@ -7930,6 +7930,16 @@ mod migration_094_tests {
         }
     }
 
+    #[test]
+    fn participant_snapshot_upgrade_captures_active_subordinates_and_cascades_delete() {
+        assert!(super::MIGRATION_095.contains("WHERE obligation.phase <> 'completed'"));
+        assert!(super::MIGRATION_095
+            .contains("participant.product_conversation_id = obligation.product_conversation_id"));
+        assert!(super::MIGRATION_095.contains(
+            "FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE"
+        ));
+    }
+
     #[tokio::test]
     async fn lifecycle_cutover_reconciles_released_drift_without_dropping_rows() {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
@@ -8005,9 +8015,15 @@ CREATE TABLE close_attempt_participants (
     captured_at TEXT NOT NULL,
     PRIMARY KEY (attempt_id, conversation_id),
     FOREIGN KEY (attempt_id) REFERENCES close_obligations(attempt_id) ON DELETE CASCADE,
-    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE RESTRICT
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
 );
 INSERT INTO close_attempt_participants (attempt_id, conversation_id, captured_at)
+SELECT obligation.attempt_id, participant.id, obligation.created_at
+FROM close_obligations obligation
+JOIN conversations participant
+  ON participant.product_conversation_id = obligation.product_conversation_id
+WHERE obligation.phase <> 'completed';
+INSERT OR IGNORE INTO close_attempt_participants (attempt_id, conversation_id, captured_at)
 SELECT member.attempt_id, member.conversation_id, member.captured_at
 FROM close_attempt_members member;
 
