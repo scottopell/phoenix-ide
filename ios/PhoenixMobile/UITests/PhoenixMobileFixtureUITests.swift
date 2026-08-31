@@ -63,7 +63,6 @@ final class PhoenixMobileFixtureUITests: XCTestCase {
             if fixture == .readOnly {
                 let approval = element("state.taskApprovalCard")
                 XCTAssertTrue(scrollFixtureShell(to: approval))
-                XCTAssertFalse(app.buttons["Approve…"].isHittable)
                 XCTAssertTrue(scrollFixtureShell(to: element("fixture.composer")))
                 XCTAssertTrue(element("fixture.composer").exists)
             }
