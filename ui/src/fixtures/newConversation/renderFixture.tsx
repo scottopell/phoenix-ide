@@ -22,6 +22,14 @@ function pageHasSettled(root: HTMLElement, scenario: NewConversationScenario): b
   const draft = root.querySelector<HTMLTextAreaElement>('.new-conv-textarea-mobile');
   const directoryReady = root.querySelector('.status-ok') !== null;
   const sendButtons = Array.from(root.querySelectorAll<HTMLButtonElement>('.new-conv-send'));
+  const recoveryItems = root.querySelectorAll('.product-creation-recovery__item').length;
+  const expectedRecoveryItems = (scenario.recoveryRows?.length ?? 0) * 2;
+  const loadMore = Array.from(root.querySelectorAll<HTMLButtonElement>('.product-creation-recovery__action'))
+    .find((button) => button.textContent === 'Load more');
+  const recoveryReady = recoveryItems >= expectedRecoveryItems
+    && (expectedRecoveryItems === 0 || root.querySelector('[aria-label="Recent product creation attempts"]') !== null)
+    && (scenario.recoveryNextCursor ? loadMore !== undefined : loadMore === undefined);
+  if (expectedRecoveryItems > 0) return recoveryReady;
 
   return directory?.value === scenario.cwd
     && model?.value === scenario.models.default
@@ -30,7 +38,8 @@ function pageHasSettled(root: HTMLElement, scenario: NewConversationScenario): b
     && sendButtons.length === 2
     && sendButtons.every((button) => !button.disabled)
     && !root.textContent?.includes('Workflow')
-    && !root.textContent?.includes('Chat in a fresh worktree');
+    && !root.textContent?.includes('Chat in a fresh worktree')
+    && recoveryReady;
 }
 
 function NewConversationFixtureBody({ scenario }: Props) {
@@ -49,22 +58,23 @@ function NewConversationFixtureBody({ scenario }: Props) {
     const root = rootRef.current;
     if (!root) return undefined;
 
-    let frame: number;
+    let interval = 0;
     const checkUntilSettled = () => {
-      if (pageHasSettled(root, scenario)) {
-        setReady(true);
-        return;
-      }
-      frame = requestAnimationFrame(checkUntilSettled);
+      if (!pageHasSettled(root, scenario)) return;
+      setReady(true);
+      window.clearInterval(interval);
     };
     checkUntilSettled();
-    return () => cancelAnimationFrame(frame);
+    interval = window.setInterval(checkUntilSettled, 16);
+    return () => window.clearInterval(interval);
   }, [scenario]);
 
   return (
     <main
       ref={rootRef}
       data-new-conversation-fixture={scenario.id}
+      data-new-conversation-scenario={scenario.id}
+      data-new-conversation-recovery-count={String(scenario.recoveryRows?.length ?? 0)}
       {...(ready ? { 'data-new-conversation-fixture-ready': scenario.id } : {})}
     >
       <NewConversationPage />

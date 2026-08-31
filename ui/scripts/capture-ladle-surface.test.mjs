@@ -1,3 +1,5 @@
+import { readFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { __testables } from './capture-ladle-surface.mjs';
 
@@ -30,5 +32,16 @@ describe('capture-ladle-surface viewport helpers', () => {
     expect(() => normalizeViewportMatrix([{ name: 'broken', width: Number.NaN, height: 900 }], { width: 960, height: 900 })).toThrow(
       'viewportMatrix[0] must include finite width and height',
     );
+  });
+});
+
+// Static shape check avoids executing the capture entrypoint during Vitest.
+describe('capture-product-conversation entrypoint', () => {
+  it('declares the deterministic desktop/mobile matrix in source', async () => {
+    const source = await readFile(resolve(process.cwd(), 'scripts/capture-product-conversation.mjs'), 'utf8');
+    expect(source).toContain("readyAttribute: 'data-product-conversation-fixture-ready'");
+    expect(source).toContain("{ name: 'desktop', width: 1440, height: 900 }");
+    expect(source).toContain("{ name: 'mobile', width: 390, height: 844 }");
+    expect(source).toContain("expectedConsoleErrors: new Map([");
   });
 });

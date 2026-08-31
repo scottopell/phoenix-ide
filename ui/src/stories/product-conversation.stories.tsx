@@ -12,14 +12,17 @@ const storyFor = (id: ProductConversationScenarioId): Story => {
   };
 };
 
-export const DesktopMultiSegmentQaWork = storyFor('desktop-multi-segment-qa-work');
-DesktopMultiSegmentQaWork.storyName = 'desktop-multi-segment-qa-work';
+export const DesktopOpenMultiSegmentQaWork = storyFor('desktop-open-multi-segment-qa-work');
+DesktopOpenMultiSegmentQaWork.storyName = 'desktop-open-multi-segment-qa-work';
 
 export const MobileOpen = storyFor('mobile-open');
 MobileOpen.storyName = 'mobile-open';
 
-export const HistoryReadOnly = storyFor('history-read-only');
-HistoryReadOnly.storyName = 'history-read-only';
+export const DesktopHistoryReadOnly = storyFor('desktop-history-read-only');
+DesktopHistoryReadOnly.storyName = 'desktop-history-read-only';
+
+export const MobileHistoryReadOnly = storyFor('mobile-history-read-only');
+MobileHistoryReadOnly.storyName = 'mobile-history-read-only';
 
 export const Loading = storyFor('loading');
 Loading.storyName = 'loading';
