@@ -193,7 +193,8 @@ struct FixtureConversationScreen: View {
 
     var body: some View {
         let screen = scenario.screen
-        VStack(alignment: .leading, spacing: 0) {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 0) {
             Text("Fixture ready: \(scenario.id.rawValue)")
                 .font(.caption2)
                 .foregroundStyle(.clear)
@@ -238,90 +239,36 @@ struct FixtureConversationScreen: View {
                     state: ConversationState.parse(screen.statePayload),
                     presentationMode: screen.presentationMode,
                     requiresAction: screen.requiresAction)
-                fixtureStateFamily(screen: screen)
-                if case .awaitingTaskApproval(let title, let priority, let plan) =
-                    ConversationState.parse(screen.statePayload)
-                {
-                    TaskApprovalCardBody(
-                        title: title,
-                        priority: priority,
-                        plan: plan,
-                        isOnline: screen.isOnline,
-                        acceptsActions: false,
-                        busy: false,
-                        onReject: {},
-                        onFeedback: { _ in },
-                        onApproveHere: {},
-                        onApproveFresh: {})
-                }
-                if case .awaitingUserResponse(let questions) = ConversationState.parse(screen.statePayload),
-                   !questions.isEmpty
-                {
-                    QuestionCardBody(
-                        questions: questions,
-                        isOnline: screen.isOnline,
-                        acceptsActions: false,
-                        busy: false,
-                        onAnswer: { _ in },
-                        onDismiss: {})
-                }
+                StateDetailBody(
+                    state: ConversationState.parse(screen.statePayload),
+                    presentationMode: screen.presentationMode,
+                    agentWorking: screen.presentationMode == "working",
+                    isOnline: screen.isOnline,
+                    acceptsActions: screen.isOnline,
+                    busy: false,
+                    convState: screen.statePayload,
+                    onAction: { _ in })
                 fixtureBanner(
                     title: screen.bannerTitle,
                     detail: screen.bannerDetail,
                     style: screen.bannerStyle)
                     .accessibilityIdentifier(screen.accessibilityID)
+            }
         }
         .navigationTitle(screen.title)
         .navigationBarTitleDisplayMode(.inline)
     }
 
-    @ViewBuilder
-    private func fixtureStateFamily(screen: FixtureConversationScreenModel) -> some View {
-        switch screen.presentationMode {
-        case "working":
-            WorkingStateRow {
-                Text("Deterministic work in progress")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        case "needs_action":
-            NeedsActionStateCard(
-                icon: "person.crop.circle.badge.exclamationmark",
-                title: "Action needed",
-                detail: "Deterministic fixture state",
-                footnote: screen.isOnline
-                    ? "Actions are disabled in fixture mode."
-                    : "Offline — actions need a connection and are never queued.")
-        case "error":
-            ErrorStateCard(
-                message: "Server returned malformed tool output.",
-                dismissible: true,
-                dismissDisabled: true,
-                onDismiss: {})
-        default:
-            EmptyView()
-        }
-    }
-
-    @ViewBuilder
     private func transcript(screen: FixtureConversationScreenModel) -> some View {
-        if screen.messages.isEmpty && screen.streamingText.isEmpty {
-            ContentUnavailableView {
-                Label("No messages yet", systemImage: "text.bubble")
-            } description: {
-                Text("This fixture isolates the empty conversation shell.")
-            }
-            .frame(maxWidth: .infinity)
-            .frame(minHeight: 320)
-            .accessibilityIdentifier("fixture.emptyTranscript")
-        } else {
-            ConversationTranscriptView(
-                messages: screen.messages,
-                toolIndex: screen.toolIndex,
-                streamingText: screen.streamingText,
-                outboxSession: nil)
-                .frame(minHeight: 320)
-        }
+        ConversationTranscriptView(
+            messages: screen.messages,
+            toolIndex: screen.toolIndex,
+            streamingText: screen.streamingText,
+            outboxSession: nil)
+            .frame(height: 320)
+            .accessibilityIdentifier(
+                screen.messages.isEmpty && screen.streamingText.isEmpty
+                    ? "fixture.emptyTranscript" : "fixture.populatedTranscript")
     }
 
     private func fixtureBanner(title: String, detail: String?, style: FixtureBannerStyle) -> some View {
@@ -594,6 +541,9 @@ private extension FixtureScenario {
                 accessibilityID: "fixture.footer.readOnly"))
     }
 
+    static let validPixelPNG =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+
     static var baseMessages: [Message] {
         [
             .init(
@@ -603,6 +553,16 @@ private extension FixtureScenario {
                 message_type: "user",
                 content: .object([
                     "text": .string("Please review this **deterministic** fixture run."),
+                    "images": .array([
+                        .object([
+                            "media_type": .string("image/png"),
+                            "data": .string(validPixelPNG),
+                        ]),
+                        .object([
+                            "media_type": .string("image/png"),
+                            "data": .string("not-valid-base64"),
+                        ]),
+                    ]),
                 ]),
                 display_data: nil,
                 created_at: "2025-01-02T03:04:05Z"),

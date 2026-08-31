@@ -91,10 +91,33 @@ struct ErrorStateCard: View {
 struct StateDetailView: View {
     @Environment(AppModel.self) private var model
     let session: ConversationSession
+
+    var body: some View {
+        StateDetailBody(
+            state: session.typedState,
+            presentationMode: session.presentationMode,
+            agentWorking: session.agentWorking,
+            isOnline: model.connectivity.isOnline,
+            acceptsActions: session.acceptsConversationActions,
+            busy: session.actionInFlight != nil,
+            convState: session.convState,
+            onAction: { session.perform($0) })
+    }
+}
+
+struct StateDetailBody: View {
+    let state: ConversationState
+    let presentationMode: String
+    let agentWorking: Bool
+    let isOnline: Bool
+    let acceptsActions: Bool
+    let busy: Bool
+    let convState: JSONValue?
+    let onAction: (ConversationAction) -> Void
     @State private var confirmEmptyQuestionDismissal = false
 
     var body: some View {
-        switch session.typedState {
+        switch state {
         case .toolExecuting(let toolName, let remaining, let completed):
             workingRow {
                 HStack(spacing: 4) {
@@ -125,13 +148,32 @@ struct StateDetailView: View {
             if questions.isEmpty {
                 emptyQuestionCard
             } else {
-                QuestionCard(session: session, questions: questions)
+                QuestionCardBody(
+                    questions: questions,
+                    isOnline: isOnline,
+                    acceptsActions: acceptsActions,
+                    busy: busy,
+                    onAnswer: { onAction(.respondToQuestions(answers: $0)) },
+                    onDismiss: { onAction(.dismissQuestion) })
                     .id(questions)
             }
 
         case .awaitingTaskApproval(let title, let priority, let plan):
-            TaskApprovalCard(
-                session: session, title: title, priority: priority, plan: plan)
+            TaskApprovalCardBody(
+                title: title,
+                priority: priority,
+                plan: plan,
+                isOnline: isOnline,
+                acceptsActions: acceptsActions,
+                busy: busy,
+                onReject: { onAction(.rejectTask) },
+                onFeedback: { onAction(.provideTaskFeedback($0)) },
+                onApproveHere: {
+                    onAction(.approveTask(handoff: .continueInCurrentConversation))
+                },
+                onApproveFresh: {
+                    onAction(.approveTask(handoff: .startFreshWorkConversation))
+                })
 
         case .awaitingRecovery(let message):
             workingRow {
@@ -154,7 +196,7 @@ struct StateDetailView: View {
             errorCard(message: message, dismissible: false)
 
         case .contextExhausted(let summary):
-            if session.presentationMode != "done" {
+            if presentationMode != "done" {
                 needsActionCard(
                     icon: "arrow.triangle.2.circlepath",
                     title: "Context exhausted",
@@ -184,7 +226,7 @@ struct StateDetailView: View {
             }
 
         case .idle, .awaitingLlm, .awaitingContinuation, .terminal:
-            if session.agentWorking {
+            if agentWorking {
                 workingRow {
                     Text("Working…")
                         .font(.caption)
@@ -203,17 +245,17 @@ struct StateDetailView: View {
 
     @ViewBuilder
     private func fallbackState(type: String) -> some View {
-        if session.presentationMode == "error" {
+        if presentationMode == "error" {
             errorCard(
-                message: Self.fallbackErrorMessage(type: type, state: session.convState),
+                message: Self.fallbackErrorMessage(type: type, state: convState),
                 dismissible: false)
-        } else if session.presentationMode == "needs_action" {
+        } else if presentationMode == "needs_action" {
             needsActionCard(
                 icon: "person.crop.circle.badge.exclamationmark",
                 title: "Action needed",
                 detail: type.replacingOccurrences(of: "_", with: " "),
                 footnote: "Handle this from the web UI.")
-        } else if session.agentWorking {
+        } else if agentWorking {
             workingRow {
                 Text(type.replacingOccurrences(of: "_", with: " "))
                     .font(.caption)
@@ -244,10 +286,10 @@ struct StateDetailView: View {
         ErrorStateCard(
             message: message,
             dismissible: dismissible,
-            dismissDisabled: !model.connectivity.isOnline
-                || !session.acceptsConversationActions
-                || session.actionInFlight != nil,
-            onDismiss: { session.perform(.dismissError) })
+            dismissDisabled: !isOnline
+                || !acceptsActions
+                || busy,
+            onDismiss: { onAction(.dismissError) })
     }
 
     private var emptyQuestionCard: some View {
@@ -263,9 +305,9 @@ struct StateDetailView: View {
                     confirmEmptyQuestionDismissal = true
                 }
                 .font(.callout.bold())
-                .disabled(!model.connectivity.isOnline || session.actionInFlight != nil)
+                .disabled(!isOnline || busy)
             }
-            if !model.connectivity.isOnline {
+            if !isOnline {
                 Text("Offline — dismissal needs a connection and is never queued.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
@@ -286,7 +328,7 @@ struct StateDetailView: View {
             titleVisibility: .visible
         ) {
             Button("Dismiss question", role: .destructive) {
-                session.perform(.dismissQuestion)
+                onAction(.dismissQuestion)
             }
         }
     }

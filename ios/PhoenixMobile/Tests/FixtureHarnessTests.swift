@@ -28,6 +28,14 @@ final class FixtureHarnessTests: XCTestCase {
             Set(FixtureScenario.ID.allCases))
     }
 
+    func testNormalFixtureCoversValidAndMalformedImages() {
+        let images = FixtureScenario.scenario(for: .normal).screen.messages[0].content?["images"]?.arrayValue
+
+        XCTAssertEqual(images?.count, 2)
+        XCTAssertNotNil(Data(base64Encoded: images?[0]["data"]?.stringValue ?? ""))
+        XCTAssertNil(Data(base64Encoded: images?[1]["data"]?.stringValue ?? ""))
+    }
+
     func testNormalFixtureUsesShippedToolExecutingPayloadShape() {
         let state = ConversationState.parse(FixtureScenario.scenario(for: .normal).screen.statePayload)
 

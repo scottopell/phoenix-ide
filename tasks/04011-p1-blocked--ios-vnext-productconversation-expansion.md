@@ -6,19 +6,19 @@ Coordinate the native-client migration and its systematic UI expansion without i
 
 ## Gate
 
-The program remains blocked until ProductConversation History/delete and the stable client-facing aggregate contract are on main.
+The deterministic fixture harness proceeds independently. Core migration may begin after its fixture contract seam is committed and reviewed, consuming the shipped ProductConversation REST aggregate while preserving transcript-row SSE/session ownership. Permanent delete and later capability sections do not block core migration.
 
 ## Ordered sections
 
-1. ProductConversation migration.
-2. Deterministic rendering fixture harness.
+1. Deterministic rendering fixture harness.
+2. ProductConversation migration.
 3. Conversation status and actions.
 4. Tool-output rendering.
 5. Markdown rendering.
 6. Grounding and file browsing.
 7. Prose reader and comments.
 
-Section tasks are umbrella owners, not an instruction to implement a broad feature in one PR. Before a section becomes ready, split it into numbered, narrowly scoped taskmd leaf tasks with owning REQ IDs, explicit dependencies, observable acceptance, and fixture/test evidence.
+The fixture harness is one bounded implementation task. Other section tasks are umbrella owners, not instructions to implement broad features in one PR; split them only when scheduled concurrent work has genuinely separate source ownership.
 
 ## Completion
 

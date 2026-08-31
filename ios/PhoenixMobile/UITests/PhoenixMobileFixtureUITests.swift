@@ -24,6 +24,7 @@ final class PhoenixMobileFixtureUITests: XCTestCase {
         launchFixture(.normal)
         XCTAssertTrue(element("fixture.ready.normal").waitForExistence(timeout: 10))
         XCTAssertTrue(scrollTranscript(to: element("message.user")))
+        XCTAssertTrue(scrollTranscript(to: element("attachment.base64")))
         XCTAssertTrue(scrollTranscript(to: element("message.agent")))
         XCTAssertTrue(scrollTranscript(to: element("tool.think")))
         XCTAssertTrue(scrollTranscript(to: element("tool.bash")))
@@ -54,9 +55,11 @@ final class PhoenixMobileFixtureUITests: XCTestCase {
             app.terminate()
             launchFixture(fixture)
             XCTAssertTrue(element("fixture.ready.\(fixture.rawValue)").waitForExistence(timeout: 10))
-            XCTAssertTrue(element("fixture.stateDetail").exists)
+            XCTAssertTrue(scrollFixtureShell(to: element("fixture.stateDetail")))
             if fixture == .readOnly {
-                XCTAssertTrue(element("state.taskApprovalCard").exists)
+                let approval = element("state.taskApprovalCard")
+                XCTAssertTrue(scrollFixtureShell(to: approval))
+                XCTAssertTrue(app.buttons["Approve…"].isEnabled)
             }
             attachScreenshot(named: "fixture-\(fixture.rawValue)")
         }
@@ -67,8 +70,18 @@ final class PhoenixMobileFixtureUITests: XCTestCase {
         app.launch()
     }
 
+    private func scrollFixtureShell(to target: XCUIElement) -> Bool {
+        let shell = app.scrollViews.firstMatch
+        guard shell.waitForExistence(timeout: 5) else { return false }
+        for _ in 0..<8 {
+            if target.exists && target.isHittable { return true }
+            shell.swipeUp()
+        }
+        return target.exists
+    }
+
     private func scrollTranscript(to target: XCUIElement) -> Bool {
-        let transcript = app.scrollViews.firstMatch
+        let transcript = app.scrollViews.element(boundBy: 1)
         guard transcript.waitForExistence(timeout: 5) else { return false }
         transcript.swipeDown()
         for _ in 0..<8 {
