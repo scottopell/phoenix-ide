@@ -89,7 +89,7 @@ import {
 
 // Conditional overlays / heavy panels — code-split so the default render path
 // (chat view with no overlay open) doesn't pay their bundle cost.
-// - FileViewer + MetaViewer bodies: pull in react-syntax-highlighter
+// - FileViewer + MetaViewer bodies, TaskApprovalReader: pull in react-syntax-highlighter
 // - TerminalPanel: pulls in xterm + addon (large)
 // - CredentialHelperPanel, FirstTaskWelcome: rarely mounted
 const FileViewer = lazy(() =>
@@ -97,6 +97,9 @@ const FileViewer = lazy(() =>
 );
 const ConversationDiffViewer = lazy(() =>
   import('../components/viewer/ConversationDiffViewer').then((m) => ({ default: m.ConversationDiffViewer })),
+);
+const TaskApprovalReader = lazy(() =>
+  import('../components/TaskApprovalReader').then((m) => ({ default: m.TaskApprovalReader })),
 );
 const FirstTaskWelcome = lazy(() =>
   import('../components/FirstTaskWelcome').then((m) => ({ default: m.FirstTaskWelcome })),
@@ -194,6 +197,7 @@ interface EmbeddedConversationHostProps {
   suppressCanonicalization?: boolean;
   ordinaryComposerEnabled?: boolean;
   suppressMessageViewerOwner?: boolean;
+  suppressTaskApprovalOwner?: boolean;
   onProjectionChange?: (projection: EmbeddedConversationProjection | null) => void;
   onCloseCompleted?: () => void;
 }
@@ -220,6 +224,7 @@ export function EmbeddedConversationPage({
   onProjectionChange,
   suppressMessageViewerOwner = false,
   onCloseCompleted,
+  suppressTaskApprovalOwner = false,
 }: EmbeddedConversationPageProps) {
   const navigate = useNavigate();
   const location = useLocation();
@@ -252,6 +257,7 @@ export function EmbeddedConversationPage({
         ordinaryComposerEnabled={ordinaryComposerEnabled}
         suppressCanonicalization={suppressCanonicalization}
         suppressMessageViewerOwner={suppressMessageViewerOwner}
+        suppressTaskApprovalOwner={suppressTaskApprovalOwner}
         {...(onProjectionChange ? { onProjectionChange } : {})}
         {...(onCloseCompleted ? { onCloseCompleted } : {})}
       />
@@ -284,6 +290,7 @@ function ConversationPageContent({
   suppressCanonicalization,
   onProjectionChange,
   suppressMessageViewerOwner,
+  suppressTaskApprovalOwner,
   onCloseCompleted,
 }: {
   slug: string;
@@ -294,6 +301,7 @@ function ConversationPageContent({
   suppressCanonicalization: boolean;
   onProjectionChange?: (projection: EmbeddedConversationProjection | null) => void;
   suppressMessageViewerOwner: boolean;
+  suppressTaskApprovalOwner: boolean;
   onCloseCompleted?: () => void;
 }) {
   const { setConversationReadiness } = useConversationReadiness();
@@ -562,6 +570,9 @@ function ConversationPageContent({
   const actualModelContextWindow = matchingModel ? matchingModel.context_window : null;
   const modelContextWindow = actualModelContextWindow ?? 200_000;
 
+  const [showTaskApproval, setShowTaskApproval] = useState(false);
+  const [approvalContextWindowUsed, setApprovalContextWindowUsed] = useState<number | null>(null);
+  const taskApprovalError = atom.uiError?.type === 'BackendError' ? atom.uiError.message : null;
   const [showFirstTaskWelcome, setShowFirstTaskWelcome] = useState(false);
 
   // ---------------------------------------------------------------------------
@@ -599,6 +610,8 @@ function ConversationPageContent({
     setTerminalStatus({ activity: 'disconnected', unreadLines: 0, cwd: '' });
     setImages([]);
     setFiles([]);
+    setShowTaskApproval(false);
+    setApprovalContextWindowUsed(null);
     setShowFirstTaskWelcome(false);
     setFocusToken(0);
     // Ref resets — immediate, no re-render.
@@ -1146,6 +1159,41 @@ function ConversationPageContent({
     clearSeedDraft(conversationId);
   }, [conversationId, setDraftIfEmptyCb, requestComposerFocus]);
 
+  useEffect(() => {
+    if (suppressTaskApprovalOwner) {
+      setShowTaskApproval(false);
+      setApprovalContextWindowUsed(null);
+      return;
+    }
+    if (atom.phase.type === 'awaiting_task_approval' && !isArchived) {
+      setShowTaskApproval(true);
+    } else {
+      setShowTaskApproval(false);
+      setApprovalContextWindowUsed(null);
+    }
+  }, [atom.phase.type, isArchived, suppressTaskApprovalOwner]);
+
+  useEffect(() => {
+    if (suppressTaskApprovalOwner || !showTaskApproval || atom.phase.type !== 'awaiting_task_approval' || !conversationId) {
+      setApprovalContextWindowUsed(null);
+      return;
+    }
+
+    let cancelled = false;
+    setApprovalContextWindowUsed(null);
+    api.getConversation(conversationId)
+      .then((result) => {
+        if (!cancelled) setApprovalContextWindowUsed(result.context_window_size);
+      })
+      .catch(() => {
+        if (!cancelled) setApprovalContextWindowUsed(null);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [showTaskApproval, atom.phase.type, conversationId, atom.contextWindow.used, suppressTaskApprovalOwner]);
+
   // Ctrl+` toggles the terminal collapse state. Only blocked when focus is
   // inside the xterm itself — in every other input (chat textarea, etc.)
   // the shortcut should still work, matching how VS Code and iTerm2 behave.
@@ -1514,6 +1562,37 @@ function ConversationPageContent({
     },
     [conversation, availableModels, defaultModel, navigate, createConversationWithStore],
   );
+
+  const handleApproveTask = async (handoff: 'continue_in_current_conversation' | 'start_fresh_work_conversation') => {
+    if (!conversationId || isArchived) return;
+    dispatch({ type: 'clear_error' });
+    try {
+      const result = await api.approveTask(conversationId, handoff);
+      if (result.first_task) {
+        setShowFirstTaskWelcome(true);
+      }
+    } catch (err) {
+      console.error('Failed to approve task:', err);
+    }
+  };
+
+  const handleRejectTask = async () => {
+    if (!conversationId || isArchived) return;
+    try {
+      await api.rejectTask(conversationId);
+    } catch (err) {
+      console.error('Failed to reject task:', err);
+    }
+  };
+
+  const handleTaskFeedback = async (annotations: string) => {
+    if (!conversationId || isArchived) return;
+    try {
+      await api.sendTaskFeedback(conversationId, annotations);
+    } catch (err) {
+      console.error('Failed to send task feedback:', err);
+    }
+  };
 
   // File browser opened from sidebar on desktop; mobile overlay triggered elsewhere
 
@@ -2545,6 +2624,22 @@ function ConversationPageContent({
             </Suspense>
           </div>
         </div>
+      )}
+
+      {!suppressTaskApprovalOwner && showTaskApproval && !isArchived && atom.phase.type === 'awaiting_task_approval' && (
+        <Suspense fallback={null}>
+          <TaskApprovalReader
+            title={atom.phase.title}
+            priority={atom.phase.priority}
+            plan={atom.phase.plan}
+            contextWindowUsed={approvalContextWindowUsed ?? undefined}
+            modelContextWindow={actualModelContextWindow ?? undefined}
+            approvalError={taskApprovalError}
+            onApprove={handleApproveTask}
+            onReject={handleRejectTask}
+            onSendFeedback={handleTaskFeedback}
+          />
+        </Suspense>
       )}
 
       <Toast messages={toasts} onDismiss={dismissToast} />

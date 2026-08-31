@@ -676,8 +676,24 @@ describe('ProductConversationPage', () => {
     expect(embeddedConversationPageSpy).toHaveBeenLastCalledWith(expect.objectContaining({
       suppressCanonicalization: true,
       suppressMessageViewerOwner: true,
+      suppressTaskApprovalOwner: true,
       showTranscript: false,
     }));
+  });
+
+  it('preserves embedded task approval ownership on degraded fallback routes', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot).mockRejectedValueOnce(new Error('snapshot failed'));
+
+    renderPage();
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('snapshot failed');
+    expect(embeddedConversationPageSpy.mock.calls[0]?.[0]).toEqual(expect.objectContaining({
+      slug: 'pc-1',
+      routePrefix: '/c',
+      suppressCanonicalization: true,
+    }));
+    expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.['suppressTaskApprovalOwner']).toBeUndefined();
   });
 
   it('keeps latest open row mounted even when writable transcript is null', async () => {

@@ -823,6 +823,7 @@ function ProductConversationPageInner() {
                   showTranscript={false}
                   suppressCanonicalization={true}
                   suppressMessageViewerOwner
+                  suppressTaskApprovalOwner={true}
                   ordinaryComposerEnabled={isOpen}
                   onProjectionChange={setLatestProjection}
                   onCloseCompleted={() => setSnapshotRetry((retry) => retry + 1)}
