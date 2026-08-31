@@ -175,7 +175,11 @@ export function notifyCloseSnapshotChanged(conversationId: string): void {
 
 export function notifyArchiveCloseConflict(conversationId: string, error: unknown): boolean {
   if (!(error instanceof ConflictError)) return false;
-  if (error.detail.error_type !== 'close_loss_confirmation_required') return false;
+  if (![
+    'close_loss_confirmation_required',
+    'close_stop_work_confirmation_required',
+    'close_settlement_in_progress',
+  ].includes(error.detail.error_type)) return false;
   notifyCloseSnapshotChanged(conversationId);
   notifyProductConversationListMayHaveChanged();
   return true;

@@ -110,7 +110,7 @@ describe('product conversation list revision notifications', () => {
 });
 
 describe('archive close conflict notifications', () => {
-  it('notifies only for close-loss confirmation conflicts', () => {
+  it('notifies for every durable Close conflict', () => {
     const closeListener = vi.fn();
     const listListener = vi.fn();
     const unsubscribeClose = subscribeCloseSnapshotChanged('conv-1', closeListener);
@@ -133,6 +133,16 @@ describe('archive close conflict notifications', () => {
     }))).toBe(true);
     expect(closeListener).toHaveBeenCalledTimes(1);
     expect(listListener).toHaveBeenCalledTimes(0);
+    for (const error_type of [
+      'close_stop_work_confirmation_required',
+      'close_settlement_in_progress',
+    ]) {
+      expect(notifyArchiveCloseConflict('conv-1', new ConflictError({
+        error: 'durable Close requires attention',
+        error_type,
+      }))).toBe(true);
+    }
+    expect(closeListener).toHaveBeenCalledTimes(3);
 
     vi.runAllTimers();
 

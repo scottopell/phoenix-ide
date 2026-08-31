@@ -490,6 +490,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "enforce_monotonic_message_sequences",
         sql: MIGRATION_094,
     },
+    Migration {
+        version: 95,
+        name: "reconcile_product_lifecycle_cutover",
+        sql: MIGRATION_095,
+    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -7924,7 +7929,108 @@ mod migration_094_tests {
             .is_err());
         }
     }
+
+    #[tokio::test]
+    async fn lifecycle_cutover_reconciles_released_drift_without_dropping_rows() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE product_conversations (
+                 id TEXT PRIMARY KEY, kind TEXT NOT NULL, ordinary_lifecycle TEXT
+             );
+             CREATE TABLE conversations (
+                 id TEXT PRIMARY KEY, product_conversation_id TEXT, runtime_role TEXT,
+                 parent_conversation_id TEXT, continued_in_conv_id TEXT, archived INTEGER
+             );",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO product_conversations VALUES
+                 ('open-product', 'ordinary', 'history'),
+                 ('history-product', 'ordinary', 'open'),
+                 ('coordinator', 'coordinator', NULL);
+             INSERT INTO conversations VALUES
+                 ('open-row', 'open-product', 'user', NULL, NULL, 0),
+                 ('history-row', 'history-product', 'user', NULL, NULL, 1),
+                 ('subordinate', 'history-product', 'sub_agent', 'history-row', NULL, 0),
+                 ('coordinator-row', 'coordinator', 'coordinator', NULL, NULL, 0);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "UPDATE product_conversations
+             SET ordinary_lifecycle = CASE WHEN EXISTS (
+                 SELECT 1 FROM conversations latest
+                 WHERE latest.product_conversation_id = product_conversations.id
+                   AND latest.runtime_role = 'user'
+                   AND latest.parent_conversation_id IS NULL
+                   AND latest.continued_in_conv_id IS NULL
+                   AND latest.archived = 0
+             ) THEN 'open' ELSE 'history' END
+             WHERE kind = 'ordinary'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let products = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT id, ordinary_lifecycle FROM product_conversations ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            products,
+            vec![
+                ("coordinator".into(), None),
+                ("history-product".into(), Some("history".into())),
+                ("open-product".into(), Some("open".into())),
+            ]
+        );
+        let row_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row_count, 4);
+    }
 }
+
+const MIGRATION_095: &str = r"
+DROP TRIGGER close_attempt_direct_turn_settlement_target_requires_latest_member;
+CREATE TRIGGER close_attempt_direct_turn_settlement_target_requires_sealed_participant
+BEFORE INSERT ON close_attempt_direct_turn_settlements
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM durable_turns turn
+    JOIN conversations participant ON participant.id = turn.conversation_id
+    JOIN close_obligations obligation
+      ON obligation.product_conversation_id = participant.product_conversation_id
+    WHERE obligation.attempt_id = NEW.attempt_id
+      AND participant.created_at <= obligation.created_at
+      AND turn.turn_id = NEW.turn_id
+      AND turn.generation = NEW.expected_generation
+      AND turn.owns_conversation = 1
+      AND turn.terminal_kind IS NULL
+)
+BEGIN
+    SELECT RAISE(ABORT, 'close direct-turn settlement target must be a sealed active participant');
+END;
+
+UPDATE product_conversations
+SET ordinary_lifecycle = CASE WHEN EXISTS (
+    SELECT 1
+    FROM conversations latest
+    WHERE latest.product_conversation_id = product_conversations.id
+      AND latest.runtime_role = 'user'
+      AND latest.parent_conversation_id IS NULL
+      AND latest.continued_in_conv_id IS NULL
+      AND latest.archived = 0
+) THEN 'open' ELSE 'history' END
+WHERE kind = 'ordinary';
+";
 
 const MIGRATION_094: &str = r"
 -- Released databases could contain duplicate conversation-local sequences because
@@ -13744,7 +13850,8 @@ mod tests {
                     (74, 'temporarily_skip_completed_continuation_handoffs'),
                     (91, 'temporarily_skip_product_creation_jobs'),
                     (92, 'temporarily_skip_creation_checkout_pin'),
-                    (93, 'temporarily_skip_product_creation_ownership')",
+                    (93, 'temporarily_skip_product_creation_ownership'),
+                    (95, 'temporarily_skip_product_lifecycle_reconciliation')",
         )
         .execute(&pool)
         .await
@@ -14635,7 +14742,8 @@ mod tests {
                     (74, 'temporarily_skip_completed_continuation_handoffs'),
                     (91, 'temporarily_skip_product_creation_jobs'),
                     (92, 'temporarily_skip_creation_checkout_pin'),
-                    (93, 'temporarily_skip_product_creation_ownership')",
+                    (93, 'temporarily_skip_product_creation_ownership'),
+                    (95, 'temporarily_skip_product_lifecycle_reconciliation')",
         )
         .execute(pool)
         .await

@@ -1260,10 +1260,11 @@ impl Database {
              )
              SELECT ?1, turn.turn_id, turn.generation
              FROM durable_turns turn
-             JOIN close_attempt_members member
-               ON member.conversation_id = turn.conversation_id
-             WHERE member.attempt_id = ?1
-               AND member.member_role IN ('latest', 'root_latest')
+             JOIN conversations participant ON participant.id = turn.conversation_id
+             JOIN close_obligations obligation
+               ON obligation.product_conversation_id = participant.product_conversation_id
+             WHERE obligation.attempt_id = ?1
+               AND participant.created_at <= obligation.created_at
                AND turn.owns_conversation = 1 AND turn.terminal_kind IS NULL",
         )
         .bind(attempt_id)
@@ -3958,9 +3959,12 @@ impl Database {
         sqlx::query(
             "UPDATE conversations
              SET archived = 1, updated_at = ?2
-             WHERE id IN (
-                 SELECT conversation_id FROM close_attempt_members WHERE attempt_id = ?1
-             )",
+             WHERE product_conversation_id = (
+                 SELECT product_conversation_id FROM close_obligations WHERE attempt_id = ?1
+             )
+               AND created_at <= (
+                   SELECT created_at FROM close_obligations WHERE attempt_id = ?1
+               )",
         )
         .bind(attempt_id.as_str())
         .bind(&now)
@@ -5132,7 +5136,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_turn_settlement_captures_only_latest_authority_and_receipts_exact_release() {
+    async fn direct_turn_settlement_captures_sealed_aggregate_authority_and_receipts_exact_release()
+    {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "latest", "root").await;
@@ -5179,26 +5184,30 @@ mod tests {
             .list_unsettled_close_direct_turn_settlement_targets("attempt-exact-receipt")
             .await
             .unwrap();
-        assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].conversation_id, "latest");
-        assert_eq!(targets[0].turn_id, 2);
-        assert_eq!(targets[0].expected_generation, 0);
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].conversation_id, "root");
+        assert_eq!(targets[0].turn_id, 1);
+        assert_eq!(targets[1].conversation_id, "latest");
+        assert_eq!(targets[1].turn_id, 2);
+        assert!(targets.iter().all(|target| target.expected_generation == 0));
         sqlx::query(
             "UPDATE durable_turns
              SET generation = generation + 1, terminal_kind = 'Completed', owns_conversation = 0
-             WHERE turn_id = 2",
+             WHERE turn_id IN (1, 2)",
         )
         .execute(db.pool())
         .await
         .unwrap();
-        assert!(db
-            .record_close_direct_turn_settlement_if_released("attempt-exact-receipt", &targets[0])
-            .await
-            .unwrap());
-        assert!(db
-            .record_close_direct_turn_settlement_if_released("attempt-exact-receipt", &targets[0])
-            .await
-            .unwrap());
+        for target in &targets {
+            assert!(db
+                .record_close_direct_turn_settlement_if_released("attempt-exact-receipt", target,)
+                .await
+                .unwrap());
+            assert!(db
+                .record_close_direct_turn_settlement_if_released("attempt-exact-receipt", target,)
+                .await
+                .unwrap());
+        }
         assert!(db
             .list_unsettled_close_direct_turn_settlement_targets("attempt-exact-receipt")
             .await
@@ -5297,7 +5306,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uncaptured_aggregate_participant_remains_a_settlement_blocker() {
+    async fn aggregate_participant_remains_unsettled_until_exact_receipt() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "participant", "root").await;
@@ -5340,14 +5349,19 @@ mod tests {
         db.begin_close_active_work_settlement("attempt-all-members")
             .await
             .unwrap();
-        let target = db
+        let targets = db
             .list_unsettled_close_direct_turn_settlement_targets("attempt-all-members")
             .await
-            .unwrap()
-            .into_iter()
-            .next()
             .unwrap();
-        assert_eq!(target.conversation_id, "latest");
+        assert_eq!(targets.len(), 2);
+        let latest_target = targets
+            .iter()
+            .find(|target| target.conversation_id == "latest")
+            .unwrap();
+        let participant_target = targets
+            .iter()
+            .find(|target| target.conversation_id == "participant")
+            .unwrap();
         sqlx::query(
             "UPDATE durable_turns SET generation = 1, terminal_kind = 'Completed', owns_conversation = 0 WHERE turn_id = 1",
         )
@@ -5355,7 +5369,7 @@ mod tests {
         .await
         .unwrap();
         assert!(db
-            .record_close_direct_turn_settlement_if_released("attempt-all-members", &target)
+            .record_close_direct_turn_settlement_if_released("attempt-all-members", latest_target)
             .await
             .unwrap());
 
@@ -5364,7 +5378,7 @@ mod tests {
                 .await
                 .unwrap_err(),
             DbError::CloseFoundationPrecondition(message)
-                if message.contains("active durable member obligation")
+                if message.contains("unsettled direct-turn receipt")
         ));
         sqlx::query(
             "UPDATE durable_turns SET generation = 1, terminal_kind = 'Completed', owns_conversation = 0 WHERE turn_id = 2",
@@ -5372,8 +5386,99 @@ mod tests {
         .execute(db.pool())
         .await
         .unwrap();
+        assert!(db
+            .record_close_direct_turn_settlement_if_released(
+                "attempt-all-members",
+                participant_target,
+            )
+            .await
+            .unwrap());
         assert_eq!(
             db.advance_close_settlement_when_quiescent("attempt-all-members")
+                .await
+                .unwrap()
+                .phase(),
+            ClosePhase::AwaitingRetirementInspection
+        );
+    }
+
+    #[tokio::test]
+    async fn subordinate_direct_turn_is_captured_and_archived_with_aggregate() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        db.create_subagent_conversation(
+            "subordinate-turn",
+            "subordinate-turn",
+            "/tmp",
+            "root",
+            "test-model",
+            &crate::ConvMode::Direct,
+            phoenix_core::llm_language::LlmLanguage::default(),
+            db.get_conversation("root")
+                .await
+                .unwrap()
+                .attached_work_scope_id
+                .as_ref(),
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO workflows (
+                 workflow_id, profile_kind, profile_version, runtime_acceptance_enabled,
+                 external_acceptance_enabled, version, generation, status,
+                 snapshot_codec_family, snapshot_codec_version, snapshot_payload, created_at, updated_at
+             ) VALUES (31, 'direct_turn', 1, 1, 0, 0, 0, 'Active',
+                       'direct_turn', 1, X'00', 1, 1)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO durable_turns (
+                 turn_id, workflow_id, conversation_id, client_turn_key,
+                 prepared_fingerprint, prepared_payload, disposition, generation,
+                 terminal_kind, terminal_reason, owns_conversation, canonical_message_id
+             ) VALUES (31, 31, 'subordinate-turn', 'key', 'fingerprint', X'00',
+                       'Runtime', 0, NULL, NULL, 1, NULL)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-subordinate-turn",
+        )
+        .await
+        .unwrap();
+        db.begin_close_idle_settlement("attempt-subordinate-turn")
+            .await
+            .unwrap();
+        let targets = db
+            .list_unsettled_close_direct_turn_settlement_targets("attempt-subordinate-turn")
+            .await
+            .unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].conversation_id, "subordinate-turn");
+
+        sqlx::query(
+            "UPDATE durable_turns
+             SET generation = 1, terminal_kind = 'Cancelled', owns_conversation = 0
+             WHERE turn_id = 31",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert!(db
+            .record_close_direct_turn_settlement_if_released(
+                "attempt-subordinate-turn",
+                &targets[0],
+            )
+            .await
+            .unwrap());
+        assert_eq!(
+            db.advance_close_settlement_when_quiescent("attempt-subordinate-turn")
                 .await
                 .unwrap()
                 .phase(),
@@ -8197,6 +8302,22 @@ mod tests {
         create_root(&db, "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
         create_child(&db, "latest", "root").await;
+        db.create_subagent_conversation(
+            "completion-subordinate",
+            "completion-subordinate",
+            "/tmp",
+            "latest",
+            "test-model",
+            &crate::ConvMode::Direct,
+            phoenix_core::llm_language::LlmLanguage::default(),
+            db.get_conversation("latest")
+                .await
+                .unwrap()
+                .attached_work_scope_id
+                .as_ref(),
+        )
+        .await
+        .unwrap();
         db.begin_close_foundation(
             &product_id("root"),
             &transcript_id("latest"),
@@ -8257,6 +8378,12 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(lifecycle, "history");
+        assert!(
+            db.get_conversation("completion-subordinate")
+                .await
+                .unwrap()
+                .archived
+        );
         let outcome: (String, String, String) = sqlx::query_as(
             "SELECT message_id, message_type, content
              FROM messages WHERE conversation_id = ?1",
