@@ -5320,18 +5320,17 @@ async fn continue_conversation(
                 .get_conversation(&id)
                 .await
                 .map_err(|error| AppError::Internal(error.to_string()))?;
-            let wake_repo = state.runtime.db().wake_repository();
             if parent.attached_work_scope_id == new_conv.attached_work_scope_id {
-                wake_repo
-                    .transfer_active_for_continuation(
-                        &id,
-                        &new_conv.id,
-                        phoenix_workflow::Timestamp(
-                            u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default(),
-                        ),
-                    )
-                    .await
-                    .map_err(|error| AppError::Internal(error.to_string()))?;
+                crate::runtime::wake::transfer_active_for_continuation(
+                    &state.runtime,
+                    &id,
+                    &new_conv.id,
+                    phoenix_workflow::Timestamp(
+                        u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default(),
+                    ),
+                )
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?;
             }
             tracing::info!(
                 parent_id = %id,
@@ -5379,18 +5378,17 @@ async fn continue_conversation(
                 .get_conversation(&id)
                 .await
                 .map_err(|error| AppError::Internal(error.to_string()))?;
-            let wake_repo = state.runtime.db().wake_repository();
             if parent.attached_work_scope_id == existing.attached_work_scope_id {
-                wake_repo
-                    .transfer_active_for_continuation(
-                        &id,
-                        &existing.id,
-                        phoenix_workflow::Timestamp(
-                            u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default(),
-                        ),
-                    )
-                    .await
-                    .map_err(|error| AppError::Internal(error.to_string()))?;
+                crate::runtime::wake::transfer_active_for_continuation(
+                    &state.runtime,
+                    &id,
+                    &existing.id,
+                    phoenix_workflow::Timestamp(
+                        u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default(),
+                    ),
+                )
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?;
             }
             tracing::info!(
                 parent_id = %id,
@@ -10159,18 +10157,21 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("insert ceiling message");
         }
         if matches!(kind, CeilingFixture::Over) {
+            let next_sequence = i64::try_from(MAX_RENDER_UNIT_ALIGNED_RESPONSE_MESSAGES)
+                .expect("fixture size fits i64")
+                + 1;
             sqlx::query(
                 "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )
             .bind(format!("{conversation_id}-first"))
             .bind(conversation_id)
-            .bind(0_i64)
+            .bind(next_sequence)
             .bind(first_type)
             .bind(first_json)
             .bind("2025-01-01T00:00:00Z")
             .execute(&mut *tx)
             .await
-            .expect("insert over-ceiling first message");
+            .expect("insert over-ceiling final message");
         }
         tx.commit().await.expect("commit fixture load");
         state

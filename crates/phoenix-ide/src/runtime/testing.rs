@@ -15,7 +15,7 @@ use phoenix_llm::{LlmError, LlmRequest, LlmResponse, PromptCacheKey, ToolDefinit
 use phoenix_workflow::Timestamp;
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 // ============================================================================
@@ -540,6 +540,12 @@ pub struct InMemoryStorage {
     fork_proposals: Mutex<Vec<crate::db::ForkProposal>>,
     clear_watermarks: Mutex<HashMap<String, i64>>,
     last_prompt_tokens: Mutex<HashMap<String, i64>>,
+    transcript_generations: Mutex<HashMap<String, i64>>,
+    prompt_snapshot_loads: AtomicUsize,
+    prompt_tail_loads: AtomicUsize,
+    fail_prompt_projection_load: AtomicBool,
+    prompt_projection_load_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    prompt_projection_load_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     preflight_authoritative_user_message_results:
         Mutex<VecDeque<DirectTurnMaterializationEligibility>>,
     materialize_authoritative_user_message_results:
@@ -599,6 +605,12 @@ impl InMemoryStorage {
             fork_proposals: Mutex::new(Vec::new()),
             clear_watermarks: Mutex::new(HashMap::new()),
             last_prompt_tokens: Mutex::new(HashMap::new()),
+            transcript_generations: Mutex::new(HashMap::new()),
+            prompt_snapshot_loads: AtomicUsize::new(0),
+            prompt_tail_loads: AtomicUsize::new(0),
+            fail_prompt_projection_load: AtomicBool::new(false),
+            prompt_projection_load_started: Mutex::new(None),
+            prompt_projection_load_release: Mutex::new(None),
             preflight_authoritative_user_message_results: Mutex::new(VecDeque::new()),
             materialize_authoritative_user_message_results: Mutex::new(VecDeque::new()),
             preflight_authoritative_user_message_calls: Mutex::new(Vec::new()),
@@ -649,6 +661,43 @@ impl InMemoryStorage {
 
     pub fn set_fail_message_add(&self, fail: bool) {
         *self.fail_message_add.lock().unwrap() = fail;
+    }
+
+    pub fn set_fail_prompt_projection_load(&self, fail: bool) {
+        self.fail_prompt_projection_load
+            .store(fail, Ordering::SeqCst);
+    }
+
+    pub fn replace_message_content(
+        &self,
+        conv_id: &str,
+        message_id: &str,
+        content: MessageContent,
+    ) {
+        let mut messages = self.messages.lock().unwrap();
+        let message = messages
+            .get_mut(conv_id)
+            .and_then(|messages| {
+                messages
+                    .iter_mut()
+                    .find(|message| message.message_id == message_id)
+            })
+            .expect("message must exist");
+        message.message_type = content.message_type();
+        message.content = content;
+    }
+
+    pub fn gate_prompt_projection_load(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.prompt_projection_load_started.lock().unwrap() = Some(started_tx);
+        *self.prompt_projection_load_release.lock().unwrap() = Some(release_rx);
+        (started_rx, release_tx)
     }
 
     pub fn gate_message_add(
@@ -741,6 +790,20 @@ impl InMemoryStorage {
             .lock()
             .unwrap()
             .insert(conv_id.to_string(), tokens);
+    }
+
+    pub fn set_transcript_generation(&self, conv_id: &str, generation: i64) {
+        self.transcript_generations
+            .lock()
+            .unwrap()
+            .insert(conv_id.to_string(), generation);
+    }
+
+    pub fn prompt_projection_load_counts(&self) -> (usize, usize) {
+        (
+            self.prompt_snapshot_loads.load(Ordering::SeqCst),
+            self.prompt_tail_loads.load(Ordering::SeqCst),
+        )
     }
 
     /// Make `get_clear_watermark` return an error (test the read-failure path).
@@ -1146,6 +1209,74 @@ impl MessageStore for InMemoryStorage {
         Ok(self.get_all_messages(conv_id))
     }
 
+    async fn load_hydrated_prompt_snapshot(
+        &self,
+        conv_id: &str,
+    ) -> Result<crate::db::HydratedPromptSnapshot, String> {
+        self.prompt_snapshot_loads.fetch_add(1, Ordering::SeqCst);
+        if self.fail_prompt_projection_load.load(Ordering::SeqCst) {
+            return Err("injected prompt projection load failure".to_string());
+        }
+        let messages = self.get_all_messages(conv_id);
+        if let Some(started) = self.prompt_projection_load_started.lock().unwrap().take() {
+            let _ = started.send(());
+        }
+        let release = self.prompt_projection_load_release.lock().unwrap().take();
+        if let Some(release) = release {
+            let _ = release.await;
+        }
+        let generation = *self
+            .transcript_generations
+            .lock()
+            .unwrap()
+            .get(conv_id)
+            .unwrap_or(&1);
+        crate::db::HydratedPromptSnapshot::try_new(
+            conv_id,
+            crate::db::PromptTranscriptGeneration::from_persisted(generation)
+                .map_err(|error| error.to_string())?,
+            messages,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    async fn load_hydrated_prompt_tail(
+        &self,
+        conv_id: &str,
+        after: crate::db::GenerationFencedPromptPosition,
+    ) -> Result<crate::db::HydratedPromptTail, String> {
+        self.prompt_tail_loads.fetch_add(1, Ordering::SeqCst);
+        if self.fail_prompt_projection_load.load(Ordering::SeqCst) {
+            return Err("injected prompt projection load failure".to_string());
+        }
+        let generation = *self
+            .transcript_generations
+            .lock()
+            .unwrap()
+            .get(conv_id)
+            .unwrap_or(&1);
+        let generation = crate::db::PromptTranscriptGeneration::from_persisted(generation)
+            .map_err(|error| error.to_string())?;
+        if generation != after.generation() {
+            return Ok(crate::db::HydratedPromptTail::invalidated(generation));
+        }
+        let messages = self.messages.lock().unwrap();
+        let tail = messages
+            .get(conv_id)
+            .into_iter()
+            .flatten()
+            .filter(|message| match after.position() {
+                crate::db::PromptProjectionPosition::Empty => true,
+                crate::db::PromptProjectionPosition::At(cursor) => {
+                    message.sequence_id > cursor.value()
+                }
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        crate::db::HydratedPromptTail::try_current(conv_id, after.position(), tail)
+            .map_err(|error| error.to_string())
+    }
+
     async fn message_exists(&self, message_id: &str) -> Result<bool, String> {
         let messages = self.messages.lock().unwrap();
         Ok(messages
@@ -1492,7 +1623,10 @@ impl MessageStore for InMemoryStorage {
             for msg in msgs.iter_mut() {
                 if msg.message_id == message_id {
                     msg.display_data = Some(display_data.clone());
-                    return Ok(1);
+                    let mut generations = self.transcript_generations.lock().unwrap();
+                    let generation = generations.entry(msg.conversation_id.clone()).or_insert(1);
+                    *generation += 1;
+                    return Ok(*generation);
                 }
             }
         }
@@ -1510,7 +1644,11 @@ impl MessageStore for InMemoryStorage {
                 if msg.message_id == message_id {
                     if let crate::db::MessageContent::Tool(ref mut tool) = msg.content {
                         tool.content = content.to_string();
-                        return Ok(1);
+                        let mut generations = self.transcript_generations.lock().unwrap();
+                        let generation =
+                            generations.entry(msg.conversation_id.clone()).or_insert(1);
+                        *generation += 1;
+                        return Ok(*generation);
                     }
                     return Err(format!("Message {message_id} is not a tool message"));
                 }

@@ -2534,6 +2534,15 @@ def cmd_seed(
         )
         return scope_id
 
+    def _next_message_sequence(conn: sqlite3.Connection, conversation_id: str) -> int:
+        return int(
+            conn.execute(
+                "SELECT COALESCE(MAX(sequence_id), -1) + 1 FROM messages "
+                "WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()[0]
+        )
+
     def _delete_fixture_conversation(
         conn: sqlite3.Connection,
         conversation_id: str,
@@ -2919,8 +2928,8 @@ def cmd_seed(
             "INSERT INTO messages ("
             " message_id, conversation_id, sequence_id, message_type,"
             " content, created_at"
-            ") VALUES (?, ?, 0, 'continuation', ?, ?)",
-            (msg_id, new_id, cont_content, now),
+            ") VALUES (?, ?, ?, 'continuation', ?, ?)",
+            (msg_id, new_id, _next_message_sequence(conn, new_id), cont_content, now),
         )
         return new_id, new_slug
 

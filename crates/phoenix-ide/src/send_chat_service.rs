@@ -618,6 +618,7 @@ fn map_conversation_load_error(error: crate::db::DbError) -> SendChatServiceErro
         }
         other @ (crate::db::DbError::Sqlx(_)
         | crate::db::DbError::MessageNotFound(_)
+        | crate::db::DbError::MessageConflict(_)
         | crate::db::DbError::SlugExists(_)
         | crate::db::DbError::ConversationAlreadyExists(_)
         | crate::db::DbError::Serialization(_)
@@ -664,6 +665,7 @@ fn map_direct_turn_accept_error(error: crate::db::DbError) -> SendChatServiceErr
         | crate::db::DbError::ConversationNotFound(_)
         | crate::db::DbError::ConversationAlreadyExists(_)
         | crate::db::DbError::MessageNotFound(_)
+        | crate::db::DbError::MessageConflict(_)
         | crate::db::DbError::SlugExists(_)
         | crate::db::DbError::Serialization(_)
         | crate::db::DbError::ContinuationPrecondition(_)

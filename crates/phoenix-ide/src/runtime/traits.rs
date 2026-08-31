@@ -123,6 +123,7 @@ pub trait MessageStore: Send + Sync {
     /// `message_id` is the canonical identifier for this message. For user messages,
     /// this is client-generated (enabling idempotent retries). For agent/tool messages,
     /// this is server-generated.
+    #[allow(dead_code)]
     async fn add_message(
         &self,
         message_id: &str,
@@ -190,6 +191,21 @@ pub trait MessageStore: Send + Sync {
 
     /// Get all messages for a conversation
     async fn get_messages(&self, conv_id: &str) -> Result<Vec<Message>, String>;
+
+    /// Load one transactionally consistent, fully hydrated durable prompt
+    /// snapshot for a runtime-owned projection.
+    async fn load_hydrated_prompt_snapshot(
+        &self,
+        conv_id: &str,
+    ) -> Result<crate::db::HydratedPromptSnapshot, String>;
+
+    /// Load the fully hydrated durable tail after a generation-fenced prompt
+    /// position.
+    async fn load_hydrated_prompt_tail(
+        &self,
+        conv_id: &str,
+        after: crate::db::GenerationFencedPromptPosition,
+    ) -> Result<crate::db::HydratedPromptTail, String>;
 
     /// Get a single message by ID
     #[allow(dead_code)]
@@ -654,6 +670,21 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
 
     async fn get_messages(&self, conv_id: &str) -> Result<Vec<Message>, String> {
         (**self).get_messages(conv_id).await
+    }
+
+    async fn load_hydrated_prompt_snapshot(
+        &self,
+        conv_id: &str,
+    ) -> Result<crate::db::HydratedPromptSnapshot, String> {
+        (**self).load_hydrated_prompt_snapshot(conv_id).await
+    }
+
+    async fn load_hydrated_prompt_tail(
+        &self,
+        conv_id: &str,
+        after: crate::db::GenerationFencedPromptPosition,
+    ) -> Result<crate::db::HydratedPromptTail, String> {
+        (**self).load_hydrated_prompt_tail(conv_id, after).await
     }
 
     async fn get_message_by_id(&self, message_id: &str) -> Result<Message, String> {
@@ -1230,6 +1261,27 @@ impl MessageStore for DatabaseStorage {
             .get_messages(conv_id)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    async fn load_hydrated_prompt_snapshot(
+        &self,
+        conv_id: &str,
+    ) -> Result<crate::db::HydratedPromptSnapshot, String> {
+        self.db
+            .load_hydrated_prompt_snapshot(conv_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn load_hydrated_prompt_tail(
+        &self,
+        conv_id: &str,
+        after: crate::db::GenerationFencedPromptPosition,
+    ) -> Result<crate::db::HydratedPromptTail, String> {
+        self.db
+            .load_hydrated_prompt_tail(conv_id, after)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     async fn get_message_by_id(&self, message_id: &str) -> Result<Message, String> {

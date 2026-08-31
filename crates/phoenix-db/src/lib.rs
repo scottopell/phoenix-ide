@@ -6,9 +6,15 @@ mod close_foundation;
 mod coordinator_query;
 mod ddl;
 mod git_repository_reconciliation;
+mod message_attachments;
 mod migrations;
 mod product_creation;
 pub use product_creation::*;
+mod prompt_projection;
+pub use prompt_projection::{
+    GenerationFencedPromptPosition, HydratedPromptSnapshot, HydratedPromptTail,
+    PersistedMessageSequence, PromptProjectionPosition, PromptTranscriptGeneration,
+};
 mod product_conversation_read;
 pub mod retrieval;
 mod sqlite_native_statement;
@@ -177,6 +183,8 @@ pub enum DbError {
     ConversationAlreadyExists(String),
     #[error("Message not found: {0}")]
     MessageNotFound(String),
+    #[error("Message conflicts with first durable payload: {0}")]
+    MessageConflict(String),
     #[error("Slug already exists: {0}")]
     SlugExists(String),
     #[error("Serialization error: {0}")]
@@ -1385,6 +1393,17 @@ fn parent_creation_values(
         .map_err(|error| DbError::Serialization(error.to_string()))?;
     Ok((scope, effort, Some(product_conversation_id)))
 }
+
+const PROMPT_TAIL_EMPTY_SQL: &str =
+    "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+     FROM messages
+     WHERE conversation_id = ?1
+     ORDER BY sequence_id ASC";
+const PROMPT_TAIL_AFTER_SQL: &str =
+    "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+     FROM messages
+     WHERE conversation_id = ?1 AND sequence_id > ?2
+     ORDER BY sequence_id ASC";
 
 impl Database {
     /// Access the underlying connection pool (for migrations and testing).
@@ -5972,7 +5991,7 @@ impl Database {
         .bind(&now_text)
         .execute(&mut *tx)
         .await?;
-        insert_message_attachments(&mut tx, message_id, content).await?;
+        message_attachments::insert(&mut tx, message_id, content).await?;
         update_creation_runtime_state(
             &mut tx,
             conversation_id,
@@ -10337,28 +10356,94 @@ impl Database {
         display_data: Option<&serde_json::Value>,
         usage_data: Option<&UsageData>,
     ) -> DbResult<Message> {
-        // Allocate sequence_id from the DB watermark. Callers that also
-        // broadcast the message over SSE must instead use
-        // `add_message_with_seq` with a sequence pre-allocated from the
-        // broadcaster's counter — see the PersistBeforeBroadcast invariant
-        // in specs/sse_wire/sse_wire.allium.
-        let row = sqlx::query(
-            "SELECT COALESCE(MAX(sequence_id), 0) + 1 FROM messages WHERE conversation_id = ?1",
-        )
-        .bind(conversation_id)
-        .fetch_one(&self.pool)
-        .await?;
-        let sequence_id: i64 = row.get(0);
+        let now = Utc::now();
+        let msg_type = content.message_type();
+        let content_str = serde_json::to_string(&content.to_stored_json())
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let display_str = display_data
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let usage_str = usage_data
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
 
-        self.add_message_with_seq(
-            message_id,
-            conversation_id,
-            sequence_id,
-            content,
-            display_data,
-            usage_data,
+        // Take the SQLite write reservation before inspecting the conversation
+        // watermark. Allocation and insert therefore form one serialized write
+        // boundary; concurrent appenders cannot select the same next sequence.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(mut existing) = sqlx::query(
+            "SELECT message_id, conversation_id, sequence_id, message_type, content,
+                    display_data, usage_data, created_at
+             FROM messages WHERE message_id = ?1",
         )
-        .await
+        .bind(message_id)
+        .try_map(parse_message_row)
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            message_attachments::hydrate(&mut tx, std::slice::from_mut(&mut existing)).await?;
+            let exact = existing.conversation_id == conversation_id
+                && existing.message_type == msg_type
+                && existing.content == *content
+                && existing.display_data.as_ref() == display_data
+                && existing.usage_data.as_ref() == usage_data;
+            tx.rollback().await?;
+            if exact {
+                return Ok(existing);
+            }
+            return Err(DbError::MessageConflict(message_id.to_string()));
+        }
+
+        let inserted = sqlx::query(
+            "INSERT INTO messages (
+                 message_id, conversation_id, sequence_id, message_type, content,
+                 display_data, usage_data, created_at
+             )
+             SELECT ?1, ?2, COALESCE(MAX(sequence_id), 0) + 1, ?3, ?4, ?5, ?6, ?7
+             FROM messages WHERE conversation_id = ?2
+             RETURNING sequence_id",
+        )
+        .bind(message_id)
+        .bind(conversation_id)
+        .bind(msg_type.to_string())
+        .bind(&content_str)
+        .bind(&display_str)
+        .bind(&usage_str)
+        .bind(now.to_rfc3339())
+        .fetch_one(&mut *tx)
+        .await?;
+        let sequence_id: i64 = inserted.try_get("sequence_id")?;
+        message_attachments::insert(&mut tx, message_id, content).await?;
+        sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
+            .bind(now.to_rfc3339())
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+
+        let message = Message {
+            message_id: message_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            sequence_id,
+            message_type: msg_type,
+            content: content.clone(),
+            display_data: display_data.cloned(),
+            usage_data: usage_data.cloned(),
+            created_at: now,
+        };
+        if let Err(error) =
+            retrieval::fts_upsert(&self.pool, &message, self.sqlite_workload_collector.clone())
+                .await
+        {
+            tracing::warn!(
+                message_id = %message.message_id,
+                error = %error,
+                "failed to index message for retrieval; startup reconcile will repair"
+            );
+        }
+        Ok(message)
     }
 
     /// Persist one terminal transcript message and its exact direct-turn terminal
@@ -10404,7 +10489,7 @@ impl Database {
         .bind(now.to_rfc3339())
         .execute(&mut *tx)
         .await?;
-        insert_message_attachments(&mut tx, message_id, content).await?;
+        message_attachments::insert(&mut tx, message_id, content).await?;
         workflow::WorkflowRepository::persist_terminal_obligation_tx(&mut tx, obligation).await?;
         sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
             .bind(now.to_rfc3339())
@@ -10472,6 +10557,7 @@ impl Database {
         let display_str = display_data.map(|v| serde_json::to_string(v).unwrap());
         let usage_str = usage_data.map(|u| serde_json::to_string(u).unwrap());
 
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -10484,20 +10570,15 @@ impl Database {
         .bind(&display_str)
         .bind(&usage_str)
         .bind(now.to_rfc3339())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-
-        {
-            let mut conn = self.pool.acquire().await?;
-            insert_message_attachments(&mut conn, message_id, content).await?;
-        }
-
-        // Update conversation timestamp
+        message_attachments::insert(&mut tx, message_id, content).await?;
         sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
             .bind(now.to_rfc3339())
             .bind(conversation_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
 
         let message = Message {
             message_id: message_id.to_string(),
@@ -10553,6 +10634,7 @@ impl Database {
         let display_str = display_data.map(|v| serde_json::to_string(v).unwrap());
         let usage_str = usage_data.map(|u| serde_json::to_string(u).unwrap());
 
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -10565,13 +10647,9 @@ impl Database {
         .bind(&display_str)
         .bind(&usage_str)
         .bind(created_at.to_rfc3339())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-
-        {
-            let mut conn = self.pool.acquire().await?;
-            insert_message_attachments(&mut conn, message_id, content).await?;
-        }
+        message_attachments::insert(&mut tx, message_id, content).await?;
 
         // Mirror the `add_message_with_seq` side-effect: bump the
         // conversation's `updated_at` so list-ordering stays current.
@@ -10581,8 +10659,9 @@ impl Database {
         sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
             .bind(Utc::now().to_rfc3339())
             .bind(conversation_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
 
         let message = Message {
             message_id: message_id.to_string(),
@@ -10624,6 +10703,90 @@ impl Database {
 
         hydrate_attachments(&self.pool, &mut rows).await?;
         Ok(rows)
+    }
+
+    /// Read the durable generation and complete hydrated prompt transcript from
+    /// one `SQLite` read transaction. This is the only full-history load used by
+    /// an active runtime prompt projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the conversation does not exist, durable rows are
+    /// malformed, or the consistent read cannot complete.
+    pub async fn load_hydrated_prompt_snapshot(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<HydratedPromptSnapshot> {
+        let mut tx = self.pool.begin().await?;
+        let generation: Option<i64> =
+            sqlx::query_scalar("SELECT transcript_generation FROM conversations WHERE id = ?1")
+                .bind(conversation_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let generation = generation
+            .ok_or_else(|| DbError::ConversationNotFound(conversation_id.to_string()))
+            .and_then(PromptTranscriptGeneration::from_persisted)?;
+        let mut messages = sqlx::query(
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+             FROM messages WHERE conversation_id = ?1 ORDER BY sequence_id ASC",
+        )
+        .bind(conversation_id)
+        .try_map(parse_prompt_message_row)
+        .fetch_all(&mut *tx)
+        .await?;
+        hydrate_attachments_conn(&mut tx, &mut messages).await?;
+        let snapshot = HydratedPromptSnapshot::try_new(conversation_id, generation, messages)?;
+        tx.commit().await?;
+        Ok(snapshot)
+    }
+
+    /// Read a hydrated prompt tail after `cursor`, fenced by the transcript
+    /// generation, from one `SQLite` read transaction. A generation mismatch is
+    /// a typed invalidation and never returns rows from the new generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the conversation does not exist, durable rows are
+    /// malformed, or the consistent read cannot complete.
+    pub async fn load_hydrated_prompt_tail(
+        &self,
+        conversation_id: &str,
+        after: GenerationFencedPromptPosition,
+    ) -> DbResult<HydratedPromptTail> {
+        let mut tx = self.pool.begin().await?;
+        let current_generation: Option<i64> =
+            sqlx::query_scalar("SELECT transcript_generation FROM conversations WHERE id = ?1")
+                .bind(conversation_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let current_generation = current_generation
+            .ok_or_else(|| DbError::ConversationNotFound(conversation_id.to_string()))
+            .and_then(PromptTranscriptGeneration::from_persisted)?;
+        if current_generation != after.generation() {
+            tx.commit().await?;
+            return Ok(HydratedPromptTail::invalidated(current_generation));
+        }
+        let mut messages = match after.position() {
+            PromptProjectionPosition::Empty => {
+                sqlx::query(PROMPT_TAIL_EMPTY_SQL)
+                    .bind(conversation_id)
+                    .try_map(parse_prompt_message_row)
+                    .fetch_all(&mut *tx)
+                    .await?
+            }
+            PromptProjectionPosition::At(sequence) => {
+                sqlx::query(PROMPT_TAIL_AFTER_SQL)
+                    .bind(conversation_id)
+                    .bind(sequence.value())
+                    .try_map(parse_prompt_message_row)
+                    .fetch_all(&mut *tx)
+                    .await?
+            }
+        };
+        hydrate_attachments_conn(&mut tx, &mut messages).await?;
+        let tail = HydratedPromptTail::try_current(conversation_id, after.position(), messages)?;
+        tx.commit().await?;
+        Ok(tail)
     }
 
     /// Get the exact projection consumed by runtime recovery: the newest agent
@@ -12757,15 +12920,21 @@ async fn insert_message_tx(
     .execute(&mut **tx)
     .await?;
     if inserted.rows_affected() == 0 {
-        let mut existing = sqlx::query(
+        let Some(mut existing) = sqlx::query(
             "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
              FROM messages WHERE message_id = ?1",
         )
         .bind(&msg.message_id)
         .try_map(parse_message_row)
-        .fetch_one(&mut **tx)
-        .await?;
-        hydrate_message_attachments_tx(tx, &mut existing).await?;
+        .fetch_optional(&mut **tx)
+        .await?
+        else {
+            return Err(DbError::Serialization(format!(
+                "message sequence {} conflicts within conversation {}",
+                msg.sequence_id, msg.conversation_id
+            )));
+        };
+        message_attachments::hydrate(tx, std::slice::from_mut(&mut existing)).await?;
         let exact = existing.message_id == msg.message_id
             && existing.conversation_id == msg.conversation_id
             && existing.sequence_id == msg.sequence_id
@@ -12788,7 +12957,7 @@ async fn insert_message_tx(
         .await?;
         return Ok(());
     }
-    insert_message_attachments(tx, &msg.message_id, &msg.content).await?;
+    message_attachments::insert(tx, &msg.message_id, &msg.content).await?;
     // Index for retrieval atomically with the message insert, so tx-based
     // persists (fork-resolution seed messages, checkpoint replays) get the
     // same FTS coverage as `add_message_with_seq` — no message reaches a chain
@@ -12845,42 +13014,11 @@ async fn steering_message_matches_tx(
         return Ok(Some(false));
     }
 
-    let (images, files) = message.content.attachments();
-    let stored_files = sqlx::query(
-        "SELECT original_name, media_type, size_bytes, stored_path
-         FROM message_files WHERE message_id = ?1 ORDER BY ordinal",
-    )
-    .bind(&message.message_id)
-    .fetch_all(&mut **tx)
-    .await?;
-    if stored_files.len() != files.len()
-        || stored_files.iter().zip(files).any(|(row, file)| {
-            row.get::<String, _>("original_name") != file.original_name
-                || row.get::<String, _>("media_type") != file.media_type
-                || row.get::<i64, _>("size_bytes")
-                    != i64::try_from(file.size_bytes).unwrap_or(i64::MAX)
-                || row.get::<String, _>("stored_path") != file.stored_path
-        })
-    {
-        return Ok(Some(false));
-    }
-
-    let stored_images = sqlx::query(
-        "SELECT media_type, data FROM message_images WHERE message_id = ?1 ORDER BY ordinal",
-    )
-    .bind(&message.message_id)
-    .fetch_all(&mut **tx)
-    .await?;
-    if stored_images.len() != images.len()
-        || stored_images.iter().zip(images).any(|(row, image)| {
-            row.get::<String, _>("media_type") != image.media_type
-                || row.get::<String, _>("data") != image.data
-        })
-    {
-        return Ok(Some(false));
-    }
-
-    Ok(Some(true))
+    let mut persisted = message.clone();
+    persisted.content = MessageContent::from_stored_json(message.message_type, stored_content)
+        .map_err(DbError::Serialization)?;
+    message_attachments::hydrate(tx, std::slice::from_mut(&mut persisted)).await?;
+    Ok(Some(persisted.content == message.content))
 }
 
 fn cleared_creation_intent_json() -> String {
@@ -12970,135 +13108,21 @@ async fn clear_creation_job_attachments(
     Ok(())
 }
 
-/// Write a message's user/skill attachments to the `message_files` /
-/// `message_images` child tables. `INSERT OR IGNORE` keyed on
-/// `(message_id, ordinal)` makes this idempotent under retry, matching the
-/// `INSERT OR IGNORE` on the parent message row.
-async fn hydrate_message_attachments_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    message: &mut Message,
-) -> DbResult<()> {
-    let files = sqlx::query(
-        "SELECT original_name, media_type, size_bytes, stored_path
-         FROM message_files WHERE message_id = ?1 ORDER BY ordinal",
-    )
-    .bind(&message.message_id)
-    .map(|row: SqliteRow| FileAttachment {
-        original_name: row.get("original_name"),
-        media_type: row.get("media_type"),
-        size_bytes: u64::try_from(row.get::<i64, _>("size_bytes")).unwrap_or(0),
-        stored_path: row.get("stored_path"),
-    })
-    .fetch_all(&mut **tx)
-    .await?;
-    let images = if message.message_type == MessageType::User {
-        sqlx::query(
-            "SELECT media_type, data
-             FROM message_images WHERE message_id = ?1 ORDER BY ordinal",
-        )
-        .bind(&message.message_id)
-        .map(|row: SqliteRow| ImageData {
-            media_type: row.get("media_type"),
-            data: row.get("data"),
-        })
-        .fetch_all(&mut **tx)
-        .await?
-    } else {
-        Vec::new()
-    };
-    message.content.set_attachments(images, files);
-    Ok(())
-}
-
-async fn insert_message_attachments(
-    conn: &mut sqlx::SqliteConnection,
-    message_id: &str,
-    content: &MessageContent,
-) -> DbResult<()> {
-    let (images, files) = content.attachments();
-    for (ordinal, file) in files.iter().enumerate() {
-        sqlx::query(
-            "INSERT OR IGNORE INTO message_files
-             (message_id, ordinal, original_name, media_type, size_bytes, stored_path)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        )
-        .bind(message_id)
-        .bind(i64::try_from(ordinal).unwrap_or(i64::MAX))
-        .bind(&file.original_name)
-        .bind(&file.media_type)
-        .bind(i64::try_from(file.size_bytes).unwrap_or(i64::MAX))
-        .bind(&file.stored_path)
-        .execute(&mut *conn)
-        .await?;
-    }
-    for (ordinal, image) in images.iter().enumerate() {
-        sqlx::query(
-            "INSERT OR IGNORE INTO message_images (message_id, ordinal, media_type, data)
-             VALUES (?1, ?2, ?3, ?4)",
-        )
-        .bind(message_id)
-        .bind(i64::try_from(ordinal).unwrap_or(i64::MAX))
-        .bind(&image.media_type)
-        .bind(&image.data)
-        .execute(&mut *conn)
-        .await?;
-    }
-    Ok(())
-}
-
-/// Load each message's attachments from the child tables onto its runtime
-/// content. User/skill rows read from the DB come back with empty attachments
-/// (the blob no longer carries them); this restores them. Non-user/skill
-/// messages are left untouched.
+/// Load normalized user/skill attachments through the private set-based DB
+/// boundary. Callers cannot accidentally reintroduce one query per message.
 pub(crate) async fn hydrate_attachments(
     pool: &SqlitePool,
     messages: &mut [Message],
-) -> Result<(), sqlx::Error> {
-    let mut conn = pool.acquire().await?;
-    hydrate_attachments_conn(&mut conn, messages).await
+) -> DbResult<()> {
+    let mut connection = pool.acquire().await?;
+    message_attachments::hydrate(&mut connection, messages).await
 }
 
 pub(crate) async fn hydrate_attachments_conn(
-    conn: &mut sqlx::SqliteConnection,
+    connection: &mut sqlx::SqliteConnection,
     messages: &mut [Message],
-) -> Result<(), sqlx::Error> {
-    for msg in messages.iter_mut() {
-        if !matches!(msg.message_type, MessageType::User | MessageType::Skill) {
-            continue;
-        }
-        let files = sqlx::query(
-            "SELECT original_name, media_type, size_bytes, stored_path
-             FROM message_files WHERE message_id = ?1 ORDER BY ordinal",
-        )
-        .bind(&msg.message_id)
-        .map(|row: SqliteRow| FileAttachment {
-            original_name: row.get("original_name"),
-            media_type: row.get("media_type"),
-            size_bytes: u64::try_from(row.get::<i64, _>("size_bytes")).unwrap_or(0),
-            stored_path: row.get("stored_path"),
-        })
-        .fetch_all(&mut *conn)
-        .await?;
-
-        // SkillContent has no images; skip the query for skill rows.
-        let images = if matches!(msg.message_type, MessageType::User) {
-            sqlx::query(
-                "SELECT media_type, data FROM message_images WHERE message_id = ?1 ORDER BY ordinal",
-            )
-            .bind(&msg.message_id)
-            .map(|row: SqliteRow| ImageData {
-                data: row.get("data"),
-                media_type: row.get("media_type"),
-            })
-            .fetch_all(&mut *conn)
-            .await?
-        } else {
-            Vec::new()
-        };
-
-        msg.content.set_attachments(images, files);
-    }
-    Ok(())
+) -> DbResult<()> {
+    message_attachments::hydrate(connection, messages).await
 }
 
 /// Insert a `fork_proposals` row inside a transaction, reusing the same column
@@ -13149,7 +13173,60 @@ fn is_adopted_wake_result_message(message: &Message) -> bool {
         })
 }
 
-/// Parse a message row from the database
+fn prompt_decode_error(error: impl std::fmt::Display) -> sqlx::Error {
+    sqlx::Error::Decode(Box::new(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        error.to_string(),
+    )))
+}
+
+/// Strict decoder used only at the provider-authority boundary. UI and recovery
+/// readers retain their tolerant decoder, but malformed provider-visible rows
+/// must prevent dispatch rather than fabricate substitute content or times.
+#[allow(clippy::needless_pass_by_value)]
+fn parse_prompt_message_row(row: SqliteRow) -> Result<Message, sqlx::Error> {
+    let message_type_text: String = row.try_get("message_type")?;
+    let message_type: MessageType = serde_json::from_value(serde_json::Value::String(
+        message_type_text.clone(),
+    ))
+    .map_err(|error| {
+        prompt_decode_error(format!(
+            "invalid message_type {message_type_text:?}: {error}"
+        ))
+    })?;
+    let content_text: String = row.try_get("content")?;
+    let content_value = serde_json::from_str(&content_text)
+        .map_err(|error| prompt_decode_error(format!("invalid message content JSON: {error}")))?;
+    let content = MessageContent::from_stored_json(message_type, content_value)
+        .map_err(|error| prompt_decode_error(format!("invalid typed message content: {error}")))?;
+    let display_data = row
+        .try_get::<Option<String>, _>("display_data")?
+        .map(|value| serde_json::from_str(&value))
+        .transpose()
+        .map_err(|error| prompt_decode_error(format!("invalid display_data JSON: {error}")))?;
+    let usage_data = row
+        .try_get::<Option<String>, _>("usage_data")?
+        .map(|value| serde_json::from_str(&value))
+        .transpose()
+        .map_err(|error| prompt_decode_error(format!("invalid usage_data JSON: {error}")))?;
+    let created_at_text: String = row.try_get("created_at")?;
+    let created_at = DateTime::parse_from_rfc3339(&created_at_text)
+        .map_err(|error| prompt_decode_error(format!("invalid created_at: {error}")))?
+        .with_timezone(&Utc);
+
+    Ok(Message {
+        message_id: row.try_get("message_id")?,
+        conversation_id: row.try_get("conversation_id")?,
+        sequence_id: row.try_get("sequence_id")?,
+        message_type,
+        content,
+        display_data,
+        usage_data,
+        created_at,
+    })
+}
+
+/// Tolerant decoder for UI and recovery readers.
 #[allow(clippy::needless_pass_by_value)] // sqlx try_map passes rows by value
 fn parse_message_row(row: SqliteRow) -> Result<Message, sqlx::Error> {
     let msg_type = parse_message_type(&row.try_get::<String, _>("message_type")?);
@@ -17871,6 +17948,987 @@ mod tests {
             | MessageContent::Error(_)
             | MessageContent::Continuation(_) => panic!("expected skill content"),
         }
+    }
+
+    fn file_attachment(label: &str) -> FileAttachment {
+        FileAttachment {
+            original_name: format!("{label}.txt"),
+            media_type: "text/plain".into(),
+            size_bytes: u64::try_from(label.len()).unwrap(),
+            stored_path: format!("/store/{label}.txt"),
+        }
+    }
+
+    fn image_attachment(label: &str) -> ImageData {
+        ImageData {
+            data: format!("base64-{label}"),
+            media_type: "image/png".into(),
+        }
+    }
+
+    fn native_read_statements(db: &Database) -> u64 {
+        let report = db
+            .sqlite_workload_collector
+            .aggregate_fresh_collector_for_test();
+        SqliteWorkloadCategory::ALL
+            .into_iter()
+            .map(|category| {
+                report.totals[SqliteAccessKind::Read.index()][category.index()]
+                    .baseline_statement_count
+            })
+            .sum()
+    }
+
+    async fn measured_history_attachment_reads(user_count: usize) -> u64 {
+        let db = Database::open_in_memory().await.unwrap();
+        let conversation_id = format!("batch-{user_count}");
+        db.create_conversation(&conversation_id, &conversation_id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        for index in 0..user_count {
+            let label = format!("user-{index}");
+            let images = if index % 3 == 1 {
+                vec![image_attachment(&label)]
+            } else {
+                Vec::new()
+            };
+            let files = if index % 3 == 2 {
+                vec![file_attachment(&label)]
+            } else {
+                Vec::new()
+            };
+            db.add_message_with_seq(
+                &label,
+                &conversation_id,
+                i64::try_from(index + 1).unwrap(),
+                &MessageContent::user_with_attachments(label.clone(), images, files),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        if user_count > 0 {
+            db.add_message_with_seq(
+                &format!("skill-{user_count}"),
+                &conversation_id,
+                i64::try_from(user_count + 1).unwrap(),
+                &MessageContent::Skill(SkillContent {
+                    name: "batch-proof".into(),
+                    body: "typed skill body".into(),
+                    trigger: "/batch-proof".into(),
+                    files: vec![
+                        file_attachment("skill-first"),
+                        file_attachment("skill-second"),
+                    ],
+                }),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let before = native_read_statements(&db);
+        let messages = db.get_messages(&conversation_id).await.unwrap();
+        let after = native_read_statements(&db);
+        assert_eq!(messages.len(), user_count + usize::from(user_count > 0));
+        if let Some(Message {
+            content: MessageContent::Skill(skill),
+            ..
+        }) = messages.last()
+        {
+            assert_eq!(
+                skill
+                    .files
+                    .iter()
+                    .map(|file| file.original_name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["skill-first.txt", "skill-second.txt"]
+            );
+        }
+        let get_messages_statements = after - before;
+        assert_eq!(
+            get_messages_statements, 3,
+            "one parent plus two child reads"
+        );
+        get_messages_statements - 1
+    }
+
+    #[tokio::test]
+    async fn get_messages_attachment_statement_count_is_history_independent() {
+        let zero = measured_history_attachment_reads(0).await;
+        let eight = measured_history_attachment_reads(8).await;
+        let twenty_seven = measured_history_attachment_reads(27).await;
+
+        assert_eq!((zero, eight, twenty_seven), (2, 2, 2));
+    }
+
+    #[tokio::test]
+    async fn message_sequences_reject_duplicates_and_regressions() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("monotonic", "monotonic", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.add_message_with_seq(
+            "first",
+            "monotonic",
+            7,
+            &MessageContent::user("first"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        for (id, sequence) in [("duplicate", 7), ("regression", 6)] {
+            let error = db
+                .add_message_with_seq(
+                    id,
+                    "monotonic",
+                    sequence,
+                    &MessageContent::user(id),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("strictly increase"));
+        }
+        assert_eq!(db.get_messages("monotonic").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn authoritative_prompt_snapshot_fails_closed_on_corrupt_row() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("corrupt", "corrupt", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.add_message_with_seq(
+            "corrupt-row",
+            "corrupt",
+            1,
+            &MessageContent::user("valid before corruption"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE messages SET content = '{not-json' WHERE message_id = 'corrupt-row'")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let error = db
+            .load_hydrated_prompt_snapshot("corrupt")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("invalid message content JSON"));
+        assert_eq!(db.get_messages("corrupt").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn prompt_snapshot_transaction_keeps_generation_parents_and_attachments_consistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prompt-snapshot.db");
+        let writer = Database::open(path.to_str().unwrap()).await.unwrap();
+        migrations::run_pending_migrations(writer.pool())
+            .await
+            .unwrap();
+        writer
+            .create_conversation("snapshot-tx", "snapshot-tx", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        writer
+            .add_message_with_seq(
+                "old-parent",
+                "snapshot-tx",
+                1,
+                &MessageContent::user_with_attachments(
+                    "old parent",
+                    vec![image_attachment("old-image")],
+                    vec![file_attachment("old-file")],
+                ),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let reader = Database::open(path.to_str().unwrap()).await.unwrap();
+
+        let mut read_tx = reader.pool.begin().await.unwrap();
+        let generation = sqlx::query_scalar::<_, i64>(
+            "SELECT transcript_generation FROM conversations WHERE id = 'snapshot-tx'",
+        )
+        .fetch_one(&mut *read_tx)
+        .await
+        .unwrap();
+        assert_eq!(generation, 1);
+
+        // The first read fixes the WAL snapshot. A separate connection now
+        // commits a provider-visible mutation plus an append with children.
+        writer
+            .update_message_display_data("old-parent", &serde_json::json!({"mutated": true}))
+            .await
+            .unwrap();
+        writer
+            .add_message_with_seq(
+                "new-parent",
+                "snapshot-tx",
+                2,
+                &MessageContent::user_with_attachments(
+                    "new parent",
+                    vec![image_attachment("new-image")],
+                    vec![file_attachment("new-file")],
+                ),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut parents = sqlx::query(
+            "SELECT message_id, conversation_id, sequence_id, message_type, content,
+                    display_data, usage_data, created_at
+             FROM messages WHERE conversation_id = 'snapshot-tx' ORDER BY sequence_id",
+        )
+        .try_map(parse_prompt_message_row)
+        .fetch_all(&mut *read_tx)
+        .await
+        .unwrap();
+        hydrate_attachments_conn(&mut read_tx, &mut parents)
+            .await
+            .unwrap();
+        read_tx.commit().await.unwrap();
+
+        assert_eq!(parents.len(), 1);
+        assert_eq!(parents[0].message_id, "old-parent");
+        assert!(parents[0].display_data.is_none());
+        let (images, files) = parents[0].content.attachments();
+        assert_eq!((images.len(), files.len()), (1, 1));
+
+        let rebuilt = reader
+            .load_hydrated_prompt_snapshot("snapshot-tx")
+            .await
+            .unwrap();
+        assert_eq!(rebuilt.generation().value(), 2);
+        assert_eq!(rebuilt.messages().len(), 2);
+        assert!(rebuilt.messages()[0].display_data.is_some());
+    }
+
+    #[tokio::test]
+    async fn empty_snapshot_tail_includes_first_sequence_zero_and_advances_position() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("prompt-zero", "prompt-zero", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        let snapshot = db
+            .load_hydrated_prompt_snapshot("prompt-zero")
+            .await
+            .unwrap();
+        assert!(matches!(
+            snapshot.position(),
+            PromptProjectionPosition::Empty
+        ));
+
+        db.add_message_with_seq(
+            "message-zero",
+            "prompt-zero",
+            0,
+            &MessageContent::user("zero"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let tail = db
+            .load_hydrated_prompt_tail("prompt-zero", snapshot.fenced_position())
+            .await
+            .unwrap();
+        let HydratedPromptTail::Current(rows) = tail else {
+            panic!("unchanged empty generation must return the first persisted row");
+        };
+        assert!(matches!(
+            rows.position(),
+            PromptProjectionPosition::At(sequence) if sequence.value() == 0
+        ));
+        assert_eq!(rows.messages().len(), 1);
+        assert_eq!(rows.messages()[0].message_id, "message-zero");
+
+        let once = db
+            .load_hydrated_prompt_tail(
+                "prompt-zero",
+                GenerationFencedPromptPosition::new(snapshot.generation(), rows.position()),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            once,
+            HydratedPromptTail::Current(current) if current.messages().is_empty()
+        ));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn hydrated_prompt_snapshot_and_tails_are_generation_fenced_and_gap_tolerant() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("prompt-tail", "prompt-tail", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        for (sequence, text) in [(2, "two"), (9, "nine")] {
+            db.add_message_with_seq(
+                &format!("message-{sequence}"),
+                "prompt-tail",
+                sequence,
+                &MessageContent::user(text),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let snapshot = db
+            .load_hydrated_prompt_snapshot("prompt-tail")
+            .await
+            .unwrap();
+        assert_eq!(snapshot.generation().value(), 1);
+        assert!(matches!(
+            snapshot.position(),
+            PromptProjectionPosition::At(sequence) if sequence.value() == 9
+        ));
+        assert_eq!(
+            snapshot
+                .messages()
+                .iter()
+                .map(|message| message.sequence_id)
+                .collect::<Vec<_>>(),
+            vec![2, 9]
+        );
+
+        let empty = db
+            .load_hydrated_prompt_tail("prompt-tail", snapshot.fenced_position())
+            .await
+            .unwrap();
+        let HydratedPromptTail::Current(rows) = empty else {
+            panic!("unchanged generation must return a current tail");
+        };
+        assert!(matches!(
+            rows.position(),
+            PromptProjectionPosition::At(sequence) if sequence.value() == 9
+        ));
+        assert!(rows.messages().is_empty());
+
+        for (sequence, text) in [(14, "fourteen"), (27, "twenty-seven")] {
+            db.add_message_with_seq(
+                &format!("message-{sequence}"),
+                "prompt-tail",
+                sequence,
+                &MessageContent::user(text),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let appended = db
+            .load_hydrated_prompt_tail("prompt-tail", snapshot.fenced_position())
+            .await
+            .unwrap();
+        let HydratedPromptTail::Current(rows) = appended else {
+            panic!("ordinary appends must not invalidate the generation");
+        };
+        let (position, messages) = rows.into_parts();
+        assert!(matches!(
+            position,
+            PromptProjectionPosition::At(sequence) if sequence.value() == 27
+        ));
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.sequence_id)
+                .collect::<Vec<_>>(),
+            vec![14, 27]
+        );
+        let once = db
+            .load_hydrated_prompt_tail(
+                "prompt-tail",
+                GenerationFencedPromptPosition::new(snapshot.generation(), position),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            once,
+            HydratedPromptTail::Current(rows) if rows.messages().is_empty()
+        ));
+
+        db.update_message_display_data("message-2", &serde_json::json!({"adopted": true}))
+            .await
+            .unwrap();
+        let invalidated = db
+            .load_hydrated_prompt_tail(
+                "prompt-tail",
+                GenerationFencedPromptPosition::new(snapshot.generation(), position),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            invalidated,
+            HydratedPromptTail::Invalidated(current_generation) if current_generation.value() == 2
+        ));
+    }
+
+    async fn explain_tail_plan(
+        db: &Database,
+        sql: &'static str,
+        conversation_id: &str,
+        sequence: Option<i64>,
+    ) -> Vec<String> {
+        let mut query = sqlx::query(sql).bind(conversation_id);
+        if let Some(sequence) = sequence {
+            query = query.bind(sequence);
+        }
+        query
+            .fetch_all(db.pool())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get("detail"))
+            .collect()
+    }
+
+    static EXPLAIN_PROMPT_TAIL_EMPTY_SQL: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| format!("EXPLAIN QUERY PLAN {PROMPT_TAIL_EMPTY_SQL}"));
+    static EXPLAIN_PROMPT_TAIL_AFTER_SQL: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| format!("EXPLAIN QUERY PLAN {PROMPT_TAIL_AFTER_SQL}"));
+
+    #[tokio::test]
+    async fn prompt_tail_query_plans_use_indexable_conversation_and_sequence_predicates() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation(
+            "prompt-tail-plan",
+            "prompt-tail-plan",
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        for (sequence, text) in [(1, "one"), (5, "five"), (9, "nine")] {
+            db.add_message_with_seq(
+                &format!("message-{sequence}"),
+                "prompt-tail-plan",
+                sequence,
+                &MessageContent::user(text),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let empty_plan = explain_tail_plan(
+            &db,
+            EXPLAIN_PROMPT_TAIL_EMPTY_SQL.as_str(),
+            "prompt-tail-plan",
+            None,
+        )
+        .await;
+        let empty_plan_text = empty_plan.join("\n");
+        assert!(
+            empty_plan_text.contains("conversation_id=?"),
+            "{}",
+            empty_plan_text
+        );
+        assert!(
+            empty_plan_text.contains("messages_conversation_sequence")
+                || empty_plan_text.contains("sqlite_autoindex_messages_2")
+                || empty_plan_text.contains("idx_messages_conversation_seq"),
+            "{}",
+            empty_plan_text
+        );
+        assert!(
+            !empty_plan_text.contains("SCAN messages"),
+            "{}",
+            empty_plan_text
+        );
+
+        let at_plan = explain_tail_plan(
+            &db,
+            EXPLAIN_PROMPT_TAIL_AFTER_SQL.as_str(),
+            "prompt-tail-plan",
+            Some(5),
+        )
+        .await;
+        let at_plan_text = at_plan.join("\n");
+        assert!(
+            at_plan_text.contains("conversation_id=?"),
+            "{}",
+            at_plan_text
+        );
+        assert!(at_plan_text.contains("sequence_id>?"), "{}", at_plan_text);
+        assert!(
+            at_plan_text.contains("messages_conversation_sequence")
+                || at_plan_text.contains("sqlite_autoindex_messages_2")
+                || at_plan_text.contains("idx_messages_conversation_seq"),
+            "{}",
+            at_plan_text
+        );
+        assert!(!at_plan_text.contains("SCAN messages"), "{}", at_plan_text);
+    }
+
+    #[tokio::test]
+    async fn steady_state_prompt_tail_has_constant_statement_shape_and_no_full_history_read() {
+        async fn measure(
+            user_count: usize,
+        ) -> (
+            Vec<crate::sqlite_workload::NativeStatementShape>,
+            Vec<crate::sqlite_workload::NativeStatementShape>,
+        ) {
+            let db = Database::open_in_memory().await.unwrap();
+            let conversation_id = format!("projection-shape-{user_count}");
+            db.create_conversation(&conversation_id, &conversation_id, "/tmp", true, None, None)
+                .await
+                .unwrap();
+            for index in 0..user_count {
+                db.add_message_with_seq(
+                    &format!("history-{index}"),
+                    &conversation_id,
+                    i64::try_from(index + 1).unwrap(),
+                    &MessageContent::user_with_attachments(
+                        format!("history {index}"),
+                        vec![image_attachment(&format!("image-{index}"))],
+                        vec![file_attachment(&format!("file-{index}"))],
+                    ),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            }
+            db.sqlite_workload_collector
+                .take_native_statement_shapes_for_test();
+            let snapshot = db
+                .load_hydrated_prompt_snapshot(&conversation_id)
+                .await
+                .unwrap();
+            let snapshot_statements = db
+                .sqlite_workload_collector
+                .take_native_statement_shapes_for_test();
+            db.add_message_with_seq(
+                "new-tail-row",
+                &conversation_id,
+                i64::try_from(user_count + 1).unwrap(),
+                &MessageContent::user_with_attachments(
+                    "new tail row",
+                    vec![image_attachment("tail-image")],
+                    vec![file_attachment("tail-file")],
+                ),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            db.sqlite_workload_collector
+                .take_native_statement_shapes_for_test();
+            let tail = db
+                .load_hydrated_prompt_tail(&conversation_id, snapshot.fenced_position())
+                .await
+                .unwrap();
+            let HydratedPromptTail::Current(rows) = tail else {
+                panic!("append must return a current tail");
+            };
+            assert_eq!(rows.messages().len(), 1);
+            assert_eq!(rows.messages()[0].message_id, "new-tail-row");
+            let (images, files) = rows.messages()[0].content.attachments();
+            assert_eq!((images.len(), files.len()), (1, 1));
+            let tail_statements = db
+                .sqlite_workload_collector
+                .take_native_statement_shapes_for_test();
+            (snapshot_statements, tail_statements)
+        }
+
+        fn assert_prompt_read_shape(statements: &[crate::sqlite_workload::NativeStatementShape]) {
+            assert_eq!(statements.len(), 6, "prompt statements: {statements:#?}");
+            assert_eq!(
+                statements[0],
+                crate::sqlite_workload::NativeStatementShape::Begin,
+                "prompt statements: {statements:#?}"
+            );
+            assert!(statements[1..5].iter().all(|statement| *statement
+                == crate::sqlite_workload::NativeStatementShape::OrdinaryRead));
+            // The final statement is the transaction boundary. Native metadata may
+            // conservatively classify it as an ordinary read after a cache collision;
+            // its bracket position, not that degraded category, excludes it.
+        }
+
+        for _ in 0..3 {
+            let (zero, eight, twenty_seven) = tokio::join!(measure(0), measure(8), measure(27));
+            for (snapshot_statements, tail_statements) in [zero, eight, twenty_seven] {
+                assert_prompt_read_shape(&snapshot_statements);
+                assert_prompt_read_shape(&tail_statements);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_add_message_allocates_distinct_sequences_and_preserves_replay_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("concurrent-add-message.db");
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        migrations::run_pending_migrations(db.pool()).await.unwrap();
+        db.create_conversation("concurrent-append", "append", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        let mut reservation = db.pool().acquire().await.unwrap();
+        let write_guard = reservation.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let first_db = db.clone();
+        let second_db = db.clone();
+        let first = tokio::spawn(async move {
+            first_db
+                .add_message(
+                    "concurrent-first",
+                    "concurrent-append",
+                    &MessageContent::user("first"),
+                    None,
+                    None,
+                )
+                .await
+        });
+        let second = tokio::spawn(async move {
+            second_db
+                .add_message(
+                    "concurrent-second",
+                    "concurrent-append",
+                    &MessageContent::user("second"),
+                    None,
+                    None,
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!first.is_finished());
+        assert!(!second.is_finished());
+        write_guard.commit().await.unwrap();
+
+        let first = first.await.unwrap().unwrap();
+        let second = second.await.unwrap().unwrap();
+        assert_ne!(first.sequence_id, second.sequence_id);
+        let mut sequences = [first.sequence_id, second.sequence_id];
+        sequences.sort_unstable();
+        assert_eq!(sequences, [1, 2]);
+
+        let replay = db
+            .add_message(
+                "concurrent-first",
+                "concurrent-append",
+                &MessageContent::user("first"),
+                None,
+                None,
+            )
+            .await
+            .expect("exact message-id replay is idempotent");
+        assert_eq!(replay.sequence_id, first.sequence_id);
+        let conflict = db
+            .add_message(
+                "concurrent-first",
+                "concurrent-append",
+                &MessageContent::user("changed"),
+                None,
+                None,
+            )
+            .await
+            .expect_err("changed replay is a typed conflict");
+        assert!(matches!(conflict, DbError::MessageConflict(ref id) if id == "concurrent-first"));
+    }
+
+    #[tokio::test]
+    async fn prompt_projection_rejects_malformed_image_hydration_columns() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("corrupt-image", "corrupt-image", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.add_message(
+            "corrupt-image-message",
+            "corrupt-image",
+            &MessageContent::user_with_attachments(
+                "image",
+                vec![image_attachment("corrupt-image")],
+                Vec::new(),
+            ),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE message_images
+             SET media_type = CAST(X'80' AS BLOB)
+             WHERE message_id = 'corrupt-image-message'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let error = db
+            .load_hydrated_prompt_snapshot("corrupt-image")
+            .await
+            .expect_err("authoritative projection must fail closed on malformed image columns");
+        assert!(error.to_string().contains("media_type"));
+    }
+
+    #[tokio::test]
+    async fn prompt_projection_rejects_negative_attachment_size() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("corrupt-attachment", "corrupt", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.add_message(
+            "corrupt-file-message",
+            "corrupt-attachment",
+            &MessageContent::user_with_attachments(
+                "file",
+                Vec::new(),
+                vec![file_attachment("corrupt")],
+            ),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query("PRAGMA ignore_check_constraints = ON")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE message_files SET size_bytes = -1 WHERE message_id = 'corrupt-file-message'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let error = db
+            .load_hydrated_prompt_snapshot("corrupt-attachment")
+            .await
+            .expect_err("authoritative projection must fail closed on corrupt attachment size");
+        assert!(error.to_string().contains("must be non-negative"));
+    }
+
+    #[tokio::test]
+    async fn transaction_message_replay_preserves_attachment_idempotency() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation(
+            "attachment-replay",
+            "attachment-replay",
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let content = MessageContent::User(UserContent::with_expansion(
+            "@replay",
+            "expanded replay",
+            vec![image_attachment("replay-image")],
+            vec![file_attachment("replay-file")],
+        ));
+        let message = Message {
+            message_id: "attachment-replay-message".into(),
+            conversation_id: "attachment-replay".into(),
+            sequence_id: 1,
+            message_type: MessageType::User,
+            content,
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+
+        let mut tx = db.pool().begin().await.unwrap();
+        insert_message_tx(&mut tx, &message).await.unwrap();
+        tx.commit().await.unwrap();
+        let mut replay = db.pool().begin().await.unwrap();
+        insert_message_tx(&mut replay, &message)
+            .await
+            .expect("exact parent and normalized children remain idempotent");
+        replay.commit().await.unwrap();
+
+        let mut conflicting = message.clone();
+        conflicting.content = MessageContent::user_with_attachments(
+            "@replay",
+            vec![image_attachment("changed-image")],
+            vec![file_attachment("replay-file")],
+        );
+        let mut conflict_tx = db.pool().begin().await.unwrap();
+        assert!(insert_message_tx(&mut conflict_tx, &conflicting)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("conflicts with first durable payload"));
+        conflict_tx.rollback().await.unwrap();
+
+        let persisted = db
+            .get_message_by_id("attachment-replay-message")
+            .await
+            .unwrap();
+        assert_eq!(persisted.message_id, message.message_id);
+        assert_eq!(persisted.conversation_id, message.conversation_id);
+        assert_eq!(persisted.sequence_id, message.sequence_id);
+        assert_eq!(persisted.message_type, message.message_type);
+        assert_eq!(persisted.content, message.content);
+        assert_eq!(persisted.display_data, message.display_data);
+        assert_eq!(persisted.usage_data, message.usage_data);
+        assert_eq!(persisted.created_at, message.created_at);
+    }
+
+    #[tokio::test]
+    async fn batch_attachment_hydration_preserves_typed_semantics_and_ordinals() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("batch-parity", "batch-parity", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let expected = vec![
+            MessageContent::User(UserContent::with_expansion(
+                "@first @second",
+                "expanded first then second",
+                vec![
+                    image_attachment("image-first"),
+                    image_attachment("image-second"),
+                ],
+                vec![
+                    file_attachment("file-first"),
+                    file_attachment("file-second"),
+                ],
+            )),
+            MessageContent::agent(vec![phoenix_core::domain::llm_types::ContentBlock::text(
+                "assistant boundary",
+            )]),
+            MessageContent::Skill(SkillContent {
+                name: "ordered-skill".into(),
+                body: "skill body remains typed".into(),
+                trigger: "/ordered-skill".into(),
+                files: vec![file_attachment("skill-a"), file_attachment("skill-b")],
+            }),
+            MessageContent::user("attachment-free tail"),
+        ];
+        for (index, content) in expected.iter().enumerate() {
+            db.add_message_with_seq(
+                &format!("parity-{index}"),
+                "batch-parity",
+                i64::try_from(index + 1).unwrap(),
+                content,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let actual = db
+            .get_messages("batch-parity")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|message| message.content)
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        let MessageContent::User(first) = &actual[0] else {
+            panic!("expected typed user content");
+        };
+        assert_eq!(first.llm_text(), "expanded first then second");
+        assert_eq!(
+            first
+                .images
+                .iter()
+                .map(|image| image.data.as_str())
+                .collect::<Vec<_>>(),
+            vec!["base64-image-first", "base64-image-second"]
+        );
+        assert_eq!(
+            first
+                .files
+                .iter()
+                .map(|file| file.original_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["file-first.txt", "file-second.txt"]
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_attachment_failure_rolls_back_parent_message() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation(
+            "attachment-rollback",
+            "attachment-rollback",
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER reject_test_message_image
+             BEFORE INSERT ON message_images
+             WHEN NEW.message_id LIKE 'rollback-%'
+             BEGIN SELECT RAISE(ABORT, 'injected attachment failure'); END",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let content = MessageContent::user_with_attachments(
+            "must remain whole",
+            vec![image_attachment("would-commit-first")],
+            vec![file_attachment("must-fail")],
+        );
+
+        assert!(db
+            .add_message_with_seq(
+                "rollback-now",
+                "attachment-rollback",
+                1,
+                &content,
+                None,
+                None,
+            )
+            .await
+            .is_err());
+        assert!(db
+            .add_message_with_seq_at(
+                "rollback-at",
+                "attachment-rollback",
+                2,
+                &content,
+                None,
+                None,
+                Utc::now(),
+            )
+            .await
+            .is_err());
+
+        let parent_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages WHERE conversation_id = 'attachment-rollback'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let file_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM message_files WHERE message_id LIKE 'rollback-%'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let image_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM message_images WHERE message_id LIKE 'rollback-%'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!((parent_count, file_count, image_count), (0, 0, 0));
     }
 
     /// Steering queue round-trips through the normalized tables: replace-all

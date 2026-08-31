@@ -189,6 +189,8 @@ pub enum RetrievalError {
     /// The backing SQLite/FTS5 query failed.
     #[error("retrieval query failed: {0}")]
     Db(#[from] sqlx::Error),
+    #[error("retrieval message decode failed: {0}")]
+    MessageDecode(#[from] crate::DbError),
 }
 
 /// Ranked relevance recall over conversation message content. The seam that
@@ -752,6 +754,7 @@ fn sqlx_from_db_error(error: crate::DbError) -> sqlx::Error {
         crate::DbError::ConversationNotFound(_)
         | crate::DbError::ConversationAlreadyExists(_)
         | crate::DbError::MessageNotFound(_)
+        | crate::DbError::MessageConflict(_)
         | crate::DbError::SlugExists(_)
         | crate::DbError::Serialization(_)
         | crate::DbError::ContinuationPrecondition(_)

@@ -1228,32 +1228,8 @@ impl WorkflowRepository {
                     "materialized direct-turn message identity mismatch".to_string(),
                 ));
             }
-            let files = sqlx::query(
-                "SELECT original_name, media_type, size_bytes, stored_path
-                 FROM message_files WHERE message_id = ?1 ORDER BY ordinal",
-            )
-            .bind(&message_id)
-            .map(
-                |row: sqlx::sqlite::SqliteRow| phoenix_core::domain::db_schema::FileAttachment {
-                    original_name: row.get("original_name"),
-                    media_type: row.get("media_type"),
-                    size_bytes: u64::try_from(row.get::<i64, _>("size_bytes")).unwrap_or(0),
-                    stored_path: row.get("stored_path"),
-                },
-            )
-            .fetch_all(&mut *tx.tx)
-            .await?;
-            let images = sqlx::query(
-                "SELECT media_type, data FROM message_images WHERE message_id = ?1 ORDER BY ordinal",
-            )
-            .bind(&message_id)
-            .map(|row: sqlx::sqlite::SqliteRow| phoenix_core::domain::db_schema::ImageData {
-                data: row.get("data"),
-                media_type: row.get("media_type"),
-            })
-            .fetch_all(&mut *tx.tx)
-            .await?;
-            message.content.set_attachments(images, files);
+            crate::message_attachments::hydrate(&mut tx.tx, std::slice::from_mut(&mut message))
+                .await?;
             let expected_content = input.prepared.message_content_and_display_data();
             if message.conversation_id != conversation.0
                 || message.content != expected_content.0
@@ -2820,7 +2796,7 @@ async fn insert_canonical_message_tx(
     .execute(&mut *tx.tx)
     .await
     .map_err(map_constraint)?;
-    insert_message_attachments(&mut tx.tx, &canonical_message_id.0, &content).await?;
+    crate::message_attachments::insert(&mut tx.tx, &canonical_message_id.0, &content).await?;
     sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
         .bind(created_at_dt.to_rfc3339())
         .bind(&turn.conversation.0)
@@ -2894,40 +2870,7 @@ async fn load_message_by_id_tx(
         }
     })?;
     let mut message = crate::parse_message_row(row).map_err(DbError::Sqlx)?;
-    let files = sqlx::query(
-        "SELECT original_name, media_type, size_bytes, stored_path
-         FROM message_files WHERE message_id = ?1 ORDER BY ordinal",
-    )
-    .bind(message_id)
-    .map(
-        |row: sqlx::sqlite::SqliteRow| phoenix_core::domain::db_schema::FileAttachment {
-            original_name: row.get("original_name"),
-            media_type: row.get("media_type"),
-            size_bytes: u64::try_from(row.get::<i64, _>("size_bytes")).unwrap_or(0),
-            stored_path: row.get("stored_path"),
-        },
-    )
-    .fetch_all(&mut **tx)
-    .await?;
-    let images =
-        if matches!(
-            message.message_type,
-            phoenix_core::domain::db_schema::MessageType::User
-        ) {
-            sqlx::query(
-            "SELECT media_type, data FROM message_images WHERE message_id = ?1 ORDER BY ordinal",
-        )
-        .bind(message_id)
-        .map(|row: sqlx::sqlite::SqliteRow| phoenix_core::domain::db_schema::ImageData {
-            data: row.get("data"),
-            media_type: row.get("media_type"),
-        })
-        .fetch_all(&mut **tx)
-        .await?
-        } else {
-            Vec::new()
-        };
-    message.content.set_attachments(images, files);
+    crate::message_attachments::hydrate(tx, std::slice::from_mut(&mut message)).await?;
     Ok(message)
 }
 
@@ -2953,42 +2896,6 @@ async fn has_message_fts_tx(tx: &mut super::WorkflowTx<'_>) -> DbResult<bool> {
     .fetch_one(&mut *tx.tx)
     .await?;
     Ok(exists > 0)
-}
-
-async fn insert_message_attachments(
-    conn: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    message_id: &str,
-    content: &MessageContent,
-) -> DbResult<()> {
-    let (images, files) = content.attachments();
-    for (ordinal, file) in files.iter().enumerate() {
-        sqlx::query(
-            "INSERT OR IGNORE INTO message_files
-             (message_id, ordinal, original_name, media_type, size_bytes, stored_path)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        )
-        .bind(message_id)
-        .bind(i64::try_from(ordinal).unwrap_or(i64::MAX))
-        .bind(&file.original_name)
-        .bind(&file.media_type)
-        .bind(i64::try_from(file.size_bytes).unwrap_or(i64::MAX))
-        .bind(&file.stored_path)
-        .execute(&mut **conn)
-        .await?;
-    }
-    for (ordinal, image) in images.iter().enumerate() {
-        sqlx::query(
-            "INSERT OR IGNORE INTO message_images (message_id, ordinal, media_type, data)
-             VALUES (?1, ?2, ?3, ?4)",
-        )
-        .bind(message_id)
-        .bind(i64::try_from(ordinal).unwrap_or(i64::MAX))
-        .bind(&image.media_type)
-        .bind(&image.data)
-        .execute(&mut **conn)
-        .await?;
-    }
-    Ok(())
 }
 
 async fn load_live_attempt_tx(

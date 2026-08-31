@@ -174,6 +174,14 @@ pub(crate) struct NativeStatementObservation {
     pub(crate) read_concurrency: u32,
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeStatementShape {
+    Begin,
+    OrdinaryRead,
+    Other,
+}
+
 #[derive(Debug)]
 pub(crate) struct NativeReadToken {
     collector: SqliteWorkloadCollector,
@@ -514,6 +522,8 @@ pub struct SqliteWorkloadCollector {
     inner: Arc<Mutex<InnerCollector>>,
     active_native_reads: Arc<Mutex<ActiveNativeReads>>,
     clock: CollectorClock,
+    #[cfg(test)]
+    observed_native_statements: Arc<Mutex<Vec<NativeStatementShape>>>,
 }
 
 impl Default for SqliteWorkloadCollector {
@@ -533,6 +543,8 @@ impl SqliteWorkloadCollector {
             inner: Arc::new(Mutex::new(InnerCollector::new(&clock))),
             active_native_reads: Arc::new(Mutex::new(ActiveNativeReads::default())),
             clock,
+            #[cfg(test)]
+            observed_native_statements: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -559,6 +571,24 @@ impl SqliteWorkloadCollector {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.record(observation);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_native_statement_shape_for_test(&self, shape: NativeStatementShape) {
+        self.observed_native_statements
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(shape);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_native_statement_shapes_for_test(&self) -> Vec<NativeStatementShape> {
+        std::mem::take(
+            &mut *self
+                .observed_native_statements
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     pub(crate) fn record_native_statement(&self, observation: NativeStatementObservation) {

@@ -717,6 +717,24 @@ unsafe extern "C" fn profile_callback(
     } else {
         0
     };
+    #[cfg(test)]
+    context.collector.record_native_statement_shape_for_test(
+        if matches!(
+            metadata.map(|metadata| metadata.kind),
+            Some(StatementKind::TransactionControl)
+        ) && access == SqliteAccessKind::Write
+        {
+            crate::sqlite_workload::NativeStatementShape::Begin
+        } else if matches!(
+            metadata.map(|metadata| metadata.kind),
+            Some(StatementKind::Ordinary)
+        ) && access == SqliteAccessKind::Read
+        {
+            crate::sqlite_workload::NativeStatementShape::OrdinaryRead
+        } else {
+            crate::sqlite_workload::NativeStatementShape::Other
+        },
+    );
     context
         .collector
         .record_native_statement(NativeStatementObservation {

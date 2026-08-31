@@ -1684,7 +1684,7 @@ mod tests {
 
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
-    async fn aggregate_cursor_uses_message_id_to_resume_duplicate_sequence_ids() {
+    async fn aggregate_cursor_resumes_unique_monotonic_sequence_ids() {
         let state = make_test_state().await;
         let root = state
             .db
@@ -1704,12 +1704,6 @@ mod tests {
                 .await
                 .unwrap();
         }
-        sqlx::query("UPDATE messages SET sequence_id = 1 WHERE conversation_id = ?")
-            .bind(&root.id)
-            .execute(state.db.pool())
-            .await
-            .unwrap();
-
         let first = create_router(state.clone())
             .oneshot(
                 Request::builder()
@@ -1782,10 +1776,6 @@ mod tests {
                 None,
                 None,
             )
-            .await
-            .unwrap();
-        sqlx::query("UPDATE messages SET sequence_id = 1 WHERE message_id = 'duplicate-z'")
-            .execute(state.db.pool())
             .await
             .unwrap();
         let appended_response = create_router(state)

@@ -1527,6 +1527,37 @@ impl Drop for AuthorityBoundaryConsumerGuard {
     }
 }
 
+#[derive(Debug)]
+struct ActivePromptProjection {
+    fenced_position: crate::db::GenerationFencedPromptPosition,
+    messages: Vec<crate::db::Message>,
+}
+
+impl ActivePromptProjection {
+    fn from_snapshot(snapshot: crate::db::HydratedPromptSnapshot) -> Self {
+        let (generation, position, messages) = snapshot.into_parts();
+        Self {
+            fenced_position: crate::db::GenerationFencedPromptPosition::new(generation, position),
+            messages,
+        }
+    }
+
+    fn apply_tail(&mut self, tail: crate::db::HydratedPromptTail) -> bool {
+        match tail {
+            crate::db::HydratedPromptTail::Invalidated(_current_generation) => false,
+            crate::db::HydratedPromptTail::Current(rows) => {
+                let (position, messages) = rows.into_parts();
+                self.messages.extend(messages);
+                self.fenced_position = crate::db::GenerationFencedPromptPosition::new(
+                    self.fenced_position.generation(),
+                    position,
+                );
+                true
+            }
+        }
+    }
+}
+
 pub struct ConversationRuntime<S, L, T>
 where
     S: Storage + Clone + 'static,
@@ -1565,6 +1596,9 @@ where
     /// cache is authoritative after any successful read/write; a transient
     /// watermark read failure falls back to it instead of un-clearing history.
     clear_watermark_cache: Arc<std::sync::Mutex<Option<i64>>>,
+    /// Executor-owned hydrated durable prompt rows. Provider tasks receive only
+    /// request-local rendered clones; this projection never leaves the runtime.
+    active_prompt_projection: Option<ActivePromptProjection>,
     /// Browser session manager for `ToolContext`
     browser_sessions: Arc<BrowserSessionManager>,
     /// Bash handle registry for `ToolContext` (REQ-BASH-014).
@@ -1854,6 +1888,7 @@ where
             coordinator_read_service: None,
             clearable_names,
             clear_watermark_cache: Arc::new(std::sync::Mutex::new(None)),
+            active_prompt_projection: None,
             browser_sessions,
             bash_handles,
             tmux_registry,
@@ -2218,14 +2253,23 @@ where
                 operation_id = %request.operation_id,
                 "resuming interrupted continuation summary"
             );
-            if let Err(error) = self
+            match self
                 .execute_effect(Effect::RequestContinuation {
                     request: request.clone(),
                 })
                 .await
             {
-                tracing::error!(%error, "Failed to resume continuation request");
-                return RuntimeExitDisposition::Interrupted;
+                Ok(Some(failure)) => {
+                    if let Err(error) = self.process_event(failure).await {
+                        tracing::error!(%error, "Failed to settle resumed continuation request");
+                        return RuntimeExitDisposition::Interrupted;
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::error!(%error, "Failed to resume continuation request");
+                    return RuntimeExitDisposition::Interrupted;
+                }
             }
         }
 
@@ -3300,6 +3344,11 @@ where
                     continue;
                 }
                 let is_steering_drain = matches!(effect, Effect::CommitSteeringDrain { .. });
+                let is_llm_dispatch = matches!(effect, Effect::RequestLlm);
+                let continuation_request = match &effect {
+                    Effect::RequestContinuation { request } => Some(request.clone()),
+                    _ => None,
+                };
                 let terminal_message_settlement = if terminal_direct_turn_transition {
                     match &effect {
                         Effect::PersistMessage { message_id, .. }
@@ -3567,6 +3616,22 @@ where
                             );
                         }
                         return Err(error);
+                    }
+                    Err(error) if is_llm_dispatch => {
+                        generated_events.push(self.llm_dispatch_failure_event(error));
+                        None
+                    }
+                    Err(error) if continuation_request.is_some() => {
+                        let request = continuation_request
+                            .as_ref()
+                            .expect("continuation dispatch captured before execution");
+                        generated_events.push(Event::ContinuationError {
+                            operation_id: request.operation_id.clone(),
+                            message: error,
+                            error_kind: crate::db::ErrorKind::InvalidRequest,
+                            resets_at: None,
+                        });
+                        None
                     }
                     Err(error) => return Err(error),
                 };
@@ -5121,8 +5186,12 @@ where
                         return Ok(None);
                     }
                 }
-                let (reserved_broadcast_range, reserved_seqs) =
-                    self.broadcast_tx.reserve_next_persisted_message_range(1);
+                let (reserved_broadcast_range, reserved_seqs) = self
+                    .broadcast_tx
+                    .persisted_message_reservation_authority()
+                    .await
+                    .reserve_next_range(1)
+                    .expect("executor holds exclusive persisted-message reservation authority");
                 let _reserved_broadcast_range = reserved_broadcast_range;
                 let input = crate::runtime::traits::AuthoritativeUserMessageAdoptionInput {
                     authority,
@@ -5274,8 +5343,12 @@ where
                 usage_data,
                 message_id,
             } => {
-                let (reserved_range, reserved_sequences) =
-                    self.broadcast_tx.reserve_next_persisted_message_range(1);
+                let (reserved_range, reserved_sequences) = self
+                    .broadcast_tx
+                    .persisted_message_reservation_authority()
+                    .await
+                    .reserve_next_range(1)
+                    .expect("executor holds exclusive persisted-message reservation authority");
                 let sequence_id = reserved_sequences[0];
                 let message = crate::db::Message {
                     message_id,
@@ -5474,8 +5547,12 @@ where
 
             AuthoritativeEffect::ContinuationCommit { request, summary } => {
                 let operation_id = request.operation_id.clone();
-                let (reserved_range, reserved_sequences) =
-                    self.broadcast_tx.reserve_next_persisted_message_range(1);
+                let (reserved_range, reserved_sequences) = self
+                    .broadcast_tx
+                    .persisted_message_reservation_authority()
+                    .await
+                    .reserve_next_range(1)
+                    .expect("executor holds exclusive persisted-message reservation authority");
                 let seq = reserved_sequences[0];
                 let content = crate::db::MessageContent::continuation(summary.clone());
                 let message = crate::db::Message {
@@ -5812,11 +5889,16 @@ where
                 message_id,
             } => {
                 let broadcaster = self.broadcast_tx.clone();
+                let mut reservation_authority =
+                    Some(broadcaster.persisted_message_reservation_authority().await);
                 let mut reserved_broadcast = None;
                 let materialization = {
                     let mut allocate_sequence = |persisted_sequence_max| {
-                        let (reservation, sequence_id) = broadcaster
-                            .reserve_next_persisted_message_after(persisted_sequence_max);
+                        let (reservation, sequence_id) = reservation_authority
+                            .take()
+                            .expect("materialization allocates at most one persisted-message range")
+                            .reserve_next_after(persisted_sequence_max)
+                            .expect("single persisted-message reservation");
                         reserved_broadcast = Some((reservation, sequence_id));
                         sequence_id
                     };
@@ -6065,14 +6147,14 @@ where
                     ConvState::AwaitingContinuation { request: active }
                         if active.operation_id == request.operation_id
                 ) {
-                    self.request_continuation(request, admitted);
+                    self.request_continuation(request, admitted).await
                 } else {
                     tracing::debug!(
                         operation_id = %request.operation_id,
                         "skipping continuation request that no longer owns state"
                     );
+                    Ok(None)
                 }
-                Ok(None)
             }
 
             AuthoritativeEffect::ApproveTask {
@@ -6275,7 +6357,10 @@ where
         }
         let (reserved_range, sequences) = self
             .broadcast_tx
-            .reserve_next_persisted_message_range(messages.len());
+            .persisted_message_reservation_authority()
+            .await
+            .reserve_next_range(messages.len())
+            .expect("executor holds exclusive persisted-message reservation authority");
         let created_at = Utc::now();
         let committed_messages: Vec<crate::db::Message> = messages
             .into_iter()
@@ -6468,6 +6553,38 @@ where
         }
     }
 
+    /// Refresh the executor-owned durable transcript projection and freeze the
+    /// rendered prompt before provider task dispatch. One invalidation causes
+    /// exactly one full rebuild; malformed tails fail closed.
+    async fn refresh_active_prompt_projection(&mut self) -> Result<(), String> {
+        let conversation_id = &self.context.conversation_id;
+        if self.active_prompt_projection.is_none() {
+            let snapshot = self
+                .storage
+                .load_hydrated_prompt_snapshot(conversation_id)
+                .await?;
+            self.active_prompt_projection = Some(ActivePromptProjection::from_snapshot(snapshot));
+        }
+
+        let projection = self
+            .active_prompt_projection
+            .as_mut()
+            .expect("projection initialized above");
+        let tail = self
+            .storage
+            .load_hydrated_prompt_tail(conversation_id, projection.fenced_position)
+            .await?;
+        let rebuild = !projection.apply_tail(tail);
+        if rebuild {
+            let snapshot = self
+                .storage
+                .load_hydrated_prompt_snapshot(conversation_id)
+                .await?;
+            self.active_prompt_projection = Some(ActivePromptProjection::from_snapshot(snapshot));
+        }
+        Ok(())
+    }
+
     /// Dispatch an LLM request: enforce turn/cycle caps, inject grace-turn
     /// messages, build the streaming pipeline, and spawn the LLM task.
     #[allow(clippy::too_many_lines)]
@@ -6560,17 +6677,42 @@ where
                          actually complete."
                     };
                     let content = MessageContent::User(crate::db::UserContent::meta(grace_prompt));
-                    if let Err(e) = self
+                    let (reservation, sequences) = self
+                        .broadcast_tx
+                        .persisted_message_reservation_authority()
+                        .await
+                        .reserve_next_range(1)
+                        .expect("grace turn reserves one persisted-message sequence");
+                    let sequence_id = sequences[0];
+                    if let Err(error) = self
                         .storage
-                        .add_message(&msg_id, &self.context.conversation_id, &content, None, None)
+                        .add_message_with_seq(
+                            &msg_id,
+                            &self.context.conversation_id,
+                            sequence_id,
+                            &content,
+                            None,
+                            None,
+                        )
                         .await
                     {
-                        tracing::warn!(error = %e, "Failed to persist grace turn message");
+                        let _ = self.broadcast_tx.send_reserved_seq(sequence_id, |seq| {
+                            SseEvent::Error {
+                                sequence_id: seq,
+                                error:
+                                    crate::runtime::user_facing_error::UserFacingError::with_action(
+                                        "persist the grace-turn guidance",
+                                    ),
+                            }
+                        });
+                        drop(reservation);
+                        return Err(error);
                     }
+                    drop(reservation);
 
                     // Allow the normal LLM request to proceed (don't return, don't
-                    // send UserCancel). The meta message will appear in the next
-                    // build_llm_messages call as a user-role message.
+                    // send UserCancel). The persisted meta message is included by
+                    // the prompt-projection tail refresh below.
                 }
             }
         }
@@ -6578,6 +6720,24 @@ where
         if self.grace_turn_granted && retry_attempt > 1 {
             tool_surface = LlmToolSurface::SubAgentTerminal;
         }
+
+        // Persistence effects have settled before RequestLlm reaches this method.
+        // Refresh and render now, before any provider task exists, so scheduling
+        // cannot admit later steering into this request.
+        self.refresh_active_prompt_projection().await?;
+        let frozen_messages = assemble_cleared_messages(
+            &self.storage,
+            &self.context.conversation_id,
+            &self
+                .active_prompt_projection
+                .as_ref()
+                .expect("projection refreshed above")
+                .messages,
+            &self.clearable_names,
+            self.context.context_window,
+            &self.clear_watermark_cache,
+        )
+        .await;
 
         // Typed oneshot channel: background task gets Sender<LlmOutcome>,
         // physically cannot send a ToolExecOutcome or other type.
@@ -6598,11 +6758,8 @@ where
 
         let llm_client = self.llm_client.clone();
         let tool_executor = self.tool_executor.clone();
-        let clearable_names = self.clearable_names.clone();
-        let clear_watermark_cache = self.clear_watermark_cache.clone();
         let storage = self.storage.clone();
         let conv_id = self.context.conversation_id.clone();
-        let context_window = self.context.context_window;
         let root_conv_id = self.context.root_conversation_id.clone();
         let model_id = self.context.model_id.clone();
         let explicit_effort = self.context.effort;
@@ -6672,6 +6829,73 @@ where
         let (chunk_tx, chunk_rx) = mpsc::channel::<phoenix_llm::TokenChunk>(256);
         let request_id = uuid::Uuid::new_v4().to_string();
 
+        // Freeze the complete provider request before any provider or forwarding
+        // task is spawned. Tool definitions, AGENTS-backed system prompt, and the
+        // optional Coordinator capsule are request authority, not task-local inputs.
+        let available_tools = tool_executor.definitions_for_language(llm_language).await;
+        let explore_bash_capability =
+            if matches!(mode_context.as_ref(), Some(ModeContext::Explore { .. })) {
+                explore_bash
+            } else {
+                phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable
+            };
+        let mut system_prompt = if is_coordinator {
+            crate::system_prompt::build_coordinator_system_prompt(llm_language, explore_bash)
+        } else {
+            build_system_prompt(
+                working_dir
+                    .as_deref()
+                    .expect("filesystem conversation has cwd"),
+                &tasks_dir_name,
+                is_sub_agent,
+                mode_context.as_ref(),
+                llm_language,
+                persona.as_deref(),
+                explore_bash_capability,
+            )
+        };
+        if has_approved_task_write_authority {
+            system_prompt.push_str(
+                "\n\nThe conversation mode remains Explore, but the approved-task objective on its attached WorkScope grants full write authority. Execute that approved task with the available write tools; do not propose another plan merely because the mode label is Explore.",
+            );
+        }
+        let tools = request_tool_surface.callable_tools(available_tools);
+        let callable_tool_names: std::collections::HashSet<&str> =
+            tools.iter().map(|tool| tool.name.as_str()).collect();
+        let messages = strip_unavailable_tool_blocks(
+            frozen_messages,
+            &callable_tool_names,
+            request_tool_surface == LlmToolSurface::SubAgentTerminal,
+        );
+        let mut system = vec![SystemContent::cached(&system_prompt)];
+        if is_coordinator {
+            let capsule = match coordinator_read_service {
+                Some(service) => service.coordinator_snapshot().await.unwrap_or_else(|error| {
+                    tracing::warn!(%error, "Failed to build Coordinator relational snapshot");
+                    "# Conversation activity snapshot unavailable\nPhoenix could not execute the bounded snapshot query for this turn. Use query_database to inspect current relational facts directly.".to_string()
+                }),
+                None => "# Conversation activity snapshot unavailable\nThe bounded snapshot query is unavailable for this turn. Use query_database to inspect current relational facts directly.".to_string(),
+            };
+            system.push(SystemContent::new(capsule));
+        }
+        let attempt_capture = phoenix_llm::LlmAttemptCapture::new();
+        let request = LlmRequest {
+            system,
+            messages,
+            tools,
+            max_tokens: Some(request_output_tokens),
+            effective_effort,
+            service_tier: effective_service_tier,
+            telemetry: Some(phoenix_llm::LlmRequestTelemetry {
+                conversation_id: conv_id.clone(),
+                root_conversation_id: root_conv_id.clone(),
+                request_id: request_id.clone(),
+                retry_attempt,
+                attempt_capture: attempt_capture.clone(),
+            }),
+            cache_key: PromptCacheKey::stable(&conv_id),
+        };
+
         let broadcast_tx_for_tokens = self.broadcast_tx.clone();
         let request_id_for_fwd = request_id.clone();
         let first_byte_at = Arc::new(tokio::sync::Mutex::new(None));
@@ -6719,11 +6943,10 @@ where
             }
         });
 
-        let attempt_capture = phoenix_llm::LlmAttemptCapture::new();
-        let task_attempt_capture = attempt_capture.clone();
         let forwarder_abort = forwarder_handle.abort_handle();
         let fatal_external_effect_cancellation = self.fatal_external_effect_cancellation.clone();
         let mut request_admission = admitted.reborrow();
+        let task_attempt_capture = attempt_capture.clone();
         let request_task = async move {
             let _forwarder_abort = AbortTaskOnDrop(forwarder_abort);
 
@@ -6742,100 +6965,9 @@ where
                 );
             }
 
-            // Build messages from history, applying stale tool-result clearing
-            // (specs/stale-tool-results). The whole read/plan/persist/render
-            // policy — including its REQ-STR-007 failure handling — lives in
-            // assemble_cleared_messages so it is unit-testable apart from dispatch.
-            let db_messages = match storage.get_messages(&conv_id).await {
-                Ok(m) => m,
-                Err(e) => {
-                    // Build error → treated as InvalidRequest
-                    let _ = llm_tx.send(LlmOutcome::NetworkError { message: e });
-                    return;
-                }
-            };
-            let messages = assemble_cleared_messages(
-                &storage,
-                &conv_id,
-                &db_messages,
-                &clearable_names,
-                context_window,
-                &clear_watermark_cache,
-            )
-            .await;
-
-            // Build tool definitions before the mode prompt so Explore prose can
-            // describe the same tool surface the model receives.
-            let available_tools = tool_executor.definitions_for_language(llm_language).await;
-            let explore_bash_capability =
-                if matches!(mode_context.as_ref(), Some(ModeContext::Explore { .. })) {
-                    explore_bash
-                } else {
-                    phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable
-                };
-
-            // Build system prompt with AGENTS.md content + mode context
-            // TODO(task 61006): snapshot system prompt per conversation to stop mid-session cache busts
-            let mut system_prompt = if is_coordinator {
-                crate::system_prompt::build_coordinator_system_prompt(llm_language, explore_bash)
-            } else {
-                build_system_prompt(
-                    working_dir.as_deref().expect("filesystem conversation has cwd"),
-                    &tasks_dir_name,
-                    is_sub_agent,
-                    mode_context.as_ref(),
-                    llm_language,
-                    persona.as_deref(),
-                    explore_bash_capability,
-                )
-            };
-
-            if has_approved_task_write_authority {
-                system_prompt.push_str(
-                    "\n\nThe conversation mode remains Explore, but the approved-task objective on its attached WorkScope grants full write authority. Execute that approved task with the available write tools; do not propose another plan merely because the mode label is Explore.",
-                );
-            }
-
-            let tools = request_tool_surface.callable_tools(available_tools);
-            let callable_tool_names: std::collections::HashSet<&str> =
-                tools.iter().map(|tool| tool.name.as_str()).collect();
-            let messages = strip_unavailable_tool_blocks(
-                messages,
-                &callable_tool_names,
-                request_tool_surface == LlmToolSurface::SubAgentTerminal,
-            );
-
-            let mut system = vec![SystemContent::cached(&system_prompt)];
-            if is_coordinator {
-                let capsule = match coordinator_read_service {
-                    Some(service) => service.coordinator_snapshot().await.unwrap_or_else(|error| {
-                        tracing::warn!(%error, "Failed to build Coordinator relational snapshot");
-                        "# Conversation activity snapshot unavailable\nPhoenix could not execute the bounded snapshot query for this turn. Use query_database to inspect current relational facts directly.".to_string()
-                    }),
-                    None => "# Conversation activity snapshot unavailable\nThe bounded snapshot query is unavailable for this turn. Use query_database to inspect current relational facts directly.".to_string(),
-                };
-                system.push(SystemContent::new(capsule));
-            }
-
+            // The task owns a complete immutable request. No filesystem,
+            // transcript, tool-registry, or prompt construction happens here.
             let attempt_capture = task_attempt_capture;
-            let request = LlmRequest {
-                system,
-                messages,
-                tools,
-                max_tokens: Some(request_output_tokens),
-                effective_effort,
-                service_tier: effective_service_tier,
-                telemetry: Some(phoenix_llm::LlmRequestTelemetry {
-                    conversation_id: conv_id.clone(),
-                    root_conversation_id: root_conv_id.clone(),
-                    request_id: request_id.clone(),
-                    retry_attempt,
-                    attempt_capture: attempt_capture.clone(),
-                }),
-                // Every turn in a conversation reuses the same prefix
-                // (system prompt + earlier turns), so all turns share one key.
-                cache_key: PromptCacheKey::stable(&conv_id),
-            };
 
             // Use streaming — chunk_tx forwards text tokens to SSE clients.
             let llm_outcome = match llm_client.complete_streaming(&request, &chunk_tx).await {
@@ -6846,7 +6978,10 @@ where
                         .into_iter()
                         .map(|(id, name, input)| {
                             let typed_input = if is_coordinator {
-                                ToolInput::from_name_and_value_with_work_scope_target(name, input.clone())
+                                ToolInput::from_name_and_value_with_work_scope_target(
+                                    name,
+                                    input.clone(),
+                                )
                             } else {
                                 ToolInput::from_name_and_value(name, input.clone())
                             };
@@ -6896,7 +7031,11 @@ where
             // same store to render reset/credits/promo alongside the
             // plan-aware message.
             if let LlmOutcome::UsageLimitReached { ref details, .. } = llm_outcome {
-                let _ = chunk_tx.send(phoenix_llm::TokenChunk::RateLimitSnapshot(Box::new(details.clone()))).await;
+                let _ = chunk_tx
+                    .send(phoenix_llm::TokenChunk::RateLimitSnapshot(Box::new(
+                        details.clone(),
+                    )))
+                    .await;
             }
 
             // Happens-before barrier for task 24683: close the chunk
@@ -7287,7 +7426,10 @@ where
         let conv_id = self.context.conversation_id.clone();
         let (reserved_broadcast_range, reserved_seqs) = self
             .broadcast_tx
-            .reserve_next_persisted_message_range(1 + tool_results.len());
+            .persisted_message_reservation_authority()
+            .await
+            .reserve_next_range(1 + tool_results.len())
+            .expect("executor holds exclusive persisted-message reservation authority");
         let _reserved_broadcast_range = reserved_broadcast_range;
         let agent_content = MessageContent::agent(assistant_message.content);
         let agent_msg = crate::db::Message {
@@ -7379,7 +7521,10 @@ where
                 // never sees a shifted timestamp on the message the UI displays.
                 let (reserved_broadcast_range, reserved_seqs) = self
                     .broadcast_tx
-                    .reserve_next_persisted_message_range(1 + tool_results.len());
+                    .persisted_message_reservation_authority()
+                    .await
+                    .reserve_next_range(1 + tool_results.len())
+                    .expect("executor holds exclusive persisted-message reservation authority");
                 let _reserved_broadcast_range = reserved_broadcast_range;
 
                 let agent_content = MessageContent::agent(assistant_message.content);
@@ -7486,7 +7631,10 @@ where
         // ephemeral event broadcast earlier (mirrors `persist_checkpoint`).
         let (reserved_broadcast_range, reserved_seqs) = self
             .broadcast_tx
-            .reserve_next_persisted_message_range(1 + tool_results.len());
+            .persisted_message_reservation_authority()
+            .await
+            .reserve_next_range(1 + tool_results.len())
+            .expect("executor holds exclusive persisted-message reservation authority");
         let _reserved_broadcast_range = reserved_broadcast_range;
 
         let agent_content = MessageContent::agent(assistant_message.content);
@@ -7769,31 +7917,13 @@ where
         Ok(None)
     }
 
-    /// Build LLM messages from conversation history (instance method)
-    #[allow(dead_code)] // May be useful for non-spawned code paths
-    async fn build_llm_messages(&self) -> Result<Vec<LlmMessage>, String> {
-        Self::build_llm_messages_static(&self.storage, &self.context.conversation_id).await
-    }
-
-    /// Build LLM messages from conversation history (static, for spawned tasks)
-    async fn build_llm_messages_static(
-        storage: &S,
-        conv_id: &str,
-    ) -> Result<Vec<LlmMessage>, String> {
-        let db_messages = storage.get_messages(conv_id).await?;
-        Ok(render_messages(
-            &db_messages,
-            &std::collections::HashSet::new(),
-        ))
-    }
-
     /// Request continuation summary from LLM (REQ-BED-020)
     #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)] // Consistent with Effect signature; single spawned continuation pipeline
-    fn request_continuation(
+    async fn request_continuation(
         &mut self,
         request: phoenix_core::domain::sm_state::ContinuationSummaryRequest,
         admitted: &mut crate::runtime::AdmittedOperation,
-    ) {
+    ) -> Result<Option<Event>, String> {
         let operation_id = request.operation_id;
         let rejected_tool_calls = request.rejected_tool_calls;
         let retry_attempt = request.attempt;
@@ -7815,17 +7945,11 @@ where
             if !self.llm_registry.supports_effort(&model_id, effort) {
                 let error =
                     format!("Persisted effort '{effort}' is not supported by model '{model_id}'");
-                let event_tx = self.event_tx.clone();
-                tokio::spawn(async move {
-                    let _ = event_tx
-                        .send(Event::ContinuationFailed {
-                            operation_id,
-                            error,
-                            error_kind: crate::db::ErrorKind::InvalidRequest,
-                        })
-                        .await;
-                });
-                return;
+                return Ok(Some(Event::ContinuationFailed {
+                    operation_id,
+                    error,
+                    error_kind: crate::db::ErrorKind::InvalidRequest,
+                }));
             }
         }
         let effective_effort = self
@@ -7847,108 +7971,114 @@ where
             },
         );
 
+        // Freeze the same persisted-only, generation-fenced projection used by
+        // ordinary rounds before provider work can be scheduled. Continuation
+        // compacts only this conversation member; lineage summaries remain
+        // represented by their durable continuation messages rather than by
+        // aggregate flattening.
+        if let Err(error) = self.refresh_active_prompt_projection().await {
+            tracing::error!(
+                conversation_id = %self.context.conversation_id,
+                %operation_id,
+                %error,
+                "continuation prompt projection failed before provider task spawn"
+            );
+            return Ok(Some(Event::ContinuationFailed {
+                operation_id,
+                error,
+                error_kind: crate::db::ErrorKind::InvalidRequest,
+            }));
+        }
+        let frozen_messages = assemble_cleared_messages(
+            &self.storage,
+            &self.context.conversation_id,
+            &self
+                .active_prompt_projection
+                .as_ref()
+                .expect("projection refreshed above")
+                .messages,
+            &self.clearable_names,
+            self.context.context_window,
+            &self.clear_watermark_cache,
+        )
+        .await;
+
         // Build continuation prompt
         let continuation_prompt = build_continuation_prompt(&rejected_tool_calls);
+
+        let rendered_count = frozen_messages.len();
+
+        // Complete continuation-specific flattening, image capping, budgeting,
+        // and instruction injection before a provider task exists.
+        let messages = cap_replayed_images(
+            flatten_tool_blocks(frozen_messages),
+            CONTINUATION_MAX_REPLAYED_IMAGES,
+        );
+
+        // Proactive overflow guard: continuation fires near the top of the
+        // window, so the flattened history can still exceed it. Keep the
+        // most-recent messages within a token budget, dropping oldest first,
+        // so the request can't 400 with ContextWindowExceeded and loop
+        // deterministically to the fallback summary. The budget reserves the
+        // model's reply plus the *actual* size of the continuation prompt
+        // and system text — both grow (the prompt with rejected-call args)
+        // and must not be allowed to push the request over the window after
+        // history has filled the budget.
+        let fixed_tokens = estimate_text_tokens(&continuation_prompt)
+            + estimate_text_tokens(CONTINUATION_SYSTEM_PROMPT)
+            + continuation_output_reserve
+            + CONTINUATION_SAFETY_MARGIN_TOKENS;
+        let history_item_cap = continuation_limits.max_history_messages(1);
+        let budget =
+            plan_continuation_history(messages, context_window, fixed_tokens, history_item_cap);
+        tracing::debug!(
+            rendered_count,
+            retained_count = budget.messages.len(),
+            history_item_cap,
+            dropped_for_item_cap = budget.dropped_for_item_cap,
+            dropped_by_budget = budget.dropped_by_budget,
+            trimmed_for_user_first = budget.trimmed_for_user_first,
+            dropped_for_headroom = budget.dropped_for_headroom,
+            context_window,
+            input_budget = budget.input_budget,
+            estimated_history_tokens = budget.estimated_history_tokens,
+            headroom_tokens = budget.headroom_tokens,
+            minimum_headroom_tokens = CONTINUATION_MIN_HEADROOM_TOKENS,
+            minimum_headroom_satisfied = budget.minimum_headroom_satisfied,
+            "continuation: planned bounded history"
+        );
+        let mut messages = budget.messages;
+        messages.push(LlmMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::text(&continuation_prompt)],
+        });
+        let attempt_capture = phoenix_llm::LlmAttemptCapture::new();
+        let request = LlmRequest {
+            messages,
+            system: vec![SystemContent::new(CONTINUATION_SYSTEM_PROMPT)],
+            tools: vec![], // No tools for continuation
+            // Handoff quality favors completeness; cap high enough that a
+            // thorough summary is not truncated mid-thought.
+            max_tokens: Some(u32::try_from(continuation_output_reserve).unwrap_or(u32::MAX)),
+            effective_effort,
+            service_tier: effective_service_tier,
+            telemetry: Some(phoenix_llm::LlmRequestTelemetry {
+                conversation_id: conv_id.clone(),
+                root_conversation_id: root_conv_id,
+                request_id,
+                retry_attempt,
+                attempt_capture: attempt_capture.clone(),
+            }),
+            // Same conversation as the main loop — different system
+            // prompt won't share a prefix in practice, but using the
+            // conv id keeps the cache cohort coherent.
+            cache_key: PromptCacheKey::stable(&conv_id),
+        };
 
         let fatal_external_effect_cancellation = self.fatal_external_effect_cancellation.clone();
         let continuation_admission = admitted.reborrow();
         let continuation_task = async move {
             let _continuation_admission = continuation_admission;
-            // Build messages from history and add continuation request
-            let messages = match Self::build_llm_messages_static(&storage, &conv_id).await {
-                Ok(m) => m,
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to build messages for continuation");
-                    let _ = event_tx
-                        .send(Event::ContinuationFailed {
-                            operation_id,
-                            error: e,
-                            error_kind: crate::db::ErrorKind::ServerError,
-                        })
-                        .await;
-                    return;
-                }
-            };
-
-            let rendered_count = messages.len();
-
-            // The continuation request declares no tools, so any tool_use /
-            // tool_result / server-handled block left in history would make the
-            // API 400 ("tool reference not found"). Flatten them to text rather
-            // than deleting them — the diffs applied, commands run, and output
-            // observed are exactly what the summary should draw on. Each block's
-            // text is capped so a single huge result can't dominate. Replayed
-            // screenshots are bounded to the most recent few so they cannot evict
-            // older textual context under the budget cap below.
-            let messages = cap_replayed_images(
-                flatten_tool_blocks(messages),
-                CONTINUATION_MAX_REPLAYED_IMAGES,
-            );
-
-            // Proactive overflow guard: continuation fires near the top of the
-            // window, so the flattened history can still exceed it. Keep the
-            // most-recent messages within a token budget, dropping oldest first,
-            // so the request can't 400 with ContextWindowExceeded and loop
-            // deterministically to the fallback summary. The budget reserves the
-            // model's reply plus the *actual* size of the continuation prompt
-            // and system text — both grow (the prompt with rejected-call args)
-            // and must not be allowed to push the request over the window after
-            // history has filled the budget.
-            let fixed_tokens = estimate_text_tokens(&continuation_prompt)
-                + estimate_text_tokens(CONTINUATION_SYSTEM_PROMPT)
-                + continuation_output_reserve
-                + CONTINUATION_SAFETY_MARGIN_TOKENS;
-            let history_item_cap = continuation_limits.max_history_messages(1);
-            let budget =
-                plan_continuation_history(messages, context_window, fixed_tokens, history_item_cap);
-            tracing::debug!(
-                rendered_count,
-                retained_count = budget.messages.len(),
-                history_item_cap,
-                dropped_for_item_cap = budget.dropped_for_item_cap,
-                dropped_by_budget = budget.dropped_by_budget,
-                trimmed_for_user_first = budget.trimmed_for_user_first,
-                dropped_for_headroom = budget.dropped_for_headroom,
-                context_window,
-                input_budget = budget.input_budget,
-                estimated_history_tokens = budget.estimated_history_tokens,
-                headroom_tokens = budget.headroom_tokens,
-                minimum_headroom_tokens = CONTINUATION_MIN_HEADROOM_TOKENS,
-                minimum_headroom_satisfied = budget.minimum_headroom_satisfied,
-                "continuation: planned bounded history"
-            );
-            let mut messages = budget.messages;
-
-            // Add the continuation request as a user message
-            messages.push(LlmMessage {
-                role: MessageRole::User,
-                content: vec![ContentBlock::text(&continuation_prompt)],
-            });
-
-            let attempt_capture = phoenix_llm::LlmAttemptCapture::new();
-            // Build a tool-less request
-            let request = LlmRequest {
-                messages,
-                system: vec![SystemContent::new(CONTINUATION_SYSTEM_PROMPT)],
-                tools: vec![], // No tools for continuation
-                // Handoff quality favors completeness; cap high enough that a
-                // thorough summary is not truncated mid-thought.
-                max_tokens: Some(u32::try_from(continuation_output_reserve).unwrap_or(u32::MAX)),
-                effective_effort,
-                service_tier: effective_service_tier,
-                telemetry: Some(phoenix_llm::LlmRequestTelemetry {
-                    conversation_id: conv_id.clone(),
-                    root_conversation_id: root_conv_id,
-                    request_id,
-                    retry_attempt,
-                    attempt_capture: attempt_capture.clone(),
-                }),
-                // Same conversation as the main loop — different system
-                // prompt won't share a prefix in practice, but using the
-                // conv id keeps the cache cohort coherent.
-                cache_key: PromptCacheKey::stable(&conv_id),
-            };
-
             let result = llm_client.complete(&request).await;
             if let Some(metrics) = attempt_capture.finalized() {
                 if let Err(error) = storage.upsert_llm_request_metrics(&metrics).await {
@@ -8026,6 +8156,7 @@ where
             }
         });
         self.llm_task_handle = Some(handle);
+        Ok(None)
     }
 
     /// Handle task resolution: finalize conversation state/mode/cwd, inject system message,
@@ -11135,6 +11266,207 @@ mod dispatch_context_budget_tests {
     use tempfile::TempDir;
     use tokio::sync::mpsc;
 
+    fn message(conv_id: &str, sequence_id: i64, text: &str) -> crate::db::Message {
+        crate::db::Message {
+            message_id: format!("{conv_id}-{sequence_id}"),
+            conversation_id: conv_id.to_string(),
+            sequence_id,
+            message_type: crate::db::MessageType::User,
+            content: MessageContent::user(text),
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    fn user_texts(request: &LlmRequest) -> Vec<String> {
+        request
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::User)
+            .flat_map(|message| message.content.iter())
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn prompt_transfer_types_accept_sequence_gaps_and_reject_malformed_rows() {
+        let generation = crate::db::PromptTranscriptGeneration::from_persisted(4).unwrap();
+        let snapshot = crate::db::HydratedPromptSnapshot::try_new(
+            "projection",
+            generation,
+            vec![
+                message("projection", 2, "two"),
+                message("projection", 8, "eight"),
+            ],
+        )
+        .unwrap();
+        let mut projection = ActivePromptProjection::from_snapshot(snapshot);
+        let tail = crate::db::HydratedPromptTail::try_current(
+            "projection",
+            projection.fenced_position.position(),
+            vec![message("projection", 21, "twenty-one")],
+        )
+        .unwrap();
+        assert!(projection.apply_tail(tail));
+
+        assert!(crate::db::HydratedPromptTail::try_current(
+            "projection",
+            projection.fenced_position.position(),
+            vec![message("wrong", 22, "wrong")],
+        )
+        .is_err());
+        assert!(crate::db::HydratedPromptTail::try_current(
+            "projection",
+            projection.fenced_position.position(),
+            vec![message("projection", 21, "duplicate")],
+        )
+        .is_err());
+        assert!(crate::db::HydratedPromptTail::try_current(
+            "projection",
+            projection.fenced_position.position(),
+            vec![
+                message("projection", 24, "out of order"),
+                message("projection", 23, "regression"),
+            ],
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn request_rounds_use_one_snapshot_then_tails_and_rebuild_once_on_invalidation() {
+        let cwd = TempDir::new().expect("cwd");
+        let conv_id = "bounded-projection-rounds";
+        let context = ConvContext::new(conv_id, cwd.path().to_path_buf(), "test-model", 200_000);
+        let storage = Arc::new(InMemoryStorage::new());
+        storage
+            .add_message(
+                "initial",
+                conv_id,
+                &MessageContent::user("initial"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let llm = Arc::new(MockLlmClient::new("test-model"));
+        for text in ["first", "second", "third"] {
+            llm.queue_response(LlmResponse {
+                content: vec![ContentBlock::text(text)],
+                end_turn: true,
+                usage: Usage::default(),
+                stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+            });
+        }
+        let (event_tx, event_rx) = mpsc::channel(8);
+        let mut runtime = ConversationRuntime::new(
+            context,
+            ConvState::LlmRequesting { attempt: 1 },
+            storage.clone(),
+            llm.clone(),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx,
+            SseBroadcaster::new(16, 0),
+        );
+
+        runtime.execute_effect(Effect::RequestLlm).await.unwrap();
+        runtime.llm_task_handle.take().unwrap().await.unwrap();
+        assert_eq!(storage.prompt_projection_load_counts(), (1, 1));
+
+        storage
+            .add_message(
+                "appended",
+                conv_id,
+                &MessageContent::user("appended"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        runtime.execute_effect(Effect::RequestLlm).await.unwrap();
+        runtime.llm_task_handle.take().unwrap().await.unwrap();
+        assert_eq!(storage.prompt_projection_load_counts(), (1, 2));
+        let requests = llm.recorded_requests();
+        assert_eq!(user_texts(&requests[0]), vec!["initial"]);
+        assert_eq!(user_texts(&requests[1]), vec!["initial", "appended"]);
+
+        storage.replace_message_content(
+            conv_id,
+            "initial",
+            MessageContent::user("initial edited provider-visible"),
+        );
+        storage
+            .update_message_display_data("initial", &serde_json::json!({"edited": true}))
+            .await
+            .unwrap();
+        runtime.execute_effect(Effect::RequestLlm).await.unwrap();
+        runtime.llm_task_handle.take().unwrap().await.unwrap();
+        assert_eq!(storage.prompt_projection_load_counts(), (2, 3));
+        assert_eq!(llm.recorded_requests().len(), 3);
+        assert_eq!(
+            user_texts(&llm.recorded_requests()[2]),
+            vec!["initial edited provider-visible", "appended"]
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_process_event_converts_projection_failure_to_typed_llm_error() {
+        let cwd = TempDir::new().expect("cwd");
+        let conv_id = "projection-liveness";
+        let context = ConvContext::new(conv_id, cwd.path().to_path_buf(), "test-model", 200_000);
+        let storage = Arc::new(InMemoryStorage::new());
+        storage.set_fail_prompt_projection_load(true);
+        let llm = Arc::new(MockLlmClient::new("test-model"));
+        let (event_tx, event_rx) = mpsc::channel(8);
+        let mut runtime = ConversationRuntime::new(
+            context,
+            ConvState::Idle,
+            storage,
+            llm.clone(),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx,
+            SseBroadcaster::new(16, 0),
+        );
+
+        runtime
+            .process_event(Event::UserMessage {
+                text: "dispatch me".into(),
+                llm_text: None,
+                images: Vec::new(),
+                files: Vec::new(),
+                message_id: "projection-liveness-user".into(),
+                user_agent: None,
+                skill_invocation: None,
+            })
+            .await
+            .expect("projection failure is a state-machine outcome");
+
+        assert!(runtime.llm_task_handle.is_none());
+        assert!(matches!(
+            runtime.state,
+            ConvState::Error {
+                error_kind: crate::db::ErrorKind::InvalidRequest,
+                ..
+            }
+        ));
+        assert!(llm.recorded_requests().is_empty());
+    }
+
     #[tokio::test]
     async fn conservative_prompt_estimate_cannot_short_circuit_provider_dispatch() {
         let cwd = TempDir::new().expect("cwd");
@@ -11591,7 +11923,7 @@ mod authoritative_user_message_effect_tests {
     use super::*;
     use crate::db::{Message, MessageContent, MessageType};
     use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
-    use crate::runtime::traits::AuthoritativeUserMessageMaterialization;
+    use crate::runtime::traits::{AuthoritativeUserMessageMaterialization, MessageStore};
     use crate::state_machine::state::AssistantMessage;
     use crate::tools::BrowserSessionManager;
     use phoenix_core::domain::sm_event::{DirectTurnAttemptAuthority, PreparedDirectTurnPayload};
@@ -12013,6 +12345,110 @@ mod authoritative_user_message_effect_tests {
             ConvState::Error { message, .. } if message == reason
         ));
         assert_eq!(rt.active_direct_turn, None);
+    }
+
+    #[tokio::test]
+    async fn continuation_projection_failure_settles_through_typed_error() {
+        let (mut rt, storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+            operation_id: "projection-failure".to_string(),
+            rejected_tool_calls: Vec::new(),
+            attempt: 1,
+        };
+        storage.set_fail_prompt_projection_load(true);
+        rt.state = ConvState::AwaitingContinuation {
+            request: request.clone(),
+        };
+
+        let generated = rt
+            .apply_transition_result(
+                crate::state_machine::transition::TransitionResult::new(rt.state.clone())
+                    .with_effect(Effect::RequestContinuation {
+                        request: request.clone(),
+                    }),
+            )
+            .await
+            .expect("projection failure must become a reducer event");
+
+        assert!(rt.llm_task_handle.is_none());
+        assert!(matches!(
+            generated.as_slice(),
+            [Event::ContinuationFailed {
+                operation_id,
+                error_kind: crate::db::ErrorKind::InvalidRequest,
+                ..
+            }] if operation_id == &request.operation_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn continuation_freezes_projection_before_provider_spawn() {
+        let (mut rt, storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let conversation_id = rt.context.conversation_id.clone();
+        storage
+            .add_message(
+                "continuation-history",
+                &rt.context.conversation_id,
+                &MessageContent::user("before freeze"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+            operation_id: "freeze-continuation".to_string(),
+            rejected_tool_calls: Vec::new(),
+            attempt: 1,
+        };
+        rt.state = ConvState::AwaitingContinuation {
+            request: request.clone(),
+        };
+        let (load_started, release_load) = storage.gate_prompt_projection_load();
+
+        let mut dispatch = Box::pin(rt.execute_effect(Effect::RequestContinuation { request }));
+        tokio::select! {
+            signal = load_started => signal.expect("projection load started"),
+            result = &mut dispatch => panic!("continuation dispatched before freeze barrier: {result:?}"),
+        }
+        storage
+            .add_message(
+                "post-freeze",
+                &conversation_id,
+                &MessageContent::user("after freeze must be absent"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        release_load.send(()).unwrap();
+        dispatch.as_mut().await.unwrap();
+        drop(dispatch);
+        let new_request = rt
+            .llm_task_handle
+            .take()
+            .expect("continuation provider task was spawned");
+        assert_eq!(
+            storage.prompt_projection_load_counts().0,
+            1,
+            "post-freeze append must not trigger another full projection load"
+        );
+        let loaded = storage
+            .load_hydrated_prompt_snapshot(&conversation_id)
+            .await
+            .unwrap();
+        let post_freeze_was_persisted = loaded
+            .messages()
+            .iter()
+            .any(|message| message.message_id == "post-freeze");
+        assert!(post_freeze_was_persisted);
+        new_request.abort();
+        let _ = new_request.await;
     }
 
     #[tokio::test]
@@ -13502,7 +13938,7 @@ mod authoritative_user_message_effect_tests {
     }
 
     #[tokio::test]
-    async fn committed_direct_turn_publishes_watcher_before_later_effect_failure() {
+    async fn committed_direct_turn_settles_later_dispatch_failure_through_reducer() {
         let (mut rt, _storage, _broadcast_rx) = runtime(
             DirectTurnMaterializationEligibility::Fresh,
             AuthoritativeUserMessageMaterialization::Materialized {
@@ -13527,9 +13963,17 @@ mod authoritative_user_message_effect_tests {
             })
             .with_effect(Effect::RequestLlm);
 
-        let error = rt.apply_transition_result(result).await.unwrap_err();
+        let generated = rt.apply_transition_result(result).await.unwrap();
 
-        assert!(error.contains("Persisted effort"));
+        assert_eq!(generated.len(), 1);
+        assert!(matches!(
+            &generated[0],
+            Event::LlmError {
+                message,
+                error_kind: crate::db::ErrorKind::InvalidRequest,
+                ..
+            } if message.contains("Persisted effort")
+        ));
         assert_eq!(*watch_rx.borrow(), ConvState::LlmRequesting { attempt: 1 });
     }
 

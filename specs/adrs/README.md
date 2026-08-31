@@ -56,6 +56,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [042](042_close-directory-retirement-trusts-private-namespace.md) | Close directory retirement trusts its private namespace | Accepted | REQ-WL-002b |
 | [043](043_creation-staging-uses-a-private-locked-namespace.md) | Creation staging uses a private locked namespace | Accepted | REQ-CCR-005; product-creation worktree ownership and cleanup |
 | [044](044_creation-publication-uses-request-bound-identity-and-immutable-pins.md) | Creation publication uses request-bound identity and immutable starting pins | Accepted | REQ-CCR-001/002/003/005/005A/006A, REQ-DWF-CREATE-001/002/003/004, REQ-PROJ-017/022, REQ-GITREP-003 |
+| [045](045_provider-prompts-use-persisted-generation-fenced-projections.md) | Provider prompts use persisted generation-fenced projections | Accepted | REQ-BED-018A, REQ-BED-020, REQ-BED-030A |
 
 ## For agents: which decisions bind your task
 
@@ -92,6 +93,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying the Coordinator surface, current-activity orientation, or database read boundary | 027 for tool eligibility, then 022 and 021 for Coordinator-specific evidence and UI history |
 | Specifying projects task-file shapes, proposal classification, or managed approval behavior across taskmd and plain markdown briefs | 023 |
 | Specifying continuation summary retry, restart recovery, or exactly-once commit | 025 |
+| Specifying provider prompt persistence authority, bounded transcript projection, or continuation prompt freezing | 045, then 025 and 031 |
 | Specifying iOS grounding, server-backed file browsing, prose reading, or anchored comments | 030, then 029, 028, and 026 for draft authority, reader sessions, the companion boundary, ProductConversation, and WorkScope ownership |
 
 ## Decision dependencies
@@ -127,6 +129,7 @@ ADR-000 (adopt spEARS v2 for new work)
           └── ADR-020 (Durable-workflow core matches one scheduler authority and durable acknowledgement)
               └── ADR-024 (Direct-turn authority is partitioned by semantic fact)
       ├── ADR-025 (Continuation compaction is an idempotent durable operation)
+      │   └── ADR-045 (Provider prompts use persisted generation-fenced projections)
       ├── ADR-021 (The Coordinator surface is chat-only)
       │   └── ADR-022 (The Coordinator uses bounded relational evidence)
       │       └── ADR-027 (Write-capable ProductConversations use bounded global evidence)
