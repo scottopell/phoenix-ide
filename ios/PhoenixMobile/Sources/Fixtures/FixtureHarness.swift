@@ -195,11 +195,6 @@ struct FixtureConversationScreen: View {
         let screen = scenario.screen
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
-            Text("Fixture ready: \(scenario.id.rawValue)")
-                .font(.caption2)
-                .foregroundStyle(.clear)
-                .frame(height: 1)
-                .accessibilityIdentifier("fixture.ready.\(scenario.id.rawValue)")
             if screen.showsOfflineBanner {
                     fixtureBanner(
                         title: "Offline — showing cached data, messages will queue",
@@ -257,6 +252,13 @@ struct FixtureConversationScreen: View {
         }
         .navigationTitle(screen.title)
         .navigationBarTitleDisplayMode(.inline)
+        .overlay(alignment: .topLeading) {
+            Text("Fixture ready: \(scenario.id.rawValue)")
+                .font(.caption2)
+                .foregroundStyle(.clear)
+                .frame(width: 1, height: 1)
+                .accessibilityIdentifier("fixture.ready.\(scenario.id.rawValue)")
+        }
     }
 
     private func transcript(screen: FixtureConversationScreenModel) -> some View {
