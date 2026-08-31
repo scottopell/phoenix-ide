@@ -194,7 +194,12 @@ struct FixtureConversationScreen: View {
     var body: some View {
         let screen = scenario.screen
         VStack(alignment: .leading, spacing: 0) {
-                if screen.showsOfflineBanner {
+            Text("Fixture ready: \(scenario.id.rawValue)")
+                .font(.caption2)
+                .foregroundStyle(.clear)
+                .frame(height: 1)
+                .accessibilityIdentifier("fixture.ready.\(scenario.id.rawValue)")
+            if screen.showsOfflineBanner {
                     fixtureBanner(
                         title: "Offline — showing cached data, messages will queue",
                         detail: nil,
@@ -268,7 +273,6 @@ struct FixtureConversationScreen: View {
         }
         .navigationTitle(screen.title)
         .navigationBarTitleDisplayMode(.inline)
-        .accessibilityIdentifier("fixture.ready.\(scenario.id.rawValue)")
     }
 
     @ViewBuilder
@@ -317,7 +321,6 @@ struct FixtureConversationScreen: View {
                 streamingText: screen.streamingText,
                 outboxSession: nil)
                 .frame(minHeight: 320)
-                .accessibilityIdentifier("fixture.transcript")
         }
     }
 

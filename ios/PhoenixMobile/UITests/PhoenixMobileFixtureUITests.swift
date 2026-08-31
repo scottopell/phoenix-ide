@@ -68,7 +68,7 @@ final class PhoenixMobileFixtureUITests: XCTestCase {
     }
 
     private func scrollTranscript(to target: XCUIElement) -> Bool {
-        let transcript = element("fixture.transcript")
+        let transcript = app.scrollViews.firstMatch
         guard transcript.waitForExistence(timeout: 5) else { return false }
         transcript.swipeDown()
         for _ in 0..<8 {
