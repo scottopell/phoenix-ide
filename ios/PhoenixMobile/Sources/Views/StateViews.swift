@@ -95,7 +95,7 @@ struct StateDetailView: View {
     var body: some View {
         StateDetailBody(
             state: session.typedState,
-            presentationMode: session.presentationMode,
+            presentationMode: session.presentationMode ?? "idle",
             agentWorking: session.agentWorking,
             isOnline: model.connectivity.isOnline,
             acceptsActions: session.acceptsConversationActions,
