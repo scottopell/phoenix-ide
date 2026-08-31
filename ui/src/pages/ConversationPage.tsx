@@ -194,7 +194,6 @@ interface EmbeddedConversationHostProps {
   suppressCanonicalization?: boolean;
   ordinaryComposerEnabled?: boolean;
   suppressMessageViewerOwner?: boolean;
-  suppressTaskApprovalOwner?: boolean;
   onProjectionChange?: (projection: EmbeddedConversationProjection | null) => void;
   onCloseCompleted?: () => void;
 }
@@ -221,7 +220,6 @@ export function EmbeddedConversationPage({
   onProjectionChange,
   suppressMessageViewerOwner = false,
   onCloseCompleted,
-  suppressTaskApprovalOwner = false,
 }: EmbeddedConversationPageProps) {
   const navigate = useNavigate();
   const location = useLocation();
@@ -254,7 +252,6 @@ export function EmbeddedConversationPage({
         ordinaryComposerEnabled={ordinaryComposerEnabled}
         suppressCanonicalization={suppressCanonicalization}
         suppressMessageViewerOwner={suppressMessageViewerOwner}
-        suppressTaskApprovalOwner={suppressTaskApprovalOwner}
         {...(onProjectionChange ? { onProjectionChange } : {})}
         {...(onCloseCompleted ? { onCloseCompleted } : {})}
       />

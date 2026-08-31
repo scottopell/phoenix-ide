@@ -674,7 +674,9 @@ describe('ProductConversationPage', () => {
     expect(screen.getByTestId('aggregate-task-approval-title')).toHaveTextContent('Plan');
     expect(screen.getByTestId('aggregate-task-approval-copy')).toHaveTextContent('Continue here|Start in new conversation');
     expect(embeddedConversationPageSpy).toHaveBeenLastCalledWith(expect.objectContaining({
-      suppressTaskApprovalOwner: true,
+      suppressCanonicalization: true,
+      suppressMessageViewerOwner: true,
+      showTranscript: false,
     }));
   });
 
