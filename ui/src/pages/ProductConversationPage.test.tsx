@@ -90,7 +90,10 @@ vi.mock('../components/Skeleton', () => ({
 
 vi.mock('../components/TaskApprovalReader', () => ({
   TaskApprovalReader: (props: Record<string, unknown>) => (
-    <button onClick={() => (props['onApprove'] as ((handoff: string) => void))('continue')}>approve task</button>
+    <div data-testid="aggregate-task-approval-owner">
+      <div data-testid="aggregate-task-approval-title">{String(props['title'])}</div>
+      <button onClick={() => (props['onApprove'] as ((handoff: string) => void))('continue')}>approve task</button>
+    </div>
   ),
 }));
 
@@ -655,6 +658,22 @@ describe('ProductConversationPage', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'approve task' }));
 
     expect(await screen.findByTestId('first-task-welcome')).toBeInTheDocument();
+  });
+
+  it('keeps task approval ownership on the aggregate route while suppressing the embedded transcript owner', async () => {
+    renderPage();
+    await waitForPageReady();
+
+    emitLatestProjection({
+      convState: { type: 'awaiting_task_approval', title: 'Plan', priority: 'p1', plan: 'Do it' },
+      modelContextWindow: 200_000,
+    });
+
+    expect(await screen.findByTestId('aggregate-task-approval-owner')).toBeInTheDocument();
+    expect(screen.getByTestId('aggregate-task-approval-title')).toHaveTextContent('Plan');
+    expect(embeddedConversationPageSpy).toHaveBeenLastCalledWith(expect.objectContaining({
+      suppressTaskApprovalOwner: true,
+    }));
   });
 
   it('keeps latest open row mounted even when writable transcript is null', async () => {

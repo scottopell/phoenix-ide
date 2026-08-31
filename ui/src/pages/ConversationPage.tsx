@@ -570,10 +570,6 @@ function ConversationPageContent({
   const actualModelContextWindow = matchingModel ? matchingModel.context_window : null;
   const modelContextWindow = actualModelContextWindow ?? 200_000;
 
-  // Task approval overlay
-  const [showTaskApproval, setShowTaskApproval] = useState(false);
-  const [approvalContextWindowUsed, setApprovalContextWindowUsed] = useState<number | null>(null);
-  const taskApprovalError = atom.uiError?.type === 'BackendError' ? atom.uiError.message : null;
   const [showFirstTaskWelcome, setShowFirstTaskWelcome] = useState(false);
 
   // ---------------------------------------------------------------------------
@@ -611,8 +607,6 @@ function ConversationPageContent({
     setTerminalStatus({ activity: 'disconnected', unreadLines: 0, cwd: '' });
     setImages([]);
     setFiles([]);
-    setShowTaskApproval(false);
-    setApprovalContextWindowUsed(null);
     setShowFirstTaskWelcome(false);
     setFocusToken(0);
     // Ref resets — immediate, no re-render.
@@ -1159,37 +1153,6 @@ function ConversationPageContent({
     requestComposerFocus();
     clearSeedDraft(conversationId);
   }, [conversationId, setDraftIfEmptyCb, requestComposerFocus]);
-
-  // Auto-open/close task approval overlay on state transitions
-  useEffect(() => {
-    if (atom.phase.type === 'awaiting_task_approval' && !isArchived) {
-      setShowTaskApproval(true);
-    } else {
-      setShowTaskApproval(false);
-      setApprovalContextWindowUsed(null);
-    }
-  }, [atom.phase.type, isArchived]);
-
-  useEffect(() => {
-    if (!showTaskApproval || atom.phase.type !== 'awaiting_task_approval' || !conversationId) {
-      setApprovalContextWindowUsed(null);
-      return;
-    }
-
-    let cancelled = false;
-    setApprovalContextWindowUsed(null);
-    api.getConversation(conversationId)
-      .then((result) => {
-        if (!cancelled) setApprovalContextWindowUsed(result.context_window_size);
-      })
-      .catch(() => {
-        if (!cancelled) setApprovalContextWindowUsed(null);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [showTaskApproval, atom.phase.type, conversationId, atom.contextWindow.used]);
 
   // Ctrl+` toggles the terminal collapse state. Only blocked when focus is
   // inside the xterm itself — in every other input (chat textarea, etc.)
@@ -2621,23 +2584,6 @@ function ConversationPageContent({
             </Suspense>
           </div>
         </div>
-      )}
-
-      {/* Task approval overlay — browser back navigates away; SSE restores state on return. */}
-      {!suppressTaskApprovalOwner && showTaskApproval && !isArchived && atom.phase.type === 'awaiting_task_approval' && (
-        <Suspense fallback={null}>
-          <TaskApprovalReader
-            title={atom.phase.title}
-            priority={atom.phase.priority}
-            plan={atom.phase.plan}
-            contextWindowUsed={approvalContextWindowUsed ?? undefined}
-            modelContextWindow={actualModelContextWindow ?? undefined}
-            approvalError={taskApprovalError}
-            onApprove={handleApproveTask}
-            onReject={handleRejectTask}
-            onSendFeedback={handleTaskFeedback}
-          />
-        </Suspense>
       )}
 
       <Toast messages={toasts} onDismiss={dismissToast} />
