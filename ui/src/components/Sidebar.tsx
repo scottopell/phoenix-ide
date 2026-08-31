@@ -236,7 +236,7 @@ export function Sidebar({
       onConversationCreated();
     } catch (err) {
       notifyArchiveCloseConflict(conv.id, err);
-      console.error('Failed to archive:', err);
+      console.error('Failed to close conversation:', err);
     }
   }, [onConversationCreated]);
 

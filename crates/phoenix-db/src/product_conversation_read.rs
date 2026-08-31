@@ -35,7 +35,6 @@ pub struct ProductConversationListProjection {
     pub latest_transcript_row_id: String,
     pub latest_state: crate::ConvState,
     pub latest_continued_in_conv_id: Option<String>,
-    pub latest_archived: bool,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -316,7 +315,7 @@ impl Database {
                     root.id AS root_transcript_row_id, root.slug AS root_slug, root.title AS root_title,
                     latest.id AS latest_transcript_row_id, latest.state AS latest_state,
                     latest.continued_in_conv_id AS latest_continued_in_conv_id,
-                    latest.archived AS latest_archived, activity.updated_at
+                    activity.updated_at
              FROM product_conversations product
              JOIN ranked root_ranked ON root_ranked.product_conversation_id = product.id AND root_ranked.root_rank = 1
              JOIN ranked latest_ranked ON latest_ranked.product_conversation_id = product.id AND latest_ranked.latest_rank = 1
@@ -334,11 +333,11 @@ impl Database {
                     .try_get::<String, _>("product_conversation_id")?
                     .parse::<ProductConversationId>()
                     .map_err(|error| DbError::Serialization(error.to_string()))?;
-                let lifecycle = if row.try_get("latest_archived")? {
-                    OrdinaryProductConversationLifecycle::History
-                } else {
-                    OrdinaryProductConversationLifecycle::Open
-                };
+                let lifecycle = row.try_get::<String, _>("ordinary_lifecycle")?;
+                let lifecycle = OrdinaryProductConversationLifecycle::from_db_str(&lifecycle)
+                    .ok_or_else(|| {
+                        DbError::Serialization(format!("unknown ordinary lifecycle: {lifecycle}"))
+                    })?;
                 let latest_state = serde_json::from_str(&row.try_get::<String, _>("latest_state")?)
                     .map_err(|error| DbError::Serialization(error.to_string()))?;
                 Ok(ProductConversationListProjection {
@@ -350,7 +349,6 @@ impl Database {
                     latest_transcript_row_id: row.try_get("latest_transcript_row_id")?,
                     latest_state,
                     latest_continued_in_conv_id: row.try_get("latest_continued_in_conv_id")?,
-                    latest_archived: row.try_get("latest_archived")?,
                     updated_at: row
                         .try_get::<String, _>("updated_at")?
                         .parse::<DateTime<Utc>>()
@@ -1191,6 +1189,59 @@ mod tests {
         assert_eq!(
             snapshot.aggregate.product_conversation.id(),
             &exact_id.product_conversation_id
+        );
+    }
+
+    #[tokio::test]
+    async fn list_lifecycle_uses_aggregate_authority_despite_legacy_archived_bit() {
+        let db = Database::open_in_memory().await.unwrap();
+        let conversation = db
+            .create_conversation("lifecycle", "lifecycle", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        db.archive_conversation(&conversation.id).await.unwrap();
+        let projections = db
+            .list_ordinary_product_conversation_projections()
+            .await
+            .unwrap();
+        let projection = projections
+            .iter()
+            .find(|projection| {
+                projection.product_conversation_id == conversation.product_conversation_id
+            })
+            .unwrap();
+        assert_eq!(
+            projection.lifecycle,
+            OrdinaryProductConversationLifecycle::Open
+        );
+
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1",
+        )
+        .bind(conversation.product_conversation_id.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query("UPDATE conversations SET archived = 0 WHERE id = ?1")
+            .bind(&conversation.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let projections = db
+            .list_ordinary_product_conversation_projections()
+            .await
+            .unwrap();
+        let projection = projections
+            .iter()
+            .find(|projection| {
+                projection.product_conversation_id == conversation.product_conversation_id
+            })
+            .unwrap();
+        assert_eq!(
+            projection.lifecycle,
+            OrdinaryProductConversationLifecycle::History
         );
     }
 

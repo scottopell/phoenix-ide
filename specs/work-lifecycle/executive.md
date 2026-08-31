@@ -6,7 +6,7 @@ The work lifecycle spec now describes the intended user-facing **Close conversat
 
 ## Current Reality
 
-That unified lifecycle is not yet the shipped product behavior. Phoenix still exposes legacy terminal actions instead of Close: `POST /api/conversations/:id/abandon-task` and `POST /api/conversations/:id/mark-merged` are live, and both continue to gate on the current conversation row plus `continued_in_conv_id` compatibility checks in `crates/phoenix-ide/src/api/lifecycle_handlers.rs`. Archive is still a separate ordinary API action (`POST /api/conversations/:id/archive`) backed by `archived` row state rather than the future Open/History aggregate transition. Existing row-level WorkScope fields remain attachment authority; the dormant ProductConversation projection is read-only, with no parallel writable normalized attachment relation. Legacy cleanup logic still captures abandon diff state and still distinguishes branch-disposition by legacy mode/worktree semantics. Exact-attempt adoption of immutable restart-repair evidence is normative only; the shipped implementation has not yet cut over to that fail-closed repair path.
+Durable Close retirement and ProductConversation History finalization are shipped, while the dedicated Close-start replacement and legacy-edge removal remain incomplete. A successful exact attempt retires the attached WorkScope resources, records one durable outcome message, transitions the ordinary aggregate to History in the completion transaction, and publishes compatibility updates only after commit. Primary ProductConversation surfaces expose Close and read-only History rather than Archive, but `POST /api/conversations/:id/archive`, `/abandon-task`, `/mark-merged`, and `continued_in_conv_id` compatibility checks remain live internally or on legacy surfaces. Existing row-level WorkScope fields remain attachment authority, with no parallel writable normalized attachment relation. Phoenix continues using the current Project-backed repository model; replacement is deferred until a named feature requires it. Exact-attempt adoption of immutable restart-repair evidence remains incomplete.
 
 ## Requirements Summary
 
@@ -27,10 +27,10 @@ Current normative authority is `requirements.md`, `work-lifecycle.allium`, `spec
 
 | Requirement | Status | Surface |
 |-------------|--------|---------|
-| REQ-WL-001 | Not implemented | Shipped UX still uses legacy abandon / mark-merged endpoints instead of one Close action |
+| REQ-WL-001 | Partially implemented | Primary ProductConversation surfaces expose Close, but legacy abandon / mark-merged endpoints and dedicated Close-start replacement remain incomplete |
 | REQ-WL-002 | Partially implemented | Legacy flows already inspect/capture worktree state for cleanup paths, but the exact Close loss-inventory contract is not the shipped user flow |
 | REQ-WL-002a | Not implemented | No shipped fingerprint-bound discard confirmation for the unified Close obligation |
-| REQ-WL-002b | Partially implemented | Cleanup of worktree-owned resources exists, but it is still entered through legacy archive / abandon / mark-merged / hard-delete paths rather than a single durable Close obligation |
+| REQ-WL-002b | Partially implemented | Durable Close retirement idempotently retires attached WorkScope resources and completes with one outcome plus aggregate History; legacy entry and cleanup edges remain |
 | REQ-PROJ-028a | Not implemented | Missing/inaccessible registered worktrees are not yet preserved as immutable restart-repair evidence that later Close attempts can adopt fail-closed by exact identity |
 | REQ-WL-003 | Partially implemented | Observed PR state already guides current cleanup affordances, but it still participates in legacy mark-merged UX rather than purely advisory Close guidance |
 
@@ -40,7 +40,7 @@ The following legacy surfaces are still current reality and must remain called o
 
 - `/abandon-task` — shipped destructive terminal flow with diff capture and mode-dependent cleanup
 - `/mark-merged` — shipped cleanup flow keyed to current branch/PR completion UX
-- `/archive` — shipped archived/non-archived lifecycle split, separate from Close
+- `/archive` — shipped compatibility entry used internally by the current Close journey and still reachable from legacy surfaces; aggregate lifecycle authority is Open/History
 - continuation gating via `continued_in_conv_id` — shipped protection against closing/cleaning up predecessors after handoff
 
 ## Validation Notes

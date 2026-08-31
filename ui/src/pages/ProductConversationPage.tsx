@@ -332,7 +332,7 @@ function SourceMeta({ snapshot }: { snapshot: ProductConversationSnapshotView })
       </div>
       <div className="product-conversation-meta__row">
         <span className="product-conversation-meta__label">Lifecycle</span>
-        <span>{snapshot.ordinary_lifecycle}</span>
+        <span>{snapshot.ordinary_lifecycle === 'history' ? 'History' : 'Open'}</span>
       </div>
       <div className="product-conversation-meta__row">
         <span className="product-conversation-meta__label">Canonical root</span>

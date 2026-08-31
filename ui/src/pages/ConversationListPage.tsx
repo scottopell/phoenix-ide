@@ -263,7 +263,7 @@ export function ConversationListPage() {
       }
     } catch (err) {
       notifyArchiveCloseConflict(conv.id, err);
-      console.error('Failed to archive:', err);
+      console.error('Failed to close conversation:', err);
     }
   };
 

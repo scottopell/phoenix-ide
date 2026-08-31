@@ -775,6 +775,8 @@ describe('ProductConversationPage', () => {
     expect(screen.getByTestId('chain-qa-column')).toBeInTheDocument();
     expect(screen.queryByTestId('embedded-conversation-page')).not.toBeInTheDocument();
     expect(screen.getByText('History is read-only.')).toBeInTheDocument();
+    expect(screen.getAllByText('History').length).toBeGreaterThan(0);
+    expect(screen.queryByText('history')).not.toBeInTheDocument();
   });
 
   it('keeps aggregate transcript viewer actions reachable while the aggregate route owns placement', async () => {
