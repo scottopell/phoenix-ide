@@ -123,6 +123,7 @@ pub trait MessageStore: Send + Sync {
     /// `message_id` is the canonical identifier for this message. For user messages,
     /// this is client-generated (enabling idempotent retries). For agent/tool messages,
     /// this is server-generated.
+    #[allow(dead_code)]
     async fn add_message(
         &self,
         message_id: &str,

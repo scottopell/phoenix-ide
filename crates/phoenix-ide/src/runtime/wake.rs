@@ -433,27 +433,41 @@ async fn execute_continuation_transfer(
     repo: &WakeRepository,
     preparation: phoenix_db::workflow::wake::WakeTransferPreparation,
 ) -> phoenix_db::DbResult<phoenix_db::workflow::wake::WakeTransferOutcome> {
-    let (reservation, reserved_destination_sequence_ids) =
-        if preparation.materialized_message_count == 0 {
-            (None, Vec::new())
-        } else {
-            let destination = manager
+    let authority = if preparation.materialized_message_count == 0 {
+        None
+    } else {
+        Some(
+            manager
                 .conversation_broadcaster(&preparation.to_conversation_id)
-                .await;
-            let (reservation, sequences) = destination
-                .persisted_message_reservation_authority()
                 .await
-                .reserve_range_after(
-                    preparation.materialized_message_count,
-                    preparation.destination_sequence_floor,
-                )
-                .map_err(|error| {
-                    phoenix_db::DbError::Serialization(format!(
+                .persisted_message_reservation_authority()
+                .await,
+        )
+    };
+    execute_continuation_transfer_with_authority(manager, repo, preparation, authority).await
+}
+
+async fn execute_continuation_transfer_with_authority(
+    manager: &Arc<RuntimeManager>,
+    repo: &WakeRepository,
+    preparation: phoenix_db::workflow::wake::WakeTransferPreparation,
+    authority: Option<crate::runtime::PersistedMessageReservationAuthority>,
+) -> phoenix_db::DbResult<phoenix_db::workflow::wake::WakeTransferOutcome> {
+    let (reservation, reserved_destination_sequence_ids) = if let Some(authority) = authority {
+        let (reservation, sequences) = authority
+            .reserve_range_after(
+                preparation.materialized_message_count,
+                preparation.destination_sequence_floor,
+            )
+            .map_err(|error| {
+                phoenix_db::DbError::Serialization(format!(
                     "wake continuation transfer could not reserve destination sequences: {error}"
                 ))
-                })?;
-            (Some(reservation), sequences)
-        };
+            })?;
+        (Some(reservation), sequences)
+    } else {
+        (None, Vec::new())
+    };
     let transfer = phoenix_db::workflow::wake::WakeTransferInput {
         workflow_id: preparation.workflow_id,
         from_conversation_id: preparation.from_conversation_id,
@@ -464,9 +478,37 @@ async fn execute_continuation_transfer(
         transition_id: preparation.transition_id,
         timestamp: preparation.timestamp,
     };
-    let outcome = repo.transfer_workflow_for_continuation(&transfer).await;
+    let outcome = repo.transfer_workflow_for_continuation(&transfer).await?;
+    if outcome == phoenix_db::workflow::wake::WakeTransferOutcome::Transferred
+        && !transfer.reserved_destination_sequence_ids.is_empty()
+    {
+        let destination = manager
+            .conversation_broadcaster(&transfer.to_conversation_id)
+            .await;
+        let mut moved_messages = Vec::new();
+        for delivery_id in &transfer.exact_pending_delivery_ids {
+            if let Some(link) = repo
+                .get_delivery_message_link(transfer.workflow_id, *delivery_id)
+                .await?
+                .filter(|link| link.conversation_id == transfer.to_conversation_id)
+            {
+                moved_messages.push(link.linked_message.message);
+            }
+        }
+        moved_messages.sort_by_key(|message| message.sequence_id);
+        let mut publication_authority = manager.acquire_local_authority_pass().map_err(|()| {
+            phoenix_db::DbError::Serialization(
+                "wake continuation transfer lost destination publication authority".to_string(),
+            )
+        })?;
+        for message in moved_messages {
+            let _ = destination
+                .admitted_publication(&mut publication_authority)
+                .persisted_message(message);
+        }
+    }
     drop(reservation);
-    outcome
+    Ok(outcome)
 }
 
 async fn transfer_workflow_for_continuation(
@@ -1795,15 +1837,11 @@ mod tests {
         assert_eq!(preparation.materialized_message_count, 1);
         assert_eq!(destination.broadcast_tx.current_seq(), 0);
 
-        let (reservation, reserved_destination_sequence_ids) = destination
+        let mut destination_events = destination.broadcast_tx.subscribe();
+        let authority = destination
             .broadcast_tx
             .persisted_message_reservation_authority()
-            .await
-            .reserve_range_after(
-                preparation.materialized_message_count,
-                preparation.destination_sequence_floor,
-            )
-            .unwrap();
+            .await;
         let competing = {
             let broadcaster = destination.broadcast_tx.clone();
             tokio::spawn(async move {
@@ -1816,23 +1854,14 @@ mod tests {
         };
         tokio::task::yield_now().await;
         assert!(!competing.is_finished());
-        let transfer = phoenix_db::workflow::wake::WakeTransferInput {
-            workflow_id: preparation.workflow_id,
-            from_conversation_id: preparation.from_conversation_id,
-            to_conversation_id: preparation.to_conversation_id,
-            expected_version: preparation.expected_version,
-            exact_pending_delivery_ids: preparation.exact_pending_delivery_ids,
-            reserved_destination_sequence_ids,
-            transition_id: preparation.transition_id,
-            timestamp: preparation.timestamp,
-        };
-        assert_eq!(
-            repo.transfer_workflow_for_continuation(&transfer)
-                .await
-                .unwrap(),
-            phoenix_db::workflow::wake::WakeTransferOutcome::Transferred
-        );
-        drop(reservation);
+        execute_continuation_transfer_with_authority(&manager, &repo, preparation, Some(authority))
+            .await
+            .unwrap();
+        assert!(matches!(
+            destination_events.recv().await.unwrap(),
+            crate::runtime::SseEvent::Message { ref message, .. }
+                if message.conversation_id == "conv-2" && message.sequence_id == 1
+        ));
         let (competing_reservation, competing_sequences) =
             competing.await.expect("competing checkpoint progresses");
         assert_eq!(competing_sequences, vec![2]);

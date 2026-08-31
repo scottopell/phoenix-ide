@@ -6677,13 +6677,38 @@ where
                          actually complete."
                     };
                     let content = MessageContent::User(crate::db::UserContent::meta(grace_prompt));
-                    if let Err(e) = self
+                    let (reservation, sequences) = self
+                        .broadcast_tx
+                        .persisted_message_reservation_authority()
+                        .await
+                        .reserve_next_range(1)
+                        .expect("grace turn reserves one persisted-message sequence");
+                    let sequence_id = sequences[0];
+                    if let Err(error) = self
                         .storage
-                        .add_message(&msg_id, &self.context.conversation_id, &content, None, None)
+                        .add_message_with_seq(
+                            &msg_id,
+                            &self.context.conversation_id,
+                            sequence_id,
+                            &content,
+                            None,
+                            None,
+                        )
                         .await
                     {
-                        tracing::warn!(error = %e, "Failed to persist grace turn message");
+                        let _ = self.broadcast_tx.send_reserved_seq(sequence_id, |seq| {
+                            SseEvent::Error {
+                                sequence_id: seq,
+                                error:
+                                    crate::runtime::user_facing_error::UserFacingError::with_action(
+                                        "persist the grace-turn guidance",
+                                    ),
+                            }
+                        });
+                        drop(reservation);
+                        return Err(error);
                     }
+                    drop(reservation);
 
                     // Allow the normal LLM request to proceed (don't return, don't
                     // send UserCancel). The persisted meta message is included by
