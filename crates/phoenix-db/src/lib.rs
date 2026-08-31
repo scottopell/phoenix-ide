@@ -13635,6 +13635,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![2, 3]
         );
+        let report = db
+            .sqlite_workload_collector
+            .aggregate_fresh_collector_for_test();
+        let recovery = SqliteReadFamily::RecoveryRangeHistory.index();
+        let bounded = SqliteReadFamily::LatestBoundedHistory.index();
+        assert_eq!(
+            report.read_family_outcomes[recovery][SqliteReadFamilyOutcome::Success.index()],
+            1
+        );
+        assert_eq!(report.read_family_outcomes[bounded].iter().sum::<u64>(), 0);
     }
 
     #[tokio::test]
