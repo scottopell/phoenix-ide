@@ -89,7 +89,7 @@ import {
 
 // Conditional overlays / heavy panels — code-split so the default render path
 // (chat view with no overlay open) doesn't pay their bundle cost.
-// - FileViewer + MetaViewer bodies, TaskApprovalReader: pull in react-syntax-highlighter
+// - FileViewer + MetaViewer bodies: pull in react-syntax-highlighter
 // - TerminalPanel: pulls in xterm + addon (large)
 // - CredentialHelperPanel, FirstTaskWelcome: rarely mounted
 const FileViewer = lazy(() =>
@@ -97,9 +97,6 @@ const FileViewer = lazy(() =>
 );
 const ConversationDiffViewer = lazy(() =>
   import('../components/viewer/ConversationDiffViewer').then((m) => ({ default: m.ConversationDiffViewer })),
-);
-const TaskApprovalReader = lazy(() =>
-  import('../components/TaskApprovalReader').then((m) => ({ default: m.TaskApprovalReader })),
 );
 const FirstTaskWelcome = lazy(() =>
   import('../components/FirstTaskWelcome').then((m) => ({ default: m.FirstTaskWelcome })),
@@ -291,7 +288,6 @@ function ConversationPageContent({
   onProjectionChange,
   suppressMessageViewerOwner,
   onCloseCompleted,
-  suppressTaskApprovalOwner,
 }: {
   slug: string;
   routePrefix: '/c' | '/global';
@@ -302,7 +298,6 @@ function ConversationPageContent({
   onProjectionChange?: (projection: EmbeddedConversationProjection | null) => void;
   suppressMessageViewerOwner: boolean;
   onCloseCompleted?: () => void;
-  suppressTaskApprovalOwner: boolean;
 }) {
   const { setConversationReadiness } = useConversationReadiness();
   const navigate = useNavigate();
@@ -1522,37 +1517,6 @@ function ConversationPageContent({
     },
     [conversation, availableModels, defaultModel, navigate, createConversationWithStore],
   );
-
-  const handleApproveTask = async (handoff: 'continue_in_current_conversation' | 'start_fresh_work_conversation') => {
-    if (!conversationId || isArchived) return;
-    dispatch({ type: 'clear_error' });
-    try {
-      const result = await api.approveTask(conversationId, handoff);
-      if (result.first_task) {
-        setShowFirstTaskWelcome(true);
-      }
-    } catch (err) {
-      console.error('Failed to approve task:', err);
-    }
-  };
-
-  const handleRejectTask = async () => {
-    if (!conversationId || isArchived) return;
-    try {
-      await api.rejectTask(conversationId);
-    } catch (err) {
-      console.error('Failed to reject task:', err);
-    }
-  };
-
-  const handleTaskFeedback = async (annotations: string) => {
-    if (!conversationId || isArchived) return;
-    try {
-      await api.sendTaskFeedback(conversationId, annotations);
-    } catch (err) {
-      console.error('Failed to send task feedback:', err);
-    }
-  };
 
   // File browser opened from sidebar on desktop; mobile overlay triggered elsewhere
 

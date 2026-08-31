@@ -92,6 +92,7 @@ vi.mock('../components/TaskApprovalReader', () => ({
   TaskApprovalReader: (props: Record<string, unknown>) => (
     <div data-testid="aggregate-task-approval-owner">
       <div data-testid="aggregate-task-approval-title">{String(props['title'])}</div>
+      <div data-testid="aggregate-task-approval-copy">Continue here|Start in new conversation</div>
       <button onClick={() => (props['onApprove'] as ((handoff: string) => void))('continue')}>approve task</button>
     </div>
   ),
@@ -671,6 +672,7 @@ describe('ProductConversationPage', () => {
 
     expect(await screen.findByTestId('aggregate-task-approval-owner')).toBeInTheDocument();
     expect(screen.getByTestId('aggregate-task-approval-title')).toHaveTextContent('Plan');
+    expect(screen.getByTestId('aggregate-task-approval-copy')).toHaveTextContent('Continue here|Start in new conversation');
     expect(embeddedConversationPageSpy).toHaveBeenLastCalledWith(expect.objectContaining({
       suppressTaskApprovalOwner: true,
     }));
