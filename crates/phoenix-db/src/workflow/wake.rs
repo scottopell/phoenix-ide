@@ -431,12 +431,26 @@ pub enum WakeAdoptMaterializedPendingOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeTransferPreparation {
+    pub workflow_id: WorkflowId,
+    pub from_conversation_id: String,
+    pub to_conversation_id: String,
+    pub expected_version: Version,
+    pub exact_pending_delivery_ids: Vec<DeliveryId>,
+    pub destination_sequence_floor: i64,
+    pub materialized_message_count: usize,
+    pub transition_id: TransitionId,
+    pub timestamp: Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WakeTransferInput {
     pub workflow_id: WorkflowId,
     pub from_conversation_id: String,
     pub to_conversation_id: String,
     pub expected_version: Version,
     pub exact_pending_delivery_ids: Vec<DeliveryId>,
+    pub reserved_destination_sequence_ids: Vec<i64>,
     pub transition_id: TransitionId,
     pub timestamp: Timestamp,
 }
@@ -447,6 +461,7 @@ pub enum WakeTransferOutcome {
     VersionConflict,
     OwnerMismatch,
     SetMismatch,
+    ReservedSequenceMismatch,
 }
 
 #[derive(Debug, Clone)]
@@ -2521,7 +2536,7 @@ impl WakeRepository {
         Ok(out)
     }
 
-    async fn list_workflows_owed_to_conversation(
+    pub async fn list_workflows_owed_to_conversation(
         &self,
         conversation_id: &str,
     ) -> DbResult<Vec<WorkflowId>> {
@@ -2596,39 +2611,66 @@ impl WakeRepository {
         Ok(units)
     }
 
-    pub async fn transfer_workflow_for_continuation(
+    pub async fn prepare_continuation_transfer(
         &self,
         from_conversation_id: &str,
         to_conversation_id: &str,
         workflow_id: WorkflowId,
         timestamp: Timestamp,
-    ) -> DbResult<()> {
-        for _ in 0..20 {
-            let mut tx = self.workflow_repo.begin_tx().await?;
-            let Some(head) = tx.fetch_workflow_head(workflow_id).await? else {
-                tx.rollback().await?;
-                break;
-            };
-            let pending_delivery_ids =
-                fetch_pending_terminal_delivery_ids_tx(&mut tx, workflow_id).await?;
+    ) -> DbResult<Option<WakeTransferPreparation>> {
+        let mut tx = self.workflow_repo.begin_tx().await?;
+        let Some(head) = tx.fetch_workflow_head(workflow_id).await? else {
             tx.rollback().await?;
-            let input = WakeTransferInput {
-                workflow_id,
-                from_conversation_id: from_conversation_id.to_string(),
-                to_conversation_id: to_conversation_id.to_string(),
-                expected_version: head.version,
-                exact_pending_delivery_ids: pending_delivery_ids,
-                transition_id: TransitionId(head.version.next().0),
-                timestamp,
-            };
-            match self.transfer(&input).await? {
-                WakeTransferOutcome::Transferred | WakeTransferOutcome::OwnerMismatch => break,
-                WakeTransferOutcome::VersionConflict | WakeTransferOutcome::SetMismatch => {}
-            }
-        }
-        Ok(())
+            return Ok(None);
+        };
+        let pending_delivery_ids =
+            fetch_pending_terminal_delivery_ids_tx(&mut tx, workflow_id).await?;
+        let materialized_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)
+             FROM wake_delivery_messages l
+             JOIN messages m ON m.message_id = l.message_id
+             JOIN workflow_deliveries d
+               ON d.workflow_id = l.workflow_id AND d.delivery_id = l.delivery_id
+             WHERE l.workflow_id = ?1
+               AND l.conversation_id = ?2
+               AND m.conversation_id = ?2
+               AND d.status = 'Pending'",
+        )
+        .bind(to_i64(workflow_id.0, "workflow_id")?)
+        .bind(from_conversation_id)
+        .fetch_one(&mut *tx.tx)
+        .await?;
+        let destination_max = sqlx::query_scalar::<_, i64>(
+            "SELECT COALESCE(MAX(sequence_id), 0) FROM messages WHERE conversation_id = ?1",
+        )
+        .bind(to_conversation_id)
+        .fetch_one(&mut *tx.tx)
+        .await?;
+        tx.commit().await?;
+        let materialized_count = usize::try_from(materialized_count).map_err(|_| {
+            DbError::Serialization("wake transfer materialized count overflow".to_string())
+        })?;
+        Ok(Some(WakeTransferPreparation {
+            workflow_id,
+            from_conversation_id: from_conversation_id.to_string(),
+            to_conversation_id: to_conversation_id.to_string(),
+            expected_version: head.version,
+            exact_pending_delivery_ids: pending_delivery_ids,
+            destination_sequence_floor: destination_max,
+            materialized_message_count: materialized_count,
+            transition_id: TransitionId(head.version.next().0),
+            timestamp,
+        }))
     }
 
+    pub async fn transfer_workflow_for_continuation(
+        &self,
+        input: &WakeTransferInput,
+    ) -> DbResult<WakeTransferOutcome> {
+        self.transfer(input).await
+    }
+
+    #[cfg(test)]
     pub async fn reconcile_continuation_transfers(&self, timestamp: Timestamp) -> DbResult<usize> {
         let mut repaired = 0;
         for predecessor in self.list_continuation_transfer_predecessors().await? {
@@ -2642,6 +2684,7 @@ impl WakeRepository {
         Ok(repaired)
     }
 
+    #[cfg(test)]
     pub async fn recover_continuation_transfer(
         &self,
         from_conversation_id: &str,
@@ -2674,6 +2717,7 @@ impl WakeRepository {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub async fn transfer_active_for_continuation(
         &self,
         from_conversation_id: &str,
@@ -2684,13 +2728,43 @@ impl WakeRepository {
             .list_workflows_owed_to_conversation(from_conversation_id)
             .await?;
         for workflow_id in owed {
-            self.transfer_workflow_for_continuation(
-                from_conversation_id,
-                to_conversation_id,
-                workflow_id,
-                timestamp,
-            )
-            .await?;
+            let Some(preparation) = self
+                .prepare_continuation_transfer(
+                    from_conversation_id,
+                    to_conversation_id,
+                    workflow_id,
+                    timestamp,
+                )
+                .await?
+            else {
+                continue;
+            };
+            let input = WakeTransferInput {
+                workflow_id: preparation.workflow_id,
+                from_conversation_id: preparation.from_conversation_id,
+                to_conversation_id: preparation.to_conversation_id,
+                expected_version: preparation.expected_version,
+                exact_pending_delivery_ids: preparation.exact_pending_delivery_ids,
+                reserved_destination_sequence_ids: (1..=preparation.materialized_message_count)
+                    .map(|offset| {
+                        preparation.destination_sequence_floor
+                            + i64::try_from(offset).expect("materialized count fits in i64")
+                    })
+                    .collect(),
+                transition_id: preparation.transition_id,
+                timestamp: preparation.timestamp,
+            };
+            match self.transfer_workflow_for_continuation(&input).await? {
+                WakeTransferOutcome::Transferred | WakeTransferOutcome::OwnerMismatch => {}
+                WakeTransferOutcome::VersionConflict
+                | WakeTransferOutcome::SetMismatch
+                | WakeTransferOutcome::ReservedSequenceMismatch => {
+                    return Err(DbError::Serialization(
+                        "wake continuation transfer requires live reserved destination sequences"
+                            .to_string(),
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -2779,38 +2853,83 @@ impl WakeRepository {
         // Destination sequences are allocated above its current watermark in
         // the source transcript's durable order, so overlap cannot violate the
         // destination-local unique/monotonic sequence authority.
-        let moved_messages = sqlx::query(
-            "WITH moving AS (
-                 SELECT m.message_id,
-                        ROW_NUMBER() OVER (
-                            ORDER BY m.sequence_id, m.created_at, m.message_id
-                        ) AS destination_offset
-                 FROM messages m
-                 JOIN wake_delivery_messages l ON l.message_id = m.message_id
-                 JOIN workflow_deliveries d
-                   ON d.workflow_id = l.workflow_id AND d.delivery_id = l.delivery_id
-                 WHERE l.workflow_id = ?1
-                   AND l.conversation_id = ?2
-                   AND m.conversation_id = ?2
-                   AND d.status = 'Pending'
-             ), destination AS (
-                 SELECT COALESCE(MAX(sequence_id), 0) AS prior_max
-                 FROM messages WHERE conversation_id = ?3
-             )
-             UPDATE messages
-             SET conversation_id = ?3,
-                 sequence_id = (SELECT prior_max FROM destination) + (
-                     SELECT destination_offset FROM moving
-                     WHERE moving.message_id = messages.message_id
-                 )
-             WHERE message_id IN (SELECT message_id FROM moving)",
+        let expected_materialized_count = input.reserved_destination_sequence_ids.len();
+        let actual_materialized_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)
+             FROM wake_delivery_messages l
+             JOIN messages m ON m.message_id = l.message_id
+             JOIN workflow_deliveries d
+               ON d.workflow_id = l.workflow_id AND d.delivery_id = l.delivery_id
+             WHERE l.workflow_id = ?1
+               AND l.conversation_id = ?2
+               AND m.conversation_id = ?2
+               AND d.status = 'Pending'",
         )
         .bind(to_i64(input.workflow_id.0, "workflow_id")?)
         .bind(&input.from_conversation_id)
-        .bind(&input.to_conversation_id)
-        .execute(&mut *tx.tx)
-        .await?
-        .rows_affected();
+        .fetch_one(&mut *tx.tx)
+        .await?;
+        if usize::try_from(actual_materialized_count).ok() != Some(expected_materialized_count) {
+            tx.rollback().await?;
+            return Ok(WakeTransferOutcome::ReservedSequenceMismatch);
+        }
+        if expected_materialized_count > 0 {
+            let destination_prior_max = sqlx::query_scalar::<_, i64>(
+                "SELECT COALESCE(MAX(sequence_id), 0) FROM messages WHERE conversation_id = ?1",
+            )
+            .bind(&input.to_conversation_id)
+            .fetch_one(&mut *tx.tx)
+            .await?;
+            let starts_above_durable_floor = input
+                .reserved_destination_sequence_ids
+                .first()
+                .is_some_and(|sequence| *sequence > destination_prior_max);
+            let is_consecutive = input
+                .reserved_destination_sequence_ids
+                .windows(2)
+                .all(|pair| pair[1] == pair[0] + 1);
+            if !starts_above_durable_floor || !is_consecutive {
+                tx.rollback().await?;
+                return Ok(WakeTransferOutcome::ReservedSequenceMismatch);
+            }
+        }
+
+        let moved_messages = if let Some(first_reserved_sequence) =
+            input.reserved_destination_sequence_ids.first().copied()
+        {
+            sqlx::query(
+                "WITH moving AS (
+                     SELECT m.message_id,
+                            ROW_NUMBER() OVER (
+                                ORDER BY m.sequence_id, m.created_at, m.message_id
+                            ) AS destination_offset
+                     FROM messages m
+                     JOIN wake_delivery_messages l ON l.message_id = m.message_id
+                     JOIN workflow_deliveries d
+                       ON d.workflow_id = l.workflow_id AND d.delivery_id = l.delivery_id
+                     WHERE l.workflow_id = ?1
+                       AND l.conversation_id = ?2
+                       AND m.conversation_id = ?2
+                       AND d.status = 'Pending'
+                 )
+                 UPDATE messages
+                 SET conversation_id = ?3,
+                     sequence_id = ?4 + (
+                         SELECT moving.destination_offset FROM moving
+                         WHERE moving.message_id = messages.message_id
+                     ) - 1
+                 WHERE message_id IN (SELECT message_id FROM moving)",
+            )
+            .bind(to_i64(input.workflow_id.0, "workflow_id")?)
+            .bind(&input.from_conversation_id)
+            .bind(&input.to_conversation_id)
+            .bind(first_reserved_sequence)
+            .execute(&mut *tx.tx)
+            .await?
+            .rows_affected()
+        } else {
+            0
+        };
 
         for delivery_id in &input.exact_pending_delivery_ids {
             sqlx::query(
@@ -5208,6 +5327,7 @@ mod tests {
             to_conversation_id: to_conversation_id.into(),
             expected_version,
             exact_pending_delivery_ids,
+            reserved_destination_sequence_ids: Vec::new(),
             transition_id,
             timestamp: Timestamp(30),
         }
@@ -7728,7 +7848,8 @@ mod tests {
         match left.unwrap() {
             WakeTransferOutcome::Transferred
             | WakeTransferOutcome::VersionConflict
-            | WakeTransferOutcome::SetMismatch => {}
+            | WakeTransferOutcome::SetMismatch
+            | WakeTransferOutcome::ReservedSequenceMismatch => {}
             other @ WakeTransferOutcome::OwnerMismatch => {
                 panic!("unexpected transfer race outcome: {other:?}")
             }
@@ -7821,7 +7942,8 @@ mod tests {
         match left.unwrap() {
             WakeTransferOutcome::Transferred
             | WakeTransferOutcome::VersionConflict
-            | WakeTransferOutcome::SetMismatch => {}
+            | WakeTransferOutcome::SetMismatch
+            | WakeTransferOutcome::ReservedSequenceMismatch => {}
             other @ WakeTransferOutcome::OwnerMismatch => {
                 panic!("unexpected transfer race outcome: {other:?}")
             }
@@ -9008,6 +9130,7 @@ mod tests {
 
     #[tokio::test]
     async fn transfer_moves_materialized_link_and_message_to_new_owner_pending_delivery() {
+        // exercise live-reserved destination sequence handoff via the exact transfer input
         let (_dir, repo, restarted) = open_repo_pair().await;
         insert_conversation(&repo.workflow_repo.pool, "conv-2").await;
         let workflow_id = WorkflowId(7051);
@@ -9029,17 +9152,17 @@ mod tests {
             }
         };
 
+        let mut transfer = transfer_input(
+            workflow_id,
+            "conv-1",
+            "conv-2",
+            Version(2),
+            vec![DeliveryId(1)],
+            TransitionId(3),
+        );
+        transfer.reserved_destination_sequence_ids = vec![1];
         assert_eq!(
-            repo.transfer(&transfer_input(
-                workflow_id,
-                "conv-1",
-                "conv-2",
-                Version(2),
-                vec![DeliveryId(1)],
-                TransitionId(3),
-            ))
-            .await
-            .unwrap(),
+            repo.transfer(&transfer).await.unwrap(),
             WakeTransferOutcome::Transferred
         );
         assert!(repo.list_pending("conv-1").await.unwrap().is_empty());
@@ -9100,7 +9223,14 @@ mod tests {
         .fetch_one(&repo.workflow_repo.pool)
         .await
         .unwrap();
+        let destination_sequences = sqlx::query_scalar::<_, i64>(
+            "SELECT sequence_id FROM messages WHERE conversation_id = 'conv-2' ORDER BY sequence_id",
+        )
+        .fetch_all(&repo.workflow_repo.pool)
+        .await
+        .unwrap();
         assert_eq!(source_count, 0);
+        assert_eq!(destination_sequences, vec![1]);
         assert!(destination_content.contains("wake complete"));
     }
 

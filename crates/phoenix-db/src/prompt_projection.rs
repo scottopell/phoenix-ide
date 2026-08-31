@@ -31,7 +31,7 @@ impl PromptTranscriptGeneration {
 
 /// Greatest persisted message sequence observed by a prompt projection.
 /// Sequence gaps are legal; only strict increase matters.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PersistedMessageSequence(i64);
 
 impl PersistedMessageSequence {
@@ -55,11 +55,59 @@ impl PersistedMessageSequence {
     }
 }
 
+/// Prompt projection boundary within one transcript generation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PromptProjectionPosition {
+    #[default]
+    Empty,
+    At(PersistedMessageSequence),
+}
+
+impl PromptProjectionPosition {
+    #[must_use]
+    pub const fn lower_bound_for_tail(self) -> Option<i64> {
+        match self {
+            Self::Empty => None,
+            Self::At(sequence) => Some(sequence.value()),
+        }
+    }
+}
+
+/// Tail boundary that cannot be separated from its transcript generation fence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GenerationFencedPromptPosition {
+    generation: PromptTranscriptGeneration,
+    position: PromptProjectionPosition,
+}
+
+impl GenerationFencedPromptPosition {
+    #[must_use]
+    pub const fn new(
+        generation: PromptTranscriptGeneration,
+        position: PromptProjectionPosition,
+    ) -> Self {
+        Self {
+            generation,
+            position,
+        }
+    }
+
+    #[must_use]
+    pub const fn generation(self) -> PromptTranscriptGeneration {
+        self.generation
+    }
+
+    #[must_use]
+    pub const fn position(self) -> PromptProjectionPosition {
+        self.position
+    }
+}
+
 /// Fully hydrated, transactionally consistent durable prompt transcript.
 #[derive(Debug, Clone)]
 pub struct HydratedPromptSnapshot {
     generation: PromptTranscriptGeneration,
-    cursor: PersistedMessageSequence,
+    position: PromptProjectionPosition,
     messages: Vec<Message>,
 }
 
@@ -75,10 +123,10 @@ impl HydratedPromptSnapshot {
         generation: PromptTranscriptGeneration,
         messages: Vec<Message>,
     ) -> DbResult<Self> {
-        let cursor = validate_prompt_rows(conversation_id, None, &messages)?;
+        let position = validate_prompt_rows(conversation_id, None, &messages)?;
         Ok(Self {
             generation,
-            cursor,
+            position,
             messages,
         })
     }
@@ -89,8 +137,13 @@ impl HydratedPromptSnapshot {
     }
 
     #[must_use]
-    pub const fn cursor(&self) -> PersistedMessageSequence {
-        self.cursor
+    pub const fn position(&self) -> PromptProjectionPosition {
+        self.position
+    }
+
+    #[must_use]
+    pub const fn fenced_position(&self) -> GenerationFencedPromptPosition {
+        GenerationFencedPromptPosition::new(self.generation, self.position)
     }
 
     #[must_use]
@@ -103,10 +156,10 @@ impl HydratedPromptSnapshot {
         self,
     ) -> (
         PromptTranscriptGeneration,
-        PersistedMessageSequence,
+        PromptProjectionPosition,
         Vec<Message>,
     ) {
-        (self.generation, self.cursor, self.messages)
+        (self.generation, self.position, self.messages)
     }
 }
 
@@ -118,17 +171,17 @@ pub enum HydratedPromptTail {
 }
 
 /// Validated tail rows. Private fields prevent alternate stores from forging a
-/// contradictory cursor or bypassing conversation/ordering checks.
+/// contradictory position or bypassing conversation/ordering checks.
 #[derive(Debug, Clone)]
 pub struct HydratedPromptTailRows {
-    cursor: PersistedMessageSequence,
+    position: PromptProjectionPosition,
     messages: Vec<Message>,
 }
 
 impl HydratedPromptTailRows {
     #[must_use]
-    pub const fn cursor(&self) -> PersistedMessageSequence {
-        self.cursor
+    pub const fn position(&self) -> PromptProjectionPosition {
+        self.position
     }
 
     #[must_use]
@@ -137,8 +190,8 @@ impl HydratedPromptTailRows {
     }
 
     #[must_use]
-    pub fn into_parts(self) -> (PersistedMessageSequence, Vec<Message>) {
-        (self.cursor, self.messages)
+    pub fn into_parts(self) -> (PromptProjectionPosition, Vec<Message>) {
+        (self.position, self.messages)
     }
 }
 
@@ -151,11 +204,11 @@ impl HydratedPromptTail {
     /// advance beyond `after`.
     pub fn try_current(
         conversation_id: &str,
-        after: PersistedMessageSequence,
+        after: PromptProjectionPosition,
         messages: Vec<Message>,
     ) -> DbResult<Self> {
-        let cursor = validate_prompt_rows(conversation_id, Some(after), &messages)?;
-        Ok(Self::Current(HydratedPromptTailRows { cursor, messages }))
+        let position = validate_prompt_rows(conversation_id, Some(after), &messages)?;
+        Ok(Self::Current(HydratedPromptTailRows { position, messages }))
     }
 
     #[must_use]
@@ -166,10 +219,10 @@ impl HydratedPromptTail {
 
 pub(crate) fn validate_prompt_rows(
     conversation_id: &str,
-    after: Option<PersistedMessageSequence>,
+    after: Option<PromptProjectionPosition>,
     messages: &[Message],
-) -> DbResult<PersistedMessageSequence> {
-    let mut cursor = after.unwrap_or_default();
+) -> DbResult<PromptProjectionPosition> {
+    let mut position = after.unwrap_or(PromptProjectionPosition::Empty);
     for message in messages {
         if message.conversation_id != conversation_id {
             return Err(DbError::Serialization(format!(
@@ -177,14 +230,18 @@ pub(crate) fn validate_prompt_rows(
                 message.message_id, message.conversation_id
             )));
         }
-        if message.sequence_id <= cursor.value() {
-            return Err(DbError::Serialization(format!(
-                "prompt transcript sequence {} is not greater than cursor {}",
-                message.sequence_id,
-                cursor.value()
-            )));
+        let sequence = PersistedMessageSequence::from_persisted(message.sequence_id)?;
+        match position {
+            PromptProjectionPosition::At(cursor) if message.sequence_id <= cursor.value() => {
+                return Err(DbError::Serialization(format!(
+                    "prompt transcript sequence {} is not greater than cursor {}",
+                    message.sequence_id,
+                    cursor.value()
+                )));
+            }
+            PromptProjectionPosition::Empty | PromptProjectionPosition::At(_) => {}
         }
-        cursor = PersistedMessageSequence::from_persisted(message.sequence_id)?;
+        position = PromptProjectionPosition::At(sequence);
     }
-    Ok(cursor)
+    Ok(position)
 }

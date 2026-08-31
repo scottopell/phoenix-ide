@@ -632,6 +632,7 @@ AND SHALL hydrate one transactionally consistent snapshot of transcript generati
 AND subsequent requests owned by that runtime SHALL read only generation-fenced rows whose conversation-local sequence is greater than the projection cursor
 AND SHALL hydrate attachment children with a constant number of set-based queries independent of transcript length
 AND ordinary append persistence SHALL preserve strictly increasing conversation-local message sequence values
+AND released duplicate-sequence repairs SHALL preserve every row, order affected conversation partitions by durable `(old sequence_id, created_at, message_id)`, densely renumber those partitions when required, remap `clear_watermark` to preserve the stable cleared-row identity/order, and advance transcript generation for each affected conversation
 
 WHEN a prompt-visible row is changed in place, removed, adopted, or transferred between conversations
 THE SYSTEM SHALL atomically advance the transcript generation of every affected source and destination conversation in the same transaction

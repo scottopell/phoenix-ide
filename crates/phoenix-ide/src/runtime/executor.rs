@@ -1529,17 +1529,15 @@ impl Drop for AuthorityBoundaryConsumerGuard {
 
 #[derive(Debug)]
 struct ActivePromptProjection {
-    generation: crate::db::PromptTranscriptGeneration,
-    cursor: crate::db::PersistedMessageSequence,
+    fenced_position: crate::db::GenerationFencedPromptPosition,
     messages: Vec<crate::db::Message>,
 }
 
 impl ActivePromptProjection {
     fn from_snapshot(snapshot: crate::db::HydratedPromptSnapshot) -> Self {
-        let (generation, cursor, messages) = snapshot.into_parts();
+        let (generation, position, messages) = snapshot.into_parts();
         Self {
-            generation,
-            cursor,
+            fenced_position: crate::db::GenerationFencedPromptPosition::new(generation, position),
             messages,
         }
     }
@@ -1548,9 +1546,12 @@ impl ActivePromptProjection {
         match tail {
             crate::db::HydratedPromptTail::Invalidated(_current_generation) => false,
             crate::db::HydratedPromptTail::Current(rows) => {
-                let (cursor, messages) = rows.into_parts();
+                let (position, messages) = rows.into_parts();
                 self.messages.extend(messages);
-                self.cursor = cursor;
+                self.fenced_position = crate::db::GenerationFencedPromptPosition::new(
+                    self.fenced_position.generation(),
+                    position,
+                );
                 true
             }
         }
@@ -5185,8 +5186,10 @@ where
                         return Ok(None);
                     }
                 }
-                let (reserved_broadcast_range, reserved_seqs) =
-                    self.broadcast_tx.reserve_next_persisted_message_range(1);
+                let (reserved_broadcast_range, reserved_seqs) = self
+                    .broadcast_tx
+                    .reserve_next_persisted_message_range(1)
+                    .expect("executor holds exclusive persisted-message reservation authority");
                 let _reserved_broadcast_range = reserved_broadcast_range;
                 let input = crate::runtime::traits::AuthoritativeUserMessageAdoptionInput {
                     authority,
@@ -5338,8 +5341,10 @@ where
                 usage_data,
                 message_id,
             } => {
-                let (reserved_range, reserved_sequences) =
-                    self.broadcast_tx.reserve_next_persisted_message_range(1);
+                let (reserved_range, reserved_sequences) = self
+                    .broadcast_tx
+                    .reserve_next_persisted_message_range(1)
+                    .expect("executor holds exclusive persisted-message reservation authority");
                 let sequence_id = reserved_sequences[0];
                 let message = crate::db::Message {
                     message_id,
@@ -5538,8 +5543,10 @@ where
 
             AuthoritativeEffect::ContinuationCommit { request, summary } => {
                 let operation_id = request.operation_id.clone();
-                let (reserved_range, reserved_sequences) =
-                    self.broadcast_tx.reserve_next_persisted_message_range(1);
+                let (reserved_range, reserved_sequences) = self
+                    .broadcast_tx
+                    .reserve_next_persisted_message_range(1)
+                    .expect("executor holds exclusive persisted-message reservation authority");
                 let seq = reserved_sequences[0];
                 let content = crate::db::MessageContent::continuation(summary.clone());
                 let message = crate::db::Message {
@@ -5880,7 +5887,10 @@ where
                 let materialization = {
                     let mut allocate_sequence = |persisted_sequence_max| {
                         let (reservation, sequence_id) = broadcaster
-                            .reserve_next_persisted_message_after(persisted_sequence_max);
+                            .reserve_next_persisted_message_after(persisted_sequence_max)
+                            .expect(
+                                "executor holds exclusive persisted-message reservation authority",
+                            );
                         reserved_broadcast = Some((reservation, sequence_id));
                         sequence_id
                     };
@@ -6339,7 +6349,8 @@ where
         }
         let (reserved_range, sequences) = self
             .broadcast_tx
-            .reserve_next_persisted_message_range(messages.len());
+            .reserve_next_persisted_message_range(messages.len())
+            .expect("executor holds exclusive persisted-message reservation authority");
         let created_at = Utc::now();
         let committed_messages: Vec<crate::db::Message> = messages
             .into_iter()
@@ -6551,7 +6562,7 @@ where
             .expect("projection initialized above");
         let tail = self
             .storage
-            .load_hydrated_prompt_tail(conversation_id, projection.generation, projection.cursor)
+            .load_hydrated_prompt_tail(conversation_id, projection.fenced_position)
             .await?;
         let rebuild = !projection.apply_tail(tail);
         if rebuild {
@@ -7380,7 +7391,8 @@ where
         let conv_id = self.context.conversation_id.clone();
         let (reserved_broadcast_range, reserved_seqs) = self
             .broadcast_tx
-            .reserve_next_persisted_message_range(1 + tool_results.len());
+            .reserve_next_persisted_message_range(1 + tool_results.len())
+            .expect("executor holds exclusive persisted-message reservation authority");
         let _reserved_broadcast_range = reserved_broadcast_range;
         let agent_content = MessageContent::agent(assistant_message.content);
         let agent_msg = crate::db::Message {
@@ -7472,7 +7484,8 @@ where
                 // never sees a shifted timestamp on the message the UI displays.
                 let (reserved_broadcast_range, reserved_seqs) = self
                     .broadcast_tx
-                    .reserve_next_persisted_message_range(1 + tool_results.len());
+                    .reserve_next_persisted_message_range(1 + tool_results.len())
+                    .expect("executor holds exclusive persisted-message reservation authority");
                 let _reserved_broadcast_range = reserved_broadcast_range;
 
                 let agent_content = MessageContent::agent(assistant_message.content);
@@ -7579,7 +7592,8 @@ where
         // ephemeral event broadcast earlier (mirrors `persist_checkpoint`).
         let (reserved_broadcast_range, reserved_seqs) = self
             .broadcast_tx
-            .reserve_next_persisted_message_range(1 + tool_results.len());
+            .reserve_next_persisted_message_range(1 + tool_results.len())
+            .expect("executor holds exclusive persisted-message reservation authority");
         let _reserved_broadcast_range = reserved_broadcast_range;
 
         let agent_content = MessageContent::agent(assistant_message.content);
@@ -11252,7 +11266,7 @@ mod dispatch_context_budget_tests {
         let mut projection = ActivePromptProjection::from_snapshot(snapshot);
         let tail = crate::db::HydratedPromptTail::try_current(
             "projection",
-            projection.cursor,
+            projection.fenced_position.position(),
             vec![message("projection", 21, "twenty-one")],
         )
         .unwrap();
@@ -11260,19 +11274,19 @@ mod dispatch_context_budget_tests {
 
         assert!(crate::db::HydratedPromptTail::try_current(
             "projection",
-            projection.cursor,
+            projection.fenced_position.position(),
             vec![message("wrong", 22, "wrong")],
         )
         .is_err());
         assert!(crate::db::HydratedPromptTail::try_current(
             "projection",
-            projection.cursor,
+            projection.fenced_position.position(),
             vec![message("projection", 21, "duplicate")],
         )
         .is_err());
         assert!(crate::db::HydratedPromptTail::try_current(
             "projection",
-            projection.cursor,
+            projection.fenced_position.position(),
             vec![
                 message("projection", 24, "out of order"),
                 message("projection", 23, "regression"),

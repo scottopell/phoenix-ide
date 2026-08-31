@@ -57,21 +57,20 @@ pub(crate) async fn hydrate(
 
     let mut by_message = HashMap::<String, HydratedAttachments>::new();
     for row in file_rows {
+        let message_id = row.try_get("message_id")?;
         by_message
-            .entry(row.get("message_id"))
+            .entry(message_id)
             .or_insert_with(empty_attachments)
             .files
             .push(file_from_row(&row)?);
     }
     for row in image_rows {
+        let (message_id, image) = image_from_row(&row)?;
         by_message
-            .entry(row.get("message_id"))
+            .entry(message_id)
             .or_insert_with(empty_attachments)
             .images
-            .push(ImageData {
-                media_type: row.get("media_type"),
-                data: row.get("data"),
-            });
+            .push(image);
     }
     for message in messages {
         if matches!(
@@ -109,6 +108,16 @@ fn file_from_row(row: &SqliteRow) -> DbResult<FileAttachment> {
         size_bytes,
         stored_path: row.try_get("stored_path")?,
     })
+}
+
+fn image_from_row(row: &SqliteRow) -> DbResult<(String, ImageData)> {
+    Ok((
+        row.try_get("message_id")?,
+        ImageData {
+            media_type: row.try_get("media_type")?,
+            data: row.try_get("data")?,
+        },
+    ))
 }
 
 /// Persist normalized attachment children on the caller-owned connection. A

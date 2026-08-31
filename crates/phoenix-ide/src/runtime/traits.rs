@@ -198,13 +198,12 @@ pub trait MessageStore: Send + Sync {
         conv_id: &str,
     ) -> Result<crate::db::HydratedPromptSnapshot, String>;
 
-    /// Load the fully hydrated durable tail after a typed persisted cursor,
-    /// fenced by the projection's transcript generation.
+    /// Load the fully hydrated durable tail after a generation-fenced prompt
+    /// position.
     async fn load_hydrated_prompt_tail(
         &self,
         conv_id: &str,
-        generation: crate::db::PromptTranscriptGeneration,
-        cursor: crate::db::PersistedMessageSequence,
+        after: crate::db::GenerationFencedPromptPosition,
     ) -> Result<crate::db::HydratedPromptTail, String>;
 
     /// Get a single message by ID
@@ -682,12 +681,9 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
     async fn load_hydrated_prompt_tail(
         &self,
         conv_id: &str,
-        generation: crate::db::PromptTranscriptGeneration,
-        cursor: crate::db::PersistedMessageSequence,
+        after: crate::db::GenerationFencedPromptPosition,
     ) -> Result<crate::db::HydratedPromptTail, String> {
-        (**self)
-            .load_hydrated_prompt_tail(conv_id, generation, cursor)
-            .await
+        (**self).load_hydrated_prompt_tail(conv_id, after).await
     }
 
     async fn get_message_by_id(&self, message_id: &str) -> Result<Message, String> {
@@ -1279,11 +1275,10 @@ impl MessageStore for DatabaseStorage {
     async fn load_hydrated_prompt_tail(
         &self,
         conv_id: &str,
-        generation: crate::db::PromptTranscriptGeneration,
-        cursor: crate::db::PersistedMessageSequence,
+        after: crate::db::GenerationFencedPromptPosition,
     ) -> Result<crate::db::HydratedPromptTail, String> {
         self.db
-            .load_hydrated_prompt_tail(conv_id, generation, cursor)
+            .load_hydrated_prompt_tail(conv_id, after)
             .await
             .map_err(|error| error.to_string())
     }

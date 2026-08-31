@@ -12,8 +12,8 @@ mod product_creation;
 pub use product_creation::*;
 mod prompt_projection;
 pub use prompt_projection::{
-    HydratedPromptSnapshot, HydratedPromptTail, PersistedMessageSequence,
-    PromptTranscriptGeneration,
+    GenerationFencedPromptPosition, HydratedPromptSnapshot, HydratedPromptTail,
+    PersistedMessageSequence, PromptProjectionPosition, PromptTranscriptGeneration,
 };
 mod product_conversation_read;
 pub mod retrieval;
@@ -10740,8 +10740,7 @@ impl Database {
     pub async fn load_hydrated_prompt_tail(
         &self,
         conversation_id: &str,
-        expected_generation: PromptTranscriptGeneration,
-        cursor: PersistedMessageSequence,
+        after: GenerationFencedPromptPosition,
     ) -> DbResult<HydratedPromptTail> {
         let mut tx = self.pool.begin().await?;
         let current_generation: Option<i64> =
@@ -10752,23 +10751,23 @@ impl Database {
         let current_generation = current_generation
             .ok_or_else(|| DbError::ConversationNotFound(conversation_id.to_string()))
             .and_then(PromptTranscriptGeneration::from_persisted)?;
-        if current_generation != expected_generation {
+        if current_generation != after.generation() {
             tx.commit().await?;
             return Ok(HydratedPromptTail::invalidated(current_generation));
         }
         let mut messages = sqlx::query(
             "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
              FROM messages
-             WHERE conversation_id = ?1 AND sequence_id > ?2
+             WHERE conversation_id = ?1 AND (?2 IS NULL OR sequence_id > ?2)
              ORDER BY sequence_id ASC",
         )
         .bind(conversation_id)
-        .bind(cursor.value())
+        .bind(after.position().lower_bound_for_tail())
         .try_map(parse_prompt_message_row)
         .fetch_all(&mut *tx)
         .await?;
         hydrate_attachments_conn(&mut tx, &mut messages).await?;
-        let tail = HydratedPromptTail::try_current(conversation_id, cursor, messages)?;
+        let tail = HydratedPromptTail::try_current(conversation_id, after.position(), messages)?;
         tx.commit().await?;
         Ok(tail)
     }
@@ -18201,6 +18200,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_snapshot_tail_includes_first_sequence_zero_and_advances_position() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("prompt-zero", "prompt-zero", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        let snapshot = db
+            .load_hydrated_prompt_snapshot("prompt-zero")
+            .await
+            .unwrap();
+        assert!(matches!(
+            snapshot.position(),
+            PromptProjectionPosition::Empty
+        ));
+
+        db.add_message_with_seq(
+            "message-zero",
+            "prompt-zero",
+            0,
+            &MessageContent::user("zero"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let tail = db
+            .load_hydrated_prompt_tail("prompt-zero", snapshot.fenced_position())
+            .await
+            .unwrap();
+        let HydratedPromptTail::Current(rows) = tail else {
+            panic!("unchanged empty generation must return the first persisted row");
+        };
+        assert!(matches!(
+            rows.position(),
+            PromptProjectionPosition::At(sequence) if sequence.value() == 0
+        ));
+        assert_eq!(rows.messages().len(), 1);
+        assert_eq!(rows.messages()[0].message_id, "message-zero");
+
+        let once = db
+            .load_hydrated_prompt_tail(
+                "prompt-zero",
+                GenerationFencedPromptPosition::new(snapshot.generation(), rows.position()),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            once,
+            HydratedPromptTail::Current(current) if current.messages().is_empty()
+        ));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn hydrated_prompt_snapshot_and_tails_are_generation_fenced_and_gap_tolerant() {
         let db = Database::open_in_memory().await.unwrap();
         db.create_conversation("prompt-tail", "prompt-tail", "/tmp", true, None, None)
@@ -18224,7 +18278,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(snapshot.generation().value(), 1);
-        assert_eq!(snapshot.cursor().value(), 9);
+        assert!(matches!(
+            snapshot.position(),
+            PromptProjectionPosition::At(sequence) if sequence.value() == 9
+        ));
         assert_eq!(
             snapshot
                 .messages()
@@ -18235,13 +18292,16 @@ mod tests {
         );
 
         let empty = db
-            .load_hydrated_prompt_tail("prompt-tail", snapshot.generation(), snapshot.cursor())
+            .load_hydrated_prompt_tail("prompt-tail", snapshot.fenced_position())
             .await
             .unwrap();
         let HydratedPromptTail::Current(rows) = empty else {
             panic!("unchanged generation must return a current tail");
         };
-        assert_eq!(rows.cursor().value(), 9);
+        assert!(matches!(
+            rows.position(),
+            PromptProjectionPosition::At(sequence) if sequence.value() == 9
+        ));
         assert!(rows.messages().is_empty());
 
         for (sequence, text) in [(14, "fourteen"), (27, "twenty-seven")] {
@@ -18257,14 +18317,17 @@ mod tests {
             .unwrap();
         }
         let appended = db
-            .load_hydrated_prompt_tail("prompt-tail", snapshot.generation(), snapshot.cursor())
+            .load_hydrated_prompt_tail("prompt-tail", snapshot.fenced_position())
             .await
             .unwrap();
         let HydratedPromptTail::Current(rows) = appended else {
             panic!("ordinary appends must not invalidate the generation");
         };
-        let (cursor, messages) = rows.into_parts();
-        assert_eq!(cursor.value(), 27);
+        let (position, messages) = rows.into_parts();
+        assert!(matches!(
+            position,
+            PromptProjectionPosition::At(sequence) if sequence.value() == 27
+        ));
         assert_eq!(
             messages
                 .iter()
@@ -18273,7 +18336,10 @@ mod tests {
             vec![14, 27]
         );
         let once = db
-            .load_hydrated_prompt_tail("prompt-tail", snapshot.generation(), cursor)
+            .load_hydrated_prompt_tail(
+                "prompt-tail",
+                GenerationFencedPromptPosition::new(snapshot.generation(), position),
+            )
             .await
             .unwrap();
         assert!(matches!(
@@ -18285,7 +18351,10 @@ mod tests {
             .await
             .unwrap();
         let invalidated = db
-            .load_hydrated_prompt_tail("prompt-tail", snapshot.generation(), cursor)
+            .load_hydrated_prompt_tail(
+                "prompt-tail",
+                GenerationFencedPromptPosition::new(snapshot.generation(), position),
+            )
             .await
             .unwrap();
         assert!(matches!(
@@ -18340,11 +18409,7 @@ mod tests {
             .unwrap();
             let before_tail = native_read_statements(&db);
             let tail = db
-                .load_hydrated_prompt_tail(
-                    &conversation_id,
-                    snapshot.generation(),
-                    snapshot.cursor(),
-                )
+                .load_hydrated_prompt_tail(&conversation_id, snapshot.fenced_position())
                 .await
                 .unwrap();
             let HydratedPromptTail::Current(rows) = tail else {
@@ -18440,6 +18505,41 @@ mod tests {
             .await
             .expect_err("changed replay is a typed conflict");
         assert!(matches!(conflict, DbError::MessageConflict(ref id) if id == "concurrent-first"));
+    }
+
+    #[tokio::test]
+    async fn prompt_projection_rejects_malformed_image_hydration_columns() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("corrupt-image", "corrupt-image", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.add_message(
+            "corrupt-image-message",
+            "corrupt-image",
+            &MessageContent::user_with_attachments(
+                "image",
+                vec![image_attachment("corrupt-image")],
+                Vec::new(),
+            ),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE message_images
+             SET media_type = CAST(X'80' AS BLOB)
+             WHERE message_id = 'corrupt-image-message'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let error = db
+            .load_hydrated_prompt_snapshot("corrupt-image")
+            .await
+            .expect_err("authoritative projection must fail closed on malformed image columns");
+        assert!(error.to_string().contains("media_type"));
     }
 
     #[tokio::test]

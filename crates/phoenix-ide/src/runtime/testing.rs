@@ -1243,8 +1243,7 @@ impl MessageStore for InMemoryStorage {
     async fn load_hydrated_prompt_tail(
         &self,
         conv_id: &str,
-        expected_generation: crate::db::PromptTranscriptGeneration,
-        cursor: crate::db::PersistedMessageSequence,
+        after: crate::db::GenerationFencedPromptPosition,
     ) -> Result<crate::db::HydratedPromptTail, String> {
         self.prompt_tail_loads.fetch_add(1, Ordering::SeqCst);
         if self.fail_prompt_projection_load.load(Ordering::SeqCst) {
@@ -1258,7 +1257,7 @@ impl MessageStore for InMemoryStorage {
             .unwrap_or(&1);
         let generation = crate::db::PromptTranscriptGeneration::from_persisted(generation)
             .map_err(|error| error.to_string())?;
-        if generation != expected_generation {
+        if generation != after.generation() {
             return Ok(crate::db::HydratedPromptTail::invalidated(generation));
         }
         let messages = self.messages.lock().unwrap();
@@ -1266,10 +1265,15 @@ impl MessageStore for InMemoryStorage {
             .get(conv_id)
             .into_iter()
             .flatten()
-            .filter(|message| message.sequence_id > cursor.value())
+            .filter(|message| match after.position() {
+                crate::db::PromptProjectionPosition::Empty => true,
+                crate::db::PromptProjectionPosition::At(cursor) => {
+                    message.sequence_id > cursor.value()
+                }
+            })
             .cloned()
             .collect::<Vec<_>>();
-        crate::db::HydratedPromptTail::try_current(conv_id, cursor, tail)
+        crate::db::HydratedPromptTail::try_current(conv_id, after.position(), tail)
             .map_err(|error| error.to_string())
     }
 

@@ -5320,18 +5320,17 @@ async fn continue_conversation(
                 .get_conversation(&id)
                 .await
                 .map_err(|error| AppError::Internal(error.to_string()))?;
-            let wake_repo = state.runtime.db().wake_repository();
             if parent.attached_work_scope_id == new_conv.attached_work_scope_id {
-                wake_repo
-                    .transfer_active_for_continuation(
-                        &id,
-                        &new_conv.id,
-                        phoenix_workflow::Timestamp(
-                            u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default(),
-                        ),
-                    )
-                    .await
-                    .map_err(|error| AppError::Internal(error.to_string()))?;
+                crate::runtime::wake::transfer_active_for_continuation(
+                    &state.runtime,
+                    &id,
+                    &new_conv.id,
+                    phoenix_workflow::Timestamp(
+                        u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default(),
+                    ),
+                )
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?;
             }
             tracing::info!(
                 parent_id = %id,
@@ -5379,18 +5378,17 @@ async fn continue_conversation(
                 .get_conversation(&id)
                 .await
                 .map_err(|error| AppError::Internal(error.to_string()))?;
-            let wake_repo = state.runtime.db().wake_repository();
             if parent.attached_work_scope_id == existing.attached_work_scope_id {
-                wake_repo
-                    .transfer_active_for_continuation(
-                        &id,
-                        &existing.id,
-                        phoenix_workflow::Timestamp(
-                            u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default(),
-                        ),
-                    )
-                    .await
-                    .map_err(|error| AppError::Internal(error.to_string()))?;
+                crate::runtime::wake::transfer_active_for_continuation(
+                    &state.runtime,
+                    &id,
+                    &existing.id,
+                    phoenix_workflow::Timestamp(
+                        u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default(),
+                    ),
+                )
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?;
             }
             tracing::info!(
                 parent_id = %id,
