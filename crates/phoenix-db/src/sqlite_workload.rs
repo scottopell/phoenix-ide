@@ -115,7 +115,7 @@ struct ReadFamilyAggregates {
         Box<[[u64; SqliteLatencyBin::ALL.len()]; SqliteReadFamily::ALL.len()]>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 #[must_use = "the guard records abandonment unless completed after the read attempt"]
 pub struct SqliteReadFamilyGuard {
     collector: SqliteWorkloadCollector,

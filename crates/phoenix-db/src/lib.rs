@@ -4213,7 +4213,10 @@ impl Database {
     ///
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn get_conversation_by_slug(&self, slug: &str) -> DbResult<Conversation> {
-        sqlx::query(
+        let observation = self
+            .sqlite_workload_collector
+            .start_read_family(SqliteReadFamily::ConversationGet);
+        let result = sqlx::query(
             "SELECT c.id, c.product_conversation_id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort, c.service_tier,
                     c.project_id, c.desired_base_branch,
@@ -4233,7 +4236,8 @@ impl Database {
             } else {
                 DbError::Sqlx(e)
             }
-        })
+        });
+        observation.complete(result)
     }
 
     /// Load the navigation metadata for a bounded set of conversation search hits.
@@ -13279,6 +13283,49 @@ pub(crate) const fn conv_state_kind(state: &ConvState) -> &'static str {
 mod tests {
     use super::*;
     use phoenix_core::llm_language::LlmLanguage;
+
+    async fn assert_single_conversation_get_observation(
+        db: &Database,
+        read: impl std::future::Future<Output = DbResult<Conversation>>,
+    ) {
+        read.await.unwrap();
+        let report = db
+            .sqlite_workload_collector
+            .aggregate_fresh_collector_for_test();
+        let family = SqliteReadFamily::ConversationGet.index();
+        assert_eq!(
+            report.read_family_outcomes[family][SqliteReadFamilyOutcome::Success.index()],
+            1
+        );
+        assert_eq!(
+            report.read_family_logical_elapsed_histogram[family]
+                .iter()
+                .sum::<u64>(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn single_conversation_gets_by_id_and_slug_are_attributed() {
+        let by_id = Database::open_in_memory().await.unwrap();
+        by_id
+            .create_conversation("get-by-id", "get-by-id-slug", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        assert_single_conversation_get_observation(&by_id, by_id.get_conversation("get-by-id"))
+            .await;
+
+        let by_slug = Database::open_in_memory().await.unwrap();
+        by_slug
+            .create_conversation("get-by-slug", "get-by-slug-value", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        assert_single_conversation_get_observation(
+            &by_slug,
+            by_slug.get_conversation_by_slug("get-by-slug-value"),
+        )
+        .await;
+    }
 
     #[test]
     fn worktree_fingerprint_tracks_git_administrative_incarnation() {
