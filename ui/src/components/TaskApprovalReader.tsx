@@ -18,6 +18,7 @@ import type { Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { SyntaxHighlighter, oneDark } from '../utils/syntaxHighlighter';
 import { MermaidDiagram } from './MermaidDiagram';
+import './TaskApprovalReader.css';
 import { generateUUID } from '../utils/uuid';
 import type { TaskApprovalHandoff } from '../api';
 import { useRegisterFocusScope } from '../hooks/useFocusScope';

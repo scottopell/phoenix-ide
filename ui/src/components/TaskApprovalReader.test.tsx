@@ -143,6 +143,34 @@ describe('TaskApprovalReader feedback action emphasis', () => {
       .toHaveClass('task-approval-btn--recommended-decision');
   });
 
+  it('emits both new recommendation modifier classes so the colocated CSS can style them', () => {
+    const { rerender, container } = renderTaskApprovalReader('# Plan', vi.fn(), {
+      contextWindowUsed: 96_000,
+      modelContextWindow: 200_000,
+    });
+
+    const continueCue = container.querySelector('.task-approval-context-cue--continue-here');
+    expect(continueCue).not.toBeNull();
+    expect(continueCue?.querySelector('.task-approval-context-cue__recommendation')).toHaveTextContent('Continue here recommended');
+
+    rerender(
+      <TaskApprovalReader
+        title="Review task"
+        priority="p2"
+        plan="# Plan"
+        contextWindowUsed={176_000}
+        modelContextWindow={200_000}
+        onApprove={vi.fn()}
+        onReject={vi.fn()}
+        onSendFeedback={vi.fn()}
+      />
+    );
+
+    const newConversationCue = container.querySelector('.task-approval-context-cue--new-conversation');
+    expect(newConversationCue).not.toBeNull();
+    expect(newConversationCue?.querySelector('.task-approval-context-cue__recommendation')).toHaveTextContent('Start in new conversation recommended');
+  });
+
   it('recommends a new chat when context pressure is high', () => {
     renderTaskApprovalReader('# Plan', vi.fn(), {
       contextWindowUsed: 176_000,
