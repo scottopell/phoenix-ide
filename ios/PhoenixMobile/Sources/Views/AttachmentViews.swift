@@ -71,5 +71,6 @@ struct ImageStrip: View {
                 }
             }
         }
+        .accessibilityIdentifier("attachment.imageStrip")
     }
 }
