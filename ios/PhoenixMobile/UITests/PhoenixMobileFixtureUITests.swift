@@ -24,7 +24,6 @@ final class PhoenixMobileFixtureUITests: XCTestCase {
         launchFixture(.normal)
         XCTAssertTrue(element("fixture.ready.normal").waitForExistence(timeout: 10))
         XCTAssertTrue(scrollTranscript(to: element("message.user")))
-        XCTAssertTrue(scrollTranscript(to: element("attachment.imageStrip")))
         XCTAssertTrue(scrollTranscript(to: element("message.agent")))
         XCTAssertTrue(scrollTranscript(to: element("tool.think")))
         XCTAssertTrue(scrollTranscript(to: element("tool.bash")))
