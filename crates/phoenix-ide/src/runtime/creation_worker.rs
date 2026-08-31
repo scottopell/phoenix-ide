@@ -2911,6 +2911,259 @@ mod product_creation_delivery_replay_tests {
         assert_eq!(still_pending.status, "delivery_pending");
         assert!(db.get_conversation(conversation_id).await.unwrap().archived);
     }
+
+    #[tokio::test]
+    async fn explicit_retry_after_queue_full_reuses_published_identities_without_duplicate_aggregate() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().to_string_lossy().to_string();
+        let db = Database::open_in_memory().await.unwrap();
+        let intent = ProductCreationIntent {
+            cwd: cwd.clone(),
+            objective: "deliver objective".to_string(),
+            model: None,
+            effort: None,
+            images: Vec::new(),
+            llm_language: LlmLanguage::Caveman,
+        };
+        db.accept_product_creation("req-retry-identities", &intent)
+            .await
+            .unwrap();
+        let provisioning = db
+            .claim_product_creation(
+                "req-retry-identities",
+                "provisioner",
+                "provision-token",
+                chrono::Utc::now(),
+                chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let accepted_product_id = provisioning.job.product_conversation_id.clone();
+        let publish_claim_lease_until = provisioning.claim.lease_until;
+        let conversation_id = "conv-retry-identities";
+        let conversation = stale_delivery_conversation(
+            conversation_id,
+            &accepted_product_id,
+            &intent.cwd,
+        );
+        assert!(db
+            .publish_product_creation_atomically(&ProductCreationPublishInput {
+                request_id: "req-retry-identities".to_string(),
+                claim: provisioning.claim,
+                conversation,
+                authority_kind: AuthorityKind::Work,
+                environment: EnvironmentContext::UnownedCwd {
+                    cwd: intent.cwd.clone(),
+                },
+                git_publication: Some(ProductCreationGitPublicationFacts {
+                    exact_checkout_oid: "repo-id".to_string(),
+                    repository_root: intent.cwd.clone(),
+                }),
+            })
+            .await
+            .unwrap());
+        db.update_conversation_state(
+            conversation_id,
+            &ConvState::AwaitingUserResponse {
+                questions: vec![],
+                tool_use_id: "hold-steering-drain".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let manager = Arc::new(RuntimeManager::new(
+            db.clone(),
+            Arc::new(ModelRegistry::new_empty()),
+            PlatformCapability::None {
+                details: "test".to_string(),
+            },
+            Arc::new(McpClientManager::new()),
+            None,
+        ));
+
+        for index in 0..phoenix_db::MAX_STEERING_QUEUE_DEPTH {
+            manager
+                .enqueue_steer_message(
+                    conversation_id,
+                    Event::SteerMessage {
+                        text: format!("queued {index}"),
+                        llm_text: None,
+                        images: Vec::new(),
+                        files: Vec::new(),
+                        message_id: format!("queued-{index}"),
+                        user_agent: None,
+                        skill_invocation: None,
+                    },
+                    &format!("queued-fingerprint-{index}"),
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut claim_time = publish_claim_lease_until + chrono::Duration::seconds(1);
+        let mut last_delivery_lease_until = publish_claim_lease_until;
+        for attempt in 1..=4 {
+            let delivery = db
+                .claim_next_product_creation_delivery(
+                    &format!("delivery-worker-{attempt}"),
+                    &format!("delivery-token-{attempt}"),
+                    claim_time,
+                    chrono::Duration::minutes(5),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                delivery.job.published_product_id,
+                Some(accepted_product_id.clone())
+            );
+            assert_eq!(
+                delivery.job.published_conversation_id.as_deref(),
+                Some(conversation_id)
+            );
+
+            let error = deliver_product_creation_objective(&manager, &delivery)
+                .await
+                .unwrap_err();
+            assert_eq!(error, "steering queue is full");
+            last_delivery_lease_until = delivery.claim.lease_until;
+
+            let job = db
+                .get_product_creation_job("req-retry-identities")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(job.product_conversation_id, accepted_product_id);
+            assert_eq!(job.published_product_id, Some(accepted_product_id.clone()));
+            assert_eq!(job.published_conversation_id.as_deref(), Some(conversation_id));
+            assert_eq!(job.last_error.as_deref(), Some("steering queue is full"));
+            assert!(db
+                .get_steering_acceptance_fingerprint(conversation_id, "req-retry-identities")
+                .await
+                .unwrap()
+                .is_none());
+            if attempt < 4 {
+                assert_eq!(job.status, "delivery_pending");
+                claim_time = job
+                    .delivery_retry_at
+                    .expect("retryable delivery failure schedules a next attempt")
+                    + chrono::Duration::seconds(1);
+            } else {
+                assert_eq!(job.status, "delivery_failed");
+                assert!(job.delivery_retry_at.is_none());
+            }
+        }
+
+        let product_count_before_retry: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM product_conversations")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let conversation_count_before_retry: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM conversations WHERE id = ?1")
+                .bind(conversation_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let objective_message_count_before_retry: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1 AND message_id = ?2",
+        )
+        .bind(conversation_id)
+        .bind("req-retry-identities")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(product_count_before_retry, 1);
+        assert_eq!(conversation_count_before_retry, 1);
+        assert_eq!(objective_message_count_before_retry, 0);
+
+        assert!(db
+            .retry_failed_product_creation_delivery("req-retry-identities")
+            .await
+            .unwrap());
+
+        let retried = db
+            .claim_next_product_creation_delivery(
+                "delivery-worker-explicit-retry",
+                "delivery-token-explicit-retry",
+                last_delivery_lease_until + chrono::Duration::seconds(1),
+                chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retried.job.product_conversation_id, accepted_product_id);
+        assert_eq!(retried.job.published_product_id, Some(accepted_product_id.clone()));
+        assert_eq!(retried.job.published_conversation_id.as_deref(), Some(conversation_id));
+
+        db.update_steering_queue(conversation_id, &[]).await.unwrap();
+
+        let published = deliver_product_creation_objective(&manager, &retried)
+            .await
+            .unwrap();
+        assert_eq!(published.product_conversation_id, accepted_product_id.to_string());
+        assert_eq!(published.transcript_row_id, conversation_id);
+
+        let completed = db
+            .get_product_creation_job("req-retry-identities")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.status, "published");
+        assert_eq!(completed.product_conversation_id, accepted_product_id);
+        assert_eq!(completed.published_product_id, Some(accepted_product_id.clone()));
+        assert_eq!(completed.published_conversation_id.as_deref(), Some(conversation_id));
+        assert_eq!(
+            db.get_steering_acceptance_fingerprint(conversation_id, "req-retry-identities")
+                .await
+                .unwrap(),
+            Some(phoenix_db::SteeringAcceptanceFingerprint::Exact(
+                "product-create:req-retry-identities".to_string()
+            ))
+        );
+
+        let product_count_after_retry: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM product_conversations")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let conversation_count_after_retry: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM conversations WHERE id = ?1")
+                .bind(conversation_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let objective_message_count_after_retry: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1 AND message_id = ?2",
+        )
+        .bind(conversation_id)
+        .bind("req-retry-identities")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let objective_queue_count_after_retry: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM steering_messages WHERE conversation_id = ?1 AND message_id = ?2",
+        )
+        .bind(conversation_id)
+        .bind("req-retry-identities")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let product_row_count_for_id: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM product_conversations WHERE id = ?1",
+        )
+        .bind(accepted_product_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(product_count_after_retry, 1);
+        assert_eq!(conversation_count_after_retry, 1);
+        assert_eq!(objective_message_count_after_retry, 0);
+        assert_eq!(objective_queue_count_after_retry, 1);
+        assert_eq!(product_row_count_for_id, 1);
+    }
 }
 
 #[cfg(test)]
