@@ -1504,9 +1504,11 @@ impl Database {
         Self::reconcile_close_direct_turn_settlement_receipts_tx(&mut tx, attempt_id).await?;
         let active_members: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)
-             FROM close_attempt_members member
-             JOIN conversations participant ON participant.id = member.conversation_id
-             WHERE member.attempt_id = ?1
+             FROM close_obligations obligation
+             JOIN conversations participant
+               ON participant.product_conversation_id = obligation.product_conversation_id
+             WHERE obligation.attempt_id = ?1
+               AND participant.created_at <= obligation.created_at
                AND (
                  EXISTS (
                    SELECT 1 FROM durable_turns turn
@@ -1582,10 +1584,13 @@ impl Database {
         attempt_id: &str,
     ) -> DbResult<Vec<String>> {
         let rows = sqlx::query_scalar(
-            "SELECT member.conversation_id
-             FROM close_attempt_members member
-             WHERE member.attempt_id = ?1
-             ORDER BY member.conversation_id",
+            "SELECT participant.id
+             FROM close_obligations obligation
+             JOIN conversations participant
+               ON participant.product_conversation_id = obligation.product_conversation_id
+             WHERE obligation.attempt_id = ?1
+               AND participant.created_at <= obligation.created_at
+             ORDER BY participant.id",
         )
         .bind(attempt_id)
         .fetch_all(&self.pool)
@@ -1603,10 +1608,11 @@ impl Database {
         let phase: Option<String> = sqlx::query_scalar(
             "SELECT obligation.phase
              FROM wake_bindings binding
-             JOIN close_attempt_members member
-               ON member.conversation_id = binding.conversation_id
-             JOIN close_obligations obligation ON obligation.attempt_id = member.attempt_id
+             JOIN conversations participant ON participant.id = binding.conversation_id
+             JOIN close_obligations obligation
+               ON obligation.product_conversation_id = participant.product_conversation_id
              WHERE binding.workflow_id = ?1
+               AND participant.created_at <= obligation.created_at
                AND obligation.phase IN ('settling_active_work', 'cancel_requested_during_settlement')
              ORDER BY obligation.chronology_ordinal DESC
              LIMIT 1",
@@ -1628,9 +1634,18 @@ impl Database {
             "SELECT binding.workflow_id, binding.conversation_id, binding.contract_id
              FROM wake_bindings binding
              JOIN workflows workflow ON workflow.workflow_id = binding.workflow_id
-             JOIN close_attempt_members member
-               ON member.conversation_id = binding.conversation_id
-             WHERE member.attempt_id = ?1
+             JOIN close_obligations obligation
+               ON obligation.product_conversation_id = (
+                   SELECT conversation.product_conversation_id
+                   FROM conversations conversation
+                   WHERE conversation.id = binding.conversation_id
+               )
+             WHERE obligation.attempt_id = ?1
+               AND (
+                   SELECT conversation.created_at
+                   FROM conversations conversation
+                   WHERE conversation.id = binding.conversation_id
+               ) <= obligation.created_at
                AND binding.resolved_at IS NULL
                AND workflow.status IN ('Active', 'Cancelling', 'ManualResolution', 'Incompatible', 'DeletionPending')
              ORDER BY binding.workflow_id",
@@ -5029,6 +5044,91 @@ mod tests {
                 .unwrap_err(),
             DbError::CloseFoundationPrecondition(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn settlement_captures_live_subordinate_aggregate_participant() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        db.create_subagent_conversation(
+            "subordinate",
+            "subordinate",
+            "/tmp",
+            "root",
+            "test-model",
+            &crate::ConvMode::Direct,
+            phoenix_core::llm_language::LlmLanguage::default(),
+            db.get_conversation("root")
+                .await
+                .unwrap()
+                .attached_work_scope_id
+                .as_ref(),
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO conversation_creation_jobs (
+                 id, conversation_id, message_id, status, stage, attempt, generation,
+                 intent_json, error, accepted_at, provisioning_started_at, completed_at,
+                 failed_at, cancelled_at, deletion_requested_at, created_at, updated_at
+             ) VALUES (
+                 'subordinate-live', 'subordinate', NULL, 'accepted', 'validate_intent', 0, 0,
+                 '{}', NULL, '2025-01-01T00:00:00Z', NULL, NULL,
+                 NULL, NULL, NULL, '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z'
+             )",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-subordinate",
+        )
+        .await
+        .unwrap();
+        db.begin_close_idle_settlement("attempt-subordinate")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.list_close_settlement_conversation_ids("attempt-subordinate")
+                .await
+                .unwrap(),
+            vec!["root".to_string(), "subordinate".to_string()]
+        );
+        assert!(matches!(
+            db.advance_close_settlement_when_quiescent("attempt-subordinate")
+                .await
+                .unwrap_err(),
+            DbError::CloseFoundationPrecondition(message)
+                if message.contains("active durable member obligation")
+        ));
+        let lifecycle: String = sqlx::query_scalar(
+            "SELECT ordinary_lifecycle FROM product_conversations WHERE id = 'root'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(lifecycle, "open");
+
+        sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET status = 'cancelled', cancelled_at = '2025-01-01T00:00:01Z',
+                 updated_at = '2025-01-01T00:00:01Z'
+             WHERE id = 'subordinate-live'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            db.advance_close_settlement_when_quiescent("attempt-subordinate")
+                .await
+                .unwrap()
+                .phase(),
+            ClosePhase::AwaitingRetirementInspection
+        );
     }
 
     #[tokio::test]

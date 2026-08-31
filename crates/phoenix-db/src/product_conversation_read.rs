@@ -1193,42 +1193,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn archive_compatibility_write_transitions_aggregate_to_history() {
-        let db = Database::open_in_memory().await.unwrap();
-        let conversation = db
-            .create_conversation("archive", "archive", "/tmp", true, None, None)
-            .await
-            .unwrap();
-
-        db.archive_conversation(&conversation.id).await.unwrap();
-
-        let archived = db.get_conversation(&conversation.id).await.unwrap();
-        assert!(archived.archived);
-        let aggregate = db
-            .get_ordinary_product_conversation(&conversation.product_conversation_id)
-            .await
-            .unwrap();
-        assert_eq!(
-            aggregate.product_conversation.ordinary_lifecycle(),
-            Some(OrdinaryProductConversationLifecycle::History)
-        );
-    }
-
-    #[tokio::test]
-    async fn archive_compatibility_write_rejects_coordinator_and_rolls_back() {
-        let db = Database::open_in_memory().await.unwrap();
-        let coordinator = db
-            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
-            .await
-            .unwrap();
-
-        let error = db.archive_conversation(&coordinator.id).await.unwrap_err();
-        assert!(matches!(error, DbError::Serialization(_)));
-        let coordinator = db.get_conversation(&coordinator.id).await.unwrap();
-        assert!(!coordinator.archived);
-    }
-
-    #[tokio::test]
     async fn list_lifecycle_uses_aggregate_authority_despite_legacy_archived_bit() {
         let db = Database::open_in_memory().await.unwrap();
         let conversation = db

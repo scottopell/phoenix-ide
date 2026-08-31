@@ -1272,7 +1272,9 @@ mod tests {
         })
         .await
         .unwrap();
-        db.archive_conversation(&req.conversation_id).await.unwrap();
+        db.set_legacy_conversation_archived(&req.conversation_id)
+            .await
+            .unwrap();
 
         assert_eq!(
             lookup_durable_replay(&db, &req, &submitted_identity_from_request(&req))

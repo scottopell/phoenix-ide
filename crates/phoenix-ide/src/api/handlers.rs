@@ -5612,25 +5612,7 @@ async fn archive_conversation(
     refuse_if_chain_member(&state, &id, "archive").await?;
     let admission = state.runtime.conversation_admission(&id).await;
     let _admission_guard = admission.lock().await;
-    let conversation = state
-        .db
-        .get_conversation(&id)
-        .await
-        .map_err(|error| AppError::NotFound(error.to_string()))?;
-    let has_allocated_worktree = matches!(
-        conversation.conv_mode,
-        ConvMode::Work { .. }
-            | ConvMode::Branch { .. }
-            | ConvMode::Explore {
-                worktree_path: Some(_),
-                ..
-            }
-    );
-    if has_allocated_worktree {
-        super::lifecycle_handlers::close_legacy_compat(&state, &id, "archive").await?;
-    } else {
-        run_archive_cascade(&state, &id).await?;
-    }
+    super::lifecycle_handlers::close_legacy_compat(&state, &id, "archive").await?;
     Ok(Json(SuccessResponse { success: true }))
 }
 
@@ -5643,6 +5625,7 @@ async fn archive_conversation(
 /// hard-delete — cleanup would race in-flight tool execution otherwise.
 /// Resource cleanup failures (bash / tmux / worktree) log WARN and
 /// continue; only the final `archived = 1` write is fatal.
+#[cfg(test)]
 pub(super) async fn run_archive_cascade(state: &AppState, id: &str) -> Result<(), AppError> {
     refuse_if_coordinator(state, id, "archive").await?;
     if state
@@ -5695,7 +5678,12 @@ pub(super) async fn run_archive_cascade(state: &AppState, id: &str) -> Result<()
 
     let cleanup = run_resource_cleanup_cascade(state, &conv).await?;
 
-    if let Err(error) = state.runtime.db().archive_conversation(id).await {
+    if let Err(error) = state
+        .runtime
+        .db()
+        .set_legacy_conversation_archived(id)
+        .await
+    {
         reopen_bash_after_failed_lifecycle_mutation(state, &conv, &cleanup).await;
         return Err(AppError::Internal(format!(
             "Failed to set archived flag: {error}"
@@ -13343,6 +13331,124 @@ pub(crate) mod hard_delete_cascade_tests {
         assert!(conv.archived, "archived flag must be set after archive");
     }
 
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn chat_only_close_settles_live_subordinate_before_history() {
+        let state = make_test_state().await;
+        let root = state
+            .db
+            .create_conversation("chat-close", "chat-close", "/tmp", true, None, None)
+            .await
+            .expect("create chat-only conversation");
+        let scope = root.attached_work_scope_id.as_ref();
+        state
+            .db
+            .create_subagent_conversation(
+                "chat-close-subordinate",
+                "chat-close-subordinate",
+                "/tmp",
+                &root.id,
+                "test-model",
+                &ConvMode::Direct,
+                root.llm_language,
+                scope,
+            )
+            .await
+            .expect("create subordinate participant");
+        sqlx::query(
+            "INSERT INTO conversation_creation_jobs (
+                 id, conversation_id, message_id, status, stage, attempt, generation,
+                 intent_json, error, accepted_at, provisioning_started_at, completed_at,
+                 failed_at, cancelled_at, deletion_requested_at, created_at, updated_at
+             ) VALUES (
+                 'chat-close-live-job', 'chat-close-subordinate', NULL, 'accepted',
+                 'validate_intent', 0, 0, '{}', NULL, '2025-01-01T00:00:00Z',
+                 NULL, NULL, NULL, NULL, NULL,
+                 '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z'
+             )",
+        )
+        .execute(state.db.pool())
+        .await
+        .unwrap();
+
+        let first = archive_conversation(State(state.clone()), Path(root.id.clone())).await;
+        assert!(
+            matches!(first, Err(AppError::Conflict(detail)) if detail.error_type == "close_settlement_in_progress")
+        );
+        let aggregate = state
+            .db
+            .get_ordinary_product_conversation(&root.product_conversation_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            aggregate.product_conversation.ordinary_lifecycle(),
+            Some(phoenix_core::domain::product_conversation::OrdinaryProductConversationLifecycle::Open)
+        );
+        let obligation = state
+            .db
+            .get_active_close_obligation_for_product(&root.product_conversation_id)
+            .await
+            .unwrap()
+            .expect("durable Close obligation");
+        assert_eq!(
+            obligation.phase(),
+            phoenix_core::domain::close::ClosePhase::SettlingActiveWork
+        );
+        assert_eq!(
+            state
+                .db
+                .list_close_settlement_conversation_ids(obligation.attempt_id().as_str())
+                .await
+                .unwrap(),
+            vec![root.id.clone(), "chat-close-subordinate".to_string()]
+        );
+
+        sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET status = 'cancelled', cancelled_at = '2025-01-01T00:00:01Z',
+                 updated_at = '2025-01-01T00:00:01Z'
+             WHERE id = 'chat-close-live-job'",
+        )
+        .execute(state.db.pool())
+        .await
+        .unwrap();
+        let _response = archive_conversation(State(state.clone()), Path(root.id.clone()))
+            .await
+            .expect("retry completes durable Close");
+
+        let aggregate = state
+            .db
+            .get_ordinary_product_conversation(&root.product_conversation_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            aggregate.product_conversation.ordinary_lifecycle(),
+            Some(phoenix_core::domain::product_conversation::OrdinaryProductConversationLifecycle::History)
+        );
+        let outcome_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages
+             WHERE conversation_id = ?1 AND message_id LIKE 'close-outcome:%'",
+        )
+        .bind(&root.id)
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(outcome_count, 1);
+        let completed = state
+            .db
+            .get_close_obligation(obligation.attempt_id().as_str())
+            .await
+            .unwrap();
+        assert_eq!(
+            completed.phase(),
+            phoenix_core::domain::close::ClosePhase::Completed
+        );
+        assert_eq!(
+            completed.close_outcome(),
+            Some(phoenix_core::domain::close::CloseCompletionOutcome::Archived)
+        );
+    }
+
     #[tokio::test]
     async fn archive_fences_unmaterialized_direct_turn() {
         let state = make_test_state().await;
@@ -13417,10 +13523,8 @@ pub(crate) mod hard_delete_cascade_tests {
         );
     }
 
-    /// `archive_chain_handler` runs the cascade against every member and
-    /// flips `archived = 1` on each — symmetrical with chain delete.
     #[tokio::test]
-    async fn archive_chain_handler_archives_every_member() {
+    async fn archive_chain_handler_completes_one_aggregate_close() {
         let state = make_test_state().await;
         build_chain_for_test(&state, &["ca-a", "ca-b", "ca-c"]).await;
         for id in ["ca-a", "ca-b", "ca-c"] {
@@ -13434,6 +13538,26 @@ pub(crate) mod hard_delete_cascade_tests {
         )
         .await
         .expect("chain archive");
+
+        let leaf = state.db.get_conversation("ca-c").await.unwrap();
+        let aggregate = state
+            .db
+            .get_ordinary_product_conversation(&leaf.product_conversation_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            aggregate.product_conversation.ordinary_lifecycle(),
+            Some(phoenix_core::domain::product_conversation::OrdinaryProductConversationLifecycle::History)
+        );
+        let outcome_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages
+             WHERE message_id LIKE 'close-outcome:%'
+               AND conversation_id IN ('ca-a', 'ca-b', 'ca-c')",
+        )
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(outcome_count, 1);
 
         for id in ["ca-a", "ca-b", "ca-c"] {
             let conv = state
@@ -16321,7 +16445,7 @@ mod wake_handler_tests {
             .expect("add child");
         state
             .db
-            .archive_conversation("conv-arch")
+            .set_legacy_conversation_archived("conv-arch")
             .await
             .expect("archive");
         let retriever = state.db.fts_retriever();
@@ -16535,7 +16659,7 @@ mod wake_handler_tests {
             .expect("add visible");
         state
             .db
-            .archive_conversation("conv-delete")
+            .set_legacy_conversation_archived("conv-delete")
             .await
             .expect("archive delete");
         let columns: Vec<String> = sqlx::query("PRAGMA table_info(conversation_creation_jobs)")

@@ -9104,45 +9104,24 @@ impl Database {
         .map_err(DbError::Sqlx)
     }
 
-    /// Archive a conversation
+    /// Sets the legacy transcript-row archive bit without changing aggregate lifecycle.
     ///
     /// # Errors
     ///
     /// Returns a [`DbError`] if the underlying database operation fails.
-    pub async fn archive_conversation(&self, id: &str) -> DbResult<()> {
-        let now = Utc::now().to_rfc3339();
-        let mut tx = self.pool.begin().await?;
+    pub async fn set_legacy_conversation_archived(&self, id: &str) -> DbResult<()> {
+        let now = Utc::now();
 
         let result =
             sqlx::query("UPDATE conversations SET archived = 1, updated_at = ?1 WHERE id = ?2")
-                .bind(&now)
+                .bind(now.to_rfc3339())
                 .bind(id)
-                .execute(&mut *tx)
+                .execute(&self.pool)
                 .await?;
 
         if result.rows_affected() == 0 {
-            tx.rollback().await?;
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
-
-        let aggregate = sqlx::query(
-            "UPDATE product_conversations
-             SET ordinary_lifecycle = 'history'
-             WHERE id = (
-                 SELECT product_conversation_id FROM conversations WHERE id = ?1
-             ) AND kind = 'ordinary'",
-        )
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-        if aggregate.rows_affected() != 1 {
-            tx.rollback().await?;
-            return Err(DbError::Serialization(format!(
-                "conversation {id} does not belong to an ordinary ProductConversation"
-            )));
-        }
-
-        tx.commit().await?;
         Ok(())
     }
 

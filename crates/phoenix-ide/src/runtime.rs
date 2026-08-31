@@ -11048,7 +11048,7 @@ mod scope_liveness_tests {
         // Archive the (still non-terminal) conversation; the lingering
         // runtime handle stays registered, as it does in the real cascade.
         mgr.db()
-            .archive_conversation("conv-arch")
+            .set_legacy_conversation_archived("conv-arch")
             .await
             .expect("archive");
         let conv = mgr.db().get_conversation("conv-arch").await.expect("get");

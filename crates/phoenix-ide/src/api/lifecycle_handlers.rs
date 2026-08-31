@@ -687,7 +687,10 @@ async fn run_legacy_close_compat(state: &AppState, id: &str, action: &str) -> Re
         .get_conversation(id)
         .await
         .map_err(|error| AppError::NotFound(error.to_string()))?;
-    if transcript.conv_mode.worktree_path().is_none() {
+    if action != "archive"
+        && action != "archive chain"
+        && transcript.conv_mode.worktree_path().is_none()
+    {
         return Err(AppError::BadRequest(format!(
             "Conversation must own an allocated worktree to {action}"
         )));
