@@ -59,27 +59,31 @@ on-device build and an airplane-mode queue/drain test pass.
 
 ## Planned iOS vNext Program
 
-iOS vNext migrates the native client to the ProductConversation aggregate and
-then expands its presentation surfaces systematically. The entire program is
-blocked until ProductConversation History/delete and the stable client-facing
-aggregate contract are on `main`; no section is ready for implementation
-against the transcript-row model.
+iOS vNext first establishes an independent deterministic native fixture
+harness, then migrates the client to the shipped ProductConversation REST
+aggregate while preserving ordinary transcript-row sessions as the sole owners
+of live SSE, cache, reducer, and outbox behavior. Core migration may begin after
+the fixture contract seam is committed and reviewed. Permanent delete,
+follow-up/source retrieval, grounding, and comments are later capabilities and
+do not block that migration.
 
 | Section | Status | Task |
 |---|---|---|
 | Program completion owner | Blocked | `tasks/04011-p1-blocked--ios-vnext-productconversation-expansion.md` |
 | ProductConversation migration | Blocked | `tasks/04004-p1-blocked--ios-vnext-productconversation-migration.md` |
-| Deterministic rendering fixture harness | Blocked | `tasks/04005-p1-blocked--ios-vnext-rendering-fixture-harness.md` |
+| Deterministic rendering fixture harness | In progress | `tasks/04005-p1-in-progress--ios-vnext-rendering-fixture-harness.md` |
 | Conversation status and actions | Blocked | `tasks/04006-p2-blocked--ios-vnext-conversation-status-actions.md` |
 | Tool-output rendering | Blocked | `tasks/04007-p2-blocked--ios-vnext-tool-output-rendering.md` |
 | Markdown rendering | Blocked | `tasks/04008-p2-blocked--ios-vnext-markdown-rendering.md` |
 | Grounding and file browsing | Blocked | `tasks/04009-p2-blocked--ios-vnext-grounding-files.md` |
 | Prose reader and comments | Blocked | `tasks/04010-p2-blocked--ios-vnext-prose-reader-comments.md` |
 
-These are umbrella section owners, not broad implementation instructions.
-After the ProductConversation gate clears, each section is decomposed into
-numbered, independently reviewable leaf tasks backed by requirements and
-deterministic fixture/test evidence.
+The fixture harness is one bounded implementation task. The remaining rows are
+umbrella section owners, not broad implementation instructions; they are split
+only when separate source ownership and scheduled concurrent work justify the
+coordination cost. ProductConversation migration remains blocked until the
+fixture contract seam is committed and reviewed. Later capability umbrellas
+remain blocked until independently scheduled.
 
 ## Known Gaps / Future Work
 
@@ -105,7 +109,7 @@ deterministic fixture/test evidence.
   blocked iOS vNext tool-output section owns the renderer catalog and queue.
 - Grounding/file browsing and the prose reader/commenting interface
   (`REQ-IOS-019` through `REQ-IOS-021`) are not implemented in the native
-  client; their blocked iOS vNext sections depend on the ProductConversation
-  migration and base deterministic fixture harness.
+  client. Their blocked iOS vNext sections are later capabilities and do not
+  block core ProductConversation migration.
 - The `recoverable_inconsistency` trigger is time-based rather than
   causally proven (deviation recorded in REQ-IOS-002).
