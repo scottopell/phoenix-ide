@@ -1,0 +1,7 @@
+# ProductConversation staging lifecycle convergence
+
+Converge all primary ordinary ProductConversation list, snapshot, and detail lifecycle reads on product_conversations.ordinary_lifecycle. Use consistent Open/History language, keep History read-only, keep Coordinator outside ordinary lifecycle, and remove the legacy Archive action from ProductConversation primary surfaces while retaining the shipped Close compatibility path for this bounded slice.
+
+Add deterministic DB/API/UI tests proving aggregate lifecycle wins even when a legacy transcript archived bit disagrees. Reconcile only directly proven executive status. Record the accepted aggregate/transcript authority boundary in the smallest existing normative home: ProductConversation owns stable identity, membership/topology, canonical navigation, lifecycle, and aggregate presentation; transcript members retain message persistence, SSE, runtime/provider session, and generation-fenced prompt projection. Never add aggregate-native message/SSE authority. State plainly that Phoenix continues using the current Project-backed repository model; repository-authority replacement is deferred until a named feature requires it.
+
+Do not touch PR736 prompt-projection/wake/sequence files, iOS, deletion, source retrieval, chains, repository authority, or broad legacy cleanup. Avoid handlers.rs, runtime.rs, and phoenix-db/src/lib.rs unless a hard blocker is reported first.
