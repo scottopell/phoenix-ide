@@ -19,6 +19,8 @@ final class PhoenixMobileFixtureUITests: XCTestCase {
         XCTAssertTrue(element("fixture.stateDetail").exists)
         attachScreenshot(named: "fixture-offline")
         XCTAssertTrue(element("state.questionCard").exists)
+        XCTAssertTrue(scrollFixtureShell(to: element("fixture.composer")))
+        XCTAssertTrue(element("conversation.send").isEnabled)
 
         app.terminate()
         launchFixture(.normal)
@@ -28,6 +30,9 @@ final class PhoenixMobileFixtureUITests: XCTestCase {
         XCTAssertTrue(scrollTranscript(to: element("tool.think")))
         XCTAssertTrue(scrollTranscript(to: element("tool.bash")))
         XCTAssertTrue(scrollTranscript(to: element("tool.bashResult")))
+        XCTAssertTrue(scrollFixtureShell(to: element("message.outbox")))
+        XCTAssertTrue(scrollFixtureShell(to: element("fixture.composer")))
+        XCTAssertTrue(element("conversation.send").isEnabled)
         attachScreenshot(named: "fixture-normal")
     }
 
@@ -58,7 +63,9 @@ final class PhoenixMobileFixtureUITests: XCTestCase {
             if fixture == .readOnly {
                 let approval = element("state.taskApprovalCard")
                 XCTAssertTrue(scrollFixtureShell(to: approval))
-                XCTAssertTrue(app.buttons["Approve…"].isEnabled)
+                XCTAssertFalse(app.buttons["Approve…"].isEnabled)
+                XCTAssertTrue(scrollFixtureShell(to: element("fixture.composer")))
+                XCTAssertFalse(element("conversation.send").isEnabled)
             }
             attachScreenshot(named: "fixture-\(fixture.rawValue)")
         }

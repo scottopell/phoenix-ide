@@ -210,6 +210,19 @@ struct OutboxEntryView: View {
     let session: ConversationSession
 
     var body: some View {
+        OutboxEntryBody(
+            entry: entry,
+            onRetry: { session.retryEntry(entry.localId) },
+            onDiscard: { Task { await session.dismissEntry(entry.localId) } })
+    }
+}
+
+struct OutboxEntryBody: View {
+    let entry: OutboxEntry
+    let onRetry: () -> Void
+    let onDiscard: () -> Void
+
+    var body: some View {
         VStack(alignment: .trailing, spacing: 3) {
             HStack {
                 Spacer(minLength: 40)
@@ -262,11 +275,9 @@ struct OutboxEntryView: View {
                         .foregroundStyle(.red)
                         .lineLimit(1)
                 }
-                Button("Retry") { session.retryEntry(entry.localId) }
+                Button("Retry", action: onRetry)
                     .font(.caption.bold())
-                Button("Discard", role: .destructive) {
-                    Task { await session.dismissEntry(entry.localId) }
-                }
+                Button("Discard", role: .destructive, action: onDiscard)
                 .font(.caption)
             }
         case .reconciled, .dismissed:

@@ -190,6 +190,7 @@ struct FixtureStateInspection: View {
 
 struct FixtureConversationScreen: View {
     let scenario: FixtureScenario
+    @State private var draft = "Deterministic draft"
 
     var body: some View {
         let screen = scenario.screen
@@ -230,6 +231,9 @@ struct FixtureConversationScreen: View {
                         .accessibilityIdentifier("fixture.storageWarning")
                 }
                 transcript(screen: screen)
+                if scenario.id == .normal {
+                    fixtureOutbox
+                }
                 FixtureStateInspection(
                     state: ConversationState.parse(screen.statePayload),
                     presentationMode: screen.presentationMode,
@@ -243,6 +247,16 @@ struct FixtureConversationScreen: View {
                     busy: false,
                     convState: screen.statePayload,
                     onAction: { _ in })
+                ComposerInputRow(
+                    draft: $draft,
+                    isOnline: screen.isOnline,
+                    canSend: scenario.id != .readOnly && !draft.isEmpty,
+                    showsCancel: screen.presentationMode == "working",
+                    onSend: {},
+                    onCancel: {},
+                    attachmentControl: AnyView(
+                        Image(systemName: "photo.badge.plus").font(.title3)))
+                    .accessibilityIdentifier("fixture.composer")
                 fixtureBanner(
                     title: screen.bannerTitle,
                     detail: screen.bannerDetail,
@@ -259,6 +273,16 @@ struct FixtureConversationScreen: View {
                 .frame(width: 1, height: 1)
                 .accessibilityIdentifier("fixture.ready.\(scenario.id.rawValue)")
         }
+    }
+
+    private var fixtureOutbox: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(FixtureScenario.outboxEntries) { entry in
+                OutboxEntryBody(entry: entry, onRetry: {}, onDiscard: {})
+            }
+        }
+        .padding(.horizontal, 12)
+        .accessibilityIdentifier("message.outbox")
     }
 
     private func transcript(screen: FixtureConversationScreenModel) -> some View {
@@ -541,6 +565,17 @@ private extension FixtureScenario {
                 bannerTitle: "Read-only fixture",
                 bannerDetail: "Composer is intentionally absent; transcript and state visuals stay readable.",
                 accessibilityID: "fixture.footer.readOnly"))
+    }
+
+    static var outboxEntries: [OutboxEntry] {
+        let fixedDate = Date(timeIntervalSince1970: 1_735_786_800)
+        return [
+            .init(localId: "outbox-pending", conversationId: "fixture-conv", text: "Queued offline", images: [], status: .pending, acceptedByServer: false, createdAt: fixedDate, acceptedAt: nil, lastError: nil, attemptCount: 0),
+            .init(localId: "outbox-accepted", conversationId: "fixture-conv", text: "Awaiting confirmation", images: [], status: .pending, acceptedByServer: true, createdAt: fixedDate, acceptedAt: fixedDate, lastError: nil, attemptCount: 1),
+            .init(localId: "outbox-steering", conversationId: "fixture-conv", text: "Queued after turn", images: [], status: .steeringQueued, acceptedByServer: true, createdAt: fixedDate, acceptedAt: fixedDate, lastError: nil, attemptCount: 1),
+            .init(localId: "outbox-failed", conversationId: "fixture-conv", text: "Retryable message", images: [], status: .failed, acceptedByServer: false, createdAt: fixedDate, acceptedAt: nil, lastError: "Deterministic send failure", attemptCount: 2),
+            .init(localId: "outbox-recoverable", conversationId: "fixture-conv", text: "Accepted but not reflected", images: [], status: .recoverableInconsistency, acceptedByServer: true, createdAt: fixedDate, acceptedAt: fixedDate, lastError: "Awaiting authoritative history", attemptCount: 1),
+        ]
     }
 
     static let validPixelPNG =
