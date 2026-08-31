@@ -422,6 +422,7 @@ function SqliteDiagnostics({
   const hasTypedSamples = (report?.classification.typed_outcome_count ?? 0) > 0;
   const hasNativeLoad = report?.reads.some((row) => row.total_profiled_read_execution_ms > 0 || row.peak_concurrency > 0) ?? false;
   const hasWriterOccupancy = report?.writer_categories.some((row) => row.writer_occupancy_percent > 0 || row.peak_concurrency > 0) ?? false;
+  const hasReadFamilySamples = report?.read_families.some((row) => row.attempt_count > 0) ?? false;
   const hasCoverage = (report?.covered_uptime_micros ?? 0) > 0;
   return (
     <section className="settings-section about-sqlite-section" aria-labelledby="sqlite-diagnostics-title">
@@ -543,6 +544,34 @@ function SqliteDiagnostics({
                   ))}
                 </tbody>
               </table>
+            </section>
+            <section className="about-resources-chart-card">
+              <div className="about-resources-chart-card__head">
+                <h4>Logical reads by source-defined family</h4>
+                <span>{report.read_families.length} families</span>
+              </div>
+              <table className="deploy-table about-sqlite-table">
+                <thead>
+                  <tr>
+                    <th>Read family</th>
+                    <th>Attempts</th>
+                    <th>Logical elapsed</th>
+                    <th>Outcomes</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {!hasReadFamilySamples && <tr><td colSpan={4}>No source-defined logical reads captured for this window yet.</td></tr>}
+                  {report.read_families.map((row) => (
+                    <tr key={row.family}>
+                      <td>{row.label}</td>
+                      <td>{formatNumber(row.attempt_count)}</td>
+                      <td>total {formatNumber(row.logical_elapsed.total_ms)} ms · avg {row.logical_elapsed.avg_ms ?? '—'} ms · p95≤ {row.logical_elapsed.p95_upper_bound_ms ?? '—'} ms</td>
+                      <td>success {formatNumber(row.success_count)} · fail {formatNumber(row.failure_count)} · abandoned {formatNumber(row.abandoned_count)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <div className="settings-section__hint">Logical elapsed includes the complete public database method envelope, including pool wait, decoding, and attachment hydration. It is not native SQLite execution time.</div>
             </section>
             <section className="about-resources-chart-card">
               <div className="about-resources-chart-card__head">

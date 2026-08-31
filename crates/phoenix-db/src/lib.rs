@@ -54,9 +54,10 @@ pub use retrieval::{
 pub use schema::*;
 pub use sqlite_workload::{
     abandoned_count, approximate_percentiles_from_histogram, operation_count, BucketCategoryTotals,
-    SampledSqliteWorkloadAggregateReport, SqliteAccessKind, SqliteLatencyBin, SqliteOutcome,
-    SqlitePercentiles, SqliteSnapshotWindow, SqliteWorkloadAggregateReport, SqliteWorkloadCategory,
-    SqliteWorkloadCollector, SqliteWorkloadSnapshot,
+    BucketReadFamilyTotals, SampledSqliteWorkloadAggregateReport, SqliteAccessKind,
+    SqliteLatencyBin, SqliteOutcome, SqlitePercentiles, SqliteReadFamily, SqliteReadFamilyGuard,
+    SqliteReadFamilyOutcome, SqliteSnapshotWindow, SqliteWorkloadAggregateReport,
+    SqliteWorkloadCategory, SqliteWorkloadCollector, SqliteWorkloadSnapshot,
 };
 pub use workflow::*;
 
@@ -1431,6 +1432,15 @@ impl Database {
         window: SqliteSnapshotWindow,
     ) -> SampledSqliteWorkloadAggregateReport {
         self.sqlite_workload_collector.aggregate_report_now(window)
+    }
+
+    async fn observe_sqlite_read<T>(
+        &self,
+        family: SqliteReadFamily,
+        operation: impl std::future::Future<Output = DbResult<T>>,
+    ) -> DbResult<T> {
+        let observation = self.sqlite_workload_collector.start_read_family(family);
+        observation.complete(operation.await)
     }
 
     fn sqlite_telemetry(
@@ -4170,7 +4180,10 @@ impl Database {
     ///
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn get_conversation(&self, id: &str) -> DbResult<Conversation> {
-        sqlx::query(
+        let observation = self
+            .sqlite_workload_collector
+            .start_read_family(SqliteReadFamily::ConversationGet);
+        let result = sqlx::query(
             "SELECT c.id, c.product_conversation_id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort, c.service_tier,
                     c.project_id, c.desired_base_branch,
@@ -4190,7 +4203,8 @@ impl Database {
             } else {
                 DbError::Sqlx(e)
             }
-        })
+        });
+        observation.complete(result)
     }
 
     /// Get conversation by slug
@@ -4348,7 +4362,11 @@ impl Database {
     ///
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn list_conversations(&self) -> DbResult<Vec<Conversation>> {
-        let rows = sqlx::query(
+        let observation = self
+            .sqlite_workload_collector
+            .start_read_family(SqliteReadFamily::ActiveList);
+        let result = async {
+            let rows = sqlx::query(
             "SELECT c.id, c.product_conversation_id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort, c.service_tier,
                     c.project_id, c.desired_base_branch,
@@ -4364,9 +4382,12 @@ impl Database {
         )
         .try_map(parse_conversation_row)
         .fetch_all(&self.pool)
-        .await?;
+            .await?;
 
-        Ok(rows)
+            Ok(rows)
+        }
+        .await;
+        observation.complete(result)
     }
 
     /// Top-level conversations parked in a usage-limit error that carries a
@@ -4563,7 +4584,11 @@ impl Database {
     ///
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn list_archived_conversations(&self) -> DbResult<Vec<Conversation>> {
-        let rows = sqlx::query(
+        let observation = self
+            .sqlite_workload_collector
+            .start_read_family(SqliteReadFamily::ArchivedList);
+        let result = async {
+            let rows = sqlx::query(
             "SELECT c.id, c.product_conversation_id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort, c.service_tier,
                     c.project_id, c.desired_base_branch,
@@ -4582,9 +4607,12 @@ impl Database {
         )
         .try_map(parse_conversation_row)
         .fetch_all(&self.pool)
-        .await?;
+            .await?;
 
-        Ok(rows)
+            Ok(rows)
+        }
+        .await;
+        observation.complete(result)
     }
 
     /// Insert a durable async conversation-creation job.
@@ -10613,7 +10641,8 @@ impl Database {
     ///
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn get_messages(&self, conversation_id: &str) -> DbResult<Vec<Message>> {
-        let mut rows = sqlx::query(
+        self.observe_sqlite_read(SqliteReadFamily::FullHistory, async {
+            let mut rows = sqlx::query(
             "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
              FROM messages WHERE conversation_id = ?1 ORDER BY sequence_id ASC",
         )
@@ -10622,8 +10651,10 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
-        hydrate_attachments(&self.pool, &mut rows).await?;
-        Ok(rows)
+            hydrate_attachments(&self.pool, &mut rows).await?;
+            Ok(rows)
+        })
+        .await
     }
 
     /// Get the exact projection consumed by runtime recovery: the newest agent
@@ -10638,7 +10669,8 @@ impl Database {
     ///
     /// Returns an error if the message query or attachment hydration fails.
     pub async fn get_recovery_messages(&self, conversation_id: &str) -> DbResult<Vec<Message>> {
-        let mut rows = sqlx::query(
+        self.observe_sqlite_read(SqliteReadFamily::RecoveryRangeHistory, async {
+            let mut rows = sqlx::query(
             "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
              FROM messages
              WHERE conversation_id = ?1
@@ -10674,7 +10706,7 @@ impl Database {
             let mut wake_tail = Vec::new();
             'tail: loop {
                 let older = self
-                    .get_messages_before(conversation_id, cursor, 64)
+                    .get_messages_before_inner(conversation_id, cursor, 64)
                     .await?;
                 if older.is_empty() {
                     break;
@@ -10692,7 +10724,9 @@ impl Database {
             rows.dedup_by_key(|message| message.sequence_id);
         }
 
-        Ok(rows)
+            Ok(rows)
+        })
+        .await
     }
 
     /// Return the current transcript tail and its typed settlement, if any.
@@ -10749,7 +10783,8 @@ impl Database {
         conversation_id: &str,
         after_sequence: i64,
     ) -> DbResult<Vec<Message>> {
-        let mut rows = sqlx::query(
+        self.observe_sqlite_read(SqliteReadFamily::RecoveryRangeHistory, async {
+            let mut rows = sqlx::query(
             "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
              FROM messages WHERE conversation_id = ?1 AND sequence_id > ?2 ORDER BY sequence_id ASC",
         )
@@ -10759,8 +10794,10 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
-        hydrate_attachments(&self.pool, &mut rows).await?;
-        Ok(rows)
+            hydrate_attachments(&self.pool, &mut rows).await?;
+            Ok(rows)
+        })
+        .await
     }
 
     /// Get the latest messages for a conversation, capped by `limit`.
@@ -10776,7 +10813,8 @@ impl Database {
         conversation_id: &str,
         limit: i64,
     ) -> DbResult<Vec<Message>> {
-        let mut rows = sqlx::query(
+        self.observe_sqlite_read(SqliteReadFamily::LatestBoundedHistory, async {
+            let mut rows = sqlx::query(
             "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
              FROM messages
              WHERE conversation_id = ?1
@@ -10789,9 +10827,11 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
-        rows.reverse();
-        hydrate_attachments(&self.pool, &mut rows).await?;
-        Ok(rows)
+            rows.reverse();
+            hydrate_attachments(&self.pool, &mut rows).await?;
+            Ok(rows)
+        })
+        .await
     }
 
     /// Get the newest usage payload for a conversation.
@@ -10837,6 +10877,19 @@ impl Database {
         before_sequence: i64,
         limit: i64,
     ) -> DbResult<Vec<Message>> {
+        self.observe_sqlite_read(
+            SqliteReadFamily::LatestBoundedHistory,
+            self.get_messages_before_inner(conversation_id, before_sequence, limit),
+        )
+        .await
+    }
+
+    async fn get_messages_before_inner(
+        &self,
+        conversation_id: &str,
+        before_sequence: i64,
+        limit: i64,
+    ) -> DbResult<Vec<Message>> {
         let mut rows = sqlx::query(
             "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
              FROM messages
@@ -10867,7 +10920,8 @@ impl Database {
         after_sequence: i64,
         limit: i64,
     ) -> DbResult<Vec<Message>> {
-        let mut rows = sqlx::query(
+        self.observe_sqlite_read(SqliteReadFamily::LatestBoundedHistory, async {
+            let mut rows = sqlx::query(
             "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
              FROM messages
              WHERE conversation_id = ?1 AND sequence_id > ?2
@@ -10881,8 +10935,10 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
-        hydrate_attachments(&self.pool, &mut rows).await?;
-        Ok(rows)
+            hydrate_attachments(&self.pool, &mut rows).await?;
+            Ok(rows)
+        })
+        .await
     }
 
     /// Get the inclusive message range `[start_sequence, end_sequence]`.
@@ -10896,7 +10952,8 @@ impl Database {
         start_sequence: i64,
         end_sequence: i64,
     ) -> DbResult<Vec<Message>> {
-        let mut rows = sqlx::query(
+        self.observe_sqlite_read(SqliteReadFamily::RecoveryRangeHistory, async {
+            let mut rows = sqlx::query(
             "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
              FROM messages
              WHERE conversation_id = ?1 AND sequence_id >= ?2 AND sequence_id <= ?3
@@ -10909,8 +10966,10 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
-        hydrate_attachments(&self.pool, &mut rows).await?;
-        Ok(rows)
+            hydrate_attachments(&self.pool, &mut rows).await?;
+            Ok(rows)
+        })
+        .await
     }
 
     /// Get a window of messages around `pivot_sequence`, excluding the pivot.
@@ -10927,7 +10986,8 @@ impl Database {
         before_limit: i64,
         after_limit: i64,
     ) -> DbResult<(Vec<Message>, Vec<Message>)> {
-        let mut before = sqlx::query(
+        self.observe_sqlite_read(SqliteReadFamily::RecoveryRangeHistory, async {
+            let mut before = sqlx::query(
             "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
              FROM messages
              WHERE conversation_id = ?1 AND sequence_id < ?2
@@ -10956,9 +11016,11 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
-        hydrate_attachments(&self.pool, &mut before).await?;
-        hydrate_attachments(&self.pool, &mut after).await?;
-        Ok((before, after))
+            hydrate_attachments(&self.pool, &mut before).await?;
+            hydrate_attachments(&self.pool, &mut after).await?;
+            Ok((before, after))
+        })
+        .await
     }
 
     /// Get a message by its `message_id`

@@ -195,6 +195,18 @@ function sqliteReadCategory(category: SqliteReportCategory, label: string) {
   };
 }
 
+function sqliteReadFamily() {
+  return {
+    family: 'active_list' as const,
+    label: 'Active conversation list',
+    attempt_count: 0,
+    success_count: 0,
+    failure_count: 0,
+    abandoned_count: 0,
+    logical_elapsed: { sample_count: 0, total_ms: 0, avg_ms: null, p50_upper_bound_ms: null, p95_upper_bound_ms: null, p99_upper_bound_ms: null },
+  };
+}
+
 function sqliteReport(overrides: Partial<SqliteWorkloadReportResponse> = {}): SqliteWorkloadReportResponse {
   return {
     sampled_at: '2026-06-01T00:00:05Z',
@@ -218,6 +230,7 @@ function sqliteReport(overrides: Partial<SqliteWorkloadReportResponse> = {}): Sq
     baseline_categories: [sqliteBaselineCategory('message_persistence', 'Message persistence')],
     writer_categories: [sqliteCategory('message_persistence', 'Message persistence')],
     reads: [sqliteReadCategory('message_persistence', 'Message persistence')],
+    read_families: [sqliteReadFamily()],
     ...overrides,
   };
 }
@@ -328,13 +341,23 @@ describe('AboutDeploymentPage disk usage health', () => {
 
   it('loads SQLite workload and switches fixed report windows', async () => {
     apiMock.deploymentSqliteWorkload
-      .mockResolvedValueOnce(sqliteReport())
+      .mockResolvedValueOnce(sqliteReport({
+        read_families: [{
+          ...sqliteReadFamily(),
+          attempt_count: 3,
+          success_count: 2,
+          failure_count: 1,
+          logical_elapsed: { sample_count: 3, total_ms: 42, avg_ms: 14, p50_upper_bound_ms: 19, p95_upper_bound_ms: 49, p99_upper_bound_ms: 49 },
+        }],
+      }))
       .mockResolvedValueOnce(sqliteReport({ window: 'six_hours' }));
 
     renderPage(deployment());
 
     expect(await screen.findByRole('heading', { name: 'SQLite workload' })).toBeInTheDocument();
     expect(screen.getByText('Restart truncated')).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Logical reads by source-defined family' })).toBeInTheDocument();
+    expect(screen.getByText('success 2 · fail 1 · abandoned 0')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '6h' }));
     expect(apiMock.deploymentSqliteWorkload).toHaveBeenLastCalledWith('six_hours');
     await screen.findAllByText(/No (native baseline|instrumented contention|native read load)/);

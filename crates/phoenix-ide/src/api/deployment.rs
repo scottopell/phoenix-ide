@@ -179,6 +179,18 @@ pub enum SqliteReportCategory {
     Other,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum SqliteReportReadFamily {
+    ActiveList,
+    ArchivedList,
+    ConversationGet,
+    FullHistory,
+    LatestBoundedHistory,
+    RecoveryRangeHistory,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct SqliteWorkloadReportQuery {
@@ -201,6 +213,7 @@ pub struct SqliteWorkloadReportResponse {
     pub baseline_categories: Vec<SqliteBaselineCategoryReport>,
     pub writer_categories: Vec<SqliteWriterCategoryReport>,
     pub reads: Vec<SqliteReadCategoryReport>,
+    pub read_families: Vec<SqliteReadFamilyReport>,
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
@@ -262,6 +275,18 @@ pub struct SqliteReadCategoryReport {
     pub pool_wait: Option<SqliteWaitSummary>,
     pub retries: Option<SqliteRetrySummary>,
     pub failures: SqliteFailureSummary,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct SqliteReadFamilyReport {
+    pub family: SqliteReportReadFamily,
+    pub label: String,
+    pub attempt_count: u64,
+    pub success_count: u64,
+    pub failure_count: u64,
+    pub abandoned_count: u64,
+    pub logical_elapsed: SqliteWaitSummary,
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
@@ -639,7 +664,10 @@ fn sample_sqlite_workload_report(
     state: &AppState,
     window: SqliteReportWindow,
 ) -> SqliteWorkloadReportResponse {
-    use crate::db::{SqliteAccessKind, SqliteSnapshotWindow, SqliteWorkloadCategory};
+    use crate::db::{
+        SqliteAccessKind, SqliteReadFamily, SqliteReadFamilyOutcome, SqliteSnapshotWindow,
+        SqliteWorkloadCategory,
+    };
 
     let sampled = state
         .db
@@ -775,6 +803,31 @@ fn sample_sqlite_workload_report(
         })
         .collect();
 
+    let read_families = SqliteReadFamily::ALL
+        .iter()
+        .copied()
+        .map(|family| {
+            let outcomes = &report.read_family_outcomes[family.index()];
+            let success_count = outcomes[SqliteReadFamilyOutcome::Success.index()];
+            let failure_count = outcomes[SqliteReadFamilyOutcome::Failure.index()];
+            let abandoned_count = outcomes[SqliteReadFamilyOutcome::Abandoned.index()];
+            SqliteReadFamilyReport {
+                family: SqliteReportReadFamily::from(family),
+                label: sqlite_read_family_label(family).to_string(),
+                attempt_count: success_count
+                    .saturating_add(failure_count)
+                    .saturating_add(abandoned_count),
+                success_count,
+                failure_count,
+                abandoned_count,
+                logical_elapsed: wait_summary(
+                    &report.read_family_logical_elapsed_histogram[family.index()],
+                    report.read_family_totals[family.index()].logical_elapsed_micros,
+                ),
+            }
+        })
+        .collect();
+
     SqliteWorkloadReportResponse {
         sampled_at,
         window,
@@ -789,6 +842,7 @@ fn sample_sqlite_workload_report(
         baseline_categories,
         writer_categories,
         reads,
+        read_families,
     }
 }
 
@@ -914,6 +968,30 @@ fn sqlite_category_label(category: crate::db::SqliteWorkloadCategory) -> &'stati
         crate::db::SqliteWorkloadCategory::PrProjectData => "PR/project data",
         crate::db::SqliteWorkloadCategory::Maintenance => "Maintenance",
         crate::db::SqliteWorkloadCategory::Other => "Other",
+    }
+}
+
+fn sqlite_read_family_label(family: crate::db::SqliteReadFamily) -> &'static str {
+    match family {
+        crate::db::SqliteReadFamily::ActiveList => "Active conversation list",
+        crate::db::SqliteReadFamily::ArchivedList => "Archived conversation list",
+        crate::db::SqliteReadFamily::ConversationGet => "Single conversation get",
+        crate::db::SqliteReadFamily::FullHistory => "Full message history",
+        crate::db::SqliteReadFamily::LatestBoundedHistory => "Latest/bounded message history",
+        crate::db::SqliteReadFamily::RecoveryRangeHistory => "Recovery/range message history",
+    }
+}
+
+impl From<crate::db::SqliteReadFamily> for SqliteReportReadFamily {
+    fn from(value: crate::db::SqliteReadFamily) -> Self {
+        match value {
+            crate::db::SqliteReadFamily::ActiveList => Self::ActiveList,
+            crate::db::SqliteReadFamily::ArchivedList => Self::ArchivedList,
+            crate::db::SqliteReadFamily::ConversationGet => Self::ConversationGet,
+            crate::db::SqliteReadFamily::FullHistory => Self::FullHistory,
+            crate::db::SqliteReadFamily::LatestBoundedHistory => Self::LatestBoundedHistory,
+            crate::db::SqliteReadFamily::RecoveryRangeHistory => Self::RecoveryRangeHistory,
+        }
     }
 }
 
