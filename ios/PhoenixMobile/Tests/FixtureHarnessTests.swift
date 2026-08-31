@@ -28,6 +28,17 @@ final class FixtureHarnessTests: XCTestCase {
             Set(FixtureScenario.ID.allCases))
     }
 
+    func testNormalFixtureUsesShippedToolExecutingPayloadShape() {
+        let state = ConversationState.parse(FixtureScenario.scenario(for: .normal).screen.statePayload)
+
+        guard case .toolExecuting(let name, let remaining, let completed) = state else {
+            return XCTFail("expected tool_executing state")
+        }
+        XCTAssertEqual(name, "bash")
+        XCTAssertEqual(remaining, 1)
+        XCTAssertEqual(completed, 2)
+    }
+
     func testEveryFixtureUsesFixedMessageIdentityAndTimestamp() {
         for scenario in FixtureScenario.all {
             for message in scenario.screen.messages {

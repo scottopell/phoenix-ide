@@ -387,9 +387,9 @@ private extension FixtureScenario {
                 streamingText: "Streaming tail with fixed timing…",
                 statePayload: .object([
                     "type": .string("tool_executing"),
-                    "tool_name": .string("bash"),
-                    "remaining_count": .number(1),
-                    "completed_count": .number(2),
+                    "current_tool": .object(["name": .string("bash")]),
+                    "remaining_tools": .array([.object(["name": .string("patch")])]),
+                    "completed_results": .array([.object([:]), .object([:])]),
                 ]),
                 presentationMode: "working",
                 requiresAction: false,
