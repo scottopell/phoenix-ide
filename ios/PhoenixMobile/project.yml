@@ -62,7 +62,23 @@ targets:
     type: bundle.ui-testing
     platform: iOS
     sources:
-      - UITests
+      - path: UITests
+        excludes:
+          - PhoenixMobileFixtureUITests.swift
+    dependencies:
+      - target: PhoenixMobile
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "5.9"
+
+  PhoenixMobileFixtureUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: UITests
+        includes:
+          - PhoenixMobileFixtureUITests.swift
     dependencies:
       - target: PhoenixMobile
     settings:
@@ -99,3 +115,13 @@ schemes:
       environmentVariables:
         PHOENIX_UI_TEST_SERVER_URL: "$(PHOENIX_UI_TEST_SERVER_URL_VALUE)"
         PHOENIX_UI_TEST_CWD: "$(PHOENIX_UI_TEST_CWD_VALUE)"
+
+  PhoenixMobileFixtures:
+    build:
+      targets:
+        PhoenixMobile: all
+        PhoenixMobileFixtureUITests: [test]
+    test:
+      config: Debug
+      targets:
+        - PhoenixMobileFixtureUITests

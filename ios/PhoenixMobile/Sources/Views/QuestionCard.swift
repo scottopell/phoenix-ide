@@ -11,6 +11,25 @@ struct QuestionCard: View {
     let session: ConversationSession
     let questions: [UserQuestion]
 
+    var body: some View {
+        QuestionCardBody(
+            questions: questions,
+            isOnline: model.connectivity.isOnline,
+            acceptsActions: session.acceptsConversationActions,
+            busy: session.actionInFlight != nil,
+            onAnswer: { session.perform(.respondToQuestions(answers: $0)) },
+            onDismiss: { session.perform(.dismissQuestion) })
+    }
+}
+
+struct QuestionCardBody: View {
+    let questions: [UserQuestion]
+    let isOnline: Bool
+    let acceptsActions: Bool
+    let busy: Bool
+    let onAnswer: ([String: String]) -> Void
+    let onDismiss: () -> Void
+
     /// Selected option labels per question text. Single-select questions
     /// keep at most one entry; the encoder treats them uniformly.
     @State private var selections: [String: Set<String>] = [:]
@@ -20,10 +39,7 @@ struct QuestionCard: View {
     @State private var otherRevealed: Set<String> = []
     @State private var confirmDismiss = false
 
-    private var busy: Bool { session.actionInFlight != nil }
-    private var actionable: Bool {
-        model.connectivity.isOnline && session.acceptsConversationActions && !busy
-    }
+    private var actionable: Bool { isOnline && acceptsActions && !busy }
     private var encodedAnswers: [String: String]? {
         QuestionAnswers.encode(
             questions: questions, selections: selections, otherTexts: otherTexts)
@@ -59,7 +75,7 @@ struct QuestionCard: View {
 
                 Button("Send answers") {
                     if let answers = encodedAnswers {
-                        session.perform(.respondToQuestions(answers: answers))
+                        onAnswer(answers)
                         // Selections deliberately kept: on success the state
                         // change unmounts this card; on failure the user's
                         // choices must survive for retry.
@@ -70,7 +86,7 @@ struct QuestionCard: View {
                 .disabled(!actionable || encodedAnswers == nil)
             }
 
-            if !model.connectivity.isOnline {
+            if !isOnline {
                 Text("Offline — answering needs a connection and is never queued.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
@@ -90,9 +106,10 @@ struct QuestionCard: View {
             isPresented: $confirmDismiss, titleVisibility: .visible
         ) {
             Button("Dismiss questions", role: .destructive) {
-                session.perform(.dismissQuestion)
+                onDismiss()
             }
         }
+        .accessibilityIdentifier("state.questionCard")
     }
 
     @ViewBuilder

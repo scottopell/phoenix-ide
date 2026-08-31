@@ -47,7 +47,11 @@ struct ConversationView: View {
                 }
                 .frame(maxHeight: .infinity)
             } else {
-                messageList
+                ConversationTranscriptView(
+                    messages: session.messages,
+                    toolIndex: session.toolUseIndex,
+                    streamingText: session.streamingText,
+                    outboxSession: session)
                 StateDetailView(session: session)
                 ComposerView(session: session, draft: $draft)
             }
@@ -97,34 +101,45 @@ struct ConversationView: View {
             && session.outbox.visibleEntries.isEmpty
     }
 
-    private var messageList: some View {
+}
+
+struct ConversationTranscriptView: View {
+    let messages: [Message]
+    let toolIndex: [String: ToolUseRef]
+    let streamingText: String
+    var outboxSession: ConversationSession?
+
+    var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 10) {
-                    ForEach(session.messages) { message in
-                        MessageView(message: message, toolIndex: session.toolUseIndex)
+                    ForEach(messages) { message in
+                        MessageView(message: message, toolIndex: toolIndex)
                             .id(message.message_id)
                     }
-                    if !session.streamingText.isEmpty {
-                        StreamingBubble(text: session.streamingText)
+                    if !streamingText.isEmpty {
+                        StreamingBubble(text: streamingText)
                             .id("streaming")
                     }
-                    OutboxSection(session: session)
+                    if let outboxSession {
+                        OutboxSection(session: outboxSession)
+                    }
                     Color.clear.frame(height: 1).id("bottom")
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
             }
             .defaultScrollAnchor(.bottom)
-            .onChange(of: session.messages.count) {
+            .onChange(of: messages.count) {
                 withAnimation(.easeOut(duration: 0.2)) {
                     proxy.scrollTo("bottom", anchor: .bottom)
                 }
             }
-            .onChange(of: session.streamingText) {
+            .onChange(of: streamingText) {
                 proxy.scrollTo("bottom", anchor: .bottom)
             }
         }
+        .accessibilityIdentifier("conversation.transcript")
     }
 }
 
