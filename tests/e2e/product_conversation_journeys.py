@@ -44,6 +44,10 @@ def poll(label: str, read, predicate, timeout: float = TIMEOUT):
     raise AssertionError(f"timed out waiting for {label}; last={last!r}")
 
 
+class RetryableCreationScheduled(RuntimeError):
+    pass
+
+
 def create_product(base_url: str, cwd: Path, objective: str) -> dict:
     request_id = str(uuid.uuid4())
     body = {
@@ -62,8 +66,10 @@ def create_product(base_url: str, cwd: Path, objective: str) -> dict:
             result = response.json()
             break
         payload = response.json()
-        if payload.get("error_type") != "product_creation_retry_scheduled" or time.monotonic() >= deadline:
+        if payload.get("error_type") != "product_creation_retry_scheduled":
             raise AssertionError(f"POST /api/product-conversations/new: {response.status_code}: {response.text}")
+        if time.monotonic() >= deadline:
+            raise RetryableCreationScheduled(response.text)
         time.sleep(0.1)
     assert result["canonical_route"] == f"/product-conversations/{result['product_conversation_id']}"
     result["request_id"] = request_id
@@ -237,6 +243,8 @@ def scenario_merged_context_continuation(base_url: str, _cwd: Path) -> None:
 
 
 def is_retryable_creation_response(error: Exception) -> bool:
+    if isinstance(error, RetryableCreationScheduled):
+        return True
     if not isinstance(error, httpx.HTTPStatusError):
         return False
     try:
@@ -270,7 +278,7 @@ def run_journeys() -> None:
                         scenario(base_url, repo)
                         print(f"✓ {name} {time.monotonic() - started:.2f}s", flush=True)
                 break
-            except httpx.HTTPStatusError as error:
+            except (httpx.HTTPStatusError, RetryableCreationScheduled) as error:
                 if attempt == 3 or not is_retryable_creation_response(error):
                     raise
                 print(f"[qa] {name}: retrying in a fresh isolated instance ({attempt}/3)", flush=True)

@@ -47,7 +47,7 @@ function segment(
     transcript_row_id: transcriptRowId,
     slug: transcriptRowId,
     title,
-    messages,
+    messages: messages.map((message) => ({ ...message, conversation_id: transcriptRowId })),
     handoff: handoffSummary === null ? null : {
       kind: 'historical' as const,
       predecessor_transcript_row_id: transcriptRowId,
