@@ -446,11 +446,10 @@ export function ChainPage() {
             await api.archiveChain(rootConvId);
             navigate('/');
           } catch (err) {
-            if (!notifyArchiveCloseConflict(rootConvId, err)) {
-              dispatch({
-                type: 'LOAD_FAIL',
-                error: err instanceof Error ? err.message : 'Failed to archive chain',
-              });
+            if (notifyArchiveCloseConflict(rootConvId, err)) {
+              navigate(`/c/${encodeURIComponent(rootConvId)}`);
+            } else {
+              showError(err instanceof Error ? err.message : 'Failed to archive chain');
             }
           }
         }}

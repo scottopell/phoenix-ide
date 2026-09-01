@@ -1549,7 +1549,7 @@ impl Database {
                    SELECT 1 FROM conversation_creation_jobs creation
                    WHERE creation.conversation_id = participant.id
                      AND (
-                       creation.status IN ('accepted', 'claimed', 'retry_scheduled', 'cancelling', 'deletion_pending')
+                       creation.status IN ('accepted', 'claimed', 'retry_scheduled', 'cancelling')
                        OR (creation.status = 'failed' AND EXISTS (
                          SELECT 1 FROM conversation_creation_resource_reservations reservation
                          WHERE reservation.job_id = creation.id AND reservation.status != 'released'

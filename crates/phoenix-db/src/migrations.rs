@@ -8090,6 +8090,11 @@ WHEN EXISTS (
     JOIN close_obligations obligation ON obligation.attempt_id = participant.attempt_id
     WHERE participant.conversation_id = OLD.id
       AND obligation.phase <> 'completed'
+      AND NOT EXISTS (
+        SELECT 1 FROM conversation_creation_jobs cleanup
+        WHERE cleanup.conversation_id = OLD.id
+          AND cleanup.status = 'deletion_pending'
+      )
 )
 BEGIN
     SELECT RAISE(ABORT, 'active Close rejects sealed participant deletion');
