@@ -1260,6 +1260,48 @@ impl SteeringBeginTestLatch {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Default)]
+pub(crate) struct SteeringCapacityTestControl {
+    blocked_conversations: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        >,
+    >,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl SteeringCapacityTestControl {
+    pub(crate) fn block_conversation(
+        &self,
+        conversation_id: impl Into<String>,
+        is_full: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        self.blocked_conversations
+            .lock()
+            .unwrap()
+            .insert(conversation_id.into(), is_full)
+    }
+
+    pub(crate) fn unblock_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        self.blocked_conversations
+            .lock()
+            .unwrap()
+            .remove(conversation_id)
+    }
+
+    fn conversation_is_blocked(&self, conversation_id: &str) -> bool {
+        self.blocked_conversations
+            .lock()
+            .unwrap()
+            .get(conversation_id)
+            .is_some_and(|is_full| is_full.load(std::sync::atomic::Ordering::SeqCst))
+    }
+}
+
 pub struct Database {
     pool: SqlitePool,
     sqlite_workload_collector: SqliteWorkloadCollector,
@@ -1274,6 +1316,8 @@ pub struct Database {
     pub(crate) close_foundation_test_latch: Option<std::sync::Arc<CloseFoundationTestLatch>>,
     #[cfg(test)]
     steering_begin_test_latch: Option<std::sync::Arc<SteeringBeginTestLatch>>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) steering_capacity_test_control: SteeringCapacityTestControl,
 }
 
 impl Clone for Database {
@@ -1291,6 +1335,8 @@ impl Clone for Database {
             close_foundation_test_latch: self.close_foundation_test_latch.clone(),
             #[cfg(test)]
             steering_begin_test_latch: self.steering_begin_test_latch.clone(),
+            #[cfg(any(test, feature = "test-support"))]
+            steering_capacity_test_control: self.steering_capacity_test_control.clone(),
         }
     }
 }
@@ -1513,12 +1559,35 @@ impl Database {
             close_foundation_test_latch: None,
             #[cfg(test)]
             steering_begin_test_latch: None,
+            #[cfg(any(test, feature = "test-support"))]
+            steering_capacity_test_control: SteeringCapacityTestControl::default(),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn from_pool_for_tests(pool: SqlitePool, path: String) -> Self {
         Self::new_with_generated_target_binding(pool, path, SqliteWorkloadCollector::new())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn test_block_steering_conversation(
+        &self,
+        conversation_id: impl Into<String>,
+        is_full: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        self.steering_capacity_test_control
+            .block_conversation(conversation_id, is_full)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn test_unblock_steering_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        self.steering_capacity_test_control
+            .unblock_conversation(conversation_id)
     }
 
     /// Re-tighten the on-disk DB file and its `-wal`/`-shm` sidecars to 0600.
@@ -6375,6 +6444,15 @@ impl Database {
         }
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         require_product_conversation_admission_tx(&mut tx, id).await?;
+
+        #[cfg(any(test, feature = "test-support"))]
+        if self
+            .steering_capacity_test_control
+            .conversation_is_blocked(id)
+        {
+            tx.rollback().await?;
+            return Err(DbError::SteeringQueueFull);
+        }
 
         let (queue_position, ordinal): (i64, i64) = sqlx::query_as(
             "SELECT COUNT(*), COALESCE(MAX(ordinal), -1) + 1

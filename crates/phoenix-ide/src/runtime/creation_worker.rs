@@ -494,22 +494,49 @@ async fn expand_product_creation_objective(
 }
 
 #[allow(clippy::too_many_lines)]
-async fn deliver_product_creation_objective(
+async fn enqueue_product_creation_objective(
+    manager: &Arc<RuntimeManager>,
+    conversation_id: &str,
+    event: Event,
+    request_fingerprint: String,
+) -> Result<(), String> {
+    manager
+        .enqueue_steer_message(conversation_id, event, &request_fingerprint)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn persist_retryable_delivery_failure(
     manager: &Arc<RuntimeManager>,
     claimed: &crate::db::ClaimedProductCreationJob,
-) -> Result<PublishedProductCreation, String> {
+    delivery_error: &str,
+) -> Result<String, String> {
+    manager
+        .db()
+        .schedule_product_creation_delivery_retry(
+            &claimed.job.request_id,
+            &claimed.claim,
+            delivery_error,
+            chrono::Utc::now(),
+        )
+        .await
+        .map_err(|db_error| {
+            format!("{delivery_error}; delivery retry persistence failed: {db_error}")
+        })?;
+    manager.kick_creation_worker();
+    Ok(delivery_error.to_string())
+}
+
+async fn complete_already_accepted_product_creation_delivery(
+    manager: &Arc<RuntimeManager>,
+    claimed: &crate::db::ClaimedProductCreationJob,
+    product_id: &phoenix_core::domain::close::ProductConversationId,
+    conversation_id: &str,
+) -> Result<Option<PublishedProductCreation>, String> {
     let job = &claimed.job;
-    let product_id = job
-        .published_product_id
-        .clone()
-        .ok_or_else(|| "delivery obligation lacked product id".to_string())?;
-    let conversation_id = job
-        .published_conversation_id
-        .clone()
-        .ok_or_else(|| "delivery obligation lacked conversation id".to_string())?;
     let steering_fingerprint = manager
         .db()
-        .get_steering_acceptance_fingerprint(&conversation_id, &job.request_id)
+        .get_steering_acceptance_fingerprint(conversation_id, &job.request_id)
         .await
         .map_err(|error| error.to_string())?;
     if let Some(exact_fingerprint) = steering_fingerprint.as_ref().filter(|fingerprint| {
@@ -543,11 +570,37 @@ async fn deliver_product_creation_objective(
                     "product creation delivery claim was lost before completion".to_string()
                 );
             }
-            return Ok(PublishedProductCreation {
+            return Ok(Some(PublishedProductCreation {
                 product_conversation_id: product_id.to_string(),
-                transcript_row_id: conversation_id,
-            });
+                transcript_row_id: conversation_id.to_string(),
+            }));
         }
+    }
+    Ok(None)
+}
+
+async fn deliver_product_creation_objective(
+    manager: &Arc<RuntimeManager>,
+    claimed: &crate::db::ClaimedProductCreationJob,
+) -> Result<PublishedProductCreation, String> {
+    let job = &claimed.job;
+    let product_id = job
+        .published_product_id
+        .clone()
+        .ok_or_else(|| "delivery obligation lacked product id".to_string())?;
+    let conversation_id = job
+        .published_conversation_id
+        .clone()
+        .ok_or_else(|| "delivery obligation lacked conversation id".to_string())?;
+    if let Some(completed) = complete_already_accepted_product_creation_delivery(
+        manager,
+        claimed,
+        &product_id,
+        &conversation_id,
+    )
+    .await?
+    {
+        return Ok(completed);
     }
     let images = job
         .intent
@@ -562,7 +615,8 @@ async fn deliver_product_creation_objective(
         expand_product_creation_objective(manager, &conversation_id, &job.intent.objective).await?;
     let enqueue_result = tokio::time::timeout(
         std::time::Duration::from_secs(15),
-        manager.enqueue_steer_message(
+        enqueue_product_creation_objective(
+            manager,
             &conversation_id,
             Event::SteerMessage {
                 text: expanded.display_text,
@@ -573,46 +627,20 @@ async fn deliver_product_creation_objective(
                 user_agent: None,
                 skill_invocation: expanded.skill_invocation,
             },
-            &format!("product-create:{}", job.request_id),
+            format!("product-create:{}", job.request_id),
         ),
     )
     .await;
     if let Err(error) = enqueue_result {
-        let delivery_error =
-            format!("product creation objective delivery timed out after 15 seconds: {error}");
-        manager
-            .db()
-            .schedule_product_creation_delivery_retry(
-                &job.request_id,
-                &claimed.claim,
-                &delivery_error,
-                chrono::Utc::now(),
-            )
-            .await
-            .map_err(|db_error| {
-                format!(
-                    "delivery acceptance timed out; delivery retry persistence failed: {db_error}"
-                )
-            })?;
-        manager.kick_creation_worker();
-        return Err(delivery_error);
+        return Err(persist_retryable_delivery_failure(
+            manager,
+            claimed,
+            &format!("product creation objective delivery timed out after 15 seconds: {error}"),
+        )
+        .await?);
     }
     if let Err(error) = enqueue_result.expect("checked timeout above") {
-        let delivery_error = error.to_string();
-        manager
-            .db()
-            .schedule_product_creation_delivery_retry(
-                &job.request_id,
-                &claimed.claim,
-                &delivery_error,
-                chrono::Utc::now(),
-            )
-            .await
-            .map_err(|db_error| {
-                format!("{error}; delivery retry persistence failed: {db_error}")
-            })?;
-        manager.kick_creation_worker();
-        return Err(delivery_error);
+        return Err(persist_retryable_delivery_failure(manager, claimed, &error.clone()).await?);
     }
     let completed = manager
         .db()
@@ -2770,6 +2798,345 @@ mod product_creation_delivery_replay_tests {
             spawned_from_conversation_id: None,
         }
     }
+    fn test_runtime_manager(db: Database) -> Arc<RuntimeManager> {
+        Arc::new(RuntimeManager::new(
+            db,
+            Arc::new(ModelRegistry::new_empty()),
+            PlatformCapability::None {
+                details: "test".to_string(),
+            },
+            Arc::new(McpClientManager::new()),
+            None,
+        ))
+    }
+
+    async fn seed_retry_identity_delivery(
+        db: &Database,
+        cwd: &str,
+        request_id: &str,
+        conversation_id: &str,
+    ) -> (
+        ProductCreationIntent,
+        phoenix_core::domain::close::ProductConversationId,
+        chrono::DateTime<chrono::Utc>,
+    ) {
+        let intent = ProductCreationIntent {
+            cwd: cwd.to_string(),
+            objective: "deliver objective".to_string(),
+            model: None,
+            effort: None,
+            images: Vec::new(),
+            llm_language: LlmLanguage::Caveman,
+        };
+        db.accept_product_creation(request_id, &intent)
+            .await
+            .unwrap();
+        let provisioning = db
+            .claim_product_creation(
+                request_id,
+                "provisioner",
+                "provision-token",
+                chrono::Utc::now(),
+                chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let accepted_product_id = provisioning.job.product_conversation_id.clone();
+        let publish_claim_lease_until = provisioning.claim.lease_until;
+        let conversation =
+            stale_delivery_conversation(conversation_id, &accepted_product_id, &intent.cwd);
+        assert!(db
+            .publish_product_creation_atomically(&ProductCreationPublishInput {
+                request_id: request_id.to_string(),
+                claim: provisioning.claim,
+                conversation,
+                authority_kind: AuthorityKind::Direct,
+                environment: EnvironmentContext::UnownedCwd {
+                    cwd: intent.cwd.clone(),
+                },
+                git_publication: None,
+            })
+            .await
+            .unwrap());
+        (intent, accepted_product_id, publish_claim_lease_until)
+    }
+
+    async fn claim_delivery_attempt(
+        db: &Database,
+        request_id: &str,
+        attempt_label: &str,
+        claim_time: chrono::DateTime<chrono::Utc>,
+    ) -> crate::db::ClaimedProductCreationJob {
+        db.claim_next_product_creation_delivery(
+            &format!("delivery-worker-{attempt_label}"),
+            &format!("delivery-token-{attempt_label}"),
+            claim_time,
+            chrono::Duration::minutes(5),
+        )
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("expected delivery claim for {request_id} at {claim_time}"))
+    }
+
+    async fn global_objective_artifact_counts(db: &Database, request_id: &str) -> (i64, i64) {
+        let committed_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE message_id = ?1")
+                .bind(request_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let queued_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM steering_messages WHERE message_id = ?1")
+                .bind(request_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        (committed_count, queued_count)
+    }
+    struct RetryIdentityExpectations {
+        job_count: i64,
+        product_count: i64,
+        artifact_delta: (i64, i64),
+        total_delta: i64,
+    }
+
+    async fn assert_retry_identity_job_state(
+        db: &Database,
+        request_id: &str,
+        conversation_id: &str,
+        accepted_product_id: &phoenix_core::domain::close::ProductConversationId,
+        expected_status: &str,
+    ) -> crate::db::ProductCreationJobRecord {
+        let job = db
+            .get_product_creation_job(request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.product_conversation_id, *accepted_product_id);
+        assert_eq!(job.published_product_id, Some(accepted_product_id.clone()));
+        assert_eq!(
+            job.published_conversation_id.as_deref(),
+            Some(conversation_id)
+        );
+        assert_eq!(job.last_error.as_deref(), Some("steering queue is full"));
+        assert_eq!(job.status, expected_status);
+        assert!(db
+            .get_steering_acceptance_fingerprint(conversation_id, request_id)
+            .await
+            .unwrap()
+            .is_none());
+        job
+    }
+
+    async fn assert_retry_identity_counts(
+        db: &Database,
+        request_id: &str,
+        expected_published_product_id: &phoenix_core::domain::close::ProductConversationId,
+        expected_published_conversation_id: &str,
+        expectations: RetryIdentityExpectations,
+    ) {
+        let job_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM product_creation_jobs")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let product_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM product_conversations")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let published_root_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)
+             FROM product_creation_jobs
+             WHERE published_product_id IS NOT NULL
+                OR published_conversation_id IS NOT NULL",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let transcript_count_for_request_publication: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)
+             FROM conversations
+             WHERE product_conversation_id = (
+                 SELECT published_product_id
+                 FROM product_creation_jobs
+                 WHERE request_id = ?1
+             )",
+        )
+        .bind(request_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let (committed_objective_count, queued_objective_count) =
+            global_objective_artifact_counts(db, request_id).await;
+        let published = db
+            .get_product_creation_job(request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job_count, expectations.job_count);
+        assert_eq!(product_count, expectations.product_count);
+        assert_eq!(published_root_count, 1);
+        assert_eq!(transcript_count_for_request_publication, 1);
+        assert_eq!(
+            published.published_product_id,
+            Some(expected_published_product_id.clone())
+        );
+        assert_eq!(
+            published.published_conversation_id.as_deref(),
+            Some(expected_published_conversation_id)
+        );
+        assert_eq!(
+            committed_objective_count + queued_objective_count,
+            expectations.total_delta
+        );
+        if expectations.artifact_delta != (-1, -1) {
+            assert_eq!(
+                (committed_objective_count, queued_objective_count),
+                expectations.artifact_delta
+            );
+        }
+    }
+
+    async fn exhaust_delivery_into_failed_state(
+        db: &Database,
+        manager: &Arc<RuntimeManager>,
+        request_id: &str,
+        conversation_id: &str,
+        accepted_product_id: &phoenix_core::domain::close::ProductConversationId,
+        first_claim_time: chrono::DateTime<chrono::Utc>,
+    ) -> chrono::DateTime<chrono::Utc> {
+        let mut claim_time = first_claim_time;
+        let mut last_delivery_lease_until = first_claim_time;
+        for attempt in 1..=4 {
+            let delivery =
+                claim_delivery_attempt(db, request_id, &attempt.to_string(), claim_time).await;
+            assert_eq!(
+                delivery.job.published_product_id,
+                Some(accepted_product_id.clone())
+            );
+            assert_eq!(
+                delivery.job.published_conversation_id.as_deref(),
+                Some(conversation_id)
+            );
+
+            let error = deliver_product_creation_objective(manager, &delivery)
+                .await
+                .unwrap_err();
+            assert_eq!(error, "steering queue is full");
+            last_delivery_lease_until = delivery.claim.lease_until;
+
+            let expected_status = if attempt < 4 {
+                "delivery_pending"
+            } else {
+                "delivery_failed"
+            };
+            let job = assert_retry_identity_job_state(
+                db,
+                request_id,
+                conversation_id,
+                accepted_product_id,
+                expected_status,
+            )
+            .await;
+
+            if attempt < 4 {
+                claim_time = job
+                    .delivery_retry_at
+                    .expect("retryable delivery failure schedules a next attempt")
+                    + chrono::Duration::seconds(1);
+            } else {
+                assert!(job.delivery_retry_at.is_none());
+            }
+        }
+        last_delivery_lease_until
+    }
+
+    async fn create_non_target_conversation_and_enqueue(
+        db: &Database,
+        manager: &Arc<RuntimeManager>,
+        cwd: &str,
+    ) {
+        let other_conversation_id = "conv-retry-other";
+        db.create_conversation(
+            other_conversation_id,
+            other_conversation_id,
+            cwd,
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        manager
+            .enqueue_steer_message(
+                other_conversation_id,
+                Event::SteerMessage {
+                    text: "non-target".to_string(),
+                    llm_text: None,
+                    images: Vec::new(),
+                    files: Vec::new(),
+                    message_id: "non-target-message".to_string(),
+                    user_agent: None,
+                    skill_invocation: None,
+                },
+                "product-create:non-target",
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn assert_explicit_retry_publish_success(
+        db: &Database,
+        manager: &Arc<RuntimeManager>,
+        request_id: &str,
+        conversation_id: &str,
+        accepted_product_id: &phoenix_core::domain::close::ProductConversationId,
+        claim_time: chrono::DateTime<chrono::Utc>,
+    ) {
+        let retried = claim_delivery_attempt(db, request_id, "explicit-retry", claim_time).await;
+        assert_eq!(retried.job.product_conversation_id, *accepted_product_id);
+        assert_eq!(
+            retried.job.published_product_id,
+            Some(accepted_product_id.clone())
+        );
+        assert_eq!(
+            retried.job.published_conversation_id.as_deref(),
+            Some(conversation_id)
+        );
+
+        let published = deliver_product_creation_objective(manager, &retried)
+            .await
+            .unwrap();
+        assert_eq!(
+            published.product_conversation_id,
+            accepted_product_id.to_string()
+        );
+        assert_eq!(published.transcript_row_id, conversation_id);
+
+        let completed = db
+            .get_product_creation_job(request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.status, "published");
+        assert_eq!(completed.product_conversation_id, *accepted_product_id);
+        assert_eq!(
+            completed.published_product_id,
+            Some(accepted_product_id.clone())
+        );
+        assert_eq!(
+            completed.published_conversation_id.as_deref(),
+            Some(conversation_id)
+        );
+        assert_eq!(
+            db.get_steering_acceptance_fingerprint(conversation_id, request_id)
+                .await
+                .unwrap(),
+            Some(phoenix_db::SteeringAcceptanceFingerprint::Exact(
+                "product-create:req-retry-identities".to_string()
+            ))
+        );
+    }
 
     #[tokio::test]
     async fn initial_objective_expands_against_published_conversation_root() {
@@ -2910,6 +3277,96 @@ mod product_creation_delivery_replay_tests {
             .unwrap();
         assert_eq!(still_pending.status, "delivery_pending");
         assert!(db.get_conversation(conversation_id).await.unwrap().archived);
+    }
+
+    #[tokio::test]
+    async fn explicit_retry_after_queue_full_reuses_published_identities_without_duplicate_aggregate(
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().to_string_lossy().to_string();
+        let db = Database::open_in_memory().await.unwrap();
+        let request_id = "req-retry-identities";
+        let conversation_id = "conv-retry-identities";
+        let manager = test_runtime_manager(db.clone());
+        let (_intent, accepted_product_id, publish_claim_lease_until) =
+            seed_retry_identity_delivery(&db, &cwd, request_id, conversation_id).await;
+        let baseline_artifact_counts = global_objective_artifact_counts(&db, request_id).await;
+        assert_eq!(baseline_artifact_counts, (0, 0));
+        let baseline_job_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM product_creation_jobs")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let baseline_product_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM product_conversations")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let capacity_full = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let prior_capacity =
+            db.test_block_steering_conversation(conversation_id, Arc::clone(&capacity_full));
+        assert!(prior_capacity.is_none());
+
+        create_non_target_conversation_and_enqueue(&db, &manager, &cwd).await;
+
+        let last_delivery_lease_until = exhaust_delivery_into_failed_state(
+            &db,
+            &manager,
+            request_id,
+            conversation_id,
+            &accepted_product_id,
+            publish_claim_lease_until + chrono::Duration::seconds(1),
+        )
+        .await;
+
+        assert_retry_identity_counts(
+            &db,
+            request_id,
+            &accepted_product_id,
+            conversation_id,
+            RetryIdentityExpectations {
+                job_count: baseline_job_count,
+                product_count: baseline_product_count + 1,
+                artifact_delta: baseline_artifact_counts,
+                total_delta: 0,
+            },
+        )
+        .await;
+        assert!(db
+            .get_steering_acceptance_fingerprint(conversation_id, request_id)
+            .await
+            .unwrap()
+            .is_none());
+        capacity_full.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(db
+            .test_unblock_steering_conversation(conversation_id)
+            .is_some());
+        assert!(db
+            .retry_failed_product_creation_delivery(request_id)
+            .await
+            .unwrap());
+        assert_explicit_retry_publish_success(
+            &db,
+            &manager,
+            request_id,
+            conversation_id,
+            &accepted_product_id,
+            last_delivery_lease_until + chrono::Duration::seconds(1),
+        )
+        .await;
+        assert_retry_identity_counts(
+            &db,
+            request_id,
+            &accepted_product_id,
+            conversation_id,
+            RetryIdentityExpectations {
+                job_count: baseline_job_count,
+                product_count: baseline_product_count + 1,
+                artifact_delta: (-1, -1),
+                total_delta: 1,
+            },
+        )
+        .await;
     }
 }
 
