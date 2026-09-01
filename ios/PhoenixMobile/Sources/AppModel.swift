@@ -310,6 +310,34 @@ final class AppModel {
                 aggregateIdentity: aggregateIdentity))
     }
 
+    private func handleAggregateHardDeleted(aggregateId: String, transcriptRowId: String?) async {
+        let aggregateConversationIds = Set(listStore.transcriptToAggregate.compactMap { key, value in
+            value == aggregateId ? key : nil
+        }).union(Set([transcriptRowId].compactMap { $0 }))
+        let ownedSessions = aggregateConversationIds.compactMap { sessions.removeValue(forKey: $0) }
+        let ownedDrainSessions = aggregateConversationIds.compactMap { drainSessions.removeValue(forKey: $0) }
+        for session in ownedSessions { session.stop() }
+        for session in ownedDrainSessions { session.stop() }
+        productConversationDetails[aggregateId]?.stop()
+        productConversationDetails.removeValue(forKey: aggregateId)
+        listStore.remove(aggregateId: aggregateId)
+        if pendingOpenConversationId == transcriptRowId || pendingOpenConversationId == aggregateId {
+            pendingOpenConversationId = nil
+        }
+        UNUserNotificationCenter.current().removeDeliveredNotifications(
+            withIdentifiers: ["attention-\(aggregateId)"])
+        UNUserNotificationCenter.current().removePendingNotificationRequests(
+            withIdentifiers: ["attention-\(aggregateId)"])
+        for session in ownedSessions {
+            await session.clearCachedSnapshotAndWait()
+            await session.outbox.clearAndWait()
+        }
+        for session in ownedDrainSessions {
+            await session.clearCachedSnapshotAndWait()
+            await session.outbox.clearAndWait()
+        }
+    }
+
     private func handleHardDeleted(_ conversationId: String, aggregateIdentity: String?) {
         let notificationId: String
         if let aggregateIdentity {
@@ -457,6 +485,12 @@ final class AppModel {
             },
             persistedOutboxContents: { [weak self] transcriptRowId in
                 self?.persistedOutboxContents(for: transcriptRowId) ?? .empty
+            },
+            hasCachedSnapshot: { [weak self] transcriptRowId in
+                self?.hasCachedSnapshot(transcriptRowId) ?? false
+            },
+            handleDefinitiveNotFound: { [weak self] transcriptRowId in
+                await self?.handleAggregateHardDeleted(aggregateId: aggregateId, transcriptRowId: transcriptRowId)
             },
             onConfigurationInvalidated: { [weak self] in
                 self?.productConversationDetails.removeValue(forKey: aggregateId)
