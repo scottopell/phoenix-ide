@@ -13451,6 +13451,43 @@ pub(crate) mod hard_delete_cascade_tests {
     }
 
     #[tokio::test]
+    async fn compatibility_archive_retry_does_not_restart_close_for_history() {
+        let state = make_test_state().await;
+        let root = state
+            .db
+            .create_conversation(
+                "history-close-retry",
+                "history-close-retry",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1",
+        )
+        .bind(root.product_conversation_id.as_str())
+        .execute(state.db.pool())
+        .await
+        .unwrap();
+
+        let result = archive_conversation(State(state.clone()), Path(root.id)).await;
+        assert!(
+            matches!(result, Err(AppError::Conflict(detail)) if detail.error_type == "close_start_failed")
+        );
+        let attempts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_obligations WHERE product_conversation_id = ?1",
+        )
+        .bind(root.product_conversation_id.as_str())
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(attempts, 0);
+    }
+
+    #[tokio::test]
     async fn compatibility_archive_rejects_durable_coordinator() {
         let state = make_test_state().await;
         let coordinator = state

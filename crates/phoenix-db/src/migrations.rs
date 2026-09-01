@@ -8082,6 +8082,18 @@ CREATE TABLE close_attempt_participants (
     FOREIGN KEY (conversation_id, product_conversation_id)
         REFERENCES conversations(id, product_conversation_id) ON DELETE CASCADE
 );
+CREATE TRIGGER conversations_reject_sealed_participant_delete
+BEFORE DELETE ON conversations
+WHEN EXISTS (
+    SELECT 1
+    FROM close_attempt_participants participant
+    JOIN close_obligations obligation ON obligation.attempt_id = participant.attempt_id
+    WHERE participant.conversation_id = OLD.id
+      AND obligation.phase <> 'completed'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'active Close rejects sealed participant deletion');
+END;
 INSERT INTO close_attempt_participants (
     attempt_id, product_conversation_id, conversation_id, captured_at_unix_micros
 )

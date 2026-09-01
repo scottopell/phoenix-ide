@@ -1128,6 +1128,18 @@ impl Database {
             .await?
             .ok_or_else(|| DbError::CloseFoundationNotFound(product_conversation_id.to_string()))?;
         validate_begin_preconditions(&topology, expected_latest_transcript_id.as_str())?;
+        let lifecycle: Option<String> = sqlx::query_scalar(
+            "SELECT ordinary_lifecycle FROM product_conversations
+             WHERE id = ?1 AND kind = 'ordinary'",
+        )
+        .bind(product_conversation_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if lifecycle.as_deref() == Some("history") {
+            return Err(DbError::CloseFoundationConflict(format!(
+                "ProductConversation {product_conversation_id} is already in History"
+            )));
+        }
 
         if let Some(row) = sqlx::query(
             "SELECT attempt_id, product_conversation_id, phase, inspection_generation,
@@ -4893,6 +4905,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn begin_close_rejects_history_without_creating_second_attempt() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "history-retry").await;
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = 'history-retry'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let error = db
+            .begin_close_foundation(
+                &product_id("history-retry"),
+                &transcript_id("history-retry"),
+                "history-retry-attempt",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DbError::CloseFoundationConflict(_)));
+        let attempts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_obligations WHERE product_conversation_id = 'history-retry'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(attempts, 0);
+    }
+
+    #[tokio::test]
     async fn participant_snapshot_rejects_cross_product_identity() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "participant-a").await;
@@ -4918,6 +4959,47 @@ mod tests {
         .await
         .expect_err("cross-product participant identity must be rejected");
         assert!(error.to_string().contains("FOREIGN KEY constraint failed"));
+    }
+
+    #[tokio::test]
+    async fn active_participant_cannot_delete_but_completed_close_cascades_cleanup() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "delete-sealed").await;
+        db.begin_close_foundation(
+            &product_id("delete-sealed"),
+            &transcript_id("delete-sealed"),
+            "delete-sealed-attempt",
+        )
+        .await
+        .unwrap();
+
+        let error = sqlx::query("DELETE FROM conversations WHERE id = 'delete-sealed'")
+            .execute(db.pool())
+            .await
+            .expect_err("active sealed participant must be undeletable");
+        assert!(error
+            .to_string()
+            .contains("active Close rejects sealed participant deletion"));
+        sqlx::query(
+            "UPDATE close_obligations
+             SET phase = 'completed', completed_at = updated_at, close_outcome = 'cancelled'
+             WHERE attempt_id = 'delete-sealed-attempt'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM conversations WHERE id = 'delete-sealed'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let participants: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_attempt_participants
+             WHERE attempt_id = 'delete-sealed-attempt'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(participants, 0);
     }
 
     #[tokio::test]
