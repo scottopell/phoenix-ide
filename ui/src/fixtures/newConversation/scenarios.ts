@@ -62,7 +62,7 @@ export const newConversationScenarios = [
         published_product_conversation_id: null,
         llm_language: 'English',
         images: [{ media_type: 'image/png', data: 'fixture-image' }],
-        allowed_actions: ['retry_delivery'],
+        allowed_actions: [],
         last_error: null,
       },
     ],

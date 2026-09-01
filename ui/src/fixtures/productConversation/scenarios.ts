@@ -40,7 +40,6 @@ function segment(
   title: string,
   messages: ReturnType<typeof textMessage>[],
   handoffSummary: string | null,
-  handoffPredecessorTranscriptRowId?: string,
   handoffSuccessorTranscriptRowId?: string,
 ) {
   return {
@@ -51,7 +50,7 @@ function segment(
     messages,
     handoff: handoffSummary === null ? null : {
       kind: 'historical' as const,
-      predecessor_transcript_row_id: handoffPredecessorTranscriptRowId ?? transcriptRowId,
+      predecessor_transcript_row_id: transcriptRowId,
       successor_transcript_row_id: handoffSuccessorTranscriptRowId ?? transcriptRowId,
       continuation_message_id: `continue-${transcriptRowId}`,
       summary: handoffSummary,
@@ -95,11 +94,11 @@ function makeSnapshot(overrides: Partial<ProductConversationSnapshotView> = {}):
       segment(2, 'row-qa', 'Question answering', [
         textMessage('qa-1', 3, 'user', 'What are the invariants we must preserve?'),
         textMessage('qa-2', 4, 'agent', 'We must preserve the transcript ordering, source lineage, and Q&A history.'),
-      ], null),
+      ], FIXTURE_HANDOFF_SUMMARY, 'row-work'),
       segment(3, 'row-work', 'Implementation', [
         textMessage('work-1', 5, 'user', FIXTURE_SUCCESSOR_FIRST_MESSAGE),
         textMessage('work-2', 6, 'agent', 'I will add a deterministic ProductConversation Ladle fixture and keep the history read-only.', state('idle')),
-      ], FIXTURE_HANDOFF_SUMMARY, 'row-qa', 'row-work'),
+      ], null),
     ],
     before: null,
     has_older: false,
@@ -174,9 +173,8 @@ function makeLongSnapshot(): ProductConversationSnapshotView {
       `row-long-${segmentIndex + 1}`,
       `Stage ${segmentIndex + 1}`,
       messages,
-      segmentIndex === 1 ? FIXTURE_HANDOFF_SUMMARY : null,
-      segmentIndex === 1 ? 'row-long-1' : undefined,
-      segmentIndex === 1 ? 'row-long-2' : undefined,
+      segmentIndex === 0 ? FIXTURE_HANDOFF_SUMMARY : null,
+      segmentIndex === 0 ? 'row-long-2' : undefined,
     );
   });
 
@@ -243,11 +241,11 @@ export const productConversationScenarios = [
         segment(1, 'row-history-1', 'Historical root', [
           textMessage('history-1', 1, 'user', 'What happened before the handoff?'),
           textMessage('history-2', 2, 'agent', 'A prior worktree produced the approved task and was archived after handoff.'),
-        ], null),
+        ], FIXTURE_HANDOFF_SUMMARY, 'row-history-2'),
         segment(2, 'row-history-2', 'Historical continuation', [
           textMessage('history-3', 3, 'user', FIXTURE_SUCCESSOR_FIRST_MESSAGE),
           textMessage('history-4', 4, 'agent', 'History snapshots remain read-only even when Q&A history is visible.', state('terminal')),
-        ], FIXTURE_HANDOFF_SUMMARY, 'row-history-1', 'row-history-2'),
+        ], null),
       ],
     }),
     chain: makeChain({ archived: true }),
@@ -278,11 +276,11 @@ export const productConversationScenarios = [
         segment(1, 'row-mobile-history-1', 'Mobile history root', [
           textMessage('mobile-history-1', 1, 'user', 'Does mobile history stay read-only?'),
           textMessage('mobile-history-2', 2, 'agent', 'Yes. The shipped ProductConversation shell still shows chronology without mutation controls.'),
-        ], null),
+        ], FIXTURE_HANDOFF_SUMMARY, 'row-mobile-history-2'),
         segment(2, 'row-mobile-history-2', 'Mobile history continuation', [
           textMessage('mobile-history-3', 3, 'user', FIXTURE_SUCCESSOR_FIRST_MESSAGE),
           textMessage('mobile-history-4', 4, 'agent', 'The continuation remains read-only in History.', state('terminal')),
-        ], FIXTURE_HANDOFF_SUMMARY, 'row-mobile-history-1', 'row-mobile-history-2'),
+        ], null),
       ],
     }),
   },
