@@ -3,6 +3,11 @@ import XCTest
 @testable import PhoenixMobile
 
 final class ConversationListStoreTests: XCTestCase {
+    private struct LegacyCache: Codable {
+        var conversations: [Conversation]
+        var lastRefreshed: Date
+    }
+
     private func conversation(
         id: String,
         aggregateId: String? = nil,
@@ -139,6 +144,75 @@ final class ConversationListStoreTests: XCTestCase {
         XCTAssertEqual(store.aggregateId(forTranscriptRowId: "row-2"), "pc-1")
         XCTAssertEqual(store.conversations.count, 1)
         XCTAssertEqual(store.conversations.first?.id, "row-2")
+    }
+
+    @MainActor
+    func testTranscriptAliasPersistsAcrossFullRefreshReplacement() throws {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-list-tests-\(UUID().uuidString)")
+        let store = ConversationListStore()
+        store.upsert(try conversation(id: "row-1", aggregateId: "pc-1", title: "predecessor"))
+        let token = store.externalRefreshToken()
+
+        XCTAssertTrue(store.applyExternal([
+            try conversation(id: "row-2", aggregateId: "pc-1", title: "successor")
+        ], startedAt: token))
+
+        XCTAssertEqual(store.aggregateId(forTranscriptRowId: "row-1"), "pc-1")
+        XCTAssertEqual(store.aggregateId(forTranscriptRowId: "row-2"), "pc-1")
+        store.upsert(try conversation(id: "row-1", aggregateId: "pc-1", title: "late predecessor update"))
+
+        XCTAssertEqual(store.conversations.count, 1)
+        XCTAssertEqual(store.conversations.first?.aggregateIdentity, "pc-1")
+    }
+
+    @MainActor
+    func testTranscriptAliasPersistsAcrossColdRestartAfterReplacement() throws {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-list-tests-\(UUID().uuidString)")
+        let first = ConversationListStore()
+        first.upsert(try conversation(id: "row-1", aggregateId: "pc-1", title: "predecessor"))
+        let token = first.externalRefreshToken()
+        XCTAssertTrue(first.applyExternal([
+            try conversation(id: "row-2", aggregateId: "pc-1", title: "successor")
+        ], startedAt: token))
+
+        let reloaded = ConversationListStore()
+
+        XCTAssertEqual(reloaded.aggregateId(forTranscriptRowId: "row-1"), "pc-1")
+        XCTAssertEqual(reloaded.aggregateId(forTranscriptRowId: "row-2"), "pc-1")
+        XCTAssertEqual(reloaded.cachedTranscriptRowId(forAggregateId: "pc-1"), "row-2")
+        reloaded.upsert(try conversation(id: "row-1", aggregateId: "pc-1", title: "late predecessor update"))
+        XCTAssertEqual(reloaded.conversations.count, 1)
+        XCTAssertEqual(reloaded.conversations.first?.aggregateIdentity, "pc-1")
+    }
+
+    @MainActor
+    func testFullRefreshPreservesCanonicalTaskTitleAcrossRestart() throws {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-list-tests-\(UUID().uuidString)")
+        let seed = try JSONSerialization.data(withJSONObject: [
+            "id": "row-1",
+            "product_conversation_id": "pc-1",
+            "slug": "root",
+            "title": "Canonical",
+            "task_title": "Canonical Task",
+        ])
+        let seededConversation = try JSONDecoder().decode(Conversation.self, from: seed)
+        DiskStore.saveVersioned(
+            LegacyCache(conversations: [seededConversation], lastRefreshed: Date()),
+            name: "conversations",
+            version: 1)
+
+        let first = ConversationListStore()
+        let token = first.externalRefreshToken()
+        XCTAssertTrue(first.applyExternal([
+            try conversation(id: "row-2", aggregateId: "pc-1", title: "successor")
+        ], startedAt: token))
+
+        let reloaded = ConversationListStore()
+
+        XCTAssertEqual(reloaded.conversations.first?.task_title, "Canonical Task")
     }
 
     @MainActor

@@ -130,9 +130,10 @@ struct ConversationListView: View {
                 }
                 ForEach(model.listStore.conversations, id: \.aggregateIdentity) { conversation in
                     let transcriptRowId = conversation.transcriptRowIdentity
+                    let navigationId = model.navigationConversationId(for: conversation)
                     let isCoordinator = conversation.isCoordinator
                         || transcriptRowId == model.coordinatorConversationId
-                    NavigationLink(value: transcriptRowId) {
+                    NavigationLink(value: navigationId) {
                         ConversationRow(
                             conversation: conversation,
                             isCoordinator: isCoordinator)
@@ -164,7 +165,10 @@ struct ConversationListView: View {
     private func consumePendingNavigation() {
         guard let id = model.pendingOpenConversationId else { return }
         model.pendingOpenConversationId = nil
-        navPath = [id]
+        let aggregateId = model.listStore.aggregateId(forTranscriptRowId: id)
+        navPath = [model.resolvedNavigationConversationId(
+            aggregateId: aggregateId,
+            latestTranscriptRowId: id)]
     }
 
     /// Freshness note shown only when the cache is meaningfully stale.

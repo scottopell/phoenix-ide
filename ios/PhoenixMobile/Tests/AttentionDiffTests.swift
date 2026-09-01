@@ -148,6 +148,67 @@ final class AttentionDiffTests: XCTestCase {
     }
 
     @MainActor
+    func testLegacyTranscriptKeySnapshotMigratesOnceUsingAuthoritativeAggregateMapping() {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-attention-tests-\(UUID().uuidString)")
+        let legacy: [String: AttentionMonitor.Entry] = [
+            "row-1": AttentionMonitor.Entry(mode: "working", title: "fix login")
+        ]
+        DiskStore.saveVersioned(legacy, name: "attention-snapshot", version: 1)
+
+        let migrated = AttentionMonitor(
+            currentConversations: [
+                conv("row-1", aggregateId: "pc-1", mode: "working", title: "fix login")
+            ],
+            transcriptToAggregate: ["row-1": "pc-1"])
+
+        XCTAssertEqual(
+            migrated.snapshot,
+            ["pc-1": AttentionMonitor.Entry(mode: "working", title: "fix login")])
+        let reloaded = AttentionMonitor(currentConversations: [], transcriptToAggregate: [:])
+        XCTAssertEqual(reloaded.snapshot, migrated.snapshot)
+    }
+    @MainActor
+    func testLegacyTranscriptKeySnapshotQuarantinesUnresolvedEntriesWithoutRetry() {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-attention-tests-\(UUID().uuidString)")
+        DiskStore.saveVersioned(
+            ["row-1": AttentionMonitor.Entry(mode: "working", title: "fix login")],
+            name: "attention-snapshot",
+            version: 1)
+
+        let migrated = AttentionMonitor(currentConversations: [], transcriptToAggregate: [:])
+
+        XCTAssertEqual(migrated.snapshot, [:])
+        let reloaded = AttentionMonitor(
+            currentConversations: [
+                conv("row-1", aggregateId: "pc-1", mode: "working", title: "fix login")
+            ],
+            transcriptToAggregate: ["row-1": "pc-1"])
+        XCTAssertEqual(reloaded.snapshot, [:])
+    }
+
+    @MainActor
+    func testLegacyTranscriptKeySnapshotMigratesUsingPersistedAliasAfterRotation() {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-attention-tests-\(UUID().uuidString)")
+        DiskStore.saveVersioned(
+            ["row-1": AttentionMonitor.Entry(mode: "working", title: "fix login")],
+            name: "attention-snapshot",
+            version: 1)
+
+        let migrated = AttentionMonitor(
+            currentConversations: [
+                conv("row-2", aggregateId: "pc-1", mode: "working", title: "fix login")
+            ],
+            transcriptToAggregate: ["row-1": "pc-1", "row-2": "pc-1"])
+
+        XCTAssertEqual(
+            migrated.snapshot,
+            ["pc-1": AttentionMonitor.Entry(mode: "working", title: "fix login")])
+    }
+
+    @MainActor
     func testResetClearsTheInMemoryAndPersistedSnapshot() {
         DiskStore.baseDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("phoenix-attention-tests-\(UUID().uuidString)")
@@ -167,10 +228,11 @@ final class AttentionDiffTests: XCTestCase {
         let monitor = AttentionMonitor()
         monitor.seed(with: [conv("c1", mode: "working")])
 
-        let completed = await monitor.checkAndNotify(
-            [conv("c1", mode: "idle")], isCurrent: { false })
+        await monitor.refreshAndNotifyIfNeeded(
+            from: [conv("c1", mode: "idle")],
+            transcriptToAggregate: [:],
+            isCurrent: { false })
 
-        XCTAssertFalse(completed)
         XCTAssertEqual(monitor.snapshot, ["c1": entry("working")])
     }
 }

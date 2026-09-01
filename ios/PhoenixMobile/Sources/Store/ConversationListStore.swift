@@ -13,14 +13,26 @@ final class ConversationListStore {
     private(set) var lastError: String?
 
     private static let cacheName = "conversations"
-    private static let schemaVersion = 1
+    private static let schemaVersion = 2
 
-    private struct Cache: Codable {
+    private struct CacheV1: Codable {
         var conversations: [Conversation]
         var lastRefreshed: Date
     }
 
+    private struct Cache: Codable {
+        var conversations: [Conversation]
+        var transcriptToAggregate: [String: String]
+        var aggregateToCachedTranscript: [String: String]
+        var lastRefreshed: Date
+    }
+
+    private struct SnapshotMetadata: Decodable {
+        var conversation: Conversation?
+    }
+
     private(set) var transcriptToAggregate: [String: String] = [:]
+    private(set) var aggregateToCachedTranscript: [String: String] = [:]
 
     /// Reset invalidates an in-flight refresh. Row-level changes are folded
     /// into its result so the refresh can still update unrelated rows.
@@ -37,10 +49,21 @@ final class ConversationListStore {
 
     init() {
         if let cache = DiskStore.loadVersioned(
-            Cache.self, name: Self.cacheName, version: Self.schemaVersion) {
+            Cache.self, name: Self.cacheName, version: Self.schemaVersion)
+        {
             conversations = Self.sortedByUpdatedAt(Self.merging(cache.conversations, preserving: [:]))
             lastRefreshed = cache.lastRefreshed
-            rebuildTranscriptAliases()
+            rebuildIndexes(from: cache)
+            return
+        }
+        if let legacy = DiskStore.loadVersioned(
+            CacheV1.self, name: Self.cacheName, version: 1)
+        {
+            conversations = Self.sortedByUpdatedAt(Self.merging(legacy.conversations, preserving: [:]))
+            lastRefreshed = legacy.lastRefreshed
+            rebuildIndexesFromConversations()
+            hydrateIndexesFromSnapshots()
+            persistCache()
         }
     }
 
@@ -68,7 +91,6 @@ final class ConversationListStore {
             lastError = nil
         } catch {
             guard generation == startedGeneration else { return }
-            // Keep the cached list — stale data beats no data offline.
             lastError = (error as? APIError)?.errorDescription ?? error.localizedDescription
         }
     }
@@ -88,15 +110,92 @@ final class ConversationListStore {
         return Array(byId.values)
     }
 
-    private func rebuildTranscriptAliases() {
-        transcriptToAggregate = Dictionary(uniqueKeysWithValues: conversations.map {
-            ($0.transcriptRowIdentity, $0.aggregateIdentity)
+    private func rebuildIndexes(from cache: Cache) {
+        rebuildIndexesFromConversations()
+        for (transcriptId, aggregateId) in cache.transcriptToAggregate where aggregateExists(aggregateId) {
+            transcriptToAggregate[transcriptId] = aggregateId
+        }
+        for (aggregateId, transcriptId) in cache.aggregateToCachedTranscript where aggregateExists(aggregateId) {
+            aggregateToCachedTranscript[aggregateId] = transcriptId
+        }
+    }
+
+    private func rebuildIndexesFromConversations() {
+        transcriptToAggregate.removeAll(keepingCapacity: true)
+        aggregateToCachedTranscript.removeAll(keepingCapacity: true)
+        for conversation in conversations {
+            transcriptToAggregate[conversation.transcriptRowIdentity] = conversation.aggregateIdentity
+            aggregateToCachedTranscript[conversation.aggregateIdentity] = conversation.transcriptRowIdentity
+        }
+    }
+
+    private func aggregateExists(_ aggregateId: String) -> Bool {
+        conversations.contains { $0.aggregateIdentity == aggregateId }
+    }
+
+    private func hydrateIndexesFromSnapshots() {
+        for name in DiskStore.listNames(prefix: "conv-") {
+
+            guard let snapshot = DiskStore.loadVersioned(
+                SnapshotMetadata.self,
+                name: name,
+                version: 1),
+                let conversation = snapshot.conversation,
+                let aggregateId = conversation.product_conversation_id,
+                aggregateExists(aggregateId)
+            else { continue }
+            transcriptToAggregate[conversation.transcriptRowIdentity] = aggregateId
+            if ConversationSession.hasCachedSnapshot(conversationId: conversation.transcriptRowIdentity) {
+                aggregateToCachedTranscript[aggregateId] = conversation.transcriptRowIdentity
+            }
+        }
+    }
+
+    private func mergeCanonicalMetadata(into fresh: [Conversation]) -> [Conversation] {
+        let existingByAggregate = Dictionary(uniqueKeysWithValues: conversations.map {
+            ($0.aggregateIdentity, $0)
         })
+        return fresh.map { incoming in
+            guard let existing = existingByAggregate[incoming.aggregateIdentity] else {
+                return incoming
+            }
+            return Conversation(
+                id: incoming.id,
+                product_conversation_id: incoming.product_conversation_id,
+                slug: incoming.slug,
+                title: incoming.title,
+                model: incoming.model,
+                cwd: incoming.cwd,
+                created_at: incoming.created_at,
+                updated_at: incoming.updated_at,
+                message_count: incoming.message_count,
+                state: incoming.state,
+                state_updated_at: incoming.state_updated_at,
+                branch_name: incoming.branch_name,
+                task_title: existing.task_title,
+                archived: incoming.archived,
+                project_name: incoming.project_name,
+                conv_mode_label: incoming.conv_mode_label,
+                presentation_mode: incoming.presentation_mode,
+                requires_action: incoming.requires_action,
+                transcript_generation: incoming.transcript_generation,
+                runtime_role: incoming.runtime_role)
+        }
     }
 
     private func apply(_ fresh: [Conversation]) {
-        conversations = Self.sortedByUpdatedAt(fresh)
-        rebuildTranscriptAliases()
+        let priorAliases = transcriptToAggregate
+        let priorCached = aggregateToCachedTranscript
+        conversations = Self.sortedByUpdatedAt(mergeCanonicalMetadata(into: fresh))
+        rebuildIndexesFromConversations()
+        for (transcriptId, aggregateId) in priorAliases where aggregateExists(aggregateId) {
+            transcriptToAggregate[transcriptId] = aggregateId
+        }
+        for (aggregateId, cachedTranscriptId) in priorCached where aggregateExists(aggregateId) {
+            if ConversationSession.hasCachedSnapshot(conversationId: cachedTranscriptId) {
+                aggregateToCachedTranscript[aggregateId] = cachedTranscriptId
+            }
+        }
         lastRefreshed = Date()
         persistCache()
     }
@@ -137,6 +236,7 @@ final class ConversationListStore {
             }
             conversations.removeAll { $0.aggregateIdentity == aggregateIdentity }
             transcriptToAggregate = transcriptToAggregate.filter { $0.value != aggregateIdentity }
+            aggregateToCachedTranscript[aggregateIdentity] = nil
             persistCache()
             return
         }
@@ -145,6 +245,11 @@ final class ConversationListStore {
             upsertsDuringRefresh[aggregateIdentity] = conversation
         }
         transcriptToAggregate[conversation.transcriptRowIdentity] = aggregateIdentity
+        if ConversationSession.hasCachedSnapshot(conversationId: conversation.transcriptRowIdentity)
+            || aggregateToCachedTranscript[aggregateIdentity] == nil
+        {
+            aggregateToCachedTranscript[aggregateIdentity] = conversation.transcriptRowIdentity
+        }
         if let idx = conversations.firstIndex(where: { $0.aggregateIdentity == aggregateIdentity }) {
             conversations[idx] = conversation
         } else {
@@ -169,11 +274,33 @@ final class ConversationListStore {
         }
         conversations.removeAll { $0.aggregateIdentity == aggregateId }
         transcriptToAggregate = transcriptToAggregate.filter { $0.value != aggregateId }
+        aggregateToCachedTranscript[aggregateId] = nil
         persistCache()
     }
 
     func aggregateId(forTranscriptRowId transcriptRowId: String) -> String? {
         transcriptToAggregate[transcriptRowId]
+    }
+
+    func cachedTranscriptRowId(forAggregateId aggregateId: String) -> String? {
+        aggregateToCachedTranscript[aggregateId]
+    }
+
+    func cachedNavigationTranscriptRowId(forAggregateId aggregateId: String, latestTranscriptRowId: String) -> String {
+        if ConversationSession.hasCachedSnapshot(conversationId: latestTranscriptRowId) {
+            return latestTranscriptRowId
+        }
+        if let cached = aggregateToCachedTranscript[aggregateId],
+           ConversationSession.hasCachedSnapshot(conversationId: cached)
+        {
+            return cached
+        }
+        for (transcriptId, mappedAggregateId) in transcriptToAggregate where mappedAggregateId == aggregateId {
+            if ConversationSession.hasCachedSnapshot(conversationId: transcriptId) {
+                return transcriptId
+            }
+        }
+        return latestTranscriptRowId
     }
 
     func removeByTranscriptRowId(_ transcriptRowId: String) {
@@ -183,11 +310,6 @@ final class ConversationListStore {
         remove(aggregateId: aggregateId)
     }
 
-    /// Drop in-memory state after the disk cache is cleared (or the user
-    /// signs out). Without this the long-lived store keeps showing
-    /// supposedly-deleted rows until a successful refresh. Also invalidates
-    /// any in-flight refresh so its late response can't repopulate the
-    /// cleared cache with the previous server's data.
     func reset() {
         generation += 1
         refreshToken = nil
@@ -196,6 +318,7 @@ final class ConversationListStore {
         exclusionsDuringRefresh.removeAll()
         conversations = []
         transcriptToAggregate = [:]
+        aggregateToCachedTranscript = [:]
         lastRefreshed = nil
         lastError = nil
     }
@@ -203,7 +326,11 @@ final class ConversationListStore {
     private func persistCache() {
         guard let lastRefreshed else { return }
         DiskStore.saveVersioned(
-            Cache(conversations: conversations, lastRefreshed: lastRefreshed),
+            Cache(
+                conversations: conversations,
+                transcriptToAggregate: transcriptToAggregate,
+                aggregateToCachedTranscript: aggregateToCachedTranscript,
+                lastRefreshed: lastRefreshed),
             name: Self.cacheName,
             version: Self.schemaVersion)
     }

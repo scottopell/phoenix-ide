@@ -105,6 +105,11 @@ struct StateDetailView: View {
             acceptsActions: session.acceptsConversationActions,
             busy: session.actionInFlight != nil,
             convState: session.convState,
+            resolveNavigation: { successorConversationId in
+                model.resolvedNavigationConversationId(
+                    aggregateId: model.listStore.aggregateId(forTranscriptRowId: successorConversationId),
+                    latestTranscriptRowId: successorConversationId)
+            },
             onAction: { session.perform($0) })
     }
 }
@@ -117,6 +122,7 @@ struct StateDetailBody: View {
     let acceptsActions: Bool
     let busy: Bool
     let convState: JSONValue?
+    let resolveNavigation: (String) -> String
     let onAction: (ConversationAction) -> Void
     @State private var confirmEmptyQuestionDismissal = false
 
@@ -223,7 +229,7 @@ struct StateDetailBody: View {
 
         case .handedOff(let successorConversationId):
             if let successorConversationId {
-                NavigationLink(value: successorConversationId) {
+                NavigationLink(value: resolveNavigation(successorConversationId)) {
                     Label("Open new conversation", systemImage: "arrow.right.circle")
                 }
                 .font(.callout.bold())

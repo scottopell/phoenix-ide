@@ -58,8 +58,10 @@ final class AppModel {
         serverURLString = UserDefaults.standard.string(forKey: Self.serverURLKey) ?? ""
         password = Keychain.password(account: Self.passwordAccount) ?? ""
         trustSelfSigned = UserDefaults.standard.object(forKey: Self.trustSelfSignedKey) as? Bool ?? true
+        attention = AttentionMonitor(
+            currentConversations: listStore.conversations,
+            transcriptToAggregate: listStore.transcriptToAggregate)
         rebuildAPI()
-        adoptCoordinatorIdentityFromList()
         _ = connectivity.addRestoreObserver { [weak self] in
             self?.drainPersistedOutboxes()
             Task { await self?.refreshList() }
@@ -138,7 +140,7 @@ final class AppModel {
             state: liveUpdate.state,
             state_updated_at: liveUpdate.state_updated_at,
             branch_name: liveUpdate.branch_name,
-            task_title: liveUpdate.task_title,
+            task_title: existing.task_title,
             archived: existing.archived,
             project_name: liveUpdate.project_name,
             conv_mode_label: liveUpdate.conv_mode_label,
@@ -185,16 +187,17 @@ final class AppModel {
         attentionEvidenceGeneration &+= 1
         await listStore.refresh(api: api)
         if listStore.lastError == nil {
-            adoptCoordinatorIdentityFromList()
             // The user is looking at fresh data — nothing here should nudge
             // them later.
-            attention.seed(with: listStore.conversations)
+            attention.seed(
+                with: listStore.conversations,
+                transcriptToAggregate: listStore.transcriptToAggregate)
         }
     }
 
     // MARK: - Needs-attention nudges
 
-    let attention = AttentionMonitor()
+    let attention: AttentionMonitor
     private let notificationRouter = NotificationRouter()
     private static let nudgesEnabledKey = "phoenix.backgroundNudges"
     private var nudgePreferenceGeneration = 0
@@ -205,6 +208,25 @@ final class AppModel {
     private(set) var nudgeAuthorizationHint: String?
     /// Set by a notification tap; the list view navigates and clears it.
     var pendingOpenConversationId: String?
+
+    func resolvedNavigationConversationId(
+        aggregateId: String?,
+        latestTranscriptRowId: String
+    ) -> String {
+        if connectivity.isOnline {
+            return latestTranscriptRowId
+        }
+        guard let aggregateId else { return latestTranscriptRowId }
+        return listStore.cachedNavigationTranscriptRowId(
+            forAggregateId: aggregateId,
+            latestTranscriptRowId: latestTranscriptRowId)
+    }
+
+    func navigationConversationId(for conversation: Conversation) -> String {
+        resolvedNavigationConversationId(
+            aggregateId: conversation.product_conversation_id,
+            latestTranscriptRowId: conversation.transcriptRowIdentity)
+    }
 
     func setBackgroundNudges(_ enabled: Bool) async {
         nudgePreferenceGeneration &+= 1
@@ -250,13 +272,18 @@ final class AppModel {
               listStore.canApplyExternal(startedAt: listToken)
         else { return false }
         guard listStore.applyExternal(fresh, startedAt: listToken) else { return false }
-        return await attention.checkAndNotify(fresh) { [weak self] in
+        let isCurrent: @MainActor () -> Bool = { [weak self] in
             guard let self else { return false }
             return self.backgroundNudgesEnabled
                 && self.apiGeneration == startedGeneration
                 && self.nudgePreferenceGeneration == startedNudgeGeneration
                 && self.attentionEvidenceGeneration == startedEvidenceGeneration
         }
+        await attention.refreshAndNotifyIfNeeded(
+            from: fresh,
+            transcriptToAggregate: listStore.transcriptToAggregate,
+            isCurrent: isCurrent)
+        return await isCurrent()
     }
 
     // MARK: - Coordinator
@@ -272,17 +299,6 @@ final class AppModel {
         return ConversationSession.hasCachedSnapshot(conversationId: id)
     }
 
-    private func adoptCoordinatorIdentityFromList() {
-        guard let coordinatorId = coordinatorConversationId else {
-            return
-        }
-        if listStore.conversations.contains(where: { $0.transcriptRowIdentity == coordinatorId }) {
-            return
-        }
-        if let session = sessions[coordinatorId]?.conversation ?? drainSessions[coordinatorId]?.conversation {
-            listStore.upsert(session)
-        }
-    }
 
     /// Resolve the Coordinator conversation to open. Online: get-or-create
     /// on the server (it's an ordinary conversation; everything downstream
