@@ -129,6 +129,8 @@ pub(crate) async fn approve_task(
     Path(id): Path<String>,
     body: Option<Json<TaskApprovalRequest>>,
 ) -> Result<Json<TaskApprovalResponse>, AppError> {
+    let admission = state.runtime.conversation_admission(&id).await;
+    let _admission_guard = admission.lock().await;
     // 1. Validate conversation exists and is in AwaitingTaskApproval state
     let conv = state
         .runtime
@@ -169,6 +171,8 @@ pub(crate) async fn reject_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
+    let admission = state.runtime.conversation_admission(&id).await;
+    let _admission_guard = admission.lock().await;
     // Validate conversation exists and is in AwaitingTaskApproval state
     let conv = state
         .runtime
@@ -204,6 +208,8 @@ pub(crate) async fn task_feedback(
     Path(id): Path<String>,
     Json(req): Json<TaskFeedbackRequest>,
 ) -> Result<Json<SuccessResponse>, AppError> {
+    let admission = state.runtime.conversation_admission(&id).await;
+    let _admission_guard = admission.lock().await;
     // Validate conversation exists and is in AwaitingTaskApproval state
     let conv = state
         .runtime

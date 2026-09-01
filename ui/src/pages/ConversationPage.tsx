@@ -711,9 +711,9 @@ function ConversationPageContent({
     () => deriveDisplayedPendingMessages(
       localPendingMessages,
       atom.steeringMessages,
-      atom.conversation?.archived === true,
+      terminallyUnavailable,
     ),
-    [atom.conversation?.archived, atom.steeringMessages, localPendingMessages],
+    [atom.steeringMessages, localPendingMessages, terminallyUnavailable],
   );
 
   const viewableMessages = atom.messages;
