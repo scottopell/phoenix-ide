@@ -1,6 +1,6 @@
 // Sync queue for handling offline operations
 
-import { api } from './api';
+import { api, ConflictError } from './api';
 import { cacheDB, type PendingOperation } from './cache';
 import { notifyArchiveCloseConflict } from './notifications';
 
@@ -14,13 +14,17 @@ export class SyncQueue {
         if (!op.payload.text && (op.payload.files || []).length === 0 && (op.payload.images || []).length === 0) {
           throw new Error('send_message requires text or attachments');
         }
-        await api.sendMessage(
-          op.conversationId,
-          op.payload.text || '',
-          op.payload.images || [],
-          op.payload.files || [],
-          op.payload.localId,
-        );
+        try {
+          await api.sendMessage(
+            op.conversationId,
+            op.payload.text || '',
+            op.payload.images || [],
+            op.payload.files || [],
+            op.payload.localId,
+          );
+        } catch (error) {
+          if (!(error instanceof ConflictError && error.detail.error_type === 'target_unavailable')) throw error;
+        }
         break;
       }
       case 'archive':

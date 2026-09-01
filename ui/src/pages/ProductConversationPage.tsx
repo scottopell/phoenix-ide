@@ -592,7 +592,9 @@ function ProductConversationPageInner() {
   );
   const latestSlug = latestProjection?.slug ?? snapshot?.latest_transcript_row_id ?? null;
   const latestConversationId = latestProjection?.conversationId ?? snapshot?.latest_transcript_row_id ?? undefined;
-  const latestWorkScopeKey = latestProjection?.isArchived ? undefined : latestProjection?.conversation?.work_scope_key;
+  const latestWorkScopeKey = snapshot?.ordinary_lifecycle === 'open'
+    ? latestProjection?.conversation?.work_scope_key
+    : undefined;
   const aggregateWorkIdentity = snapshot?.work_identity ?? null;
   const transcriptView = {
     conversationId: latestConversationId ?? snapshot?.product_conversation_id ?? '',
@@ -831,6 +833,7 @@ function ProductConversationPageInner() {
                   suppressMessageViewerOwner
                   suppressTaskApprovalOwner={true}
                   ordinaryComposerEnabled={isOpen}
+                  aggregateLifecycleOpen={isOpen}
                   onProjectionChange={setLatestProjection}
                   onCloseCompleted={() => setSnapshotRetry((retry) => retry + 1)}
                 />

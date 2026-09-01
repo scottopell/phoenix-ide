@@ -196,6 +196,7 @@ export interface EmbeddedConversationProjection {
 interface EmbeddedConversationHostProps {
   suppressCanonicalization?: boolean;
   ordinaryComposerEnabled?: boolean;
+  aggregateLifecycleOpen?: boolean | undefined;
   suppressMessageViewerOwner?: boolean;
   suppressTaskApprovalOwner?: boolean;
   onProjectionChange?: (projection: EmbeddedConversationProjection | null) => void;
@@ -221,6 +222,7 @@ export function EmbeddedConversationPage({
   showTranscript = true,
   suppressCanonicalization = false,
   ordinaryComposerEnabled = true,
+  aggregateLifecycleOpen,
   onProjectionChange,
   suppressMessageViewerOwner = false,
   onCloseCompleted,
@@ -255,6 +257,7 @@ export function EmbeddedConversationPage({
         composerQuickAction={composerQuickAction}
         showTranscript={showTranscript}
         ordinaryComposerEnabled={ordinaryComposerEnabled}
+        aggregateLifecycleOpen={aggregateLifecycleOpen}
         suppressCanonicalization={suppressCanonicalization}
         suppressMessageViewerOwner={suppressMessageViewerOwner}
         suppressTaskApprovalOwner={suppressTaskApprovalOwner}
@@ -287,6 +290,7 @@ function ConversationPageContent({
   composerQuickAction,
   showTranscript,
   ordinaryComposerEnabled,
+  aggregateLifecycleOpen,
   suppressCanonicalization,
   onProjectionChange,
   suppressMessageViewerOwner,
@@ -298,6 +302,7 @@ function ConversationPageContent({
   composerQuickAction?: ComposerQuickAction | undefined;
   showTranscript: boolean;
   ordinaryComposerEnabled: boolean;
+  aggregateLifecycleOpen?: boolean | undefined;
   suppressCanonicalization: boolean;
   onProjectionChange?: (projection: EmbeddedConversationProjection | null) => void;
   suppressMessageViewerOwner: boolean;
@@ -330,7 +335,9 @@ function ConversationPageContent({
   const archiveStatusConfirmed =
     conversationId !== undefined && archiveStatusConfirmedConversationId === conversationId;
   const serverArchived = conversation?.archived === true;
-  const isArchived = serverArchived || !archiveStatusConfirmed;
+  const isArchived = aggregateLifecycleOpen === undefined
+    ? serverArchived || !archiveStatusConfirmed
+    : !aggregateLifecycleOpen;
   const confirmedLive = !!conversationId && archiveStatusConfirmed && !serverArchived;
   const prStatusHandle = useConversationPrStatus({
     conversationId: confirmedLive ? conversationId : undefined,

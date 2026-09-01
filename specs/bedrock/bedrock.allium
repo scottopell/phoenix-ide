@@ -211,6 +211,7 @@ entity CloseObligation {
         awaiting_loss_confirmation -> retirement_requested
         awaiting_loss_confirmation -> completed
         retirement_requested -> needs_repair
+        retirement_requested -> awaiting_retirement_inspection
         needs_repair -> awaiting_retirement_inspection
         retirement_requested -> completed
         needs_repair -> completed
