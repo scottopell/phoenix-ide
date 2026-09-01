@@ -205,7 +205,9 @@ struct FixtureConversationScreen: View {
                 }
                 if screen.connectionNote != nil {
                     ConnectionStateBody(
-                        connection: scenario.id == .loading ? .connecting : .waitingToRetry)
+                        connection: scenario.id == .loading
+                            ? .connecting
+                            : .waitingToRetry(nextAttempt: Date(timeIntervalSince1970: 1_735_786_800)))
                         .accessibilityIdentifier("fixture.connectionNote")
                 }
                 if let cacheNote = screen.cacheNote {
