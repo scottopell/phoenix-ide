@@ -110,6 +110,26 @@ final class ModelCompatibilityTests: XCTestCase {
         XCTAssertTrue(snapshot.has_older)
     }
 
+    func testProductConversationListRowMapsToTranscriptBackedConversation() throws {
+        let api = PhoenixAPI(
+            baseURL: URL(string: "https://phoenix.invalid")!,
+            password: nil,
+            allowSelfSigned: false)!
+        let row = try JSONDecoder().decode(
+            ProductConversationListRow.self,
+            from: Data(#"{"product_conversation_id":"pc-map","canonical_route":"/product-conversations/pc-map","canonical_root":{"transcript_row_id":"root-map","slug":"root-map","title":"Mapped"},"ordinary_lifecycle":"history","latest_transcript_row_id":"latest-map","updated_at":"2025-01-02T03:04:05Z","presentation":{"kind":"needs_action","display_name":"Mapped"}}"#.utf8))
+
+        let conversation = api.productConversationListRowToConversation(row)
+
+        XCTAssertEqual(conversation.id, "latest-map")
+        XCTAssertEqual(conversation.product_conversation_id, "pc-map")
+        XCTAssertEqual(conversation.aggregateIdentity, "pc-map")
+        XCTAssertEqual(conversation.transcriptRowIdentity, "latest-map")
+        XCTAssertEqual(conversation.archived, true)
+        XCTAssertEqual(conversation.presentation_mode, "needs_action")
+        XCTAssertEqual(conversation.requires_action, true)
+    }
+
     func testTranscriptRowConversationCarriesDistinctAggregateIdentity() throws {
         let conversation = try JSONDecoder().decode(
             Conversation.self,

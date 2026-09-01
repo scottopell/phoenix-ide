@@ -94,11 +94,17 @@ final class AppModel {
     func session(for conversationId: String) -> ConversationSession? {
         guard let api else { return nil }
         if let existing = sessions[conversationId] { return existing }
+        let aggregateIdentity = listStore.conversations.first(where: {
+            $0.transcriptRowIdentity == conversationId
+        })?.aggregateIdentity
         let onConversationUpdate: (Conversation) -> Void = { [weak self] conversation in
-            self?.listStore.upsert(conversation)
+            self?.handleSessionConversationUpdate(
+                conversation,
+                transcriptRowId: conversationId,
+                aggregateIdentity: aggregateIdentity)
         }
         let onHardDeleted: (String) -> Void = { [weak self] deletedId in
-            self?.handleHardDeleted(deletedId)
+            self?.handleHardDeleted(deletedId, aggregateIdentity: aggregateIdentity)
         }
         let session: ConversationSession
         if let draining = drainSessions.removeValue(forKey: conversationId) {
@@ -116,8 +122,26 @@ final class AppModel {
         return session
     }
 
-    private func handleHardDeleted(_ conversationId: String) {
-        listStore.removeByTranscriptRowId(conversationId)
+    private func handleSessionConversationUpdate(
+        _ conversation: Conversation,
+        transcriptRowId: String,
+        aggregateIdentity: String?
+    ) {
+        if let aggregateIdentity {
+            var aggregateConversation = conversation
+            aggregateConversation.product_conversation_id = aggregateIdentity
+            listStore.upsert(aggregateConversation)
+            return
+        }
+        listStore.upsert(conversation)
+    }
+
+    private func handleHardDeleted(_ conversationId: String, aggregateIdentity: String?) {
+        if let aggregateIdentity {
+            listStore.remove(aggregateId: aggregateIdentity)
+        } else {
+            listStore.removeByTranscriptRowId(conversationId)
+        }
         if pendingOpenConversationId == conversationId {
             pendingOpenConversationId = nil
         }
@@ -218,11 +242,15 @@ final class AppModel {
     }
 
     private func adoptCoordinatorIdentityFromList() {
-        guard let coordinator = listStore.conversations.first(where: \.isCoordinator) else {
+        guard let coordinatorId = coordinatorConversationId else {
             return
         }
-        coordinatorConversationId = coordinator.id
-        UserDefaults.standard.set(coordinator.id, forKey: Self.coordinatorIdKey)
+        if listStore.conversations.contains(where: { $0.transcriptRowIdentity == coordinatorId }) {
+            return
+        }
+        if let session = sessions[coordinatorId]?.conversation ?? drainSessions[coordinatorId]?.conversation {
+            listStore.upsert(session)
+        }
     }
 
     /// Resolve the Coordinator conversation to open. Online: get-or-create
@@ -269,9 +297,10 @@ final class AppModel {
     @discardableResult
     func archive(conversationId: String) async -> Bool {
         guard ClientOperation.archive.policy == .onlineOnly else { return false }
-        let serverIdentifiesCoordinator = listStore.conversations.first {
-            $0.id == conversationId
-        }?.isCoordinator == true
+        let serverIdentifiesCoordinator = conversationId == coordinatorConversationId
+            || listStore.conversations.first {
+                $0.transcriptRowIdentity == conversationId
+            }?.isCoordinator == true
         guard conversationId != coordinatorConversationId, !serverIdentifiesCoordinator else {
             lastActionError = "The Coordinator is a permanent fleet conversation and can't be archived."
             return false

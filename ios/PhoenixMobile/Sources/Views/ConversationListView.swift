@@ -128,19 +128,20 @@ struct ConversationListView: View {
                             .listRowSeparator(.hidden)
                     }
                 }
-                ForEach(model.listStore.conversations) { conversation in
+                ForEach(model.listStore.conversations, id: \.aggregateIdentity) { conversation in
+                    let transcriptRowId = conversation.transcriptRowIdentity
                     let isCoordinator = conversation.isCoordinator
-                        || conversation.id == model.coordinatorConversationId
-                    NavigationLink(value: conversation.id) {
+                        || transcriptRowId == model.coordinatorConversationId
+                    NavigationLink(value: transcriptRowId) {
                         ConversationRow(
                             conversation: conversation,
                             isCoordinator: isCoordinator)
                     }
-                    .accessibilityIdentifier("conversationList.row.\(conversation.id)")
+                    .accessibilityIdentifier("conversationList.row.\(conversation.aggregateIdentity)")
                     .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                         if !isCoordinator {
                             Button {
-                                Task { await model.archive(conversationId: conversation.id) }
+                                Task { await model.archive(conversationId: transcriptRowId) }
                             } label: {
                                 Label("Archive", systemImage: "archivebox")
                             }
