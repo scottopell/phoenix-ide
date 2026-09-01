@@ -19,9 +19,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-#[cfg(test)]
-use std::sync::LazyLock;
-
 #[derive(Debug, Clone)]
 pub(crate) struct PublishedProductCreation {
     pub product_conversation_id: String,
@@ -29,22 +26,6 @@ pub(crate) struct PublishedProductCreation {
 }
 
 const PRODUCT_CREATION_OWNER_MARKER: &str = "phoenix-product-creation-owner";
-
-#[cfg(test)]
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct TestSteeringCapacityKey(String);
-
-#[cfg(test)]
-struct TestSteeringCapacityRegistration {
-    is_full: Arc<std::sync::atomic::AtomicBool>,
-}
-
-#[cfg(test)]
-static TEST_STEERING_CAPACITY: LazyLock<
-    std::sync::Mutex<
-        std::collections::HashMap<TestSteeringCapacityKey, TestSteeringCapacityRegistration>,
-    >,
-> = LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StagingOwnershipConflict {
@@ -519,21 +500,6 @@ async fn enqueue_product_creation_objective(
     event: Event,
     request_fingerprint: String,
 ) -> Result<(), String> {
-    #[cfg(test)]
-    {
-        let key = TestSteeringCapacityKey(request_fingerprint.clone());
-        let is_full = TEST_STEERING_CAPACITY
-            .lock()
-            .unwrap()
-            .get(&key)
-            .map(|registration| Arc::clone(&registration.is_full));
-        if let Some(is_full) = is_full {
-            if is_full.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err("steering queue is full".to_string());
-            }
-        }
-    }
-
     manager
         .enqueue_steer_message(conversation_id, event, &request_fingerprint)
         .await
@@ -2844,31 +2810,6 @@ mod product_creation_delivery_replay_tests {
         ))
     }
 
-    struct TestSteeringCapacityGuard {
-        key: TestSteeringCapacityKey,
-        prior: Option<TestSteeringCapacityRegistration>,
-    }
-
-    impl Drop for TestSteeringCapacityGuard {
-        fn drop(&mut self) {
-            let mut registrations = TEST_STEERING_CAPACITY.lock().unwrap();
-            if let Some(prior) = self.prior.take() {
-                registrations.insert(self.key.clone(), prior);
-            } else {
-                registrations.remove(&self.key);
-            }
-        }
-    }
-
-    fn install_test_steering_capacity(
-        key: TestSteeringCapacityKey,
-        is_full: Arc<std::sync::atomic::AtomicBool>,
-    ) -> TestSteeringCapacityGuard {
-        let mut registrations = TEST_STEERING_CAPACITY.lock().unwrap();
-        let prior = registrations.insert(key.clone(), TestSteeringCapacityRegistration { is_full });
-        TestSteeringCapacityGuard { key, prior }
-    }
-
     async fn seed_retry_identity_delivery(
         db: &Database,
         cwd: &str,
@@ -2953,6 +2894,12 @@ mod product_creation_delivery_replay_tests {
                 .unwrap();
         (committed_count, queued_count)
     }
+    struct RetryIdentityExpectations {
+        job_count: i64,
+        product_count: i64,
+        artifact_delta: (i64, i64),
+        total_delta: i64,
+    }
 
     async fn assert_retry_identity_job_state(
         db: &Database,
@@ -2987,8 +2934,7 @@ mod product_creation_delivery_replay_tests {
         request_id: &str,
         expected_published_product_id: &phoenix_core::domain::close::ProductConversationId,
         expected_published_conversation_id: &str,
-        expected_artifact_delta: (i64, i64),
-        expected_total_delta: i64,
+        expectations: RetryIdentityExpectations,
     ) {
         let job_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM product_creation_jobs")
             .fetch_one(db.pool())
@@ -3027,8 +2973,8 @@ mod product_creation_delivery_replay_tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(job_count, 1);
-        assert_eq!(product_count, 1);
+        assert_eq!(job_count, expectations.job_count);
+        assert_eq!(product_count, expectations.product_count);
         assert_eq!(published_root_count, 1);
         assert_eq!(transcript_count_for_request_publication, 1);
         assert_eq!(
@@ -3041,12 +2987,12 @@ mod product_creation_delivery_replay_tests {
         );
         assert_eq!(
             committed_objective_count + queued_objective_count,
-            expected_total_delta
+            expectations.total_delta
         );
-        if expected_artifact_delta != (-1, -1) {
+        if expectations.artifact_delta != (-1, -1) {
             assert_eq!(
                 (committed_objective_count, queued_objective_count),
-                expected_artifact_delta
+                expectations.artifact_delta
             );
         }
     }
@@ -3092,6 +3038,7 @@ mod product_creation_delivery_replay_tests {
                 expected_status,
             )
             .await;
+
             if attempt < 4 {
                 claim_time = job
                     .delivery_retry_at
@@ -3102,6 +3049,40 @@ mod product_creation_delivery_replay_tests {
             }
         }
         last_delivery_lease_until
+    }
+
+    async fn create_non_target_conversation_and_enqueue(
+        db: &Database,
+        manager: &Arc<RuntimeManager>,
+        cwd: &str,
+    ) {
+        let other_conversation_id = "conv-retry-other";
+        db.create_conversation(
+            other_conversation_id,
+            other_conversation_id,
+            cwd,
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        manager
+            .enqueue_steer_message(
+                other_conversation_id,
+                Event::SteerMessage {
+                    text: "non-target".to_string(),
+                    llm_text: None,
+                    images: Vec::new(),
+                    files: Vec::new(),
+                    message_id: "non-target-message".to_string(),
+                    user_agent: None,
+                    skill_invocation: None,
+                },
+                "product-create:non-target",
+            )
+            .await
+            .unwrap();
     }
 
     async fn assert_explicit_retry_publish_success(
@@ -3310,30 +3291,23 @@ mod product_creation_delivery_replay_tests {
         let (_intent, accepted_product_id, publish_claim_lease_until) =
             seed_retry_identity_delivery(&db, &cwd, request_id, conversation_id).await;
         let baseline_artifact_counts = global_objective_artifact_counts(&db, request_id).await;
-        let target_request_fingerprint =
-            TestSteeringCapacityKey(format!("product-create:{request_id}"));
+        assert_eq!(baseline_artifact_counts, (0, 0));
+        let baseline_job_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM product_creation_jobs")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let baseline_product_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM product_conversations")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
         let capacity_full = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let _capacity_guard = install_test_steering_capacity(
-            target_request_fingerprint.clone(),
-            Arc::clone(&capacity_full),
-        );
+        let prior_capacity =
+            db.test_block_steering_conversation(conversation_id, Arc::clone(&capacity_full));
+        assert!(prior_capacity.is_none());
 
-        enqueue_product_creation_objective(
-            &manager,
-            conversation_id,
-            Event::SteerMessage {
-                text: "non-target".to_string(),
-                llm_text: None,
-                images: Vec::new(),
-                files: Vec::new(),
-                message_id: "non-target-message".to_string(),
-                user_agent: None,
-                skill_invocation: None,
-            },
-            "product-create:non-target".to_string(),
-        )
-        .await
-        .unwrap();
+        create_non_target_conversation_and_enqueue(&db, &manager, &cwd).await;
 
         let last_delivery_lease_until = exhaust_delivery_into_failed_state(
             &db,
@@ -3350,11 +3324,23 @@ mod product_creation_delivery_replay_tests {
             request_id,
             &accepted_product_id,
             conversation_id,
-            baseline_artifact_counts,
-            baseline_artifact_counts.0 + baseline_artifact_counts.1,
+            RetryIdentityExpectations {
+                job_count: baseline_job_count,
+                product_count: baseline_product_count + 1,
+                artifact_delta: baseline_artifact_counts,
+                total_delta: 0,
+            },
         )
         .await;
+        assert!(db
+            .get_steering_acceptance_fingerprint(conversation_id, request_id)
+            .await
+            .unwrap()
+            .is_none());
         capacity_full.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(db
+            .test_unblock_steering_conversation(conversation_id)
+            .is_some());
         assert!(db
             .retry_failed_product_creation_delivery(request_id)
             .await
@@ -3373,8 +3359,12 @@ mod product_creation_delivery_replay_tests {
             request_id,
             &accepted_product_id,
             conversation_id,
-            (-1, -1),
-            baseline_artifact_counts.0 + baseline_artifact_counts.1 + 1,
+            RetryIdentityExpectations {
+                job_count: baseline_job_count,
+                product_count: baseline_product_count + 1,
+                artifact_delta: (-1, -1),
+                total_delta: 1,
+            },
         )
         .await;
     }

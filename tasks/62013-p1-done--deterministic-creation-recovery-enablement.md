@@ -1,6 +1,6 @@
 # Deterministic creation-recovery enablement
 
-Child of parent task 17003.
+Child of parent task 17001.
 
 Commission B: add deterministic creation-recovery coverage for ProductConversation creation without changing production behavior.
 
