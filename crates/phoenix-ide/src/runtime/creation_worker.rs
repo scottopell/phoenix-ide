@@ -2914,34 +2914,16 @@ mod product_creation_delivery_replay_tests {
 
     async fn assert_retry_identity_counts(
         db: &Database,
-        conversation_id: &str,
         accepted_product_id: &phoenix_core::domain::close::ProductConversationId,
+        request_id: &str,
         objective_message_count: i64,
         objective_queue_count: i64,
+        objective_total_count: i64,
     ) {
-        let product_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM product_conversations")
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
-        let conversation_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM conversations WHERE id = ?1")
-                .bind(conversation_id)
-                .fetch_one(db.pool())
-                .await
-                .unwrap();
-        let message_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1 AND message_id = ?2",
+        let transcript_count_for_product: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversations WHERE product_conversation_id = ?1",
         )
-        .bind(conversation_id)
-        .bind("req-retry-identities")
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-        let queue_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM steering_messages WHERE conversation_id = ?1 AND message_id = ?2",
-        )
-        .bind(conversation_id)
-        .bind("req-retry-identities")
+        .bind(accepted_product_id.as_str())
         .fetch_one(db.pool())
         .await
         .unwrap();
@@ -2951,11 +2933,38 @@ mod product_creation_delivery_replay_tests {
                 .fetch_one(db.pool())
                 .await
                 .unwrap();
-        assert_eq!(product_count, 1);
-        assert_eq!(conversation_count, 1);
-        assert_eq!(message_count, objective_message_count);
-        assert_eq!(queue_count, objective_queue_count);
+        let committed_objective_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)
+             FROM messages m
+             JOIN conversations c ON c.id = m.conversation_id
+             WHERE m.message_id = ?1
+               AND c.product_conversation_id = ?2",
+        )
+        .bind(request_id)
+        .bind(accepted_product_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let queued_objective_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)
+             FROM steering_messages s
+             JOIN conversations c ON c.id = s.conversation_id
+             WHERE s.message_id = ?1
+               AND c.product_conversation_id = ?2",
+        )
+        .bind(request_id)
+        .bind(accepted_product_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
         assert_eq!(product_row_count_for_id, 1);
+        assert_eq!(transcript_count_for_product, 1);
+        assert_eq!(committed_objective_count, objective_message_count);
+        assert_eq!(queued_objective_count, objective_queue_count);
+        assert_eq!(
+            committed_objective_count + queued_objective_count,
+            objective_total_count
+        );
     }
 
     async fn exhaust_delivery_into_failed_state(
@@ -3233,7 +3242,7 @@ mod product_creation_delivery_replay_tests {
         )
         .await;
 
-        assert_retry_identity_counts(&db, conversation_id, &accepted_product_id, 0, 0).await;
+        assert_retry_identity_counts(&db, &accepted_product_id, request_id, 0, 0, 0).await;
         assert!(db
             .retry_failed_product_creation_delivery(request_id)
             .await
@@ -3247,7 +3256,7 @@ mod product_creation_delivery_replay_tests {
             last_delivery_lease_until + chrono::Duration::seconds(1),
         )
         .await;
-        assert_retry_identity_counts(&db, conversation_id, &accepted_product_id, 0, 1).await;
+        assert_retry_identity_counts(&db, &accepted_product_id, request_id, 0, 1, 1).await;
     }
 }
 
