@@ -49,6 +49,7 @@ Adding a new scenario
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import contextlib
 import json
@@ -544,6 +545,28 @@ def _default_model(base_url: str) -> str:
     return model
 
 
+def _git_worktree_inventory() -> list[str]:
+    result = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    entries: list[str] = []
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            entries.append(line.removeprefix("worktree "))
+    return entries
+
+
+def _assert_git_worktrees_unchanged(before: list[str], after: list[str], context: str) -> None:
+    if before != after:
+        raise AssertionError(
+            f"git worktree leak during {context}: before={before!r} after={after!r}"
+        )
+
+
 def _new_conv(
     base_url: str,
     text: str,
@@ -575,6 +598,24 @@ def _cancel(base_url: str, conv_id: str) -> dict:
 
 def _get_conv(base_url: str, conv_id: str) -> dict:
     r = httpx.get(f"{base_url}/api/conversations/{conv_id}", timeout=10.0)
+    r.raise_for_status()
+    return r.json()
+
+
+def _get_product_conversation(base_url: str, reference: str) -> dict:
+    r = httpx.get(f"{base_url}/api/product-conversations/{reference}", timeout=10.0)
+    r.raise_for_status()
+    return r.json()
+
+
+def _get_product_conversation_route(base_url: str, reference: str) -> dict:
+    r = httpx.get(f"{base_url}/api/product-conversations/{reference}/route", timeout=10.0)
+    r.raise_for_status()
+    return r.json()
+
+
+def _list_product_conversations(base_url: str) -> dict:
+    r = httpx.get(f"{base_url}/api/product-conversations", timeout=10.0)
     r.raise_for_status()
     return r.json()
 
@@ -628,6 +669,36 @@ def _terminal_event(event_type: str, raw_data: str) -> bool:
         return presentation in ("idle", "done")
     if event_type == "agent_done":
         return True
+    if event_type == "error":
+        message = data.get("message") or raw_data or "(no data)"
+        raise RuntimeError(f"sse error: {message}")
+    return False
+
+
+def _context_exhausted_event(event_type: str, raw_data: str) -> bool:
+    if event_type == "ping":
+        return False
+
+    try:
+        data = json.loads(raw_data) if raw_data else {}
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            f"malformed JSON in SSE event {event_type!r}: {raw_data[:200]!r}"
+        ) from error
+
+    if event_type == "init":
+        conversation = data.get("conversation") or {}
+        state = _state_str(conversation.get("state"))
+        if state == "error":
+            state_data = conversation.get("state_data") or {}
+            raise RuntimeError(f"conversation error: {state_data.get('message')}")
+        return state == "context_exhausted"
+    if event_type == "state_change":
+        state = _state_str(data.get("state"))
+        if state == "error":
+            state_data = data.get("state_data") or {}
+            raise RuntimeError(f"conversation error: {state_data.get('message')}")
+        return state == "context_exhausted"
     if event_type == "error":
         message = data.get("message") or raw_data or "(no data)"
         raise RuntimeError(f"sse error: {message}")
@@ -821,6 +892,34 @@ def _send_chat_and_stream(
         diagnostic = _timeout_diagnostic(base_url, conv_id)
         raise TimeoutError(
             f"continuation SSE did not reach terminal in {timeout:g}s ({diagnostic})"
+        ) from error
+
+
+async def _wait_for_sse_signal_async(
+    base_url: str,
+    conv_id: str,
+    predicate,
+    timeout: float,
+) -> None:
+    stream_url = f"{base_url}/api/conversations/{conv_id}/stream"
+    transport_timeout = httpx.Timeout(connect=5.0, read=20.0, write=5.0, pool=5.0)
+    async with httpx.AsyncClient(timeout=transport_timeout) as client:
+        async with asyncio.timeout(timeout):
+            async with aconnect_sse(client, "GET", stream_url) as source:
+                source.response.raise_for_status()
+                async for event in source.aiter_sse():
+                    if predicate(event.event, event.data):
+                        return
+    raise RuntimeError("SSE stream closed before the expected signal arrived")
+
+
+def _wait_for_sse_signal(base_url: str, conv_id: str, predicate, timeout: float) -> None:
+    try:
+        asyncio.run(_wait_for_sse_signal_async(base_url, conv_id, predicate, timeout))
+    except (TimeoutError, httpx.TimeoutException) as error:
+        diagnostic = _timeout_diagnostic(base_url, conv_id)
+        raise TimeoutError(
+            f"SSE signal did not arrive in {timeout:g}s ({diagnostic})"
         ) from error
 
 
@@ -1025,7 +1124,176 @@ def scenario_continuation(base_url: str) -> None:
     text = _agent_text(final["messages"])
     assert "analyzed the situation" in text, "first turn's assistant text missing"
     assert "## Analysis" in text, "second turn's assistant text missing"
-    _assert_next_chat_is_accepted(base_url, conv["id"])
+    third_turn_message_count = _send_chat_and_stream(
+        base_url,
+        conv["id"],
+        "[[scenario:plain_text]] three",
+        SCENARIO_TIMEOUT_SECONDS,
+    )
+    _poll_to_idle_with_messages(
+        base_url,
+        conv["id"],
+        lambda messages: len(messages) >= third_turn_message_count,
+        "third-turn idle completion",
+        timeout=SCENARIO_TIMEOUT_SECONDS,
+    )
+
+
+def scenario_product_conversation_context_continuation(base_url: str) -> None:
+    worktrees_before = _git_worktree_inventory()
+    with tempfile.TemporaryDirectory(prefix="phoenix-e2e-product-cwd-") as temp_cwd:
+        create = httpx.post(
+            f"{base_url}/api/product-conversations/new",
+            json={
+                "cwd": temp_cwd,
+                "model": _default_model(base_url),
+                "objective": "[[scenario:context_window_exceeded]] exhaust naturally",
+                "images": [],
+                "request_id": str(uuid.uuid4()),
+            },
+            timeout=10.0,
+        )
+        create.raise_for_status()
+        created = create.json()
+        product_conversation_id = created["product_conversation_id"]
+        canonical_route = created["canonical_route"]
+        root_conv_id = created["transcript_row_id"]
+
+        assert canonical_route == f"/product-conversations/{product_conversation_id}", (
+            f"unexpected canonical route: {canonical_route!r}"
+        )
+
+        _wait_for_sse_signal(
+            base_url,
+            root_conv_id,
+            _context_exhausted_event,
+            SCENARIO_TIMEOUT_SECONDS,
+        )
+        exhausted = _get_conv(base_url, root_conv_id)
+        exhausted_state = _state_str(exhausted["conversation"]["state"])
+        assert exhausted_state == "context_exhausted", (
+            f"expected context_exhausted after mock scenario, got {exhausted_state}"
+        )
+        assert exhausted["conversation"].get("id") == root_conv_id, (
+            "root row identity changed unexpectedly during initial exhaustion"
+        )
+        assert exhausted["conversation"].get("continued_in_conv_id") is None, (
+            "root row should not yet point at a continuation"
+        )
+
+        handoff = "Continue with the same ProductConversation after natural context exhaustion."
+        continue_response = httpx.post(
+            f"{base_url}/api/conversations/{root_conv_id}/continue",
+            json={
+                "handoff": handoff,
+                "message_id": str(uuid.uuid4()),
+            },
+            timeout=10.0,
+        )
+        continue_response.raise_for_status()
+        continued = continue_response.json()
+        successor_id = continued["conversation_id"]
+        assert continued["status"] == "accepted", (
+            f"unexpected continue status: {continued!r}"
+        )
+        assert successor_id != root_conv_id, "continuation should create a successor row"
+
+        _wait_for_sse_signal(
+            base_url,
+            successor_id,
+            _terminal_event,
+            SCENARIO_TIMEOUT_SECONDS,
+        )
+
+        root_after = _get_conv(base_url, root_conv_id)
+        successor = _get_conv(base_url, successor_id)
+        assert root_after["conversation"].get("continued_in_conv_id") == successor_id, (
+            "root row did not point at the continuation successor"
+        )
+        assert successor["conversation"].get("id") == successor_id, (
+            "successor row identity changed unexpectedly"
+        )
+        assert successor["conversation"].get("continued_in_conv_id") is None, (
+            "successor should be the latest leaf row"
+        )
+        successor_state = _state_str(successor["conversation"]["state"])
+        assert successor_state == "idle", f"successor not idle after handoff: {successor_state}"
+        successor_agent_messages = [
+            message for message in successor["messages"] if message.get("message_type") == "agent"
+        ]
+        assert successor_agent_messages, "successor did not receive an opening handoff turn"
+
+        route_from_root = _get_product_conversation_route(base_url, root_conv_id)
+        route_from_successor = _get_product_conversation_route(base_url, successor_id)
+        assert route_from_root["transcript_row_id"] == root_conv_id, (
+            f"canonical route from root should resolve to root row, got {route_from_root!r}"
+        )
+        assert route_from_successor["transcript_row_id"] == root_conv_id, (
+            "canonical aggregate route should resolve successor references to the root row"
+        )
+
+        snapshot = _get_product_conversation(base_url, product_conversation_id)
+        assert snapshot["product_conversation_id"] == product_conversation_id
+        assert snapshot["canonical_route"] == canonical_route
+        assert snapshot["requested_transcript_row_id"] in {product_conversation_id, root_conv_id}, (
+            "snapshot requested reference should resolve from the aggregate or canonical root"
+        )
+        assert snapshot["canonical_root"]["transcript_row_id"] == root_conv_id, (
+            "canonical root row diverged from creation response"
+        )
+        assert snapshot["latest_transcript_row_id"] == successor_id, (
+            "aggregate latest row did not advance to the continuation successor"
+        )
+        assert snapshot["writable_transcript_row_id"] == successor_id, (
+            "aggregate writable row should be the latest successor"
+        )
+        handoffs = [
+            segment.get("handoff")
+            for segment in snapshot.get("segments", [])
+            if isinstance(segment, dict) and segment.get("handoff") is not None
+        ]
+        assert len(handoffs) == 1, (
+            f"expected exactly one typed continuation handoff, got {len(handoffs)}"
+        )
+        handoff_view = handoffs[0]
+        assert handoff_view.get("kind") == "completed", (
+            f"expected completed typed handoff, got {handoff_view!r}"
+        )
+        assert handoff_view.get("predecessor_transcript_row_id") == root_conv_id, (
+            f"unexpected handoff predecessor: {handoff_view!r}"
+        )
+        assert handoff_view.get("successor_transcript_row_id") == successor_id, (
+            f"unexpected handoff successor: {handoff_view!r}"
+        )
+
+        listed = _list_product_conversations(base_url)["product_conversations"]
+        matching = [row for row in listed if row.get("product_conversation_id") == product_conversation_id]
+        assert len(matching) == 1, (
+            f"expected exactly one ProductConversation list row for journey, got {len(matching)}"
+        )
+        row = matching[0]
+        assert row.get("canonical_route") == canonical_route
+        assert row.get("latest_transcript_row_id") == successor_id
+
+        probe_message_count = _send_chat_and_stream(
+            base_url,
+            successor_id,
+            "[[scenario:plain_text]] ownership release probe",
+            SCENARIO_TIMEOUT_SECONDS,
+        )
+        _poll_to_idle_with_messages(
+            base_url,
+            successor_id,
+            lambda messages: len(messages) >= probe_message_count,
+            "accepted ownership probe response",
+            timeout=SCENARIO_TIMEOUT_SECONDS,
+        )
+    worktrees_after = _git_worktree_inventory()
+    _assert_git_worktrees_unchanged(
+        worktrees_before,
+        worktrees_after,
+        "product_conversation_context_continuation",
+    )
 
 
 def scenario_mid_stream_cancel(base_url: str) -> None:
@@ -1167,10 +1435,48 @@ SCENARIOS = [
     ("read_file", scenario_read_file),
     ("patch", scenario_patch),
     ("continuation", scenario_continuation),
+    (
+        "product_conversation_context_continuation",
+        scenario_product_conversation_context_continuation,
+    ),
     ("mid_stream_cancel", scenario_mid_stream_cancel),
     ("image_roundtrip", scenario_image_roundtrip),
     ("perf_stream", scenario_perf_stream),
 ]
+
+
+SCENARIO_MAP = dict(SCENARIOS)
+
+
+def _parse_args(argv: list[str]):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--self-test", action="store_true")
+    parser.add_argument(
+        "--scenario",
+        action="append",
+        default=[],
+        help="Run only the named scenario. Repeat to run multiple named scenarios.",
+    )
+    parser.add_argument("positional", nargs="*")
+    args = parser.parse_args(argv)
+    if args.positional:
+        parser.error(f"unrecognized arguments: {' '.join(args.positional)}")
+    return args
+
+
+def _select_scenarios(names: list[str]) -> list[tuple[str, object]]:
+    if not names:
+        return SCENARIOS
+    seen: set[str] = set()
+    selected: list[tuple[str, object]] = []
+    for name in names:
+        if name in seen:
+            raise ValueError(f"duplicate --scenario selector: {name}")
+        if name not in SCENARIO_MAP:
+            raise ValueError(f"unknown scenario: {name}")
+        seen.add(name)
+        selected.append((name, SCENARIO_MAP[name]))
+    return selected
 
 
 class HarnessIsolationTests(unittest.TestCase):
@@ -1401,6 +1707,32 @@ class StartupRetryTests(unittest.TestCase):
         self.assertTrue(_is_addr_in_use("bind failed: Address already in use"))
         self.assertFalse(_is_addr_in_use("database migration failed"))
 
+
+class ScenarioSelectorTests(unittest.TestCase):
+    def test_select_scenarios_defaults_to_all(self):
+        self.assertEqual([name for name, _ in SCENARIOS], [name for name, _ in _select_scenarios([])])
+
+    def test_select_scenarios_picks_named_subset_in_order(self):
+        selected = _select_scenarios(["patch", "list_models"])
+        self.assertEqual(["patch", "list_models"], [name for name, _ in selected])
+
+    def test_select_scenarios_rejects_unknown(self):
+        with self.assertRaisesRegex(ValueError, "unknown scenario: nope"):
+            _select_scenarios(["nope"])
+
+    def test_select_scenarios_rejects_duplicates(self):
+        with self.assertRaisesRegex(ValueError, "duplicate --scenario selector: patch"):
+            _select_scenarios(["patch", "patch"])
+
+    def test_parse_args_accepts_repeated_scenario_flags(self):
+        args = _parse_args(["--scenario", "patch", "--scenario", "list_models"])
+        self.assertEqual(["patch", "list_models"], args.scenario)
+        self.assertFalse(args.self_test)
+
+    def test_parse_args_rejects_positional_arguments(self):
+        with self.assertRaises(SystemExit):
+            _parse_args(["product_conversation_context_continuation"])
+
     def test_retries_retryable_failures_and_returns_success(self):
         attempts: list[int] = []
         expected = object()
@@ -1441,21 +1773,30 @@ class StartupRetryTests(unittest.TestCase):
 def _run_self_tests() -> int:
     suite = unittest.TestSuite(
         unittest.defaultTestLoader.loadTestsFromTestCase(case)
-        for case in (HarnessIsolationTests, CpuProfilingTests, StartupRetryTests)
+        for case in (
+            HarnessIsolationTests,
+            CpuProfilingTests,
+            StartupRetryTests,
+            ScenarioSelectorTests,
+        )
     )
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     return 0 if result.wasSuccessful() else 1
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(sys.argv[1:] if argv is None else argv)
+    if args.self_test:
+        return _run_self_tests()
     if _run_self_tests() != 0:
         return 1
+    selected_scenarios = _select_scenarios(args.scenario)
     _build_binary()
     failures: list[tuple[str, str]] = []
     log_text = ""
     with _server() as (base_url, log_path, server_pid, profile_dir):
         print(f"[e2e] server up at {base_url}", flush=True)
-        for name, fn in SCENARIOS:
+        for name, fn in selected_scenarios:
             started_wall_ns = time.time_ns()
             started_monotonic_ns = time.monotonic_ns()
             started_harness_cpu = (
@@ -1546,11 +1887,11 @@ def main() -> int:
         print(f"\n✗ {len(failures)} e2e check(s) failed")
         return 1
     print(
-        f"\n✓ all {len(SCENARIOS)} e2e scenarios passed "
+        f"\n✓ all {len(selected_scenarios)} e2e scenarios passed "
         "(no external MCP or slow-statement WARNs)"
     )
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(_run_self_tests() if "--self-test" in sys.argv[1:] else main())
+    sys.exit(main())
