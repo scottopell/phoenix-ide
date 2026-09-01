@@ -7931,11 +7931,45 @@ mod migration_094_tests {
     }
 
     #[test]
-    fn lifecycle_cutover_preserves_cancel_intent_and_timestamp_contract() {
-        assert!(super::MIGRATION_095.contains("WHERE phase = 'cancel_requested_during_settlement'"));
-        assert!(super::MIGRATION_095.contains("phase = 'completed', close_outcome = 'cancelled'"));
+    fn lifecycle_cutover_preserves_timestamp_contract() {
         assert!(super::MIGRATION_095.contains("captured_at_unix_micros INTEGER NOT NULL"));
         assert!(super::MIGRATION_095.contains("CHECK (captured_at_unix_micros >= 0)"));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_cutover_preserves_cancellation_settlement_for_recovery() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE close_obligations (
+                 attempt_id TEXT PRIMARY KEY, phase TEXT NOT NULL, updated_at TEXT NOT NULL
+             );
+             INSERT INTO close_obligations VALUES
+                 ('settling', 'settling_active_work', 'before'),
+                 ('cancelling', 'cancel_requested_during_settlement', 'before');
+             UPDATE close_obligations
+             SET phase = 'awaiting_stop_work_confirmation', updated_at = 'after'
+             WHERE phase = 'settling_active_work';",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let phases = sqlx::query_as::<_, (String, String)>(
+            "SELECT attempt_id, phase FROM close_obligations ORDER BY attempt_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            phases,
+            vec![
+                (
+                    "cancelling".into(),
+                    "cancel_requested_during_settlement".into()
+                ),
+                ("settling".into(), "awaiting_stop_work_confirmation".into()),
+            ]
+        );
     }
 
     #[test]
@@ -7958,6 +7992,9 @@ mod migration_094_tests {
              CREATE TABLE conversations (
                  id TEXT PRIMARY KEY, product_conversation_id TEXT, runtime_role TEXT,
                  parent_conversation_id TEXT, continued_in_conv_id TEXT, archived INTEGER
+             );
+             CREATE TABLE product_creation_jobs (
+                 published_product_id TEXT, status TEXT NOT NULL
              );",
         )
         .execute(&pool)
@@ -7967,12 +8004,19 @@ mod migration_094_tests {
             "INSERT INTO product_conversations VALUES
                  ('open-product', 'ordinary', 'history'),
                  ('history-product', 'ordinary', 'open'),
+                 ('delivery-pending-product', 'ordinary', 'history'),
+                 ('published-history-product', 'ordinary', 'open'),
                  ('coordinator', 'coordinator', NULL);
              INSERT INTO conversations VALUES
                  ('open-row', 'open-product', 'user', NULL, NULL, 0),
                  ('history-row', 'history-product', 'user', NULL, NULL, 1),
                  ('subordinate', 'history-product', 'sub_agent', 'history-row', NULL, 0),
-                 ('coordinator-row', 'coordinator', 'coordinator', NULL, NULL, 0);",
+                 ('delivery-pending-row', 'delivery-pending-product', 'user', NULL, NULL, 1),
+                 ('published-history-row', 'published-history-product', 'user', NULL, NULL, 1),
+                 ('coordinator-row', 'coordinator', 'coordinator', NULL, NULL, 0);
+             INSERT INTO product_creation_jobs VALUES
+                 ('delivery-pending-product', 'delivery_pending'),
+                 ('published-history-product', 'published');",
         )
         .execute(&pool)
         .await
@@ -7987,6 +8031,10 @@ mod migration_094_tests {
                    AND latest.parent_conversation_id IS NULL
                    AND latest.continued_in_conv_id IS NULL
                    AND latest.archived = 0
+             ) OR EXISTS (
+                 SELECT 1 FROM product_creation_jobs job
+                 WHERE job.published_product_id = product_conversations.id
+                   AND job.status = 'delivery_pending'
              ) THEN 'open' ELSE 'history' END
              WHERE kind = 'ordinary'",
         )
@@ -8004,15 +8052,17 @@ mod migration_094_tests {
             products,
             vec![
                 ("coordinator".into(), None),
+                ("delivery-pending-product".into(), Some("open".into())),
                 ("history-product".into(), Some("history".into())),
                 ("open-product".into(), Some("open".into())),
+                ("published-history-product".into(), Some("history".into())),
             ]
         );
         let row_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversations")
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(row_count, 4);
+        assert_eq!(row_count, 6);
     }
 }
 
@@ -8058,11 +8108,6 @@ BEGIN
     SELECT RAISE(ABORT, 'close direct-turn settlement target must be a sealed active participant');
 END;
 DROP TRIGGER close_obligations_transition_graph;
-UPDATE close_obligations
-SET phase = 'completed', close_outcome = 'cancelled',
-    completed_at = STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now'),
-    updated_at = STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now')
-WHERE phase = 'cancel_requested_during_settlement';
 UPDATE close_obligations
 SET phase = 'awaiting_stop_work_confirmation',
     updated_at = STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now')
@@ -8113,7 +8158,7 @@ SET ordinary_lifecycle = CASE WHEN EXISTS (
 ) OR EXISTS (
     SELECT 1 FROM product_creation_jobs job
     WHERE job.published_product_id = product_conversations.id
-      AND job.status IN ('delivery_pending', 'published')
+      AND job.status = 'delivery_pending'
 ) THEN 'open' ELSE 'history' END
 WHERE kind = 'ordinary';
 ";

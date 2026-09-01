@@ -1080,7 +1080,7 @@ THE SYSTEM SHALL reconcile every ordinary ProductConversation lifecycle from tha
 AND SHALL preserve every ProductConversation, transcript member, message, and subordinate participant row during reconciliation
 AND SHALL leave coordinator lifecycle structurally inapplicable
 AND SHALL persist sealed Close participant capture time as a nonnegative INTEGER in an explicitly unit-named Unix-microseconds column under REQ-COMP-005
-AND SHALL preserve a durable cancel request across compatibility upgrade by completing that Close attempt with the cancelled outcome rather than resuming archival settlement
+AND SHALL preserve a durable cancel request across compatibility upgrade in its cancellation-settlement phase so recovery completes it with the cancelled outcome only after every owned authority releases
 
 **Rationale:** Aggregate identity, membership, navigation, lifecycle, and presentation are distinct from transcript-owned continuation edges and member execution authority. Keeping one authority for each prevents a transcript segment from becoming a second ProductConversation or lifecycle owner and prevents the aggregate from becoming a duplicate transcript, SSE, runtime, or provider-session authority.
 
