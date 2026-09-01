@@ -5279,6 +5279,23 @@ impl Database {
             tx.rollback().await?;
             return Err(DbError::Sqlx(sqlx::Error::RowNotFound));
         };
+        let active_close: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+               SELECT 1 FROM conversations conversation
+               JOIN close_obligations obligation
+                 ON obligation.product_conversation_id = conversation.product_conversation_id
+               WHERE conversation.id = ?1 AND obligation.phase <> 'completed'
+             )",
+        )
+        .bind(conversation_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if active_close {
+            tx.rollback().await?;
+            return Err(DbError::CloseFoundationConflict(
+                "active Close rejects conversation deletion".to_string(),
+            ));
+        }
         let result = sqlx::query(
             "UPDATE conversation_creation_jobs
              SET status = 'deletion_pending', generation = generation + 1,

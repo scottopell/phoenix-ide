@@ -883,8 +883,13 @@ impl WorkflowRepository {
                     durable_turns.prepared_payload
              FROM durable_turns
              JOIN conversations ON conversations.id = durable_turns.conversation_id
+             JOIN product_conversations product
+               ON product.id = conversations.product_conversation_id
              WHERE disposition = 'Runtime'
-               AND conversations.archived = 0
+               AND (
+                 (product.kind = 'ordinary' AND product.ordinary_lifecycle = 'open')
+                 OR (product.kind <> 'ordinary' AND conversations.archived = 0)
+               )
                AND terminal_kind IS NULL
                AND canonical_message_id IS NULL
                AND workflow_id IS NOT NULL

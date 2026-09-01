@@ -338,7 +338,11 @@ function ConversationPageContent({
   const isArchived = aggregateLifecycleOpen === undefined
     ? serverArchived || !archiveStatusConfirmed
     : !aggregateLifecycleOpen;
-  const confirmedLive = !!conversationId && archiveStatusConfirmed && !serverArchived;
+  const confirmedLive = !!conversationId && (
+    aggregateLifecycleOpen === undefined
+      ? archiveStatusConfirmed && !serverArchived
+      : aggregateLifecycleOpen
+  );
   const prStatusHandle = useConversationPrStatus({
     conversationId: confirmedLive ? conversationId : undefined,
     convModeLabel: conversation?.conv_mode_label,
