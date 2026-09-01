@@ -6,7 +6,7 @@ Provide a deterministic, background-oriented QA foundation for cataloging real n
 
 ## Dependencies
 
-Blocked by the shipped ProductConversation client contract and the native migration seam. Fixtures must model the new aggregate, not preserve transcript-row assumptions.
+Fixture-only work is independent of the native ProductConversation migration. The harness uses deterministic synthetic/current shipped payloads without asserting ProductConversation lifecycle, delete, provenance, live-routing, or persistence behavior. Core live migration may begin after this task's typed fixture contract seam is committed and reviewed.
 
 ## Scope
 
@@ -16,7 +16,7 @@ Blocked by the shipped ProductConversation client contract and the native migrat
 - Extend the existing `ios/PhoenixMobile/UITests/` and focused test seams without taking over the Mac's mouse or keyboard.
 - Define the fixture conventions that later renderer, grounding, and reader leaf tasks must extend alongside their components.
 
-Before implementation, split this umbrella into narrow fixture/catalog tasks.
+This task owns the bounded fixture host, renderer catalog, and no-server validation directly; it does not create child tasks.
 
 ## Acceptance
 

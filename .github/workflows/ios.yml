@@ -26,7 +26,7 @@ concurrency:
 
 jobs:
   test:
-    name: build + unit tests (simulator)
+    name: build + unit/fixture tests (simulator)
     runs-on: macos-15
     timeout-minutes: 30
     defaults:
@@ -54,7 +54,7 @@ jobs:
           echo "Using simulator: $DEVICE"
           echo "device=$DEVICE" >> "$GITHUB_OUTPUT"
 
-      - name: Build and test
+      - name: Build and test unit scheme
         run: |
           set -o pipefail
           xcodebuild test \
@@ -63,3 +63,23 @@ jobs:
             -destination "platform=iOS Simulator,name=${{ steps.sim.outputs.device }}" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGN_IDENTITY=""
+
+      - name: Test no-server fixture scheme
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -project PhoenixMobile.xcodeproj \
+            -scheme PhoenixMobileFixtures \
+            -destination "platform=iOS Simulator,name=${{ steps.sim.outputs.device }}" \
+            -resultBundlePath PhoenixMobileFixtures.xcresult \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY=""
+
+      - name: Upload fixture inspection results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-fixture-results
+          path: ios/PhoenixMobile/PhoenixMobileFixtures.xcresult
+          if-no-files-found: error
+          retention-days: 14

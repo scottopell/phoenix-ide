@@ -6,17 +6,17 @@ Make the native client consume the stable ProductConversation aggregate instead 
 
 ## Unblocking evidence
 
-Begin only after the ProductConversation History/delete stack and its client-facing contract are on main. The contract must define durable root identity, Open/History projection, unified transcript boundaries, live-target routing, SSE identity, and supported actions.
+Begin only after task 04005's deterministic fixture contract seam is committed and reviewed. Consume the shipped ProductConversation REST aggregate and existing ordinary transcript-row REST/SSE contracts. Permanent delete, follow-up/source retrieval, grounding, and comments are not prerequisites.
 
 ## Scope
 
 - Re-ground `ios/PhoenixMobile/Sources/API/` against the shipped REST/SSE contract.
-- Re-key list, navigation, snapshots, sessions, and outboxes in `ios/PhoenixMobile/Sources/Store/` to the correct aggregate/member identities.
+- Re-key user-facing list, navigation, and aggregate snapshots to ProductConversation identity while retaining transcript-row ownership for sessions, SSE, caches, and outboxes.
 - Adapt `ios/PhoenixMobile/Sources/Views/` to one ProductConversation entry and one chronological transcript.
 - Preserve offline-first durability, idempotent sends, and certificate behavior.
 - Add focused contract tests and extend the live simulator journey.
 
-Before implementation, split this umbrella into narrow leaf tasks against the exact shipped contract.
+Implement under this umbrella unless two concurrently scheduled workers have genuinely separate source ownership; in that case create at most two leaves for the approved REST/list and live-delegation/composition slices.
 
 ## Acceptance
 
