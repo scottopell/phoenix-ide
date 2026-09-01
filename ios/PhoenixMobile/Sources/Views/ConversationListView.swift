@@ -18,7 +18,10 @@ struct ConversationListView: View {
             }
             .navigationTitle("Conversations")
             .navigationDestination(for: String.self) { conversationId in
-                if let session = model.session(for: conversationId) {
+                if let aggregateId = model.listStore.aggregateId(forTranscriptRowId: conversationId),
+                   model.connectivity.isOnline {
+                    ProductConversationDetailView(aggregateId: aggregateId, model: model)
+                } else if let session = model.session(for: conversationId) {
                     ConversationView(session: session)
                 } else {
                     Text("Configure a server first")
