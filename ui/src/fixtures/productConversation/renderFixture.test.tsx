@@ -72,6 +72,9 @@ describe('ProductConversationFixture', () => {
 
       expect(screen.getByTestId('product-conversation-page')).toBeInTheDocument();
       expect(view.container.querySelector(`[data-product-conversation-viewport="${scenario.viewport}"]`)).not.toBeNull();
+      await waitFor(() => {
+        expect(view.container.querySelector('[data-testid="product-conversation-composer"]')).toBeNull();
+      });
       expect(scenario.snapshot?.ordinary_lifecycle).toBe('history');
       expect(scenario.snapshot?.writable_transcript_row_id).toBeNull();
       expect(handoffSummaries(scenario)).toEqual([FIXTURE_HANDOFF_SUMMARY]);
@@ -98,6 +101,9 @@ describe('ProductConversationFixture', () => {
     expect(handoffSummaries(scenario)).toEqual([FIXTURE_HANDOFF_SUMMARY]);
     expect(view.container.querySelectorAll('a[href*="product-handoff"]').length).toBe(1);
     expect(screen.getAllByText('Long fixture conversation')).toHaveLength(2);
+    await waitFor(() => {
+      expect(view.container.querySelector('[data-testid="product-conversation-composer"]')).toBeNull();
+    });
   });
 
   it('keeps handoff identities aligned with adjacent transcript segments', () => {

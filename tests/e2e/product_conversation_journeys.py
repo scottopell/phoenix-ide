@@ -201,11 +201,13 @@ def scenario_dirty_exact_loss(base_url: str, cwd: Path) -> None:
         "inspection_generation": confirmation["generation"],
         "inspection_fingerprint": confirmation["fingerprint"],
     })
-    poll(
+    history = poll(
         "dirty Close to History",
         lambda: product_snapshot(base_url, created["product_conversation_id"]),
         lambda value: value.get("ordinary_lifecycle") == "history",
     )
+    assert history["writable_transcript_row_id"] is None
+    assert_one_row(product_rows(base_url), created["product_conversation_id"])
 
 
 def scenario_merged_creation_recovery() -> None:

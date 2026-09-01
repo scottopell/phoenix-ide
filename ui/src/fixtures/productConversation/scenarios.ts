@@ -181,6 +181,7 @@ function makeLongSnapshot(): ProductConversationSnapshotView {
   return makeSnapshot({
     product_conversation_id: 'pc-long-history',
     canonical_route: '/product-conversations/pc-long-history',
+    ordinary_lifecycle: 'history',
     requested_transcript_row_id: 'row-long-4',
     latest_transcript_row_id: 'row-long-4',
     writable_transcript_row_id: null,
