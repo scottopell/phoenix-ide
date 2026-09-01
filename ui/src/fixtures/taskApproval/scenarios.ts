@@ -14,7 +14,7 @@ Add trimmed fixtures + \`<stem>.bounds.json\` for the missing/approximated cases
 
 1. The fixture generation command is documented and repeatable.
 2. Long inline identifiers such as \`s3://noaa-nexrad-level2/2025/05/16/KOUN/KOUN20250516_235959_V06\` never force the approval screen wider than the mobile viewport.
-3. The approval action bar keeps **Discard**, **Send Feedback**, **Continue here**, and **Start fresh conversation** visible on mobile.
+3. The approval action bar keeps **Discard**, **Send Feedback**, **Continue here**, and **Start in new conversation** visible on mobile.
 
 \`\`\`bash
 uv run scripts/build_qc_fixture.py \\

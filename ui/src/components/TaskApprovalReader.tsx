@@ -18,6 +18,7 @@ import type { Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { SyntaxHighlighter, oneDark } from '../utils/syntaxHighlighter';
 import { MermaidDiagram } from './MermaidDiagram';
+import './TaskApprovalReader.css';
 import { generateUUID } from '../utils/uuid';
 import type { TaskApprovalHandoff } from '../api';
 import { useRegisterFocusScope } from '../hooks/useFocusScope';
@@ -59,16 +60,16 @@ const formatTaskApprovalContextPercent = (used: number, max: number): string => 
   return `${Math.round(percent)}%`;
 };
 
-type TaskApprovalContextRecommendation = 'start-here' | 'new-chat' | 'either';
+type TaskApprovalContextRecommendation = 'continue-here' | 'new-conversation' | 'either';
 
 function getTaskApprovalContextRecommendation(percent: number): {
   kind: TaskApprovalContextRecommendation;
   label: string;
 } {
-  if (percent < 60) return { kind: 'start-here', label: 'Start here recommended' };
+  if (percent < 60) return { kind: 'continue-here', label: 'Continue here recommended' };
   if (percent < 82) return { kind: 'either', label: 'Either path is fine' };
-  if (percent < 94) return { kind: 'new-chat', label: 'New chat recommended' };
-  return { kind: 'new-chat', label: 'New chat strongly recommended' };
+  if (percent < 94) return { kind: 'new-conversation', label: 'Start in new conversation recommended' };
+  return { kind: 'new-conversation', label: 'Start in new conversation strongly recommended' };
 }
 
 export interface TaskApprovalReaderProps {
@@ -787,7 +788,7 @@ export function TaskApprovalReader({
             {contextRecommendation.label}
           </span>
           <span className="task-approval-context-cue__hint">
-            Start here keeps this discussion; New chat starts a summarized continuation.
+            Continue here keeps this discussion; Start in new conversation starts a summarized continuation.
           </span>
         </div>
       )}
@@ -826,13 +827,13 @@ export function TaskApprovalReader({
             'task-approval-btn',
             'task-approval-btn--approve',
             hasUnsentNotes && 'task-approval-btn--subdued',
-            !hasUnsentNotes && contextRecommendation?.kind === 'start-here' && 'task-approval-btn--recommended-decision',
+            !hasUnsentNotes && contextRecommendation?.kind === 'continue-here' && 'task-approval-btn--recommended-decision',
           ]
             .filter(Boolean)
             .join(' ')}
           disabled={approvingHandoff !== null}
           onClick={() => handleApprove('continue_in_current_conversation')}
-          aria-label="Approve and start here"
+          aria-label="Continue here"
         >
           {approvingHandoff === 'continue_in_current_conversation' ? (
             <>
@@ -842,8 +843,8 @@ export function TaskApprovalReader({
           ) : (
             <>
               <Check size={18} />
-              <span className="task-approval-btn-label-full">Start here</span>
-              <span className="task-approval-btn-label-compact">Start here</span>
+              <span className="task-approval-btn-label-full">Continue here</span>
+              <span className="task-approval-btn-label-compact">Continue here</span>
             </>
           )}
         </button>
@@ -852,13 +853,13 @@ export function TaskApprovalReader({
             'task-approval-btn',
             'task-approval-btn--approve',
             hasUnsentNotes && 'task-approval-btn--subdued',
-            !hasUnsentNotes && contextRecommendation?.kind === 'new-chat' && 'task-approval-btn--recommended-decision',
+            !hasUnsentNotes && contextRecommendation?.kind === 'new-conversation' && 'task-approval-btn--recommended-decision',
           ]
             .filter(Boolean)
             .join(' ')}
           disabled={approvingHandoff !== null}
           onClick={() => handleApprove('start_fresh_work_conversation')}
-          aria-label="Approve and start a new continuation conversation"
+          aria-label="Start in new conversation"
         >
           {approvingHandoff === 'start_fresh_work_conversation' ? (
             <>
@@ -868,8 +869,8 @@ export function TaskApprovalReader({
           ) : (
             <>
               <Check size={18} />
-              <span className="task-approval-btn-label-full">New chat</span>
-              <span className="task-approval-btn-label-compact">New chat</span>
+              <span className="task-approval-btn-label-full">Start in new conversation</span>
+              <span className="task-approval-btn-label-compact">Start in new conversation</span>
             </>
           )}
         </button>
