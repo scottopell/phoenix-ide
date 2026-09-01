@@ -1148,7 +1148,9 @@ impl Database {
             )));
         }
 
-        let now = Utc::now().to_rfc3339();
+        let now_utc = Utc::now();
+        let now = now_utc.to_rfc3339();
+        let captured_at_unix_micros = now_utc.timestamp_micros();
         sqlx::query(
             "INSERT INTO close_obligations (
                  attempt_id, product_conversation_id, phase, created_at, updated_at, completed_at
@@ -1163,13 +1165,13 @@ impl Database {
 
         sqlx::query(
             "INSERT INTO close_attempt_participants (
-                 attempt_id, conversation_id, captured_at
+                 attempt_id, conversation_id, captured_at_unix_micros
              )
              SELECT ?1, id, ?2 FROM conversations
              WHERE product_conversation_id = ?3",
         )
         .bind(attempt_id)
-        .bind(&now)
+        .bind(captured_at_unix_micros)
         .bind(product_conversation_id.as_str())
         .execute(&mut *tx)
         .await?;

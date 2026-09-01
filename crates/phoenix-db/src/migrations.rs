@@ -7931,6 +7931,14 @@ mod migration_094_tests {
     }
 
     #[test]
+    fn lifecycle_cutover_preserves_cancel_intent_and_timestamp_contract() {
+        assert!(super::MIGRATION_095.contains("WHERE phase = 'cancel_requested_during_settlement'"));
+        assert!(super::MIGRATION_095.contains("phase = 'completed', close_outcome = 'cancelled'"));
+        assert!(super::MIGRATION_095.contains("captured_at_unix_micros INTEGER NOT NULL"));
+        assert!(super::MIGRATION_095.contains("CHECK (captured_at_unix_micros >= 0)"));
+    }
+
+    #[test]
     fn participant_snapshot_upgrade_captures_active_subordinates_and_cascades_delete() {
         assert!(super::MIGRATION_095.contains("WHERE obligation.phase <> 'completed'"));
         assert!(super::MIGRATION_095
@@ -8012,19 +8020,24 @@ const MIGRATION_095: &str = r"
 CREATE TABLE close_attempt_participants (
     attempt_id TEXT NOT NULL,
     conversation_id TEXT NOT NULL,
-    captured_at TEXT NOT NULL,
+    captured_at_unix_micros INTEGER NOT NULL
+        CHECK (captured_at_unix_micros >= 0),
     PRIMARY KEY (attempt_id, conversation_id),
     FOREIGN KEY (attempt_id) REFERENCES close_obligations(attempt_id) ON DELETE CASCADE,
     FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
 );
-INSERT INTO close_attempt_participants (attempt_id, conversation_id, captured_at)
-SELECT obligation.attempt_id, participant.id, obligation.created_at
+INSERT INTO close_attempt_participants (attempt_id, conversation_id, captured_at_unix_micros)
+SELECT obligation.attempt_id, participant.id,
+       CAST(ROUND((julianday(obligation.created_at) - 2440587.5) * 86400000000.0) AS INTEGER)
 FROM close_obligations obligation
 JOIN conversations participant
   ON participant.product_conversation_id = obligation.product_conversation_id
 WHERE obligation.phase <> 'completed';
-INSERT OR IGNORE INTO close_attempt_participants (attempt_id, conversation_id, captured_at)
-SELECT member.attempt_id, member.conversation_id, member.captured_at
+INSERT OR IGNORE INTO close_attempt_participants (
+    attempt_id, conversation_id, captured_at_unix_micros
+)
+SELECT member.attempt_id, member.conversation_id,
+       CAST(ROUND((julianday(member.captured_at) - 2440587.5) * 86400000000.0) AS INTEGER)
 FROM close_attempt_members member;
 
 DROP TRIGGER close_attempt_direct_turn_settlement_target_requires_latest_member;
@@ -8046,9 +8059,14 @@ BEGIN
 END;
 DROP TRIGGER close_obligations_transition_graph;
 UPDATE close_obligations
+SET phase = 'completed', close_outcome = 'cancelled',
+    completed_at = STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now'),
+    updated_at = STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now')
+WHERE phase = 'cancel_requested_during_settlement';
+UPDATE close_obligations
 SET phase = 'awaiting_stop_work_confirmation',
     updated_at = STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now')
-WHERE phase IN ('settling_active_work', 'cancel_requested_during_settlement');
+WHERE phase = 'settling_active_work';
 DELETE FROM close_attempt_direct_turn_settlement_captures
 WHERE attempt_id IN (
     SELECT attempt_id FROM close_obligations
