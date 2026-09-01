@@ -126,10 +126,15 @@ export function CommandPalette({ conversations, productConversations = [], activ
               const isWritable = activeProduct
                 ? activeProduct.ordinary_lifecycle === 'open'
                 : conv?.archived !== true;
-              if (!conv || !isWritable || computeChainRoots(conversations).get(conv.id) != null) return undefined;
+              const chainRootId = computeChainRoots(conversations).get(conv?.id ?? '');
+              if (!conv || !isWritable || (chainRootId != null && !activeProduct)) return undefined;
               return async () => {
                 try {
-                  await api.archiveConversation(conv.id);
+                  if (chainRootId != null) {
+                    await api.archiveChain(conv.id);
+                  } else {
+                    await api.archiveConversation(conv.id);
+                  }
                   navigate('/');
                 } catch (error) {
                   if (!notifyArchiveCloseConflict(conv.id, error)) throw error;

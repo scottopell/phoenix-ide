@@ -2324,7 +2324,12 @@ impl WakeRepository {
         let eligible = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM wake_bindings b
              JOIN conversations c ON c.id = b.conversation_id
-             WHERE b.workflow_id = ?1 AND b.conversation_id = ?2 AND c.archived = 0",
+             JOIN product_conversations product ON product.id = c.product_conversation_id
+             WHERE b.workflow_id = ?1 AND b.conversation_id = ?2
+               AND (
+                 (product.kind = 'ordinary' AND product.ordinary_lifecycle = 'open')
+                 OR (product.kind <> 'ordinary' AND c.archived = 0)
+               )",
         )
         .bind(to_i64(input.workflow_id.0, "workflow_id")?)
         .bind(&input.conversation_id)

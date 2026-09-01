@@ -8140,6 +8140,17 @@ WHEN NOT EXISTS (
 BEGIN
     SELECT RAISE(ABORT, 'close direct-turn settlement target must be a sealed active participant');
 END;
+INSERT OR IGNORE INTO close_attempt_direct_turn_settlements (
+    attempt_id, turn_id, expected_generation
+)
+SELECT participant.attempt_id, turn.turn_id, turn.generation
+FROM close_attempt_participants participant
+JOIN close_obligations obligation ON obligation.attempt_id = participant.attempt_id
+JOIN durable_turns turn
+  ON turn.conversation_id = participant.conversation_id
+ AND turn.owns_conversation = 1
+ AND turn.terminal_kind IS NULL
+WHERE obligation.phase IN ('settling_active_work', 'cancel_requested_during_settlement');
 DROP TRIGGER close_obligations_transition_graph;
 DELETE FROM close_attempt_direct_turn_settlement_captures
 WHERE attempt_id IN (
@@ -8192,6 +8203,14 @@ SET ordinary_lifecycle = CASE WHEN EXISTS (
       AND latest.parent_conversation_id IS NULL
       AND latest.continued_in_conv_id IS NULL
       AND latest.archived = 0
+) OR EXISTS (
+    SELECT 1
+    FROM conversations member
+    JOIN durable_turns turn ON turn.conversation_id = member.id
+    WHERE member.product_conversation_id = product_conversations.id
+      AND turn.disposition = 'Runtime'
+      AND turn.terminal_kind IS NULL
+      AND turn.canonical_message_id IS NULL
 ) OR EXISTS (
     SELECT 1 FROM product_creation_jobs job
     WHERE job.published_product_id = product_conversations.id
