@@ -1506,10 +1506,22 @@ where
         let Ok(_owner) = admit() else {
             return;
         };
-        if owners
-            .iter()
-            .any(crate::runtime::conversation_attachment_retains_work_scope)
-        {
+        let mut retained = false;
+        for owner in &owners {
+            match crate::runtime::conversation_retains_work_scope(db, owner).await {
+                Ok(true) => {
+                    retained = true;
+                    break;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(%error, conversation_id = %owner.id, "failed to classify startup work-scope owner");
+                    retained = true;
+                    break;
+                }
+            }
+        }
+        if retained {
             continue;
         }
         let worktree = std::path::PathBuf::from(&path);

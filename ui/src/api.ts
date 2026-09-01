@@ -1961,6 +1961,9 @@ export const api = {
       const detail = await resp.json() as ExpansionErrorDetail;
       throw new ExpansionError(detail);
     }
+    if (resp.status === 409) {
+      throw new ConflictError(await resp.json() as ConflictErrorDetail);
+    }
     if (!resp.ok) throw new Error('Failed to send message');
     return resp.json();
   },

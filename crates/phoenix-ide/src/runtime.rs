@@ -2018,6 +2018,24 @@ pub(crate) fn conversation_attachment_retains_work_scope(conv: &crate::db::Conve
     }
 }
 
+pub(crate) async fn conversation_retains_work_scope(
+    db: &crate::db::Database,
+    conv: &crate::db::Conversation,
+) -> Result<bool, crate::db::DbError> {
+    if conversation_attachment_retains_work_scope(conv) {
+        return Ok(true);
+    }
+    if !conv.archived || conv.state.is_terminal() {
+        return Ok(false);
+    }
+    Ok(matches!(
+        db.message_target_admission(&conv.id).await?,
+        crate::db::MessageTargetAdmission::Aggregate(
+            crate::db::ProductConversationAdmission::Accepted { .. }
+        )
+    ))
+}
+
 fn conversation_resource_scope(conv: &crate::db::Conversation) -> Option<ResourceScopeKey> {
     match conv.attached_work_scope_id.clone() {
         Some(scope) => Some(ResourceScopeKey::Work(scope)),
@@ -3012,7 +3030,7 @@ impl RuntimeManager {
         let conversation = self.db().get_conversation(conversation_id).await?;
         Ok(
             conversation_resource_scope(&conversation).as_ref() == Some(work_scope)
-                && conversation_attachment_retains_work_scope(&conversation),
+                && conversation_retains_work_scope(self.db(), &conversation).await?,
         )
     }
 
@@ -3059,7 +3077,7 @@ impl RuntimeManager {
             };
             return Ok(
                 conversation_resource_scope(&conversation).as_ref() == Some(work_scope)
-                    && conversation_attachment_retains_work_scope(&conversation),
+                    && conversation_retains_work_scope(self.db(), &conversation).await?,
             );
         }
         let Some(work_scope_id) = work_scope.work_scope_id() else {
@@ -3074,15 +3092,7 @@ impl RuntimeManager {
             if excluded_conv_id == Some(conv.id.as_str()) {
                 continue;
             }
-            // An archived conversation is not a live owner even when its
-            // row still reads non-terminal: archiving a Work/Branch chain
-            // archives earlier members before the leaf's cleanup runs.
-            // Counting it as live would preserve the shared scope and leak
-            // its bash/tmux/browser/terminal resources.
-            if conv.archived {
-                continue;
-            }
-            if !conversation_attachment_retains_work_scope(&conv) {
+            if !conversation_retains_work_scope(self.db(), &conv).await? {
                 continue;
             }
             if conv.attached_work_scope_id.as_ref() == Some(work_scope_id) {
@@ -11033,7 +11043,7 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
-    async fn archived_conversation_does_not_count_as_live() {
+    async fn open_aggregate_archived_drift_still_counts_as_live() {
         let mgr = test_manager().await;
         mgr.db()
             .create_conversation("conv-arch", "slug", "/tmp", true, None, None)
@@ -11059,8 +11069,19 @@ mod scope_liveness_tests {
         );
 
         assert!(
+            mgr.scope_has_live_conversation(&scope).await.unwrap(),
+            "an Open aggregate must preserve its scope despite archived row drift"
+        );
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history'
+             WHERE id = (SELECT product_conversation_id FROM conversations WHERE id = 'conv-arch')",
+        )
+        .execute(mgr.db().pool())
+        .await
+        .unwrap();
+        assert!(
             !mgr.scope_has_live_conversation(&scope).await.unwrap(),
-            "an archived conversation must not preserve its scope"
+            "History aggregate releases its scope"
         );
     }
 

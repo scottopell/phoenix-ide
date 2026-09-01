@@ -8077,6 +8077,7 @@ CREATE TABLE close_attempt_participants (
     settlement_state TEXT NOT NULL DEFAULT 'live'
         CHECK (settlement_state IN ('live', 'deleted')),
     captured_at_unix_micros INTEGER NOT NULL
+        CHECK (typeof(captured_at_unix_micros) = 'integer')
         CHECK (captured_at_unix_micros >= 0),
     PRIMARY KEY (attempt_id, conversation_id),
     FOREIGN KEY (attempt_id, product_conversation_id)
