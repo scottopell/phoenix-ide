@@ -36,6 +36,7 @@ describe('NewConversationFixture', () => {
 
     expect(screen.getAllByLabelText('Recent product creation attempts')).toHaveLength(2);
     expect(screen.getAllByText('Needs retry')).toHaveLength(2);
+    expect(screen.getAllByText('Failed')).toHaveLength(2);
     expect(screen.getAllByText('Finishing')).toHaveLength(2);
     expect(screen.getAllByText('Image-only request')).toHaveLength(2);
     const retryButtons = screen.getAllByRole('button', { name: 'Retry' });
@@ -46,8 +47,8 @@ describe('NewConversationFixture', () => {
     await waitFor(() => {
       expect(screen.getAllByRole('button', { name: 'Retry' })[0]).toBeEnabled();
     });
-    expect(screen.queryByRole('button', { name: 'Delete' })).toBeNull();
-    expect(screen.queryByRole('button', { name: 'Start over' })).toBeNull();
+    expect(screen.getAllByRole('button', { name: 'Delete' })).toHaveLength(2);
+    expect(screen.getAllByRole('button', { name: 'Start over' })).toHaveLength(2);
   });
 
   it('restores the document theme, storage, and API methods after unmount', async () => {
