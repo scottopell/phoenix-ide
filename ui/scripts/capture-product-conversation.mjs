@@ -14,5 +14,9 @@ runSurfaceCapture({
       'Failed to load resource: the server responded with a status of 404 (Not Found)',
       'WebSocket connection to',
     ]],
+    ['mobile-open', [
+      'Failed to load resource: the server responded with a status of 404 (Not Found)',
+      'WebSocket connection to',
+    ]],
   ]),
 });

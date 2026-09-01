@@ -51,6 +51,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   const originalSubmitChainQuestion = api.submitChainQuestion;
   const originalGetConversationBySlug = api.getConversationBySlug;
   const originalGetConversation = api.getConversation;
+  const originalGetConversationRoute = api.getConversationRoute;
   const originalGetConversationRouteBySlug = api.getConversationRouteBySlug;
   const originalGetConversationMessagesLatest = api.getConversationMessagesLatest;
   const originalGetConversationMessagesBefore = api.getConversationMessagesBefore;
@@ -131,7 +132,11 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   api.submitChainQuestion = async () => ({ chain_qa_id: 'fixture-chain-qa' });
   api.getConversation = async () => latestSegmentConversation(scenario);
   api.getConversationBySlug = async () => latestSegmentConversation(scenario);
-  api.getConversationRouteBySlug = async (slug: string) => ({ id: slug, slug, canonical_route: `/c/${encodeURIComponent(slug)}` });
+  api.getConversationRoute = async (id: string) => ({ id, slug: id, canonical_route: `/c/${encodeURIComponent(id)}` });
+  api.getConversationRouteBySlug = async (slug: string) => {
+    const id = scenario.snapshot?.latest_transcript_row_id ?? slug;
+    return { id, slug, canonical_route: `/c/${encodeURIComponent(slug)}` };
+  };
   api.getConversationMessagesLatest = async () => ({
     messages: latestSegmentConversation(scenario).messages,
     tombstones: [],
@@ -176,6 +181,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     api.submitChainQuestion = originalSubmitChainQuestion;
     api.getConversation = originalGetConversation;
     api.getConversationBySlug = originalGetConversationBySlug;
+    api.getConversationRoute = originalGetConversationRoute;
     api.getConversationRouteBySlug = originalGetConversationRouteBySlug;
     api.getConversationMessagesLatest = originalGetConversationMessagesLatest;
     api.getConversationMessagesBefore = originalGetConversationMessagesBefore;
