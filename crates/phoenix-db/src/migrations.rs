@@ -7981,6 +7981,7 @@ mod migration_094_tests {
         assert!(super::MIGRATION_095.contains("CHECK (settlement_state IN ('live', 'deleted'))"));
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn lifecycle_cutover_reconciles_released_drift_without_dropping_rows() {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
@@ -7994,6 +7995,14 @@ mod migration_094_tests {
              );
              CREATE TABLE product_creation_jobs (
                  published_product_id TEXT, status TEXT NOT NULL
+             );
+             CREATE TABLE durable_turns (
+                 turn_id INTEGER PRIMARY KEY, conversation_id TEXT NOT NULL,
+                 disposition TEXT NOT NULL CHECK (disposition IN ('Runtime', 'Steering')),
+                 terminal_kind TEXT, terminal_reason TEXT, generation INTEGER NOT NULL,
+                 owns_conversation INTEGER NOT NULL,
+                 canonical_message_id TEXT,
+                 CHECK (terminal_kind = 'Failed' OR terminal_reason IS NULL)
              );",
         )
         .execute(&pool)
@@ -8015,7 +8024,31 @@ mod migration_094_tests {
                  ('coordinator-row', 'coordinator', 'coordinator', NULL, NULL, 0);
              INSERT INTO product_creation_jobs VALUES
                  ('delivery-pending-product', 'delivery_pending'),
-                 ('published-history-product', 'published');",
+                 ('published-history-product', 'published');
+             INSERT INTO durable_turns VALUES
+                 (1, 'history-row', 'Runtime', NULL, NULL, 7, 1, NULL);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "UPDATE durable_turns
+             SET terminal_kind = 'Cancelled', terminal_reason = NULL,
+                 generation = generation + 1, owns_conversation = 0
+             WHERE terminal_kind IS NULL AND canonical_message_id IS NULL
+               AND conversation_id IN (
+                 SELECT member.id FROM conversations member
+                 JOIN product_conversations product ON product.id = member.product_conversation_id
+                 WHERE product.kind = 'ordinary' AND NOT EXISTS (
+                   SELECT 1 FROM conversations latest
+                   WHERE latest.product_conversation_id = product.id
+                     AND latest.runtime_role = 'user'
+                     AND latest.parent_conversation_id IS NULL
+                     AND latest.continued_in_conv_id IS NULL
+                     AND latest.archived = 0
+                 )
+               )",
         )
         .execute(&pool)
         .await
@@ -8057,6 +8090,15 @@ mod migration_094_tests {
                 ("published-history-product".into(), Some("history".into())),
             ]
         );
+        let turn: (String, String, Option<String>, i64, i64) = sqlx::query_as(
+            "SELECT disposition, terminal_kind, terminal_reason, generation, owns_conversation
+             FROM durable_turns WHERE turn_id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(turn, ("Runtime".into(), "Cancelled".into(), None, 8, 0));
+
         let row_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversations")
             .fetch_one(&pool)
             .await
@@ -8196,8 +8238,9 @@ END;
 
 UPDATE durable_turns
 SET terminal_kind = 'Cancelled',
-    terminal_reason = 'compatibility_upgrade_archived_aggregate',
-    disposition = 'Settled'
+    terminal_reason = NULL,
+    generation = generation + 1,
+    owns_conversation = 0
 WHERE terminal_kind IS NULL
   AND canonical_message_id IS NULL
   AND conversation_id IN (
