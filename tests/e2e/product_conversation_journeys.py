@@ -198,6 +198,7 @@ def scenario_dirty_exact_loss(base_url: str, cwd: Path) -> None:
     assert response.json().get("error_type") == "close_loss_confirmation_required", response.text
     close = product_snapshot(base_url, created["product_conversation_id"])["close"]
     losses = close.get("losses") or (close.get("inspection") or {}).get("losses")
+    assert len(losses) == 1, losses
     expected_identity = "git_path_bytes_hex_v1:" + "qa-exact-loss.txt".encode().hex()
     identities = {loss.get("identity") for loss in losses}
     assert identities == {expected_identity}, losses

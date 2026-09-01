@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { api } from '../../api';
 import { NewConversationFixture } from './renderFixture';
@@ -48,8 +48,12 @@ describe('NewConversationFixture', () => {
       expect(screen.getAllByRole('button', { name: 'Retry' })[0]).toBeEnabled();
     });
     const deleteButtons = screen.getAllByRole('button', { name: 'Delete' });
+    const deleteSpy = vi.spyOn(api, 'deleteProductConversationCreation');
     expect(deleteButtons).toHaveLength(2);
     fireEvent.click(deleteButtons[0]!);
+    await waitFor(() => {
+      expect(deleteSpy).toHaveBeenCalledWith('req-failed');
+    });
     expect(screen.getAllByRole('button', { name: 'Start over' })).toHaveLength(2);
   });
 
