@@ -81,6 +81,16 @@ describe('SyncQueue legacy op draining', () => {
     expect(apiMock.archiveConversation).toHaveBeenCalledTimes(1);
   });
 
+  it('drains lost-response archive replay when another client already closed it', async () => {
+    apiMock.archiveConversation.mockRejectedValueOnce(new ConflictError({
+      error: 'ProductConversation is already in History',
+      error_type: 'close_already_history',
+    }));
+    await expect(processAndDeletePendingOperation(makeOp('archive'))).resolves.toBeUndefined();
+    expect(cacheMock.deletePendingOp).toHaveBeenCalledWith('op-1');
+    expect(apiMock.archiveConversation).toHaveBeenCalledTimes(1);
+  });
+
   it('retains archive replay for unrelated conflicts', async () => {
     apiMock.archiveConversation.mockRejectedValueOnce(new ConflictError({
       error: 'unrelated',

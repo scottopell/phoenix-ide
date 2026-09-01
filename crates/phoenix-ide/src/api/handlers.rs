@@ -13475,7 +13475,7 @@ pub(crate) mod hard_delete_cascade_tests {
 
         let result = archive_conversation(State(state.clone()), Path(root.id)).await;
         assert!(
-            matches!(result, Err(AppError::Conflict(detail)) if detail.error_type == "close_start_failed")
+            matches!(result, Err(AppError::Conflict(detail)) if detail.error_type == "close_already_history")
         );
         let attempts: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM close_obligations WHERE product_conversation_id = ?1",

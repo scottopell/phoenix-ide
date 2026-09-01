@@ -720,6 +720,19 @@ async fn run_legacy_close_compat(state: &AppState, id: &str, action: &str) -> Re
     {
         Some(obligation) => obligation,
         None => {
+            if matches!(
+                state
+                    .db
+                    .product_conversation_admission(&transcript.id)
+                    .await
+                    .map_err(|error| AppError::Internal(error.to_string()))?,
+                phoenix_db::ProductConversationAdmission::History(_)
+            ) {
+                return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                    "ProductConversation is already in History",
+                    "close_already_history",
+                ))));
+            }
             let attempt_id = CloseAttemptId::parse(uuid::Uuid::new_v4().to_string())
                 .expect("UUID is a valid Close attempt id");
             state
