@@ -117,7 +117,7 @@ final class AppModel {
     }
 
     private func handleHardDeleted(_ conversationId: String) {
-        listStore.remove(id: conversationId)
+        listStore.removeByTranscriptRowId(conversationId)
         if pendingOpenConversationId == conversationId {
             pendingOpenConversationId = nil
         }
@@ -317,7 +317,11 @@ final class AppModel {
             await session.clearCachedSnapshotAndWait()
             await session.outbox.clearAndWait()
             sessions[conversationId] = nil
-            listStore.remove(id: conversationId)
+            if let aggregateId = listStore.conversations.first(where: {
+                $0.transcriptRowIdentity == conversationId
+            })?.aggregateIdentity {
+                listStore.remove(aggregateId: aggregateId)
+            }
             UNUserNotificationCenter.current().removeDeliveredNotifications(
                 withIdentifiers: ["attention-\(conversationId)"])
             return true

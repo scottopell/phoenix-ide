@@ -273,7 +273,8 @@ struct PhoenixAPI: Sendable {
     }
 
     func listConversations() async throws -> [Conversation] {
-        try await get("api/conversations", as: ConversationListResponse.self).conversations
+        let response = try await listProductConversations()
+        return response.product_conversations.map(productConversationListRowToConversation)
     }
 
     func listProductConversations() async throws -> ProductConversationListResponse {
@@ -305,6 +306,37 @@ struct PhoenixAPI: Sendable {
         return try await get(
             "api/product-conversations/\(id)", query: query,
             as: ProductConversationSnapshot.self)
+    }
+
+    func productConversationListRowToConversation(_ row: ProductConversationListRow) -> Conversation {
+        let (presentationMode, requiresAction): (String?, Bool?) = switch row.presentation {
+        case .needsAction:
+            ("needs_action", true)
+        case .state(_, let presentationMode):
+            (presentationMode, false)
+        }
+
+        return Conversation(
+            id: row.latest_transcript_row_id,
+            product_conversation_id: row.product_conversation_id,
+            slug: row.canonical_root.slug,
+            title: row.canonical_root.title,
+            model: nil,
+            cwd: nil,
+            created_at: nil,
+            updated_at: row.updated_at,
+            message_count: nil,
+            state: nil,
+            state_updated_at: nil,
+            branch_name: nil,
+            task_title: nil,
+            archived: row.ordinary_lifecycle == .history,
+            project_name: nil,
+            conv_mode_label: nil,
+            presentation_mode: presentationMode,
+            requires_action: requiresAction,
+            transcript_generation: nil,
+            runtime_role: nil)
     }
 
     /// Idempotent by `messageId`: the server returns success without a

@@ -27,9 +27,10 @@ final class ConversationListStore {
     /// Changes on every list mutation, including non-destructive upserts.
     /// Background fetches use this separately from foreground refresh merging.
     private var externalMutationGeneration = 0
-    /// Server-pushed rows received after the current full refresh began.
+    /// Server-pushed rows received after the current full refresh began,
+    /// keyed by ProductConversation aggregate identity.
     private var upsertsDuringRefresh: [String: Conversation] = [:]
-    /// Rows removed or archived after the current full refresh began.
+    /// Aggregate identities removed or archived after the current full refresh began.
     private var exclusionsDuringRefresh: Set<String> = []
 
     init() {
@@ -75,8 +76,8 @@ final class ConversationListStore {
         excluding exclusions: Set<String> = []
     ) -> [Conversation] {
         var byId = Dictionary(uniqueKeysWithValues: fresh
-            .filter { $0.archived != true && !exclusions.contains($0.id) }
-            .map { ($0.id, $0) })
+            .filter { $0.archived != true && !exclusions.contains($0.aggregateIdentity) }
+            .map { ($0.aggregateIdentity, $0) })
         for (id, conversation) in upserts
         where conversation.archived != true && !exclusions.contains(id) {
             byId[id] = conversation
@@ -118,20 +119,21 @@ final class ConversationListStore {
     func upsert(_ conversation: Conversation) {
         if lastRefreshed == nil { lastRefreshed = Date() }
         externalMutationGeneration += 1
+        let aggregateIdentity = conversation.aggregateIdentity
         if conversation.archived == true {
             if isRefreshing {
-                upsertsDuringRefresh[conversation.id] = nil
-                exclusionsDuringRefresh.insert(conversation.id)
+                upsertsDuringRefresh[aggregateIdentity] = nil
+                exclusionsDuringRefresh.insert(aggregateIdentity)
             }
-            conversations.removeAll { $0.id == conversation.id }
+            conversations.removeAll { $0.aggregateIdentity == aggregateIdentity }
             persistCache()
             return
         }
         if isRefreshing {
-            exclusionsDuringRefresh.remove(conversation.id)
-            upsertsDuringRefresh[conversation.id] = conversation
+            exclusionsDuringRefresh.remove(aggregateIdentity)
+            upsertsDuringRefresh[aggregateIdentity] = conversation
         }
-        if let idx = conversations.firstIndex(where: { $0.id == conversation.id }) {
+        if let idx = conversations.firstIndex(where: { $0.aggregateIdentity == aggregateIdentity }) {
             conversations[idx] = conversation
         } else {
             conversations.insert(conversation, at: 0)
@@ -147,14 +149,23 @@ final class ConversationListStore {
             .map(\.conversation)
     }
 
-    func remove(id: String) {
+    func remove(aggregateId: String) {
         externalMutationGeneration += 1
-        upsertsDuringRefresh[id] = nil
+        upsertsDuringRefresh[aggregateId] = nil
         if isRefreshing {
-            exclusionsDuringRefresh.insert(id)
+            exclusionsDuringRefresh.insert(aggregateId)
         }
-        conversations.removeAll { $0.id == id }
+        conversations.removeAll { $0.aggregateIdentity == aggregateId }
         persistCache()
+    }
+
+    func removeByTranscriptRowId(_ transcriptRowId: String) {
+        guard let aggregateId = conversations.first(where: { $0.transcriptRowIdentity == transcriptRowId })?
+            .aggregateIdentity
+        else {
+            return
+        }
+        remove(aggregateId: aggregateId)
     }
 
     /// Drop in-memory state after the disk cache is cleared (or the user

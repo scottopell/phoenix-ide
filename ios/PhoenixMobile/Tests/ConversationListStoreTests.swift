@@ -5,15 +5,18 @@ import XCTest
 final class ConversationListStoreTests: XCTestCase {
     private func conversation(
         id: String,
+        aggregateId: String? = nil,
         title: String,
         archived: Bool = false
     ) throws -> Conversation {
-        let data = try JSONSerialization.data(withJSONObject: [
+        var json: [String: Any] = [
             "id": id,
             "slug": id,
             "title": title,
             "archived": archived,
-        ])
+        ]
+        json["product_conversation_id"] = aggregateId
+        let data = try JSONSerialization.data(withJSONObject: json)
         return try JSONDecoder().decode(Conversation.self, from: data)
     }
 
@@ -33,22 +36,39 @@ final class ConversationListStoreTests: XCTestCase {
         XCTAssertEqual(byId["two"]?.title, "fresh")
         XCTAssertEqual(byId["three"]?.title, "new conversation")
     }
+
+    func testRefreshMergeKeysRowsByAggregateIdentity() throws {
+        let merged = ConversationListStore.merging(
+            [
+                try conversation(id: "root-a", aggregateId: "pc-1", title: "root"),
+                try conversation(id: "other", aggregateId: "pc-2", title: "other"),
+            ],
+            preserving: [
+                "pc-1": try conversation(id: "latest-a", aggregateId: "pc-1", title: "latest")
+            ])
+        let byAggregate = Dictionary(uniqueKeysWithValues: merged.map { ($0.aggregateIdentity, $0) })
+
+        XCTAssertEqual(merged.count, 2)
+        XCTAssertEqual(byAggregate["pc-1"]?.id, "latest-a")
+        XCTAssertEqual(byAggregate["pc-1"]?.title, "latest")
+        XCTAssertEqual(byAggregate["pc-2"]?.id, "other")
+    }
     func testRefreshMergeCannotResurrectArchivedRows() throws {
         let merged = ConversationListStore.merging(
             [
-                try conversation(id: "fresh-archived", title: "old", archived: true),
-                try conversation(id: "removed-during-refresh", title: "old"),
-                try conversation(id: "active", title: "active"),
+                try conversation(id: "fresh-archived", aggregateId: "pc-archived", title: "old", archived: true),
+                try conversation(id: "removed-during-refresh", aggregateId: "pc-removed", title: "old"),
+                try conversation(id: "active", aggregateId: "pc-active", title: "active"),
             ],
             preserving: [
                 "pushed-archived": try conversation(
-                    id: "pushed-archived", title: "archived", archived: true),
-                "removed-during-refresh": try conversation(
-                    id: "removed-during-refresh", title: "newer update"),
+                    id: "pushed-archived", aggregateId: "pc-pushed-archived", title: "archived", archived: true),
+                "pc-removed": try conversation(
+                    id: "removed-during-refresh", aggregateId: "pc-removed", title: "newer update"),
             ],
-            excluding: ["removed-during-refresh"])
+            excluding: ["pc-removed"])
 
-        XCTAssertEqual(merged.map(\.id), ["active"])
+        XCTAssertEqual(merged.map(\.aggregateIdentity), ["pc-active"])
     }
 
     @MainActor
@@ -62,6 +82,18 @@ final class ConversationListStoreTests: XCTestCase {
         XCTAssertFalse(store.applyExternal(
             [try conversation(id: "one", title: "stale response")], startedAt: token))
         XCTAssertEqual(store.conversations.first?.title, "SSE update")
+    }
+
+    @MainActor
+    func testRemoveByTranscriptRowIdRemovesAggregateRow() throws {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-list-tests-\(UUID().uuidString)")
+        let store = ConversationListStore()
+        store.upsert(try conversation(id: "latest-a", aggregateId: "pc-1", title: "latest"))
+
+        store.removeByTranscriptRowId("latest-a")
+
+        XCTAssertTrue(store.conversations.isEmpty)
     }
 
     @MainActor
