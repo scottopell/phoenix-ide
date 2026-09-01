@@ -45,6 +45,7 @@ import {
   type ChainMemberSummary,
   type ChainSseEventData,
 } from '../api';
+import { notifyArchiveCloseConflict } from '../notifications';
 import { ChainDeleteConfirm } from '../components/ChainDeleteConfirm';
 import { WorkScopePanel } from '../components/WorkScopePanel';
 import { ChainWorkIdentityBlock } from '../components/ChainWorkIdentityBlock';
@@ -445,10 +446,12 @@ export function ChainPage() {
             await api.archiveChain(rootConvId);
             navigate('/');
           } catch (err) {
-            dispatch({
-              type: 'LOAD_FAIL',
-              error: err instanceof Error ? err.message : 'Failed to archive chain',
-            });
+            if (!notifyArchiveCloseConflict(rootConvId, err)) {
+              dispatch({
+                type: 'LOAD_FAIL',
+                error: err instanceof Error ? err.message : 'Failed to archive chain',
+              });
+            }
           }
         }}
         onDelete={() => setDeleteConfirmOpen(true)}

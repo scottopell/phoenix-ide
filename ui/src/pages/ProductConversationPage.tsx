@@ -430,12 +430,18 @@ function ProductConversationPageInner() {
   }, [productConversationId, snapshotRetry]);
 
   useEffect(() => {
-    const notificationId = snapshot?.latest_transcript_row_id ?? productConversationId;
-    if (!notificationId) return;
-    return subscribeCloseSnapshotChanged(notificationId, () => {
-      setSnapshotRetry((retry) => retry + 1);
-    });
-  }, [productConversationId, snapshot?.latest_transcript_row_id]);
+    const notificationIds = new Set([
+      productConversationId,
+      snapshot?.latest_transcript_row_id,
+      snapshot?.canonical_root.transcript_row_id,
+      ...((snapshot?.segments ?? []).map((segment) => segment.transcript_row_id)),
+    ].filter((id): id is string => Boolean(id)));
+    if (notificationIds.size === 0) return;
+    const refresh = () => setSnapshotRetry((retry) => retry + 1);
+    const unsubscribes = [...notificationIds].map((id) =>
+      subscribeCloseSnapshotChanged(id, refresh));
+    return () => unsubscribes.forEach((unsubscribe) => unsubscribe());
+  }, [productConversationId, snapshot]);
 
   const refreshChain = useCallback(async (rootId: string) => {
     try {
