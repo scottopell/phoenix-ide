@@ -2823,14 +2823,11 @@ mod product_creation_delivery_replay_tests {
                 request_id: request_id.to_string(),
                 claim: provisioning.claim,
                 conversation,
-                authority_kind: AuthorityKind::Work,
+                authority_kind: AuthorityKind::Direct,
                 environment: EnvironmentContext::UnownedCwd {
                     cwd: intent.cwd.clone(),
                 },
-                git_publication: Some(ProductCreationGitPublicationFacts {
-                    exact_checkout_oid: "repo-id".to_string(),
-                    repository_root: intent.cwd.clone(),
-                }),
+                git_publication: None,
             })
             .await
             .unwrap());
@@ -2914,34 +2911,58 @@ mod product_creation_delivery_replay_tests {
 
     async fn assert_retry_identity_counts(
         db: &Database,
-        accepted_product_id: &phoenix_core::domain::close::ProductConversationId,
         request_id: &str,
+        expected_published_product_id: &phoenix_core::domain::close::ProductConversationId,
+        expected_published_conversation_id: &str,
         objective_message_count: i64,
         objective_queue_count: i64,
         objective_total_count: i64,
     ) {
-        let transcript_count_for_product: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM conversations WHERE product_conversation_id = ?1",
+        let published_product_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)
+             FROM product_creation_jobs
+             WHERE request_id = ?1
+               AND published_product_id IS NOT NULL",
         )
-        .bind(accepted_product_id.as_str())
+        .bind(request_id)
         .fetch_one(db.pool())
         .await
         .unwrap();
-        let product_row_count_for_id: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM product_conversations WHERE id = ?1")
-                .bind(accepted_product_id.as_str())
-                .fetch_one(db.pool())
-                .await
-                .unwrap();
+        let published_conversation_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)
+             FROM product_creation_jobs
+             WHERE request_id = ?1
+               AND published_conversation_id IS NOT NULL",
+        )
+        .bind(request_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let transcript_count_for_request_publication: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)
+             FROM conversations
+             WHERE product_conversation_id = (
+                 SELECT published_product_id
+                 FROM product_creation_jobs
+                 WHERE request_id = ?1
+             )",
+        )
+        .bind(request_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
         let committed_objective_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)
              FROM messages m
              JOIN conversations c ON c.id = m.conversation_id
              WHERE m.message_id = ?1
-               AND c.product_conversation_id = ?2",
+               AND c.product_conversation_id = (
+                   SELECT published_product_id
+                   FROM product_creation_jobs
+                   WHERE request_id = ?1
+               )",
         )
         .bind(request_id)
-        .bind(accepted_product_id.as_str())
         .fetch_one(db.pool())
         .await
         .unwrap();
@@ -2950,15 +2971,32 @@ mod product_creation_delivery_replay_tests {
              FROM steering_messages s
              JOIN conversations c ON c.id = s.conversation_id
              WHERE s.message_id = ?1
-               AND c.product_conversation_id = ?2",
+               AND c.product_conversation_id = (
+                   SELECT published_product_id
+                   FROM product_creation_jobs
+                   WHERE request_id = ?1
+               )",
         )
         .bind(request_id)
-        .bind(accepted_product_id.as_str())
         .fetch_one(db.pool())
         .await
         .unwrap();
-        assert_eq!(product_row_count_for_id, 1);
-        assert_eq!(transcript_count_for_product, 1);
+        let published = db
+            .get_product_creation_job(request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(published_product_count, 1);
+        assert_eq!(published_conversation_count, 1);
+        assert_eq!(transcript_count_for_request_publication, 1);
+        assert_eq!(
+            published.published_product_id,
+            Some(expected_published_product_id.clone())
+        );
+        assert_eq!(
+            published.published_conversation_id.as_deref(),
+            Some(expected_published_conversation_id)
+        );
         assert_eq!(committed_objective_count, objective_message_count);
         assert_eq!(queued_objective_count, objective_queue_count);
         assert_eq!(
@@ -3242,7 +3280,16 @@ mod product_creation_delivery_replay_tests {
         )
         .await;
 
-        assert_retry_identity_counts(&db, &accepted_product_id, request_id, 0, 0, 0).await;
+        assert_retry_identity_counts(
+            &db,
+            request_id,
+            &accepted_product_id,
+            conversation_id,
+            0,
+            0,
+            0,
+        )
+        .await;
         assert!(db
             .retry_failed_product_creation_delivery(request_id)
             .await
@@ -3256,7 +3303,16 @@ mod product_creation_delivery_replay_tests {
             last_delivery_lease_until + chrono::Duration::seconds(1),
         )
         .await;
-        assert_retry_identity_counts(&db, &accepted_product_id, request_id, 0, 1, 1).await;
+        assert_retry_identity_counts(
+            &db,
+            request_id,
+            &accepted_product_id,
+            conversation_id,
+            0,
+            1,
+            1,
+        )
+        .await;
     }
 }
 
