@@ -11,6 +11,8 @@ final class ProductConversationDetailModel {
     private let createSession: (String) -> ConversationSession?
     private let existingSession: (String) -> ConversationSession?
     private let persistedOutboxContents: (String) -> Outbox.StoredContents
+    private let hasCachedSnapshot: (String) -> Bool
+    private let handleDefinitiveNotFound: @MainActor (String?) async -> Void
     private let loadSnapshot: (String, String?) async throws -> ProductConversationSnapshot
     private let didStartRefresh: @MainActor (ProductConversationRefreshCause) -> Void
     private let onConfigurationInvalidated: @MainActor () -> Void
@@ -36,6 +38,8 @@ final class ProductConversationDetailModel {
     private var retainedFallbackSession: ConversationSession?
     private var retainedFallbackSource: FallbackSessionSource = .none
     private var persistedOutboxOwnerIndex = PersistedOutboxOwnerIndex()
+    private var aggregateTranscriptRowIds: Set<String> = []
+    private var lastTranscriptMutation: TranscriptMutation = .unknown
 
     init(
         aggregateId: String,
@@ -45,6 +49,8 @@ final class ProductConversationDetailModel {
         sessionProvider: @escaping (String) -> ConversationSession?,
         existingSession: @escaping (String) -> ConversationSession? = { _ in nil },
         persistedOutboxContents: @escaping (String) -> Outbox.StoredContents = { _ in .empty },
+        hasCachedSnapshot: @escaping (String) -> Bool = { _ in false },
+        handleDefinitiveNotFound: @escaping @MainActor (String?) async -> Void = { _ in },
         loadSnapshot: ((String, String?) async throws -> ProductConversationSnapshot)? = nil,
         didStartRefresh: @escaping @MainActor (ProductConversationRefreshCause) -> Void = { _ in },
         onConfigurationInvalidated: @escaping @MainActor () -> Void = {}
@@ -55,6 +61,8 @@ final class ProductConversationDetailModel {
         self.createSession = sessionProvider
         self.existingSession = existingSession
         self.persistedOutboxContents = persistedOutboxContents
+        self.hasCachedSnapshot = hasCachedSnapshot
+        self.handleDefinitiveNotFound = handleDefinitiveNotFound
         self.loadSnapshot = loadSnapshot ?? { id, before in
             try await api.getProductConversation(id: id, before: before)
         }
@@ -119,6 +127,8 @@ final class ProductConversationDetailModel {
         guard let fallbackSession = retainedFallbackSession else { return [] }
         return fallbackSession.messages.map(ProductConversationTranscriptItem.message)
     }
+
+    var transcriptMutation: TranscriptMutation { lastTranscriptMutation }
 
     var fallbackSession: ConversationSession? {
         retainedFallbackSession
@@ -374,10 +384,18 @@ final class ProductConversationDetailModel {
             didStartRefresh(cause)
             let fresh = try await loadSnapshot(aggregateId, nil)
             guard generation == loadGeneration, !Task.isCancelled else { return }
+            let previousItems = transcriptItems
             applyRefreshedSnapshot(fresh, cause: cause)
+            updateTranscriptMutation(from: previousItems, to: transcriptItems)
             loadError = nil
         } catch {
             guard generation == loadGeneration, !Task.isCancelled else { return }
+            if let apiError = error as? APIError, apiError.isNotFound {
+                await handleDefinitiveNotFound(selectedTranscriptRowId ?? initialTranscriptRowId)
+                invalidateConfiguration()
+                loadError = nil
+                return
+            }
             if snapshot == nil {
                 activateInitialFallbackIfAvailable()
                 activateRetainedFallbackFromPersistedOutboxIfNeeded()
@@ -433,6 +451,7 @@ final class ProductConversationDetailModel {
     private func applySnapshot(_ newSnapshot: ProductConversationSnapshot, resetRetainedPages: Bool) {
         if resetRetainedPages { retainedOlderPages.removeAll() }
         snapshot = newSnapshot
+        aggregateTranscriptRowIds = Set(newSnapshot.segments.map(\.transcript_row_id))
         updatePersistedOutboxSessions(from: newSnapshot)
         if retainedFallbackSource == .persistedOutbox,
            let retainedFallbackSession,
@@ -662,6 +681,7 @@ final class ProductConversationDetailModel {
     private func activateInitialFallbackIfAvailable() {
         guard retainedFallbackSession == nil,
               let initialTranscriptRowId,
+              hasCachedSnapshot(initialTranscriptRowId),
               let session = materializeSession(initialTranscriptRowId)
         else { return }
         retainedFallbackSession = session
@@ -787,6 +807,22 @@ final class ProductConversationDetailModel {
             index[id] = ToolUseRef(name: name, input: block["input"])
         }
     }
+
+    private func updateTranscriptMutation(
+        from previousItems: [ProductConversationTranscriptItem],
+        to currentItems: [ProductConversationTranscriptItem]
+    ) {
+        guard previousItems != currentItems else {
+            lastTranscriptMutation = .unchanged
+            return
+        }
+        if currentItems.count > previousItems.count,
+           Array(currentItems.suffix(previousItems.count)) == previousItems {
+            lastTranscriptMutation = .prependedOlder
+            return
+        }
+        lastTranscriptMutation = .appendedLive
+    }
 }
 
 private struct MergedSegment {
@@ -809,6 +845,13 @@ private enum FallbackSessionSource {
     case initialTranscriptRow
     case persistedOutbox
     case none
+}
+
+enum TranscriptMutation: Equatable {
+    case unknown
+    case prependedOlder
+    case appendedLive
+    case unchanged
 }
 
 private enum PendingLoad: Equatable {

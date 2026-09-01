@@ -41,7 +41,8 @@ struct ProductConversationDetailView: View {
                     items: detailModel.transcriptItems,
                     toolIndex: detailModel.composedToolUseIndex,
                     streamingText: streamingText,
-                    outboxProjections: detailModel.outboxProjections)
+                    outboxProjections: detailModel.outboxProjections,
+                    transcriptMutation: detailModel.transcriptMutation)
                 if let session = detailModel.stateDetailSession {
                     ProductConversationStateDetailView(
                         session: session,
@@ -49,6 +50,18 @@ struct ProductConversationDetailView: View {
                         isOnline: detailModel.delegatedConnectivityAllowsActions)
                 }
                 ProductConversationSegmentPicker(model: detailModel)
+                if let session = detailModel.currentOwnerSession, !session.outbox.persistenceHealthy {
+                    HStack(spacing: 6) {
+                        Image(systemName: "externaldrive.badge.exclamationmark")
+                            .foregroundStyle(.orange)
+                        Text("Queued message storage failed — keep this screen open until you retry or discard pending messages.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.top, 4)
+                    .accessibilityIdentifier("productConversation.outboxPersistenceWarning")
+                }
                 if let error = detailModel.lastDelegatedError {
                     InlineErrorBanner(message: error) { detailModel.dismissDelegatedError() }
                 }
@@ -120,6 +133,7 @@ struct ProductConversationTranscriptView: View {
     let toolIndex: [String: ToolUseRef]
     let streamingText: String
     let outboxProjections: [ProductConversationOutboxProjection]
+    let transcriptMutation: TranscriptMutation
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -147,7 +161,8 @@ struct ProductConversationTranscriptView: View {
                 .padding(.vertical, 8)
             }
             .defaultScrollAnchor(.bottom)
-            .onChange(of: items.count) {
+            .onChange(of: transcriptMutation) {
+                guard transcriptMutation == .appendedLive else { return }
                 withAnimation(.easeOut(duration: 0.2)) {
                     proxy.scrollTo("bottom", anchor: .bottom)
                 }

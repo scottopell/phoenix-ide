@@ -565,6 +565,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
                 sessionProvider: { id in id == "row-2" ? cached : nil },
                 existingSession: { id in id == "row-2" ? cached : nil },
                 persistedOutboxContents: { persisted.contents(for: $0) },
+                hasCachedSnapshot: { $0 == "row-2" },
                 loadSnapshot: { _, _ in throw URLError(.cannotConnectToHost) })
 
             await model.start()
@@ -668,6 +669,49 @@ final class ProductConversationDetailModelTests: XCTestCase {
         XCTAssertEqual(counter.created, createdAfterApply)
     }
 
+    func testInitialFallbackRequiresCachedSnapshot() async {
+        let uncached = makeSession(id: "row-2")
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-1",
+            initialTranscriptRowId: "row-2",
+            api: makeAPI(),
+            connectivity: ConnectivityMonitor(),
+            sessionProvider: { id in id == "row-2" ? uncached : nil },
+            existingSession: { _ in nil },
+            hasCachedSnapshot: { _ in false },
+            loadSnapshot: { _, _ in throw APIError.transport(underlying: URLError(.notConnectedToInternet)) })
+
+        await model.start()
+
+        XCTAssertNil(model.fallbackSession)
+        XCTAssertEqual(model.loadError, APIError.transport(underlying: URLError(.notConnectedToInternet)).errorDescription)
+    }
+
+    func testAggregateNotFoundTriggersOwnedCleanup() async {
+        final class Box {
+            var cleanedTranscriptRowId: String?
+        }
+        let box = Box()
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-1",
+            initialTranscriptRowId: "row-2",
+            api: makeAPI(),
+            connectivity: ConnectivityMonitor(),
+            sessionProvider: { _ in nil },
+            existingSession: { _ in nil },
+            handleDefinitiveNotFound: { transcriptRowId in
+                box.cleanedTranscriptRowId = transcriptRowId
+            },
+            loadSnapshot: { _, _ in throw APIError.http(status: 404, body: "gone") })
+
+        await model.start()
+
+        XCTAssertEqual(box.cleanedTranscriptRowId, "row-2")
+        XCTAssertNil(model.snapshot)
+        XCTAssertNil(model.fallbackSession)
+        XCTAssertNil(model.loadError)
+    }
+
     func testSeededPersistedOutboxFallbackActivatesOnInitialLoadFailure() async {
         let row1 = makeSession(id: "row-1")
         let row2 = makeSession(id: "row-2")
@@ -726,7 +770,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
         box.persisted = TestPersistedOutboxStore()
         model.handleSessionEvent(transcriptRowId: "row-1", generation: 1, event: .outboxChanged)
 
-        XCTAssertNil(model.fallbackSession)
+        XCTAssertNotNil(model.fallbackSession)
     }
 
     private func withScopedDiskStoreDirectory(
