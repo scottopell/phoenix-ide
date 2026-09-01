@@ -14,11 +14,6 @@ export class SyncQueue {
         if (!op.payload.text && (op.payload.files || []).length === 0 && (op.payload.images || []).length === 0) {
           throw new Error('send_message requires text or attachments');
         }
-        const current = await api.getConversation(op.conversationId);
-        if (current.conversation.archived) {
-          console.debug('Draining queued send for archived conversation:', op.conversationId);
-          break;
-        }
         await api.sendMessage(
           op.conversationId,
           op.payload.text || '',

@@ -961,18 +961,6 @@ fn validate_begin_preconditions(
     let root = &topology.root;
     let latest = &topology.latest;
 
-    if root.archived {
-        return Err(close_precondition("root conversation is archived"));
-    }
-    if topology
-        .members
-        .iter()
-        .any(|member| member.conversation.archived)
-    {
-        return Err(close_precondition(
-            "Close topology contains an archived conversation",
-        ));
-    }
     if root.runtime_role != RuntimeRole::User {
         return Err(close_precondition(
             "root conversation must have runtime_role=user",
@@ -1160,10 +1148,6 @@ impl Database {
             return Ok(obligation);
         }
 
-        let topology = read_topology_tx(&mut tx, product_conversation_id)
-            .await?
-            .ok_or_else(|| DbError::CloseFoundationNotFound(product_conversation_id.to_string()))?;
-        validate_begin_preconditions(&topology, expected_latest_transcript_id.as_str())?;
         let lifecycle: Option<String> = sqlx::query_scalar(
             "SELECT ordinary_lifecycle FROM product_conversations
              WHERE id = ?1 AND kind = 'ordinary'",
@@ -1176,6 +1160,17 @@ impl Database {
                 "ProductConversation {product_conversation_id} is already in History"
             )));
         }
+        sqlx::query(
+            "UPDATE conversations SET archived = 0
+             WHERE product_conversation_id = ?1 AND archived = 1",
+        )
+        .bind(product_conversation_id.as_str())
+        .execute(&mut *tx)
+        .await?;
+        let topology = read_topology_tx(&mut tx, product_conversation_id)
+            .await?
+            .ok_or_else(|| DbError::CloseFoundationNotFound(product_conversation_id.to_string()))?;
+        validate_begin_preconditions(&topology, expected_latest_transcript_id.as_str())?;
 
         if let Some(row) = sqlx::query(
             "SELECT attempt_id, product_conversation_id, phase, inspection_generation,
@@ -7205,38 +7200,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn archived_non_root_member_is_rejected() {
+    async fn open_aggregate_ignores_archived_member_drift() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "latest", "root").await;
         set_archived(&db, "latest", true).await;
-        let error = db
-            .begin_close_foundation(
-                &product_id("root"),
-                &transcript_id("latest"),
-                "attempt-archived-member",
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(error, DbError::CloseFoundationPrecondition(_)));
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("latest"),
+            "attempt-archived-member",
+        )
+        .await
+        .expect("aggregate lifecycle, not legacy archived drift, owns Close admission");
     }
 
     #[tokio::test]
     async fn archived_root_non_user_and_non_user_initiated_are_rejected() {
         let db = Database::open_in_memory().await.unwrap();
-        create_root(&db, "archived").await;
-        set_archived(&db, "archived", true).await;
-        assert!(matches!(
-            db.begin_close_foundation(
-                &product_id("archived"),
-                &transcript_id("archived"),
-                "attempt-a"
-            )
-            .await
-            .unwrap_err(),
-            DbError::CloseFoundationPrecondition(_)
-        ));
-
         create_root(&db, "subagent-parent").await;
         let parent = db.get_conversation("subagent-parent").await.unwrap();
         db.create_conversation_with_project(
