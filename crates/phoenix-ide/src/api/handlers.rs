@@ -13450,6 +13450,80 @@ pub(crate) mod hard_delete_cascade_tests {
     }
 
     #[tokio::test]
+    async fn compatibility_archive_reports_cancelled_close_instead_of_success() {
+        let state = make_test_state().await;
+        let root = state
+            .db
+            .create_conversation(
+                "chat-close-cancel",
+                "chat-close-cancel",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .expect("create chat-only conversation");
+        sqlx::query(
+            "INSERT INTO conversation_creation_jobs (
+                 id, conversation_id, message_id, status, stage, attempt, generation,
+                 intent_json, error, accepted_at, provisioning_started_at, completed_at,
+                 failed_at, cancelled_at, deletion_requested_at, created_at, updated_at
+             ) VALUES (
+                 'chat-close-cancel-job', ?1, NULL, 'accepted', 'validate_intent', 0, 0,
+                 '{}', NULL, '2025-01-01T00:00:00Z', NULL, NULL, NULL, NULL, NULL,
+                 '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z'
+             )",
+        )
+        .bind(&root.id)
+        .execute(state.db.pool())
+        .await
+        .unwrap();
+
+        let first = archive_conversation(State(state.clone()), Path(root.id.clone())).await;
+        assert!(
+            matches!(first, Err(AppError::Conflict(detail)) if detail.error_type == "close_settlement_in_progress")
+        );
+        let obligation = state
+            .db
+            .get_active_close_obligation_for_product(&root.product_conversation_id)
+            .await
+            .unwrap()
+            .expect("active Close obligation");
+        state
+            .db
+            .request_close_settlement_cancellation(obligation.attempt_id().as_str())
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET status = 'cancelled', cancelled_at = '2025-01-01T00:00:01Z',
+                 updated_at = '2025-01-01T00:00:01Z'
+             WHERE id = 'chat-close-cancel-job'",
+        )
+        .execute(state.db.pool())
+        .await
+        .unwrap();
+
+        let retry = archive_conversation(State(state.clone()), Path(root.id.clone()))
+            .await
+            .expect_err("cancelled Close is not archive success");
+        assert!(
+            matches!(retry, AppError::Conflict(detail) if detail.error_type == "close_cancelled")
+        );
+        let completed = state
+            .db
+            .get_close_obligation(obligation.attempt_id().as_str())
+            .await
+            .unwrap();
+        assert_eq!(
+            completed.close_outcome(),
+            Some(phoenix_core::domain::close::CloseCompletionOutcome::Cancelled)
+        );
+        assert!(!state.db.get_conversation(&root.id).await.unwrap().archived);
+    }
+
+    #[tokio::test]
     async fn archive_fences_unmaterialized_direct_turn() {
         let state = make_test_state().await;
         state

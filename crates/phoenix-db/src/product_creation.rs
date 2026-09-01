@@ -1138,8 +1138,9 @@ impl Database {
         }
         let now = unix_micros_now();
         let mut tx = self.pool.begin().await?;
-        let published_conversation_id: Option<String> = sqlx::query_scalar(
-            "SELECT published_conversation_id FROM product_creation_jobs
+        let published_ids: Option<(String, String)> = sqlx::query_as(
+            "SELECT published_conversation_id, published_product_id
+             FROM product_creation_jobs
              WHERE request_id = ?1 AND status = 'delivery_pending'
                AND claim_generation = ?2 AND claim_worker_id = ?3 AND claim_token = ?4
                AND claim_lease_until_unix_micros > ?5",
@@ -1150,9 +1151,8 @@ impl Database {
         .bind(&claim.token)
         .bind(now)
         .fetch_optional(&mut *tx)
-        .await?
-        .flatten();
-        let Some(published_conversation_id) = published_conversation_id else {
+        .await?;
+        let Some((published_conversation_id, published_product_id)) = published_ids else {
             tx.rollback().await?;
             return Ok(false);
         };
@@ -1160,6 +1160,13 @@ impl Database {
             .bind(&published_conversation_id)
             .execute(&mut *tx)
             .await?;
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'open'
+             WHERE id = ?1 AND kind = 'ordinary'",
+        )
+        .bind(&published_product_id)
+        .execute(&mut *tx)
+        .await?;
         let updated = sqlx::query(
             "UPDATE product_creation_jobs
              SET status = 'published', claim_worker_id = NULL, claim_token = NULL,
@@ -3052,7 +3059,7 @@ mod product_creation_tests {
             .unwrap();
         let mut conv = published_conversation(
             "conv-delivery-complete",
-            accepted.product_conversation_id,
+            accepted.product_conversation_id.clone(),
             WorkScopeId::new(),
             "/repo/a",
         );
@@ -3073,6 +3080,19 @@ mod product_creation_tests {
         })
         .await
         .unwrap();
+        sqlx::query(
+            "UPDATE product_creation_jobs
+             SET status = 'delivery_failed', delivery_retry_at_unix_micros = NULL,
+                 claim_worker_id = NULL, claim_token = NULL, claim_lease_until_unix_micros = NULL
+             WHERE request_id = 'req-delivery-complete'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert!(db
+            .retry_failed_product_creation_delivery("req-delivery-complete")
+            .await
+            .unwrap());
         let delivery = db
             .claim_next_product_creation_delivery(
                 "delivery-worker",
@@ -3105,6 +3125,13 @@ mod product_creation_tests {
             },
             "product-create:req-delivery-complete",
         )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1",
+        )
+        .bind(accepted.product_conversation_id.as_str())
+        .execute(db.pool())
         .await
         .unwrap();
         let stale_claim = ProductCreationClaim {
@@ -3141,6 +3168,14 @@ mod product_creation_tests {
                 .unwrap()
                 .archived
         );
+        let lifecycle: String = sqlx::query_scalar(
+            "SELECT ordinary_lifecycle FROM product_conversations WHERE id = ?1",
+        )
+        .bind(delivery.job.product_conversation_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(lifecycle, "open");
     }
 
     #[tokio::test]

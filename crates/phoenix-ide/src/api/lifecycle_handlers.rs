@@ -680,7 +680,7 @@ pub(crate) async fn retry_close_retirement(
 
 #[allow(clippy::too_many_lines, clippy::single_match_else)]
 async fn run_legacy_close_compat(state: &AppState, id: &str, action: &str) -> Result<(), AppError> {
-    use phoenix_core::domain::close::{CloseAttemptId, ClosePhase};
+    use phoenix_core::domain::close::{CloseAttemptId, CloseCompletionOutcome, ClosePhase};
 
     let transcript = state
         .db
@@ -863,7 +863,20 @@ async fn run_legacy_close_compat(state: &AppState, id: &str, action: &str) -> Re
                     "close_retirement_needs_repair",
                 ))));
             }
-            ClosePhase::Completed => return Ok(()),
+            ClosePhase::Completed => {
+                return match obligation.close_outcome() {
+                    Some(CloseCompletionOutcome::Archived) => Ok(()),
+                    Some(CloseCompletionOutcome::Cancelled) => {
+                        Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                            "Close was cancelled before archival completed",
+                            "close_cancelled",
+                        ))))
+                    }
+                    None => Err(AppError::Internal(
+                        "completed Close attempt has no terminal outcome".to_string(),
+                    )),
+                };
+            }
         };
     }
 }
