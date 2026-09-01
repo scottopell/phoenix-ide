@@ -8485,14 +8485,6 @@ html * {
   font-weight: 700;
 }
 
-.task-approval-context-cue--start-here .task-approval-context-cue__recommendation {
-  color: var(--accent-green);
-}
-
-.task-approval-context-cue--new-chat .task-approval-context-cue__recommendation {
-  color: var(--accent-yellow);
-}
-
 .task-approval-context-cue__hint {
   min-width: 0;
   overflow: hidden;
@@ -8616,22 +8608,6 @@ html * {
     display: inline;
   }
 
-  .task-approval-context-cue {
-    padding: 8px 12px;
-  }
-
-  .task-approval-context-cue__hint {
-    display: none;
-  }
-
-  .task-approval-context-cue__recommendation {
-    flex-shrink: 1;
-    min-width: 0;
-    margin-left: auto;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
 }
 
 /* --- First Task Welcome modal --- */

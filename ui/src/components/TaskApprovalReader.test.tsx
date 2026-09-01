@@ -79,8 +79,8 @@ describe('TaskApprovalReader feedback action emphasis', () => {
     const buttons = toolbarButtons();
     expect(buttons.map((button) => button.getAttribute('aria-label'))).toEqual([
       'Request changes (0)',
-      'Approve and start here',
-      'Approve and start a new continuation conversation',
+      'Continue here',
+      'Start in new conversation',
     ]);
     expect(screen.getByRole('button', { name: 'Discard task' })).toHaveClass('task-approval-header-discard');
 
@@ -112,8 +112,8 @@ describe('TaskApprovalReader feedback action emphasis', () => {
     const buttons = toolbarButtons();
     expect(buttons.map((button) => button.getAttribute('aria-label'))).toEqual([
       'Request changes (1)',
-      'Approve and start here',
-      'Approve and start a new continuation conversation',
+      'Continue here',
+      'Start in new conversation',
     ]);
 
     expect(buttons[0]).toBeEnabled();
@@ -138,9 +138,37 @@ describe('TaskApprovalReader feedback action emphasis', () => {
 
     expect(screen.getByText('Context')).toBeInTheDocument();
     expect(screen.getByText('48% used')).toBeInTheDocument();
-    expect(screen.getByText('Start here recommended')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Approve and start here' }))
+    expect(screen.getByText('Continue here recommended')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Continue here' }))
       .toHaveClass('task-approval-btn--recommended-decision');
+  });
+
+  it('emits both new recommendation modifier classes so the colocated CSS can style them', () => {
+    const { rerender, container } = renderTaskApprovalReader('# Plan', vi.fn(), {
+      contextWindowUsed: 96_000,
+      modelContextWindow: 200_000,
+    });
+
+    const continueCue = container.querySelector('.task-approval-context-cue--continue-here');
+    expect(continueCue).not.toBeNull();
+    expect(continueCue?.querySelector('.task-approval-context-cue__recommendation')).toHaveTextContent('Continue here recommended');
+
+    rerender(
+      <TaskApprovalReader
+        title="Review task"
+        priority="p2"
+        plan="# Plan"
+        contextWindowUsed={176_000}
+        modelContextWindow={200_000}
+        onApprove={vi.fn()}
+        onReject={vi.fn()}
+        onSendFeedback={vi.fn()}
+      />
+    );
+
+    const newConversationCue = container.querySelector('.task-approval-context-cue--new-conversation');
+    expect(newConversationCue).not.toBeNull();
+    expect(newConversationCue?.querySelector('.task-approval-context-cue__recommendation')).toHaveTextContent('Start in new conversation recommended');
   });
 
   it('recommends a new chat when context pressure is high', () => {
@@ -150,8 +178,8 @@ describe('TaskApprovalReader feedback action emphasis', () => {
     });
 
     expect(screen.getByText('88% used')).toBeInTheDocument();
-    expect(screen.getByText('New chat recommended')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Approve and start a new continuation conversation' }))
+    expect(screen.getByText('Start in new conversation recommended')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Start in new conversation' }))
       .toHaveClass('task-approval-btn--recommended-decision');
   });
 
@@ -159,19 +187,19 @@ describe('TaskApprovalReader feedback action emphasis', () => {
     const onApprove = vi.fn();
     renderTaskApprovalReader(undefined, onApprove);
 
-    fireEvent.click(screen.getByRole('button', { name: 'Approve and start here' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Continue here' }));
     expect(onApprove).toHaveBeenCalledWith('continue_in_current_conversation');
 
-    expect(screen.getByRole('button', { name: 'Approve and start a new continuation conversation' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Start in new conversation' })).toBeInTheDocument();
   });
 
   it('clears approving state and shows async approval errors', () => {
     const onApprove = vi.fn();
     const { rerender } = renderTaskApprovalReader(undefined, onApprove);
 
-    fireEvent.click(screen.getByRole('button', { name: 'Approve and start here' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Continue here' }));
     expect(screen.getByText('Approving...')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Approve and start a new continuation conversation' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Start in new conversation' })).toBeDisabled();
 
     rerender(
       <TaskApprovalReader
@@ -187,8 +215,8 @@ describe('TaskApprovalReader feedback action emphasis', () => {
 
     expect(screen.getByRole('alert')).toHaveTextContent('Target branch already exists');
     expect(screen.queryByText('Approving...')).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Approve and start here' })).toBeEnabled();
-    expect(screen.getByRole('button', { name: 'Approve and start a new continuation conversation' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Continue here' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Start in new conversation' })).toBeEnabled();
   });
 });
 
