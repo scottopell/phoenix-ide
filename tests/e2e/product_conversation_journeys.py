@@ -201,10 +201,6 @@ def scenario_dirty_exact_loss(base_url: str, cwd: Path) -> None:
 
 
 BLOCKED_COMMISSIONED_JOURNEYS = {
-    "multi-transcript/handoff/latest-writable": (
-        "POST /api/conversations/:id/continue requires an already context-exhausted transcript, "
-        "but the shipped mock/provider surface has no deterministic context-exhaustion input"
-    ),
     "creation-failure/retry": (
         "invalid cwd and invalid model are rejected before durable creation intent, while the "
         "shipped surface has no deterministic post-publication delivery-failure input"
@@ -212,25 +208,46 @@ BLOCKED_COMMISSIONED_JOURNEYS = {
 }
 
 
+def scenario_merged_context_continuation(base_url: str, _cwd: Path) -> None:
+    run.scenario_product_conversation_context_continuation(base_url)
+
+
+def is_retryable_creation_response(error: Exception) -> bool:
+    if not isinstance(error, httpx.HTTPStatusError):
+        return False
+    try:
+        return error.response.json().get("error_type") == "product_creation_retry_scheduled"
+    except ValueError:
+        return False
+
+
 def run_journeys() -> None:
     if not (ROOT / "target" / "debug" / "phoenix-ide").exists():
         run._build_binary()
     scenarios = [
         ("create/objective/one-row/reload", scenario_create_objective_one_row_reload),
+        ("multi-transcript/handoff/latest-writable", scenario_merged_context_continuation),
         ("clean-close/history", scenario_clean_close_history),
         ("busy/stop-work-confirm", scenario_busy_stop_work),
         ("dirty/exact-loss", scenario_dirty_exact_loss),
     ]
     for name, scenario in scenarios:
-        with tempfile.TemporaryDirectory(prefix="product-conversation-journey-") as directory:
-            root = Path(directory)
-            repo = root / "repo"
-            repo.mkdir()
-            init_git_repo(repo)
-            with run._server() as (base_url, _log_path, _pid, _profile_dir):
-                started = time.monotonic()
-                scenario(base_url, repo)
-                print(f"✓ {name} {time.monotonic() - started:.2f}s", flush=True)
+        for attempt in range(1, 4):
+            try:
+                with tempfile.TemporaryDirectory(prefix="product-conversation-journey-") as directory:
+                    root = Path(directory)
+                    repo = root / "repo"
+                    repo.mkdir()
+                    init_git_repo(repo)
+                    with run._server() as (base_url, _log_path, _pid, _profile_dir):
+                        started = time.monotonic()
+                        scenario(base_url, repo)
+                        print(f"✓ {name} {time.monotonic() - started:.2f}s", flush=True)
+                break
+            except httpx.HTTPStatusError as error:
+                if attempt == 3 or not is_retryable_creation_response(error):
+                    raise
+                print(f"[qa] {name}: retrying in a fresh isolated instance ({attempt}/3)", flush=True)
     blocked = "\n".join(f"- {name}: {reason}" for name, reason in BLOCKED_COMMISSIONED_JOURNEYS.items())
     raise RuntimeError(f"commissioned ProductConversation journeys remain blocked:\n{blocked}")
 

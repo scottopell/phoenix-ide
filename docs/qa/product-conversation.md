@@ -134,16 +134,14 @@ Run `./dev.py qa product-conversation-journeys`. The QA-only harness starts a fr
 
 - create with the exact initial objective;
 - exactly one aggregate/list row and stable canonical identity after reload;
+- deterministic natural context exhaustion followed by a successor transcript, exactly one typed handoff, one aggregate/list row, and latest-successor writable ownership via the merged `product_conversation_context_continuation` scenario;
 - clean Close to History;
 - busy Close stop-work confirmation;
 - dirty-worktree Close with the exact persisted loss identity and confirmation.
 
-The command intentionally exits nonzero after those green journeys because two commissioned journeys lack a deterministic shipped boundary:
+The command intentionally exits nonzero after those green journeys because the creation-failure/retry journey still depends on PR741. It requires a durable post-publication delivery failure; invalid cwd/model inputs are rejected before durable intent and current main has no external fault input reaching `delivery_failed`.
 
-- multi-transcript/handoff/latest-writable requires an already context-exhausted transcript, but the shipped mock/provider surface cannot deterministically create one;
-- creation-failure/retry requires a durable post-publication delivery failure, but invalid cwd/model inputs are rejected before durable intent and no shipped external fault input reaches `delivery_failed`.
-
-No fixture data or direct database mutation substitutes for these user journeys. The candidate is therefore blocked from devmbp UAT until the owning production workstream ships an external deterministic boundary or otherwise makes both real journeys reachable without QA changing production behavior.
+No fixture data or direct database mutation substitutes for these user journeys. The candidate is therefore blocked from devmbp UAT until PR741 lands and the real recovery journey passes without QA changing production behavior.
 
 ## Validation for this slice
 

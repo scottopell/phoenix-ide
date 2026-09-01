@@ -100,6 +100,21 @@ describe('ProductConversationFixture', () => {
     expect(screen.getAllByText('Long fixture conversation')).toHaveLength(2);
   });
 
+  it('resolves embedded mobile routes to the latest transcript identity', async () => {
+    const scenario = getProductConversationScenario('mobile-open');
+    render(<ProductConversationFixture scenario={scenario} />);
+
+    await waitFor(() => {
+      expect(document.documentElement.dataset['productConversationFixtureReady']).toBe(scenario.id);
+    });
+
+    const bySlug = await api.getConversationRouteBySlug('fixture-mobile');
+    const byId = await api.getConversationRoute('row-mobile-1');
+    expect(bySlug.id).toBe('row-mobile-1');
+    expect(byId.id).toBe('row-mobile-1');
+    expect(scenario.snapshot?.latest_transcript_row_id).toBe('row-mobile-1');
+  });
+
   it('keeps the product fixture surface distinct from the coordinator fixture surface and restores mutable API hooks after unmount', async () => {
     const scenario = getProductConversationScenario('mobile-open');
     const originalGetSnapshot = api.getProductConversationSnapshot;

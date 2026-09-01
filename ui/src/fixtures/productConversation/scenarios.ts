@@ -205,6 +205,14 @@ export const productConversationScenarios = [
       source: null,
       work_identity: null,
       chain_qa_compatibility: null,
+      requested_transcript_row_id: 'row-mobile-1',
+      latest_transcript_row_id: 'row-mobile-1',
+      writable_transcript_row_id: 'row-mobile-1',
+      canonical_root: {
+        transcript_row_id: 'row-mobile-1',
+        slug: 'row-mobile-1',
+        title: 'Product Alpha mobile',
+      },
       segments: [
         segment(1, 'row-mobile-1', 'Mobile root', [
           textMessage('mobile-1', 1, 'user', 'Show how this page stacks on a phone.'),
