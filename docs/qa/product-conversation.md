@@ -138,10 +138,11 @@ Run `./dev.py qa product-conversation-journeys`. The QA-only harness starts a fr
 - clean Close to History;
 - busy Close stop-work confirmation;
 - dirty-worktree Close with the exact persisted loss identity and confirmation.
+- creation delivery failure/retry through the merged typed-capacity integration seam with stable durable identities and global uniqueness.
 
-The command intentionally exits nonzero after those green journeys because the creation-failure/retry journey still depends on PR741. It requires a durable post-publication delivery failure; invalid cwd/model inputs are rejected before durable intent and current main has no external fault input reaching `delivery_failed`.
+The creation-failure/retry journey invokes the merged `explicit_retry_after_queue_full_reuses_published_identities_without_duplicate_aggregate` selector. That integration test drives the real creation worker/runtime manager through a legitimate typed steering-capacity admission failure, durable `delivery_failed`, explicit retry after capacity release, stable published product/transcript/message identities, and global one-job/one-publication counts. It remains test-only rather than exposing a production fault endpoint.
 
-No fixture data or direct database mutation substitutes for these user journeys. The candidate is therefore blocked from devmbp UAT until PR741 lands and the real recovery journey passes without QA changing production behavior.
+No fixture data or direct database mutation substitutes for these user journeys.
 
 ## Validation for this slice
 

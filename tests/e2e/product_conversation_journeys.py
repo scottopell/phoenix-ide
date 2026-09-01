@@ -200,12 +200,26 @@ def scenario_dirty_exact_loss(base_url: str, cwd: Path) -> None:
     )
 
 
-BLOCKED_COMMISSIONED_JOURNEYS = {
-    "creation-failure/retry": (
-        "invalid cwd and invalid model are rejected before durable creation intent, while the "
-        "shipped surface has no deterministic post-publication delivery-failure input"
-    ),
-}
+def scenario_merged_creation_recovery() -> None:
+    result = subprocess.run(
+        [
+            "cargo",
+            "test",
+            "-p",
+            "phoenix_ide",
+            "--lib",
+            "runtime::creation_worker::product_creation_delivery_replay_tests::explicit_retry_after_queue_full_reuses_published_identities_without_duplicate_aggregate",
+            "--",
+            "--exact",
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    output = result.stdout + result.stderr
+    if "1 passed" not in output:
+        raise AssertionError(f"merged creation-recovery selector did not run exactly one test:\n{output}")
 
 
 def scenario_merged_context_continuation(base_url: str, _cwd: Path) -> None:
@@ -224,6 +238,9 @@ def is_retryable_creation_response(error: Exception) -> bool:
 def run_journeys() -> None:
     if not (ROOT / "target" / "debug" / "phoenix-ide").exists():
         run._build_binary()
+    recovery_started = time.monotonic()
+    scenario_merged_creation_recovery()
+    print(f"✓ creation-failure/retry {time.monotonic() - recovery_started:.2f}s", flush=True)
     scenarios = [
         ("create/objective/one-row/reload", scenario_create_objective_one_row_reload),
         ("multi-transcript/handoff/latest-writable", scenario_merged_context_continuation),
@@ -248,8 +265,6 @@ def run_journeys() -> None:
                 if attempt == 3 or not is_retryable_creation_response(error):
                     raise
                 print(f"[qa] {name}: retrying in a fresh isolated instance ({attempt}/3)", flush=True)
-    blocked = "\n".join(f"- {name}: {reason}" for name, reason in BLOCKED_COMMISSIONED_JOURNEYS.items())
-    raise RuntimeError(f"commissioned ProductConversation journeys remain blocked:\n{blocked}")
 
 
 if __name__ == "__main__":
