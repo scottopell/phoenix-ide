@@ -28,6 +28,12 @@ final class FixtureHarnessTests: XCTestCase {
             Set(FixtureScenario.ID.allCases))
     }
 
+    func testNormalFixtureCoversNativeMessageFamilies() {
+        let types = Set(FixtureScenario.scenario(for: .normal).screen.messages.map(\.message_type))
+
+        XCTAssertTrue(["user", "agent", "tool", "skill", "system", "continuation"].allSatisfy(types.contains))
+    }
+
     func testNormalFixtureCoversValidAndMalformedImages() {
         let images = FixtureScenario.scenario(for: .normal).screen.messages[0].content["images"]?.arrayValue
 
