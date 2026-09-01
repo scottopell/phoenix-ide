@@ -3043,7 +3043,11 @@ mod product_creation_delivery_replay_tests {
         );
         assert_eq!(published.transcript_row_id, conversation_id);
 
-        let completed = db.get_product_creation_job(request_id).await.unwrap().unwrap();
+        let completed = db
+            .get_product_creation_job(request_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(completed.status, "published");
         assert_eq!(completed.product_conversation_id, *accepted_product_id);
         assert_eq!(
