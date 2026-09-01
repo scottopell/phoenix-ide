@@ -20,6 +20,8 @@ final class ConversationListStore {
         var lastRefreshed: Date
     }
 
+    private(set) var transcriptToAggregate: [String: String] = [:]
+
     /// Reset invalidates an in-flight refresh. Row-level changes are folded
     /// into its result so the refresh can still update unrelated rows.
     private var generation = 0
@@ -36,8 +38,9 @@ final class ConversationListStore {
     init() {
         if let cache = DiskStore.loadVersioned(
             Cache.self, name: Self.cacheName, version: Self.schemaVersion) {
-            conversations = cache.conversations
+            conversations = Self.sortedByUpdatedAt(Self.merging(cache.conversations, preserving: [:]))
             lastRefreshed = cache.lastRefreshed
+            rebuildTranscriptAliases()
         }
     }
 
@@ -85,8 +88,15 @@ final class ConversationListStore {
         return Array(byId.values)
     }
 
+    private func rebuildTranscriptAliases() {
+        transcriptToAggregate = Dictionary(uniqueKeysWithValues: conversations.map {
+            ($0.transcriptRowIdentity, $0.aggregateIdentity)
+        })
+    }
+
     private func apply(_ fresh: [Conversation]) {
         conversations = Self.sortedByUpdatedAt(fresh)
+        rebuildTranscriptAliases()
         lastRefreshed = Date()
         persistCache()
     }
@@ -109,7 +119,7 @@ final class ConversationListStore {
     @discardableResult
     func applyExternal(_ fresh: [Conversation], startedAt token: ExternalRefreshToken) -> Bool {
         guard canApplyExternal(startedAt: token) else { return false }
-        apply(fresh)
+        apply(Self.merging(fresh, preserving: [:]))
         lastError = nil
         return true
     }
@@ -126,6 +136,7 @@ final class ConversationListStore {
                 exclusionsDuringRefresh.insert(aggregateIdentity)
             }
             conversations.removeAll { $0.aggregateIdentity == aggregateIdentity }
+            transcriptToAggregate = transcriptToAggregate.filter { $0.value != aggregateIdentity }
             persistCache()
             return
         }
@@ -133,6 +144,7 @@ final class ConversationListStore {
             exclusionsDuringRefresh.remove(aggregateIdentity)
             upsertsDuringRefresh[aggregateIdentity] = conversation
         }
+        transcriptToAggregate[conversation.transcriptRowIdentity] = aggregateIdentity
         if let idx = conversations.firstIndex(where: { $0.aggregateIdentity == aggregateIdentity }) {
             conversations[idx] = conversation
         } else {
@@ -156,13 +168,16 @@ final class ConversationListStore {
             exclusionsDuringRefresh.insert(aggregateId)
         }
         conversations.removeAll { $0.aggregateIdentity == aggregateId }
+        transcriptToAggregate = transcriptToAggregate.filter { $0.value != aggregateId }
         persistCache()
     }
 
+    func aggregateId(forTranscriptRowId transcriptRowId: String) -> String? {
+        transcriptToAggregate[transcriptRowId]
+    }
+
     func removeByTranscriptRowId(_ transcriptRowId: String) {
-        guard let aggregateId = conversations.first(where: { $0.transcriptRowIdentity == transcriptRowId })?
-            .aggregateIdentity
-        else {
+        guard let aggregateId = aggregateId(forTranscriptRowId: transcriptRowId) else {
             return
         }
         remove(aggregateId: aggregateId)
@@ -180,6 +195,7 @@ final class ConversationListStore {
         upsertsDuringRefresh.removeAll()
         exclusionsDuringRefresh.removeAll()
         conversations = []
+        transcriptToAggregate = [:]
         lastRefreshed = nil
         lastError = nil
     }

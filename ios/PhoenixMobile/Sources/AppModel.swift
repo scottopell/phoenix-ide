@@ -94,17 +94,11 @@ final class AppModel {
     func session(for conversationId: String) -> ConversationSession? {
         guard let api else { return nil }
         if let existing = sessions[conversationId] { return existing }
-        let aggregateIdentity = listStore.conversations.first(where: {
-            $0.transcriptRowIdentity == conversationId
-        })?.aggregateIdentity
         let onConversationUpdate: (Conversation) -> Void = { [weak self] conversation in
-            self?.handleSessionConversationUpdate(
-                conversation,
-                transcriptRowId: conversationId,
-                aggregateIdentity: aggregateIdentity)
+            self?.handleSessionConversationUpdate(conversation, transcriptRowId: conversationId)
         }
         let onHardDeleted: (String) -> Void = { [weak self] deletedId in
-            self?.handleHardDeleted(deletedId, aggregateIdentity: aggregateIdentity)
+            self?.handleHardDeleted(deletedId, aggregateIdentity: self?.aggregateIdentity(forTranscriptRowId: conversationId))
         }
         let session: ConversationSession
         if let draining = drainSessions.removeValue(forKey: conversationId) {
@@ -122,31 +116,68 @@ final class AppModel {
         return session
     }
 
-    private func handleSessionConversationUpdate(
-        _ conversation: Conversation,
-        transcriptRowId: String,
-        aggregateIdentity: String?
-    ) {
-        if let aggregateIdentity {
-            var aggregateConversation = conversation
-            aggregateConversation.product_conversation_id = aggregateIdentity
-            listStore.upsert(aggregateConversation)
+    private func aggregateIdentity(forTranscriptRowId transcriptRowId: String) -> String? {
+        listStore.aggregateId(forTranscriptRowId: transcriptRowId)
+    }
+
+    private func mergeAggregateProjection(
+        existing: Conversation,
+        liveUpdate: Conversation,
+        aggregateIdentity: String
+    ) -> Conversation {
+        Conversation(
+            id: existing.id == liveUpdate.id ? liveUpdate.id : existing.id,
+            product_conversation_id: aggregateIdentity,
+            slug: existing.slug,
+            title: existing.title,
+            model: liveUpdate.model,
+            cwd: liveUpdate.cwd,
+            created_at: liveUpdate.created_at,
+            updated_at: liveUpdate.updated_at,
+            message_count: liveUpdate.message_count,
+            state: liveUpdate.state,
+            state_updated_at: liveUpdate.state_updated_at,
+            branch_name: liveUpdate.branch_name,
+            task_title: liveUpdate.task_title,
+            archived: existing.archived,
+            project_name: liveUpdate.project_name,
+            conv_mode_label: liveUpdate.conv_mode_label,
+            presentation_mode: liveUpdate.presentation_mode,
+            requires_action: liveUpdate.requires_action,
+            transcript_generation: liveUpdate.transcript_generation,
+            runtime_role: existing.runtime_role ?? liveUpdate.runtime_role)
+    }
+
+    private func handleSessionConversationUpdate(_ conversation: Conversation, transcriptRowId: String) {
+        guard let aggregateIdentity = aggregateIdentity(forTranscriptRowId: transcriptRowId),
+              let existing = listStore.conversations.first(where: { $0.aggregateIdentity == aggregateIdentity })
+        else {
+            listStore.upsert(conversation)
             return
         }
-        listStore.upsert(conversation)
+        listStore.upsert(
+            mergeAggregateProjection(
+                existing: existing,
+                liveUpdate: conversation,
+                aggregateIdentity: aggregateIdentity))
     }
 
     private func handleHardDeleted(_ conversationId: String, aggregateIdentity: String?) {
+        let notificationId: String
         if let aggregateIdentity {
             listStore.remove(aggregateId: aggregateIdentity)
+            notificationId = aggregateIdentity
         } else {
             listStore.removeByTranscriptRowId(conversationId)
+            notificationId = conversationId
         }
         if pendingOpenConversationId == conversationId {
             pendingOpenConversationId = nil
         }
         UNUserNotificationCenter.current().removeDeliveredNotifications(
-            withIdentifiers: ["attention-\(conversationId)"])
+            withIdentifiers: ["attention-\(notificationId)"])
+        UNUserNotificationCenter.current().removePendingNotificationRequests(
+            withIdentifiers: ["attention-\(notificationId)"])
     }
 
     func refreshList() async {
@@ -346,13 +377,15 @@ final class AppModel {
             await session.clearCachedSnapshotAndWait()
             await session.outbox.clearAndWait()
             sessions[conversationId] = nil
-            if let aggregateId = listStore.conversations.first(where: {
-                $0.transcriptRowIdentity == conversationId
-            })?.aggregateIdentity {
+            let aggregateId = listStore.aggregateId(forTranscriptRowId: conversationId)
+            if let aggregateId {
                 listStore.remove(aggregateId: aggregateId)
             }
+            let notificationId = aggregateId ?? conversationId
             UNUserNotificationCenter.current().removeDeliveredNotifications(
-                withIdentifiers: ["attention-\(conversationId)"])
+                withIdentifiers: ["attention-\(notificationId)"])
+            UNUserNotificationCenter.current().removePendingNotificationRequests(
+                withIdentifiers: ["attention-\(notificationId)"])
             return true
         } catch {
             lastActionError = (error as? APIError)?.errorDescription
@@ -367,6 +400,16 @@ final class AppModel {
         }
         drainPersistedOutboxes()
         Task { await refreshList() }
+    }
+
+    func integrateBackgroundConversationUpdate(existing: Conversation, update: Conversation) -> Conversation {
+        if let aggregateIdentity = existing.product_conversation_id {
+            return mergeAggregateProjection(
+                existing: existing,
+                liveUpdate: update,
+                aggregateIdentity: aggregateIdentity)
+        }
+        return update
     }
 
     /// Deliver queued messages for conversations the user hasn't reopened.

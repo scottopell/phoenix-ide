@@ -97,6 +97,51 @@ final class ConversationListStoreTests: XCTestCase {
     }
 
     @MainActor
+    func testBackgroundExternalRefreshFiltersHistoryRows() throws {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-list-tests-\(UUID().uuidString)")
+        let store = ConversationListStore()
+        let token = store.externalRefreshToken()
+
+        XCTAssertTrue(store.applyExternal([
+            try conversation(id: "latest-open", aggregateId: "pc-open", title: "open"),
+            try conversation(id: "latest-history", aggregateId: "pc-history", title: "history", archived: true),
+        ], startedAt: token))
+        XCTAssertEqual(store.conversations.map(\.aggregateIdentity), ["pc-open"])
+    }
+
+    @MainActor
+    func testLegacyCacheRefreshThenTranscriptUpdateKeepsSingleAggregateProjection() throws {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-list-tests-\(UUID().uuidString)")
+        let store = ConversationListStore()
+        store.upsert(try conversation(id: "legacy-row", title: "legacy"))
+        let refreshToken = store.externalRefreshToken()
+        XCTAssertTrue(store.applyExternal([
+            try conversation(id: "latest-row", aggregateId: "pc-1", title: "root title")
+        ], startedAt: refreshToken))
+        store.upsert(try conversation(id: "newer-row", aggregateId: "pc-1", title: "root title"))
+
+        XCTAssertEqual(store.conversations.count, 1)
+        XCTAssertEqual(store.conversations.first?.aggregateIdentity, "pc-1")
+        XCTAssertEqual(store.conversations.first?.id, "newer-row")
+    }
+
+    @MainActor
+    func testTranscriptAliasPersistsAcrossLatestTranscriptRotation() throws {
+        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-list-tests-\(UUID().uuidString)")
+        let store = ConversationListStore()
+        store.upsert(try conversation(id: "row-1", aggregateId: "pc-1", title: "root"))
+        store.upsert(try conversation(id: "row-2", aggregateId: "pc-1", title: "root"))
+
+        XCTAssertEqual(store.aggregateId(forTranscriptRowId: "row-1"), "pc-1")
+        XCTAssertEqual(store.aggregateId(forTranscriptRowId: "row-2"), "pc-1")
+        XCTAssertEqual(store.conversations.count, 1)
+        XCTAssertEqual(store.conversations.first?.id, "row-2")
+    }
+
+    @MainActor
     func testExternalRefreshAppliesWithoutAnInterveningMutation() throws {
         DiskStore.baseDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("phoenix-list-tests-\(UUID().uuidString)")
@@ -108,3 +153,4 @@ final class ConversationListStoreTests: XCTestCase {
         XCTAssertEqual(store.conversations.first?.title, "fresh")
     }
 }
+
