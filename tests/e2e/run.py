@@ -545,6 +545,28 @@ def _default_model(base_url: str) -> str:
     return model
 
 
+def _git_worktree_inventory() -> list[str]:
+    result = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    entries: list[str] = []
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            entries.append(line.removeprefix("worktree "))
+    return entries
+
+
+def _assert_git_worktrees_unchanged(before: list[str], after: list[str], context: str) -> None:
+    if before != after:
+        raise AssertionError(
+            f"git worktree leak during {context}: before={before!r} after={after!r}"
+        )
+
+
 def _new_conv(
     base_url: str,
     text: str,
@@ -1118,151 +1140,159 @@ def scenario_continuation(base_url: str) -> None:
 
 
 def scenario_product_conversation_context_continuation(base_url: str) -> None:
-    create = httpx.post(
-        f"{base_url}/api/product-conversations/new",
-        json={
-            "cwd": str(ROOT),
-            "model": _default_model(base_url),
-            "objective": "[[scenario:context_window_exceeded]] exhaust naturally",
-            "images": [],
-            "request_id": str(uuid.uuid4()),
-        },
-        timeout=10.0,
-    )
-    create.raise_for_status()
-    created = create.json()
-    product_conversation_id = created["product_conversation_id"]
-    canonical_route = created["canonical_route"]
-    root_conv_id = created["transcript_row_id"]
+    worktrees_before = _git_worktree_inventory()
+    with tempfile.TemporaryDirectory(prefix="phoenix-e2e-product-cwd-") as temp_cwd:
+        create = httpx.post(
+            f"{base_url}/api/product-conversations/new",
+            json={
+                "cwd": temp_cwd,
+                "model": _default_model(base_url),
+                "objective": "[[scenario:context_window_exceeded]] exhaust naturally",
+                "images": [],
+                "request_id": str(uuid.uuid4()),
+            },
+            timeout=10.0,
+        )
+        create.raise_for_status()
+        created = create.json()
+        product_conversation_id = created["product_conversation_id"]
+        canonical_route = created["canonical_route"]
+        root_conv_id = created["transcript_row_id"]
 
-    assert canonical_route == f"/product-conversations/{product_conversation_id}", (
-        f"unexpected canonical route: {canonical_route!r}"
-    )
+        assert canonical_route == f"/product-conversations/{product_conversation_id}", (
+            f"unexpected canonical route: {canonical_route!r}"
+        )
 
-    _wait_for_sse_signal(
-        base_url,
-        root_conv_id,
-        _context_exhausted_event,
-        SCENARIO_TIMEOUT_SECONDS,
-    )
-    exhausted = _get_conv(base_url, root_conv_id)
-    exhausted_state = _state_str(exhausted["conversation"]["state"])
-    assert exhausted_state == "context_exhausted", (
-        f"expected context_exhausted after mock scenario, got {exhausted_state}"
-    )
-    assert exhausted["conversation"].get("id") == root_conv_id, (
-        "root row identity changed unexpectedly during initial exhaustion"
-    )
-    assert exhausted["conversation"].get("continued_in_conv_id") is None, (
-        "root row should not yet point at a continuation"
-    )
+        _wait_for_sse_signal(
+            base_url,
+            root_conv_id,
+            _context_exhausted_event,
+            SCENARIO_TIMEOUT_SECONDS,
+        )
+        exhausted = _get_conv(base_url, root_conv_id)
+        exhausted_state = _state_str(exhausted["conversation"]["state"])
+        assert exhausted_state == "context_exhausted", (
+            f"expected context_exhausted after mock scenario, got {exhausted_state}"
+        )
+        assert exhausted["conversation"].get("id") == root_conv_id, (
+            "root row identity changed unexpectedly during initial exhaustion"
+        )
+        assert exhausted["conversation"].get("continued_in_conv_id") is None, (
+            "root row should not yet point at a continuation"
+        )
 
-    handoff = "Continue with the same ProductConversation after natural context exhaustion."
-    continue_response = httpx.post(
-        f"{base_url}/api/conversations/{root_conv_id}/continue",
-        json={
-            "handoff": handoff,
-            "message_id": str(uuid.uuid4()),
-        },
-        timeout=10.0,
-    )
-    continue_response.raise_for_status()
-    continued = continue_response.json()
-    successor_id = continued["conversation_id"]
-    assert continued["status"] == "accepted", (
-        f"unexpected continue status: {continued!r}"
-    )
-    assert successor_id != root_conv_id, "continuation should create a successor row"
+        handoff = "Continue with the same ProductConversation after natural context exhaustion."
+        continue_response = httpx.post(
+            f"{base_url}/api/conversations/{root_conv_id}/continue",
+            json={
+                "handoff": handoff,
+                "message_id": str(uuid.uuid4()),
+            },
+            timeout=10.0,
+        )
+        continue_response.raise_for_status()
+        continued = continue_response.json()
+        successor_id = continued["conversation_id"]
+        assert continued["status"] == "accepted", (
+            f"unexpected continue status: {continued!r}"
+        )
+        assert successor_id != root_conv_id, "continuation should create a successor row"
 
-    _wait_for_sse_signal(
-        base_url,
-        successor_id,
-        _terminal_event,
-        SCENARIO_TIMEOUT_SECONDS,
-    )
+        _wait_for_sse_signal(
+            base_url,
+            successor_id,
+            _terminal_event,
+            SCENARIO_TIMEOUT_SECONDS,
+        )
 
-    root_after = _get_conv(base_url, root_conv_id)
-    successor = _get_conv(base_url, successor_id)
-    assert root_after["conversation"].get("continued_in_conv_id") == successor_id, (
-        "root row did not point at the continuation successor"
-    )
-    assert successor["conversation"].get("id") == successor_id, (
-        "successor row identity changed unexpectedly"
-    )
-    assert successor["conversation"].get("continued_in_conv_id") is None, (
-        "successor should be the latest leaf row"
-    )
-    successor_state = _state_str(successor["conversation"]["state"])
-    assert successor_state == "idle", f"successor not idle after handoff: {successor_state}"
-    successor_agent_messages = [
-        message for message in successor["messages"] if message.get("message_type") == "agent"
-    ]
-    assert successor_agent_messages, "successor did not receive an opening handoff turn"
+        root_after = _get_conv(base_url, root_conv_id)
+        successor = _get_conv(base_url, successor_id)
+        assert root_after["conversation"].get("continued_in_conv_id") == successor_id, (
+            "root row did not point at the continuation successor"
+        )
+        assert successor["conversation"].get("id") == successor_id, (
+            "successor row identity changed unexpectedly"
+        )
+        assert successor["conversation"].get("continued_in_conv_id") is None, (
+            "successor should be the latest leaf row"
+        )
+        successor_state = _state_str(successor["conversation"]["state"])
+        assert successor_state == "idle", f"successor not idle after handoff: {successor_state}"
+        successor_agent_messages = [
+            message for message in successor["messages"] if message.get("message_type") == "agent"
+        ]
+        assert successor_agent_messages, "successor did not receive an opening handoff turn"
 
-    route_from_root = _get_product_conversation_route(base_url, root_conv_id)
-    route_from_successor = _get_product_conversation_route(base_url, successor_id)
-    assert route_from_root["transcript_row_id"] == root_conv_id, (
-        f"canonical route from root should resolve to root row, got {route_from_root!r}"
-    )
-    assert route_from_successor["transcript_row_id"] == root_conv_id, (
-        "canonical aggregate route should resolve successor references to the root row"
-    )
+        route_from_root = _get_product_conversation_route(base_url, root_conv_id)
+        route_from_successor = _get_product_conversation_route(base_url, successor_id)
+        assert route_from_root["transcript_row_id"] == root_conv_id, (
+            f"canonical route from root should resolve to root row, got {route_from_root!r}"
+        )
+        assert route_from_successor["transcript_row_id"] == root_conv_id, (
+            "canonical aggregate route should resolve successor references to the root row"
+        )
 
-    snapshot = _get_product_conversation(base_url, product_conversation_id)
-    assert snapshot["product_conversation_id"] == product_conversation_id
-    assert snapshot["canonical_route"] == canonical_route
-    assert snapshot["requested_transcript_row_id"] in {product_conversation_id, root_conv_id}, (
-        "snapshot requested reference should resolve from the aggregate or canonical root"
-    )
-    assert snapshot["canonical_root"]["transcript_row_id"] == root_conv_id, (
-        "canonical root row diverged from creation response"
-    )
-    assert snapshot["latest_transcript_row_id"] == successor_id, (
-        "aggregate latest row did not advance to the continuation successor"
-    )
-    assert snapshot["writable_transcript_row_id"] == successor_id, (
-        "aggregate writable row should be the latest successor"
-    )
-    handoffs = [
-        segment.get("handoff")
-        for segment in snapshot.get("segments", [])
-        if isinstance(segment, dict) and segment.get("handoff") is not None
-    ]
-    assert len(handoffs) == 1, (
-        f"expected exactly one typed continuation handoff, got {len(handoffs)}"
-    )
-    handoff_view = handoffs[0]
-    assert handoff_view.get("kind") == "completed", (
-        f"expected completed typed handoff, got {handoff_view!r}"
-    )
-    assert handoff_view.get("predecessor_transcript_row_id") == root_conv_id, (
-        f"unexpected handoff predecessor: {handoff_view!r}"
-    )
-    assert handoff_view.get("successor_transcript_row_id") == successor_id, (
-        f"unexpected handoff successor: {handoff_view!r}"
-    )
+        snapshot = _get_product_conversation(base_url, product_conversation_id)
+        assert snapshot["product_conversation_id"] == product_conversation_id
+        assert snapshot["canonical_route"] == canonical_route
+        assert snapshot["requested_transcript_row_id"] in {product_conversation_id, root_conv_id}, (
+            "snapshot requested reference should resolve from the aggregate or canonical root"
+        )
+        assert snapshot["canonical_root"]["transcript_row_id"] == root_conv_id, (
+            "canonical root row diverged from creation response"
+        )
+        assert snapshot["latest_transcript_row_id"] == successor_id, (
+            "aggregate latest row did not advance to the continuation successor"
+        )
+        assert snapshot["writable_transcript_row_id"] == successor_id, (
+            "aggregate writable row should be the latest successor"
+        )
+        handoffs = [
+            segment.get("handoff")
+            for segment in snapshot.get("segments", [])
+            if isinstance(segment, dict) and segment.get("handoff") is not None
+        ]
+        assert len(handoffs) == 1, (
+            f"expected exactly one typed continuation handoff, got {len(handoffs)}"
+        )
+        handoff_view = handoffs[0]
+        assert handoff_view.get("kind") == "completed", (
+            f"expected completed typed handoff, got {handoff_view!r}"
+        )
+        assert handoff_view.get("predecessor_transcript_row_id") == root_conv_id, (
+            f"unexpected handoff predecessor: {handoff_view!r}"
+        )
+        assert handoff_view.get("successor_transcript_row_id") == successor_id, (
+            f"unexpected handoff successor: {handoff_view!r}"
+        )
 
-    listed = _list_product_conversations(base_url)["product_conversations"]
-    matching = [row for row in listed if row.get("product_conversation_id") == product_conversation_id]
-    assert len(matching) == 1, (
-        f"expected exactly one ProductConversation list row for journey, got {len(matching)}"
-    )
-    row = matching[0]
-    assert row.get("canonical_route") == canonical_route
-    assert row.get("latest_transcript_row_id") == successor_id
+        listed = _list_product_conversations(base_url)["product_conversations"]
+        matching = [row for row in listed if row.get("product_conversation_id") == product_conversation_id]
+        assert len(matching) == 1, (
+            f"expected exactly one ProductConversation list row for journey, got {len(matching)}"
+        )
+        row = matching[0]
+        assert row.get("canonical_route") == canonical_route
+        assert row.get("latest_transcript_row_id") == successor_id
 
-    probe_message_count = _send_chat_and_stream(
-        base_url,
-        successor_id,
-        "[[scenario:plain_text]] ownership release probe",
-        SCENARIO_TIMEOUT_SECONDS,
-    )
-    _poll_to_idle_with_messages(
-        base_url,
-        successor_id,
-        lambda messages: len(messages) >= probe_message_count,
-        "accepted ownership probe response",
-        timeout=SCENARIO_TIMEOUT_SECONDS,
+        probe_message_count = _send_chat_and_stream(
+            base_url,
+            successor_id,
+            "[[scenario:plain_text]] ownership release probe",
+            SCENARIO_TIMEOUT_SECONDS,
+        )
+        _poll_to_idle_with_messages(
+            base_url,
+            successor_id,
+            lambda messages: len(messages) >= probe_message_count,
+            "accepted ownership probe response",
+            timeout=SCENARIO_TIMEOUT_SECONDS,
+        )
+    worktrees_after = _git_worktree_inventory()
+    _assert_git_worktrees_unchanged(
+        worktrees_before,
+        worktrees_after,
+        "product_conversation_context_continuation",
     )
 
 

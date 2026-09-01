@@ -676,10 +676,7 @@ fn build_response(scenario: &Scenario) -> (Vec<ContentBlock>, String) {
             let text =
                 "This turn will naturally exhaust the context window after normal mock streaming."
                     .to_string();
-            (
-                vec![ContentBlock::Text { text: text.clone() }],
-                text,
-            )
+            (vec![ContentBlock::Text { text: text.clone() }], text)
         }
     }
 }
@@ -768,7 +765,10 @@ impl LlmService for MockLlmService {
             build_response(&Scenario::from_message(request)).0
         };
 
-        if matches!(Scenario::from_message(request), Scenario::ContextWindowExceeded) {
+        if matches!(
+            Scenario::from_message(request),
+            Scenario::ContextWindowExceeded
+        ) {
             return Err(LlmError::context_window_exceeded(
                 "mock scenario: normal turn exceeded the context window".to_string(),
             ));
