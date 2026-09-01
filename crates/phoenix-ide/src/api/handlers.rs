@@ -5066,16 +5066,34 @@ async fn trigger_continuation(
 ) -> Result<Json<SuccessResponse>, AppError> {
     let admission = state.runtime.conversation_admission(&id).await;
     let _admission = admission.lock().await;
-    let conversation = state
+    match state
         .runtime
         .db()
-        .get_conversation(&id)
+        .message_target_admission(&id)
         .await
-        .map_err(|error| AppError::NotFound(error.to_string()))?;
-    if conversation.archived {
-        return Err(AppError::BadRequest(
-            "Cannot retry continuation for an archived conversation".to_string(),
-        ));
+        .map_err(|error| AppError::NotFound(error.to_string()))?
+    {
+        phoenix_db::MessageTargetAdmission::Aggregate(
+            phoenix_db::ProductConversationAdmission::Accepted { .. },
+        )
+        | phoenix_db::MessageTargetAdmission::StandaloneAvailable => {}
+        phoenix_db::MessageTargetAdmission::Aggregate(
+            phoenix_db::ProductConversationAdmission::Refused(_),
+        ) => {
+            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                "Close admission fence rejects continuation retry",
+                "close_admission_fenced",
+            ))));
+        }
+        phoenix_db::MessageTargetAdmission::Aggregate(
+            phoenix_db::ProductConversationAdmission::History(_),
+        )
+        | phoenix_db::MessageTargetAdmission::StandaloneArchived => {
+            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                "Conversation is unavailable for continuation retry",
+                "target_unavailable",
+            ))));
+        }
     }
     let effective_state = match state.runtime.effective_conversation_state(&id).await {
         Some(runtime_state) => runtime_state,

@@ -3060,13 +3060,21 @@ impl WakeRepository {
         timestamp: Timestamp,
     ) -> DbResult<()> {
         let mut tx = self.workflow_repo.begin_tx().await?;
-        let archived =
-            sqlx::query_scalar::<_, i64>("SELECT archived FROM conversations WHERE id = ?1")
-                .bind(&pending.conversation_id)
-                .fetch_optional(&mut *tx.tx)
-                .await?
-                .unwrap_or_default()
-                != 0;
+        let archived = sqlx::query_scalar::<_, i64>(
+            "SELECT CASE
+               WHEN product.kind = 'ordinary' THEN product.ordinary_lifecycle = 'history'
+               ELSE conversation.archived
+             END
+             FROM conversations conversation
+             JOIN product_conversations product
+               ON product.id = conversation.product_conversation_id
+             WHERE conversation.id = ?1",
+        )
+        .bind(&pending.conversation_id)
+        .fetch_optional(&mut *tx.tx)
+        .await?
+        .unwrap_or_default()
+            != 0;
         let head = tx.fetch_workflow_head(pending.workflow_id).await?;
         tx.rollback().await?;
         if archived {
@@ -3281,16 +3289,24 @@ impl WakeRepository {
         timestamp: Timestamp,
     ) -> DbResult<WakeAdoptMaterializedPendingOutcome> {
         let mut tx = self.workflow_repo.begin_immediate_tx().await?;
-        let Some(conversation_row) =
-            sqlx::query("SELECT state, archived FROM conversations WHERE id = ?1")
-                .bind(conversation_id)
-                .fetch_optional(&mut *tx.tx)
-                .await?
+        let Some(conversation_row) = sqlx::query(
+            "SELECT conversation.state,
+                        CASE WHEN product.kind = 'ordinary'
+                             THEN product.ordinary_lifecycle = 'history'
+                             ELSE conversation.archived END AS unavailable
+                 FROM conversations conversation
+                 JOIN product_conversations product
+                   ON product.id = conversation.product_conversation_id
+                 WHERE conversation.id = ?1",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&mut *tx.tx)
+        .await?
         else {
             tx.rollback().await?;
             return Ok(WakeAdoptMaterializedPendingOutcome::NothingPending);
         };
-        if conversation_row.get::<i64, _>("archived") != 0 {
+        if conversation_row.get::<i64, _>("unavailable") != 0 {
             tx.rollback().await?;
             return Ok(WakeAdoptMaterializedPendingOutcome::NothingPending);
         }
@@ -3719,7 +3735,10 @@ async fn exact_replay_is_live_tx(
     binding: &WakeBindingRecord,
 ) -> DbResult<bool> {
     sqlx::query_scalar(
-        "SELECT c.archived = 0
+        "SELECT (
+             (product.kind = 'ordinary' AND product.ordinary_lifecycle = 'open')
+             OR (product.kind <> 'ordinary' AND c.archived = 0)
+         )
          AND c.state_kind NOT IN (
              'terminal', 'completed', 'failed', 'creation_failed', 'creation_cancelled',
              'context_exhausted', 'handed_off'
@@ -3732,6 +3751,7 @@ async fn exact_replay_is_live_tx(
          FROM wake_bindings b
          JOIN conversations c ON c.id = b.conversation_id
          JOIN workflows w ON w.workflow_id = b.workflow_id
+         JOIN product_conversations product ON product.id = c.product_conversation_id
          WHERE b.workflow_id = ?1",
     )
     .bind(to_i64(binding.workflow_id.0, "workflow_id")?)
@@ -6274,7 +6294,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn conversation_adoption_refuses_archived_conversation_transactionally() {
+    async fn conversation_adoption_uses_aggregate_lifecycle_transactionally() {
         let (_dir, repo, _) = open_repo_pair().await;
         let workflow_id = WorkflowId(8131);
         let pending = create_pending_terminal_delivery(&repo, workflow_id).await;
@@ -6283,6 +6303,13 @@ mod tests {
             .execute(&repo.workflow_repo.pool)
             .await
             .unwrap();
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history'
+             WHERE id = (SELECT product_conversation_id FROM conversations WHERE id = 'conv-1')",
+        )
+        .execute(&repo.workflow_repo.pool)
+        .await
+        .unwrap();
 
         assert!(matches!(
             repo.adopt_materialized_pending_for_conversation("conv-1", Timestamp(51))
