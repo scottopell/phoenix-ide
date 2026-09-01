@@ -5466,7 +5466,9 @@ async fn respond_to_question(
     Path(id): Path<String>,
     Json(req): Json<RespondToQuestionPayload>,
 ) -> Result<Json<SuccessResponse>, AppError> {
-    // 1. Validate conversation exists and is in AwaitingUserResponse state
+    let admission = state.runtime.conversation_admission(&id).await;
+    let _admission_guard = admission.lock().await;
+
     let conv = state
         .runtime
         .db()
@@ -5481,7 +5483,36 @@ async fn respond_to_question(
         ))));
     }
 
-    // 2. Dispatch response event to state machine
+    match state
+        .runtime
+        .db()
+        .message_target_admission(&id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+    {
+        phoenix_db::MessageTargetAdmission::Aggregate(
+            phoenix_db::ProductConversationAdmission::Accepted { .. },
+        )
+        | phoenix_db::MessageTargetAdmission::StandaloneAvailable => {}
+        phoenix_db::MessageTargetAdmission::Aggregate(
+            phoenix_db::ProductConversationAdmission::Refused(_),
+        ) => {
+            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                "Close admission fence rejects question response",
+                "close_admission_fenced",
+            ))));
+        }
+        phoenix_db::MessageTargetAdmission::Aggregate(
+            phoenix_db::ProductConversationAdmission::History(_),
+        )
+        | phoenix_db::MessageTargetAdmission::StandaloneArchived => {
+            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                "Conversation is unavailable for question response",
+                "target_unavailable",
+            ))));
+        }
+    }
+
     state
         .runtime
         .send_event(
