@@ -2918,6 +2918,10 @@ mod product_creation_delivery_replay_tests {
         objective_queue_count: i64,
         objective_total_count: i64,
     ) {
+        let job_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM product_creation_jobs")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
         let product_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM product_conversations")
             .fetch_one(db.pool())
             .await
@@ -2961,6 +2965,7 @@ mod product_creation_delivery_replay_tests {
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(job_count, 1);
         assert_eq!(product_count, 1);
         assert_eq!(published_root_count, 1);
         assert_eq!(transcript_count_for_request_publication, 1);
