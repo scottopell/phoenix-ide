@@ -51,6 +51,8 @@ final class ConversationSession {
     private var connectivityToken: UUID?
     private var streamTask: Task<Void, Never>?
     private var drainTask: Task<Void, Never>?
+    private var drainGeneration = 0
+    private var lastCompletedDrainGeneration = 0
     private var staleCheckTask: Task<Void, Never>?
     private var cancelNeedsAgentDoneFallback = false
     /// localIds with a POST in flight — prevents duplicate concurrent sends
@@ -173,6 +175,20 @@ final class ConversationSession {
             resumeLiveTasks()
         }
         drainOutbox()
+    }
+
+    func invalidateConfiguration() {
+        streamBlockedUntilConfigurationChange = true
+        streamTask?.cancel()
+        streamTask = nil
+        staleCheckTask?.cancel()
+        staleCheckTask = nil
+        drainGeneration &+= 1
+        drainTask?.cancel()
+        drainTask = nil
+        actionAttempt = nil
+        connection = .idle
+        onSessionEvent?(.connectionChanged(.idle))
     }
 
     func setSessionEventObserver(_ observer: ((ProductConversationSessionEvent) -> Void)?) {
@@ -387,10 +403,21 @@ final class ConversationSession {
     /// eagerly and repeatedly: entry-level `inFlight` guards duplicate
     /// concurrent POSTs, and the server's message_id idempotency makes
     /// genuine resends no-ops.
-    func drainOutbox() {
-        guard drainTask == nil, !isHardDeleted else { return }
+    @discardableResult
+    func drainOutbox() -> Int? {
+        guard !isHardDeleted else { return nil }
+        if let drainTask {
+            return drainGeneration
+        }
+        drainGeneration &+= 1
+        let generation = drainGeneration
         drainTask = Task {
-            defer { drainTask = nil }
+            defer {
+                if drainGeneration == generation {
+                    lastCompletedDrainGeneration = max(lastCompletedDrainGeneration, generation)
+                    drainTask = nil
+                }
+            }
             // Loop until no sendable entries remain, so a message enqueued
             // while a drain is already running is picked up by this pass
             // instead of waiting for the next trigger.
@@ -415,7 +442,9 @@ final class ConversationSession {
                     // A completion racing stop() (cache clear, sign-out)
                     // must not mutate — and re-persist — the outbox after
                     // its files were deleted.
-                    guard !Task.isCancelled else { return }
+                    guard !Task.isCancelled,
+                          api.configurationIdentity == self.api.configurationIdentity
+                    else { return }
                     outbox.markAccepted(entry.localId, steering: response.steering ?? false)
                     if response.already_persisted == true {
                         await reconcileAlreadyPersisted(entry.localId)
@@ -434,6 +463,18 @@ final class ConversationSession {
                 }
             }
         }
+        return generation
+    }
+
+    func awaitDrainOutbox(generation: Int) async -> Bool {
+        if lastCompletedDrainGeneration >= generation {
+            return true
+        }
+        guard generation == drainGeneration,
+              let drainTask
+        else { return false }
+        await drainTask.value
+        return lastCompletedDrainGeneration >= generation
     }
 
     /// The action currently being executed, or nil. Views use this to

@@ -33,6 +33,7 @@ final class ConversationListStore {
 
     private(set) var transcriptToAggregate: [String: String] = [:]
     private(set) var aggregateToCachedTranscript: [String: String] = [:]
+    private let hasCachedSnapshot: (String) -> Bool
 
     /// Reset invalidates an in-flight refresh. Row-level changes are folded
     /// into its result so the refresh can still update unrelated rows.
@@ -47,7 +48,12 @@ final class ConversationListStore {
     /// Aggregate identities removed or archived after the current full refresh began.
     private var exclusionsDuringRefresh: Set<String> = []
 
-    init() {
+    init(hasCachedSnapshot: ((String) -> Bool)? = nil) {
+        self.hasCachedSnapshot = hasCachedSnapshot ?? { conversationId in
+            MainActor.assumeIsolated {
+                ConversationSession.hasCachedSnapshot(conversationId: conversationId)
+            }
+        }
         if let cache = DiskStore.loadVersioned(
             Cache.self, name: Self.cacheName, version: Self.schemaVersion)
         {
@@ -145,7 +151,7 @@ final class ConversationListStore {
                 aggregateExists(aggregateId)
             else { continue }
             transcriptToAggregate[conversation.transcriptRowIdentity] = aggregateId
-            if ConversationSession.hasCachedSnapshot(conversationId: conversation.transcriptRowIdentity) {
+            if hasCachedSnapshot(conversation.transcriptRowIdentity) {
                 aggregateToCachedTranscript[aggregateId] = conversation.transcriptRowIdentity
             }
         }
@@ -192,7 +198,7 @@ final class ConversationListStore {
             transcriptToAggregate[transcriptId] = aggregateId
         }
         for (aggregateId, cachedTranscriptId) in priorCached where aggregateExists(aggregateId) {
-            if ConversationSession.hasCachedSnapshot(conversationId: cachedTranscriptId) {
+            if hasCachedSnapshot(cachedTranscriptId) {
                 aggregateToCachedTranscript[aggregateId] = cachedTranscriptId
             }
         }
@@ -245,7 +251,7 @@ final class ConversationListStore {
             upsertsDuringRefresh[aggregateIdentity] = conversation
         }
         transcriptToAggregate[conversation.transcriptRowIdentity] = aggregateIdentity
-        if ConversationSession.hasCachedSnapshot(conversationId: conversation.transcriptRowIdentity)
+        if hasCachedSnapshot(conversation.transcriptRowIdentity)
             || aggregateToCachedTranscript[aggregateIdentity] == nil
         {
             aggregateToCachedTranscript[aggregateIdentity] = conversation.transcriptRowIdentity
@@ -287,16 +293,16 @@ final class ConversationListStore {
     }
 
     func cachedNavigationTranscriptRowId(forAggregateId aggregateId: String, latestTranscriptRowId: String) -> String {
-        if ConversationSession.hasCachedSnapshot(conversationId: latestTranscriptRowId) {
+        if hasCachedSnapshot(latestTranscriptRowId) {
             return latestTranscriptRowId
         }
         if let cached = aggregateToCachedTranscript[aggregateId],
-           ConversationSession.hasCachedSnapshot(conversationId: cached)
+           hasCachedSnapshot(cached)
         {
             return cached
         }
         for (transcriptId, mappedAggregateId) in transcriptToAggregate where mappedAggregateId == aggregateId {
-            if ConversationSession.hasCachedSnapshot(conversationId: transcriptId) {
+            if hasCachedSnapshot(transcriptId) {
                 return transcriptId
             }
         }

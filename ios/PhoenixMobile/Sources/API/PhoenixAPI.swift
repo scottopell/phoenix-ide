@@ -174,10 +174,17 @@ struct PhoenixAPI: Sendable {
     let baseURL: URL
     let password: String?
     private let trustDelegate: ServerTrustDelegate
+    private let allowSelfSigned: Bool
     private let session: URLSession
     /// Long-lived session for SSE: effectively no per-request deadline; the
     /// idle timeout covers gaps between events (the server keep-alives).
     private let streamSession: URLSession
+
+    var configurationIdentity: String {
+        let passwordIdentity = password ?? ""
+        let trustIdentity = String(allowSelfSigned)
+        return "\(baseURL.absoluteString)|\(passwordIdentity)|\(trustIdentity)"
+    }
 
     init?(baseURL: URL, password: String?, allowSelfSigned: Bool) {
         guard password?.isEmpty != false || baseURL.scheme?.lowercased() == "https" else {
@@ -185,6 +192,7 @@ struct PhoenixAPI: Sendable {
         }
         self.baseURL = baseURL
         self.password = password
+        self.allowSelfSigned = allowSelfSigned
 
         let delegate = ServerTrustDelegate(allowSelfSigned: allowSelfSigned)
         self.trustDelegate = delegate

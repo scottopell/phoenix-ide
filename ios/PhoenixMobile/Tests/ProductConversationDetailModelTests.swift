@@ -2,8 +2,17 @@ import XCTest
 
 @testable import PhoenixMobile
 
+private struct TestPersistedOutboxStore {
+    var visibleByTranscriptRowId: [String: Bool] = [:]
+
+    func contents(for transcriptRowId: String) -> Outbox.StoredContents {
+        visibleByTranscriptRowId[transcriptRowId] == true ? .hasVisibleEntries : .empty
+    }
+}
+
 @MainActor
 final class ProductConversationDetailModelTests: XCTestCase {
+
     private func makeAPI() -> PhoenixAPI {
         PhoenixAPI(baseURL: URL(string: "https://example.com")!, password: nil, allowSelfSigned: true)!
     }
@@ -208,9 +217,11 @@ final class ProductConversationDetailModelTests: XCTestCase {
 
         model.applyForTesting(snapshot())
 
-        XCTAssertEqual(model.outboxProjections.count, 1)
-        XCTAssertEqual(model.outboxProjections[0].transcriptRowId, "row-1")
-        XCTAssertTrue(({ if case .interactive(let session) = model.outboxProjections[0].actionPolicy { session === row1 } else { false } })())
+        let targetLocalIds = Set(row1.outbox.visibleEntries.map(\.localId))
+        let projections = model.outboxProjections.filter { targetLocalIds.contains($0.entry.localId) }
+        XCTAssertEqual(Set(projections.map(\.entry.localId)), targetLocalIds)
+        XCTAssertEqual(Set(projections.map(\.transcriptRowId)), ["row-1"])
+        XCTAssertTrue(({ if case .interactive(let session) = projections[0].actionPolicy { session === row1 } else { false } })())
     }
 
     func testTopologyInvalidationBurstUsesSingleFlightCoalescingWithoutSleep() async {
@@ -429,6 +440,307 @@ final class ProductConversationDetailModelTests: XCTestCase {
         XCTAssertEqual(box.calls, [nil, "cursor-1", nil])
         XCTAssertEqual(model.olderCursor, "cursor-2")
         XCTAssertTrue(model.hasOlder)
+    }
+
+    func testColdRestartDiscoversPersistedPredecessorOutboxWithoutPreexistingSession() async throws {
+        final class SessionRegistry {
+            var sessions: [String: ConversationSession] = [:]
+            var created: [String] = []
+        }
+        try await withScopedDiskStoreDirectory {
+            let connectivity = ConnectivityMonitor()
+            connectivity.setOnlineForTesting(false)
+            let registry = SessionRegistry()
+            let row1 = ConversationSession(conversationId: "row-1", api: self.makeAPI(), connectivity: connectivity)
+            row1.receive(.initSnapshot(.init(
+                conversation: try! self.conversation(id: "row-1"),
+                messages: [], agentWorking: false, presentationMode: "idle", lastSequenceId: 1,
+                pendingAnchorSequenceId: 1, pendingEvents: [], pendingTruncated: false)))
+            _ = await row1.send(text: "pending predecessor")
+            let persisted = TestPersistedOutboxStore(visibleByTranscriptRowId: ["row-1": true])
+            let model = ProductConversationDetailModel(
+                aggregateId: "pc-1",
+                api: self.makeAPI(),
+                connectivity: connectivity,
+                sessionProvider: { id in
+                    registry.created.append(id)
+                    if registry.sessions[id] == nil, id == "row-1" {
+                        registry.sessions[id] = row1
+                    }
+                    return registry.sessions[id]
+                },
+                existingSession: { id in registry.sessions[id] },
+                persistedOutboxContents: { persisted.contents(for: $0) })
+
+            model.applyForTesting(self.snapshot())
+            XCTAssertEqual(model.outboxProjections.count, 1)
+            XCTAssertEqual(model.outboxProjections[0].transcriptRowId, "row-1")
+            XCTAssertEqual(registry.created, ["row-1", "row-2", "row-2"])
+            _ = model.outboxProjections
+            _ = model.transcriptItems
+            _ = model.displayTitle
+            XCTAssertEqual(registry.created, ["row-1", "row-2", "row-2"])
+        }
+    }
+
+    func testTopologyGenerationChangeResetsToFreshCursorChain() async {
+        let pages = [
+            snapshot(before: "cursor-1", hasOlder: true),
+            snapshot(before: "cursor-older", hasOlder: true),
+            snapshot(latest: "row-3", writable: "row-3", before: "cursor-fresh", hasOlder: true),
+        ]
+        final class Box { var index = 0 }
+        let box = Box()
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-1",
+            api: makeAPI(),
+            connectivity: ConnectivityMonitor(),
+            sessionProvider: { _ in nil },
+            loadSnapshot: { _, _ in defer { box.index += 1 }; return pages[min(box.index, pages.count - 1)] })
+
+        await model.refresh(cause: .manual)
+        await model.loadOlder()
+        await model.refresh(cause: .delegateConversationChanged)
+
+        XCTAssertEqual(model.olderCursor, "cursor-fresh")
+        XCTAssertEqual(model.latestTranscriptRowId, "row-3")
+    }
+
+    func testDelegatedLifecycleSessionConnectionDrivesActionConnectivityWhenNoChatOwner() {
+        let latest = makeSession(id: "row-2")
+        latest.receive(.initSnapshot(.init(
+            conversation: try! conversation(id: "row-2", state: "{\"type\":\"needs_input\",\"task_kind\":\"edit\"}"),
+            messages: [], agentWorking: false, presentationMode: "needs_action", lastSequenceId: 1,
+            pendingAnchorSequenceId: 1, pendingEvents: [], pendingTruncated: false)))
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-1",
+            api: makeAPI(),
+            connectivity: ConnectivityMonitor(),
+            sessionProvider: { id in id == "row-2" ? latest : nil },
+            existingSession: { id in id == "row-2" ? latest : nil })
+
+        model.applyForTesting(snapshot(lifecycle: .open, writable: nil))
+        model.applyOwnerEventForTesting(.connectionChanged(.offline))
+
+        XCTAssertFalse(model.canSendChat)
+        XCTAssertEqual(model.currentOwnerConnection, .offline)
+        XCTAssertFalse(model.delegatedConnectivityAllowsActions)
+    }
+
+    func testDismissDelegatedErrorTargetsCurrentLifecycleOwnerAndDoesNotResurrectOnRefresh() async {
+        let latest = makeSession(id: "row-2")
+        latest.receive(.errorEvent(seq: 2, message: "boom", retryable: false))
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-1",
+            api: makeAPI(),
+            connectivity: ConnectivityMonitor(),
+            sessionProvider: { id in id == "row-2" ? latest : nil },
+            existingSession: { id in id == "row-2" ? latest : nil },
+            loadSnapshot: { _, _ in self.snapshot(lifecycle: .open, writable: nil) })
+
+        model.applyForTesting(snapshot(lifecycle: .open, writable: nil))
+        model.applyOwnerEventForTesting(.errorToastChanged("boom"))
+        model.dismissDelegatedError()
+        await model.refresh(cause: .manual)
+
+        XCTAssertNil(latest.lastErrorToast)
+        XCTAssertNil(model.lastDelegatedError)
+    }
+
+    func testInitialAggregateLoadFailureFallsBackToCachedMemberSession() async throws {
+        try await withScopedDiskStoreDirectory {
+            let cached = self.makeSession(id: "row-2")
+            cached.receive(.initSnapshot(.init(
+                conversation: try! self.conversation(id: "row-2"),
+                messages: [try! self.message(id: "m-cache", type: "agent", content: "{\"text\":\"cached\"}")],
+                agentWorking: false, presentationMode: "idle", lastSequenceId: 1,
+                pendingAnchorSequenceId: 1, pendingEvents: [], pendingTruncated: false)))
+            _ = await cached.send(text: "pending cached")
+            let persisted = TestPersistedOutboxStore(visibleByTranscriptRowId: ["row-2": true])
+            let model = ProductConversationDetailModel(
+                aggregateId: "pc-1",
+                initialTranscriptRowId: "row-2",
+                api: self.makeAPI(),
+                connectivity: ConnectivityMonitor(),
+                sessionProvider: { id in id == "row-2" ? cached : nil },
+                existingSession: { id in id == "row-2" ? cached : nil },
+                persistedOutboxContents: { persisted.contents(for: $0) },
+                loadSnapshot: { _, _ in throw URLError(.cannotConnectToHost) })
+
+            await model.start()
+
+            XCTAssertTrue(model.fallbackSession === cached)
+            XCTAssertEqual(model.selectedTranscriptRowId, "row-2")
+            XCTAssertEqual(model.transcriptItems.map(\.debugLabel), ["message:m-cache"])
+        }
+    }
+
+    func testHistoryNeverOverlaysExistingSessionMessagesOverSnapshotAuthority() {
+        let existing = makeSession(id: "row-2")
+        existing.receive(.initSnapshot(.init(
+            conversation: try! conversation(id: "row-2"),
+            messages: [
+                .init(message_id: "m-live", conversation_id: "row-2", sequence_id: 9, message_type: "agent", content: .object(["text": .string("live")]), display_data: nil, created_at: "2025-01-02T03:04:09Z")
+            ], agentWorking: false, presentationMode: "idle", lastSequenceId: 9,
+            pendingAnchorSequenceId: 9, pendingEvents: [], pendingTruncated: false)))
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-1",
+            api: makeAPI(),
+            connectivity: ConnectivityMonitor(),
+            sessionProvider: { id in id == "row-2" ? existing : nil },
+            existingSession: { id in id == "row-2" ? existing : nil })
+
+        model.applyForTesting(snapshot(lifecycle: .history, writable: nil))
+
+        XCTAssertEqual(model.transcriptItems.map(\.debugLabel), ["message:m-1", "handoff:summary", "message:m-2"])
+    }
+
+    func testChatCapabilityInvalidationTriggersRefreshAndRestoresWritableComposerState() async {
+        final class Box { var refreshes = 0 }
+        let box = Box()
+        let refreshed = snapshot(lifecycle: .open, writable: "row-2")
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-1",
+            api: makeAPI(),
+            connectivity: ConnectivityMonitor(),
+            sessionProvider: { _ in nil },
+            loadSnapshot: { _, _ in refreshed },
+            didStartRefresh: { _ in box.refreshes += 1 })
+
+        model.applyForTesting(snapshot(lifecycle: .open, writable: nil))
+        model.invalidateAggregateTopologyForTesting(.init(
+            transcriptRowId: "row-2",
+            aggregateIdentity: "pc-1",
+            reason: .awaitingContinuation))
+        while box.refreshes < 1 { await Task.yield() }
+
+        XCTAssertTrue(model.canSendChat)
+        XCTAssertEqual(model.actionTranscriptRowId, "row-2")
+    }
+
+    func testStartWithRetainedSnapshotKeepsCachedOwnerLiveWhenRefreshFails() async {
+        let cached = makeSession(id: "row-2")
+        cached.receive(.initSnapshot(.init(
+            conversation: try! conversation(id: "row-2"),
+            messages: [], agentWorking: false, presentationMode: "idle", lastSequenceId: 1,
+            pendingAnchorSequenceId: 1, pendingEvents: [], pendingTruncated: false)))
+        cached.receive(.errorEvent(seq: 2, message: "cached error", retryable: true))
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-1",
+            api: makeAPI(),
+            connectivity: ConnectivityMonitor(),
+            sessionProvider: { id in id == "row-2" ? cached : nil },
+            existingSession: { id in id == "row-2" ? cached : nil },
+            loadSnapshot: { _, _ in throw URLError(.timedOut) })
+
+        model.applyForTesting(snapshot(lifecycle: .open, writable: "row-2"))
+        await model.start()
+
+        XCTAssertEqual(model.lastDelegatedError, "cached error")
+    }
+
+    func testRepeatedProjectionReadsDoNotCreateAdditionalSessions() {
+        final class Counter { var created: [String] = [] }
+        let counter = Counter()
+        let row2 = makeSession(id: "row-2")
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-1",
+            api: makeAPI(),
+            connectivity: ConnectivityMonitor(),
+            sessionProvider: { id in
+                counter.created.append(id)
+                return id == "row-2" ? row2 : nil
+            },
+            existingSession: { id in id == "row-2" ? row2 : nil })
+
+        model.applyForTesting(snapshot(latest: "row-2", writable: "row-2"))
+        let createdAfterApply = counter.created
+
+        _ = model.actionSession
+        _ = model.lifecycleSession
+        _ = model.stateDetailSession
+        _ = model.selectedTranscriptSession
+        _ = model.canMutateLifecycle
+        _ = model.currentOwnerSession
+        _ = model.outboxProjections
+        _ = model.transcriptItems
+
+        XCTAssertEqual(counter.created, createdAfterApply)
+    }
+
+    func testSeededPersistedOutboxFallbackActivatesOnInitialLoadFailure() async {
+        let row1 = makeSession(id: "row-1")
+        let row2 = makeSession(id: "row-2")
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-1",
+            initialTranscriptRowId: nil,
+            api: makeAPI(),
+            connectivity: ConnectivityMonitor(),
+            sessionProvider: { id in
+                switch id {
+                case "row-1": row1
+                case "row-2": row2
+                default: nil
+                }
+            },
+            existingSession: { _ in nil },
+            persistedOutboxContents: { transcriptRowId in
+                transcriptRowId == "row-2" ? .hasVisibleEntries : .empty
+            },
+            loadSnapshot: { _, _ in throw APIError.transport(underlying: URLError(.notConnectedToInternet)) })
+
+        model.seedPersistedOutboxFallbackOwnerForTesting("row-2")
+        await model.start()
+
+        XCTAssertNil(model.snapshot)
+        XCTAssertEqual(model.fallbackSession?.conversationId, "row-2")
+        XCTAssertEqual(model.selectedTranscriptRowId, "row-2")
+        XCTAssertTrue(model.outboxProjections.isEmpty)
+    }
+
+    func testPersistedOutboxRemovalReleasesFallbackOwnerWhenNoLongerNeeded() async {
+        final class Box {
+            var persisted = TestPersistedOutboxStore(visibleByTranscriptRowId: ["row-1": true])
+            var sessions: [String: ConversationSession] = [:]
+            var created: [String] = []
+        }
+        let box = Box()
+        let row1 = makeSession(id: "row-1")
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-1",
+            api: makeAPI(),
+            connectivity: ConnectivityMonitor(),
+            sessionProvider: { id in
+                box.created.append(id)
+                if box.sessions[id] == nil, id == "row-1" { box.sessions[id] = row1 }
+                return box.sessions[id]
+            },
+            existingSession: { box.sessions[$0] },
+            persistedOutboxContents: { box.persisted.contents(for: $0) })
+
+        await model.start()
+        model.applyForTesting(snapshot())
+        XCTAssertTrue(model.fallbackSession === row1)
+        XCTAssertEqual(box.created, ["row-1", "row-2", "row-2"])
+
+        box.persisted = TestPersistedOutboxStore()
+        model.handleSessionEvent(transcriptRowId: "row-1", generation: 1, event: .outboxChanged)
+
+        XCTAssertNil(model.fallbackSession)
+    }
+
+    private func withScopedDiskStoreDirectory(
+        _ body: @escaping @MainActor () async throws -> Void
+    ) async throws {
+        await DiskStore.removeAllAndWait()
+        try await body()
+        await DiskStore.removeAllAndWait()
+    }
+
+    private func message(id: String, type: String = "agent", content: String) throws -> Message {
+        try JSONDecoder().decode(
+            Message.self,
+            from: Data("{\"message_id\":\"\(id)\",\"conversation_id\":\"c1\",\"sequence_id\":2,\"message_type\":\"\(type)\",\"content\":\(content)}".utf8))
     }
 
     private func conversation(id: String, state: String = "{\"type\":\"idle\"}") throws -> Conversation {
