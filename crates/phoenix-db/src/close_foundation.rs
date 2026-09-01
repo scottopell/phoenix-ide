@@ -1569,6 +1569,7 @@ impl Database {
              FROM close_attempt_participants captured
              JOIN conversations participant ON participant.id = captured.conversation_id
              WHERE captured.attempt_id = ?1
+               AND captured.settlement_state = 'live'
                AND (
                  EXISTS (
                    SELECT 1 FROM durable_turns turn
@@ -4994,7 +4995,9 @@ mod tests {
         .execute(db.pool())
         .await
         .expect_err("cross-product participant identity must be rejected");
-        assert!(error.to_string().contains("FOREIGN KEY constraint failed"));
+        assert!(error
+            .to_string()
+            .contains("close participant must belong to the attempted ProductConversation"));
     }
 
     #[tokio::test]
@@ -5075,6 +5078,24 @@ mod tests {
             .execute(db.pool())
             .await
             .unwrap();
+        let participant: (i64, String) = sqlx::query_as(
+            "SELECT COUNT(*), MIN(settlement_state) FROM close_attempt_participants
+             WHERE attempt_id = 'delete-sealed-attempt'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(participant, (1, "live".to_string()));
+        sqlx::query("DELETE FROM close_attempt_members WHERE attempt_id = 'delete-sealed-attempt'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "DELETE FROM close_attempt_participants WHERE attempt_id = 'delete-sealed-attempt'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
         let participants: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM close_attempt_participants
              WHERE attempt_id = 'delete-sealed-attempt'",

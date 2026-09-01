@@ -9228,6 +9228,21 @@ impl Database {
         .bind(conversation_id)
         .execute(&mut *connection)
         .await?;
+        if creation_cleanup_claim.is_some() {
+            sqlx::query(
+                "UPDATE close_attempt_participants
+                 SET settlement_state = 'deleted'
+                 WHERE product_conversation_id = ?1 AND settlement_state = 'live'
+                   AND EXISTS (
+                     SELECT 1 FROM close_obligations obligation
+                     WHERE obligation.attempt_id = close_attempt_participants.attempt_id
+                       AND obligation.phase <> 'completed'
+                   )",
+            )
+            .bind(&membership)
+            .execute(&mut *connection)
+            .await?;
+        }
         let deleted = if let Some((cleanup, generation, now_str)) = creation_cleanup_claim {
             sqlx::query(
                 "DELETE FROM conversations

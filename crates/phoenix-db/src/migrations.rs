@@ -7976,9 +7976,9 @@ mod migration_094_tests {
     fn participant_snapshot_upgrade_captures_active_subordinates_and_cascades_delete() {
         assert!(super::MIGRATION_095.contains("WHERE obligation.phase <> 'completed'"));
         assert!(super::MIGRATION_095.contains("FOREIGN KEY (attempt_id, product_conversation_id)"));
-        assert!(
-            super::MIGRATION_095.contains("FOREIGN KEY (conversation_id, product_conversation_id)")
-        );
+        assert!(super::MIGRATION_095
+            .contains("close participant must belong to the attempted ProductConversation"));
+        assert!(super::MIGRATION_095.contains("CHECK (settlement_state IN ('live', 'deleted'))"));
     }
 
     #[tokio::test]
@@ -8074,14 +8074,24 @@ CREATE TABLE close_attempt_participants (
     attempt_id TEXT NOT NULL,
     product_conversation_id TEXT NOT NULL,
     conversation_id TEXT NOT NULL,
+    settlement_state TEXT NOT NULL DEFAULT 'live'
+        CHECK (settlement_state IN ('live', 'deleted')),
     captured_at_unix_micros INTEGER NOT NULL
         CHECK (captured_at_unix_micros >= 0),
     PRIMARY KEY (attempt_id, conversation_id),
     FOREIGN KEY (attempt_id, product_conversation_id)
-        REFERENCES close_obligations(attempt_id, product_conversation_id) ON DELETE CASCADE,
-    FOREIGN KEY (conversation_id, product_conversation_id)
-        REFERENCES conversations(id, product_conversation_id) ON DELETE CASCADE
+        REFERENCES close_obligations(attempt_id, product_conversation_id) ON DELETE CASCADE
 );
+CREATE TRIGGER close_attempt_participants_require_same_product_on_insert
+BEFORE INSERT ON close_attempt_participants
+WHEN NOT EXISTS (
+    SELECT 1 FROM conversations participant
+    WHERE participant.id = NEW.conversation_id
+      AND participant.product_conversation_id = NEW.product_conversation_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'close participant must belong to the attempted ProductConversation');
+END;
 CREATE TRIGGER conversations_reject_sealed_participant_delete
 BEFORE DELETE ON conversations
 WHEN EXISTS (
@@ -8089,12 +8099,8 @@ WHEN EXISTS (
     FROM close_attempt_participants participant
     JOIN close_obligations obligation ON obligation.attempt_id = participant.attempt_id
     WHERE participant.conversation_id = OLD.id
+      AND participant.settlement_state = 'live'
       AND obligation.phase <> 'completed'
-      AND NOT EXISTS (
-        SELECT 1 FROM conversation_creation_jobs cleanup
-        WHERE cleanup.conversation_id = OLD.id
-          AND cleanup.status = 'deletion_pending'
-      )
 )
 BEGIN
     SELECT RAISE(ABORT, 'active Close rejects sealed participant deletion');
