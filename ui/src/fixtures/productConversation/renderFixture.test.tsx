@@ -102,7 +102,9 @@ describe('ProductConversationFixture', () => {
 
   it('keeps handoff identities aligned with adjacent transcript segments', () => {
     for (const id of ['desktop-open-multi-segment-qa-work', 'desktop-history-read-only', 'mobile-history-read-only', 'long-history-110-messages'] as const) {
-      const segments = getProductConversationScenario(id).snapshot?.segments ?? [];
+      const snapshot = getProductConversationScenario(id).snapshot;
+      const segments = snapshot?.segments ?? [];
+      expect(segments.some((segment) => segment.transcript_row_id === snapshot?.latest_transcript_row_id)).toBe(true);
       segments.forEach((segment, index) => {
         if (!segment.handoff) return;
         expect(segment.handoff.predecessor_transcript_row_id).toBe(segment.transcript_row_id);

@@ -182,6 +182,8 @@ function makeLongSnapshot(): ProductConversationSnapshotView {
     product_conversation_id: 'pc-long-history',
     canonical_route: '/product-conversations/pc-long-history',
     requested_transcript_row_id: 'row-long-4',
+    latest_transcript_row_id: 'row-long-4',
+    writable_transcript_row_id: null,
     canonical_root: { transcript_row_id: 'row-long-1', slug: 'long-root', title: 'Long history root' },
     presentation: { kind: 'state', display_name: 'Long fixture conversation', presentation_mode: 'idle' },
     work_identity: null,
@@ -229,6 +231,13 @@ export const productConversationScenarios = [
       writable_transcript_row_id: null,
       presentation: { kind: 'state', display_name: 'Archived product history', presentation_mode: 'done' },
       work_identity: null,
+      requested_transcript_row_id: 'row-history-2',
+      latest_transcript_row_id: 'row-history-2',
+      canonical_root: {
+        transcript_row_id: 'row-history-1',
+        slug: 'row-history-1',
+        title: 'Historical root',
+      },
       source: {
         status: 'deleted',
         source_product_conversation_id: 'pc-deleted',
