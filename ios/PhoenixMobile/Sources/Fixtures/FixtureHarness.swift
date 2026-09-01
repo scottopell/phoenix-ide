@@ -604,9 +604,36 @@ private extension FixtureScenario {
                 display_data: nil,
                 created_at: "2025-01-02T03:04:05Z"),
             .init(
-                message_id: "m-agent-1",
+                message_id: "m-skill",
                 conversation_id: "fixture-conv",
                 sequence_id: 2,
+                message_type: "skill",
+                content: .object([
+                    "name": .string("phoenix-development"),
+                    "description": .string("Deterministic skill row"),
+                ]),
+                display_data: nil,
+                created_at: "2025-01-02T03:04:06Z"),
+            .init(
+                message_id: "m-system",
+                conversation_id: "fixture-conv",
+                sequence_id: 3,
+                message_type: "system",
+                content: .object(["text": .string("Deterministic system note")]),
+                display_data: nil,
+                created_at: "2025-01-02T03:04:07Z"),
+            .init(
+                message_id: "m-continuation",
+                conversation_id: "fixture-conv",
+                sequence_id: 4,
+                message_type: "continuation",
+                content: .object(["text": .string("Continued from an earlier transcript")]),
+                display_data: nil,
+                created_at: "2025-01-02T03:04:08Z"),
+            .init(
+                message_id: "m-agent-1",
+                conversation_id: "fixture-conv",
+                sequence_id: 5,
                 message_type: "agent",
                 content: .array([
                     .object([
@@ -638,7 +665,7 @@ private extension FixtureScenario {
             .init(
                 message_id: "m-tool-1",
                 conversation_id: "fixture-conv",
-                sequence_id: 3,
+                sequence_id: 6,
                 message_type: "tool",
                 content: .object([
                     "tool_use_id": .string("tool-bash-1"),
