@@ -113,8 +113,8 @@ describe('CommandPalette lifecycle availability', () => {
     expect(screen.getByText('Close Current Conversation')).toBeInTheDocument();
   });
 
-  it('offers Close on the canonical ProductConversation route', () => {
-    const latest = makeConversation({ id: 'latest-id', slug: 'latest' });
+  it('offers Close for an Open canonical aggregate despite archived row drift', () => {
+    const latest = makeConversation({ id: 'latest-id', slug: 'latest', archived: true });
     render(
       <MemoryRouter initialEntries={['/product-conversations/product-1']}>
         <FileExplorerContext.Provider value={{

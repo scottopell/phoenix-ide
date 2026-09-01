@@ -123,7 +123,10 @@ export function CommandPalette({ conversations, productConversations = [], activ
           ? (() => {
               const activeRoute = activeConvId ?? activeProduct?.latest_transcript_row_id ?? currentSlug;
               const conv = conversations.find(c => c.id === activeRoute || c.slug === activeRoute);
-              if (!conv || conv.archived === true || computeChainRoots(conversations).get(conv.id) != null) return undefined;
+              const isWritable = activeProduct
+                ? activeProduct.ordinary_lifecycle === 'open'
+                : conv?.archived !== true;
+              if (!conv || !isWritable || computeChainRoots(conversations).get(conv.id) != null) return undefined;
               return async () => {
                 try {
                   await api.archiveConversation(conv.id);
