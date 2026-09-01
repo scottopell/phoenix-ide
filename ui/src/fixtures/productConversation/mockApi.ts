@@ -60,6 +60,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   const originalListModels = api.listModels;
   const originalGetPrStatus = api.getPrStatus;
   const originalGetConversationGitStatus = api.getConversationGitStatus;
+  const originalGetSystemPrompt = api.getSystemPrompt;
   const originalListForkProposals = api.listForkProposals;
   const originalResolveCoordinatorRoute = api.resolveCoordinatorRoute;
   const originalSubscribeToChainStream = streamApi.subscribeToChainStream;
@@ -160,6 +161,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     work_change: { kind: 'clean' },
   });
   api.getConversationGitStatus = async () => ({ kind: 'non_git' });
+  api.getSystemPrompt = async () => 'Fixture system prompt';
   api.listForkProposals = async () => [];
   api.resolveCoordinatorRoute = async () => ({ coordinator_id: null });
 
@@ -190,6 +192,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     api.listModels = originalListModels;
     api.getPrStatus = originalGetPrStatus;
     api.getConversationGitStatus = originalGetConversationGitStatus;
+    api.getSystemPrompt = originalGetSystemPrompt;
     api.listForkProposals = originalListForkProposals;
     api.resolveCoordinatorRoute = originalResolveCoordinatorRoute;
     streamApi.subscribeToChainStream = originalSubscribeToChainStream;
