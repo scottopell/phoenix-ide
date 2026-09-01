@@ -86,6 +86,15 @@ enum DiskStore {
     private static func url(for name: String) -> URL {
         directory.appendingPathComponent(name + ".json")
     }
+    static func listNames(prefix: String) -> [String] {
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil)
+        else { return [] }
+        return files
+            .filter { $0.lastPathComponent.hasPrefix(prefix) && $0.pathExtension == "json" }
+            .map { $0.deletingPathExtension().lastPathComponent }
+    }
 
     static func load<T: Decodable>(_ type: T.Type, name: String) -> T? {
         guard let data = try? Data(contentsOf: url(for: name)) else { return nil }

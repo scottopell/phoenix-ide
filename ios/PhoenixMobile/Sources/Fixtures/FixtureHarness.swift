@@ -36,6 +36,16 @@ struct FixtureConversationScreenModel {
     var showsOfflineBanner: Bool { !isOnline }
 }
 
+@MainActor
+private enum FixtureNavigationResolver {
+    static func resolve(_ conversationId: String) -> String {
+        let aggregateId = conversationId.hasPrefix("pc-") ? conversationId : nil
+        return AppModel().resolvedNavigationConversationId(
+            aggregateId: aggregateId,
+            latestTranscriptRowId: conversationId)
+    }
+}
+
 enum FixtureBannerStyle {
     case info
     case warning
@@ -244,6 +254,7 @@ struct FixtureConversationScreen: View {
                     acceptsActions: screen.isOnline,
                     busy: false,
                     convState: screen.statePayload,
+                    resolveNavigation: FixtureNavigationResolver.resolve,
                     onAction: { _ in })
                 ComposerInputRow(
                     draft: $draft,

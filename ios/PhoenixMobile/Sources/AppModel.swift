@@ -58,8 +58,10 @@ final class AppModel {
         serverURLString = UserDefaults.standard.string(forKey: Self.serverURLKey) ?? ""
         password = Keychain.password(account: Self.passwordAccount) ?? ""
         trustSelfSigned = UserDefaults.standard.object(forKey: Self.trustSelfSignedKey) as? Bool ?? true
+        attention = AttentionMonitor(
+            currentConversations: listStore.conversations,
+            transcriptToAggregate: listStore.transcriptToAggregate)
         rebuildAPI()
-        adoptCoordinatorIdentityFromList()
         _ = connectivity.addRestoreObserver { [weak self] in
             self?.drainPersistedOutboxes()
             Task { await self?.refreshList() }
@@ -95,10 +97,10 @@ final class AppModel {
         guard let api else { return nil }
         if let existing = sessions[conversationId] { return existing }
         let onConversationUpdate: (Conversation) -> Void = { [weak self] conversation in
-            self?.listStore.upsert(conversation)
+            self?.handleSessionConversationUpdate(conversation, transcriptRowId: conversationId)
         }
         let onHardDeleted: (String) -> Void = { [weak self] deletedId in
-            self?.handleHardDeleted(deletedId)
+            self?.handleHardDeleted(deletedId, aggregateIdentity: self?.aggregateIdentity(forTranscriptRowId: conversationId))
         }
         let session: ConversationSession
         if let draining = drainSessions.removeValue(forKey: conversationId) {
@@ -116,13 +118,68 @@ final class AppModel {
         return session
     }
 
-    private func handleHardDeleted(_ conversationId: String) {
-        listStore.remove(id: conversationId)
+    private func aggregateIdentity(forTranscriptRowId transcriptRowId: String) -> String? {
+        listStore.aggregateId(forTranscriptRowId: transcriptRowId)
+    }
+
+    private func mergeAggregateProjection(
+        existing: Conversation,
+        liveUpdate: Conversation,
+        aggregateIdentity: String
+    ) -> Conversation {
+        Conversation(
+            id: existing.id == liveUpdate.id ? liveUpdate.id : existing.id,
+            product_conversation_id: aggregateIdentity,
+            slug: existing.slug,
+            title: existing.title,
+            model: liveUpdate.model,
+            cwd: liveUpdate.cwd,
+            created_at: liveUpdate.created_at,
+            updated_at: liveUpdate.updated_at,
+            message_count: liveUpdate.message_count,
+            state: liveUpdate.state,
+            state_updated_at: liveUpdate.state_updated_at,
+            branch_name: liveUpdate.branch_name,
+            task_title: existing.task_title,
+            archived: existing.archived,
+            project_name: liveUpdate.project_name,
+            conv_mode_label: liveUpdate.conv_mode_label,
+            presentation_mode: liveUpdate.presentation_mode,
+            requires_action: liveUpdate.requires_action,
+            transcript_generation: liveUpdate.transcript_generation,
+            runtime_role: existing.runtime_role ?? liveUpdate.runtime_role)
+    }
+
+    private func handleSessionConversationUpdate(_ conversation: Conversation, transcriptRowId: String) {
+        guard let aggregateIdentity = aggregateIdentity(forTranscriptRowId: transcriptRowId),
+              let existing = listStore.conversations.first(where: { $0.aggregateIdentity == aggregateIdentity })
+        else {
+            listStore.upsert(conversation)
+            return
+        }
+        listStore.upsert(
+            mergeAggregateProjection(
+                existing: existing,
+                liveUpdate: conversation,
+                aggregateIdentity: aggregateIdentity))
+    }
+
+    private func handleHardDeleted(_ conversationId: String, aggregateIdentity: String?) {
+        let notificationId: String
+        if let aggregateIdentity {
+            listStore.remove(aggregateId: aggregateIdentity)
+            notificationId = aggregateIdentity
+        } else {
+            listStore.removeByTranscriptRowId(conversationId)
+            notificationId = conversationId
+        }
         if pendingOpenConversationId == conversationId {
             pendingOpenConversationId = nil
         }
         UNUserNotificationCenter.current().removeDeliveredNotifications(
-            withIdentifiers: ["attention-\(conversationId)"])
+            withIdentifiers: ["attention-\(notificationId)"])
+        UNUserNotificationCenter.current().removePendingNotificationRequests(
+            withIdentifiers: ["attention-\(notificationId)"])
     }
 
     func refreshList() async {
@@ -130,16 +187,17 @@ final class AppModel {
         attentionEvidenceGeneration &+= 1
         await listStore.refresh(api: api)
         if listStore.lastError == nil {
-            adoptCoordinatorIdentityFromList()
             // The user is looking at fresh data — nothing here should nudge
             // them later.
-            attention.seed(with: listStore.conversations)
+            attention.seed(
+                with: listStore.conversations,
+                transcriptToAggregate: listStore.transcriptToAggregate)
         }
     }
 
     // MARK: - Needs-attention nudges
 
-    let attention = AttentionMonitor()
+    let attention: AttentionMonitor
     private let notificationRouter = NotificationRouter()
     private static let nudgesEnabledKey = "phoenix.backgroundNudges"
     private var nudgePreferenceGeneration = 0
@@ -150,6 +208,25 @@ final class AppModel {
     private(set) var nudgeAuthorizationHint: String?
     /// Set by a notification tap; the list view navigates and clears it.
     var pendingOpenConversationId: String?
+
+    func resolvedNavigationConversationId(
+        aggregateId: String?,
+        latestTranscriptRowId: String
+    ) -> String {
+        if connectivity.isOnline {
+            return latestTranscriptRowId
+        }
+        guard let aggregateId else { return latestTranscriptRowId }
+        return listStore.cachedNavigationTranscriptRowId(
+            forAggregateId: aggregateId,
+            latestTranscriptRowId: latestTranscriptRowId)
+    }
+
+    func navigationConversationId(for conversation: Conversation) -> String {
+        resolvedNavigationConversationId(
+            aggregateId: conversation.product_conversation_id,
+            latestTranscriptRowId: conversation.transcriptRowIdentity)
+    }
 
     func setBackgroundNudges(_ enabled: Bool) async {
         nudgePreferenceGeneration &+= 1
@@ -195,13 +272,18 @@ final class AppModel {
               listStore.canApplyExternal(startedAt: listToken)
         else { return false }
         guard listStore.applyExternal(fresh, startedAt: listToken) else { return false }
-        return await attention.checkAndNotify(fresh) { [weak self] in
+        let isCurrent: @MainActor () -> Bool = { [weak self] in
             guard let self else { return false }
             return self.backgroundNudgesEnabled
                 && self.apiGeneration == startedGeneration
                 && self.nudgePreferenceGeneration == startedNudgeGeneration
                 && self.attentionEvidenceGeneration == startedEvidenceGeneration
         }
+        await attention.refreshAndNotifyIfNeeded(
+            from: fresh,
+            transcriptToAggregate: listStore.transcriptToAggregate,
+            isCurrent: isCurrent)
+        return await isCurrent()
     }
 
     // MARK: - Coordinator
@@ -217,13 +299,6 @@ final class AppModel {
         return ConversationSession.hasCachedSnapshot(conversationId: id)
     }
 
-    private func adoptCoordinatorIdentityFromList() {
-        guard let coordinator = listStore.conversations.first(where: \.isCoordinator) else {
-            return
-        }
-        coordinatorConversationId = coordinator.id
-        UserDefaults.standard.set(coordinator.id, forKey: Self.coordinatorIdKey)
-    }
 
     /// Resolve the Coordinator conversation to open. Online: get-or-create
     /// on the server (it's an ordinary conversation; everything downstream
@@ -269,9 +344,10 @@ final class AppModel {
     @discardableResult
     func archive(conversationId: String) async -> Bool {
         guard ClientOperation.archive.policy == .onlineOnly else { return false }
-        let serverIdentifiesCoordinator = listStore.conversations.first {
-            $0.id == conversationId
-        }?.isCoordinator == true
+        let serverIdentifiesCoordinator = conversationId == coordinatorConversationId
+            || listStore.conversations.first {
+                $0.transcriptRowIdentity == conversationId
+            }?.isCoordinator == true
         guard conversationId != coordinatorConversationId, !serverIdentifiesCoordinator else {
             lastActionError = "The Coordinator is a permanent fleet conversation and can't be archived."
             return false
@@ -317,9 +393,15 @@ final class AppModel {
             await session.clearCachedSnapshotAndWait()
             await session.outbox.clearAndWait()
             sessions[conversationId] = nil
-            listStore.remove(id: conversationId)
+            let aggregateId = listStore.aggregateId(forTranscriptRowId: conversationId)
+            if let aggregateId {
+                listStore.remove(aggregateId: aggregateId)
+            }
+            let notificationId = aggregateId ?? conversationId
             UNUserNotificationCenter.current().removeDeliveredNotifications(
-                withIdentifiers: ["attention-\(conversationId)"])
+                withIdentifiers: ["attention-\(notificationId)"])
+            UNUserNotificationCenter.current().removePendingNotificationRequests(
+                withIdentifiers: ["attention-\(notificationId)"])
             return true
         } catch {
             lastActionError = (error as? APIError)?.errorDescription
@@ -334,6 +416,16 @@ final class AppModel {
         }
         drainPersistedOutboxes()
         Task { await refreshList() }
+    }
+
+    func integrateBackgroundConversationUpdate(existing: Conversation, update: Conversation) -> Conversation {
+        if let aggregateIdentity = existing.product_conversation_id {
+            return mergeAggregateProjection(
+                existing: existing,
+                liveUpdate: update,
+                aggregateIdentity: aggregateIdentity)
+        }
+        return update
     }
 
     /// Deliver queued messages for conversations the user hasn't reopened.

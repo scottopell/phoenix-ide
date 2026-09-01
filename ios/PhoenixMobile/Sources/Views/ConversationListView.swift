@@ -128,19 +128,21 @@ struct ConversationListView: View {
                             .listRowSeparator(.hidden)
                     }
                 }
-                ForEach(model.listStore.conversations) { conversation in
+                ForEach(model.listStore.conversations, id: \.aggregateIdentity) { conversation in
+                    let transcriptRowId = conversation.transcriptRowIdentity
+                    let navigationId = model.navigationConversationId(for: conversation)
                     let isCoordinator = conversation.isCoordinator
-                        || conversation.id == model.coordinatorConversationId
-                    NavigationLink(value: conversation.id) {
+                        || transcriptRowId == model.coordinatorConversationId
+                    NavigationLink(value: navigationId) {
                         ConversationRow(
                             conversation: conversation,
                             isCoordinator: isCoordinator)
                     }
-                    .accessibilityIdentifier("conversationList.row.\(conversation.id)")
+                    .accessibilityIdentifier("conversationList.row.\(conversation.aggregateIdentity)")
                     .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                         if !isCoordinator {
                             Button {
-                                Task { await model.archive(conversationId: conversation.id) }
+                                Task { await model.archive(conversationId: transcriptRowId) }
                             } label: {
                                 Label("Archive", systemImage: "archivebox")
                             }
@@ -163,7 +165,10 @@ struct ConversationListView: View {
     private func consumePendingNavigation() {
         guard let id = model.pendingOpenConversationId else { return }
         model.pendingOpenConversationId = nil
-        navPath = [id]
+        let aggregateId = model.listStore.aggregateId(forTranscriptRowId: id)
+        navPath = [model.resolvedNavigationConversationId(
+            aggregateId: aggregateId,
+            latestTranscriptRowId: id)]
     }
 
     /// Freshness note shown only when the cache is meaningfully stale.
