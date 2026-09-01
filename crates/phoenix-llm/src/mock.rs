@@ -7,7 +7,7 @@
 //! Test-driver markers (parsed from the latest user message text):
 //! - `[[scenario:NAME]]` — force a specific scripted response
 //!   (`plain_text`, `markdown`, `mermaid`, `bash`, `read_file`, `think`,
-//!   `multi_tool`, `long`, `patch`, `spawn_agents`).
+//!   `multi_tool`, `long`, `patch`, `spawn_agents`, `context_window_exceeded`).
 //! - `[[perf:N]]` — deterministic text-only response of ~N words
 //!   (performance fingerprint, no rand).
 //! - `[[ttft:N]]` — override time-to-first-token sleep with N ms.
@@ -77,6 +77,11 @@ enum Scenario {
     /// turn after the sub-agents finish falls through to `PlainText`. Authored
     /// for sub-agent UI testing; see `[[scenario:spawn_agents]]`.
     SpawnAgents,
+    /// Marker-only (not in hash rotation): returns `LlmError::ContextWindowExceeded`
+    /// from the normal streaming turn path after the ordinary TTFT/streaming
+    /// setup has run, so E2E can drive the shipped continuation journey
+    /// without a fault endpoint or direct state fabrication.
+    ContextWindowExceeded,
 }
 
 impl Scenario {
@@ -132,8 +137,9 @@ impl Scenario {
 /// forces selection of a specific scripted response, bypassing the hash-based
 /// roulette. Symmetric with `[[perf:N]]` — both make the mock authorable for
 /// E2E tests. Recognized NAMEs: `plain_text`, `markdown`, `mermaid`, `bash`,
-/// `read_file`, `think`, `multi_tool`, `long`, `patch`, `spawn_agents`. Dev-only: mock is
-/// opt-in (`PHOENIX_ENABLE_MOCK_MODEL=1`).
+/// `read_file`, `think`, `multi_tool`, `long`, `patch`, `spawn_agents`,
+/// `context_window_exceeded`. Dev-only: mock is opt-in
+/// (`PHOENIX_ENABLE_MOCK_MODEL=1`).
 fn parse_scenario(request: &LlmRequest) -> Option<Scenario> {
     let text = request.messages.iter().rev().find_map(|m| {
         if m.role == super::types::MessageRole::User {
@@ -165,6 +171,7 @@ fn parse_scenario(request: &LlmRequest) -> Option<Scenario> {
         "long" => Some(Scenario::LongStreaming),
         "patch" => Some(Scenario::PatchToolCall),
         "spawn_agents" => Some(Scenario::SpawnAgents),
+        "context_window_exceeded" => Some(Scenario::ContextWindowExceeded),
         _ => None,
     }
 }
@@ -664,6 +671,16 @@ fn build_response(scenario: &Scenario) -> (Vec<ContentBlock>, String) {
                 text,
             )
         }
+
+        Scenario::ContextWindowExceeded => {
+            let text =
+                "This turn will naturally exhaust the context window after normal mock streaming."
+                    .to_string();
+            (
+                vec![ContentBlock::Text { text: text.clone() }],
+                text,
+            )
+        }
     }
 }
 
@@ -751,6 +768,12 @@ impl LlmService for MockLlmService {
             build_response(&Scenario::from_message(request)).0
         };
 
+        if matches!(Scenario::from_message(request), Scenario::ContextWindowExceeded) {
+            return Err(LlmError::context_window_exceeded(
+                "mock scenario: normal turn exceeded the context window".to_string(),
+            ));
+        }
+
         Ok(LlmResponse {
             content,
             end_turn: true,
@@ -792,13 +815,14 @@ impl LlmService for MockLlmService {
             // attempt > fail_n: fall through to the normal scenario.
         }
 
+        let scenario = Scenario::from_message(request);
         let (content, streamable_text) = if let Some(seconds) = parse_slow_tool(request) {
             build_slow_tool_response(seconds)
         } else if let Some(n) = parse_perf_words(request) {
             let t = perf_text(n);
             (vec![ContentBlock::Text { text: t.clone() }], t)
         } else {
-            build_response(&Scenario::from_message(request))
+            build_response(&scenario)
         };
 
         // Initial latency (time-to-first-token). `[[ttft:N]]` overrides
@@ -813,6 +837,12 @@ impl LlmService for MockLlmService {
         if !streamable_text.is_empty() {
             let stall = parse_stall(request);
             stream_text_with_optional_stall(&streamable_text, chunk_tx, stall).await;
+        }
+
+        if matches!(scenario, Scenario::ContextWindowExceeded) {
+            return Err(LlmError::context_window_exceeded(
+                "mock scenario: normal turn exceeded the context window".to_string(),
+            ));
         }
 
         Ok(LlmResponse {
@@ -882,6 +912,10 @@ mod tests {
             ("[[scenario:long]]", Scenario::LongStreaming),
             ("[[scenario:patch]]", Scenario::PatchToolCall),
             ("[[scenario:spawn_agents]]", Scenario::SpawnAgents),
+            (
+                "[[scenario:context_window_exceeded]]",
+                Scenario::ContextWindowExceeded,
+            ),
         ];
         for (text, expected) in cases {
             let req = user_req(text);
