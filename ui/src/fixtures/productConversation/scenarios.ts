@@ -67,7 +67,7 @@ function makeSnapshot(overrides: Partial<ProductConversationSnapshotView> = {}):
     canonical_root: { transcript_row_id: 'row-root', slug: 'product-alpha-root', title: 'Product Alpha root' },
     ordinary_lifecycle: 'open',
     latest_transcript_row_id: 'row-work',
-    writable_transcript_row_id: null,
+    writable_transcript_row_id: 'row-work',
     updated_at: isoAgo(2),
     presentation: { kind: 'state', display_name: 'Product Alpha', presentation_mode: 'working' },
     work_identity: {
@@ -274,7 +274,7 @@ export const productConversationScenarios = [
         relation: 'approved_task',
         relation_key: 'task-39751-mobile',
       },
-      chain_qa_compatibility: null,
+      chain_qa_compatibility: { root_transcript_row_id: 'row-mobile-history-1', url: '/chains/row-mobile-history-1' },
       requested_transcript_row_id: 'row-mobile-history-2',
       latest_transcript_row_id: 'row-mobile-history-2',
       canonical_root: {
