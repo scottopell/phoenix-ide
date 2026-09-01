@@ -479,6 +479,13 @@ AND SHALL refuse the action without modifying that store
 WHEN loading a pre-envelope legacy file
 THE SYSTEM SHALL decode the bare payload as version zero
 
+WHEN a persistence migration changes the semantic meaning of persisted keys
+without changing the persisted value shape
+THE SYSTEM SHALL still bump the affected store version or run a bounded
+migration hook that rewrites the old key domain using authoritative current
+state available at load time
+AND SHALL NOT rely on an indefinite mixed-key fallback during normal runtime
+
 Changing any persisted struct requires either a version bump plus a
 migration branch, or a field-level note that the change is
 additive-optional (old files decode it as nil/default).

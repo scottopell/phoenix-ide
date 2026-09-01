@@ -273,7 +273,12 @@ struct PhoenixAPI: Sendable {
     }
 
     func listConversations() async throws -> [Conversation] {
-        try await get("api/conversations", as: ConversationListResponse.self).conversations
+        let response = try await listProductConversations()
+        return response.product_conversations.map(productConversationListRowToConversation)
+    }
+
+    func listProductConversations() async throws -> ProductConversationListResponse {
+        try await get("api/product-conversations", as: ProductConversationListResponse.self)
     }
 
     func getConversation(id: String, afterSequence: Int64 = 0) async throws
@@ -286,6 +291,52 @@ struct PhoenixAPI: Sendable {
         return try await get(
             "api/conversations/\(id)", query: query,
             as: ConversationWithMessagesResponse.self)
+    }
+
+    func getProductConversation(id: String, before: String? = nil, messageLimit: Int? = nil) async throws
+        -> ProductConversationSnapshot
+    {
+        var query: [URLQueryItem] = []
+        if let before, !before.isEmpty {
+            query.append(URLQueryItem(name: "before", value: before))
+        }
+        if let messageLimit {
+            query.append(URLQueryItem(name: "message_limit", value: String(messageLimit)))
+        }
+        return try await get(
+            "api/product-conversations/\(id)", query: query,
+            as: ProductConversationSnapshot.self)
+    }
+
+    func productConversationListRowToConversation(_ row: ProductConversationListRow) -> Conversation {
+        let (presentationMode, requiresAction): (String?, Bool?) = switch row.presentation {
+        case .needsAction:
+            ("needs_action", true)
+        case .state(_, let presentationMode):
+            (presentationMode, false)
+        }
+
+        return Conversation(
+            id: row.latest_transcript_row_id,
+            product_conversation_id: row.product_conversation_id,
+            slug: row.canonical_root.slug,
+            title: row.canonical_root.title,
+            model: nil,
+            cwd: nil,
+            created_at: nil,
+            updated_at: row.updated_at,
+            message_count: nil,
+            state: nil,
+            state_updated_at: nil,
+            branch_name: nil,
+            task_title: nil,
+            archived: row.ordinary_lifecycle == .history,
+            project_name: nil,
+            conv_mode_label: nil,
+            presentation_mode: presentationMode,
+            requires_action: requiresAction,
+            transcript_generation: nil,
+            runtime_role: nil)
     }
 
     /// Idempotent by `messageId`: the server returns success without a
@@ -394,9 +445,9 @@ struct PhoenixAPI: Sendable {
             as: SuccessResponse.self)
     }
 
-    /// Get-or-create the fleet Coordinator — an ordinary conversation that
-    /// answers questions about every other conversation. Everything else
-    /// about it (transcript, SSE, chat) uses the normal conversation surface.
+    /// Get-or-create the fleet Coordinator's writable transcript row. The
+    /// list surface is aggregate-keyed, but live Coordinator transcript work
+    /// still uses the ordinary conversation endpoints.
     func ensureCoordinator() async throws -> Conversation {
         try await post("api/global/coordinator", body: [:], as: ConversationResponse.self)
             .conversation
