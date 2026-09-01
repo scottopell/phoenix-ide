@@ -105,8 +105,8 @@ describe('ProductConversationFixture', () => {
       const segments = getProductConversationScenario(id).snapshot?.segments ?? [];
       segments.forEach((segment, index) => {
         if (!segment.handoff) return;
-        expect(segment.handoff.predecessor_transcript_row_id).toBe(segments[index - 1]?.transcript_row_id);
-        expect(segment.handoff.successor_transcript_row_id).toBe(segment.transcript_row_id);
+        expect(segment.handoff.predecessor_transcript_row_id).toBe(segment.transcript_row_id);
+        expect(segment.handoff.successor_transcript_row_id).toBe(segments[index + 1]?.transcript_row_id);
       });
     }
   });
