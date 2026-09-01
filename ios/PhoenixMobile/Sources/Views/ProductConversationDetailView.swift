@@ -23,16 +23,37 @@ struct ProductConversationDetailView: View {
                 ProgressView("Loading…")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                ProductConversationTranscriptView(items: detailModel.transcriptItems, toolIndex: toolIndex, streamingText: streamingText, outboxSession: outboxSession)
+                if detailModel.hasOlder {
+                    Button(detailModel.loadingOlder ? "Loading older…" : "Load older messages") {
+                        Task { await detailModel.loadOlder() }
+                    }
+                    .disabled(detailModel.loadingOlder)
+                    .padding(.top, 8)
+                    .accessibilityIdentifier("productConversation.loadOlder")
+                }
+                ProductConversationTranscriptView(
+                    items: detailModel.transcriptItems,
+                    toolIndex: detailModel.composedToolUseIndex,
+                    streamingText: streamingText,
+                    outboxProjections: detailModel.outboxProjections)
                 if let session = detailModel.stateDetailSession {
-                    ProductConversationStateDetailView(session: session, readOnly: detailModel.isReadOnly)
+                    ProductConversationStateDetailView(
+                        session: session,
+                        readOnly: detailModel.isHistoryReadOnly,
+                        isOnline: detailModel.delegatedConnectivityAllowsActions)
                 }
                 ProductConversationSegmentPicker(model: detailModel)
-                if detailModel.isReadOnly {
-                    ProductConversationReadOnlyFooter()
-                } else if let session = detailModel.actionSession {
+                if let error = detailModel.lastDelegatedError {
+                    InlineErrorBanner(message: error) { detailModel.dismissDelegatedError() }
+                }
+                if detailModel.canSendChat, let session = detailModel.actionSession {
+                    ConnectionStateBar(session: session)
                     ComposerView(session: session, draft: $draft)
                         .accessibilityIdentifier("conversation.productComposer")
+                } else if detailModel.isHistoryReadOnly {
+                    ProductConversationReadOnlyFooter()
+                } else {
+                    ProductConversationNoWritableChatFooter()
                 }
             }
         }
@@ -42,23 +63,15 @@ struct ProductConversationDetailView: View {
         .onDisappear { detailModel.stop() }
     }
 
-    private var outboxSession: ConversationSession? {
-        guard !detailModel.isReadOnly else { return nil }
-        return detailModel.actionSession
-    }
-
     private var streamingText: String {
         detailModel.actionSession?.streamingText ?? ""
-    }
-
-    private var toolIndex: [String: ToolUseRef] {
-        detailModel.actionSession?.toolUseIndex ?? [:]
     }
 }
 
 struct ProductConversationStateDetailView: View {
     let session: ConversationSession
     let readOnly: Bool
+    let isOnline: Bool
 
     var body: some View {
         if readOnly {
@@ -73,7 +86,16 @@ struct ProductConversationStateDetailView: View {
                 resolveNavigation: { $0 },
                 onAction: { _ in })
         } else {
-            StateDetailView(session: session)
+            StateDetailBody(
+                state: session.typedState,
+                presentationMode: session.presentationMode ?? "idle",
+                agentWorking: session.agentWorking,
+                isOnline: isOnline,
+                acceptsActions: session.acceptsConversationActions,
+                busy: session.actionInFlight != nil,
+                convState: session.convState,
+                resolveNavigation: { $0 },
+                onAction: { session.perform($0) })
         }
     }
 }
@@ -82,7 +104,7 @@ struct ProductConversationTranscriptView: View {
     let items: [ProductConversationTranscriptItem]
     let toolIndex: [String: ToolUseRef]
     let streamingText: String
-    var outboxSession: ConversationSession?
+    let outboxProjections: [ProductConversationOutboxProjection]
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -101,8 +123,8 @@ struct ProductConversationTranscriptView: View {
                         StreamingBubble(text: streamingText)
                             .id("streaming")
                     }
-                    if let outboxSession {
-                        OutboxSection(session: outboxSession)
+                    if !outboxProjections.isEmpty {
+                        ProductConversationOutboxList(projections: outboxProjections)
                     }
                     Color.clear.frame(height: 1).id("bottom")
                 }
@@ -120,6 +142,64 @@ struct ProductConversationTranscriptView: View {
             }
         }
         .accessibilityIdentifier("conversation.transcript")
+    }
+}
+
+struct ProductConversationOutboxList: View {
+    let projections: [ProductConversationOutboxProjection]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(projections) { projection in
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Pending in \(projection.transcriptRowId)")
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                    switch projection.actionPolicy {
+                    case .readOnly:
+                        OutboxReadOnlyView(entry: projection.entry)
+                    case .interactive(let session):
+                        OutboxEntryView(entry: projection.entry, session: session)
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct OutboxReadOnlyView: View {
+    let entry: OutboxEntry
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(entry.text)
+                .font(.body)
+            Text(statusText)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.secondary.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .accessibilityIdentifier("productConversation.readOnlyOutbox")
+    }
+
+    private var statusText: String {
+        switch entry.status {
+        case .pending:
+            "Pending"
+        case .steeringQueued:
+            "Queued"
+        case .recoverableInconsistency:
+            "Pending server reconciliation"
+        case .failed:
+            "Failed"
+        case .reconciled:
+            "Reconciled"
+        case .dismissed:
+            "Dismissed"
+        }
     }
 }
 
@@ -203,5 +283,37 @@ struct ProductConversationReadOnlyFooter: View {
             .padding(.vertical, 8)
             .background(.bar)
             .accessibilityIdentifier("conversation.readOnlyFooter")
+    }
+}
+
+struct ProductConversationNoWritableChatFooter: View {
+    var body: some View {
+        Text("Chat is unavailable for this conversation, but state actions may still be available.")
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 8)
+            .background(.bar)
+            .accessibilityIdentifier("conversation.noWritableChatFooter")
+    }
+}
+
+struct InlineErrorBanner: View {
+    let message: String
+    let onDismiss: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            Text(message)
+                .font(.caption)
+            Spacer()
+            Button("Dismiss", action: onDismiss)
+                .font(.caption.bold())
+        }
+        .padding(10)
+        .background(Color.orange.opacity(0.1))
+        .accessibilityIdentifier("productConversation.inlineError")
     }
 }
