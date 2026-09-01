@@ -3,14 +3,125 @@ import SwiftUI
 // State-detail rendering falls into three visual families: working detail,
 // needs-action cards, and error cards.
 
+struct WorkingStateRow<Content: View>: View {
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        HStack(spacing: 8) {
+            ProgressView()
+                .controlSize(.small)
+            content()
+            Spacer()
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .accessibilityIdentifier("state.working")
+    }
+}
+
+struct NeedsActionStateCard: View {
+    let icon: String
+    let title: String
+    let detail: String?
+    let footnote: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Label(title, systemImage: icon)
+                .font(.callout.bold())
+            if let detail {
+                Text(detail)
+                    .font(.callout)
+                    .lineLimit(3)
+            }
+            Text(footnote)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(Color.blue.opacity(0.1))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(Color.blue.opacity(0.35), lineWidth: 0.5))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .accessibilityIdentifier("state.needsAction")
+    }
+}
+
+struct ErrorStateCard: View {
+    let message: String
+    let dismissible: Bool
+    let dismissDisabled: Bool
+    let onDismiss: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label("Agent error", systemImage: "exclamationmark.triangle.fill")
+                .font(.callout.bold())
+                .foregroundStyle(.red)
+            Text(message)
+                .font(.callout)
+                .lineLimit(4)
+            if dismissible {
+                HStack {
+                    Spacer()
+                    Button("Dismiss error", action: onDismiss)
+                        .font(.callout.bold())
+                        .disabled(dismissDisabled)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(Color.red.opacity(0.08))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(Color.red.opacity(0.35), lineWidth: 0.5))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .accessibilityIdentifier("state.error")
+    }
+}
+
 /// Rendered between the transcript and the composer. Quiet when idle.
 struct StateDetailView: View {
     @Environment(AppModel.self) private var model
     let session: ConversationSession
+
+    nonisolated static func fallbackErrorMessage(type: String, state: JSONValue?) -> String {
+        StateDetailBody.fallbackErrorMessage(type: type, state: state)
+    }
+
+    var body: some View {
+        StateDetailBody(
+            state: session.typedState,
+            presentationMode: session.presentationMode ?? "idle",
+            agentWorking: session.agentWorking,
+            isOnline: model.connectivity.isOnline,
+            acceptsActions: session.acceptsConversationActions,
+            busy: session.actionInFlight != nil,
+            convState: session.convState,
+            onAction: { session.perform($0) })
+    }
+}
+
+struct StateDetailBody: View {
+    let state: ConversationState
+    let presentationMode: String
+    let agentWorking: Bool
+    let isOnline: Bool
+    let acceptsActions: Bool
+    let busy: Bool
+    let convState: JSONValue?
+    let onAction: (ConversationAction) -> Void
     @State private var confirmEmptyQuestionDismissal = false
 
     var body: some View {
-        switch session.typedState {
+        switch state {
         case .toolExecuting(let toolName, let remaining, let completed):
             workingRow {
                 HStack(spacing: 4) {
@@ -41,13 +152,32 @@ struct StateDetailView: View {
             if questions.isEmpty {
                 emptyQuestionCard
             } else {
-                QuestionCard(session: session, questions: questions)
+                QuestionCardBody(
+                    questions: questions,
+                    isOnline: isOnline,
+                    acceptsActions: acceptsActions,
+                    busy: busy,
+                    onAnswer: { onAction(.respondToQuestions(answers: $0)) },
+                    onDismiss: { onAction(.dismissQuestion) })
                     .id(questions)
             }
 
         case .awaitingTaskApproval(let title, let priority, let plan):
-            TaskApprovalCard(
-                session: session, title: title, priority: priority, plan: plan)
+            TaskApprovalCardBody(
+                title: title,
+                priority: priority,
+                plan: plan,
+                isOnline: isOnline,
+                acceptsActions: acceptsActions,
+                busy: busy,
+                onReject: { onAction(.rejectTask) },
+                onFeedback: { onAction(.provideTaskFeedback($0)) },
+                onApproveHere: {
+                    onAction(.approveTask(handoff: .continueInCurrentConversation))
+                },
+                onApproveFresh: {
+                    onAction(.approveTask(handoff: .startFreshWorkConversation))
+                })
 
         case .awaitingRecovery(let message):
             workingRow {
@@ -70,7 +200,7 @@ struct StateDetailView: View {
             errorCard(message: message, dismissible: false)
 
         case .contextExhausted(let summary):
-            if session.presentationMode != "done" {
+            if presentationMode != "done" {
                 needsActionCard(
                     icon: "arrow.triangle.2.circlepath",
                     title: "Context exhausted",
@@ -100,7 +230,7 @@ struct StateDetailView: View {
             }
 
         case .idle, .awaitingLlm, .awaitingContinuation, .terminal:
-            if session.agentWorking {
+            if agentWorking {
                 workingRow {
                     Text("Working…")
                         .font(.caption)
@@ -119,17 +249,17 @@ struct StateDetailView: View {
 
     @ViewBuilder
     private func fallbackState(type: String) -> some View {
-        if session.presentationMode == "error" {
+        if presentationMode == "error" {
             errorCard(
-                message: Self.fallbackErrorMessage(type: type, state: session.convState),
+                message: Self.fallbackErrorMessage(type: type, state: convState),
                 dismissible: false)
-        } else if session.presentationMode == "needs_action" {
+        } else if presentationMode == "needs_action" {
             needsActionCard(
                 icon: "person.crop.circle.badge.exclamationmark",
                 title: "Action needed",
                 detail: type.replacingOccurrences(of: "_", with: " "),
                 footnote: "Handle this from the web UI.")
-        } else if session.agentWorking {
+        } else if agentWorking {
             workingRow {
                 Text(type.replacingOccurrences(of: "_", with: " "))
                     .font(.caption)
@@ -145,74 +275,25 @@ struct StateDetailView: View {
         return parts.isEmpty ? "running" : parts.joined(separator: " · ")
     }
 
-    private func workingRow(@ViewBuilder _ content: () -> some View) -> some View {
-        HStack(spacing: 8) {
-            ProgressView()
-                .controlSize(.small)
-            content()
-            Spacer()
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 6)
+    private func workingRow(@ViewBuilder _ content: @escaping () -> some View) -> some View {
+        WorkingStateRow(content: content)
     }
 
     private func needsActionCard(
         icon: String, title: String, detail: String?, footnote: String
     ) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Label(title, systemImage: icon)
-                .font(.callout.bold())
-            if let detail {
-                Text(detail)
-                    .font(.callout)
-                    .lineLimit(3)
-            }
-            Text(footnote)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(10)
-        .background(Color.blue.opacity(0.1))
-        .overlay(
-            RoundedRectangle(cornerRadius: 10)
-                .strokeBorder(Color.blue.opacity(0.35), lineWidth: 0.5))
-        .clipShape(RoundedRectangle(cornerRadius: 10))
-        .padding(.horizontal, 12)
-        .padding(.vertical, 6)
+        NeedsActionStateCard(
+            icon: icon, title: title, detail: detail, footnote: footnote)
     }
 
     private func errorCard(message: String, dismissible: Bool = true) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Label("Agent error", systemImage: "exclamationmark.triangle.fill")
-                .font(.callout.bold())
-                .foregroundStyle(.red)
-            Text(message)
-                .font(.callout)
-                .lineLimit(4)
-            if dismissible {
-                HStack {
-                    Spacer()
-                    Button("Dismiss error") {
-                        session.perform(.dismissError)
-                    }
-                    .font(.callout.bold())
-                    .disabled(
-                        !model.connectivity.isOnline
-                            || !session.acceptsConversationActions
-                            || session.actionInFlight != nil)
-                }
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(10)
-        .background(Color.red.opacity(0.08))
-        .overlay(
-            RoundedRectangle(cornerRadius: 10)
-                .strokeBorder(Color.red.opacity(0.35), lineWidth: 0.5))
-        .clipShape(RoundedRectangle(cornerRadius: 10))
-        .padding(.horizontal, 12)
-        .padding(.vertical, 6)
+        ErrorStateCard(
+            message: message,
+            dismissible: dismissible,
+            dismissDisabled: !isOnline
+                || !acceptsActions
+                || busy,
+            onDismiss: { onAction(.dismissError) })
     }
 
     private var emptyQuestionCard: some View {
@@ -228,9 +309,9 @@ struct StateDetailView: View {
                     confirmEmptyQuestionDismissal = true
                 }
                 .font(.callout.bold())
-                .disabled(!model.connectivity.isOnline || session.actionInFlight != nil)
+                .disabled(!isOnline || busy)
             }
-            if !model.connectivity.isOnline {
+            if !isOnline {
                 Text("Offline — dismissal needs a connection and is never queued.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
@@ -251,7 +332,7 @@ struct StateDetailView: View {
             titleVisibility: .visible
         ) {
             Button("Dismiss question", role: .destructive) {
-                session.perform(.dismissQuestion)
+                onAction(.dismissQuestion)
             }
         }
     }
@@ -265,15 +346,43 @@ struct TaskApprovalCard: View {
     let priority: String
     let plan: String
 
+    var body: some View {
+        TaskApprovalCardBody(
+            title: title,
+            priority: priority,
+            plan: plan,
+            isOnline: model.connectivity.isOnline,
+            acceptsActions: session.acceptsConversationActions,
+            busy: session.actionInFlight != nil,
+            onReject: { session.perform(.rejectTask) },
+            onFeedback: { session.perform(.provideTaskFeedback($0)) },
+            onApproveHere: {
+                session.perform(.approveTask(handoff: .continueInCurrentConversation))
+            },
+            onApproveFresh: {
+                session.perform(.approveTask(handoff: .startFreshWorkConversation))
+            })
+    }
+}
+
+struct TaskApprovalCardBody: View {
+    let title: String
+    let priority: String
+    let plan: String
+    let isOnline: Bool
+    let acceptsActions: Bool
+    let busy: Bool
+    let onReject: () -> Void
+    let onFeedback: (TaskFeedback) -> Void
+    let onApproveHere: () -> Void
+    let onApproveFresh: () -> Void
+
     @State private var planExpanded = false
     @State private var showFeedbackField = false
     @State private var feedbackText = ""
     @State private var confirmReject = false
 
-    private var busy: Bool { session.actionInFlight != nil }
-    private var actionable: Bool {
-        model.connectivity.isOnline && session.acceptsConversationActions && !busy
-    }
+    private var actionable: Bool { isOnline && acceptsActions && !busy }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -332,7 +441,7 @@ struct TaskApprovalCard: View {
                 Button(showFeedbackField ? "Send changes" : "Request changes") {
                     if showFeedbackField {
                         guard let feedback = TaskFeedback(feedbackText) else { return }
-                        session.perform(.provideTaskFeedback(feedback))
+                        onFeedback(feedback)
                     } else {
                         withAnimation(.easeInOut(duration: 0.15)) {
                             showFeedbackField = true
@@ -346,14 +455,8 @@ struct TaskApprovalCard: View {
                 Spacer()
 
                 Menu {
-                    Button("Start here") {
-                        session.perform(.approveTask(
-                            handoff: .continueInCurrentConversation))
-                    }
-                    Button("New chat") {
-                        session.perform(.approveTask(
-                            handoff: .startFreshWorkConversation))
-                    }
+                    Button("Start here", action: onApproveHere)
+                    Button("New chat", action: onApproveFresh)
                 } label: {
                     Label("Approve…", systemImage: "checkmark")
                 }
@@ -362,7 +465,7 @@ struct TaskApprovalCard: View {
             }
             .font(.callout)
 
-            if !model.connectivity.isOnline {
+            if !isOnline {
                 Text("Offline — approval needs a connection and is never queued.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
@@ -377,13 +480,12 @@ struct TaskApprovalCard: View {
         .clipShape(RoundedRectangle(cornerRadius: 10))
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
+        .accessibilityIdentifier("state.taskApprovalCard")
         .confirmationDialog(
             "Reject this task plan?",
             isPresented: $confirmReject, titleVisibility: .visible
         ) {
-            Button("Reject plan", role: .destructive) {
-                session.perform(.rejectTask)
-            }
+            Button("Reject plan", role: .destructive, action: onReject)
         }
     }
 }

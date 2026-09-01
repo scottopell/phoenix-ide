@@ -166,7 +166,7 @@ struct AgentMessageView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("message.agent")
     }
 
@@ -257,6 +257,7 @@ struct GenericToolUseCard: View {
             RoundedRectangle(cornerRadius: 8)
                 .strokeBorder(Color(.separator), lineWidth: 0.5))
         .clipShape(RoundedRectangle(cornerRadius: 8))
+        .accessibilityIdentifier("tool.genericUse")
     }
 
     private var summary: String {
@@ -322,6 +323,7 @@ struct GenericToolResultCard: View {
         .padding(8)
         .background(isError ? Color.red.opacity(0.08) : Color(.tertiarySystemBackground))
         .clipShape(RoundedRectangle(cornerRadius: 8))
+        .accessibilityIdentifier("tool.genericResult")
     }
 
     private var isError: Bool {

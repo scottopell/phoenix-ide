@@ -63,8 +63,12 @@ final class PhoenixMobileUIQATests: XCTestCase {
 
         XCTAssertTrue(message(identifier: "message.user", containing: seedMessage)
             .waitForExistence(timeout: 20))
-        XCTAssertTrue(message(identifier: "message.agent", containing: "I've analyzed")
-            .waitForExistence(timeout: 30))
+        let agentMessage = element("message.agent")
+        XCTAssertTrue(agentMessage.waitForExistence(timeout: 30))
+        XCTAssertTrue(
+            agentMessage.staticTexts.containing(
+                NSPredicate(format: "label CONTAINS %@", "I've analyzed"))
+                .firstMatch.waitForExistence(timeout: 10))
 
         let composer = element("conversation.composer")
         focusMultilineField(composer)

@@ -106,6 +106,7 @@ struct ThinkCard: View {
             }
         }
         .padding(.vertical, 2)
+        .accessibilityIdentifier("tool.think")
         .contentShape(Rectangle())
         .onTapGesture {
             withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
@@ -147,6 +148,7 @@ struct BashUseCard: View {
             RoundedRectangle(cornerRadius: 8)
                 .strokeBorder(Color(.separator), lineWidth: 0.5))
         .clipShape(RoundedRectangle(cornerRadius: 8))
+        .accessibilityIdentifier("tool.bash")
         .contentShape(Rectangle())
         .onTapGesture {
             withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
@@ -340,6 +342,7 @@ struct BashResultCard: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(failed ? Color.red.opacity(0.08) : Color(.tertiarySystemBackground))
         .clipShape(RoundedRectangle(cornerRadius: 8))
+        .accessibilityIdentifier("tool.bashResult")
     }
 
     private var failed: Bool { result.isFailure || isError }
