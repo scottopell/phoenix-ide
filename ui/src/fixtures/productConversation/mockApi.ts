@@ -86,20 +86,21 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
         const fixtureConversation = latestSegmentConversation(scenario);
         queueMicrotask(() => {
           this.dispatchEvent(new Event('open'));
+          const eventSequence = fixtureConversation.messages.at(-1)?.sequence_id ?? 0;
           this.dispatchEvent(new MessageEvent('init', { data: JSON.stringify({
-            sequence_id: 0,
+            sequence_id: eventSequence,
             conversation: fixtureConversation.conversation,
             transcript_generation: 1,
             transcript_coverage: 'complete',
             messages: fixtureConversation.messages,
             steering_messages: [],
             agent_working: false,
-            last_sequence_id: fixtureConversation.messages.at(-1)?.sequence_id ?? 0,
+            last_sequence_id: eventSequence,
             stream_incarnation: `fixture-${transcriptId}`,
             presentation_mode: fixtureConversation.presentation_mode,
             context_window_size: fixtureConversation.context_window_size,
             project_name: null,
-            pending_anchor_sequence_id: 0,
+            pending_anchor_sequence_id: eventSequence,
             pending_events: [],
             pending_truncated: false,
           }) }));
