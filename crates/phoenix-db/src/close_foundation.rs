@@ -66,6 +66,13 @@ pub enum ProductConversationAdmission {
     History(ProductConversationId),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MessageTargetAdmission {
+    Aggregate(ProductConversationAdmission),
+    StandaloneAvailable,
+    StandaloneArchived,
+}
+
 impl ProductConversationAdmission {
     #[must_use]
     pub fn is_accepted(&self) -> bool {
@@ -1038,6 +1045,35 @@ impl Database {
     ) -> DbResult<ProductConversationAdmission> {
         let mut tx = self.pool.begin().await?;
         let admission = admit_product_conversation_operation_tx(&mut tx, conversation_id).await?;
+        tx.commit().await?;
+        Ok(admission)
+    }
+
+    pub async fn message_target_admission(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<MessageTargetAdmission> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT conversation.archived, product.kind
+             FROM conversations conversation
+             JOIN product_conversations product
+               ON product.id = conversation.product_conversation_id
+             WHERE conversation.id = ?1",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| DbError::ConversationNotFound(conversation_id.to_string()))?;
+        let admission = if row.try_get::<String, _>("kind")? == "ordinary" {
+            MessageTargetAdmission::Aggregate(
+                admit_product_conversation_operation_tx(&mut tx, conversation_id).await?,
+            )
+        } else if row.try_get::<bool, _>("archived")? {
+            MessageTargetAdmission::StandaloneArchived
+        } else {
+            MessageTargetAdmission::StandaloneAvailable
+        };
         tx.commit().await?;
         Ok(admission)
     }
@@ -4962,6 +4998,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_close_outcome_controls_new_participant_admission() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "completed-history").await;
+        create_root(&db, "completed-cancelled").await;
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history'
+             WHERE id = 'completed-history'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let history_parent = db.get_conversation("completed-history").await.unwrap();
+        let history_error = db
+            .create_subagent_conversation(
+                "history-child",
+                "history-child",
+                "/tmp",
+                "completed-history",
+                "test-model",
+                &crate::ConvMode::Direct,
+                phoenix_core::llm_language::LlmLanguage::default(),
+                history_parent.attached_work_scope_id.as_ref(),
+            )
+            .await
+            .expect_err("History aggregate must reject late participants");
+        assert!(
+            history_error
+                .to_string()
+                .contains("non-writable ProductConversation"),
+            "unexpected error: {history_error:?}"
+        );
+        let cancelled_parent = db.get_conversation("completed-cancelled").await.unwrap();
+        db.create_subagent_conversation(
+            "cancelled-child",
+            "cancelled-child",
+            "/tmp",
+            "completed-cancelled",
+            "test-model",
+            &crate::ConvMode::Direct,
+            phoenix_core::llm_language::LlmLanguage::default(),
+            cancelled_parent.attached_work_scope_id.as_ref(),
+        )
+        .await
+        .expect("completed-cancelled Open aggregate remains writable");
+    }
+
+    #[tokio::test]
     async fn active_participant_cannot_delete_but_completed_close_cascades_cleanup() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "delete-sealed").await;
@@ -5186,7 +5269,7 @@ mod tests {
             .unwrap_err();
         assert!(error
             .to_string()
-            .contains("active Close rejects new aggregate participants"));
+            .contains("non-writable ProductConversation rejects new aggregate participants"));
         assert!(matches!(
             db.get_conversation("late-subordinate").await,
             Err(DbError::ConversationNotFound(_))
@@ -5872,6 +5955,48 @@ mod tests {
         assert_eq!(
             obligation.close_outcome(),
             Some(CloseCompletionOutcome::Cancelled)
+        );
+    }
+
+    #[tokio::test]
+    async fn message_admission_uses_typed_aggregate_or_standalone_authority() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "open-archived-drift").await;
+        create_root(&db, "history-target").await;
+        sqlx::query("UPDATE conversations SET archived = 1 WHERE id = 'open-archived-drift'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history'
+             WHERE id = 'history-target'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let coordinator = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE conversations SET archived = 1 WHERE id = ?1")
+            .bind(&coordinator.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            db.message_target_admission("open-archived-drift")
+                .await
+                .unwrap(),
+            MessageTargetAdmission::Aggregate(ProductConversationAdmission::Accepted { .. })
+        ));
+        assert!(matches!(
+            db.message_target_admission("history-target").await.unwrap(),
+            MessageTargetAdmission::Aggregate(ProductConversationAdmission::History(_))
+        ));
+        assert_eq!(
+            db.message_target_admission(&coordinator.id).await.unwrap(),
+            MessageTargetAdmission::StandaloneArchived
         );
     }
 

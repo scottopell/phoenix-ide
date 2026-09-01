@@ -8159,13 +8159,21 @@ END;
 CREATE TRIGGER conversations_reject_participant_insert_during_close
 BEFORE INSERT ON conversations
 WHEN NEW.product_conversation_id IS NOT NULL
- AND EXISTS (
-    SELECT 1 FROM close_obligations obligation
-    WHERE obligation.product_conversation_id = NEW.product_conversation_id
-      AND obligation.phase <> 'completed'
+ AND (
+    EXISTS (
+      SELECT 1 FROM close_obligations obligation
+      WHERE obligation.product_conversation_id = NEW.product_conversation_id
+        AND obligation.phase <> 'completed'
+    )
+    OR EXISTS (
+      SELECT 1 FROM product_conversations product
+      WHERE product.id = NEW.product_conversation_id
+        AND product.kind = 'ordinary'
+        AND product.ordinary_lifecycle = 'history'
+    )
  )
 BEGIN
-    SELECT RAISE(ABORT, 'active Close rejects new aggregate participants');
+    SELECT RAISE(ABORT, 'non-writable ProductConversation rejects new aggregate participants');
 END;
 
 UPDATE product_conversations

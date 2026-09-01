@@ -24972,7 +24972,7 @@ mod tests {
             .unwrap_err();
         assert!(error
             .to_string()
-            .contains("active Close rejects new aggregate participants"));
+            .contains("non-writable ProductConversation rejects new aggregate participants"));
         assert_eq!(
             db.retire_work_scope_for_close_attempt(
                 &attempt,
