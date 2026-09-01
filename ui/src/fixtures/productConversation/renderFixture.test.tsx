@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import { api, streamApi } from '../../api';
 import { cacheDB } from '../../cache';
-import { COORDINATOR_FIXTURE_SURFACE } from '../coordinator';
+import { COORDINATOR_FIXTURE_SURFACE, CoordinatorFixture, getCoordinatorScenario } from '../coordinator';
 import { ProductConversationFixture } from './renderFixture';
 import {
   FIXTURE_HANDOFF_SUMMARY,
@@ -53,6 +53,7 @@ describe('ProductConversationFixture', () => {
     expect(screen.getAllByText('Product Alpha').length).toBeGreaterThan(0);
     expect(screen.getByText('Presentation')).toBeInTheDocument();
     expect(container.querySelector('[data-testid="product-conversation-composer"]')).not.toBeNull();
+    expect(scenario.snapshot?.writable_transcript_row_id).toBe('row-work');
     expect(screen.getByText('What user-visible surfaces must remain stable?')).toBeInTheDocument();
     expect(screen.getByText(/The route, title, lineage metadata/)).toBeInTheDocument();
     expect(handoffSummaries(scenario)).toEqual([FIXTURE_HANDOFF_SUMMARY]);
@@ -77,12 +78,15 @@ describe('ProductConversationFixture', () => {
       });
       expect(scenario.snapshot?.ordinary_lifecycle).toBe('history');
       expect(scenario.snapshot?.writable_transcript_row_id).toBeNull();
+      if (id === 'mobile-history-read-only') {
+        expect(scenario.snapshot?.chain_qa_compatibility?.root_transcript_row_id).toBe(scenario.snapshot?.canonical_root.transcript_row_id);
+      }
       expect(handoffSummaries(scenario)).toEqual([FIXTURE_HANDOFF_SUMMARY]);
       expect(view.container.querySelectorAll('a[href*="product-handoff"]').length).toBe(1);
     },
   );
 
-  it('keeps exactly one handoff marker through rerender and long scrolling', async () => {
+  it('keeps exactly one handoff marker through rerender of a long transcript', async () => {
     const scenario = getProductConversationScenario('long-history-110-messages');
     const view = render(<ProductConversationFixture scenario={scenario} />);
 
@@ -162,6 +166,14 @@ describe('ProductConversationFixture', () => {
     expect(streamApi.subscribeToChainStream).not.toBe(originalSubscribe);
 
     unmount();
+
+    const coordinator = render(<CoordinatorFixture scenario={getCoordinatorScenario('conversation-idle')} />);
+    await waitFor(() => {
+      expect(document.documentElement.dataset['coordinatorFixtureReady']).toBe('conversation-idle');
+    });
+    expect(coordinator.container.querySelector('.coordinator-page')).not.toBeNull();
+    expect(coordinator.container.querySelector('[data-product-conversation-surface="product-conversation"]')).toBeNull();
+    coordinator.unmount();
 
     expect(api.getProductConversationSnapshot).toBe(originalGetSnapshot);
     expect(api.getChain).toBe(originalGetChain);

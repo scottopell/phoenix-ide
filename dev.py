@@ -3446,6 +3446,12 @@ def cmd_qa_product_conversation() -> None:
 
 def cmd_qa_product_conversation_journeys() -> None:
     """Run black-box ProductConversation journeys in an isolated Phoenix instance."""
+    subprocess.run(["pnpm", "run", "build"], cwd=ROOT / "ui", check=True, env=node_env())
+    subprocess.run(
+        ["uv", "run", "--with", "playwright>=1.49,<2", "python", "-m", "playwright", "install", "chromium"],
+        cwd=ROOT,
+        check=True,
+    )
     subprocess.run(
         ["uv", "run", "tests/e2e/product_conversation_journeys.py"],
         cwd=ROOT,
