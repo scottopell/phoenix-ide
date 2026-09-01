@@ -2,24 +2,30 @@ import SwiftUI
 
 struct ProductConversationDetailView: View {
     @Environment(AppModel.self) private var model
+    let aggregateId: String
+    let initialTranscriptRowId: String?
     @State private var detailModel: ProductConversationDetailModel
     @State private var draft = ""
 
-    init(aggregateId: String, model: AppModel) {
-        _detailModel = State(initialValue: model.productConversationDetailModel(for: aggregateId))
+    init(aggregateId: String, initialTranscriptRowId: String? = nil, model: AppModel) {
+        self.aggregateId = aggregateId
+        self.initialTranscriptRowId = initialTranscriptRowId
+        _detailModel = State(initialValue: model.productConversationDetailModel(
+            for: aggregateId,
+            initialTranscriptRowId: initialTranscriptRowId))
     }
 
     var body: some View {
         VStack(spacing: 0) {
             OfflineBanner()
-            if let error = detailModel.loadError, detailModel.snapshot == nil {
+            if let error = detailModel.loadError, detailModel.snapshot == nil, detailModel.fallbackSession == nil {
                 ContentUnavailableView {
                     Label("Unable to load conversation", systemImage: "exclamationmark.triangle")
                 } description: {
                     Text(error)
                 }
                 .frame(maxHeight: .infinity)
-            } else if detailModel.loading && detailModel.snapshot == nil {
+            } else if detailModel.loading && detailModel.snapshot == nil && detailModel.fallbackSession == nil {
                 ProgressView("Loading…")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
@@ -59,7 +65,16 @@ struct ProductConversationDetailView: View {
         }
         .navigationTitle(detailModel.displayTitle)
         .navigationBarTitleDisplayMode(.inline)
-        .task { await detailModel.start() }
+        .task(id: model.configurationIdentity) {
+            let current = detailModel
+            detailModel = model.productConversationDetailModel(
+                for: aggregateId,
+                initialTranscriptRowId: initialTranscriptRowId)
+            if current !== detailModel {
+                current.stop()
+            }
+            await detailModel.start()
+        }
         .onDisappear { detailModel.stop() }
     }
 

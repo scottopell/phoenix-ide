@@ -46,9 +46,26 @@ B2 implementation ownership after B1's seam lands:
 - focused new session/composition tests under `ios/PhoenixMobile/Tests/`
 - narrowly relevant fixture/UI journey files under `ios/PhoenixMobile/UITests/` and fixture support already authorized by 04005
 
-B2 may read and consume B1-owned files to integrate the shipped seam, but must not treat them as editable owners. After B1 reports the seam, any touch to a B1-owned file must be import-only, specifically demonstrated, and coordinated.
+B2 may read and consume B1-owned files to integrate the shipped seam. After B1 merged/retired, narrowly coordinated post-B1 edits are allowed only when specifically authorized for this task and kept within the approved constraints below.
 
 `ios/PhoenixMobile/Tests/SSEParserTests.swift` is B2-owned only if the existing transcript-row SSE parser needs regression coverage for delegation/composition behavior. It is not a place to introduce aggregate SSE or alter wire parsing semantics.
+
+## Coordinator-approved post-B1 integration handoff
+
+B1 is merged/retired and no concurrent owner remains. For this task, B2 may make the following narrow post-B1 integration edits:
+
+- `ios/PhoenixMobile/Sources/API/PhoenixAPI.swift` only for configuration identity used to fence transport handles.
+- `ios/PhoenixMobile/Sources/AppModel.swift` only for ProductConversation detail/session composition, instance-owned Coordinator/cache/outbox dependencies, startup drain, and reconfiguration invalidation.
+- `ios/PhoenixMobile/Sources/Store/ConversationListStore.swift` only to inject the existing cache-availability capability without changing aggregate identity/mapping semantics.
+- `ios/PhoenixMobile/Sources/Views/ConversationListView.swift` only to enter the merged aggregate detail route while preserving B1 resolver authority.
+- Matching seam tests covering these edits are in scope.
+
+Still prohibited within this handoff:
+
+- changing ProductConversation DTO or wire shapes;
+- changing list identity semantics or aggregate identity/mapping semantics;
+- introducing alternate caches or resolvers;
+- changing B1 API endpoint contracts.
 
 ## Acceptance
 
@@ -57,7 +74,7 @@ B2 may read and consume B1-owned files to integrate the shipped seam, but must n
 - Rebind is deterministic when aggregate latest or writable member changes.
 - History mode stays readable and disables chat plus Open-only state-transition actions.
 - No aggregate SSE store, no aggregate outbox, no duplicated durable message cache.
-- B2 consumes only B1's shared ProductConversation seam; B1-owned list/cache/API-model/navigation files remain read/consume-only unless a specific import-only edit is demonstrated and coordinated after the seam lands.
+- B2 consumes only B1's shared ProductConversation seam. Formerly B1-owned list/cache/API-model/navigation files may be touched only within the Coordinator-approved post-B1 integration handoff below; no ProductConversation DTO/wire-shape changes, list identity-semantic changes, alternate caches/resolvers, or B1 API endpoint-contract changes are allowed.
 - Focused simulator/mock-server validation and applicable iOS checks pass.
 - Adversarial review, independent review, separate PR exact-head CI/review, and zero unresolved threads are completed before merge request handoff.
 
