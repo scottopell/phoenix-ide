@@ -203,13 +203,9 @@ struct FixtureConversationScreen: View {
                         style: .warning)
                         .accessibilityIdentifier("fixture.offlineBanner")
                 }
-                if let connectionNote = screen.connectionNote {
-                    Text(connectionNote)
-                        .font(.caption2)
-                        .foregroundStyle(.orange)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 3)
-                        .background(.thinMaterial)
+                if screen.connectionNote != nil {
+                    ConnectionStateBody(
+                        connection: scenario.id == .loading ? .connecting : .waitingToRetry)
                         .accessibilityIdentifier("fixture.connectionNote")
                 }
                 if let cacheNote = screen.cacheNote {

@@ -148,13 +148,21 @@ struct ConnectionStateBar: View {
     let session: ConversationSession
 
     var body: some View {
-        switch session.connection {
+        ConnectionStateBody(connection: session.connection)
+    }
+}
+
+struct ConnectionStateBody: View {
+    let connection: ConversationSession.ConnectionState
+
+    var body: some View {
+        switch connection {
         case .live, .idle:
             EmptyView()
         case .connecting:
             bar { Text("Connecting…") }
         case .offline:
-            EmptyView()  // OfflineBanner and the conversation cache note cover this.
+            EmptyView()
         case .waitingToRetry:
             bar { Text("Connection lost — reconnecting…") }
         }
