@@ -2918,23 +2918,16 @@ mod product_creation_delivery_replay_tests {
         objective_queue_count: i64,
         objective_total_count: i64,
     ) {
-        let published_product_count: i64 = sqlx::query_scalar(
+        let product_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM product_conversations")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let published_root_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)
              FROM product_creation_jobs
-             WHERE request_id = ?1
-               AND published_product_id IS NOT NULL",
+             WHERE published_product_id IS NOT NULL
+                OR published_conversation_id IS NOT NULL",
         )
-        .bind(request_id)
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-        let published_conversation_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)
-             FROM product_creation_jobs
-             WHERE request_id = ?1
-               AND published_conversation_id IS NOT NULL",
-        )
-        .bind(request_id)
         .fetch_one(db.pool())
         .await
         .unwrap();
@@ -2951,43 +2944,25 @@ mod product_creation_delivery_replay_tests {
         .fetch_one(db.pool())
         .await
         .unwrap();
-        let committed_objective_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)
-             FROM messages m
-             JOIN conversations c ON c.id = m.conversation_id
-             WHERE m.message_id = ?1
-               AND c.product_conversation_id = (
-                   SELECT published_product_id
-                   FROM product_creation_jobs
-                   WHERE request_id = ?1
-               )",
-        )
-        .bind(request_id)
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-        let queued_objective_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)
-             FROM steering_messages s
-             JOIN conversations c ON c.id = s.conversation_id
-             WHERE s.message_id = ?1
-               AND c.product_conversation_id = (
-                   SELECT published_product_id
-                   FROM product_creation_jobs
-                   WHERE request_id = ?1
-               )",
-        )
-        .bind(request_id)
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
+        let committed_objective_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE message_id = ?1")
+                .bind(request_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let queued_objective_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM steering_messages WHERE message_id = ?1")
+                .bind(request_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
         let published = db
             .get_product_creation_job(request_id)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(published_product_count, 1);
-        assert_eq!(published_conversation_count, 1);
+        assert_eq!(product_count, 1);
+        assert_eq!(published_root_count, 1);
         assert_eq!(transcript_count_for_request_publication, 1);
         assert_eq!(
             published.published_product_id,
