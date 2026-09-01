@@ -132,3 +132,15 @@ AND SHALL keep any retained SQLite result-code detail bounded and diagnostic rat
 WHEN SQLite workload attribution is implemented
 THE SYSTEM SHALL include verification covering the fixed ring size, closed vocabularies, fixed histogram bins, half-open minute-boundary duration splitting, fixed 1h/6h/24h windows, restart truncation, percentile unavailable semantics, shared-collector cloning through `Database`, and the read-only report surface contract
 AND comprehensive verification of workload category assignment, retry attribution, and concurrency attribution across every SQLite call site MAY be partial until all production observation sites are instrumented against the shared collector
+
+---
+
+### REQ-SWA-014: Closed logical read-family attribution contract
+
+WHEN the collector records logical read-family attribution
+THE SYSTEM SHALL classify each logical read observation with the closed read-family vocabulary `active_list`, `archived_list`, `conversation_get`, `full_history`, `latest_bounded_history`, and `recovery_range_history`
+AND SHALL retain separate fixed per-minute aggregates for each read family consisting only of outcome counts, summed logical elapsed time, and logical elapsed histogram samples
+AND SHALL record each logical read-family observation in the one-minute bucket containing its completion time
+AND SHALL expose success, failure, and abandonment through a `#[must_use]` RAII guard returned by `start_read_family` whose success and failure methods consume the guard and whose drop path records abandonment exactly once
+AND SHALL derive the guard's completion timestamp and logical elapsed duration from the shared collector clock so deterministic tests and production recording observe the same completion semantics
+AND SHALL keep read-family attribution bounded by the fixed minute ring without storing per-operation history or expanding the vocabulary at runtime

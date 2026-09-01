@@ -16130,14 +16130,25 @@ mod wake_handler_tests {
         assert_eq!(payload["window"], "one_hour");
         assert!(payload["writer_categories"].is_array());
         assert!(payload["reads"].is_array());
+        assert!(payload["read_families"].is_array());
         let writer_categories = payload["writer_categories"]
             .as_array()
             .expect("writer categories array");
         let read_categories = payload["reads"].as_array().expect("read categories array");
+        let read_families = payload["read_families"]
+            .as_array()
+            .expect("read families array");
         assert!(!writer_categories.is_empty());
         assert!(!read_categories.is_empty());
+        assert_eq!(read_families.len(), 6);
         assert_eq!(writer_categories[0]["category"], "message_persistence");
         assert_eq!(read_categories[0]["category"], "message_persistence");
+        assert_eq!(read_families[0]["family"], "active_list");
+        assert_eq!(read_families[0]["success_count"], 0);
+        assert_eq!(read_families[0]["failure_count"], 0);
+        assert_eq!(read_families[0]["abandoned_count"], 0);
+        assert!(read_families[0].get("attempt_count").is_none());
+        assert_eq!(read_families[0]["logical_elapsed"]["sample_count"], 0);
     }
 
     #[tokio::test]

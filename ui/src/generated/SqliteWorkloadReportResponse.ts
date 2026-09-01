@@ -2,8 +2,9 @@
 import type { SqliteBaselineCategoryReport } from "./SqliteBaselineCategoryReport";
 import type { SqliteClassificationSummary } from "./SqliteClassificationSummary";
 import type { SqliteReadCategoryReport } from "./SqliteReadCategoryReport";
+import type { SqliteReadFamilyReport } from "./SqliteReadFamilyReport";
 import type { SqliteReportWindow } from "./SqliteReportWindow";
 import type { SqliteWorkloadCoverage } from "./SqliteWorkloadCoverage";
 import type { SqliteWriterCategoryReport } from "./SqliteWriterCategoryReport";
 
-export type SqliteWorkloadReportResponse = { sampled_at: string, window: SqliteReportWindow, bucket_count: number, restart_truncated: boolean, process_started_at: string, process_uptime_seconds: number, covered_uptime_seconds: number, covered_uptime_micros: number, coverage: SqliteWorkloadCoverage, classification: SqliteClassificationSummary, baseline_categories: Array<SqliteBaselineCategoryReport>, writer_categories: Array<SqliteWriterCategoryReport>, reads: Array<SqliteReadCategoryReport>, };
+export type SqliteWorkloadReportResponse = { sampled_at: string, window: SqliteReportWindow, bucket_count: number, restart_truncated: boolean, process_started_at: string, process_uptime_seconds: number, covered_uptime_seconds: number, covered_uptime_micros: number, coverage: SqliteWorkloadCoverage, classification: SqliteClassificationSummary, baseline_categories: Array<SqliteBaselineCategoryReport>, writer_categories: Array<SqliteWriterCategoryReport>, reads: Array<SqliteReadCategoryReport>, read_families: Array<SqliteReadFamilyReport>, };

@@ -54,6 +54,130 @@ impl SqliteAccessKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+pub enum SqliteReadFamily {
+    ActiveList,
+    ArchivedList,
+    ConversationGet,
+    FullHistory,
+    LatestBoundedHistory,
+    RecoveryRangeHistory,
+}
+
+impl SqliteReadFamily {
+    pub const ALL: [Self; 6] = [
+        Self::ActiveList,
+        Self::ArchivedList,
+        Self::ConversationGet,
+        Self::FullHistory,
+        Self::LatestBoundedHistory,
+        Self::RecoveryRangeHistory,
+    ];
+
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SqliteReadFamilyOutcome {
+    Success,
+    Failure,
+    Abandoned,
+}
+
+impl SqliteReadFamilyOutcome {
+    pub const ALL: [Self; 3] = [Self::Success, Self::Failure, Self::Abandoned];
+
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SqliteReadFamilyObservation {
+    family: SqliteReadFamily,
+    outcome: SqliteReadFamilyOutcome,
+    logical_elapsed: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BucketReadFamilyTotals {
+    pub logical_elapsed_micros: u64,
+}
+
+struct ReadFamilyAggregates {
+    totals: Box<[BucketReadFamilyTotals; SqliteReadFamily::ALL.len()]>,
+    outcomes: Box<[[u64; SqliteReadFamilyOutcome::ALL.len()]; SqliteReadFamily::ALL.len()]>,
+    logical_elapsed_histogram:
+        Box<[[u64; SqliteLatencyBin::ALL.len()]; SqliteReadFamily::ALL.len()]>,
+}
+
+#[derive(Debug)]
+#[must_use = "the guard records abandonment unless completed after the read attempt"]
+pub struct SqliteReadFamilyGuard {
+    collector: SqliteWorkloadCollector,
+    family: SqliteReadFamily,
+    started_at_instant: Instant,
+    completed: bool,
+}
+
+impl SqliteReadFamilyGuard {
+    pub fn success(mut self) {
+        self.finish(SqliteReadFamilyOutcome::Success);
+    }
+
+    pub fn failure(mut self) {
+        self.finish(SqliteReadFamilyOutcome::Failure);
+    }
+
+    /// Returns the supplied result after recording its success or failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns the supplied error unchanged after recording a failed attempt.
+    pub fn complete<T, E>(mut self, result: Result<T, E>) -> Result<T, E> {
+        let outcome = if result.is_ok() {
+            SqliteReadFamilyOutcome::Success
+        } else {
+            SqliteReadFamilyOutcome::Failure
+        };
+        self.finish(outcome);
+        result
+    }
+
+    fn finish(&mut self, outcome: SqliteReadFamilyOutcome) {
+        if self.completed {
+            return;
+        }
+        let completed_at_unix_micros = self.collector.clock.unix_now_micros();
+        let logical_elapsed = self
+            .collector
+            .clock
+            .instant_now()
+            .saturating_duration_since(self.started_at_instant);
+        self.collector.record_read_family(
+            SqliteReadFamilyObservation {
+                family: self.family,
+                outcome,
+                logical_elapsed,
+            },
+            completed_at_unix_micros,
+        );
+        self.completed = true;
+    }
+}
+
+impl Drop for SqliteReadFamilyGuard {
+    fn drop(&mut self) {
+        self.finish(SqliteReadFamilyOutcome::Abandoned);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum SqliteOutcome {
     Success,
     Busy,
@@ -304,6 +428,11 @@ pub struct SqliteBucketSnapshot {
         [[[u64; SqliteLatencyBin::ALL.len()]; SqliteWorkloadCategory::ALL.len()];
             SqliteAccessKind::ALL.len()],
     >,
+    pub read_family_totals: Box<[BucketReadFamilyTotals; SqliteReadFamily::ALL.len()]>,
+    pub read_family_outcomes:
+        Box<[[u64; SqliteReadFamilyOutcome::ALL.len()]; SqliteReadFamily::ALL.len()]>,
+    pub read_family_logical_elapsed_histogram:
+        Box<[[u64; SqliteLatencyBin::ALL.len()]; SqliteReadFamily::ALL.len()]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -350,6 +479,11 @@ pub struct SqliteWorkloadAggregateReport {
         [[[u64; SqliteLatencyBin::ALL.len()]; SqliteWorkloadCategory::ALL.len()];
             SqliteAccessKind::ALL.len()],
     >,
+    pub read_family_totals: Box<[BucketReadFamilyTotals; SqliteReadFamily::ALL.len()]>,
+    pub read_family_outcomes:
+        Box<[[u64; SqliteReadFamilyOutcome::ALL.len()]; SqliteReadFamily::ALL.len()]>,
+    pub read_family_logical_elapsed_histogram:
+        Box<[[u64; SqliteLatencyBin::ALL.len()]; SqliteReadFamily::ALL.len()]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -414,7 +548,6 @@ struct SqliteBucket {
         [[[u64; SqliteLatencyBin::ALL.len()]; SqliteWorkloadCategory::ALL.len()];
             SqliteAccessKind::ALL.len()],
     >,
-
     pool_wait_histogram: Box<
         [[[u64; SqliteLatencyBin::ALL.len()]; SqliteWorkloadCategory::ALL.len()];
             SqliteAccessKind::ALL.len()],
@@ -423,6 +556,11 @@ struct SqliteBucket {
         [[[u64; SqliteLatencyBin::ALL.len()]; SqliteWorkloadCategory::ALL.len()];
             SqliteAccessKind::ALL.len()],
     >,
+    read_family_totals: Box<[BucketReadFamilyTotals; SqliteReadFamily::ALL.len()]>,
+    read_family_outcomes:
+        Box<[[u64; SqliteReadFamilyOutcome::ALL.len()]; SqliteReadFamily::ALL.len()]>,
+    read_family_logical_elapsed_histogram:
+        Box<[[u64; SqliteLatencyBin::ALL.len()]; SqliteReadFamily::ALL.len()]>,
 }
 
 impl Default for SqliteBucket {
@@ -455,6 +593,15 @@ impl Default for SqliteBucket {
                 [[[0; SqliteLatencyBin::ALL.len()]; SqliteWorkloadCategory::ALL.len()];
                     SqliteAccessKind::ALL.len()],
             ),
+            read_family_totals: Box::new(
+                [BucketReadFamilyTotals::default(); SqliteReadFamily::ALL.len()],
+            ),
+            read_family_outcomes: Box::new(
+                [[0; SqliteReadFamilyOutcome::ALL.len()]; SqliteReadFamily::ALL.len()],
+            ),
+            read_family_logical_elapsed_histogram: Box::new(
+                [[0; SqliteLatencyBin::ALL.len()]; SqliteReadFamily::ALL.len()],
+            ),
         }
     }
 }
@@ -478,6 +625,11 @@ impl SqliteBucket {
             typed_attempt_latency_histogram: self.typed_attempt_latency_histogram.clone(),
             pool_wait_histogram: self.pool_wait_histogram.clone(),
             write_admission_wait_histogram: self.write_admission_wait_histogram.clone(),
+            read_family_totals: self.read_family_totals.clone(),
+            read_family_outcomes: self.read_family_outcomes.clone(),
+            read_family_logical_elapsed_histogram: self
+                .read_family_logical_elapsed_histogram
+                .clone(),
         }
     }
 }
@@ -634,6 +786,27 @@ impl SqliteWorkloadCollector {
                 waits: observation.waits,
             },
         });
+    }
+
+    pub fn start_read_family(&self, family: SqliteReadFamily) -> SqliteReadFamilyGuard {
+        SqliteReadFamilyGuard {
+            collector: self.clone(),
+            family,
+            started_at_instant: self.clock.instant_now(),
+            completed: false,
+        }
+    }
+
+    fn record_read_family(
+        &self,
+        observation: SqliteReadFamilyObservation,
+        completed_at_unix_micros: u64,
+    ) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.record_read_family(completed_at_unix_micros, observation);
     }
 
     pub(crate) fn begin_native_read(&self, category: SqliteWorkloadCategory) -> NativeReadToken {
@@ -870,6 +1043,34 @@ impl SqliteWorkloadCollector {
         Self::aggregate_snapshot(&self.snapshot_at(window, now_unix_micros, now_instant))
     }
 
+    fn aggregate_read_families(buckets: &[SqliteBucketSnapshot]) -> ReadFamilyAggregates {
+        let mut totals = Box::new([BucketReadFamilyTotals::default(); SqliteReadFamily::ALL.len()]);
+        let mut outcomes =
+            Box::new([[0; SqliteReadFamilyOutcome::ALL.len()]; SqliteReadFamily::ALL.len()]);
+        let mut elapsed_histogram =
+            Box::new([[0; SqliteLatencyBin::ALL.len()]; SqliteReadFamily::ALL.len()]);
+        for bucket in buckets {
+            for family in SqliteReadFamily::ALL {
+                let index = family.index();
+                totals[index].logical_elapsed_micros +=
+                    bucket.read_family_totals[index].logical_elapsed_micros;
+                for outcome in SqliteReadFamilyOutcome::ALL {
+                    outcomes[index][outcome.index()] +=
+                        bucket.read_family_outcomes[index][outcome.index()];
+                }
+                for bin in SqliteLatencyBin::ALL {
+                    elapsed_histogram[index][bin.index()] +=
+                        bucket.read_family_logical_elapsed_histogram[index][bin.index()];
+                }
+            }
+        }
+        ReadFamilyAggregates {
+            totals,
+            outcomes,
+            logical_elapsed_histogram: elapsed_histogram,
+        }
+    }
+
     fn aggregate_snapshot(snapshot: &SqliteWorkloadSnapshot) -> SqliteWorkloadAggregateReport {
         let mut totals = Box::new(
             [[BucketCategoryTotals::default(); SqliteWorkloadCategory::ALL.len()];
@@ -895,6 +1096,7 @@ impl SqliteWorkloadCollector {
             [[[0; SqliteLatencyBin::ALL.len()]; SqliteWorkloadCategory::ALL.len()];
                 SqliteAccessKind::ALL.len()],
         );
+        let read_family_aggregates = Self::aggregate_read_families(&snapshot.buckets);
         let mut classification_gap_count = 0u64;
         let mut writer_occupancy_gap_count = 0u64;
         for bucket in &snapshot.buckets {
@@ -950,11 +1152,30 @@ impl SqliteWorkloadCollector {
             typed_attempt_latency_histogram,
             pool_wait_histogram,
             write_admission_wait_histogram,
+            read_family_totals: read_family_aggregates.totals,
+            read_family_outcomes: read_family_aggregates.outcomes,
+            read_family_logical_elapsed_histogram: read_family_aggregates.logical_elapsed_histogram,
         }
     }
 }
 
 impl InnerCollector {
+    fn record_read_family(
+        &mut self,
+        completed_at_unix_micros: u64,
+        observation: SqliteReadFamilyObservation,
+    ) {
+        let bucket = self.bucket_mut(minute_start(completed_at_unix_micros));
+        let family = observation.family.index();
+        bucket.read_family_totals[family].logical_elapsed_micros = bucket.read_family_totals
+            [family]
+            .logical_elapsed_micros
+            .saturating_add(duration_to_micros(observation.logical_elapsed));
+        bucket.read_family_outcomes[family][observation.outcome.index()] += 1;
+        bucket.read_family_logical_elapsed_histogram[family]
+            [SqliteLatencyBin::from_duration(observation.logical_elapsed).index()] += 1;
+    }
+
     fn record(&mut self, observation: InnerObservation) {
         let completed_minute_start = minute_start(observation.completed_at_unix_micros);
         let bucket = self.bucket_mut(completed_minute_start);
@@ -1294,12 +1515,28 @@ mod tests {
         assert_eq!(BUCKET_COUNT, 1_441);
         assert_eq!(SqliteWorkloadCategory::ALL.len(), 7);
         assert_eq!(SqliteAccessKind::ALL.len(), 2);
+        assert_eq!(SqliteReadFamily::ALL.len(), 6);
         assert_eq!(SqliteOutcome::ALL.len(), 7);
         assert_eq!(SqliteLatencyBin::ALL.len(), 7);
         assert_eq!(SqliteSnapshotWindow::ALL.len(), 3);
         assert_eq!(SqliteSnapshotWindow::OneHour.minutes(), 60);
         assert_eq!(SqliteSnapshotWindow::SixHours.minutes(), 360);
         assert_eq!(SqliteSnapshotWindow::TwentyFourHours.minutes(), 1_440);
+    }
+
+    #[test]
+    fn read_family_vocabulary_is_closed_and_ordered() {
+        assert_eq!(
+            SqliteReadFamily::ALL,
+            [
+                SqliteReadFamily::ActiveList,
+                SqliteReadFamily::ArchivedList,
+                SqliteReadFamily::ConversationGet,
+                SqliteReadFamily::FullHistory,
+                SqliteReadFamily::LatestBoundedHistory,
+                SqliteReadFamily::RecoveryRangeHistory,
+            ]
+        );
     }
 
     #[test]
@@ -2157,6 +2394,159 @@ mod tests {
             report.totals[access][category].writer_held_micros,
             5_000_000
         );
+    }
+
+    #[test]
+    fn read_family_guard_records_success_failure_and_abandonment_once() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let now = Arc::new(AtomicU64::new(2 * M));
+        let elapsed = Arc::new(AtomicU64::new(0));
+        let instant = Instant::now();
+        let collector = SqliteWorkloadCollector::with_test_clock(
+            {
+                let now = Arc::clone(&now);
+                move || now.load(Ordering::SeqCst)
+            },
+            {
+                let elapsed = Arc::clone(&elapsed);
+                move || instant + Duration::from_micros(elapsed.load(Ordering::SeqCst))
+            },
+        );
+
+        let active_guard = collector.start_read_family(SqliteReadFamily::ActiveList);
+        elapsed.store(5_000, Ordering::SeqCst);
+        active_guard.success();
+
+        let archived_guard = collector.start_read_family(SqliteReadFamily::ArchivedList);
+        elapsed.store(22_000, Ordering::SeqCst);
+        archived_guard.failure();
+
+        let get_guard = collector.start_read_family(SqliteReadFamily::ConversationGet);
+        elapsed.store(51_000, Ordering::SeqCst);
+        drop(get_guard);
+
+        let report = collector.aggregate_fresh_collector_for_test();
+        let active = SqliteReadFamily::ActiveList.index();
+        let archived = SqliteReadFamily::ArchivedList.index();
+        let get = SqliteReadFamily::ConversationGet.index();
+        assert_eq!(
+            report.read_family_outcomes[active][SqliteReadFamilyOutcome::Success.index()],
+            1
+        );
+        assert_eq!(
+            report.read_family_outcomes[archived][SqliteReadFamilyOutcome::Failure.index()],
+            1
+        );
+        assert_eq!(
+            report.read_family_outcomes[get][SqliteReadFamilyOutcome::Abandoned.index()],
+            1
+        );
+        assert_eq!(
+            report.read_family_totals[active].logical_elapsed_micros,
+            5_000
+        );
+        assert_eq!(
+            report.read_family_totals[archived].logical_elapsed_micros,
+            17_000
+        );
+        assert_eq!(
+            report.read_family_totals[get].logical_elapsed_micros,
+            29_000
+        );
+        assert_eq!(
+            report.read_family_logical_elapsed_histogram[active][SqliteLatencyBin::Ms5To19.index()],
+            1
+        );
+        assert_eq!(
+            report.read_family_logical_elapsed_histogram[archived]
+                [SqliteLatencyBin::Ms5To19.index()],
+            1
+        );
+        assert_eq!(
+            report.read_family_logical_elapsed_histogram[get][SqliteLatencyBin::Ms20To99.index()],
+            1
+        );
+    }
+
+    #[test]
+    fn read_family_guard_rolls_up_by_completion_minute_and_window() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let now = Arc::new(AtomicU64::new(M - 1));
+        let elapsed = Arc::new(AtomicU64::new(0));
+        let instant = Instant::now();
+        let collector = SqliteWorkloadCollector::with_test_clock(
+            {
+                let now = Arc::clone(&now);
+                move || now.load(Ordering::SeqCst)
+            },
+            {
+                let elapsed = Arc::clone(&elapsed);
+                move || instant + Duration::from_micros(elapsed.load(Ordering::SeqCst))
+            },
+        );
+
+        let guard = collector.start_read_family(SqliteReadFamily::LatestBoundedHistory);
+        now.store(M + 1, Ordering::SeqCst);
+        elapsed.store(2_000, Ordering::SeqCst);
+        guard.success();
+
+        let snapshot = collector.snapshot(SqliteSnapshotWindow::OneHour, M + 1);
+        let family = SqliteReadFamily::LatestBoundedHistory.index();
+        let completion_bucket = snapshot
+            .buckets
+            .iter()
+            .find(|bucket| bucket.minute_start_unix_micros == M)
+            .unwrap();
+        assert_eq!(
+            completion_bucket.read_family_outcomes[family]
+                [SqliteReadFamilyOutcome::Success.index()],
+            1
+        );
+        assert_eq!(
+            completion_bucket.read_family_totals[family].logical_elapsed_micros,
+            2_000
+        );
+        assert_eq!(snapshot.buckets.len(), 1);
+    }
+
+    #[test]
+    fn read_family_storage_stays_bounded_by_fixed_ring() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let now = Arc::new(AtomicU64::new(0));
+        let elapsed = Arc::new(AtomicU64::new(0));
+        let instant = Instant::now();
+        let collector = SqliteWorkloadCollector::with_test_clock(
+            {
+                let now = Arc::clone(&now);
+                move || now.load(Ordering::SeqCst)
+            },
+            {
+                let elapsed = Arc::clone(&elapsed);
+                move || instant + Duration::from_micros(elapsed.load(Ordering::SeqCst))
+            },
+        );
+
+        for minute in 1..=(BUCKET_COUNT as u64 + 5) {
+            now.store(minute * M, Ordering::SeqCst);
+            elapsed.store((minute - 1) * M, Ordering::SeqCst);
+            collector
+                .start_read_family(SqliteReadFamily::RecoveryRangeHistory)
+                .success();
+        }
+
+        let report = collector.aggregate_report(
+            SqliteSnapshotWindow::TwentyFourHours,
+            (BUCKET_COUNT as u64 + 5) * M + 1,
+        );
+        let family = SqliteReadFamily::RecoveryRangeHistory.index();
+        assert_eq!(
+            report.read_family_outcomes[family][SqliteReadFamilyOutcome::Success.index()],
+            1_440
+        );
+        assert_eq!(report.read_family_totals[family].logical_elapsed_micros, 0);
     }
 
     #[test]
