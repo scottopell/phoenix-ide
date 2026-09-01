@@ -91,6 +91,39 @@ async fn ensure_task_approval_authorized(
     }
 }
 
+async fn require_task_lifecycle_admission(
+    state: &AppState,
+    conversation_id: &str,
+) -> Result<(), AppError> {
+    match state
+        .runtime
+        .db()
+        .message_target_admission(conversation_id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+    {
+        phoenix_db::MessageTargetAdmission::Aggregate(
+            phoenix_db::ProductConversationAdmission::Accepted { .. },
+        )
+        | phoenix_db::MessageTargetAdmission::StandaloneAvailable => Ok(()),
+        phoenix_db::MessageTargetAdmission::Aggregate(
+            phoenix_db::ProductConversationAdmission::Refused(_),
+        ) => Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Close admission fence rejects task decision",
+            "close_admission_fenced",
+        )))),
+        phoenix_db::MessageTargetAdmission::Aggregate(
+            phoenix_db::ProductConversationAdmission::History(_),
+        )
+        | phoenix_db::MessageTargetAdmission::StandaloneArchived => {
+            Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                "Conversation is unavailable for task decisions",
+                "target_unavailable",
+            ))))
+        }
+    }
+}
+
 pub(crate) async fn approve_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -111,6 +144,7 @@ pub(crate) async fn approve_task(
     }
 
     ensure_task_approval_authorized(&state, &conv).await?;
+    require_task_lifecycle_admission(&state, &id).await?;
 
     let handoff = body.map(|Json(req)| req.handoff).unwrap_or_default();
     // 3. Dispatch approval event to state machine
@@ -149,6 +183,8 @@ pub(crate) async fn reject_task(
         ));
     }
 
+    require_task_lifecycle_admission(&state, &id).await?;
+
     state
         .runtime
         .send_event(
@@ -181,6 +217,8 @@ pub(crate) async fn task_feedback(
             "Conversation is not awaiting task approval".to_string(),
         ));
     }
+
+    require_task_lifecycle_admission(&state, &id).await?;
 
     state
         .runtime

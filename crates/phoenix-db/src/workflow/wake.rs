@@ -2376,8 +2376,13 @@ impl WakeRepository {
                ON p.workflow_id = d.workflow_id AND p.delivery_id = d.delivery_id
              JOIN wake_bindings b ON b.workflow_id = p.workflow_id
              JOIN conversations c ON c.id = p.conversation_id
+             JOIN product_conversations product ON product.id = c.product_conversation_id
              WHERE d.workflow_id = ?1 AND d.delivery_id = ?2 AND d.status = 'Pending'
-               AND p.conversation_id = ?3 AND c.archived = 0"
+               AND p.conversation_id = ?3
+               AND (
+                 (product.kind = 'ordinary' AND product.ordinary_lifecycle = 'open')
+                 OR (product.kind <> 'ordinary' AND c.archived = 0)
+               )"
         )
         .bind(to_i64(input.workflow_id.0, "workflow_id")?)
         .bind(to_i64(input.delivery_id.0, "delivery_id")?)

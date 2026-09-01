@@ -8194,6 +8194,27 @@ BEGIN
     SELECT RAISE(ABORT, 'non-writable ProductConversation rejects new aggregate participants');
 END;
 
+UPDATE durable_turns
+SET terminal_kind = 'Cancelled',
+    terminal_reason = 'compatibility_upgrade_archived_aggregate',
+    disposition = 'Settled'
+WHERE terminal_kind IS NULL
+  AND canonical_message_id IS NULL
+  AND conversation_id IN (
+    SELECT member.id
+    FROM conversations member
+    JOIN product_conversations product ON product.id = member.product_conversation_id
+    WHERE product.kind = 'ordinary'
+      AND NOT EXISTS (
+        SELECT 1 FROM conversations latest
+        WHERE latest.product_conversation_id = product.id
+          AND latest.runtime_role = 'user'
+          AND latest.parent_conversation_id IS NULL
+          AND latest.continued_in_conv_id IS NULL
+          AND latest.archived = 0
+      )
+  );
+
 UPDATE product_conversations
 SET ordinary_lifecycle = CASE WHEN EXISTS (
     SELECT 1
@@ -8203,14 +8224,6 @@ SET ordinary_lifecycle = CASE WHEN EXISTS (
       AND latest.parent_conversation_id IS NULL
       AND latest.continued_in_conv_id IS NULL
       AND latest.archived = 0
-) OR EXISTS (
-    SELECT 1
-    FROM conversations member
-    JOIN durable_turns turn ON turn.conversation_id = member.id
-    WHERE member.product_conversation_id = product_conversations.id
-      AND turn.disposition = 'Runtime'
-      AND turn.terminal_kind IS NULL
-      AND turn.canonical_message_id IS NULL
 ) OR EXISTS (
     SELECT 1 FROM product_creation_jobs job
     WHERE job.published_product_id = product_conversations.id

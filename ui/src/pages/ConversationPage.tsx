@@ -338,6 +338,9 @@ function ConversationPageContent({
   const isArchived = aggregateLifecycleOpen === undefined
     ? serverArchived || !archiveStatusConfirmed
     : !aggregateLifecycleOpen;
+  const terminallyUnavailable = aggregateLifecycleOpen === undefined
+    ? serverArchived
+    : !aggregateLifecycleOpen;
   const confirmedLive = !!conversationId && (
     aggregateLifecycleOpen === undefined
       ? archiveStatusConfirmed && !serverArchived
@@ -1353,7 +1356,7 @@ function ConversationPageContent({
   useEffect(() => { sendMessageRef.current = sendMessage; }, [sendMessage]);
 
   useEffect(() => {
-    if (!serverArchived) return;
+    if (!terminallyUnavailable) return;
     for (const msg of localPendingMessages) {
       dismiss(msg.localId);
     }
@@ -1362,7 +1365,7 @@ function ConversationPageContent({
         console.error('Failed to drop archived pending operations:', err);
       });
     }
-  }, [serverArchived, conversationId, localPendingMessages, dismiss, removePendingOperations]);
+  }, [terminallyUnavailable, conversationId, localPendingMessages, dismiss, removePendingOperations]);
 
   // Send queued messages when connection is restored. Iterate the derived
   // `pendingMessages` (NOT raw `queuedMessages`) so we don't re-POST entries
