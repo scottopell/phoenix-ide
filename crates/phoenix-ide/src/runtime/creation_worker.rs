@@ -2800,7 +2800,9 @@ mod product_creation_delivery_replay_tests {
             images: Vec::new(),
             llm_language: LlmLanguage::Caveman,
         };
-        db.accept_product_creation(request_id, &intent).await.unwrap();
+        db.accept_product_creation(request_id, &intent)
+            .await
+            .unwrap();
         let provisioning = db
             .claim_product_creation(
                 request_id,
@@ -2844,10 +2846,7 @@ mod product_creation_delivery_replay_tests {
         (intent, accepted_product_id, publish_claim_lease_until)
     }
 
-    async fn saturate_steering_queue(
-        manager: &Arc<RuntimeManager>,
-        conversation_id: &str,
-    ) {
+    async fn saturate_steering_queue(manager: &Arc<RuntimeManager>, conversation_id: &str) {
         for index in 0..phoenix_db::MAX_STEERING_QUEUE_DEPTH {
             manager
                 .enqueue_steer_message(
@@ -2899,7 +2898,10 @@ mod product_creation_delivery_replay_tests {
             .unwrap();
         assert_eq!(job.product_conversation_id, *accepted_product_id);
         assert_eq!(job.published_product_id, Some(accepted_product_id.clone()));
-        assert_eq!(job.published_conversation_id.as_deref(), Some(conversation_id));
+        assert_eq!(
+            job.published_conversation_id.as_deref(),
+            Some(conversation_id)
+        );
         assert_eq!(job.last_error.as_deref(), Some("steering queue is full"));
         assert_eq!(job.status, expected_status);
         assert!(db
@@ -3155,7 +3157,10 @@ mod product_creation_delivery_replay_tests {
         }
 
         assert_retry_identity_counts(&db, conversation_id, &accepted_product_id, 0, 0).await;
-        assert!(db.retry_failed_product_creation_delivery(request_id).await.unwrap());
+        assert!(db
+            .retry_failed_product_creation_delivery(request_id)
+            .await
+            .unwrap());
 
         let retried = claim_delivery_attempt(
             &db,
@@ -3165,8 +3170,14 @@ mod product_creation_delivery_replay_tests {
         )
         .await;
         assert_eq!(retried.job.product_conversation_id, accepted_product_id);
-        assert_eq!(retried.job.published_product_id, Some(accepted_product_id.clone()));
-        assert_eq!(retried.job.published_conversation_id.as_deref(), Some(conversation_id));
+        assert_eq!(
+            retried.job.published_product_id,
+            Some(accepted_product_id.clone())
+        );
+        assert_eq!(
+            retried.job.published_conversation_id.as_deref(),
+            Some(conversation_id)
+        );
 
         db.update_steering_queue(conversation_id, &[])
             .await
@@ -3181,7 +3192,11 @@ mod product_creation_delivery_replay_tests {
         );
         assert_eq!(published.transcript_row_id, conversation_id);
 
-        let completed = db.get_product_creation_job(request_id).await.unwrap().unwrap();
+        let completed = db
+            .get_product_creation_job(request_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(completed.status, "published");
         assert_eq!(completed.product_conversation_id, accepted_product_id);
         assert_eq!(
