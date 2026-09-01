@@ -8182,23 +8182,21 @@ WHEN NOT EXISTS (
 BEGIN
     SELECT RAISE(ABORT, 'close direct-turn settlement target must be a sealed active participant');
 END;
-INSERT OR IGNORE INTO close_attempt_direct_turn_settlements (
-    attempt_id, turn_id, expected_generation
-)
-SELECT participant.attempt_id, turn.turn_id, turn.generation
-FROM close_attempt_participants participant
-JOIN close_obligations obligation ON obligation.attempt_id = participant.attempt_id
-JOIN durable_turns turn
-  ON turn.conversation_id = participant.conversation_id
- AND turn.owns_conversation = 1
- AND turn.terminal_kind IS NULL
-WHERE obligation.phase IN ('settling_active_work', 'cancel_requested_during_settlement');
 DROP TRIGGER close_obligations_transition_graph;
 DELETE FROM close_attempt_direct_turn_settlement_captures
 WHERE attempt_id IN (
     SELECT attempt_id FROM close_obligations
-    WHERE phase = 'awaiting_stop_work_confirmation'
+    WHERE phase = 'settling_active_work'
 );
+DELETE FROM close_attempt_direct_turn_settlements
+WHERE attempt_id IN (
+    SELECT attempt_id FROM close_obligations
+    WHERE phase = 'settling_active_work'
+);
+UPDATE close_obligations
+SET phase = 'awaiting_stop_work_confirmation',
+    updated_at = STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now')
+WHERE phase = 'settling_active_work';
 CREATE TRIGGER close_obligations_transition_graph
 BEFORE UPDATE OF phase ON close_obligations
 FOR EACH ROW
@@ -8257,6 +8255,40 @@ WHERE terminal_kind IS NULL
           AND latest.archived = 0
       )
   );
+UPDATE workflow_effects
+SET status = 'Invalidated', next_eligible_at = NULL,
+    generation = generation + 1, pending_reconciliation = 0
+WHERE workflow_id IN (
+    SELECT turn.workflow_id FROM durable_turns turn
+    JOIN workflows workflow ON workflow.workflow_id = turn.workflow_id
+    WHERE turn.terminal_kind = 'Cancelled' AND turn.owns_conversation = 0
+      AND workflow.status NOT IN ('Cancelled', 'Completed', 'Failed', 'Deleted')
+) AND status NOT IN ('Receipted', 'Invalidated');
+UPDATE workflows
+SET status = 'Cancelled', generation = generation + 1,
+    version = version + 1, updated_at = updated_at + 1
+WHERE workflow_id IN (
+    SELECT workflow_id FROM durable_turns
+    WHERE terminal_kind = 'Cancelled' AND owns_conversation = 0
+) AND status NOT IN ('Cancelled', 'Completed', 'Failed', 'Deleted');
+
+UPDATE product_creation_jobs
+SET status = 'delivery_failed', last_error = 'completed_close_won_cutover',
+    delivery_retry_at_unix_micros = NULL,
+    claim_worker_id = NULL, claim_token = NULL, claim_lease_until_unix_micros = NULL
+WHERE status = 'delivery_pending'
+  AND published_product_id IN (
+    SELECT obligation.product_conversation_id FROM close_obligations obligation
+    WHERE obligation.phase = 'completed' AND obligation.close_outcome = 'archived'
+      AND NOT EXISTS (
+        SELECT 1 FROM conversations latest
+        WHERE latest.product_conversation_id = obligation.product_conversation_id
+          AND latest.runtime_role = 'user'
+          AND latest.parent_conversation_id IS NULL
+          AND latest.continued_in_conv_id IS NULL
+          AND latest.archived = 0
+      )
+  );
 
 UPDATE product_conversations
 SET ordinary_lifecycle = CASE WHEN EXISTS (
@@ -8271,6 +8303,20 @@ SET ordinary_lifecycle = CASE WHEN EXISTS (
     SELECT 1 FROM product_creation_jobs job
     WHERE job.published_product_id = product_conversations.id
       AND job.status = 'delivery_pending'
+      AND NOT EXISTS (
+        SELECT 1 FROM close_obligations obligation
+        WHERE obligation.product_conversation_id = product_conversations.id
+          AND obligation.phase = 'completed'
+          AND obligation.close_outcome = 'archived'
+          AND NOT EXISTS (
+            SELECT 1 FROM conversations latest
+            WHERE latest.product_conversation_id = product_conversations.id
+              AND latest.runtime_role = 'user'
+              AND latest.parent_conversation_id IS NULL
+              AND latest.continued_in_conv_id IS NULL
+              AND latest.archived = 0
+          )
+      )
 ) THEN 'open' ELSE 'history' END
 WHERE kind = 'ordinary';
 ";
