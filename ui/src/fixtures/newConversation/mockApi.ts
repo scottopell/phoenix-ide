@@ -11,6 +11,7 @@ export function installNewConversationFixtureApi(scenario: NewConversationScenar
     listModels: api.listModels,
     listProductConversationCreations: api.listProductConversationCreations,
     retryProductConversationDelivery: api.retryProductConversationDelivery,
+    deleteProductConversationCreation: api.deleteProductConversationCreation,
     listProjectSkills: api.listProjectSkills,
     searchProjectFiles: api.searchProjectFiles,
     validateCwd: api.validateCwd,
@@ -27,6 +28,7 @@ export function installNewConversationFixtureApi(scenario: NewConversationScenar
     next_cursor: cursor ? null : (scenario.recoveryNextCursor ?? null),
   });
   api.retryProductConversationDelivery = async () => {};
+  api.deleteProductConversationCreation = async () => {};
   api.listProjectSkills = async () => ({ skills: [] });
   api.searchProjectFiles = async () => ({ items: [] });
   api.validateCwd = async () => ({ valid: true, is_git: true });
@@ -40,6 +42,7 @@ export function installNewConversationFixtureApi(scenario: NewConversationScenar
     api.listModels = original.listModels;
     api.listProductConversationCreations = original.listProductConversationCreations;
     api.retryProductConversationDelivery = original.retryProductConversationDelivery;
+    api.deleteProductConversationCreation = original.deleteProductConversationCreation;
     api.listProjectSkills = original.listProjectSkills;
     api.searchProjectFiles = original.searchProjectFiles;
     api.validateCwd = original.validateCwd;
