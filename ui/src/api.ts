@@ -2638,6 +2638,10 @@ export const api = {
     const resp = await fetch(`/api/chains/${encodeURIComponent(rootId)}/archive`, {
       method: 'POST',
     });
+    if (resp.status === 409) {
+      const err = await resp.json();
+      throw new ConflictError(err as ConflictErrorDetail);
+    }
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));
       throw new Error(err.error || 'Failed to archive chain');

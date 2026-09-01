@@ -15,6 +15,7 @@ vi.mock('./api', async () => {
 });
 
 import { syncQueue } from './syncQueue';
+import { ConflictError } from './api';
 
 function makeOp(type: string): PendingOperation {
   return {
@@ -57,5 +58,34 @@ describe('SyncQueue legacy op draining', () => {
   it('processes a current archive op through the api', async () => {
     await syncQueue.processOperation(makeOp('archive'));
     expect(apiMock.archiveConversation).toHaveBeenCalledWith('conv-1');
+  });
+
+  it('drains archive replay when durable Close requires manual attention', async () => {
+    apiMock.archiveConversation.mockRejectedValueOnce(new ConflictError({
+      error: 'Close settlement in progress',
+      error_type: 'close_settlement_in_progress',
+    }));
+    await expect(syncQueue.processOperation(makeOp('archive'))).resolves.toBeUndefined();
+  });
+
+  it('retains archive replay for unrelated conflicts', async () => {
+    apiMock.archiveConversation.mockRejectedValueOnce(new ConflictError({
+      error: 'unrelated',
+      error_type: 'proposal_resolved',
+    }));
+    await expect(syncQueue.processOperation(makeOp('archive'))).rejects.toThrow();
+  });
+
+  it('drains chain archive replay when durable Close owns resolution', async () => {
+    apiMock.archiveChain.mockRejectedValueOnce(new ConflictError({
+      error: 'Close requires confirmation',
+      error_type: 'close_stop_work_confirmation_required',
+    }));
+    await expect(syncQueue.processOperation(makeOp('archive_chain'))).resolves.toBeUndefined();
+  });
+
+  it('retains chain archive replay for unrelated failures', async () => {
+    apiMock.archiveChain.mockRejectedValueOnce(new Error('offline'));
+    await expect(syncQueue.processOperation(makeOp('archive_chain'))).rejects.toThrow('offline');
   });
 });

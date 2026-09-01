@@ -8044,6 +8044,32 @@ WHEN NOT EXISTS (
 BEGIN
     SELECT RAISE(ABORT, 'close direct-turn settlement target must be a sealed active participant');
 END;
+DROP TRIGGER close_obligations_transition_graph;
+UPDATE close_obligations
+SET phase = 'awaiting_stop_work_confirmation',
+    updated_at = STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now')
+WHERE phase IN ('settling_active_work', 'cancel_requested_during_settlement');
+DELETE FROM close_attempt_direct_turn_settlement_captures
+WHERE attempt_id IN (
+    SELECT attempt_id FROM close_obligations
+    WHERE phase = 'awaiting_stop_work_confirmation'
+);
+CREATE TRIGGER close_obligations_transition_graph
+BEFORE UPDATE OF phase ON close_obligations
+FOR EACH ROW
+WHEN NOT (
+    (OLD.phase = 'awaiting_blocker_resolution' AND NEW.phase IN ('awaiting_stop_work_confirmation', 'settling_active_work', 'completed'))
+    OR (OLD.phase = 'awaiting_stop_work_confirmation' AND NEW.phase IN ('settling_active_work', 'completed'))
+    OR (OLD.phase = 'settling_active_work' AND NEW.phase IN ('cancel_requested_during_settlement', 'awaiting_retirement_inspection'))
+    OR (OLD.phase = 'cancel_requested_during_settlement' AND NEW.phase = 'completed')
+    OR (OLD.phase = 'awaiting_retirement_inspection' AND NEW.phase IN ('awaiting_loss_confirmation', 'retirement_requested', 'needs_repair', 'completed'))
+    OR (OLD.phase = 'awaiting_loss_confirmation' AND NEW.phase IN ('awaiting_retirement_inspection', 'retirement_requested', 'completed'))
+    OR (OLD.phase = 'retirement_requested' AND NEW.phase IN ('awaiting_retirement_inspection', 'needs_repair', 'completed'))
+    OR (OLD.phase = 'needs_repair' AND NEW.phase IN ('awaiting_retirement_inspection', 'retirement_requested', 'completed'))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid close obligation phase transition');
+END;
 
 CREATE TRIGGER conversations_reject_participant_insert_during_close
 BEFORE INSERT ON conversations
@@ -8066,6 +8092,10 @@ SET ordinary_lifecycle = CASE WHEN EXISTS (
       AND latest.parent_conversation_id IS NULL
       AND latest.continued_in_conv_id IS NULL
       AND latest.archived = 0
+) OR EXISTS (
+    SELECT 1 FROM product_creation_jobs job
+    WHERE job.published_product_id = product_conversations.id
+      AND job.status IN ('delivery_pending', 'published')
 ) THEN 'open' ELSE 'history' END
 WHERE kind = 'ordinary';
 ";

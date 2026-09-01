@@ -41,7 +41,11 @@ export function CommandPalette({ conversations, productConversations = [], activ
 
   // Extract current slug and active conversation
   const slugMatch = location.pathname.match(/^\/c\/(.+)$/);
+  const productMatch = location.pathname.match(/^\/product-conversations\/([^/]+)$/);
   const currentSlug = slugMatch?.[1] ?? null;
+  const activeProduct = productMatch
+    ? productConversations.find(row => row.product_conversation_id === productMatch[1])
+    : undefined;
 
   const activeConvId = activeConversation?.id ?? null;
   const activeFileRoot = activeConversationFileRoot(activeConversation);
@@ -114,10 +118,10 @@ export function CommandPalette({ conversations, productConversations = [], activ
     () =>
       createBuiltInActions({
         navigate,
-        currentSlug,
-        archiveCurrent: currentSlug
+        currentSlug: currentSlug ?? activeProduct?.canonical_root.slug ?? null,
+        archiveCurrent: currentSlug || activeProduct?.ordinary_lifecycle === 'open'
           ? (() => {
-              const activeRoute = activeConvId ?? currentSlug;
+              const activeRoute = activeConvId ?? activeProduct?.latest_transcript_row_id ?? currentSlug;
               const conv = conversations.find(c => c.id === activeRoute || c.slug === activeRoute);
               if (!conv || conv.archived === true || computeChainRoots(conversations).get(conv.id) != null) return undefined;
               return async () => {
@@ -125,14 +129,13 @@ export function CommandPalette({ conversations, productConversations = [], activ
                   await api.archiveConversation(conv.id);
                   navigate('/');
                 } catch (error) {
-                  notifyArchiveCloseConflict(conv.id, error);
-                  throw error;
+                  if (!notifyArchiveCloseConflict(conv.id, error)) throw error;
                 }
               };
             })()
           : undefined,
       }),
-    [navigate, currentSlug, activeConvId, conversations],
+    [navigate, currentSlug, activeProduct, activeConvId, conversations],
   );
   const actionsRef = useRef(actions);
   useEffect(() => {

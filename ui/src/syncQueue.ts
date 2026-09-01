@@ -2,6 +2,7 @@
 
 import { api } from './api';
 import type { PendingOperation } from './cache';
+import { notifyArchiveCloseConflict } from './notifications';
 
 export class SyncQueue {
   async processOperation(op: PendingOperation): Promise<void> {
@@ -28,7 +29,11 @@ export class SyncQueue {
         break;
       }
       case 'archive':
-        await api.archiveConversation(op.conversationId);
+        try {
+          await api.archiveConversation(op.conversationId);
+        } catch (error) {
+          if (!notifyArchiveCloseConflict(op.conversationId, error)) throw error;
+        }
         break;
       
       case 'delete':
@@ -46,7 +51,11 @@ export class SyncQueue {
         break;
 
       case 'archive_chain':
-        await api.archiveChain(op.conversationId);
+        try {
+          await api.archiveChain(op.conversationId);
+        } catch (error) {
+          if (!notifyArchiveCloseConflict(op.conversationId, error)) throw error;
+        }
         break;
 
       case 'delete_chain':
