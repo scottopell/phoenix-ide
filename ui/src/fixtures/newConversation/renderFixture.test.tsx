@@ -47,7 +47,9 @@ describe('NewConversationFixture', () => {
     await waitFor(() => {
       expect(screen.getAllByRole('button', { name: 'Retry' })[0]).toBeEnabled();
     });
-    expect(screen.getAllByRole('button', { name: 'Delete' })).toHaveLength(2);
+    const deleteButtons = screen.getAllByRole('button', { name: 'Delete' });
+    expect(deleteButtons).toHaveLength(2);
+    fireEvent.click(deleteButtons[0]!);
     expect(screen.getAllByRole('button', { name: 'Start over' })).toHaveLength(2);
   });
 

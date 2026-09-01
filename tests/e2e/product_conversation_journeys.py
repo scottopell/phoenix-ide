@@ -169,7 +169,7 @@ def scenario_clean_close_history(base_url: str, cwd: Path) -> None:
     created = scenario_create_objective_one_row_reload(base_url, cwd)
     transcript_id = created["transcript_row_id"]
     poll("idle before Close", lambda: conversation(base_url, transcript_id), run._init_has_completed_turn)
-    request(base_url, "POST", f"/api/conversations/{transcript_id}/archive")
+    request(base_url, "POST", f"/api/conversations/{transcript_id}/abandon-task")
     history = poll(
         "clean Close to History",
         lambda: product_snapshot(base_url, created["product_conversation_id"]),
