@@ -34,6 +34,7 @@ struct Base64ImageView: View {
                     .padding(8)
             }
         }
+        .accessibilityIdentifier("attachment.base64")
         .task(id: base64) {
             decodedImage = nil
             decodingFinished = false
@@ -70,5 +71,6 @@ struct ImageStrip: View {
                 }
             }
         }
+        .accessibilityIdentifier("attachment.imageStrip")
     }
 }

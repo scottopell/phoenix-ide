@@ -90,7 +90,11 @@ vi.mock('../components/Skeleton', () => ({
 
 vi.mock('../components/TaskApprovalReader', () => ({
   TaskApprovalReader: (props: Record<string, unknown>) => (
-    <button onClick={() => (props['onApprove'] as ((handoff: string) => void))('continue')}>approve task</button>
+    <div data-testid="aggregate-task-approval-owner">
+      <div data-testid="aggregate-task-approval-title">{String(props['title'])}</div>
+      <div data-testid="aggregate-task-approval-copy">Continue here|Start in new conversation</div>
+      <button onClick={() => (props['onApprove'] as ((handoff: string) => void))('continue')}>approve task</button>
+    </div>
   ),
 }));
 
@@ -655,6 +659,41 @@ describe('ProductConversationPage', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'approve task' }));
 
     expect(await screen.findByTestId('first-task-welcome')).toBeInTheDocument();
+  });
+
+  it('keeps task approval ownership on the aggregate route while suppressing the embedded transcript owner', async () => {
+    renderPage();
+    await waitForPageReady();
+
+    emitLatestProjection({
+      convState: { type: 'awaiting_task_approval', title: 'Plan', priority: 'p1', plan: 'Do it' },
+      modelContextWindow: 200_000,
+    });
+
+    expect(await screen.findByTestId('aggregate-task-approval-owner')).toBeInTheDocument();
+    expect(screen.getByTestId('aggregate-task-approval-title')).toHaveTextContent('Plan');
+    expect(screen.getByTestId('aggregate-task-approval-copy')).toHaveTextContent('Continue here|Start in new conversation');
+    expect(embeddedConversationPageSpy).toHaveBeenLastCalledWith(expect.objectContaining({
+      suppressCanonicalization: true,
+      suppressMessageViewerOwner: true,
+      suppressTaskApprovalOwner: true,
+      showTranscript: false,
+    }));
+  });
+
+  it('preserves embedded task approval ownership on degraded fallback routes', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot).mockRejectedValueOnce(new Error('snapshot failed'));
+
+    renderPage();
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('snapshot failed');
+    expect(embeddedConversationPageSpy.mock.calls[0]?.[0]).toEqual(expect.objectContaining({
+      slug: 'pc-1',
+      routePrefix: '/c',
+      suppressCanonicalization: true,
+    }));
+    expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.['suppressTaskApprovalOwner']).toBeUndefined();
   });
 
   it('keeps latest open row mounted even when writable transcript is null', async () => {

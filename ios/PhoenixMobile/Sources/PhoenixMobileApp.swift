@@ -2,7 +2,12 @@ import SwiftUI
 
 @main
 struct PhoenixMobileApp: App {
-    @State private var model: AppModel
+    #if DEBUG
+    private let fixtureRequested = FixtureAppLaunch.isRequested(in: ProcessInfo.processInfo.arguments)
+    private let fixtureSelection = FixtureAppLaunch.selection(from: ProcessInfo.processInfo.arguments)
+    #endif
+
+    @State private var model: AppModel? = nil
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
@@ -10,6 +15,7 @@ struct PhoenixMobileApp: App {
         if ProcessInfo.processInfo.arguments.contains("-ui-testing-reset") {
             AppModel.resetPersistentStateForUITesting()
         }
+        guard !fixtureRequested else { return }
         #endif
         let model = AppModel()
         _model = State(initialValue: model)
@@ -19,10 +25,10 @@ struct PhoenixMobileApp: App {
 
     var body: some Scene {
         WindowGroup {
-            RootView()
-                .environment(model)
+            appRoot
         }
         .onChange(of: scenePhase) { _, phase in
+            guard let model else { return }
             switch phase {
             case .active:
                 model.foregrounded()
@@ -32,5 +38,30 @@ struct PhoenixMobileApp: App {
                 break
             }
         }
+    }
+
+    @ViewBuilder
+    private var appRoot: some View {
+        #if DEBUG
+        if fixtureRequested {
+            if let fixtureSelection {
+                if fixtureSelection == .catalog {
+                    FixtureCatalogView()
+                } else {
+                    FixtureRootView(selection: fixtureSelection)
+                }
+            } else {
+                InvalidFixtureView()
+            }
+        } else if let model {
+            RootView()
+                .environment(model)
+        }
+        #else
+        if let model {
+            RootView()
+                .environment(model)
+        }
+        #endif
     }
 }

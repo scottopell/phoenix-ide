@@ -1,6 +1,47 @@
 import PhotosUI
 import SwiftUI
 
+struct ComposerInputRow: View {
+    @Binding var draft: String
+    let isOnline: Bool
+    let canSend: Bool
+    let showsCancel: Bool
+    let onSend: () -> Void
+    let onCancel: () -> Void
+    let attachmentControl: AnyView
+
+    var body: some View {
+        HStack(alignment: .bottom, spacing: 8) {
+            attachmentControl
+            TextField("Message", text: $draft, axis: .vertical)
+                .lineLimit(1...6)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(Color(.secondarySystemBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 16))
+                .accessibilityIdentifier("conversation.composer")
+            if showsCancel {
+                Button(action: onCancel) {
+                    Image(systemName: "stop.circle.fill")
+                        .font(.title2)
+                        .foregroundStyle(.red)
+                }
+                .disabled(!isOnline)
+                .accessibilityIdentifier("conversation.cancel")
+            }
+            Button(action: onSend) {
+                Image(systemName: "arrow.up.circle.fill")
+                    .font(.title2)
+                    .foregroundStyle(isOnline ? Color.accentColor : .orange)
+            }
+            .disabled(!canSend)
+            .accessibilityIdentifier("conversation.send")
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+    }
+}
+
 /// Message input. Offline and supported mid-turn sends remain available;
 /// state decisions and archive operations disable text and image submission.
 struct ComposerView: View {
@@ -35,51 +76,24 @@ struct ComposerView: View {
                     .padding(.top, 4)
             }
 
-            HStack(alignment: .bottom, spacing: 8) {
-                PhotosPicker(
-                    selection: $pickerItems,
-                    maxSelectionCount: Self.maxAttachments - attachments.count,
-                    matching: .images
-                ) {
-                    Image(systemName: "photo.badge.plus")
-                        .font(.title3)
-                }
-                .disabled(attachments.count >= Self.maxAttachments || isLoadingAttachments)
-
-                TextField("Message", text: $draft, axis: .vertical)
-                    .lineLimit(1...6)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 8)
-                    .background(Color(.secondarySystemBackground))
-                    .clipShape(RoundedRectangle(cornerRadius: 16))
-                    .focused($focused)
-                    .accessibilityIdentifier("conversation.composer")
-
-                if showsUnconfirmedStop {
-                    Button {
-                        session.perform(.cancel)
-                    } label: {
-                        Image(systemName: "stop.circle.fill")
-                            .font(.title2)
-                            .foregroundStyle(.red)
+            ComposerInputRow(
+                draft: $draft,
+                isOnline: model.connectivity.isOnline,
+                canSend: canSend,
+                showsCancel: showsUnconfirmedStop,
+                onSend: send,
+                onCancel: { session.perform(.cancel) },
+                attachmentControl: AnyView(
+                    PhotosPicker(
+                        selection: $pickerItems,
+                        maxSelectionCount: Self.maxAttachments - attachments.count,
+                        matching: .images
+                    ) {
+                        Image(systemName: "photo.badge.plus")
+                            .font(.title3)
                     }
-                    .disabled(!model.connectivity.isOnline)
-                    .accessibilityIdentifier("conversation.cancel")
-                }
-
-                Button {
-                    send()
-                } label: {
-                    // Orange while offline: the tap queues rather than sends.
-                    Image(systemName: "arrow.up.circle.fill")
-                        .font(.title2)
-                        .foregroundStyle(model.connectivity.isOnline ? Color.accentColor : .orange)
-                }
-                .disabled(!canSend)
-                .accessibilityIdentifier("conversation.send")
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
+                    .disabled(attachments.count >= Self.maxAttachments || isLoadingAttachments)))
+            .focused($focused)
         }
         .background(.bar)
         .onChange(of: pickerItems) { _, items in

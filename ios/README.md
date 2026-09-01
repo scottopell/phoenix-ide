@@ -64,13 +64,28 @@ xcodebuild test -project PhoenixMobile.xcodeproj -scheme PhoenixMobile \
   -destination 'platform=iOS Simulator,name=iPhone 16'
 ```
 
-CI runs the same thing on a macOS runner for any change under `ios/`
-(`.github/workflows/ios.yml`) — the Linux-based `./dev.py check` lanes
-cannot cover Swift.
+CI runs that unit-test scheme plus a separate no-server fixture UI scheme on a
+macOS runner for any change under `ios/` (`.github/workflows/ios.yml`) — the
+Linux-based `./dev.py check` lanes cannot cover Swift.
 
-The opt-in live-server UI journey has its own scheme so normal unit tests
-never depend on a running Phoenix instance. Start an auth-disabled dev server
-with `PHOENIX_ENABLE_MOCK_MODEL=1`, then run:
+The DEBUG-only fixture harness launches deterministic transcript/state screens
+without creating `AppModel`, starting sessions, touching persistence, or
+opening network connections. Run the fixture UI tests separately from live UIQA:
+
+```bash
+cd ios/PhoenixMobile
+xcodegen generate
+xcrun simctl boot 'iPhone 16' 2>/dev/null || true
+xcrun simctl bootstatus 'iPhone 16' -b
+xcodebuild test -project PhoenixMobile.xcodeproj -scheme PhoenixMobileFixtures \
+  -destination 'platform=iOS Simulator,name=iPhone 16' \
+  CODE_SIGNING_ALLOWED=NO \
+  CODE_SIGN_IDENTITY=''
+```
+
+The opt-in live-server UI journey keeps its own scheme so normal CI and
+fixture UI tests never depend on a running Phoenix instance. Start an
+auth-disabled dev server with `PHOENIX_ENABLE_MOCK_MODEL=1`, then run:
 
 ```bash
 cd ios/PhoenixMobile
