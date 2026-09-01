@@ -197,6 +197,7 @@ final class AppModel {
 
     // MARK: - Needs-attention nudges
 
+    private var productConversationDetails: [String: ProductConversationDetailModel] = [:]
     let attention: AttentionMonitor
     private let notificationRouter = NotificationRouter()
     private static let nudgesEnabledKey = "phoenix.backgroundNudges"
@@ -226,6 +227,22 @@ final class AppModel {
         resolvedNavigationConversationId(
             aggregateId: conversation.product_conversation_id,
             latestTranscriptRowId: conversation.transcriptRowIdentity)
+    }
+
+    func productConversationDetailModel(for aggregateId: String) -> ProductConversationDetailModel {
+        if let existing = productConversationDetails[aggregateId] { return existing }
+        guard let api else {
+            fatalError("ProductConversationDetailModel requires configured API")
+        }
+        let created = ProductConversationDetailModel(
+            aggregateId: aggregateId,
+            api: api,
+            connectivity: connectivity,
+            sessionProvider: { [weak self] transcriptRowId in
+                self?.session(for: transcriptRowId)
+            })
+        productConversationDetails[aggregateId] = created
+        return created
     }
 
     func setBackgroundNudges(_ enabled: Bool) async {
@@ -491,6 +508,7 @@ final class AppModel {
     }
 
     func clearCache() async {
+        productConversationDetails.removeAll()
         apiGeneration += 1
         let ownedSessions = Array(sessions.values) + Array(drainSessions.values)
         for session in ownedSessions { session.stop() }
