@@ -5610,6 +5610,7 @@ async fn archive_conversation(
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
     refuse_if_chain_member(&state, &id, "archive").await?;
+    refuse_if_coordinator(&state, &id, "archive").await?;
     let admission = state.runtime.conversation_admission(&id).await;
     let _admission_guard = admission.lock().await;
     super::lifecycle_handlers::close_legacy_compat(&state, &id, "archive").await?;
@@ -13446,6 +13447,21 @@ pub(crate) mod hard_delete_cascade_tests {
         assert_eq!(
             completed.close_outcome(),
             Some(phoenix_core::domain::close::CloseCompletionOutcome::Archived)
+        );
+    }
+
+    #[tokio::test]
+    async fn compatibility_archive_rejects_durable_coordinator() {
+        let state = make_test_state().await;
+        let coordinator = state
+            .db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+
+        let result = archive_conversation(State(state), Path(coordinator.id)).await;
+        assert!(
+            matches!(result, Err(AppError::Conflict(detail)) if detail.error_type == "coordinator_lifecycle")
         );
     }
 

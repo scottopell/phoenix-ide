@@ -7947,8 +7947,8 @@ mod migration_094_tests {
                  ('settling', 'settling_active_work', 'before'),
                  ('cancelling', 'cancel_requested_during_settlement', 'before');
              UPDATE close_obligations
-             SET phase = 'awaiting_stop_work_confirmation', updated_at = 'after'
-             WHERE phase = 'settling_active_work';",
+             SET updated_at = updated_at
+             WHERE 0;",
         )
         .execute(&pool)
         .await
@@ -7967,7 +7967,7 @@ mod migration_094_tests {
                     "cancelling".into(),
                     "cancel_requested_during_settlement".into()
                 ),
-                ("settling".into(), "awaiting_stop_work_confirmation".into()),
+                ("settling".into(), "settling_active_work".into()),
             ]
         );
     }
@@ -8108,10 +8108,6 @@ BEGIN
     SELECT RAISE(ABORT, 'close direct-turn settlement target must be a sealed active participant');
 END;
 DROP TRIGGER close_obligations_transition_graph;
-UPDATE close_obligations
-SET phase = 'awaiting_stop_work_confirmation',
-    updated_at = STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now')
-WHERE phase = 'settling_active_work';
 DELETE FROM close_attempt_direct_turn_settlement_captures
 WHERE attempt_id IN (
     SELECT attempt_id FROM close_obligations
