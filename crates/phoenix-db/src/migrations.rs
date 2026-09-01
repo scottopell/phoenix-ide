@@ -7975,11 +7975,10 @@ mod migration_094_tests {
     #[test]
     fn participant_snapshot_upgrade_captures_active_subordinates_and_cascades_delete() {
         assert!(super::MIGRATION_095.contains("WHERE obligation.phase <> 'completed'"));
-        assert!(super::MIGRATION_095
-            .contains("participant.product_conversation_id = obligation.product_conversation_id"));
-        assert!(super::MIGRATION_095.contains(
-            "FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE"
-        ));
+        assert!(super::MIGRATION_095.contains("FOREIGN KEY (attempt_id, product_conversation_id)"));
+        assert!(
+            super::MIGRATION_095.contains("FOREIGN KEY (conversation_id, product_conversation_id)")
+        );
     }
 
     #[tokio::test]
@@ -8067,28 +8066,38 @@ mod migration_094_tests {
 }
 
 const MIGRATION_095: &str = r"
+CREATE UNIQUE INDEX close_obligations_attempt_product_identity
+ON close_obligations(attempt_id, product_conversation_id);
+CREATE UNIQUE INDEX conversations_member_product_identity
+ON conversations(id, product_conversation_id);
 CREATE TABLE close_attempt_participants (
     attempt_id TEXT NOT NULL,
+    product_conversation_id TEXT NOT NULL,
     conversation_id TEXT NOT NULL,
     captured_at_unix_micros INTEGER NOT NULL
         CHECK (captured_at_unix_micros >= 0),
     PRIMARY KEY (attempt_id, conversation_id),
-    FOREIGN KEY (attempt_id) REFERENCES close_obligations(attempt_id) ON DELETE CASCADE,
-    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+    FOREIGN KEY (attempt_id, product_conversation_id)
+        REFERENCES close_obligations(attempt_id, product_conversation_id) ON DELETE CASCADE,
+    FOREIGN KEY (conversation_id, product_conversation_id)
+        REFERENCES conversations(id, product_conversation_id) ON DELETE CASCADE
 );
-INSERT INTO close_attempt_participants (attempt_id, conversation_id, captured_at_unix_micros)
-SELECT obligation.attempt_id, participant.id,
+INSERT INTO close_attempt_participants (
+    attempt_id, product_conversation_id, conversation_id, captured_at_unix_micros
+)
+SELECT obligation.attempt_id, obligation.product_conversation_id, participant.id,
        CAST(ROUND((julianday(obligation.created_at) - 2440587.5) * 86400000000.0) AS INTEGER)
 FROM close_obligations obligation
 JOIN conversations participant
   ON participant.product_conversation_id = obligation.product_conversation_id
 WHERE obligation.phase <> 'completed';
 INSERT OR IGNORE INTO close_attempt_participants (
-    attempt_id, conversation_id, captured_at_unix_micros
+    attempt_id, product_conversation_id, conversation_id, captured_at_unix_micros
 )
-SELECT member.attempt_id, member.conversation_id,
+SELECT member.attempt_id, obligation.product_conversation_id, member.conversation_id,
        CAST(ROUND((julianday(member.captured_at) - 2440587.5) * 86400000000.0) AS INTEGER)
-FROM close_attempt_members member;
+FROM close_attempt_members member
+JOIN close_obligations obligation ON obligation.attempt_id = member.attempt_id;
 
 DROP TRIGGER close_attempt_direct_turn_settlement_target_requires_latest_member;
 CREATE TRIGGER close_attempt_direct_turn_settlement_target_requires_sealed_participant

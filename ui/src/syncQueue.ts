@@ -1,7 +1,7 @@
 // Sync queue for handling offline operations
 
 import { api } from './api';
-import type { PendingOperation } from './cache';
+import { cacheDB, type PendingOperation } from './cache';
 import { notifyArchiveCloseConflict } from './notifications';
 
 export class SyncQueue {
@@ -103,3 +103,8 @@ export class SyncQueue {
 }
 
 export const syncQueue = new SyncQueue();
+
+export async function processAndDeletePendingOperation(op: PendingOperation): Promise<void> {
+  await syncQueue.processOperation(op);
+  await cacheDB.deletePendingOp(op.id);
+}

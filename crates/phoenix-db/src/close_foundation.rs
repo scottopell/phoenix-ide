@@ -1165,9 +1165,9 @@ impl Database {
 
         sqlx::query(
             "INSERT INTO close_attempt_participants (
-                 attempt_id, conversation_id, captured_at_unix_micros
+                 attempt_id, product_conversation_id, conversation_id, captured_at_unix_micros
              )
-             SELECT ?1, id, ?2 FROM conversations
+             SELECT ?1, ?3, id, ?2 FROM conversations
              WHERE product_conversation_id = ?3",
         )
         .bind(attempt_id)
@@ -4890,6 +4890,34 @@ mod tests {
                 message: "broken".to_string(),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn participant_snapshot_rejects_cross_product_identity() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "participant-a").await;
+        create_root(&db, "participant-b").await;
+        let attempt = db
+            .begin_close_foundation(
+                &product_id("participant-a"),
+                &transcript_id("participant-a"),
+                "participant-attempt",
+            )
+            .await
+            .unwrap();
+
+        let error = sqlx::query(
+            "INSERT INTO close_attempt_participants (
+                 attempt_id, product_conversation_id, conversation_id, captured_at_unix_micros
+             ) VALUES (?1, ?2, ?3, 0)",
+        )
+        .bind(attempt.attempt_id().as_str())
+        .bind(product_id("participant-a").as_str())
+        .bind("participant-b")
+        .execute(db.pool())
+        .await
+        .expect_err("cross-product participant identity must be rejected");
+        assert!(error.to_string().contains("FOREIGN KEY constraint failed"));
     }
 
     #[tokio::test]

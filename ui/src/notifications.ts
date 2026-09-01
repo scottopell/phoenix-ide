@@ -179,6 +179,7 @@ export function notifyArchiveCloseConflict(conversationId: string, error: unknow
     'close_loss_confirmation_required',
     'close_stop_work_confirmation_required',
     'close_settlement_in_progress',
+    'close_cancelled',
     'close_inspection_failed',
     'close_retirement_needs_repair',
     'stale_close_inspection',

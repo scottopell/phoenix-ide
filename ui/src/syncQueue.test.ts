@@ -1,12 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { PendingOperation } from './cache';
 
-const { apiMock } = vi.hoisted(() => ({
+const { apiMock, cacheMock } = vi.hoisted(() => ({
   apiMock: {
     archiveConversation: vi.fn(),
     archiveChain: vi.fn(),
     deleteConversation: vi.fn(),
   },
+  cacheMock: { deletePendingOp: vi.fn() },
 }));
 
 vi.mock('./api', async () => {
@@ -14,7 +15,9 @@ vi.mock('./api', async () => {
   return { ...actual, api: apiMock };
 });
 
-import { syncQueue } from './syncQueue';
+vi.mock('./cache', () => ({ cacheDB: cacheMock }));
+
+import { processAndDeletePendingOperation, syncQueue } from './syncQueue';
 import { ConflictError } from './api';
 
 function makeOp(type: string): PendingOperation {
@@ -66,6 +69,16 @@ describe('SyncQueue legacy op draining', () => {
       error_type: 'close_settlement_in_progress',
     }));
     await expect(syncQueue.processOperation(makeOp('archive'))).resolves.toBeUndefined();
+  });
+
+  it('drains archive replay when durable Close cancellation wins', async () => {
+    apiMock.archiveConversation.mockRejectedValueOnce(new ConflictError({
+      error: 'Close was cancelled',
+      error_type: 'close_cancelled',
+    }));
+    await expect(processAndDeletePendingOperation(makeOp('archive'))).resolves.toBeUndefined();
+    expect(cacheMock.deletePendingOp).toHaveBeenCalledWith('op-1');
+    expect(apiMock.archiveConversation).toHaveBeenCalledTimes(1);
   });
 
   it('retains archive replay for unrelated conflicts', async () => {
