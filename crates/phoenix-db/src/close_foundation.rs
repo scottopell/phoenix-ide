@@ -5734,6 +5734,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deleted_participant_settlement_preserves_other_live_authority() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "deleted-a").await;
+        create_child(&db, "live-b", "deleted-a").await;
+        sqlx::query(
+            "INSERT INTO workflows (
+                 workflow_id, profile_kind, profile_version, runtime_acceptance_enabled,
+                 external_acceptance_enabled, version, generation, status,
+                 snapshot_codec_family, snapshot_codec_version, snapshot_payload, created_at, updated_at
+             ) VALUES (41, 'direct_turn', 1, 1, 0, 0, 0, 'Active', 'direct_turn', 1, X'00', 1, 1);
+             INSERT INTO durable_turns (
+                 turn_id, workflow_id, conversation_id, client_turn_key, prepared_fingerprint,
+                 prepared_payload, disposition, generation, terminal_kind, terminal_reason,
+                 owns_conversation, canonical_message_id
+             ) VALUES (41, 41, 'live-b', 'live-b-turn', 'prepared', X'00', 'Runtime', 0, NULL, NULL, 1, NULL);",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        db.begin_close_foundation(
+            &product_id("deleted-a"),
+            &transcript_id("live-b"),
+            "deleted-a-attempt",
+        )
+        .await
+        .unwrap();
+        db.confirm_close_stop_work("deleted-a-attempt")
+            .await
+            .unwrap();
+        db.begin_close_active_work_settlement("deleted-a-attempt")
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE close_attempt_participants SET settlement_state = 'deleted'
+             WHERE attempt_id = 'deleted-a-attempt' AND conversation_id = 'deleted-a'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let states: Vec<(String, String)> = sqlx::query_as(
+            "SELECT conversation_id, settlement_state FROM close_attempt_participants
+             WHERE attempt_id = 'deleted-a-attempt' ORDER BY conversation_id",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            states,
+            vec![
+                ("deleted-a".to_string(), "deleted".to_string()),
+                ("live-b".to_string(), "live".to_string()),
+            ]
+        );
+        assert!(db
+            .advance_close_settlement_when_quiescent("deleted-a-attempt")
+            .await
+            .is_err());
+        db.request_close_settlement_cancellation("deleted-a-attempt")
+            .await
+            .unwrap();
+        assert!(db
+            .advance_close_settlement_when_quiescent("deleted-a-attempt")
+            .await
+            .is_err());
+        assert_eq!(
+            db.get_close_obligation("deleted-a-attempt")
+                .await
+                .unwrap()
+                .phase(),
+            ClosePhase::CancelRequestedDuringSettlement
+        );
+    }
+
+    #[tokio::test]
     async fn active_work_settlement_remains_fenced_until_every_captured_turn_is_terminal() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;

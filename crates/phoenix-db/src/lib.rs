@@ -9232,14 +9232,14 @@ impl Database {
             sqlx::query(
                 "UPDATE close_attempt_participants
                  SET settlement_state = 'deleted'
-                 WHERE product_conversation_id = ?1 AND settlement_state = 'live'
+                 WHERE conversation_id = ?1 AND settlement_state = 'live'
                    AND EXISTS (
                      SELECT 1 FROM close_obligations obligation
                      WHERE obligation.attempt_id = close_attempt_participants.attempt_id
                        AND obligation.phase <> 'completed'
                    )",
             )
-            .bind(&membership)
+            .bind(conversation_id)
             .execute(&mut *connection)
             .await?;
         }
