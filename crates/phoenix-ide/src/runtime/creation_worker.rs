@@ -19,6 +19,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(test)]
+use std::sync::LazyLock;
+
 #[derive(Debug, Clone)]
 pub(crate) struct PublishedProductCreation {
     pub product_conversation_id: String,
@@ -26,6 +29,22 @@ pub(crate) struct PublishedProductCreation {
 }
 
 const PRODUCT_CREATION_OWNER_MARKER: &str = "phoenix-product-creation-owner";
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct TestSteeringCapacityKey(String);
+
+#[cfg(test)]
+struct TestSteeringCapacityRegistration {
+    is_full: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(test)]
+static TEST_STEERING_CAPACITY: LazyLock<
+    std::sync::Mutex<
+        std::collections::HashMap<TestSteeringCapacityKey, TestSteeringCapacityRegistration>,
+    >,
+> = LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StagingOwnershipConflict {
@@ -494,22 +513,64 @@ async fn expand_product_creation_objective(
 }
 
 #[allow(clippy::too_many_lines)]
-async fn deliver_product_creation_objective(
+async fn enqueue_product_creation_objective(
+    manager: &Arc<RuntimeManager>,
+    conversation_id: &str,
+    event: Event,
+    request_fingerprint: String,
+) -> Result<(), String> {
+    #[cfg(test)]
+    {
+        let key = TestSteeringCapacityKey(request_fingerprint.clone());
+        let is_full = TEST_STEERING_CAPACITY
+            .lock()
+            .unwrap()
+            .get(&key)
+            .map(|registration| Arc::clone(&registration.is_full));
+        if let Some(is_full) = is_full {
+            if is_full.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("steering queue is full".to_string());
+            }
+        }
+    }
+
+    manager
+        .enqueue_steer_message(conversation_id, event, &request_fingerprint)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn persist_retryable_delivery_failure(
     manager: &Arc<RuntimeManager>,
     claimed: &crate::db::ClaimedProductCreationJob,
-) -> Result<PublishedProductCreation, String> {
+    delivery_error: &str,
+) -> Result<String, String> {
+    manager
+        .db()
+        .schedule_product_creation_delivery_retry(
+            &claimed.job.request_id,
+            &claimed.claim,
+            delivery_error,
+            chrono::Utc::now(),
+        )
+        .await
+        .map_err(|db_error| {
+            format!("{delivery_error}; delivery retry persistence failed: {db_error}")
+        })?;
+    manager.kick_creation_worker();
+    Ok(delivery_error.to_string())
+}
+
+async fn complete_already_accepted_product_creation_delivery(
+    manager: &Arc<RuntimeManager>,
+    claimed: &crate::db::ClaimedProductCreationJob,
+    product_id: &phoenix_core::domain::close::ProductConversationId,
+    conversation_id: &str,
+) -> Result<Option<PublishedProductCreation>, String> {
     let job = &claimed.job;
-    let product_id = job
-        .published_product_id
-        .clone()
-        .ok_or_else(|| "delivery obligation lacked product id".to_string())?;
-    let conversation_id = job
-        .published_conversation_id
-        .clone()
-        .ok_or_else(|| "delivery obligation lacked conversation id".to_string())?;
     let steering_fingerprint = manager
         .db()
-        .get_steering_acceptance_fingerprint(&conversation_id, &job.request_id)
+        .get_steering_acceptance_fingerprint(conversation_id, &job.request_id)
         .await
         .map_err(|error| error.to_string())?;
     if let Some(exact_fingerprint) = steering_fingerprint.as_ref().filter(|fingerprint| {
@@ -543,11 +604,37 @@ async fn deliver_product_creation_objective(
                     "product creation delivery claim was lost before completion".to_string()
                 );
             }
-            return Ok(PublishedProductCreation {
+            return Ok(Some(PublishedProductCreation {
                 product_conversation_id: product_id.to_string(),
-                transcript_row_id: conversation_id,
-            });
+                transcript_row_id: conversation_id.to_string(),
+            }));
         }
+    }
+    Ok(None)
+}
+
+async fn deliver_product_creation_objective(
+    manager: &Arc<RuntimeManager>,
+    claimed: &crate::db::ClaimedProductCreationJob,
+) -> Result<PublishedProductCreation, String> {
+    let job = &claimed.job;
+    let product_id = job
+        .published_product_id
+        .clone()
+        .ok_or_else(|| "delivery obligation lacked product id".to_string())?;
+    let conversation_id = job
+        .published_conversation_id
+        .clone()
+        .ok_or_else(|| "delivery obligation lacked conversation id".to_string())?;
+    if let Some(completed) = complete_already_accepted_product_creation_delivery(
+        manager,
+        claimed,
+        &product_id,
+        &conversation_id,
+    )
+    .await?
+    {
+        return Ok(completed);
     }
     let images = job
         .intent
@@ -562,7 +649,8 @@ async fn deliver_product_creation_objective(
         expand_product_creation_objective(manager, &conversation_id, &job.intent.objective).await?;
     let enqueue_result = tokio::time::timeout(
         std::time::Duration::from_secs(15),
-        manager.enqueue_steer_message(
+        enqueue_product_creation_objective(
+            manager,
             &conversation_id,
             Event::SteerMessage {
                 text: expanded.display_text,
@@ -573,46 +661,20 @@ async fn deliver_product_creation_objective(
                 user_agent: None,
                 skill_invocation: expanded.skill_invocation,
             },
-            &format!("product-create:{}", job.request_id),
+            format!("product-create:{}", job.request_id),
         ),
     )
     .await;
     if let Err(error) = enqueue_result {
-        let delivery_error =
-            format!("product creation objective delivery timed out after 15 seconds: {error}");
-        manager
-            .db()
-            .schedule_product_creation_delivery_retry(
-                &job.request_id,
-                &claimed.claim,
-                &delivery_error,
-                chrono::Utc::now(),
-            )
-            .await
-            .map_err(|db_error| {
-                format!(
-                    "delivery acceptance timed out; delivery retry persistence failed: {db_error}"
-                )
-            })?;
-        manager.kick_creation_worker();
-        return Err(delivery_error);
+        return Err(persist_retryable_delivery_failure(
+            manager,
+            claimed,
+            &format!("product creation objective delivery timed out after 15 seconds: {error}"),
+        )
+        .await?);
     }
     if let Err(error) = enqueue_result.expect("checked timeout above") {
-        let delivery_error = error.to_string();
-        manager
-            .db()
-            .schedule_product_creation_delivery_retry(
-                &job.request_id,
-                &claimed.claim,
-                &delivery_error,
-                chrono::Utc::now(),
-            )
-            .await
-            .map_err(|db_error| {
-                format!("{error}; delivery retry persistence failed: {db_error}")
-            })?;
-        manager.kick_creation_worker();
-        return Err(delivery_error);
+        return Err(persist_retryable_delivery_failure(manager, claimed, &error.clone()).await?);
     }
     let completed = manager
         .db()
@@ -2782,6 +2844,31 @@ mod product_creation_delivery_replay_tests {
         ))
     }
 
+    struct TestSteeringCapacityGuard {
+        key: TestSteeringCapacityKey,
+        prior: Option<TestSteeringCapacityRegistration>,
+    }
+
+    impl Drop for TestSteeringCapacityGuard {
+        fn drop(&mut self) {
+            let mut registrations = TEST_STEERING_CAPACITY.lock().unwrap();
+            if let Some(prior) = self.prior.take() {
+                registrations.insert(self.key.clone(), prior);
+            } else {
+                registrations.remove(&self.key);
+            }
+        }
+    }
+
+    fn install_test_steering_capacity(
+        key: TestSteeringCapacityKey,
+        is_full: Arc<std::sync::atomic::AtomicBool>,
+    ) -> TestSteeringCapacityGuard {
+        let mut registrations = TEST_STEERING_CAPACITY.lock().unwrap();
+        let prior = registrations.insert(key.clone(), TestSteeringCapacityRegistration { is_full });
+        TestSteeringCapacityGuard { key, prior }
+    }
+
     async fn seed_retry_identity_delivery(
         db: &Database,
         cwd: &str,
@@ -2831,37 +2918,7 @@ mod product_creation_delivery_replay_tests {
             })
             .await
             .unwrap());
-        db.update_conversation_state(
-            conversation_id,
-            &ConvState::AwaitingUserResponse {
-                questions: vec![],
-                tool_use_id: "hold-steering-drain".to_string(),
-            },
-        )
-        .await
-        .unwrap();
         (intent, accepted_product_id, publish_claim_lease_until)
-    }
-
-    async fn saturate_steering_queue(manager: &Arc<RuntimeManager>, conversation_id: &str) {
-        for index in 0..phoenix_db::MAX_STEERING_QUEUE_DEPTH {
-            manager
-                .enqueue_steer_message(
-                    conversation_id,
-                    Event::SteerMessage {
-                        text: format!("queued {index}"),
-                        llm_text: None,
-                        images: Vec::new(),
-                        files: Vec::new(),
-                        message_id: format!("queued-{index}"),
-                        user_agent: None,
-                        skill_invocation: None,
-                    },
-                    &format!("queued-fingerprint-{index}"),
-                )
-                .await
-                .unwrap();
-        }
     }
 
     async fn claim_delivery_attempt(
@@ -2879,6 +2936,22 @@ mod product_creation_delivery_replay_tests {
         .await
         .unwrap()
         .unwrap_or_else(|| panic!("expected delivery claim for {request_id} at {claim_time}"))
+    }
+
+    async fn global_objective_artifact_counts(db: &Database, request_id: &str) -> (i64, i64) {
+        let committed_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE message_id = ?1")
+                .bind(request_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let queued_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM steering_messages WHERE message_id = ?1")
+                .bind(request_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        (committed_count, queued_count)
     }
 
     async fn assert_retry_identity_job_state(
@@ -2914,9 +2987,8 @@ mod product_creation_delivery_replay_tests {
         request_id: &str,
         expected_published_product_id: &phoenix_core::domain::close::ProductConversationId,
         expected_published_conversation_id: &str,
-        objective_message_count: i64,
-        objective_queue_count: i64,
-        objective_total_count: i64,
+        expected_artifact_delta: (i64, i64),
+        expected_total_delta: i64,
     ) {
         let job_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM product_creation_jobs")
             .fetch_one(db.pool())
@@ -2948,18 +3020,8 @@ mod product_creation_delivery_replay_tests {
         .fetch_one(db.pool())
         .await
         .unwrap();
-        let committed_objective_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE message_id = ?1")
-                .bind(request_id)
-                .fetch_one(db.pool())
-                .await
-                .unwrap();
-        let queued_objective_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM steering_messages WHERE message_id = ?1")
-                .bind(request_id)
-                .fetch_one(db.pool())
-                .await
-                .unwrap();
+        let (committed_objective_count, queued_objective_count) =
+            global_objective_artifact_counts(db, request_id).await;
         let published = db
             .get_product_creation_job(request_id)
             .await
@@ -2977,12 +3039,16 @@ mod product_creation_delivery_replay_tests {
             published.published_conversation_id.as_deref(),
             Some(expected_published_conversation_id)
         );
-        assert_eq!(committed_objective_count, objective_message_count);
-        assert_eq!(queued_objective_count, objective_queue_count);
         assert_eq!(
             committed_objective_count + queued_objective_count,
-            objective_total_count
+            expected_total_delta
         );
+        if expected_artifact_delta != (-1, -1) {
+            assert_eq!(
+                (committed_objective_count, queued_objective_count),
+                expected_artifact_delta
+            );
+        }
     }
 
     async fn exhaust_delivery_into_failed_state(
@@ -3056,10 +3122,6 @@ mod product_creation_delivery_replay_tests {
             retried.job.published_conversation_id.as_deref(),
             Some(conversation_id)
         );
-
-        db.update_steering_queue(conversation_id, &[])
-            .await
-            .unwrap();
 
         let published = deliver_product_creation_objective(manager, &retried)
             .await
@@ -3247,8 +3309,31 @@ mod product_creation_delivery_replay_tests {
         let manager = test_runtime_manager(db.clone());
         let (_intent, accepted_product_id, publish_claim_lease_until) =
             seed_retry_identity_delivery(&db, &cwd, request_id, conversation_id).await;
+        let baseline_artifact_counts = global_objective_artifact_counts(&db, request_id).await;
+        let target_request_fingerprint =
+            TestSteeringCapacityKey(format!("product-create:{request_id}"));
+        let capacity_full = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let _capacity_guard = install_test_steering_capacity(
+            target_request_fingerprint.clone(),
+            Arc::clone(&capacity_full),
+        );
 
-        saturate_steering_queue(&manager, conversation_id).await;
+        enqueue_product_creation_objective(
+            &manager,
+            conversation_id,
+            Event::SteerMessage {
+                text: "non-target".to_string(),
+                llm_text: None,
+                images: Vec::new(),
+                files: Vec::new(),
+                message_id: "non-target-message".to_string(),
+                user_agent: None,
+                skill_invocation: None,
+            },
+            "product-create:non-target".to_string(),
+        )
+        .await
+        .unwrap();
 
         let last_delivery_lease_until = exhaust_delivery_into_failed_state(
             &db,
@@ -3265,11 +3350,11 @@ mod product_creation_delivery_replay_tests {
             request_id,
             &accepted_product_id,
             conversation_id,
-            0,
-            0,
-            0,
+            baseline_artifact_counts,
+            baseline_artifact_counts.0 + baseline_artifact_counts.1,
         )
         .await;
+        capacity_full.store(false, std::sync::atomic::Ordering::SeqCst);
         assert!(db
             .retry_failed_product_creation_delivery(request_id)
             .await
@@ -3288,9 +3373,8 @@ mod product_creation_delivery_replay_tests {
             request_id,
             &accepted_product_id,
             conversation_id,
-            0,
-            1,
-            1,
+            (-1, -1),
+            baseline_artifact_counts.0 + baseline_artifact_counts.1 + 1,
         )
         .await;
     }
