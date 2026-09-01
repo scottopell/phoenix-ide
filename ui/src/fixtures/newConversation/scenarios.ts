@@ -48,7 +48,7 @@ export const newConversationScenarios = [
         published_product_conversation_id: null,
         llm_language: 'English',
         images: [],
-        allowed_actions: ['retry_delivery', 'delete', 'start_over'],
+        allowed_actions: ['retry_delivery'],
         last_error: 'The worktree was created, but publishing the product conversation route failed.',
       },
       {
