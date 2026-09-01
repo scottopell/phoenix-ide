@@ -58,6 +58,7 @@ final class ConversationSession {
     private var inFlight: Set<String> = []
     private var retryDelay: TimeInterval = 1
     private var onConversationUpdate: ((Conversation) -> Void)?
+    private var onSessionEvent: ((ProductConversationSessionEvent) -> Void)?
     private var onHardDeleted: (String) -> Void
     private var viewIsActive = false
     private var replayFromPendingAnchor = false
@@ -174,6 +175,10 @@ final class ConversationSession {
         drainOutbox()
     }
 
+    func setSessionEventObserver(_ observer: ((ProductConversationSessionEvent) -> Void)?) {
+        onSessionEvent = observer
+    }
+
     func adoptOpenOwnership(
         onConversationUpdate: @escaping (Conversation) -> Void,
         onHardDeleted: @escaping (String) -> Void
@@ -212,6 +217,7 @@ final class ConversationSession {
         staleCheckTask?.cancel()
         staleCheckTask = nil
         connection = .idle
+        onSessionEvent?(.connectionChanged(.idle))
         persistSnapshot()
     }
 
@@ -251,6 +257,7 @@ final class ConversationSession {
         staleCheckTask?.cancel()
         staleCheckTask = nil
         connection = .offline
+        onSessionEvent?(.connectionChanged(.offline))
     }
 
     private func snapshotForPersistence(authoritative: Bool) -> Snapshot {
@@ -347,19 +354,23 @@ final class ConversationSession {
         }
         guard await outbox.enqueue(text: trimmed, images: images) != nil else {
             lastErrorToast = "Message could not be saved on this device. Free storage and try again."
+            onSessionEvent?(.errorToastChanged(lastErrorToast))
             return false
         }
         drainOutbox()
+        onSessionEvent?(.outboxChanged)
         return true
     }
 
     func retryEntry(_ localId: String) {
         outbox.retry(localId)
         drainOutbox()
+        onSessionEvent?(.outboxChanged)
     }
 
     func dismissEntry(_ localId: String) async {
         await outbox.dismiss(localId)
+        onSessionEvent?(.outboxChanged)
     }
 
     func beginArchiving() -> Bool {
@@ -445,6 +456,7 @@ final class ConversationSession {
         case .onlineOnly:
             guard connectivity.isOnline else {
                 lastErrorToast = "This action needs a connection — it can't be queued."
+                onSessionEvent?(.errorToastChanged(lastErrorToast))
                 return
             }
         case .outboxed:
@@ -484,12 +496,14 @@ final class ConversationSession {
                 actionAttempt = nil
                 lastErrorToast = (error as? APIError)?.errorDescription
                     ?? error.localizedDescription
+                onSessionEvent?(.errorToastChanged(lastErrorToast))
             }
         }
     }
 
     func clearErrorToast() {
         lastErrorToast = nil
+        onSessionEvent?(.errorToastChanged(nil))
     }
 
     // MARK: - Stream lifecycle
@@ -536,9 +550,11 @@ final class ConversationSession {
             }
 
             connection = .connecting
+            onSessionEvent?(.connectionChanged(.connecting))
             do {
                 let (bytes, _) = try await api.openStream(conversationId: conversationId)
                 connection = .live
+                onSessionEvent?(.connectionChanged(.live))
                 for try await event in Self.decodedEvents(from: bytes) {
                     if Task.isCancelled { return }
                     receive(event)
@@ -553,13 +569,17 @@ final class ConversationSession {
                 }
                 if case .certificatePinMismatch = error {
                     lastErrorToast = error.errorDescription
+                    onSessionEvent?(.errorToastChanged(lastErrorToast))
                     connection = .idle
+                    onSessionEvent?(.connectionChanged(.idle))
                     return
                 }
                 if error.isPermanentStreamAuthenticationFailure {
                     streamBlockedUntilConfigurationChange = true
                     lastErrorToast = error.errorDescription
+                    onSessionEvent?(.errorToastChanged(lastErrorToast))
                     connection = .idle
+                    onSessionEvent?(.connectionChanged(.idle))
                     return
                 }
             } catch {
@@ -569,6 +589,7 @@ final class ConversationSession {
             persistSnapshot()
             let jitter = Double.random(in: 0...0.3) * retryDelay
             connection = .waitingToRetry(nextAttempt: Date().addingTimeInterval(retryDelay + jitter))
+            onSessionEvent?(.connectionChanged(connection))
             try? await Task.sleep(for: .seconds(retryDelay + jitter))
             retryDelay = min(retryDelay * 2, 30)
         }
@@ -639,8 +660,13 @@ final class ConversationSession {
             }
             lastSequenceId = max(lastSequenceId, snap.lastSequenceId)
             rebuildToolUseIndex()
+            onSessionEvent?(.messagesChanged)
             if let conversation {
                 onConversationUpdate?(conversation)
+                emitAggregateTopologyInvalidationIfNeeded(
+                    previousConversation: nil,
+                    previousState: .unknown,
+                    conversation: conversation)
             }
             // Persist the authoritative snapshot BEFORE reconciling: the
             // outbox prune must never become durable while the message
@@ -675,14 +701,21 @@ final class ConversationSession {
                let messageDate = message.createdAtDate,
                var conversation,
                conversation.updatedAtDate.map({ messageDate > $0 }) ?? true {
+                let previousConversation = self.conversation
+                let previousState = typedState
                 conversation.updated_at = createdAt
                 self.conversation = conversation
                 onConversationUpdate?(conversation)
+                emitAggregateTopologyInvalidationIfNeeded(
+                    previousConversation: previousConversation,
+                    previousState: previousState,
+                    conversation: conversation)
             }
             if message.message_type == "agent" {
                 streamingText = ""
                 streamingRequestId = nil
                 rebuildToolUseIndex()
+                onSessionEvent?(.messagesChanged)
             }
             // Snapshot before outbox prune — see the init branch.
             persistSnapshot(authoritative: true, reconcileOutboxOnSuccess: true)
@@ -733,6 +766,8 @@ final class ConversationSession {
             cancelNeedsAgentDoneFallback = false
             if let mode { presentationMode = mode }
             if var conversation {
+                let previousConversation = self.conversation
+                let previousState = typedState
                 conversation.state = state
                 if let stateUpdatedAt { conversation.state_updated_at = stateUpdatedAt }
                 if let mode {
@@ -742,6 +777,10 @@ final class ConversationSession {
                 self.conversation = conversation
                 persistSnapshot(authoritative: true)
                 onConversationUpdate?(conversation)
+                emitAggregateTopologyInvalidationIfNeeded(
+                    previousConversation: previousConversation,
+                    previousState: previousState,
+                    conversation: conversation)
             }
             clearResolvedActionIfStateAdvanced(
                 currentState: ConversationState.parse(state))
@@ -794,6 +833,8 @@ final class ConversationSession {
                 actionAttempt = nil
             }
             if shouldMoveToIdle {
+                let previousConversation = conversation
+                let previousState = typedState
                 conversation?.state = .string("idle")
                 // The mode must move with the state, or the snapshot
                 // persists idle-with-working-mode and a cold reopen seeds
@@ -801,7 +842,13 @@ final class ConversationSession {
                 presentationMode = "idle"
                 conversation?.presentation_mode = "idle"
                 conversation?.requires_action = false
-                if let conversation { onConversationUpdate?(conversation) }
+                if let conversation {
+                    onConversationUpdate?(conversation)
+                    emitAggregateTopologyInvalidationIfNeeded(
+                        previousConversation: previousConversation,
+                        previousState: previousState,
+                        conversation: conversation)
+                }
             }
             // Turn boundary: steering-queued entries should now be in
             // history; also a natural moment to send anything pending.
@@ -818,6 +865,8 @@ final class ConversationSession {
             // conversation — this event exists precisely so clients don't
             // need a reconnect to see it.
             if var conv = conversation {
+                let previousConversation = conversation
+                let previousState = typedState
                 if let v = update["cwd"]?.stringValue { conv.cwd = v }
                 if let v = update["branch_name"]?.stringValue { conv.branch_name = v }
                 if let v = update["task_title"]?.stringValue { conv.task_title = v }
@@ -829,6 +878,10 @@ final class ConversationSession {
                 conversation = conv
                 persistSnapshot(authoritative: true)
                 onConversationUpdate?(conv)
+                emitAggregateTopologyInvalidationIfNeeded(
+                    previousConversation: previousConversation,
+                    previousState: previousState,
+                    conversation: conv)
             }
 
         case .steerMessageQueued(let seq, let messageId):
@@ -838,6 +891,7 @@ final class ConversationSession {
         case .errorEvent(let seq, let message, let retryable):
             guard applyIfNewer(seq) else { return }
             lastErrorToast = message
+            onSessionEvent?(.errorToastChanged(lastErrorToast))
             if retryable, actionAttempt?.action.waitsForAuthoritativeStateChange == true {
                 actionAttempt = nil
             }
@@ -1080,6 +1134,35 @@ final class ConversationSession {
                 ).map(\.message_id)))
     }
 
+    private func emitAggregateTopologyInvalidationIfNeeded(
+        previousConversation: Conversation?,
+        previousState: ConversationState,
+        conversation: Conversation
+    ) {
+        let currentState = typedState
+        if previousConversation?.aggregateIdentity != conversation.aggregateIdentity,
+           let previousAggregateIdentity = previousConversation?.aggregateIdentity {
+            onSessionEvent?(
+                .aggregateTopologyInvalidated(
+                    ProductConversationTopologyInvalidation(
+                        transcriptRowId: conversation.transcriptRowIdentity,
+                        aggregateIdentity: conversation.aggregateIdentity,
+                        reason: .aggregateIdentityChanged(
+                            previous: previousAggregateIdentity,
+                            current: conversation.aggregateIdentity))))
+            return
+        }
+        guard previousState != currentState,
+              let reason = currentState.productConversationTopologyInvalidationReason
+        else { return }
+        onSessionEvent?(
+            .aggregateTopologyInvalidated(
+                ProductConversationTopologyInvalidation(
+                    transcriptRowId: conversation.transcriptRowIdentity,
+                    aggregateIdentity: conversation.aggregateIdentity,
+                    reason: reason)))
+    }
+
     private func rebuildToolUseIndex() {
         var index: [String: ToolUseRef] = [:]
         for message in messages where message.message_type == "agent" {
@@ -1092,6 +1175,7 @@ final class ConversationSession {
             }
         }
         toolUseIndex = index
+        onSessionEvent?(.messagesChanged)
     }
 }
 

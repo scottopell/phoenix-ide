@@ -15,7 +15,9 @@ final class ProductConversationDetailModelTests: XCTestCase {
     private func snapshot(
         lifecycle: ProductConversationOrdinaryLifecycle = .open,
         latest: String = "row-2",
-        writable: String? = "row-2"
+        writable: String? = "row-2",
+        before: String? = nil,
+        hasOlder: Bool = false
     ) -> ProductConversationSnapshot {
         ProductConversationSnapshot(
             product_conversation_id: "pc-1",
@@ -69,8 +71,8 @@ final class ProductConversationDetailModelTests: XCTestCase {
                     ],
                     handoff: nil),
             ],
-            before: nil,
-            has_older: false)
+            before: before,
+            has_older: hasOlder)
     }
 
     func testPrefersWritableTranscriptSessionWithoutRetargetingExistingSessions() {
@@ -88,62 +90,33 @@ final class ProductConversationDetailModelTests: XCTestCase {
                 }
             })
 
-        model.apply(snapshot: snapshot())
+        model.applyForTesting(snapshot())
 
         XCTAssertTrue(model.actionSession === row2)
         XCTAssertEqual(model.actionTranscriptRowId, "row-2")
         XCTAssertEqual(row2.conversationId, "row-2")
     }
 
-    func testRebindSelectsNewWritableTranscriptSession() async {
-        let row1 = makeSession(id: "row-1")
+    func testHistoryOnlyDisablesGlobalMutationsButOpenWithoutWritableStillAllowsLifecycleActions() {
         let row2 = makeSession(id: "row-2")
-        let row3 = makeSession(id: "row-3")
-        let model = ProductConversationDetailModel(
-            aggregateId: "pc-1",
-            api: makeAPI(),
-            connectivity: ConnectivityMonitor(),
-            sessionProvider: { id in
-                switch id {
-                case "row-1": row1
-                case "row-2": row2
-                case "row-3": row3
-                default: nil
-                }
-            })
-
-        await model.start()
-        model.apply(snapshot: snapshot())
-        XCTAssertTrue(model.actionSession === row2)
-
-        var rebound = snapshot(latest: "row-3", writable: "row-3")
-        rebound.segments.append(
-            .init(
-                segment_ordinal: 2,
-                transcript_row_id: "row-3",
-                slug: "third",
-                title: "Third",
-                messages: [],
-                handoff: nil))
-        model.apply(snapshot: rebound)
-
-        XCTAssertTrue(model.actionSession === row3)
-        XCTAssertEqual(model.actionTranscriptRowId, "row-3")
-    }
-
-    func testHistoryIsReadOnlyAndUsesNoOutboxOwner() {
-        let row2 = makeSession(id: "row-2")
+        row2.receive(.initSnapshot(.init(
+            conversation: try! conversation(id: "row-2", state: "{\"type\":\"needs_input\",\"task_kind\":\"edit\"}"),
+            messages: [], agentWorking: false, presentationMode: "needs_action", lastSequenceId: 1,
+            pendingAnchorSequenceId: 1, pendingEvents: [], pendingTruncated: false)))
         let model = ProductConversationDetailModel(
             aggregateId: "pc-1",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
             sessionProvider: { id in id == "row-2" ? row2 : nil })
 
-        model.apply(snapshot: snapshot(lifecycle: .history, writable: nil))
+        model.applyForTesting(snapshot(lifecycle: .open, writable: nil))
+        XCTAssertFalse(model.canSendChat)
+        XCTAssertFalse(model.isHistoryReadOnly)
+        XCTAssertTrue(model.canMutateLifecycle)
 
-        XCTAssertTrue(model.isReadOnly)
-        XCTAssertTrue(model.stateDetailSession === row2)
-        XCTAssertTrue(model.actionSession === row2)
+        model.applyForTesting(snapshot(lifecycle: .history, writable: nil))
+        XCTAssertTrue(model.isHistoryReadOnly)
+        XCTAssertFalse(model.canMutateLifecycle)
     }
 
     func testComposedMessagesPreserveSegmentBoundaryOrderWhenSequenceResets() {
@@ -153,13 +126,11 @@ final class ProductConversationDetailModelTests: XCTestCase {
             connectivity: ConnectivityMonitor(),
             sessionProvider: { _ in nil })
 
-        model.apply(snapshot: snapshot())
+        model.applyForTesting(snapshot())
 
         let items = model.transcriptItems
         XCTAssertEqual(items.count, 3)
         XCTAssertEqual(items.map(\.debugLabel), ["message:m-1", "handoff:summary", "message:m-2"])
-        XCTAssertEqual(model.segments.map(\.transcript_row_id), ["row-1", "row-2"])
-        XCTAssertEqual(model.segments[0].handoff?.summaryText, "summary")
     }
 
     func testSelectingHistoricalSegmentDoesNotMoveWritableDelegate() {
@@ -169,20 +140,301 @@ final class ProductConversationDetailModelTests: XCTestCase {
             aggregateId: "pc-1",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
-            sessionProvider: { id in
-                switch id {
-                case "row-1": row1
-                case "row-2": row2
-                default: nil
-                }
-            })
+            sessionProvider: { id in id == "row-1" ? row1 : (id == "row-2" ? row2 : nil) })
 
-        model.apply(snapshot: snapshot())
+        model.applyForTesting(snapshot())
         model.selectTranscriptRow(id: "row-1")
 
         XCTAssertEqual(model.selectedTranscriptRowId, "row-1")
         XCTAssertEqual(model.actionTranscriptRowId, "row-2")
         XCTAssertTrue(model.actionSession === row2)
+    }
+
+    func testLiveOverlayReplacesByIdentityAndSuppressesBoundaryContinuation() {
+        let row2 = makeSession(id: "row-2")
+        row2.receive(.initSnapshot(.init(
+            conversation: try! conversation(id: "row-2"),
+            messages: [
+                .init(message_id: "m-2", conversation_id: "row-2", sequence_id: 1, message_type: "agent", content: .object(["text": .string("after-live")]), display_data: nil, created_at: "2025-01-02T03:04:07Z"),
+                .init(message_id: "m-cont", conversation_id: "row-2", sequence_id: 2, message_type: "user", content: .object(["text": .string("suppressed")]), display_data: nil, created_at: "2025-01-02T03:04:08Z")
+            ], agentWorking: false, presentationMode: "working", lastSequenceId: 2,
+            pendingAnchorSequenceId: 2, pendingEvents: [], pendingTruncated: false)))
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-1",
+            api: makeAPI(),
+            connectivity: ConnectivityMonitor(),
+            sessionProvider: { id in id == "row-2" ? row2 : nil })
+
+        model.applyForTesting(snapshot())
+        let labels = model.transcriptItems.map(\.debugLabel)
+        XCTAssertEqual(labels, ["message:m-1", "handoff:summary", "message:m-2"])
+    }
+
+    func testToolUseIndexIncludesHistoricalToolUseBlocksAcrossSegments() {
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-1",
+            api: makeAPI(),
+            connectivity: ConnectivityMonitor(),
+            sessionProvider: { _ in nil })
+        var snap = snapshot()
+        snap.segments[0].messages = [
+            .init(message_id: "tool-msg", conversation_id: "row-1", sequence_id: 4, message_type: "agent", content: .array([
+                .object(["type": .string("tool_use"), "id": .string("tu-1"), "name": .string("read_file"), "input": .object(["path": .string("a")])]),
+                .object(["type": .string("tool_result"), "tool_use_id": .string("tu-1"), "content": .string("ok")])
+            ]), display_data: nil, created_at: "2025-01-02T03:04:05Z")
+        ]
+
+        model.applyForTesting(snap)
+
+        XCTAssertEqual(model.composedToolUseIndex["tu-1"]?.name, "read_file")
+    }
+
+    func testOutboxProjectionIncludesPredecessorEntriesWithOwningSession() async {
+        let connectivity = ConnectivityMonitor()
+        connectivity.setOnlineForTesting(false)
+        let row1 = ConversationSession(conversationId: "row-1", api: makeAPI(), connectivity: connectivity)
+        let row2 = ConversationSession(conversationId: "row-2", api: makeAPI(), connectivity: connectivity)
+        row1.receive(.initSnapshot(.init(
+            conversation: try! conversation(id: "row-1"),
+            messages: [], agentWorking: false, presentationMode: "idle", lastSequenceId: 1,
+            pendingAnchorSequenceId: 1, pendingEvents: [], pendingTruncated: false)))
+        _ = await row1.send(text: "pending predecessor")
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-1",
+            api: makeAPI(),
+            connectivity: ConnectivityMonitor(),
+            sessionProvider: { id in id == "row-1" ? row1 : (id == "row-2" ? row2 : nil) },
+            existingSession: { id in id == "row-1" ? row1 : (id == "row-2" ? row2 : nil) })
+
+        model.applyForTesting(snapshot())
+
+        XCTAssertEqual(model.outboxProjections.count, 1)
+        XCTAssertEqual(model.outboxProjections[0].transcriptRowId, "row-1")
+        XCTAssertTrue(({ if case .interactive(let session) = model.outboxProjections[0].actionPolicy { session === row1 } else { false } })())
+    }
+
+    func testTopologyInvalidationBurstUsesSingleFlightCoalescingWithoutSleep() async {
+        final class Counter {
+            var refreshCalls = 0
+            weak var model: ProductConversationDetailModel?
+        }
+        let counter = Counter()
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-1",
+            api: makeAPI(),
+            connectivity: ConnectivityMonitor(),
+            sessionProvider: { _ in nil },
+            loadSnapshot: { _, _ in self.snapshot() },
+            didStartRefresh: { cause in
+                _ = cause
+                counter.refreshCalls += 1
+                if counter.refreshCalls == 1 {
+                    counter.model?.invalidateAggregateTopologyForTesting(
+                        ProductConversationTopologyInvalidation(
+                            transcriptRowId: "row-2",
+                            aggregateIdentity: "pc-1",
+                            reason: .awaitingContinuation))
+                    counter.model?.invalidateAggregateTopologyForTesting(
+                        ProductConversationTopologyInvalidation(
+                            transcriptRowId: "row-2",
+                            aggregateIdentity: "pc-1",
+                            reason: .handedOff(successorConversationId: "row-3")))
+                }
+            })
+        counter.model = model
+
+        model.invalidateAggregateTopologyForTesting(
+            ProductConversationTopologyInvalidation(
+                transcriptRowId: "row-2",
+                aggregateIdentity: "pc-1",
+                reason: .contextExhausted))
+
+        while counter.refreshCalls < 2 { await Task.yield() }
+        XCTAssertEqual(counter.refreshCalls, 2)
+    }
+
+    func testRepeatedIdenticalInvalidationDoesNotRequireMoreThanOneFollowupRefresh() async {
+        final class Counter { var refreshCalls = 0 }
+        let counter = Counter()
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-1",
+            api: makeAPI(),
+            connectivity: ConnectivityMonitor(),
+            sessionProvider: { _ in nil },
+            loadSnapshot: { _, _ in self.snapshot() },
+            didStartRefresh: { _ in counter.refreshCalls += 1 })
+
+        let invalidation = ProductConversationTopologyInvalidation(
+            transcriptRowId: "row-2",
+            aggregateIdentity: "pc-1",
+            reason: .awaitingContinuation)
+        model.invalidateAggregateTopologyForTesting(invalidation)
+        model.invalidateAggregateTopologyForTesting(invalidation)
+
+        while counter.refreshCalls < 1 { await Task.yield() }
+        XCTAssertEqual(counter.refreshCalls, 1)
+    }
+
+    func testAggregateSnapshotAuthorityWinsOverHandoffHintForSuccessorRebind() {
+        let row2 = makeSession(id: "row-2")
+        let row4 = makeSession(id: "row-4")
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-1",
+            api: makeAPI(),
+            connectivity: ConnectivityMonitor(),
+            sessionProvider: { id in id == "row-2" ? row2 : (id == "row-4" ? row4 : nil) })
+
+        model.handleSessionEvent(
+            transcriptRowId: "row-2",
+            generation: 0,
+            event: ProductConversationSessionEvent.aggregateTopologyInvalidated(
+                ProductConversationTopologyInvalidation(
+                    transcriptRowId: "row-2",
+                    aggregateIdentity: "pc-1",
+                    reason: .handedOff(successorConversationId: "row-3"))))
+        model.applyForTesting(snapshot(latest: "row-4", writable: "row-4"))
+
+        XCTAssertEqual(model.actionTranscriptRowId, "row-4")
+        XCTAssertTrue(model.actionSession === row4)
+    }
+
+    func testPaginationAdvancesCursorFromOlderPage() async {
+        let pages = [
+            snapshot(before: "cursor-1", hasOlder: true),
+            snapshot(before: "cursor-2", hasOlder: false),
+        ]
+        final class Box { var calls: [String?] = [] ; var index = 0 }
+        let box = Box()
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-1",
+            api: makeAPI(),
+            connectivity: ConnectivityMonitor(),
+            sessionProvider: { _ in nil },
+            loadSnapshot: { _, before in
+                box.calls.append(before)
+                defer { box.index += 1 }
+                return pages[min(box.index, pages.count - 1)]
+            })
+
+        await model.refresh(cause: .manual)
+        XCTAssertEqual(model.olderCursor, "cursor-1")
+        await model.loadOlder()
+        XCTAssertEqual(box.calls, [nil, "cursor-1"])
+        XCTAssertEqual(model.olderCursor, "cursor-2")
+        XCTAssertFalse(model.hasOlder)
+    }
+
+    func testHistoryDoesNotCreateSessionsForLatestOrSelectionWithoutExistingSession() {
+        final class Counter { var created: [String] = [] }
+        let counter = Counter()
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-1",
+            api: makeAPI(),
+            connectivity: ConnectivityMonitor(),
+            sessionProvider: { id in counter.created.append(id); return self.makeSession(id: id) })
+
+        model.applyForTesting(snapshot(lifecycle: .history, writable: nil))
+        _ = model.stateDetailSession
+        _ = model.selectedTranscriptSession
+
+        XCTAssertTrue(counter.created.isEmpty)
+    }
+
+    func testOpenWithoutWritableUsesLatestSessionForActionsButNotChat() {
+        let latest = makeSession(id: "row-2")
+        latest.receive(.initSnapshot(.init(
+            conversation: try! conversation(id: "row-2", state: "{\"type\":\"needs_input\",\"task_kind\":\"edit\"}"),
+            messages: [], agentWorking: false, presentationMode: "needs_action", lastSequenceId: 1,
+            pendingAnchorSequenceId: 1, pendingEvents: [], pendingTruncated: false)))
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-1",
+            api: makeAPI(),
+            connectivity: ConnectivityMonitor(),
+            sessionProvider: { id in id == "row-2" ? latest : nil },
+            existingSession: { id in id == "row-2" ? latest : nil })
+
+        model.applyForTesting(snapshot(lifecycle: .open, writable: nil))
+
+        XCTAssertFalse(model.canSendChat)
+        XCTAssertTrue(model.canMutateLifecycle)
+        XCTAssertTrue(model.stateDetailSession === latest)
+    }
+
+    func testAggregateIdentityInvalidatesBothOldAndNewOwners() {
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-old",
+            api: makeAPI(),
+            connectivity: ConnectivityMonitor(),
+            sessionProvider: { _ in nil })
+
+        XCTAssertTrue(model.invalidatesAggregateForTesting(.init(
+            transcriptRowId: "row-2",
+            aggregateIdentity: "pc-new",
+            reason: .aggregateIdentityChanged(previous: "pc-old", current: "pc-new"))))
+    }
+
+    func testLateCancelledLoadCannotClearNewFlight() async {
+        final class Gate {
+            var firstStarted = false
+            var firstCanFinish = false
+            var secondCount = 0
+        }
+        let gate = Gate()
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-1",
+            api: makeAPI(),
+            connectivity: ConnectivityMonitor(),
+            sessionProvider: { _ in nil },
+            loadSnapshot: { _, _ in
+                if !gate.firstStarted {
+                    gate.firstStarted = true
+                    while !gate.firstCanFinish { await Task.yield() }
+                    return self.snapshot(latest: "row-2", writable: "row-2")
+                }
+                gate.secondCount += 1
+                return self.snapshot(latest: "row-3", writable: "row-3")
+            })
+
+        Task { await model.refresh(cause: .manual) }
+        while !gate.firstStarted { await Task.yield() }
+        model.stop()
+        Task { await model.refresh(cause: .manual) }
+        gate.firstCanFinish = true
+        while gate.secondCount < 1 { await Task.yield() }
+        XCTAssertEqual(model.latestTranscriptRowId, "row-3")
+    }
+
+    func testLoadOlderThenRefreshPreservesDeepestCursor() async {
+        let initial = snapshot(before: "cursor-1", hasOlder: true)
+        let older = snapshot(before: "cursor-2", hasOlder: true)
+        let refreshed = snapshot(before: "cursor-1", hasOlder: true)
+        final class Box { var calls: [String?] = [] ; var index = 0 }
+        let box = Box()
+        let responses = [initial, older, refreshed]
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-1",
+            api: makeAPI(),
+            connectivity: ConnectivityMonitor(),
+            sessionProvider: { _ in nil },
+            loadSnapshot: { _, before in
+                box.calls.append(before)
+                defer { box.index += 1 }
+                return responses[min(box.index, responses.count - 1)]
+            })
+
+        await model.refresh(cause: .manual)
+        await model.loadOlder()
+        await model.refresh(cause: .manual)
+
+        XCTAssertEqual(box.calls, [nil, "cursor-1", nil])
+        XCTAssertEqual(model.olderCursor, "cursor-2")
+        XCTAssertTrue(model.hasOlder)
+    }
+
+    private func conversation(id: String, state: String = "{\"type\":\"idle\"}") throws -> Conversation {
+        try JSONDecoder().decode(
+            Conversation.self,
+            from: Data("{\"id\":\"\(id)\",\"slug\":\"\(id)\",\"product_conversation_id\":\"pc-1\",\"state\":\(state)}".utf8))
     }
 }
 
