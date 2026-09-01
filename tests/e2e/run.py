@@ -1102,38 +1102,19 @@ def scenario_continuation(base_url: str) -> None:
     text = _agent_text(final["messages"])
     assert "analyzed the situation" in text, "first turn's assistant text missing"
     assert "## Analysis" in text, "second turn's assistant text missing"
-    _assert_next_chat_is_accepted(base_url, conv["id"])
-
-
-def scenario_continuation(base_url: str) -> None:
-    conv = _new_conv(base_url, "[[scenario:plain_text]] one")
-    _poll_to_idle_with_messages(
+    third_turn_message_count = _send_chat_and_stream(
         base_url,
         conv["id"],
-        lambda messages: "analyzed the situation" in _agent_text(messages),
-        "first-turn response",
-        timeout=SCENARIO_TIMEOUT_SECONDS,
-    )
-    second_turn_message_count = _send_chat_and_stream(
-        base_url,
-        conv["id"],
-        "[[scenario:markdown]] two",
+        "[[scenario:plain_text]] three",
         SCENARIO_TIMEOUT_SECONDS,
     )
     _poll_to_idle_with_messages(
         base_url,
         conv["id"],
-        lambda messages: len(messages) >= second_turn_message_count,
-        "second-turn idle completion",
+        lambda messages: len(messages) >= third_turn_message_count,
+        "third-turn idle completion",
         timeout=SCENARIO_TIMEOUT_SECONDS,
     )
-    final = _get_conv(base_url, conv["id"])
-    users = _user_messages(final["messages"])
-    assert len(users) >= 2, f"expected at least 2 user messages, got {len(users)}"
-    text = _agent_text(final["messages"])
-    assert "analyzed the situation" in text, "first turn's assistant text missing"
-    assert "## Analysis" in text, "second turn's assistant text missing"
-    _assert_next_chat_is_accepted(base_url, conv["id"])
 
 
 def scenario_product_conversation_context_continuation(base_url: str) -> None:
@@ -1414,24 +1395,6 @@ def scenario_perf_stream(base_url: str) -> None:
     text = _agent_text(final["messages"])
     word_count = len(text.split())
     assert word_count == n, f"expected {n} words from perf stream, got {word_count}"
-
-
-SCENARIOS = [
-    ("list_models", scenario_list_models),
-    ("text_streaming", scenario_text_streaming),
-    ("multi_tool", scenario_multi_tool),
-    ("think_tool", scenario_think_tool),
-    ("read_file", scenario_read_file),
-    ("patch", scenario_patch),
-    ("continuation", scenario_continuation),
-    (
-        "product_conversation_context_continuation",
-        scenario_product_conversation_context_continuation,
-    ),
-    ("mid_stream_cancel", scenario_mid_stream_cancel),
-    ("image_roundtrip", scenario_image_roundtrip),
-    ("perf_stream", scenario_perf_stream),
-]
 
 
 SCENARIOS = [
