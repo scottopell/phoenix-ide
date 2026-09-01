@@ -229,6 +229,11 @@ final class AppModel {
             latestTranscriptRowId: conversation.transcriptRowIdentity)
     }
 
+    func existingSession(for conversationId: String) -> ConversationSession? {
+        if let existing = sessions[conversationId] { return existing }
+        return drainSessions[conversationId]
+    }
+
     func productConversationDetailModel(for aggregateId: String) -> ProductConversationDetailModel {
         if let existing = productConversationDetails[aggregateId] { return existing }
         guard let api else {
@@ -240,6 +245,9 @@ final class AppModel {
             connectivity: connectivity,
             sessionProvider: { [weak self] transcriptRowId in
                 self?.session(for: transcriptRowId)
+            },
+            existingSession: { [weak self] transcriptRowId in
+                self?.existingSession(for: transcriptRowId)
             })
         productConversationDetails[aggregateId] = created
         return created
