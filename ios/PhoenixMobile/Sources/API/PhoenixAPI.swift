@@ -276,6 +276,10 @@ struct PhoenixAPI: Sendable {
         try await get("api/conversations", as: ConversationListResponse.self).conversations
     }
 
+    func listProductConversations() async throws -> ProductConversationListResponse {
+        try await get("api/product-conversations", as: ProductConversationListResponse.self)
+    }
+
     func getConversation(id: String, afterSequence: Int64 = 0) async throws
         -> ConversationWithMessagesResponse
     {
@@ -286,6 +290,21 @@ struct PhoenixAPI: Sendable {
         return try await get(
             "api/conversations/\(id)", query: query,
             as: ConversationWithMessagesResponse.self)
+    }
+
+    func getProductConversation(id: String, before: String? = nil, messageLimit: Int? = nil) async throws
+        -> ProductConversationSnapshot
+    {
+        var query: [URLQueryItem] = []
+        if let before, !before.isEmpty {
+            query.append(URLQueryItem(name: "before", value: before))
+        }
+        if let messageLimit {
+            query.append(URLQueryItem(name: "message_limit", value: String(messageLimit)))
+        }
+        return try await get(
+            "api/product-conversations/\(id)", query: query,
+            as: ProductConversationSnapshot.self)
     }
 
     /// Idempotent by `messageId`: the server returns success without a
@@ -394,9 +413,9 @@ struct PhoenixAPI: Sendable {
             as: SuccessResponse.self)
     }
 
-    /// Get-or-create the fleet Coordinator — an ordinary conversation that
-    /// answers questions about every other conversation. Everything else
-    /// about it (transcript, SSE, chat) uses the normal conversation surface.
+    /// Get-or-create the fleet Coordinator's writable transcript row. The
+    /// list surface is aggregate-keyed, but live Coordinator transcript work
+    /// still uses the ordinary conversation endpoints.
     func ensureCoordinator() async throws -> Conversation {
         try await post("api/global/coordinator", body: [:], as: ConversationResponse.self)
             .conversation
