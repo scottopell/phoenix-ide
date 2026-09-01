@@ -100,6 +100,26 @@ describe('ProductConversationFixture', () => {
     expect(screen.getAllByText('Long fixture conversation')).toHaveLength(2);
   });
 
+  it('keeps handoff identities aligned with adjacent transcript segments', () => {
+    for (const id of ['desktop-open-multi-segment-qa-work', 'desktop-history-read-only', 'mobile-history-read-only', 'long-history-110-messages'] as const) {
+      const segments = getProductConversationScenario(id).snapshot?.segments ?? [];
+      segments.forEach((segment, index) => {
+        if (!segment.handoff) return;
+        expect(segment.handoff.predecessor_transcript_row_id).toBe(segments[index - 1]?.transcript_row_id);
+        expect(segment.handoff.successor_transcript_row_id).toBe(segment.transcript_row_id);
+      });
+    }
+  });
+
+  it('renders the error scenario through the mocked snapshot failure', async () => {
+    const scenario = getProductConversationScenario('error');
+    const { container } = render(<ProductConversationFixture scenario={scenario} />);
+    await waitFor(() => {
+      expect(container.querySelector(`[data-product-conversation-fixture-ready="${scenario.id}"]`)).not.toBeNull();
+    });
+    expect(screen.getByRole('alert').textContent).toContain('Fixture failed to fetch product conversation snapshot');
+  });
+
   it('resolves embedded mobile routes to the latest transcript identity', async () => {
     const scenario = getProductConversationScenario('mobile-open');
     render(<ProductConversationFixture scenario={scenario} />);

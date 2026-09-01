@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { api } from '../../api';
 import { NewConversationFixture } from './renderFixture';
 import { getNewConversationScenario } from './scenarios';
@@ -38,10 +38,16 @@ describe('NewConversationFixture', () => {
     expect(screen.getAllByText('Needs retry')).toHaveLength(2);
     expect(screen.getAllByText('Finishing')).toHaveLength(2);
     expect(screen.getAllByText('Image-only request')).toHaveLength(2);
-    expect(screen.getAllByRole('button', { name: 'Retry' })[0]).toBeEnabled();
-    expect(screen.getAllByRole('button', { name: 'Delete' })[0]).toBeEnabled();
-    expect(screen.getAllByRole('button', { name: 'Start over' })[0]).toBeEnabled();
-
+    const retryButtons = screen.getAllByRole('button', { name: 'Retry' });
+    const retryButton = retryButtons[0];
+    expect(retryButton).toBeDefined();
+    expect(retryButton!).toBeEnabled();
+    fireEvent.click(retryButton!);
+    await waitFor(() => {
+      expect(screen.getAllByRole('button', { name: 'Retry' })[0]).toBeEnabled();
+    });
+    expect(screen.queryByRole('button', { name: 'Delete' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Start over' })).toBeNull();
   });
 
   it('restores the document theme, storage, and API methods after unmount', async () => {

@@ -91,19 +91,20 @@ def connect_transcript(base_url: str, transcript_id: str) -> None:
 
 
 def wait_for_objective(base_url: str, transcript_id: str, objective: str) -> dict:
-    def has_objective(payload: dict) -> bool:
-        return any(
-            message.get("message_type") == "user"
-            and message.get("content", {}).get("text") == objective
-            for message in payload.get("messages", [])
-        )
-    return poll("initial objective persistence", lambda: conversation(base_url, transcript_id), has_objective)
+    def has_first_objective(payload: dict) -> bool:
+        user_messages = [
+            message for message in payload.get("messages", [])
+            if message.get("message_type") == "user"
+        ]
+        return bool(user_messages) and user_messages[0].get("content", {}).get("text") == objective
+    return poll("initial objective persistence", lambda: conversation(base_url, transcript_id), has_first_objective)
 
 
 def assert_one_row(rows: list[dict], product_id: str) -> dict:
-    matches = [row for row in rows if row.get("product_conversation_id") == product_id]
-    assert len(matches) == 1, f"expected exactly one aggregate row for {product_id}, got {matches!r}"
-    return matches[0]
+    assert len(rows) == 1, f"expected exactly one global aggregate row, got {rows!r}"
+    row = rows[0]
+    assert row.get("product_conversation_id") == product_id, row
+    return row
 
 
 def scenario_create_objective_one_row_reload(base_url: str, cwd: Path) -> dict:
@@ -146,6 +147,13 @@ def scenario_busy_stop_work(base_url: str, cwd: Path) -> None:
     attempt_id = close.get("attempt_id")
     assert attempt_id, snapshot
     request(base_url, "POST", f"/api/conversations/{transcript_id}/close/confirm-stop-work", body={"attempt_id": attempt_id})
+    history = poll(
+        "busy Close to History",
+        lambda: product_snapshot(base_url, created["product_conversation_id"]),
+        lambda value: value.get("ordinary_lifecycle") == "history",
+    )
+    assert history["writable_transcript_row_id"] is None
+    assert_one_row(product_rows(base_url), created["product_conversation_id"])
 
 
 def init_git_repo(path: Path) -> None:
@@ -236,8 +244,7 @@ def is_retryable_creation_response(error: Exception) -> bool:
 
 
 def run_journeys() -> None:
-    if not (ROOT / "target" / "debug" / "phoenix-ide").exists():
-        run._build_binary()
+    run._build_binary()
     recovery_started = time.monotonic()
     scenario_merged_creation_recovery()
     print(f"✓ creation-failure/retry {time.monotonic() - recovery_started:.2f}s", flush=True)

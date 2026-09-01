@@ -82,8 +82,8 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
       super();
       this.url = String(url);
       const transcriptId = scenario.snapshot?.latest_transcript_row_id;
-      const fixtureConversation = latestSegmentConversation(scenario);
-      if (transcriptId) {
+      if (transcriptId && scenario.snapshot) {
+        const fixtureConversation = latestSegmentConversation(scenario);
         queueMicrotask(() => {
           this.dispatchEvent(new Event('open'));
           this.dispatchEvent(new MessageEvent('init', { data: JSON.stringify({

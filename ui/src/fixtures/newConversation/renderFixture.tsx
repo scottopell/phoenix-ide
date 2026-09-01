@@ -29,8 +29,6 @@ function pageHasSettled(root: HTMLElement, scenario: NewConversationScenario): b
   const recoveryReady = recoveryItems >= expectedRecoveryItems
     && (expectedRecoveryItems === 0 || root.querySelector('[aria-label="Recent product creation attempts"]') !== null)
     && (scenario.recoveryNextCursor ? loadMore !== undefined : loadMore === undefined);
-  if (expectedRecoveryItems > 0) return recoveryReady;
-
   return directory?.value === scenario.cwd
     && model?.value === scenario.models.default
     && draft?.value === scenario.draft
