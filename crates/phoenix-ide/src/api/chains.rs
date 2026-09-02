@@ -393,7 +393,12 @@ pub async fn archive_chain_handler(
         .await
         .map_err(super::handlers::map_admission_db_error)?;
     let _aggregate_admission_guard = aggregate_admission.lock_owned().await;
-    let _member_admission_guards = lock_chain_admissions(&state, &member_ids).await;
+    let non_root_member_ids = member_ids
+        .iter()
+        .filter(|member_id| member_id.as_str() != root_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    let _member_admission_guards = lock_chain_admissions(&state, &non_root_member_ids).await;
     for id in &member_ids {
         super::handlers::refuse_if_coordinator(&state, id, "archive").await?;
     }
