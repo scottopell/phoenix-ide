@@ -4,6 +4,9 @@ import type { ProductConversationScenario, ProductConversationScenarioId } from 
 
 const now = Date.parse('2026-07-01T12:00:00Z');
 const isoAgo = (minutes: number) => new Date(now - minutes * 60_000).toISOString();
+const FIXTURE_HANDOFF_SUMMARY = 'Approved handoff: keep exactly one persisted handoff summary between predecessor history and the successor transcript.';
+const FIXTURE_SUCCESSOR_FIRST_MESSAGE = 'Successor kickoff: begin implementation without repeating the persisted handoff summary.';
+
 
 function state(type: ConversationState['type']): ConversationState {
   switch (type) {
@@ -37,17 +40,18 @@ function segment(
   title: string,
   messages: ReturnType<typeof textMessage>[],
   handoffSummary: string | null,
+  handoffSuccessorTranscriptRowId?: string,
 ) {
   return {
     segment_ordinal: segmentOrdinal,
     transcript_row_id: transcriptRowId,
     slug: transcriptRowId,
     title,
-    messages,
+    messages: messages.map((message) => ({ ...message, conversation_id: transcriptRowId })),
     handoff: handoffSummary === null ? null : {
       kind: 'historical' as const,
-      predecessor_transcript_row_id: `prev-${transcriptRowId}`,
-      successor_transcript_row_id: transcriptRowId,
+      predecessor_transcript_row_id: transcriptRowId,
+      successor_transcript_row_id: handoffSuccessorTranscriptRowId ?? transcriptRowId,
       continuation_message_id: `continue-${transcriptRowId}`,
       summary: handoffSummary,
     },
@@ -63,7 +67,7 @@ function makeSnapshot(overrides: Partial<ProductConversationSnapshotView> = {}):
     canonical_root: { transcript_row_id: 'row-root', slug: 'product-alpha-root', title: 'Product Alpha root' },
     ordinary_lifecycle: 'open',
     latest_transcript_row_id: 'row-work',
-    writable_transcript_row_id: null,
+    writable_transcript_row_id: 'row-work',
     updated_at: isoAgo(2),
     presentation: { kind: 'state', display_name: 'Product Alpha', presentation_mode: 'working' },
     work_identity: {
@@ -86,13 +90,13 @@ function makeSnapshot(overrides: Partial<ProductConversationSnapshotView> = {}):
       segment(1, 'row-root', 'Discovery', [
         textMessage('root-1', 1, 'user', 'Summarize the product-surface issue.'),
         textMessage('root-2', 2, 'agent', 'The chain route and product route overlap in a way that confuses ownership.'),
-      ], 'Exploration converged on product-conversation routing.'),
+      ], null),
       segment(2, 'row-qa', 'Question answering', [
         textMessage('qa-1', 3, 'user', 'What are the invariants we must preserve?'),
         textMessage('qa-2', 4, 'agent', 'We must preserve the transcript ordering, source lineage, and Q&A history.'),
-      ], 'The focused Q&A fork captured the invariants before work began.'),
+      ], FIXTURE_HANDOFF_SUMMARY, 'row-work'),
       segment(3, 'row-work', 'Implementation', [
-        textMessage('work-1', 5, 'user', 'Proceed with the frontend-only fixture implementation.'),
+        textMessage('work-1', 5, 'user', FIXTURE_SUCCESSOR_FIRST_MESSAGE),
         textMessage('work-2', 6, 'agent', 'I will add a deterministic ProductConversation Ladle fixture and keep the history read-only.', state('idle')),
       ], null),
     ],
@@ -169,14 +173,18 @@ function makeLongSnapshot(): ProductConversationSnapshotView {
       `row-long-${segmentIndex + 1}`,
       `Stage ${segmentIndex + 1}`,
       messages,
-      segmentIndex === 0 ? 'Earlier product discussion condensed into a single historical handoff.' : null,
+      segmentIndex === 0 ? FIXTURE_HANDOFF_SUMMARY : null,
+      segmentIndex === 0 ? 'row-long-2' : undefined,
     );
   });
 
   return makeSnapshot({
     product_conversation_id: 'pc-long-history',
     canonical_route: '/product-conversations/pc-long-history',
+    ordinary_lifecycle: 'history',
     requested_transcript_row_id: 'row-long-4',
+    latest_transcript_row_id: 'row-long-4',
+    writable_transcript_row_id: null,
     canonical_root: { transcript_row_id: 'row-long-1', slug: 'long-root', title: 'Long history root' },
     presentation: { kind: 'state', display_name: 'Long fixture conversation', presentation_mode: 'idle' },
     work_identity: null,
@@ -201,6 +209,14 @@ export const productConversationScenarios = [
       source: null,
       work_identity: null,
       chain_qa_compatibility: null,
+      requested_transcript_row_id: 'row-mobile-1',
+      latest_transcript_row_id: 'row-mobile-1',
+      writable_transcript_row_id: 'row-mobile-1',
+      canonical_root: {
+        transcript_row_id: 'row-mobile-1',
+        slug: 'row-mobile-1',
+        title: 'Product Alpha mobile',
+      },
       segments: [
         segment(1, 'row-mobile-1', 'Mobile root', [
           textMessage('mobile-1', 1, 'user', 'Show how this page stacks on a phone.'),
@@ -216,6 +232,13 @@ export const productConversationScenarios = [
       writable_transcript_row_id: null,
       presentation: { kind: 'state', display_name: 'Archived product history', presentation_mode: 'done' },
       work_identity: null,
+      requested_transcript_row_id: 'row-history-2',
+      latest_transcript_row_id: 'row-history-2',
+      canonical_root: {
+        transcript_row_id: 'row-history-1',
+        slug: 'row-history-1',
+        title: 'Historical root',
+      },
       source: {
         status: 'deleted',
         source_product_conversation_id: 'pc-deleted',
@@ -228,9 +251,9 @@ export const productConversationScenarios = [
         segment(1, 'row-history-1', 'Historical root', [
           textMessage('history-1', 1, 'user', 'What happened before the handoff?'),
           textMessage('history-2', 2, 'agent', 'A prior worktree produced the approved task and was archived after handoff.'),
-        ], 'Historical summary from the predecessor transcript.'),
+        ], FIXTURE_HANDOFF_SUMMARY, 'row-history-2'),
         segment(2, 'row-history-2', 'Historical continuation', [
-          textMessage('history-3', 3, 'user', 'Why is the composer missing?'),
+          textMessage('history-3', 3, 'user', FIXTURE_SUCCESSOR_FIRST_MESSAGE),
           textMessage('history-4', 4, 'agent', 'History snapshots remain read-only even when Q&A history is visible.', state('terminal')),
         ], null),
       ],
@@ -239,6 +262,37 @@ export const productConversationScenarios = [
   },
   {
     ...productConversationScenarioDefinitions[3],
+    snapshot: makeSnapshot({
+      ordinary_lifecycle: 'history',
+      writable_transcript_row_id: null,
+      presentation: { kind: 'state', display_name: 'Archived product history mobile', presentation_mode: 'done' },
+      work_identity: null,
+      source: {
+        status: 'deleted',
+        source_product_conversation_id: 'pc-deleted-mobile',
+        source_conversation_id: 'conv-deleted-mobile',
+        relation: 'approved_task',
+        relation_key: 'task-39751-mobile',
+      },
+      chain_qa_compatibility: { root_transcript_row_id: 'row-mobile-history-1', url: '/chains/row-mobile-history-1' },
+      requested_transcript_row_id: 'row-mobile-history-2',
+      latest_transcript_row_id: 'row-mobile-history-2',
+      canonical_root: {
+        transcript_row_id: 'row-mobile-history-1',
+        slug: 'row-mobile-history-1',
+        title: 'Mobile history root',
+      },
+      segments: [
+        segment(1, 'row-mobile-history-1', 'Mobile history root', [
+          textMessage('mobile-history-1', 1, 'user', 'Does mobile history stay read-only?'),
+          textMessage('mobile-history-2', 2, 'agent', 'Yes. The shipped ProductConversation shell still shows chronology without mutation controls.'),
+        ], FIXTURE_HANDOFF_SUMMARY, 'row-mobile-history-2'),
+        segment(2, 'row-mobile-history-2', 'Mobile history continuation', [
+          textMessage('mobile-history-3', 3, 'user', FIXTURE_SUCCESSOR_FIRST_MESSAGE),
+          textMessage('mobile-history-4', 4, 'agent', 'The continuation remains read-only in History.', state('terminal')),
+        ], null),
+      ],
+    }),
   },
   {
     ...productConversationScenarioDefinitions[4],
@@ -246,9 +300,16 @@ export const productConversationScenarios = [
   },
   {
     ...productConversationScenarioDefinitions[5],
+    snapshot: makeSnapshot(),
+    snapshotError: 'Fixture failed to fetch product conversation snapshot',
+  },
+  {
+    ...productConversationScenarioDefinitions[6],
     snapshot: makeLongSnapshot(),
   },
 ] as const satisfies readonly ProductConversationScenario[];
+
+export { FIXTURE_HANDOFF_SUMMARY, FIXTURE_SUCCESSOR_FIRST_MESSAGE };
 
 export function getProductConversationScenario(id: ProductConversationScenarioId): ProductConversationScenario {
   const scenario = productConversationScenarios.find((item) => item.id === id);
