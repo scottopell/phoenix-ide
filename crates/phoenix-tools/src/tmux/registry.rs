@@ -292,7 +292,7 @@ fn process_is_zombie(_pid: u32) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn wait_process_exit(expected: ProcessIdentity, timeout: Duration) -> ExactProcessState {
+fn wait_process_exit(expected: ProcessIdentity, deadline: std::time::Instant) -> ExactProcessState {
     let Ok(pid) = libc::pid_t::try_from(expected.pid) else {
         return ExactProcessState::Unproven;
     };
@@ -308,6 +308,7 @@ fn wait_process_exit(expected: ProcessIdentity, timeout: Duration) -> ExactProce
         events: libc::POLLIN,
         revents: 0,
     };
+    let timeout = deadline.saturating_duration_since(std::time::Instant::now());
     let millis =
         libc::c_int::try_from(timeout.as_millis().min(i32::MAX as u128)).unwrap_or(i32::MAX);
     let ready = unsafe { libc::poll(std::ptr::addr_of_mut!(poll_fd), 1, millis) };
@@ -320,7 +321,7 @@ fn wait_process_exit(expected: ProcessIdentity, timeout: Duration) -> ExactProce
 }
 
 #[cfg(target_os = "macos")]
-fn wait_process_exit(expected: ProcessIdentity, timeout: Duration) -> ExactProcessState {
+fn wait_process_exit(expected: ProcessIdentity, deadline: std::time::Instant) -> ExactProcessState {
     let queue = unsafe { libc::kqueue() };
     if queue < 0 {
         return ExactProcessState::Unproven;
@@ -333,6 +334,7 @@ fn wait_process_exit(expected: ProcessIdentity, timeout: Duration) -> ExactProce
         data: 0,
         udata: std::ptr::null_mut(),
     };
+    let timeout = deadline.saturating_duration_since(std::time::Instant::now());
     let deadline = libc::timespec {
         tv_sec: timeout.as_secs().min(i64::MAX as u64).cast_signed(),
         tv_nsec: i64::from(timeout.subsec_nanos()),
@@ -356,7 +358,10 @@ fn wait_process_exit(expected: ProcessIdentity, timeout: Duration) -> ExactProce
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn wait_process_exit(expected: ProcessIdentity, _timeout: Duration) -> ExactProcessState {
+fn wait_process_exit(
+    expected: ProcessIdentity,
+    _deadline: std::time::Instant,
+) -> ExactProcessState {
     exact_process_state(expected)
 }
 
@@ -364,10 +369,17 @@ async fn exact_process_exit_until(
     expected: ProcessIdentity,
     expires: tokio::time::Instant,
 ) -> ExactProcessState {
-    let timeout = expires.saturating_duration_since(tokio::time::Instant::now());
-    tokio::task::spawn_blocking(move || wait_process_exit(expected, timeout))
-        .await
-        .unwrap_or(ExactProcessState::Unproven)
+    let remaining = expires.saturating_duration_since(tokio::time::Instant::now());
+    let deadline = std::time::Instant::now() + remaining;
+    match tokio::time::timeout_at(
+        expires,
+        tokio::task::spawn_blocking(move || wait_process_exit(expected, deadline)),
+    )
+    .await
+    {
+        Ok(Ok(state)) => state,
+        _ => ExactProcessState::Unproven,
+    }
 }
 
 fn exact_process_state(expected: ProcessIdentity) -> ExactProcessState {
@@ -2127,7 +2139,9 @@ impl TmuxRegistry {
             .get_or_insert(self, work_scope, server, "retirement begin")
             .await
             .map_err(|reason| TmuxRetirementOutcome::RemovalFailed { reason })?;
-        let exact_process = if authority == TmuxRetirementAuthority::ExactServer {
+        let observed_entry = if created {
+            None
+        } else {
             let server = tokio::time::timeout_at(expires, entry.server.read())
                 .await
                 .map_err(|_| TmuxRetirementOutcome::RemovalFailed {
@@ -2136,30 +2150,41 @@ impl TmuxRegistry {
                 })?;
             let identity = server.exact_identity();
             drop(server);
-            exact_server_process_identity_until(
+            let process = exact_server_process_identity_until(
                 &identity.socket_path,
                 &identity.server_token,
                 expires,
             )
-            .await
-            .map(|process| (identity, process))
-        } else {
-            None
+            .await;
+            Some((identity, process))
         };
         let Ok(mut server) = tokio::time::timeout_at(expires, entry.server.write()).await else {
             return Err(TmuxRetirementOutcome::RemovalFailed {
                 reason: "tmux retirement fence write lock exceeded the Close deadline".to_string(),
             });
         };
-        if !created && authority == TmuxRetirementAuthority::EndpointAbsent {
-            return Err(TmuxRetirementOutcome::IdentityNotProven {
-                reason: "tmux endpoint is absent but registered server absence was not proven"
-                    .to_string(),
-            });
-        }
-        let exact_process = exact_process.and_then(|(identity, process)| {
-            (server.exact_identity() == identity).then_some(process)
-        });
+        let (authority, exact_process) = match observed_entry {
+            None => (authority, None),
+            Some((identity, _)) if server.exact_identity() != identity => {
+                return Err(TmuxRetirementOutcome::IdentityNotProven {
+                    reason: "tmux server identity changed after retirement discovery".to_string(),
+                });
+            }
+            Some((_, Some(process))) => (TmuxRetirementAuthority::ExactServer, Some(process)),
+            Some((_, None)) if authority == TmuxRetirementAuthority::ExactServer => {
+                (authority, None)
+            }
+            Some((_, None)) if authority == TmuxRetirementAuthority::ServerAbsenceVerified => {
+                (authority, None)
+            }
+            Some((_, None)) => {
+                return Err(TmuxRetirementOutcome::IdentityNotProven {
+                    reason:
+                        "tmux server appeared after absence discovery without exact process authority"
+                            .to_string(),
+                });
+            }
+        };
         let permit = Self::build_retirement_permit(
             work_scope,
             &mut server,
