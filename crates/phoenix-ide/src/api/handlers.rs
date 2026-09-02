@@ -4979,6 +4979,36 @@ async fn upgrade_conversation_model(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
+    match state
+        .runtime
+        .db()
+        .message_target_admission(&id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+    {
+        phoenix_db::MessageTargetAdmission::Aggregate(
+            phoenix_db::ProductConversationAdmission::Accepted { .. },
+        )
+        | phoenix_db::MessageTargetAdmission::StandaloneAvailable => {}
+        phoenix_db::MessageTargetAdmission::Aggregate(
+            phoenix_db::ProductConversationAdmission::Refused(_),
+        ) => {
+            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                "Close admission fence rejects model changes",
+                "close_admission_fenced",
+            ))));
+        }
+        phoenix_db::MessageTargetAdmission::Aggregate(
+            phoenix_db::ProductConversationAdmission::History(_),
+        )
+        | phoenix_db::MessageTargetAdmission::StandaloneArchived => {
+            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                "Conversation is unavailable for model changes",
+                "target_unavailable",
+            ))));
+        }
+    }
+
     let effective_state = state
         .runtime
         .effective_conversation_state(&id)
