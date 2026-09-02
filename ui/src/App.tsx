@@ -7,7 +7,7 @@ import { ThemeProvider } from './components/ThemeProvider';
 import { DensityProvider } from './components/DensityProvider';
 import { ConversationProvider } from './conversation';
 import { ChainProvider } from './chain';
-import { api } from './api';
+import { api, ApiResponseError } from './api';
 import { ConversationReadinessProvider } from './contexts/ConversationReadinessContext';
 import './index.css';
 
@@ -117,10 +117,14 @@ function AppRoutes() {
   );
 }
 
-function ProductConversationAliasRedirect({ reference }: { reference: string | undefined }) {
+export function ProductConversationAliasRedirect({ reference }: { reference: string | undefined }) {
   const navigate = useNavigate();
   const location = useLocation();
-  const [fallbackSnapshot, setFallbackSnapshot] = useState<{ reference: string; rowSlug: string } | null>(null);
+  const [fallbackSnapshot, setFallbackSnapshot] = useState<{
+    reference: string;
+    rowSlug: string;
+    aggregateResolutionUnavailable: boolean;
+  } | null>(null);
   const [retryToken, setRetryToken] = useState(0);
   const activeFallback = fallbackSnapshot?.reference === reference ? fallbackSnapshot : null;
 
@@ -140,9 +144,13 @@ function ProductConversationAliasRedirect({ reference }: { reference: string | u
           }, { replace: true });
         }
       })
-      .catch(() => {
+      .catch((error: unknown) => {
         if (!cancelled) {
-          setFallbackSnapshot({ reference, rowSlug: reference });
+          setFallbackSnapshot({
+            reference,
+            rowSlug: reference,
+            aggregateResolutionUnavailable: !(error instanceof ApiResponseError && error.status === 404),
+          });
         }
       });
     return () => { cancelled = true; };
@@ -151,7 +159,15 @@ function ProductConversationAliasRedirect({ reference }: { reference: string | u
   if (activeFallback) {
     return (
       <main>
-        <EmbeddedConversationPage slug={activeFallback.rowSlug} suppressCanonicalization routePrefix="/c" />
+        <EmbeddedConversationPage
+          slug={activeFallback.rowSlug}
+          suppressCanonicalization
+          routePrefix="/c"
+          mutationEnabled={!activeFallback.aggregateResolutionUnavailable}
+          {...(activeFallback.aggregateResolutionUnavailable
+            ? { aggregateLifecycleOpen: false }
+            : {})}
+        />
         <div role="alert">Showing cached conversation while live snapshot is unavailable.</div>
         <button type="button" onClick={() => { setFallbackSnapshot(null); setRetryToken((n) => n + 1); }}>Retry</button>
       </main>

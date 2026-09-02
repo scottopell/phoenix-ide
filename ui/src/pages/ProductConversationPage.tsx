@@ -625,7 +625,9 @@ function ProductConversationPageInner() {
       if (routeGenerationRef.current !== routeGeneration || paginationRequestRef.current !== requestGeneration) return;
       setOwnedSnapshot((current) => {
         if (!current || current.productConversationId !== ownerId) return current;
-        const authoritativeTail = refreshedTail ?? current.value;
+        const authoritativeTail = refreshedTail
+          ? mergeRefreshedTail(current.value, refreshedTail)
+          : current.value;
         return { productConversationId: ownerId, value: mergeOlderSegments(authoritativeTail, older) };
       });
       setHistoryGeneration((generation) => generation + 1);

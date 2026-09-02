@@ -1181,6 +1181,45 @@ describe('ProductConversationPage', () => {
     });
   });
 
+  it('preserves multiple loaded pages through Close refresh and stale-cursor recovery', async () => {
+    const { api } = await import('../api');
+    const activeClose = {
+      attempt_id: 'close-active', phase: 'settling_active_work', confirmation_snapshot: null,
+      inspections: [], losses: [], residuals: [],
+    } satisfies ProductConversationCloseView;
+    const page = (id: string, ordinal: number, before: string | null, hasOlder: boolean) => makeSnapshot({
+      close: activeClose,
+      segments: [{ segment_ordinal: ordinal, transcript_row_id: `row-${id}`, slug: `row-${id}`, title: id, messages: [makeMessage(id, ordinal)], handoff: null }],
+      before,
+      has_older: hasOlder,
+    });
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot({ close: activeClose, before: 'cursor-1', has_older: true }))
+      .mockResolvedValueOnce(page('older-1', 0, 'cursor-0', true))
+      .mockResolvedValueOnce(page('older-0', -1, 'stale-cursor', true))
+      .mockResolvedValueOnce(makeSnapshot({ close: { ...activeClose, phase: 'awaiting_retirement_inspection' }, before: 'fresh-cursor', has_older: true }))
+      .mockRejectedValueOnce(new ApiResponseError('stale cursor', 400))
+      .mockResolvedValueOnce(makeSnapshot({ close: { ...activeClose, phase: 'awaiting_retirement_inspection' }, before: 'retry-cursor', has_older: true }))
+      .mockResolvedValueOnce(page('recovered', -2, null, false));
+
+    renderPage();
+    await waitForPageReady();
+    fireEvent.click(screen.getByRole('button', { name: 'load older' }));
+    await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent('older-1'));
+    fireEvent.click(screen.getByRole('button', { name: 'load older' }));
+    await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent('older-0'));
+    act(() => notifyCloseSnapshotChanged('pc-1', 'stream'));
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(4));
+    fireEvent.click(screen.getByRole('button', { name: 'load older' }));
+
+    const expected = 'recovered,older-0,older-1,m-1,m-2,product-handoff:pc-1:row-1:cont-1,m-3,m-4';
+    await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent(expected));
+    const ids = screen.getByTestId('message-order').textContent?.split(',') ?? [];
+    expect(new Set(ids).size).toBe(ids.length);
+    act(() => emitLatestProjection({ messages: [makeMessage('m-3', 3), makeMessage('m-4', 4)] as never }));
+    await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent(expected));
+  });
+
   it('discards delayed older-page results after a new product route wins', async () => {
     const { api } = await import('../api');
     let resolveOlder!: (value: ProductConversationSnapshotView) => void;
