@@ -863,7 +863,7 @@ export function WorkControlBar({
               type="button"
               className="mobile-pr-action mobile-pr-action--hero"
               aria-label="Review workspace changes"
-              onClick={() => { if (!readOnly) openDiffFullscreen('workspace'); }}
+              onClick={() => openDiffFullscreen('workspace')}
             >
               Review changes
             </button>

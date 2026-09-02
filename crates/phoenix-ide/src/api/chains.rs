@@ -387,7 +387,13 @@ pub async fn archive_chain_handler(
         .chain_members_forward(&root_id)
         .await
         .map_err(db_to_app)?;
-    let _admission_guards = lock_chain_admissions(&state, &member_ids).await;
+    let aggregate_admission = state
+        .runtime
+        .mutation_admission(&root_id)
+        .await
+        .map_err(super::handlers::map_admission_db_error)?;
+    let _aggregate_admission_guard = aggregate_admission.lock_owned().await;
+    let _member_admission_guards = lock_chain_admissions(&state, &member_ids).await;
     for id in &member_ids {
         super::handlers::refuse_if_coordinator(&state, id, "archive").await?;
     }

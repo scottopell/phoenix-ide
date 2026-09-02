@@ -48,7 +48,15 @@ export function CommandPalette({ conversations, productConversations = [], activ
     : undefined;
 
   const activeConvId = activeConversation?.id ?? null;
-  const activeFileRoot = activeConversationFileRoot(activeConversation);
+  const activeProductConversation = activeProduct
+    ? conversations.find((conversation) => conversation.id === activeProduct.latest_transcript_row_id)
+      ?? (activeConversation?.id === activeProduct.latest_transcript_row_id ? activeConversation : undefined)
+    : undefined;
+  const activeFileRoot = activeProduct
+    ? (activeProduct.ordinary_lifecycle === 'open'
+      ? activeProductConversation?.worktree_path ?? activeProductConversation?.cwd ?? null
+      : null)
+    : activeConversationFileRoot(activeConversation);
 
   // Stable conversation ids string — only changes when the *set* of conversations changes.
   const conversationIdsKey = useMemo(
