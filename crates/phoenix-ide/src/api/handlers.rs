@@ -6096,7 +6096,20 @@ async fn delete_conversation(
 ) -> Result<Json<SuccessResponse>, AppError> {
     let admission = state.runtime.conversation_admission(&id).await;
     let _admission_guard = admission.lock().await;
-    require_hard_delete_admission(&state, &id).await?;
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    if !matches!(
+        conv.state,
+        ConvState::Provisioning { .. }
+            | ConvState::CreationCancelled { .. }
+            | ConvState::CreationFailed { .. }
+    ) {
+        require_hard_delete_admission(&state, &id).await?;
+    }
     refuse_if_chain_member(&state, &id, "delete").await?;
     run_hard_delete_cascade(&state, &id).await?;
     Ok(Json(SuccessResponse { success: true }))
@@ -13142,6 +13155,98 @@ pub(crate) mod hard_delete_cascade_tests {
             state.db.get_conversation("c-1").await.is_err(),
             "row must be gone after successful cascade"
         );
+    }
+
+    #[tokio::test]
+    async fn delete_endpoint_admits_non_ready_creation_cleanup() {
+        for (index, state_kind) in [
+            ConvState::Provisioning {
+                job_id: "job".into(),
+                phase: phoenix_core::domain::db_schema::ConversationCreationPhase::Provisioning,
+            },
+            ConvState::CreationFailed {
+                job_id: "job".into(),
+                error: "failed".into(),
+                error_kind: phoenix_core::domain::db_schema::ErrorKind::ServerError,
+            },
+            ConvState::CreationCancelled {
+                job_id: "job".into(),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let state = make_test_state().await;
+            let id = format!("delete-non-ready-{index}");
+            state
+                .db
+                .create_conversation(&id, &id, "/tmp", true, None, None)
+                .await
+                .expect("create");
+            state
+                .db
+                .insert_conversation_creation_job(&crate::db::InsertConversationCreationJob {
+                    id: format!("job-{index}"),
+                    conversation_id: id.clone(),
+                    message_id: Some(format!("message-{index}")),
+                    intent: crate::db::ConversationCreationIntent {
+                        cwd: "/tmp".into(),
+                        model: None,
+                        effort: None,
+                        text: "test creation".into(),
+                        expansion_preflighted: false,
+                        llm_text: None,
+                        skill_invocation: None,
+                        message_id: format!("message-{index}"),
+                        images: vec![],
+                        files: vec![],
+                        mode: None,
+                        base_branch: None,
+                        checkout_ref: None,
+                        seed_parent_id: None,
+                        seed_label: None,
+                        approved_task: None,
+                    },
+                })
+                .await
+                .expect("insert creation job");
+            let job_status = match state_kind {
+                ConvState::CreationFailed { .. } => "failed",
+                ConvState::CreationCancelled { .. } => "cancelled",
+                _ => "accepted",
+            };
+            sqlx::query(
+                "UPDATE conversation_creation_jobs
+                 SET status = ?1,
+                     failed_at = CASE WHEN ?1 = 'failed' THEN updated_at ELSE NULL END,
+                     error = CASE WHEN ?1 = 'failed' THEN 'failed' ELSE NULL END,
+                     cancelled_at = CASE WHEN ?1 = 'cancelled' THEN updated_at ELSE NULL END
+                 WHERE conversation_id = ?2",
+            )
+            .bind(job_status)
+            .bind(&id)
+            .execute(state.db.pool())
+            .await
+            .expect("align job status");
+            state
+                .db
+                .update_conversation_state(&id, &state_kind)
+                .await
+                .expect("set creation state");
+
+            let _ = delete_conversation(State(state.clone()), Path(id.clone()))
+                .await
+                .expect("non-ready creation cleanup remains available");
+            let shell = state.db.get_conversation(&id).await.expect("reload shell");
+            assert!(shell.archived, "deletion-pending shell must be hidden");
+            let job_status: String =
+                sqlx::query_scalar("SELECT status FROM conversation_creation_jobs WHERE id = ?1")
+                    .bind(format!("job-{index}"))
+                    .fetch_one(state.db.pool())
+                    .await
+                    .expect("reload job status");
+            assert_eq!(job_status, "deletion_pending");
+        }
     }
 
     #[tokio::test]

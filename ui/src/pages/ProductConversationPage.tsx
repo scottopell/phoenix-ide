@@ -856,7 +856,7 @@ function ProductConversationPageInner() {
                   suppressCanonicalization={true}
                   suppressMessageViewerOwner
                   suppressTaskApprovalOwner={true}
-                  ordinaryComposerEnabled={liveControlsEnabled}
+                  mutationEnabled={liveControlsEnabled}
                   aggregateLifecycleOpen={isOpen}
                   onProjectionChange={setLatestProjection}
                   onCloseCompleted={() => setSnapshotRetry((retry) => retry + 1)}

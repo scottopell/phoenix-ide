@@ -15,6 +15,7 @@ import { subscribeCloseSnapshotChanged } from '../notifications';
 import './WorkActions.css';
 
 interface WorkControlBarProps {
+  mutationEnabled?: boolean;
   conversationId: string;
   convModeLabel: string | undefined;
   phaseType: string;
@@ -279,6 +280,7 @@ function PrReviewStateIndicator({ feedbackStatus }: { feedbackStatus: 'open' | '
 }
 
 export function WorkControlBar({
+  mutationEnabled = true,
   conversationId,
   convModeLabel,
   phaseType,
@@ -308,6 +310,7 @@ export function WorkControlBar({
   const closeSnapshotRequestRef = useRef(0);
   const usesCompactLayout = useIsCompactLayout();
   const isLoading = markingMerged || abandoning;
+  const readOnly = !mutationEnabled;
   const { openDiffFullscreen } = useViewerSlotCommands();
   const openSelectorFromFallback = () => {
     fallbackSelectorOriginRef.current = true;
@@ -454,7 +457,7 @@ export function WorkControlBar({
     continuedInConvId,
     prStatus: dispositionPrStatus,
     prLoading,
-    canSendMessage: !!onSendMessage,
+    canSendMessage: mutationEnabled && !!onSendMessage,
     workChange: prStatus?.work_change ?? null,
   });
 
@@ -716,7 +719,7 @@ export function WorkControlBar({
   const closePanel = closeSnapshot ? (
     <CloseStatusPanel
       snapshot={closeSnapshot}
-      busy={isLoading}
+      busy={isLoading || readOnly}
       onConfirmLosses={() => { void confirmCloseLosses(); }}
       onConfirmStopWork={() => { void confirmCloseStopWork(); }}
       onCancel={() => { void cancelClose(); }}
@@ -792,7 +795,7 @@ export function WorkControlBar({
               <button
                 type="button"
                 className="mobile-pr-action mobile-pr-action--hero"
-                disabled={!prStatusHandle.resumeInference}
+                disabled={readOnly || !prStatusHandle.resumeInference}
                 onClick={() => void resumePrInference()}
               >
                 Resume PR inference
@@ -815,7 +818,7 @@ export function WorkControlBar({
               <button
                 type="button"
                 className="mobile-pr-action mobile-pr-action--hero"
-                disabled={!prStatusHandle.resumeInference}
+                disabled={readOnly || !prStatusHandle.resumeInference}
                 onClick={() => void resumePrInference()}
               >
                 Resume PR inference
@@ -827,7 +830,7 @@ export function WorkControlBar({
               type="button"
               className="mobile-pr-action mobile-pr-action--hero"
               data-testid="mobile-primary-address-feedback"
-              disabled={capturing}
+              disabled={readOnly || capturing}
               onClick={handleAddressFeedback}
             >
               <span>{capturing ? `Capturing ${addressFeedbackPrLabel}…` : `Address feedback${freshnessLabel ? ` · ${freshnessLabel}` : ''}`}</span>
@@ -847,7 +850,7 @@ export function WorkControlBar({
               <button
                 type="button"
                 className="mobile-pr-action mobile-pr-action--hero"
-                disabled={!prStatusHandle.resumeInference}
+                disabled={readOnly || !prStatusHandle.resumeInference}
                 onClick={() => void resumePrInference()}
               >
                 Resume PR inference
@@ -859,7 +862,7 @@ export function WorkControlBar({
               type="button"
               className="mobile-pr-action mobile-pr-action--hero"
               aria-label="Review workspace changes"
-              onClick={() => openDiffFullscreen('workspace')}
+              onClick={() => { if (!readOnly) openDiffFullscreen('workspace'); }}
             >
               Review changes
             </button>
@@ -877,7 +880,7 @@ export function WorkControlBar({
               <button
                 type="button"
                 className="mobile-pr-action mobile-pr-action--hero"
-                disabled={!prStatusHandle.resumeInference}
+                disabled={readOnly || !prStatusHandle.resumeInference}
                 onClick={() => void resumePrInference()}
               >
                 Resume PR inference
@@ -890,7 +893,7 @@ export function WorkControlBar({
               className="mobile-pr-action mobile-pr-action--cleanup mobile-pr-action--hero"
               aria-label={`Close conversation. ${closeHintText()}`}
               title={closeHintText()}
-              disabled={isLoading}
+              disabled={readOnly || isLoading}
               onClick={handleCleanUp}
             >
               {markingMerged ? 'Closing…' : 'Close conversation'}
@@ -902,7 +905,7 @@ export function WorkControlBar({
               className="mobile-pr-action mobile-pr-action--danger mobile-pr-action--hero"
               aria-label={`Close conversation. ${closeHintText()}`}
               title={closeHintText()}
-              disabled={isLoading}
+              disabled={readOnly || isLoading}
               onClick={handleAbandon}
             >
               {abandoning ? 'Closing…' : 'Close conversation'}
@@ -946,7 +949,7 @@ export function WorkControlBar({
               <button
                 type="button"
                 className="mobile-pr-action mobile-pr-action--cleanup"
-                disabled={isLoading}
+                disabled={readOnly || isLoading}
                 aria-label={`Close conversation. ${closeHintText()}`}
                 title={closeHintText()}
                 onClick={async () => {
@@ -962,7 +965,7 @@ export function WorkControlBar({
                 className="mobile-pr-action mobile-pr-action--danger"
                 aria-label={`Close conversation. ${closeHintText()}`}
                 title={closeHintText()}
-                disabled={isLoading}
+                disabled={readOnly || isLoading}
                 onClick={async () => {
                   if (await handleAbandon()) closeFallbackPanel();
                 }}
@@ -987,7 +990,7 @@ export function WorkControlBar({
       <button
         type="button"
         className="mobile-pr-action mobile-pr-action--hero mobile-pr-action--cleanup"
-        disabled={isLoading}
+        disabled={readOnly || isLoading}
         onClick={handleCleanUp}
       >
         Close conversation
@@ -998,7 +1001,7 @@ export function WorkControlBar({
         className="mobile-pr-action mobile-pr-action--hero mobile-pr-action--danger"
         aria-label={`Close conversation. ${closeHintText()}`}
         title={closeHintText()}
-        disabled={isLoading}
+        disabled={readOnly || isLoading}
         onClick={handleAbandon}
       >
         Close conversation
@@ -1008,7 +1011,7 @@ export function WorkControlBar({
         type="button"
         className="mobile-pr-action mobile-pr-action--hero"
         data-testid="mobile-primary-address-feedback"
-        disabled={capturing}
+        disabled={readOnly || capturing}
         onClick={handleAddressFeedback}
       >
         <span>{capturing ? `Capturing ${activePrLabel}…` : `Address feedback${freshnessLabel ? ` · ${freshnessLabel}` : ''}`}</span>
@@ -1055,7 +1058,7 @@ export function WorkControlBar({
                   className="mobile-pr-action mobile-pr-action--cleanup"
                   aria-label={`Close conversation. ${closeHintText()}`}
                   title={closeHintText()}
-                  disabled={isLoading}
+                  disabled={readOnly || isLoading}
                   onClick={handleCleanUp}
                 >
                   <span className="mobile-pr-action-icon" aria-hidden="true">—</span><span>Close conversation</span>
@@ -1067,7 +1070,7 @@ export function WorkControlBar({
                   className="mobile-pr-action mobile-pr-action--danger"
                   aria-label={`Close conversation. ${closeHintText()}`}
                   title={closeHintText()}
-                  disabled={isLoading}
+                  disabled={readOnly || isLoading}
                   onClick={handleAbandon}
                 >
                   <span className="mobile-pr-action-icon" aria-hidden="true">!</span><span>Close conversation</span>
@@ -1077,6 +1080,7 @@ export function WorkControlBar({
                 <button
                   type="button"
                   className="mobile-pr-action mobile-pr-action--automatic"
+                  disabled={readOnly}
                   onClick={resumePrInference}
                 >
                   <span className="mobile-pr-action-icon" aria-hidden="true">↻</span><span>Auto</span>
@@ -1102,7 +1106,7 @@ export function WorkControlBar({
                 data-pr-identity={identity}
                 aria-pressed={selected}
                 aria-expanded={isExpanded}
-                disabled={savingPrIdentity !== null}
+                disabled={readOnly || savingPrIdentity !== null}
                 onClick={() => selectRailPr(pr, selected)}
               >
                 <span className={`mobile-pr-status-dot mobile-pr-status-dot--${pr.display_state}`} aria-hidden="true" />
@@ -1135,6 +1139,7 @@ export function WorkControlBar({
             type="button"
             className="mobile-pr-chip desktop-work-actions-identity"
             data-testid="desktop-work-actions-identity"
+            disabled={readOnly}
             onClick={requestActivePrSelectorOpen}
           >
             <span className="mobile-pr-status-dot" aria-hidden="true" />
@@ -1163,7 +1168,7 @@ export function WorkControlBar({
           <button
             type="button"
             className="work-actions-btn work-actions-resolve work-actions-btn--primary"
-            disabled={!prStatusHandle.resumeInference}
+            disabled={readOnly || !prStatusHandle.resumeInference}
             onClick={() => void resumePrInference()}
           >
             Resume PR inference
@@ -1185,7 +1190,7 @@ export function WorkControlBar({
             className={`work-actions-btn work-actions-address${primaryClass('resolve')}`}
             data-testid="address-feedback-button"
             aria-label={addressFeedbackAriaLabel}
-            disabled={capturing}
+            disabled={readOnly || capturing}
             onClick={handleAddressFeedback}
           >
             <span className="work-actions-address-copy">{addressFeedbackLabel}</span>
@@ -1206,7 +1211,7 @@ export function WorkControlBar({
               data-testid="clean-up-button"
               aria-label={`Close conversation. ${closeHintText()}`}
               title={closeHintText()}
-              disabled={isLoading}
+              disabled={readOnly || isLoading}
               onClick={handleCleanUp}
             >
               {markingMerged ? 'Closing…' : 'Close conversation'}
@@ -1221,7 +1226,7 @@ export function WorkControlBar({
               data-testid="abandon-button"
               aria-label={`Close conversation. ${closeHintText()}`}
               title={closeHintText()}
-              disabled={isLoading}
+              disabled={readOnly || isLoading}
               onClick={handleAbandon}
             >
               {abandoning ? 'Closing…' : 'Close conversation'}

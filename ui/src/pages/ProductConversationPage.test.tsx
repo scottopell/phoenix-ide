@@ -657,7 +657,7 @@ describe('ProductConversationPage', () => {
     expect(embeddedConversationPageSpy).toHaveBeenCalledWith(expect.objectContaining({
       slug: 'row-2',
       suppressCanonicalization: true,
-      ordinaryComposerEnabled: true,
+      mutationEnabled: true,
     }));
     expect(screen.getByTestId('chain-work-scope-dock')).toBeInTheDocument();
     expect(chainWorkScopeDockSpy).toHaveBeenLastCalledWith(expect.objectContaining({
@@ -727,7 +727,7 @@ describe('ProductConversationPage', () => {
     await screen.findByTestId('embedded-conversation-page');
     expect(embeddedConversationPageSpy).toHaveBeenCalledWith(expect.objectContaining({
       slug: 'row-2',
-      ordinaryComposerEnabled: true,
+      mutationEnabled: true,
       suppressCanonicalization: true,
     }));
   });
@@ -739,14 +739,14 @@ describe('ProductConversationPage', () => {
     emitLatestProjection({ convState: { type: 'awaiting_task_approval' } });
     await waitFor(() => {
       expect(embeddedConversationPageSpy).toHaveBeenLastCalledWith(expect.objectContaining({
-        ordinaryComposerEnabled: true,
+        mutationEnabled: true,
       }));
     });
 
     emitLatestProjection({ convState: { type: 'idle' } });
     await waitFor(() => {
       expect(embeddedConversationPageSpy).toHaveBeenLastCalledWith(expect.objectContaining({
-        ordinaryComposerEnabled: true,
+        mutationEnabled: true,
       }));
     });
   });
@@ -797,7 +797,7 @@ describe('ProductConversationPage', () => {
     renderPage();
     await waitForPageReady();
 
-    expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.['ordinaryComposerEnabled']).toBe(false);
+    expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.['mutationEnabled']).toBe(false);
     expect(screen.getByRole('textbox', { name: 'recall draft' })).toBeDisabled();
     expect(chainQaColumnSpy.mock.lastCall?.[0]?.['onSubmit']).toBeUndefined();
     expect(chainQaColumnSpy.mock.lastCall?.[0]?.['disabled']).toBe(true);
@@ -848,7 +848,7 @@ describe('ProductConversationPage', () => {
     renderPage();
     await waitForPageReady();
 
-    expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.['ordinaryComposerEnabled']).toBe(true);
+    expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.['mutationEnabled']).toBe(true);
   });
 
   it('retries older-page fetch once with a fresh tail cursor after a stale 400 cursor error', async () => {

@@ -88,6 +88,7 @@ interface InputAreaProps {
   onCancel: () => void;
   onRetry: (localId: string) => void;
   onDismissError?: (localId: string) => void;
+  readOnly?: boolean;
 }
 
 function formatBytes(bytes: number): string {
@@ -147,11 +148,12 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   onCancel,
   onRetry,
   onDismissError,
+  readOnly = false,
 }, ref) {
   const agentWorking = isAgentWorking(convState);
-  const canCancel = canCancelConversationState(convState);
+  const canCancel = !readOnly && canCancelConversationState(convState);
   const isCancelling = isCancellingState(convState);
-  const acceptsChatMessage = canAcceptChatMessage(convState);
+  const acceptsChatMessage = !readOnly && canAcceptChatMessage(convState);
   const setDraft = onDraftChange;
   const clearDraft = useCallback(() => onDraftChange(''), [onDraftChange]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -554,7 +556,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const displayedText = voiceBase !== null ? voiceBase : draft;
   const hasContent = displayedText.trim().length > 0 || voiceInterim.trim().length > 0 || images.length > 0 || files.length > 0;
   const canSend = acceptsChatMessage && !isUploadingFiles;
-  const sendEnabled = canSend && hasContent && !expansionError;
+  const sendEnabled = !readOnly && canSend && hasContent && !expansionError;
 
   // Cycle placeholder hint each time the input clears (e.g., after send).
   // Advances only when draft goes empty, not on a timer.

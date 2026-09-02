@@ -195,7 +195,7 @@ export interface EmbeddedConversationProjection {
 
 interface EmbeddedConversationHostProps {
   suppressCanonicalization?: boolean;
-  ordinaryComposerEnabled?: boolean;
+  mutationEnabled?: boolean;
   aggregateLifecycleOpen?: boolean | undefined;
   suppressMessageViewerOwner?: boolean;
   suppressTaskApprovalOwner?: boolean;
@@ -221,7 +221,7 @@ export function EmbeddedConversationPage({
   composerQuickAction,
   showTranscript = true,
   suppressCanonicalization = false,
-  ordinaryComposerEnabled = true,
+  mutationEnabled = true,
   aggregateLifecycleOpen,
   onProjectionChange,
   suppressMessageViewerOwner = false,
@@ -256,7 +256,7 @@ export function EmbeddedConversationPage({
         routePrefix={routePrefix}
         composerQuickAction={composerQuickAction}
         showTranscript={showTranscript}
-        ordinaryComposerEnabled={ordinaryComposerEnabled}
+        mutationEnabled={mutationEnabled}
         aggregateLifecycleOpen={aggregateLifecycleOpen}
         suppressCanonicalization={suppressCanonicalization}
         suppressMessageViewerOwner={suppressMessageViewerOwner}
@@ -289,7 +289,7 @@ function ConversationPageContent({
   routePrefix,
   composerQuickAction,
   showTranscript,
-  ordinaryComposerEnabled,
+  mutationEnabled,
   aggregateLifecycleOpen,
   suppressCanonicalization,
   onProjectionChange,
@@ -301,7 +301,7 @@ function ConversationPageContent({
   routePrefix: '/c' | '/global';
   composerQuickAction?: ComposerQuickAction | undefined;
   showTranscript: boolean;
-  ordinaryComposerEnabled: boolean;
+  mutationEnabled: boolean;
   aggregateLifecycleOpen?: boolean | undefined;
   suppressCanonicalization: boolean;
   onProjectionChange?: (projection: EmbeddedConversationProjection | null) => void;
@@ -346,6 +346,7 @@ function ConversationPageContent({
       ? archiveStatusConfirmed && !serverArchived
       : aggregateLifecycleOpen
   );
+  const readOnly = !mutationEnabled;
   const prStatusHandle = useConversationPrStatus({
     conversationId: confirmedLive ? conversationId : undefined,
     convModeLabel: conversation?.conv_mode_label,
@@ -2225,7 +2226,7 @@ function ConversationPageContent({
             pendingMessages={pendingMessages}
             convState={convStateForChildren}
             onRetry={handleRetry}
-            onCancelSteering={isArchived ? undefined : handleCancelSteering}
+            onCancelSteering={readOnly || isArchived ? undefined : handleCancelSteering}
             onOpenFile={isArchived ? undefined : handleOpenFileFromPatch}
             filePathRootDir={conversation.worktree_path ?? conversation.cwd ?? '/'}
             workScopeKey={isArchived ? undefined : conversation.work_scope_key}
@@ -2417,11 +2418,12 @@ function ConversationPageContent({
         </div>
       )}
       {!isArchived && <WorkControlBar
+        mutationEnabled={mutationEnabled}
         conversationId={conversation.id}
         convModeLabel={conversation.conv_mode_label}
         phaseType={convStateForChildren.type}
         continuedInConvId={conversation.continued_in_conv_id}
-        {...(ordinaryComposerEnabled && ordinaryComposerEligible ? { onSendMessage: handleSendTextOnly } : {})}
+        {...(mutationEnabled && ordinaryComposerEligible ? { onSendMessage: handleSendTextOnly } : {})}
         showError={showError}
         prStatusHandle={prStatusHandle}
         {...(onCloseCompleted ? { onCloseCompleted } : {})}
@@ -2466,8 +2468,8 @@ function ConversationPageContent({
         <ErrorBanner
           message={convStateForChildren.message}
           error={convStateForChildren.error}
-          onRetry={isArchived ? undefined : () => handleSend('continue', [])}
-          onDismiss={isArchived ? undefined : () => {
+          onRetry={readOnly || isArchived ? undefined : () => handleSend('continue', [])}
+          onDismiss={readOnly || isArchived ? undefined : () => {
             // No optimistic idle: `dismissError` resolves on enqueue, not on
             // persist, so faking idle could diverge if the executor races/
             // rejects. The server-broadcast state_change SSE drives idle.
@@ -2481,7 +2483,7 @@ function ConversationPageContent({
             banner's quick "retry/continue" so the user is not forced into the
             canned "continue" turn. Gated on can_user_resume to match the
             banner: a non-resumable error stays a dead end. */}
-        {(convStateForChildren.error?.can_user_resume ?? false) && !isArchived && (
+        {(convStateForChildren.error?.can_user_resume ?? false) && !isArchived && mutationEnabled && (
           <RenderProfiler id="InputArea">
           <ConnectedInputArea
             ref={inputRef}
@@ -2501,8 +2503,10 @@ function ConversationPageContent({
             onSend={handleSend}
             onCancel={handleCancel}
             onRetry={handleRetry}
-            onDismissError={dismiss}
-          />
+          onDismissError={dismiss}
+          readOnly={readOnly}
+        />
+
           </RenderProfiler>
         )}
         </>
@@ -2511,11 +2515,11 @@ function ConversationPageContent({
           questions={convStateForChildren.questions}
           conversationId={conversation.id}
           showToast={showInfo}
-          readOnly={isArchived}
+          readOnly={readOnly || isArchived}
           onAnswered={() => dispatch({ type: 'local_phase_change', phase: { type: 'llm_requesting', attempt: 1 }, expectedConversationId: conversation.id })}
           onDismissed={() => dispatch({ type: 'local_phase_change', phase: { type: 'idle' }, expectedConversationId: conversation.id })}
         />
-      ) : ordinaryComposerEnabled && ordinaryComposerEligible ? (
+      ) : mutationEnabled && ordinaryComposerEligible ? (
         <>
         {credentialStatus && credentialStatus !== 'not_configured' && credentialStatus !== 'valid' && (
           <Suspense fallback={null}>
