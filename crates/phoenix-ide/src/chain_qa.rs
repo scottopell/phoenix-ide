@@ -173,6 +173,7 @@ impl ChainQa {
         &self,
         root_id: &str,
         question: &str,
+        admission_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     ) -> Result<ChainQaId, ChainQaError> {
         let prep = self.prepare_invocation(root_id, question).await?;
         let qa_id_for_caller = prep.row_id.clone();
@@ -188,6 +189,7 @@ impl ChainQa {
         let this = self.clone();
         let runtime_for_task = Arc::clone(&runtime);
         tokio::spawn(async move {
+            let _admission_guard = admission_guard;
             let invocation_result = this.run_answer_invocation(&prep, &runtime_for_task).await;
             this.finalize(&qa_id_for_task, invocation_result, &runtime_for_task)
                 .await;

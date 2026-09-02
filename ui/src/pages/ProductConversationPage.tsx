@@ -390,7 +390,7 @@ function ProductConversationPageInner() {
   const { chain, inflight, inflightOrder, draft, submitting, sseLost, loadError } = atom;
   const activeTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const inflightRef = useRef(inflight);
-  const observedMemberArchivedRef = useRef<{ conversationId: string; isArchived: boolean } | null>(null);
+  const observedMemberProjectionRef = useRef<typeof latestProjection>(null);
   const aggregateMessages = useMemo(
     () => snapshot ? makeAggregateMessages(snapshot, latestProjection) : [],
     [latestProjection, snapshot],
@@ -405,7 +405,7 @@ function ProductConversationPageInner() {
     setRestoreCommand(null);
     setOlderError(null);
     setLoadingOlder(false);
-    observedMemberArchivedRef.current = null;
+    observedMemberProjectionRef.current = null;
   }, [productConversationId]);
 
   useEffect(() => {
@@ -465,20 +465,15 @@ function ProductConversationPageInner() {
 
   useEffect(() => {
     if (!latestProjection?.conversationId || !snapshot) return;
-    const observed = {
-      conversationId: latestProjection.conversationId,
-      isArchived: latestProjection.isArchived,
-    };
-    const previous = observedMemberArchivedRef.current;
-    observedMemberArchivedRef.current = observed;
-    const lifecycleMismatch = observed.isArchived !== (snapshot.ordinary_lifecycle === 'history');
-    const firstObservation = previous === null;
-    const sameMemberChanged = previous?.conversationId === observed.conversationId
-      && previous.isArchived !== observed.isArchived;
-    if (lifecycleMismatch && (firstObservation || sameMemberChanged)) {
+    const previous = observedMemberProjectionRef.current;
+    observedMemberProjectionRef.current = latestProjection;
+    const lifecycleMismatch = latestProjection.isArchived
+      !== (snapshot.ordinary_lifecycle === 'history');
+    const projectionChanged = previous !== latestProjection;
+    if (lifecycleMismatch && projectionChanged) {
       setSnapshotRetry((retry) => retry + 1);
     }
-  }, [latestProjection?.conversationId, latestProjection?.isArchived, snapshot]);
+  }, [latestProjection, snapshot]);
 
   useEffect(() => {
     const projection = latestProjection;

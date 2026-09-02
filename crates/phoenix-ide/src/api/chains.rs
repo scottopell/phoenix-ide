@@ -199,12 +199,12 @@ pub async fn submit_chain_question(
     validate_chain_root(&state, &root_id).await?;
 
     let admission = state.runtime.conversation_admission(&root_id).await;
-    let _admission_guard = admission.lock().await;
+    let admission_guard = admission.lock_owned().await;
     super::handlers::require_ordinary_mutation_admission(&state, &root_id, "chain Q&A").await?;
 
     let chain_qa_id = state
         .chain_qa
-        .submit_question(&root_id, trimmed)
+        .submit_question(&root_id, trimmed, Some(admission_guard))
         .await
         .map_err(map_chain_qa_error)?;
     Ok(Json(SubmitChainQaResponse { chain_qa_id }))
