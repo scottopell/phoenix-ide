@@ -19693,6 +19693,8 @@ mod tests {
             .await
             .unwrap();
         let conversation = drain_db.get_conversation("drain-race").await.unwrap();
+        let product_conversation_id = conversation.product_conversation_id.clone();
+        let product_conversation_id_for_close = product_conversation_id.clone();
         let latch = std::sync::Arc::new(SteeringDrainTestLatch::new());
         drain_db.steering_drain_test_latch = Some(latch.clone());
 
@@ -19712,24 +19714,36 @@ mod tests {
         )
         .await
         .expect("drain transaction must reach the causal test latch");
+        let close_attempted = std::sync::Arc::new(tokio::sync::Notify::new());
+        let close_attempted_for_task = close_attempted.clone();
         let close = tokio::spawn(async move {
+            close_attempted_for_task.notify_one();
             close_db
                 .begin_close_foundation(
-                    &conversation.product_conversation_id,
+                    &product_conversation_id_for_close,
                     &phoenix_core::domain::close::TranscriptConversationId::parse("drain-race")
                         .unwrap(),
                     "drain-race-close",
                 )
                 .await
         });
-        tokio::task::yield_now().await;
-        assert!(
-            !close.is_finished(),
-            "Close must wait for drain's immediate transaction"
-        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            close_attempted.notified(),
+        )
+        .await
+        .expect("competing Close must start while the drain transaction is held");
         latch.release_transaction.notify_one();
         assert!(drain.await.unwrap().is_ok());
         assert!(close.await.unwrap().is_ok());
+        let obligation = observer
+            .get_active_close_obligation_for_product(&product_conversation_id)
+            .await
+            .unwrap();
+        assert!(
+            obligation.is_some(),
+            "Close commits only after the complete drain"
+        );
         assert_eq!(observer.get_messages("drain-race").await.unwrap().len(), 1);
     }
 
