@@ -62,6 +62,29 @@ struct SocketFileIdentity {
     inode: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreTeardownSocket {
+    Incarnation(SocketFileIdentity),
+    Absent,
+    NotSocket,
+}
+
+fn pre_teardown_socket(path: &Path) -> std::io::Result<PreTeardownSocket> {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_socket() => {
+            Ok(PreTeardownSocket::Incarnation(SocketFileIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }))
+        }
+        Ok(_) => Ok(PreTeardownSocket::NotSocket),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(PreTeardownSocket::Absent),
+        Err(error) => Err(error),
+    }
+}
+
 fn socket_file_identity(path: &Path) -> std::io::Result<Option<SocketFileIdentity>> {
     use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
 
@@ -532,8 +555,9 @@ struct EnsureLiveLockTestHook {
 #[cfg(test)]
 #[derive(Debug)]
 struct CompleteRetirementLockTestHook {
-    before_entry_lock: Arc<tokio::sync::Notify>,
-    before_final_authority: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    entry_lock_reached: Arc<tokio::sync::Notify>,
+    socket_identity_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    final_authority_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 }
 
 #[cfg(test)]
@@ -749,8 +773,23 @@ impl TmuxRegistry {
         before_entry_lock: Arc<tokio::sync::Notify>,
     ) -> Self {
         self.complete_retirement_lock_test_hook = Some(Arc::new(CompleteRetirementLockTestHook {
-            before_entry_lock,
-            before_final_authority: None,
+            entry_lock_reached: before_entry_lock,
+            socket_identity_gate: None,
+            final_authority_gate: None,
+        }));
+        self
+    }
+
+    #[cfg(test)]
+    fn with_socket_identity_test_hook(
+        mut self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.complete_retirement_lock_test_hook = Some(Arc::new(CompleteRetirementLockTestHook {
+            entry_lock_reached: Arc::new(tokio::sync::Notify::new()),
+            socket_identity_gate: Some((entered, release)),
+            final_authority_gate: None,
         }));
         self
     }
@@ -762,8 +801,9 @@ impl TmuxRegistry {
         release: Arc<tokio::sync::Notify>,
     ) -> Self {
         self.complete_retirement_lock_test_hook = Some(Arc::new(CompleteRetirementLockTestHook {
-            before_entry_lock: Arc::new(tokio::sync::Notify::new()),
-            before_final_authority: Some((entered, release)),
+            entry_lock_reached: Arc::new(tokio::sync::Notify::new()),
+            socket_identity_gate: None,
+            final_authority_gate: Some((entered, release)),
         }));
         self
     }
@@ -2115,7 +2155,7 @@ impl TmuxRegistry {
 
         #[cfg(test)]
         if let Some(hook) = &self.complete_retirement_lock_test_hook {
-            hook.before_entry_lock.notify_one();
+            hook.entry_lock_reached.notify_one();
         }
         let Ok(server) = tokio::time::timeout_at(permit.expires, entry.server.write()).await else {
             return Ok(TmuxRetirementOutcome::RemovalFailed {
@@ -2126,15 +2166,18 @@ impl TmuxRegistry {
         if !exact_owned {
             return self.verify_exact_absence(permit).await;
         }
-        let killed_socket = if self.binary_available {
-            match socket_file_identity(&permit.instance.socket_path) {
-                Ok(Some(identity)) => Some(identity),
-                Ok(None) => {
-                    return Ok(TmuxRetirementOutcome::IdentityNotProven {
-                        reason: "tmux socket incarnation was unavailable before exact teardown"
-                            .to_string(),
-                    });
-                }
+        #[cfg(test)]
+        if let Some((entered, release)) = self
+            .complete_retirement_lock_test_hook
+            .as_ref()
+            .and_then(|hook| hook.socket_identity_gate.as_ref())
+        {
+            entered.notify_one();
+            release.notified().await;
+        }
+        let pre_teardown = if self.binary_available {
+            match pre_teardown_socket(&permit.instance.socket_path) {
+                Ok(observation) => Some(observation),
                 Err(source) => {
                     return Err(TmuxError::ProbeFailed {
                         socket_path: permit.instance.socket_path.clone(),
@@ -2145,7 +2188,12 @@ impl TmuxRegistry {
         } else {
             None
         };
-        let kill_failure = if self.binary_available {
+        if matches!(pre_teardown, Some(PreTeardownSocket::NotSocket)) {
+            return Ok(TmuxRetirementOutcome::IdentityNotProven {
+                reason: "tmux socket incarnation was unavailable before exact teardown".to_string(),
+            });
+        }
+        let kill_failure = if matches!(pre_teardown, Some(PreTeardownSocket::Incarnation(_))) {
             let token_test = format!(
                 "#{{==:#{{E:{SERVER_TOKEN_VAR}}},{}}}",
                 permit.instance.server_token
@@ -2196,17 +2244,13 @@ impl TmuxRegistry {
         };
         drop(server);
 
-        let verified = if kill_failure.is_none() && self.binary_available {
-            let Some(killed_socket) = killed_socket else {
-                return Ok(TmuxRetirementOutcome::IdentityNotProven {
-                    reason: "tmux socket incarnation was not captured before exact teardown"
-                        .to_string(),
-                });
-            };
-            self.verify_exact_absence_after_successful_kill(permit, killed_socket)
-                .await?
-        } else {
-            self.verify_exact_absence(permit).await?
+        let verified = match (kill_failure.as_ref(), pre_teardown) {
+            (None, Some(PreTeardownSocket::Absent)) => TmuxRetirementOutcome::AbsenceVerified,
+            (None, Some(PreTeardownSocket::Incarnation(killed_socket))) => {
+                self.verify_exact_absence_after_successful_kill(permit, killed_socket)
+                    .await?
+            }
+            _ => self.verify_exact_absence(permit).await?,
         };
         if let Some(failure) = kill_failure {
             return Ok(failure);
@@ -2218,7 +2262,7 @@ impl TmuxRegistry {
                 if let Some((entered, release)) = self
                     .complete_retirement_lock_test_hook
                     .as_ref()
-                    .and_then(|hook| hook.before_final_authority.as_ref())
+                    .and_then(|hook| hook.final_authority_gate.as_ref())
                 {
                     entered.notify_one();
                     release.notified().await;
@@ -3505,6 +3549,135 @@ mod tests {
         assert!(!server.retirement_fenced);
         assert_eq!(server.retirement_generation, 0);
         drop(server);
+        owner.shutdown();
+    }
+
+    #[test]
+    fn pre_teardown_socket_distinguishes_absence_from_unknown_incarnation() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("missing.sock");
+        assert_eq!(
+            pre_teardown_socket(&missing).unwrap(),
+            PreTeardownSocket::Absent
+        );
+
+        let unknown = tmp.path().join("not-a-socket");
+        std::fs::write(&unknown, b"not an owned socket incarnation").unwrap();
+        assert_eq!(
+            pre_teardown_socket(&unknown).unwrap(),
+            PreTeardownSocket::NotSocket
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_pre_teardown_incarnation_remains_repair_required() {
+        let tmp = TempDir::new().unwrap();
+        let registry = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), true);
+        let work_scope = scope("unknown-pre-teardown-incarnation");
+        let socket_path = registry.derived_socket_path(&work_scope);
+        let _ = registry
+            .get_or_insert(&work_scope, socket_path.clone())
+            .await;
+        let permit = registry
+            .begin_retirement(&work_scope, None, None, close_deadline())
+            .await
+            .expect("capture exact in-memory authority");
+        std::fs::write(&socket_path, b"not an owned socket incarnation").unwrap();
+
+        assert!(matches!(
+            registry.complete_retirement(&permit).await.unwrap(),
+            TmuxRetirementOutcome::IdentityNotProven { reason }
+                if reason == "tmux socket incarnation was unavailable before exact teardown"
+        ));
+        assert!(registry.get_existing(&work_scope).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn exact_server_exit_before_socket_capture_is_idempotent_and_preserves_replacement() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let owner = TestTmuxServerOwner::new();
+        let before_socket_identity = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let registry = Arc::new(owner.registry().with_socket_identity_test_hook(
+            Arc::clone(&before_socket_identity),
+            Arc::clone(&release),
+        ));
+        let work_scope = scope("exact-exit-before-socket-capture");
+        let live = registry
+            .ensure_live(&work_scope, owner.path(), None, None)
+            .await
+            .expect("create exact server");
+        let retired_identity = live.read().await.exact_identity();
+        let permit = registry
+            .begin_retirement(&work_scope, None, None, close_deadline())
+            .await
+            .expect("capture exact retirement authority");
+
+        let completing = {
+            let registry = Arc::clone(&registry);
+            tokio::spawn(async move {
+                let outcome = registry.complete_retirement(&permit).await.unwrap();
+                (outcome, permit)
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), before_socket_identity.notified())
+            .await
+            .expect("completion must prove exact authority before socket capture");
+        let killed = tokio::process::Command::new("tmux")
+            .args([
+                "-S",
+                &retired_identity.socket_path.to_string_lossy(),
+                "kill-server",
+            ])
+            .env_remove("TMUX")
+            .output()
+            .await
+            .expect("run exact server teardown");
+        assert!(killed.status.success(), "kill exact server: {killed:?}");
+        assert!(matches!(
+            probe(&retired_identity.socket_path).await.unwrap(),
+            ProbeResult::NoServer | ProbeResult::NoSocket
+        ));
+        match std::fs::remove_file(&retired_identity.socket_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("remove exact retired socket: {error}"),
+        }
+        assert_eq!(
+            socket_file_identity(&retired_identity.socket_path).unwrap(),
+            None,
+            "the owned server exited and its socket is absent before exact teardown"
+        );
+        release.notify_one();
+
+        let (outcome, permit) = completing.await.unwrap();
+        assert_eq!(outcome, TmuxRetirementOutcome::Retired);
+        assert!(registry.get_existing(&work_scope).await.is_none());
+        assert_eq!(
+            registry.complete_retirement(&permit).await.unwrap(),
+            TmuxRetirementOutcome::AbsenceVerified
+        );
+
+        let replacement = registry
+            .ensure_live(&work_scope, owner.path(), None, None)
+            .await
+            .expect("create replacement server");
+        let replacement_identity = replacement.read().await.exact_identity();
+        assert_ne!(
+            replacement_identity.server_token,
+            retired_identity.server_token
+        );
+        assert_eq!(
+            registry.complete_retirement(&permit).await.unwrap(),
+            TmuxRetirementOutcome::AbsenceVerified
+        );
+        assert_eq!(
+            read_server_token(&replacement_identity.socket_path).await,
+            Some(replacement_identity.server_token.clone())
+        );
+        assert!(registry.get_existing(&work_scope).await.is_some());
         owner.shutdown();
     }
 
