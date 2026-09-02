@@ -133,7 +133,11 @@ export function CommandPalette({ conversations, productConversations = [], activ
               const chainMembers = conv && !conversations.some(candidate => candidate.id === conv.id)
                 ? [...conversations, conv]
                 : conversations;
-              const chainRootId = computeChainRoots(chainMembers).get(conv?.id ?? '');
+              const computedChainRootId = computeChainRoots(chainMembers).get(conv?.id ?? '');
+              const canonicalRootId = activeProduct?.canonical_root.transcript_row_id;
+              const chainRootId = canonicalRootId && canonicalRootId !== targetId
+                ? canonicalRootId
+                : computedChainRootId;
               if (!targetId || !isWritable || (chainRootId != null && !activeProduct)) return undefined;
               return async () => {
                 try {

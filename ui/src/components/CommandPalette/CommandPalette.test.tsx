@@ -159,7 +159,7 @@ describe('CommandPalette lifecycle availability', () => {
             conversations={[]}
             productConversations={[{
               product_conversation_id: 'product-1', canonical_route: '/product-conversations/product-1',
-              canonical_root: { transcript_row_id: 'root-id', slug: 'root', title: null },
+              canonical_root: { transcript_row_id: 'latest-id', slug: 'latest', title: null },
               ordinary_lifecycle: 'open', latest_transcript_row_id: 'latest-id',
               updated_at: '2026-01-01T00:00:00Z',
               presentation: { kind: 'state', display_name: 'Product', presentation_mode: 'idle' },
@@ -176,6 +176,34 @@ describe('CommandPalette lifecycle availability', () => {
 
     await waitFor(() => expect(mocks.archiveConversation).toHaveBeenCalledWith('latest-id'));
     expect(mocks.archiveChain).not.toHaveBeenCalled();
+  });
+
+  it('uses the canonical chain root when drift hides continuation members', async () => {
+    const active = makeConversation({ id: 'latest-id', slug: 'latest' });
+    render(
+      <MemoryRouter initialEntries={['/product-conversations/product-id']}>
+        <FileExplorerContext.Provider value={{ openFile: mocks.openFile, activeFile: null, closeFile: vi.fn(), openFileState: null }}>
+          <CommandPalette
+            conversations={[]}
+            productConversations={[{
+              product_conversation_id: 'product-id', canonical_route: '/product-conversations/product-id',
+              canonical_root: { transcript_row_id: 'root-id', slug: 'root', title: null },
+              ordinary_lifecycle: 'open', latest_transcript_row_id: 'latest-id',
+              updated_at: '2026-01-01T00:00:00Z',
+              presentation: { kind: 'state', display_name: 'Product', presentation_mode: 'idle' },
+            }]}
+            activeConversation={active}
+          />
+        </FileExplorerContext.Provider>
+      </MemoryRouter>,
+    );
+
+    fireEvent.keyDown(window, { key: 'p', metaKey: true });
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '> close' } });
+    fireEvent.click(screen.getByText('Close Current Conversation'));
+
+    await waitFor(() => expect(mocks.archiveChain).toHaveBeenCalledWith('root-id'));
+    expect(mocks.archiveConversation).not.toHaveBeenCalled();
   });
 
   it('does not offer Close on a canonical History aggregate', () => {
