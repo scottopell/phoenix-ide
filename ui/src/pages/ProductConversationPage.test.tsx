@@ -980,6 +980,33 @@ describe('ProductConversationPage', () => {
     await waitFor(() => expect(screen.getByTestId('message-count')).toHaveTextContent('0'));
   });
 
+  it('adopts a refreshed pagination boundary when no loaded prefix was retained', async () => {
+    const { api } = await import('../api');
+    const activeClose = {
+      attempt_id: 'close-active',
+      phase: 'settling_active_work',
+      confirmation_snapshot: null,
+      inspections: [],
+      losses: [],
+      residuals: [],
+    } satisfies ProductConversationCloseView;
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot({ close: activeClose, before: null, has_older: false }))
+      .mockResolvedValueOnce(makeSnapshot({
+        close: { ...activeClose, phase: 'awaiting_retirement_inspection' },
+        before: 'm-3',
+        has_older: true,
+      }));
+    renderPage();
+    await waitForPageReady();
+    expect(conversationNavStackSpy.mock.lastCall?.[0]?.['hasOlderMessages']).toBe(false);
+
+    act(() => notifyCloseSnapshotChanged('pc-1', 'stream'));
+
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.['hasOlderMessages']).toBe(true));
+  });
+
   it('does not refetch an Open snapshot for ordinary state invalidations', async () => {
     const { api } = await import('../api');
     renderPage();

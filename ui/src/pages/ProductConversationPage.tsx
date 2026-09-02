@@ -269,12 +269,16 @@ function mergeRefreshedTail(
       handoff: refreshedSegment.handoff ?? retainedSegment.handoff,
     });
   }
+  const retainedPrefix = earliestRefreshedOrdinal != null
+    && current.segments.some(
+      (segment) => segment.segment_ordinal < earliestRefreshedOrdinal,
+    );
   return {
     ...refreshed,
     segments: Array.from(segmentsByRowId.values())
       .sort((a, b) => a.segment_ordinal - b.segment_ordinal),
-    before: current.before,
-    has_older: current.has_older,
+    before: retainedPrefix ? current.before : refreshed.before,
+    has_older: retainedPrefix ? current.has_older : refreshed.has_older,
   };
 }
 
