@@ -3098,6 +3098,14 @@ mod product_creation_tests {
         .execute(db.pool())
         .await
         .unwrap();
+        let retryable_lifecycle: String = sqlx::query_scalar(
+            "SELECT ordinary_lifecycle FROM product_conversations WHERE id = ?1",
+        )
+        .bind(accepted.product_conversation_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(retryable_lifecycle, "open");
         assert!(db
             .retry_failed_product_creation_delivery("req-delivery-complete")
             .await

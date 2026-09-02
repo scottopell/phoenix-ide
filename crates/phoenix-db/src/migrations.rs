@@ -8035,6 +8035,7 @@ mod migration_094_tests {
                  ('open-product', 'ordinary', 'history'),
                  ('history-product', 'ordinary', 'open'),
                  ('delivery-pending-product', 'ordinary', 'history'),
+                 ('delivery-failed-product', 'ordinary', 'history'),
                  ('published-history-product', 'ordinary', 'open'),
                  ('coordinator', 'coordinator', NULL);
              INSERT INTO conversations VALUES
@@ -8042,10 +8043,12 @@ mod migration_094_tests {
                  ('history-row', 'history-product', 'user', NULL, NULL, 1),
                  ('subordinate', 'history-product', 'sub_agent', 'history-row', NULL, 0),
                  ('delivery-pending-row', 'delivery-pending-product', 'user', NULL, NULL, 1),
+                 ('delivery-failed-row', 'delivery-failed-product', 'user', NULL, NULL, 1),
                  ('published-history-row', 'published-history-product', 'user', NULL, NULL, 1),
                  ('coordinator-row', 'coordinator', 'coordinator', NULL, NULL, 0);
              INSERT INTO product_creation_jobs VALUES
                  ('delivery-pending-product', 'delivery_pending'),
+                 ('delivery-failed-product', 'delivery_failed'),
                  ('published-history-product', 'published');
              INSERT INTO workflows VALUES
                  (11, 'direct_turn', 2, 7, 'Active', 100),
@@ -8129,7 +8132,7 @@ mod migration_094_tests {
              ) OR EXISTS (
                  SELECT 1 FROM product_creation_jobs job
                  WHERE job.published_product_id = product_conversations.id
-                   AND job.status = 'delivery_pending'
+                   AND job.status IN ('delivery_pending', 'delivery_failed')
              ) THEN 'open' ELSE 'history' END
              WHERE kind = 'ordinary'",
         )
@@ -8147,6 +8150,7 @@ mod migration_094_tests {
             products,
             vec![
                 ("coordinator".into(), None),
+                ("delivery-failed-product".into(), Some("open".into())),
                 ("delivery-pending-product".into(), Some("open".into())),
                 ("history-product".into(), Some("history".into())),
                 ("open-product".into(), Some("open".into())),
@@ -8210,7 +8214,7 @@ mod migration_094_tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(row_count, 6);
+        assert_eq!(row_count, 7);
     }
 }
 
@@ -8423,7 +8427,7 @@ SET ordinary_lifecycle = CASE WHEN EXISTS (
 ) OR EXISTS (
     SELECT 1 FROM product_creation_jobs job
     WHERE job.published_product_id = product_conversations.id
-      AND job.status = 'delivery_pending'
+      AND job.status IN ('delivery_pending', 'delivery_failed')
       AND NOT EXISTS (
         SELECT 1 FROM close_obligations obligation
         WHERE obligation.product_conversation_id = product_conversations.id

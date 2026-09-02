@@ -1654,6 +1654,23 @@ impl Database {
         Ok(rows)
     }
 
+    pub async fn list_close_retirement_archived_conversation_ids(
+        &self,
+        attempt_id: &str,
+    ) -> DbResult<Vec<String>> {
+        sqlx::query_scalar(
+            "SELECT participant.conversation_id
+             FROM close_attempt_participants participant
+             JOIN conversations conversation ON conversation.id = participant.conversation_id
+             WHERE participant.attempt_id = ?1
+             ORDER BY participant.conversation_id",
+        )
+        .bind(attempt_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     pub async fn wake_delivery_requires_close_settlement_recheck(
         &self,
         workflow_id: phoenix_workflow::WorkflowId,
