@@ -4942,6 +4942,36 @@ async fn cancel_conversation_inner(
     }))
 }
 
+async fn admit_model_change(state: &AppState, id: &str) -> Result<(), AppError> {
+    match state
+        .runtime
+        .db()
+        .message_target_admission(id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+    {
+        phoenix_db::MessageTargetAdmission::Aggregate(
+            phoenix_db::ProductConversationAdmission::Accepted { .. },
+        )
+        | phoenix_db::MessageTargetAdmission::StandaloneAvailable => Ok(()),
+        phoenix_db::MessageTargetAdmission::Aggregate(
+            phoenix_db::ProductConversationAdmission::Refused(_),
+        ) => Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Close admission fence rejects model changes",
+            "close_admission_fenced",
+        )))),
+        phoenix_db::MessageTargetAdmission::Aggregate(
+            phoenix_db::ProductConversationAdmission::History(_),
+        )
+        | phoenix_db::MessageTargetAdmission::StandaloneArchived => {
+            Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                "Conversation is unavailable for model changes",
+                "target_unavailable",
+            ))))
+        }
+    }
+}
+
 /// Upgrade a conversation's model (e.g., from 200k to 1M context).
 /// Allowed from `Idle`, `Error`, or `RecoverableContinuationFailure` -- cannot
 /// upgrade while an LLM request, tool execution, or other operation is in flight (see
@@ -4979,35 +5009,7 @@ async fn upgrade_conversation_model(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    match state
-        .runtime
-        .db()
-        .message_target_admission(&id)
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?
-    {
-        phoenix_db::MessageTargetAdmission::Aggregate(
-            phoenix_db::ProductConversationAdmission::Accepted { .. },
-        )
-        | phoenix_db::MessageTargetAdmission::StandaloneAvailable => {}
-        phoenix_db::MessageTargetAdmission::Aggregate(
-            phoenix_db::ProductConversationAdmission::Refused(_),
-        ) => {
-            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                "Close admission fence rejects model changes",
-                "close_admission_fenced",
-            ))));
-        }
-        phoenix_db::MessageTargetAdmission::Aggregate(
-            phoenix_db::ProductConversationAdmission::History(_),
-        )
-        | phoenix_db::MessageTargetAdmission::StandaloneArchived => {
-            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                "Conversation is unavailable for model changes",
-                "target_unavailable",
-            ))));
-        }
-    }
+    admit_model_change(&state, &id).await?;
 
     let effective_state = state
         .runtime
@@ -15157,6 +15159,65 @@ mod upgrade_model_state_guard_tests {
             .expect("model switch must be allowed from Idle");
         let conv = state.db.get_conversation("c-idle").await.expect("reload");
         assert_eq!(conv.model.as_deref(), Some("claude-sonnet-5"));
+    }
+
+    #[tokio::test]
+    async fn rejects_switch_for_history_aggregate_without_mutating_model_or_runtime() {
+        let state = make_test_state().await;
+        seed(&state, "c-history").await;
+        let conv = state.db.get_conversation("c-history").await.expect("load");
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1",
+        )
+        .bind(conv.product_conversation_id.as_str())
+        .execute(state.db.pool())
+        .await
+        .expect("mark history");
+
+        let err = upgrade(&state, "c-history", "claude-sonnet-5")
+            .await
+            .expect_err("History must reject model changes");
+        assert!(matches!(
+            err,
+            AppError::Conflict(detail) if detail.error_type == "target_unavailable"
+        ));
+        let reloaded = state
+            .db
+            .get_conversation("c-history")
+            .await
+            .expect("reload");
+        assert_eq!(reloaded.model.as_deref(), Some("claude-opus-4-7"));
+    }
+
+    #[tokio::test]
+    async fn rejects_switch_while_close_admission_is_fenced() {
+        let state = make_test_state().await;
+        seed(&state, "c-closing").await;
+        let conv = state.db.get_conversation("c-closing").await.expect("load");
+        state
+            .db
+            .begin_close_foundation(
+                &conv.product_conversation_id,
+                &phoenix_core::domain::close::TranscriptConversationId::parse(conv.id.clone())
+                    .expect("transcript id"),
+                "upgrade-model-close-attempt",
+            )
+            .await
+            .expect("begin close");
+
+        let err = upgrade(&state, "c-closing", "claude-sonnet-5")
+            .await
+            .expect_err("Close fence must reject model changes");
+        assert!(matches!(
+            err,
+            AppError::Conflict(detail) if detail.error_type == "close_admission_fenced"
+        ));
+        let reloaded = state
+            .db
+            .get_conversation("c-closing")
+            .await
+            .expect("reload");
+        assert_eq!(reloaded.model.as_deref(), Some("claude-opus-4-7"));
     }
 
     #[tokio::test]
