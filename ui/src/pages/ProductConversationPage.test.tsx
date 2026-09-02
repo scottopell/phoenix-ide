@@ -839,6 +839,147 @@ describe('ProductConversationPage', () => {
     expect(screen.getByRole('heading', { name: 'Product Alpha' })).toBeInTheDocument();
   });
 
+  it('preserves loaded history across active Close refreshes', async () => {
+    const { api } = await import('../api');
+    const activeClose = {
+      attempt_id: 'close-active',
+      phase: 'settling_active_work',
+      confirmation_snapshot: null,
+      inspections: [],
+      losses: [],
+      residuals: [],
+    } satisfies ProductConversationCloseView;
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot({ close: activeClose }))
+      .mockResolvedValueOnce(makeSnapshot({
+        close: activeClose,
+        segments: [{ segment_ordinal: 0, transcript_row_id: 'row-old', slug: 'old', title: 'Old', messages: [makeMessage('old-message', 0)], handoff: null }],
+        before: null,
+        has_older: false,
+      }))
+      .mockResolvedValueOnce(makeSnapshot({
+        close: { ...activeClose, phase: 'awaiting_retirement_inspection' },
+        segments: [
+          {
+            segment_ordinal: 1,
+            transcript_row_id: 'row-1',
+            slug: 'row-1',
+            title: 'First',
+            messages: [makeMessage('m-2', 2)],
+            handoff: {
+              kind: 'historical',
+              predecessor_transcript_row_id: 'row-1',
+              successor_transcript_row_id: 'row-2',
+              continuation_message_id: 'cont-1',
+              summary: 'carry context',
+            },
+          },
+          {
+            segment_ordinal: 2,
+            transcript_row_id: 'row-2',
+            slug: 'row-2',
+            title: 'Second',
+            messages: [makeMessage('m-3', 3), makeMessage('m-4', 4)],
+            handoff: null,
+          },
+        ],
+      }));
+
+    renderPage();
+    await waitForPageReady();
+    fireEvent.click(screen.getByRole('button', { name: 'load older' }));
+    await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent('old-message'));
+
+    act(() => notifyCloseSnapshotChanged('row-2', 'stream'));
+
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent('old-message'));
+    expect(screen.getByTestId('message-order')).toHaveTextContent('old-message,m-1,m-2,product-handoff:pc-1:row-1:cont-1,m-3,m-4');
+    expect(screen.getByTestId('message-order').textContent?.split(',').filter((id) => id === 'old-message')).toHaveLength(1);
+    expect(conversationNavStackSpy.mock.lastCall?.[0]?.['transcriptPositioning']).toEqual(expect.objectContaining({ kind: 'idle' }));
+    expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.['mutationEnabled']).toBe(false);
+  });
+
+  it('does not retain a removed segment inside the authoritative refreshed tail range', async () => {
+    const { api } = await import('../api');
+    const activeClose = {
+      attempt_id: 'close-active',
+      phase: 'settling_active_work',
+      confirmation_snapshot: null,
+      inspections: [],
+      losses: [],
+      residuals: [],
+    } satisfies ProductConversationCloseView;
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot({
+        close: activeClose,
+        latest_transcript_row_id: 'row-stale',
+        writable_transcript_row_id: 'row-stale',
+        segments: [
+          {
+            segment_ordinal: 2,
+            transcript_row_id: 'row-2',
+            slug: 'row-2',
+            title: 'Second',
+            messages: [makeMessage('m-3', 3), makeMessage('m-4', 4)],
+            handoff: null,
+          },
+          {
+            segment_ordinal: 3,
+            transcript_row_id: 'row-stale',
+            slug: 'row-stale',
+            title: 'Removed',
+            messages: [makeMessage('stale-message', 5)],
+            handoff: null,
+          },
+        ],
+      }))
+      .mockResolvedValueOnce(makeSnapshot({
+        close: { ...activeClose, phase: 'awaiting_retirement_inspection' },
+        segments: [{
+          segment_ordinal: 2,
+          transcript_row_id: 'row-2',
+          slug: 'row-2',
+          title: 'Second',
+          messages: [makeMessage('m-3', 3), makeMessage('m-4', 4)],
+          handoff: null,
+        }],
+      }));
+    renderPage();
+    await waitForPageReady();
+
+    act(() => notifyCloseSnapshotChanged('pc-1', 'stream'));
+
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByTestId('message-order')).not.toHaveTextContent('stale-message'));
+    expect(screen.getByTestId('message-order')).toHaveTextContent('m-3,m-4');
+  });
+
+  it('does not preserve stale cached segments when the refreshed tail is empty', async () => {
+    const { api } = await import('../api');
+    const activeClose = {
+      attempt_id: 'close-active',
+      phase: 'settling_active_work',
+      confirmation_snapshot: null,
+      inspections: [],
+      losses: [],
+      residuals: [],
+    } satisfies ProductConversationCloseView;
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot({ close: activeClose }))
+      .mockResolvedValueOnce(makeSnapshot({
+        close: { ...activeClose, phase: 'awaiting_retirement_inspection' },
+        segments: [],
+      }));
+    renderPage();
+    await waitForPageReady();
+
+    act(() => notifyCloseSnapshotChanged('pc-1', 'stream'));
+
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByTestId('message-count')).toHaveTextContent('0'));
+  });
+
   it('does not refetch an Open snapshot for ordinary state invalidations', async () => {
     const { api } = await import('../api');
     renderPage();
@@ -920,6 +1061,42 @@ describe('ProductConversationPage', () => {
     await waitForPageReady();
 
     expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.['mutationEnabled']).toBe(true);
+  });
+
+  it('keeps an Open aggregate mutable after archived drift triggers a failed background refresh', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot({ ordinary_lifecycle: 'open' }))
+      .mockRejectedValueOnce(new Error('refresh failed'));
+    renderPage();
+    await waitForPageReady();
+
+    act(() => emitLatestProjection({ serverArchived: true }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('refresh failed');
+    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole('heading', { name: 'Product Alpha' })).toBeInTheDocument();
+    expect(screen.queryByText('Showing cached row if available.')).not.toBeInTheDocument();
+    expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.['mutationEnabled']).toBe(true);
+    expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.['aggregateLifecycleOpen']).toBe(true);
+  });
+
+  it('keeps a History aggregate read-only after a failed background refresh despite unarchived drift', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot({ ordinary_lifecycle: 'history' }))
+      .mockRejectedValueOnce(new Error('refresh failed'));
+    renderPage();
+    await waitForPageReady();
+
+    act(() => notifyCloseSnapshotChanged('row-2'));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('refresh failed');
+    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole('heading', { name: 'Product Alpha' })).toBeInTheDocument();
+    expect(screen.getByText('History is read-only.')).toBeInTheDocument();
+    expect(screen.queryByTestId('embedded-conversation-page')).not.toBeInTheDocument();
+    expect(screen.queryByText('Showing cached row if available.')).not.toBeInTheDocument();
   });
   it('gates task approval mutations behind liveControlsEnabled', async () => {
     const { api } = await import('../api');

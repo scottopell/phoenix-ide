@@ -235,6 +235,49 @@ function mergeOlderSegments(
   };
 }
 
+function mergeRefreshedTail(
+  current: ProductConversationSnapshotView,
+  refreshed: ProductConversationSnapshotView,
+): ProductConversationSnapshotView {
+  const segmentsByRowId = new Map(
+    refreshed.segments.map((segment) => [segment.transcript_row_id, segment]),
+  );
+  const earliestRefreshedOrdinal = refreshed.segments.length > 0
+    ? Math.min(...refreshed.segments.map((segment) => segment.segment_ordinal))
+    : null;
+  for (const retainedSegment of current.segments) {
+    const refreshedSegment = segmentsByRowId.get(retainedSegment.transcript_row_id);
+    if (!refreshedSegment) {
+      if (earliestRefreshedOrdinal != null
+        && retainedSegment.segment_ordinal < earliestRefreshedOrdinal) {
+        segmentsByRowId.set(retainedSegment.transcript_row_id, retainedSegment);
+      }
+      continue;
+    }
+    const refreshedMessageIds = new Set(
+      refreshedSegment.messages.map((message) => message.message_id),
+    );
+    segmentsByRowId.set(retainedSegment.transcript_row_id, {
+      ...retainedSegment,
+      ...refreshedSegment,
+      messages: [
+        ...retainedSegment.messages.filter(
+          (message) => !refreshedMessageIds.has(message.message_id),
+        ),
+        ...refreshedSegment.messages,
+      ],
+      handoff: refreshedSegment.handoff ?? retainedSegment.handoff,
+    });
+  }
+  return {
+    ...refreshed,
+    segments: Array.from(segmentsByRowId.values())
+      .sort((a, b) => a.segment_ordinal - b.segment_ordinal),
+    before: current.before,
+    has_older: current.has_older,
+  };
+}
+
 function aggregateConversationState(snapshot: ProductConversationSnapshotView, loadingOlder: boolean, olderError: string | null): ConversationState {
   if (olderError) {
     return { type: 'error', message: olderError, error_kind: 'server_error' };
@@ -421,8 +464,13 @@ function ProductConversationPageInner() {
     api.getProductConversationSnapshot(productConversationId, { message_limit: PAGE_SIZE })
       .then((next) => {
         if (cancelled) return;
-        setOwnedSnapshot({ productConversationId, value: next });
-        setHistoryGeneration(0);
+        setOwnedSnapshot((current) => ({
+          productConversationId,
+          value: current?.productConversationId === productConversationId
+            ? mergeRefreshedTail(current.value, next)
+            : next,
+        }));
+        if (!isBackgroundRefresh) setHistoryGeneration(0);
       })
       .catch((err) => {
         if (cancelled) return;
@@ -755,10 +803,8 @@ function ProductConversationPageInner() {
     );
   }
 
-  if (error || !snapshot) {
-    const fallbackSlug = ownedSnapshot && ownedSnapshot.productConversationId === productConversationId
-      ? ownedSnapshot.value.latest_transcript_row_id
-      : productConversationId;
+  if (!snapshot) {
+    const fallbackSlug = productConversationId;
     return (
       <main className="product-conversation-page">
         <div role="alert">{error ?? 'Unable to open this product conversation.'} Showing cached row if available.</div>
@@ -768,6 +814,8 @@ function ProductConversationPageInner() {
             slug={fallbackSlug}
             routePrefix="/c"
             suppressCanonicalization
+            mutationEnabled={false}
+            aggregateLifecycleOpen={false}
           />
         )}
       </main>
@@ -783,6 +831,7 @@ function ProductConversationPageInner() {
           <p className="product-conversation-page__route">{snapshot.canonical_route}</p>
         </div>
         {olderError && <div className="product-conversation-page__status" role="alert">{olderError}</div>}
+        {error && <div className="product-conversation-page__status" role="alert">{error}</div>}
         {hashTargetExhausted && (
           <div className="product-conversation-page__status" role="alert">
             The linked message is not available in this conversation history.
