@@ -467,7 +467,7 @@ function ProductConversationPageInner() {
     if (!latestProjection?.conversationId || !snapshot) return;
     const previous = observedMemberProjectionRef.current;
     observedMemberProjectionRef.current = latestProjection;
-    const lifecycleMismatch = latestProjection.isArchived
+    const lifecycleMismatch = latestProjection.serverArchived
       !== (snapshot.ordinary_lifecycle === 'history');
     const projectionChanged = previous !== latestProjection;
     if (lifecycleMismatch && projectionChanged) {

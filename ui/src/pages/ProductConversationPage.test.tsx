@@ -286,6 +286,7 @@ function emitLatestProjection(overrides: Partial<Record<string, unknown>> = {}) 
     }],
     convState: { type: 'awaiting_user_response', questions: [] },
     isArchived: false,
+    serverArchived: false,
     onRetryPending: vi.fn(),
     onCancelSteering: vi.fn(),
     onOpenFile: vi.fn(),
@@ -334,9 +335,9 @@ describe('ProductConversationPage', () => {
     renderPage();
     await waitForPageReady();
 
-    act(() => emitLatestProjection({ isArchived: false }));
+    act(() => emitLatestProjection({ isArchived: false, serverArchived: false }));
     expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(1);
-    act(() => emitLatestProjection({ isArchived: true }));
+    act(() => emitLatestProjection({ isArchived: false, serverArchived: true }));
 
     await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(screen.getByText('History is read-only.')).toBeInTheDocument());

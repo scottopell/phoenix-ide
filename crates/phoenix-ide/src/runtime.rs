@@ -6230,6 +6230,21 @@ impl RuntimeManager {
     }
 
     /// Get the database handle
+    pub(crate) async fn mutation_admission(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Arc<AsyncMutex<()>>, phoenix_db::DbError> {
+        let conversation = self.db.get_conversation(conversation_id).await?;
+        let key = match self.db.message_target_admission(conversation_id).await? {
+            phoenix_db::MessageTargetAdmission::Aggregate(_) => {
+                conversation.product_conversation_id.to_string()
+            }
+            phoenix_db::MessageTargetAdmission::StandaloneAvailable
+            | phoenix_db::MessageTargetAdmission::StandaloneArchived => conversation_id.to_string(),
+        };
+        Ok(self.conversation_admission(&key).await)
+    }
+
     pub(crate) async fn conversation_admission(
         &self,
         conversation_id: &str,

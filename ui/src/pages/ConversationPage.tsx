@@ -185,6 +185,7 @@ export interface EmbeddedConversationProjection {
   pendingMessages: PendingUserMessage[];
   convState: ReturnType<typeof parseConversationState>;
   isArchived: boolean;
+  serverArchived: boolean;
   onRetryPending: (localId: string) => void;
   onCancelSteering: (localId: string) => void;
   onOpenFile: (filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void;
@@ -1779,6 +1780,7 @@ function ConversationPageContent({
       pendingMessages,
       convState: convStateForChildren,
       isArchived,
+      serverArchived,
       onRetryPending: handleRetry,
       onCancelSteering: handleCancelSteering,
       onOpenFile: handleOpenFileFromPatch,
@@ -1799,6 +1801,7 @@ function ConversationPageContent({
     convStateForChildren,
     isArchived,
     handleRetry,
+    serverArchived,
     handleCancelSteering,
     handleOpenFileFromPatch,
     conversation?.worktree_path,
