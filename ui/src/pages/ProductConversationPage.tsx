@@ -605,9 +605,12 @@ function ProductConversationPageInner() {
   }, [historyGeneration, latestProjection?.conversationId, loadingOlder, productConversationId, snapshot]);
 
   const messages = aggregateMessages;
+  const closeInProgress = snapshot?.close != null && snapshot.close.phase !== 'completed';
   const convState = useMemo(
-    () => latestProjection?.convState ?? (snapshot ? aggregateConversationState(snapshot, loadingOlder, olderError) : { type: 'idle' } satisfies ConversationState),
-    [latestProjection, loadingOlder, olderError, snapshot],
+    () => snapshot?.ordinary_lifecycle === 'history' || closeInProgress
+      ? ({ type: 'idle' } satisfies ConversationState)
+      : latestProjection?.convState ?? (snapshot ? aggregateConversationState(snapshot, loadingOlder, olderError) : { type: 'idle' } satisfies ConversationState),
+    [closeInProgress, latestProjection, loadingOlder, olderError, snapshot],
   );
   const latestSlug = latestProjection?.slug ?? snapshot?.latest_transcript_row_id ?? null;
   const latestConversationId = latestProjection?.conversationId ?? snapshot?.latest_transcript_row_id ?? undefined;
@@ -635,6 +638,7 @@ function ProductConversationPageInner() {
     }
     : { kind: 'idle' as const, view: transcriptView });
   const isOpen = snapshot?.ordinary_lifecycle === 'open';
+  const liveControlsEnabled = isOpen && !closeInProgress;
 
   useEffect(() => {
     if (!hashTargetMessageId || hashTargetLoaded || !snapshot?.has_older || loadingOlder || olderError) return;
@@ -834,8 +838,9 @@ function ProductConversationPageInner() {
                 setDraft={setDraft}
                 submitting={submitting}
                 sseLost={sseLost}
-                {...(!loadError ? { onSubmit: handleSubmit } : {})}
+                {...(!loadError && liveControlsEnabled ? { onSubmit: handleSubmit } : {})}
                 onReask={handleReask}
+                disabled={!liveControlsEnabled}
                 activeTextareaRef={activeTextareaRef}
                 onRetryConnection={() => {
                   dispatch({ type: 'SSE_RESTORED' });
@@ -851,7 +856,7 @@ function ProductConversationPageInner() {
                   suppressCanonicalization={true}
                   suppressMessageViewerOwner
                   suppressTaskApprovalOwner={true}
-                  ordinaryComposerEnabled={isOpen}
+                  ordinaryComposerEnabled={liveControlsEnabled}
                   aggregateLifecycleOpen={isOpen}
                   onProjectionChange={setLatestProjection}
                   onCloseCompleted={() => setSnapshotRetry((retry) => retry + 1)}

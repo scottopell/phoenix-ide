@@ -73,6 +73,7 @@ vi.mock('./ChainPage', () => ({
         <textarea
           aria-label="recall draft"
           value={String(props['draft'] ?? '')}
+          disabled={Boolean(props['disabled'])}
           onChange={(event) => (props['setDraft'] as ((value: string) => void))(event.target.value)}
         />
       </div>
@@ -780,6 +781,28 @@ describe('ProductConversationPage', () => {
     });
   });
 
+  it('disables live transcript and recall controls while Close is active', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValueOnce(makeSnapshot({
+      close: {
+        attempt_id: 'close-active',
+        phase: 'settling_active_work',
+        confirmation_snapshot: null,
+        inspections: [],
+        losses: [],
+        residuals: [],
+      },
+    }));
+
+    renderPage();
+    await waitForPageReady();
+
+    expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.['ordinaryComposerEnabled']).toBe(false);
+    expect(screen.getByRole('textbox', { name: 'recall draft' })).toBeDisabled();
+    expect(chainQaColumnSpy.mock.lastCall?.[0]?.['onSubmit']).toBeUndefined();
+    expect(chainQaColumnSpy.mock.lastCall?.[0]?.['disabled']).toBe(true);
+  });
+
   it('keeps history snapshots read-only while retaining lineage recall', async () => {
     const { api } = await import('../api');
     vi.mocked(api.getProductConversationSnapshot).mockResolvedValueOnce(makeSnapshot({
@@ -795,6 +818,9 @@ describe('ProductConversationPage', () => {
     expect(screen.getByText('History is read-only.')).toBeInTheDocument();
     expect(screen.getAllByText('History').length).toBeGreaterThan(0);
     expect(screen.queryByText('history')).not.toBeInTheDocument();
+    expect(screen.getByRole('textbox', { name: 'recall draft' })).toBeDisabled();
+    expect(chainQaColumnSpy.mock.lastCall?.[0]?.['disabled']).toBe(true);
+    expect(chainQaColumnSpy.mock.lastCall?.[0]?.['onSubmit']).toBeUndefined();
   });
 
   it('keeps aggregate transcript viewer actions reachable while the aggregate route owns placement', async () => {

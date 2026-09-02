@@ -7939,16 +7939,50 @@ mod migration_094_tests {
     #[tokio::test]
     async fn lifecycle_cutover_preserves_cancellation_settlement_for_recovery() {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
-        sqlx::query(
+        sqlx::raw_sql(
             "CREATE TABLE close_obligations (
                  attempt_id TEXT PRIMARY KEY, phase TEXT NOT NULL, updated_at TEXT NOT NULL
              );
+             CREATE TABLE close_attempt_participants (
+                 attempt_id TEXT NOT NULL, conversation_id TEXT NOT NULL
+             );
+             CREATE TABLE durable_turns (
+                 turn_id INTEGER PRIMARY KEY, conversation_id TEXT NOT NULL,
+                 generation INTEGER NOT NULL, owns_conversation INTEGER NOT NULL,
+                 terminal_kind TEXT
+             );
+             CREATE TABLE close_attempt_direct_turn_settlement_captures (
+                 attempt_id TEXT PRIMARY KEY, captured_at TEXT NOT NULL
+             );
+             CREATE TABLE close_attempt_direct_turn_settlements (
+                 attempt_id TEXT NOT NULL, turn_id INTEGER NOT NULL,
+                 expected_generation INTEGER NOT NULL,
+                 PRIMARY KEY (attempt_id, turn_id)
+             );
              INSERT INTO close_obligations VALUES
-                 ('settling', 'settling_active_work', 'before'),
-                 ('cancelling', 'cancel_requested_during_settlement', 'before');
-             UPDATE close_obligations
-             SET updated_at = updated_at
-             WHERE 0;",
+                 ('settling', 'settling_active_work', 'settling-time'),
+                 ('cancelling', 'cancel_requested_during_settlement', 'cancelling-time');
+             INSERT INTO close_attempt_participants VALUES
+                 ('settling', 'settling-conv'), ('cancelling', 'cancelling-conv');
+             INSERT INTO durable_turns VALUES
+                 (11, 'settling-conv', 4, 1, NULL),
+                 (12, 'cancelling-conv', 7, 1, NULL);
+             INSERT OR IGNORE INTO close_attempt_direct_turn_settlement_captures (
+                 attempt_id, captured_at
+             )
+             SELECT obligation.attempt_id, obligation.updated_at
+             FROM close_obligations obligation
+             WHERE obligation.phase IN ('settling_active_work', 'cancel_requested_during_settlement');
+             INSERT OR IGNORE INTO close_attempt_direct_turn_settlements (
+                 attempt_id, turn_id, expected_generation
+             )
+             SELECT obligation.attempt_id, turn.turn_id, turn.generation
+             FROM close_obligations obligation
+             JOIN close_attempt_participants participant
+               ON participant.attempt_id = obligation.attempt_id
+             JOIN durable_turns turn ON turn.conversation_id = participant.conversation_id
+             WHERE obligation.phase IN ('settling_active_work', 'cancel_requested_during_settlement')
+               AND turn.owns_conversation = 1 AND turn.terminal_kind IS NULL;",
         )
         .execute(&pool)
         .await
@@ -7969,6 +8003,29 @@ mod migration_094_tests {
                 ),
                 ("settling".into(), "settling_active_work".into()),
             ]
+        );
+        let captures = sqlx::query_as::<_, (String, String)>(
+            "SELECT attempt_id, captured_at FROM close_attempt_direct_turn_settlement_captures ORDER BY attempt_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            captures,
+            vec![
+                ("cancelling".into(), "cancelling-time".into()),
+                ("settling".into(), "settling-time".into())
+            ]
+        );
+        let targets = sqlx::query_as::<_, (String, i64, i64)>(
+            "SELECT attempt_id, turn_id, expected_generation FROM close_attempt_direct_turn_settlements ORDER BY attempt_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            targets,
+            vec![("cancelling".into(), 12, 7), ("settling".into(), 11, 4)]
         );
     }
 
@@ -8293,21 +8350,25 @@ WHEN NOT EXISTS (
 BEGIN
     SELECT RAISE(ABORT, 'close direct-turn settlement target must be a sealed active participant');
 END;
+INSERT OR IGNORE INTO close_attempt_direct_turn_settlement_captures (
+    attempt_id, captured_at
+)
+SELECT obligation.attempt_id, obligation.updated_at
+FROM close_obligations obligation
+WHERE obligation.phase IN ('settling_active_work', 'cancel_requested_during_settlement');
+INSERT OR IGNORE INTO close_attempt_direct_turn_settlements (
+    attempt_id, turn_id, expected_generation
+)
+SELECT obligation.attempt_id, turn.turn_id, turn.generation
+FROM close_obligations obligation
+JOIN close_attempt_participants participant
+  ON participant.attempt_id = obligation.attempt_id
+JOIN durable_turns turn ON turn.conversation_id = participant.conversation_id
+WHERE obligation.phase IN ('settling_active_work', 'cancel_requested_during_settlement')
+  AND turn.owns_conversation = 1
+  AND turn.terminal_kind IS NULL;
+
 DROP TRIGGER close_obligations_transition_graph;
-DELETE FROM close_attempt_direct_turn_settlement_captures
-WHERE attempt_id IN (
-    SELECT attempt_id FROM close_obligations
-    WHERE phase = 'settling_active_work'
-);
-DELETE FROM close_attempt_direct_turn_settlements
-WHERE attempt_id IN (
-    SELECT attempt_id FROM close_obligations
-    WHERE phase = 'settling_active_work'
-);
-UPDATE close_obligations
-SET phase = 'awaiting_stop_work_confirmation',
-    updated_at = STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now')
-WHERE phase = 'settling_active_work';
 CREATE TRIGGER close_obligations_transition_graph
 BEFORE UPDATE OF phase ON close_obligations
 FOR EACH ROW

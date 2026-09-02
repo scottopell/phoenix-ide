@@ -4741,6 +4741,9 @@ async fn cancel_conversation_inner(
     state: AppState,
     id: String,
 ) -> Result<Json<CancelResponse>, AppError> {
+    let admission = state.runtime.conversation_admission(&id).await;
+    let _admission_guard = admission.lock().await;
+    require_ordinary_mutation_admission(&state, &id, "conversation cancellation").await?;
     // Provisioning cancellation is DB-owned because no conversation runtime
     // owns that lifecycle yet.
     let conversation = state
@@ -4942,14 +4945,11 @@ async fn cancel_conversation_inner(
     }))
 }
 
-async fn admit_model_change(state: &AppState, id: &str) -> Result<(), AppError> {
-    match state
-        .runtime
-        .db()
-        .message_target_admission(id)
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?
-    {
+pub(super) fn map_ordinary_mutation_admission(
+    admission: &phoenix_db::MessageTargetAdmission,
+    operation: &str,
+) -> Result<(), AppError> {
+    match admission {
         phoenix_db::MessageTargetAdmission::Aggregate(
             phoenix_db::ProductConversationAdmission::Accepted { .. },
         )
@@ -4957,7 +4957,7 @@ async fn admit_model_change(state: &AppState, id: &str) -> Result<(), AppError> 
         phoenix_db::MessageTargetAdmission::Aggregate(
             phoenix_db::ProductConversationAdmission::Refused(_),
         ) => Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-            "Close admission fence rejects model changes",
+            format!("Close admission fence rejects {operation}"),
             "close_admission_fenced",
         )))),
         phoenix_db::MessageTargetAdmission::Aggregate(
@@ -4965,11 +4965,68 @@ async fn admit_model_change(state: &AppState, id: &str) -> Result<(), AppError> 
         )
         | phoenix_db::MessageTargetAdmission::StandaloneArchived => {
             Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                "Conversation is unavailable for model changes",
+                format!("Conversation is unavailable for {operation}"),
                 "target_unavailable",
             ))))
         }
     }
+}
+
+pub(super) fn map_hard_delete_admission(
+    admission: &phoenix_db::MessageTargetAdmission,
+) -> Result<(), AppError> {
+    match admission {
+        phoenix_db::MessageTargetAdmission::Aggregate(
+            phoenix_db::ProductConversationAdmission::History(_),
+        )
+        | phoenix_db::MessageTargetAdmission::StandaloneArchived => Ok(()),
+        phoenix_db::MessageTargetAdmission::Aggregate(
+            phoenix_db::ProductConversationAdmission::Refused(_),
+        ) => Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Close admission fence rejects permanent delete",
+            "close_admission_fenced",
+        )))),
+        phoenix_db::MessageTargetAdmission::Aggregate(
+            phoenix_db::ProductConversationAdmission::Accepted { .. },
+        )
+        | phoenix_db::MessageTargetAdmission::StandaloneAvailable => {
+            Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                "Only a History conversation can be permanently deleted",
+                "target_unavailable",
+            ))))
+        }
+    }
+}
+
+pub(super) async fn require_hard_delete_admission(
+    state: &AppState,
+    id: &str,
+) -> Result<(), AppError> {
+    let admission = state
+        .runtime
+        .db()
+        .message_target_admission(id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    map_hard_delete_admission(&admission)
+}
+
+pub(super) async fn require_ordinary_mutation_admission(
+    state: &AppState,
+    id: &str,
+    operation: &str,
+) -> Result<(), AppError> {
+    let admission = state
+        .runtime
+        .db()
+        .message_target_admission(id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    map_ordinary_mutation_admission(&admission, operation)
+}
+
+async fn admit_model_change(state: &AppState, id: &str) -> Result<(), AppError> {
+    require_ordinary_mutation_admission(state, id, "model changes").await
 }
 
 /// Upgrade a conversation's model (e.g., from 200k to 1M context).
@@ -5098,35 +5155,7 @@ async fn trigger_continuation(
 ) -> Result<Json<SuccessResponse>, AppError> {
     let admission = state.runtime.conversation_admission(&id).await;
     let _admission = admission.lock().await;
-    match state
-        .runtime
-        .db()
-        .message_target_admission(&id)
-        .await
-        .map_err(|error| AppError::NotFound(error.to_string()))?
-    {
-        phoenix_db::MessageTargetAdmission::Aggregate(
-            phoenix_db::ProductConversationAdmission::Accepted { .. },
-        )
-        | phoenix_db::MessageTargetAdmission::StandaloneAvailable => {}
-        phoenix_db::MessageTargetAdmission::Aggregate(
-            phoenix_db::ProductConversationAdmission::Refused(_),
-        ) => {
-            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                "Close admission fence rejects continuation retry",
-                "close_admission_fenced",
-            ))));
-        }
-        phoenix_db::MessageTargetAdmission::Aggregate(
-            phoenix_db::ProductConversationAdmission::History(_),
-        )
-        | phoenix_db::MessageTargetAdmission::StandaloneArchived => {
-            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                "Conversation is unavailable for continuation retry",
-                "target_unavailable",
-            ))));
-        }
-    }
+    require_ordinary_mutation_admission(&state, &id, "continuation retry").await?;
     let effective_state = match state.runtime.effective_conversation_state(&id).await {
         Some(runtime_state) => runtime_state,
         None => {
@@ -5515,35 +5544,7 @@ async fn respond_to_question(
         ))));
     }
 
-    match state
-        .runtime
-        .db()
-        .message_target_admission(&id)
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?
-    {
-        phoenix_db::MessageTargetAdmission::Aggregate(
-            phoenix_db::ProductConversationAdmission::Accepted { .. },
-        )
-        | phoenix_db::MessageTargetAdmission::StandaloneAvailable => {}
-        phoenix_db::MessageTargetAdmission::Aggregate(
-            phoenix_db::ProductConversationAdmission::Refused(_),
-        ) => {
-            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                "Close admission fence rejects question response",
-                "close_admission_fenced",
-            ))));
-        }
-        phoenix_db::MessageTargetAdmission::Aggregate(
-            phoenix_db::ProductConversationAdmission::History(_),
-        )
-        | phoenix_db::MessageTargetAdmission::StandaloneArchived => {
-            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                "Conversation is unavailable for question response",
-                "target_unavailable",
-            ))));
-        }
-    }
+    require_ordinary_mutation_admission(&state, &id, "question response").await?;
 
     state
         .runtime
@@ -5581,35 +5582,7 @@ async fn dismiss_question(
         ))));
     }
 
-    match state
-        .runtime
-        .db()
-        .message_target_admission(&id)
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?
-    {
-        phoenix_db::MessageTargetAdmission::Aggregate(
-            phoenix_db::ProductConversationAdmission::Accepted { .. },
-        )
-        | phoenix_db::MessageTargetAdmission::StandaloneAvailable => {}
-        phoenix_db::MessageTargetAdmission::Aggregate(
-            phoenix_db::ProductConversationAdmission::Refused(_),
-        ) => {
-            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                "Close admission fence rejects question dismissal",
-                "close_admission_fenced",
-            ))));
-        }
-        phoenix_db::MessageTargetAdmission::Aggregate(
-            phoenix_db::ProductConversationAdmission::History(_),
-        )
-        | phoenix_db::MessageTargetAdmission::StandaloneArchived => {
-            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                "Conversation is unavailable for question dismissal",
-                "target_unavailable",
-            ))));
-        }
-    }
+    require_ordinary_mutation_admission(&state, &id, "question dismissal").await?;
 
     state
         .runtime
@@ -5658,35 +5631,7 @@ async fn dismiss_error(
         }
     }
 
-    match state
-        .runtime
-        .db()
-        .message_target_admission(&id)
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?
-    {
-        phoenix_db::MessageTargetAdmission::Aggregate(
-            phoenix_db::ProductConversationAdmission::Accepted { .. },
-        )
-        | phoenix_db::MessageTargetAdmission::StandaloneAvailable => {}
-        phoenix_db::MessageTargetAdmission::Aggregate(
-            phoenix_db::ProductConversationAdmission::Refused(_),
-        ) => {
-            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                "Close admission fence rejects error dismissal",
-                "close_admission_fenced",
-            ))));
-        }
-        phoenix_db::MessageTargetAdmission::Aggregate(
-            phoenix_db::ProductConversationAdmission::History(_),
-        )
-        | phoenix_db::MessageTargetAdmission::StandaloneArchived => {
-            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                "Conversation is unavailable for error dismissal",
-                "target_unavailable",
-            ))));
-        }
-    }
+    require_ordinary_mutation_admission(&state, &id, "error dismissal").await?;
 
     state
         .runtime
@@ -6142,9 +6087,10 @@ async fn delete_conversation(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
-    refuse_if_chain_member(&state, &id, "delete").await?;
     let admission = state.runtime.conversation_admission(&id).await;
     let _admission_guard = admission.lock().await;
+    require_hard_delete_admission(&state, &id).await?;
+    refuse_if_chain_member(&state, &id, "delete").await?;
     run_hard_delete_cascade(&state, &id).await?;
     Ok(Json(SuccessResponse { success: true }))
 }
@@ -12325,6 +12271,73 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("accept direct turn");
     }
 
+    #[test]
+    fn ordinary_and_hard_delete_admission_outcomes_are_complementary() {
+        use phoenix_core::domain::close::{CloseAttemptId, ClosePhase};
+        use phoenix_core::domain::product_conversation::ProductConversationId;
+        use phoenix_db::{
+            CloseAdmissionFence, MessageTargetAdmission, ProductConversationAdmission,
+        };
+
+        let product_id = ProductConversationId::parse("product-admission").expect("product id");
+        let cases = [
+            (
+                MessageTargetAdmission::Aggregate(ProductConversationAdmission::Accepted {
+                    product_conversation_id: product_id.clone(),
+                }),
+                None,
+                Some("target_unavailable"),
+            ),
+            (
+                MessageTargetAdmission::Aggregate(ProductConversationAdmission::Refused(
+                    CloseAdmissionFence {
+                        product_conversation_id: product_id.clone(),
+                        attempt_id: CloseAttemptId::parse("attempt-admission").expect("attempt id"),
+                        phase: ClosePhase::SettlingActiveWork,
+                    },
+                )),
+                Some("close_admission_fenced"),
+                Some("close_admission_fenced"),
+            ),
+            (
+                MessageTargetAdmission::Aggregate(ProductConversationAdmission::History(
+                    product_id,
+                )),
+                Some("target_unavailable"),
+                None,
+            ),
+            (
+                MessageTargetAdmission::StandaloneAvailable,
+                None,
+                Some("target_unavailable"),
+            ),
+            (
+                MessageTargetAdmission::StandaloneArchived,
+                Some("target_unavailable"),
+                None,
+            ),
+        ];
+
+        for (admission, ordinary_error, delete_error) in cases {
+            let ordinary = map_ordinary_mutation_admission(&admission, "test mutation");
+            assert_eq!(
+                ordinary.err().and_then(|error| match error {
+                    AppError::Conflict(detail) => Some(detail.error_type),
+                    _ => None,
+                }),
+                ordinary_error.map(str::to_string)
+            );
+            let deletion = map_hard_delete_admission(&admission);
+            assert_eq!(
+                deletion.err().and_then(|error| match error {
+                    AppError::Conflict(detail) => Some(detail.error_type),
+                    _ => None,
+                }),
+                delete_error.map(str::to_string)
+            );
+        }
+    }
+
     #[tokio::test]
     async fn cancel_uses_live_idle_state_over_stale_busy_database_projection() {
         let state = make_test_state().await;
@@ -12354,6 +12367,59 @@ pub(crate) mod hard_delete_cascade_tests {
         assert!(response.ok);
         assert!(response.no_op);
         assert!(matches!(*handle.state_rx.borrow(), ConvState::Idle));
+    }
+
+    #[tokio::test]
+    async fn cancel_endpoint_rejects_close_fenced_and_history_targets_without_side_effects() {
+        for (id, expected_error) in [
+            ("cancel-close-fenced", "close_admission_fenced"),
+            ("cancel-history", "target_unavailable"),
+        ] {
+            let state = make_test_state().await;
+            state
+                .db
+                .create_conversation(id, id, "/tmp", true, None, None)
+                .await
+                .expect("create");
+            let conversation = state.db.get_conversation(id).await.expect("load");
+            if expected_error == "close_admission_fenced" {
+                state
+                    .db
+                    .begin_close_foundation(
+                        &conversation.product_conversation_id,
+                        &phoenix_core::domain::close::TranscriptConversationId::parse(id)
+                            .expect("transcript id"),
+                        &format!("{id}-attempt"),
+                    )
+                    .await
+                    .expect("begin close");
+            } else {
+                sqlx::query(
+                    "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1",
+                )
+                .bind(conversation.product_conversation_id.as_str())
+                .execute(state.db.pool())
+                .await
+                .expect("mark history");
+            }
+
+            let error = cancel_conversation(State(state.clone()), Path(id.to_string()))
+                .await
+                .expect_err("lifecycle admission rejects cancellation");
+            assert!(matches!(
+                error,
+                AppError::Conflict(detail) if detail.error_type == expected_error
+            ));
+            assert!(matches!(
+                state
+                    .db
+                    .get_conversation(id)
+                    .await
+                    .expect("still present")
+                    .state,
+                ConvState::Idle
+            ));
+        }
     }
 
     #[tokio::test]
@@ -13022,6 +13088,42 @@ pub(crate) mod hard_delete_cascade_tests {
             state.db.get_conversation("c-1").await.is_err(),
             "row must be gone after successful cascade"
         );
+    }
+
+    #[tokio::test]
+    async fn delete_endpoint_requires_history_before_running_cascade() {
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation("delete-open", "delete-open", "/tmp", true, None, None)
+            .await
+            .expect("create");
+
+        let error = delete_conversation(State(state.clone()), Path("delete-open".to_string()))
+            .await
+            .expect_err("Open aggregate cannot be permanently deleted");
+        assert!(matches!(
+            error,
+            AppError::Conflict(detail) if detail.error_type == "target_unavailable"
+        ));
+        assert!(state.db.get_conversation("delete-open").await.is_ok());
+
+        let conversation = state
+            .db
+            .get_conversation("delete-open")
+            .await
+            .expect("load");
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1",
+        )
+        .bind(conversation.product_conversation_id.as_str())
+        .execute(state.db.pool())
+        .await
+        .expect("mark history");
+        let _ = delete_conversation(State(state.clone()), Path("delete-open".to_string()))
+            .await
+            .expect("History aggregate can be permanently deleted");
+        assert!(state.db.get_conversation("delete-open").await.is_err());
     }
 
     #[tokio::test]
