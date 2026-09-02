@@ -894,7 +894,6 @@ impl WorkflowRepository {
                        AND latest.runtime_role = 'user'
                        AND latest.parent_conversation_id IS NULL
                        AND latest.continued_in_conv_id IS NULL
-                       AND latest.archived = 0
                      ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1
                    ))
                  OR (product.kind <> 'ordinary' AND conversations.archived = 0)
@@ -5579,6 +5578,65 @@ mod tests {
             .unwrap()
             .candidates
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn global_discovery_uses_authoritative_live_leaf_despite_archived_drift() {
+        let repo = repo().await;
+        let db = Database::from_pool_for_tests(repo.pool.clone(), ":memory:".into());
+        db.update_conversation_state(
+            "conv-a",
+            &ConvState::ContextExhausted {
+                summary: "full".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let crate::ContinueOutcome::Created(leaf) =
+            db.continue_conversation("conv-a").await.unwrap()
+        else {
+            panic!("continuation created");
+        };
+        sqlx::query("UPDATE conversations SET archived = 1 WHERE id IN ('conv-a', ?1)")
+            .bind(&leaf.id)
+            .execute(&repo.pool)
+            .await
+            .unwrap();
+        let predecessor = repo
+            .accept_authoritative_turn(&input("conv-a", "old", 31))
+            .await
+            .unwrap();
+        let leaf = repo
+            .accept_authoritative_turn(&input(&leaf.id, "live", 32))
+            .await
+            .unwrap();
+        let TurnOutcome::Created {
+            turn_id: predecessor_id,
+            ..
+        } = predecessor.outcome
+        else {
+            panic!("created predecessor")
+        };
+        let TurnOutcome::Created {
+            turn_id: leaf_id, ..
+        } = leaf.outcome
+        else {
+            panic!("created leaf")
+        };
+
+        let candidates = repo
+            .list_discoverable_accepted_runtime_direct_turns(None, 10)
+            .await
+            .unwrap()
+            .candidates;
+        assert!(!candidates.iter().any(|row| row.turn_id == predecessor_id));
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|row| row.turn_id == leaf_id)
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

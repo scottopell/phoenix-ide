@@ -1261,6 +1261,23 @@ impl SteeringBeginTestLatch {
     }
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+struct SteeringDrainTestLatch {
+    transaction_entered: tokio::sync::Notify,
+    release_transaction: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl SteeringDrainTestLatch {
+    fn new() -> Self {
+        Self {
+            transaction_entered: tokio::sync::Notify::new(),
+            release_transaction: tokio::sync::Notify::new(),
+        }
+    }
+}
+
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Default)]
 pub(crate) struct SteeringCapacityTestControl {
@@ -1317,6 +1334,8 @@ pub struct Database {
     pub(crate) close_foundation_test_latch: Option<std::sync::Arc<CloseFoundationTestLatch>>,
     #[cfg(test)]
     steering_begin_test_latch: Option<std::sync::Arc<SteeringBeginTestLatch>>,
+    #[cfg(test)]
+    steering_drain_test_latch: Option<std::sync::Arc<SteeringDrainTestLatch>>,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) steering_capacity_test_control: SteeringCapacityTestControl,
 }
@@ -1336,6 +1355,8 @@ impl Clone for Database {
             close_foundation_test_latch: self.close_foundation_test_latch.clone(),
             #[cfg(test)]
             steering_begin_test_latch: self.steering_begin_test_latch.clone(),
+            #[cfg(test)]
+            steering_drain_test_latch: self.steering_drain_test_latch.clone(),
             #[cfg(any(test, feature = "test-support"))]
             steering_capacity_test_control: self.steering_capacity_test_control.clone(),
         }
@@ -1569,6 +1590,8 @@ impl Database {
             close_foundation_test_latch: None,
             #[cfg(test)]
             steering_begin_test_latch: None,
+            #[cfg(test)]
+            steering_drain_test_latch: None,
             #[cfg(any(test, feature = "test-support"))]
             steering_capacity_test_control: SteeringCapacityTestControl::default(),
         }
@@ -6700,6 +6723,11 @@ impl Database {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let mut statuses = Vec::with_capacity(messages.len());
         require_product_conversation_admission_tx(&mut tx, id).await?;
+        #[cfg(test)]
+        if let Some(latch) = &self.steering_drain_test_latch {
+            latch.transaction_entered.notify_one();
+            latch.release_transaction.notified().await;
+        }
 
         for message in messages {
             if message.conversation_id != id {
@@ -19650,6 +19678,98 @@ mod tests {
         .await
         .unwrap();
         assert!(!db.has_committed_steering_turn("drain-ok").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn steering_drain_serializes_close_between_admission_and_message_insert() {
+        let (_dir, mut drain_db, close_db) = open_test_db_pair().await;
+        let observer = drain_db.clone();
+        drain_db
+            .create_conversation("drain-race", "drain-race", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        drain_db
+            .update_steering_queue("drain-race", &[steering_entry("queued")])
+            .await
+            .unwrap();
+        let conversation = drain_db.get_conversation("drain-race").await.unwrap();
+        let latch = std::sync::Arc::new(SteeringDrainTestLatch::new());
+        drain_db.steering_drain_test_latch = Some(latch.clone());
+
+        let drain = tokio::spawn(async move {
+            drain_db
+                .commit_steering_drain(
+                    "drain-race",
+                    &[steering_drain_message("drain-race", "queued", 10)],
+                    &ConvState::LlmRequesting { attempt: 1 },
+                    Utc::now(),
+                )
+                .await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            latch.transaction_entered.notified(),
+        )
+        .await
+        .expect("drain transaction must reach the causal test latch");
+        let close = tokio::spawn(async move {
+            close_db
+                .begin_close_foundation(
+                    &conversation.product_conversation_id,
+                    &phoenix_core::domain::close::TranscriptConversationId::parse("drain-race")
+                        .unwrap(),
+                    "drain-race-close",
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !close.is_finished(),
+            "Close must wait for drain's immediate transaction"
+        );
+        latch.release_transaction.notify_one();
+        assert!(drain.await.unwrap().is_ok());
+        assert!(close.await.unwrap().is_ok());
+        assert_eq!(observer.get_messages("drain-race").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn steering_drain_refuses_close_fenced_aggregate_without_partial_write() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("drain-fenced", "drain-fenced", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.update_steering_queue("drain-fenced", &[steering_entry("queued")])
+            .await
+            .unwrap();
+        let conversation = db.get_conversation("drain-fenced").await.unwrap();
+        db.begin_close_foundation(
+            &conversation.product_conversation_id,
+            &phoenix_core::domain::close::TranscriptConversationId::parse("drain-fenced").unwrap(),
+            "drain-close-attempt",
+        )
+        .await
+        .unwrap();
+
+        let error = db
+            .commit_steering_drain(
+                "drain-fenced",
+                &[steering_drain_message("drain-fenced", "queued", 10)],
+                &ConvState::LlmRequesting { attempt: 1 },
+                Utc::now(),
+            )
+            .await
+            .expect_err("Close admission must fence queued steering materialization");
+        assert!(matches!(error, DbError::CloseAdmissionFenced(_)));
+        assert!(db.get_messages("drain-fenced").await.unwrap().is_empty());
+        assert_eq!(
+            db.get_steering_queue("drain-fenced").await.unwrap().len(),
+            1
+        );
+        assert_eq!(
+            db.get_conversation("drain-fenced").await.unwrap().state,
+            ConvState::Idle
+        );
     }
 
     #[tokio::test]

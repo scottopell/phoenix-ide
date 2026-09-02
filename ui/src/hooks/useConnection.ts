@@ -524,9 +524,7 @@ export function useConnection({
               // RFC3339 → unix ms once at the SSE boundary (REQ-WPV-001).
               stateUpdatedAt: Date.parse(res.data.state_updated_at),
             });
-            if (latestConversationRef.current?.id) {
-              notifyCloseSnapshotChanged(latestConversationRef.current.id);
-            }
+            notifyCloseSnapshotChanged(convId);
           });
 
           on('agent_done', (e) => {
