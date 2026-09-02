@@ -6347,6 +6347,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn close_settlement_suppresses_materialized_pending_wake_idempotently() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let workflow_id = WorkflowId(8122);
+        let pending = create_pending_terminal_delivery(&repo, workflow_id).await;
+        materialize_pending(&repo, &pending, "wake complete", None, true, Timestamp(50)).await;
+        let db = crate::Database::from_pool_for_tests(
+            repo.workflow_repo.pool.clone(),
+            "wake-close-settlement.db".into(),
+        );
+        db.begin_close_foundation(
+            &phoenix_core::domain::product_conversation::ProductConversationId::parse(
+                "wake-product",
+            )
+            .unwrap(),
+            &TranscriptConversationId::parse("conv-1").unwrap(),
+            "wake-settlement-close",
+        )
+        .await
+        .unwrap();
+        db.confirm_close_stop_work("wake-settlement-close")
+            .await
+            .unwrap();
+        db.begin_close_active_work_settlement("wake-settlement-close")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.suppress_materialized_close_settlement_wakes("wake-settlement-close")
+                .await
+                .unwrap(),
+            1,
+        );
+        assert!(repo.list_pending("conv-1").await.unwrap().is_empty());
+        assert_eq!(
+            db.suppress_materialized_close_settlement_wakes("wake-settlement-close")
+                .await
+                .unwrap(),
+            0,
+        );
+        let advanced = db
+            .advance_close_settlement_when_quiescent("wake-settlement-close")
+            .await
+            .unwrap();
+        assert_eq!(
+            advanced.phase(),
+            phoenix_core::domain::close::ClosePhase::AwaitingRetirementInspection
+        );
+        let state_kind: String =
+            sqlx::query_scalar("SELECT state_kind FROM conversations WHERE id = 'conv-1'")
+                .fetch_one(&repo.workflow_repo.pool)
+                .await
+                .unwrap();
+        assert_eq!(state_kind, "idle");
+    }
+
+    #[tokio::test]
     async fn conversation_adoption_leaves_busy_delivery_owed() {
         let (_dir, repo, _) = open_repo_pair().await;
         let workflow_id = WorkflowId(813);

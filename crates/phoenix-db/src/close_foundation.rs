@@ -1697,6 +1697,67 @@ impl Database {
         ))
     }
 
+    pub async fn suppress_materialized_close_settlement_wakes(
+        &self,
+        attempt_id: &str,
+    ) -> DbResult<usize> {
+        let rows: Vec<i64> = sqlx::query_scalar(
+            "SELECT DISTINCT binding.workflow_id
+             FROM wake_bindings binding
+             JOIN close_attempt_participants participant
+               ON participant.conversation_id = binding.conversation_id
+             JOIN close_obligations obligation ON obligation.attempt_id = participant.attempt_id
+             WHERE participant.attempt_id = ?1
+               AND obligation.phase IN ('settling_active_work', 'cancel_requested_during_settlement')
+               AND EXISTS (
+                 SELECT 1 FROM workflow_deliveries delivery
+                 JOIN wake_delivery_messages message
+                   ON message.workflow_id = delivery.workflow_id
+                  AND message.delivery_id = delivery.delivery_id
+                 WHERE delivery.workflow_id = binding.workflow_id
+                   AND delivery.status = 'Pending'
+               )
+             ORDER BY binding.workflow_id",
+        )
+        .bind(attempt_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let wake_repo = crate::workflow::wake::WakeRepository::new(self.pool.clone());
+        let mut suppressed = 0;
+        for workflow_id in rows {
+            let outcome = wake_repo
+                .resolve_materialized_pending_for_workflow(
+                    phoenix_workflow::WorkflowId(u64::try_from(workflow_id).map_err(|_| {
+                        DbError::Serialization("negative wake workflow id".to_string())
+                    })?),
+                    crate::workflow::wake::WakeResolveMaterializedDecision::Suppress,
+                    phoenix_workflow::Timestamp(u64::try_from(Utc::now().timestamp()).map_err(
+                        |_| {
+                            DbError::Serialization(
+                                "negative wake suppression timestamp".to_string(),
+                            )
+                        },
+                    )?),
+                )
+                .await?;
+            match outcome {
+                Ok(
+                    crate::workflow::wake::WakeResolveMaterializedPendingOutcome::Resolved {
+                        ..
+                    }
+                    | crate::workflow::wake::WakeResolveMaterializedPendingOutcome::AlreadyResolved,
+                ) => suppressed += 1,
+                Ok(crate::workflow::wake::WakeResolveMaterializedPendingOutcome::NothingPending)
+                | Err(
+                    crate::workflow::wake::WakeResolveMaterializedPendingError::NotFullyMaterialized {
+                        ..
+                    },
+                ) => {}
+            }
+        }
+        Ok(suppressed)
+    }
+
     pub async fn cancel_close_settlement_wakes(&self, attempt_id: &str) -> DbResult<usize> {
         let wake_repo = crate::workflow::wake::WakeRepository::new(self.pool.clone());
         let rows: Vec<(i64, String, String)> = sqlx::query_as(

@@ -8057,7 +8057,8 @@ mod migration_094_tests {
              );
              CREATE TABLE conversations (
                  id TEXT PRIMARY KEY, product_conversation_id TEXT, runtime_role TEXT,
-                 parent_conversation_id TEXT, continued_in_conv_id TEXT, archived INTEGER
+                 parent_conversation_id TEXT, continued_in_conv_id TEXT, archived INTEGER,
+                 created_at TEXT NOT NULL
              );
              CREATE TABLE product_creation_jobs (
                  request_id TEXT PRIMARY KEY, published_product_id TEXT, status TEXT NOT NULL,
@@ -8110,13 +8111,14 @@ mod migration_094_tests {
                  ('published-history-product', 'ordinary', 'open'),
                  ('coordinator', 'coordinator', NULL);
              INSERT INTO conversations VALUES
-                 ('open-row', 'open-product', 'user', NULL, NULL, 0),
-                 ('history-row', 'history-product', 'user', NULL, NULL, 1),
-                 ('subordinate', 'history-product', 'sub_agent', 'history-row', NULL, 0),
-                 ('delivery-pending-row', 'delivery-pending-product', 'user', NULL, NULL, 1),
-                 ('delivery-failed-row', 'delivery-failed-product', 'user', NULL, NULL, 1),
-                 ('published-history-row', 'published-history-product', 'user', NULL, NULL, 1),
-                 ('coordinator-row', 'coordinator', 'coordinator', NULL, NULL, 0);
+                 ('a-open-leaf', 'open-product', 'user', NULL, NULL, 0, '2026-01-02'),
+                 ('z-open-predecessor', 'open-product', 'user', NULL, 'a-open-leaf', 1, '2026-01-01'),
+                 ('history-row', 'history-product', 'user', NULL, NULL, 1, '2026-01-01'),
+                 ('subordinate', 'history-product', 'sub_agent', 'history-row', NULL, 0, '2026-01-01'),
+                 ('delivery-pending-row', 'delivery-pending-product', 'user', NULL, NULL, 1, '2026-01-01'),
+                 ('delivery-failed-row', 'delivery-failed-product', 'user', NULL, NULL, 1, '2026-01-01'),
+                 ('published-history-row', 'published-history-product', 'user', NULL, NULL, 1, '2026-01-01'),
+                 ('coordinator-row', 'coordinator', 'coordinator', NULL, NULL, 0, '2026-01-01');
              INSERT INTO product_creation_jobs VALUES
                  ('pending-request', 'delivery-pending-product', 'delivery_pending', NULL, 100, 'worker', 'token', 200),
                  ('failed-request', 'delivery-failed-product', 'delivery_failed', 'transient', NULL, NULL, NULL, NULL),
@@ -8125,16 +8127,20 @@ mod migration_094_tests {
                  ('delivery-pending-product', 'completed', 'archived');
              INSERT INTO workflows VALUES
                  (11, 'direct_turn', 2, 7, 'Active', 100),
-                 (12, 'wake', 2, 7, 'Active', 100);
+                 (12, 'wake', 2, 7, 'Active', 100),
+                 (13, 'direct_turn', 2, 7, 'Active', 100);
              INSERT INTO workflow_transitions VALUES
                  (11, 1, 0, 1, 0, 'direct_turn.event', 1, X'01', 90),
-                 (12, 1, 0, 1, 0, 'wake.event', 1, X'01', 90);
+                 (12, 1, 0, 1, 0, 'wake.event', 1, X'01', 90),
+                 (13, 1, 0, 1, 0, 'direct_turn.event', 1, X'01', 90);
              INSERT INTO workflow_effects VALUES
                  (11, 1, 'Eligible', 200, 7, 1),
-                 (12, 1, 'Eligible', 200, 7, 1);
+                 (12, 1, 'Eligible', 200, 7, 1),
+                 (13, 1, 'Eligible', 200, 7, 1);
              INSERT INTO durable_turns VALUES
                  (1, 11, 'history-row', 'Runtime', NULL, NULL, 7, 1, NULL),
-                 (2, 12, 'subordinate', 'Runtime', NULL, NULL, 7, 1, NULL);",
+                 (2, 12, 'subordinate', 'Runtime', NULL, NULL, 7, 1, NULL),
+                 (3, 13, 'z-open-predecessor', 'Runtime', NULL, NULL, 7, 1, NULL);",
         )
         .execute(&pool)
         .await
@@ -8151,13 +8157,27 @@ mod migration_094_tests {
              WHERE turn.terminal_kind IS NULL AND turn.canonical_message_id IS NULL
                AND workflow.profile_kind = 'direct_turn'
                AND workflow.status NOT IN ('Cancelled', 'Completed', 'Failed', 'Deleted')
-               AND product.kind = 'ordinary' AND NOT EXISTS (
-                 SELECT 1 FROM conversations latest
-                 WHERE latest.product_conversation_id = product.id
-                   AND latest.runtime_role = 'user'
-                   AND latest.parent_conversation_id IS NULL
-                   AND latest.continued_in_conv_id IS NULL
-                   AND latest.archived = 0
+               AND product.kind = 'ordinary' AND (
+                 NOT EXISTS (
+                   SELECT 1 FROM conversations latest
+                   WHERE latest.product_conversation_id = product.id
+                     AND latest.runtime_role = 'user'
+                     AND latest.parent_conversation_id IS NULL
+                     AND latest.continued_in_conv_id IS NULL
+                     AND latest.archived = 0
+                 ) OR (
+                   member.runtime_role = 'user'
+                   AND member.parent_conversation_id IS NULL
+                   AND member.id <> (
+                     SELECT latest.id FROM conversations latest
+                     WHERE latest.product_conversation_id = product.id
+                       AND latest.runtime_role = 'user'
+                       AND latest.parent_conversation_id IS NULL
+                       AND latest.continued_in_conv_id IS NULL
+                       AND latest.archived = 0
+                     ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1
+                   )
+                 )
                );
              INSERT INTO workflow_transitions (
                  workflow_id, transition_id, from_version, to_version, generation,
@@ -8335,6 +8355,28 @@ mod migration_094_tests {
         .await
         .unwrap();
         assert_eq!(effect, ("Invalidated".into(), None, 8, 0));
+        let predecessor_turn: (Option<String>, i64, i64) = sqlx::query_as(
+            "SELECT terminal_kind, generation, owns_conversation FROM durable_turns WHERE turn_id = 3",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(predecessor_turn, (Some("Cancelled".into()), 8, 0));
+        let predecessor_workflow: (String, i64, i64) = sqlx::query_as(
+            "SELECT status, version, generation FROM workflows WHERE workflow_id = 13",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(predecessor_workflow, ("Cancelled".into(), 3, 8));
+        let predecessor_effect: (String, Option<i64>, i64, i64) = sqlx::query_as(
+            "SELECT status, next_eligible_at, generation, pending_reconciliation
+             FROM workflow_effects WHERE workflow_id = 13 AND effect_id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(predecessor_effect, ("Invalidated".into(), None, 8, 0));
         let wake_workflow: (String, i64, i64) = sqlx::query_as(
             "SELECT status, version, generation FROM workflows WHERE workflow_id = 12",
         )
@@ -8347,7 +8389,7 @@ mod migration_094_tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(row_count, 7);
+        assert_eq!(row_count, 8);
     }
 }
 
@@ -8507,13 +8549,28 @@ WHERE turn.terminal_kind IS NULL
   AND workflow.profile_kind = 'direct_turn'
   AND workflow.status NOT IN ('Cancelled', 'Completed', 'Failed', 'Deleted')
   AND product.kind = 'ordinary'
-  AND NOT EXISTS (
-    SELECT 1 FROM conversations latest
-    WHERE latest.product_conversation_id = product.id
-      AND latest.runtime_role = 'user'
-      AND latest.parent_conversation_id IS NULL
-      AND latest.continued_in_conv_id IS NULL
-      AND latest.archived = 0
+  AND (
+    NOT EXISTS (
+      SELECT 1 FROM conversations latest
+      WHERE latest.product_conversation_id = product.id
+        AND latest.runtime_role = 'user'
+        AND latest.parent_conversation_id IS NULL
+        AND latest.continued_in_conv_id IS NULL
+        AND latest.archived = 0
+    )
+    OR (
+      member.runtime_role = 'user'
+      AND member.parent_conversation_id IS NULL
+      AND member.id <> (
+        SELECT latest.id FROM conversations latest
+        WHERE latest.product_conversation_id = product.id
+          AND latest.runtime_role = 'user'
+          AND latest.parent_conversation_id IS NULL
+          AND latest.continued_in_conv_id IS NULL
+          AND latest.archived = 0
+        ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1
+      )
+    )
   );
 INSERT INTO workflow_transitions (
     workflow_id, transition_id, from_version, to_version, generation,

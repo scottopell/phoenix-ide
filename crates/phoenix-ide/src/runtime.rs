@@ -3317,6 +3317,11 @@ impl RuntimeManager {
                     .await
                     .map_err(|error| error.to_string())?;
                 manager
+                    .db
+                    .suppress_materialized_close_settlement_wakes(obligation.attempt_id().as_str())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                manager
                     .settle_close_direct_turn_targets(obligation.attempt_id().as_str())
                     .await?;
                 match manager
