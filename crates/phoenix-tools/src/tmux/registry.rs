@@ -300,14 +300,18 @@ fn wait_process_exit(expected: ProcessIdentity, timeout: Duration) -> ExactProce
     if fd < 0 {
         return exact_process_state(expected);
     }
+    let Ok(fd) = libc::c_int::try_from(fd) else {
+        return ExactProcessState::Unproven;
+    };
     let mut poll_fd = libc::pollfd {
-        fd: fd as i32,
+        fd,
         events: libc::POLLIN,
         revents: 0,
     };
-    let millis = timeout.as_millis().min(i32::MAX as u128) as i32;
+    let millis =
+        libc::c_int::try_from(timeout.as_millis().min(i32::MAX as u128)).unwrap_or(i32::MAX);
     let ready = unsafe { libc::poll(std::ptr::addr_of_mut!(poll_fd), 1, millis) };
-    unsafe { libc::close(fd as i32) };
+    unsafe { libc::close(fd) };
     if ready > 0 && poll_fd.revents & libc::POLLIN != 0 {
         ExactProcessState::DeadOrReused
     } else {
