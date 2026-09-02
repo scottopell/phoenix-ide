@@ -390,6 +390,7 @@ function ProductConversationPageInner() {
   const { chain, inflight, inflightOrder, draft, submitting, sseLost, loadError } = atom;
   const activeTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const inflightRef = useRef(inflight);
+  const observedMemberArchivedRef = useRef<{ conversationId: string; isArchived: boolean } | null>(null);
   const aggregateMessages = useMemo(
     () => snapshot ? makeAggregateMessages(snapshot, latestProjection) : [],
     [latestProjection, snapshot],
@@ -404,6 +405,7 @@ function ProductConversationPageInner() {
     setRestoreCommand(null);
     setOlderError(null);
     setLoadingOlder(false);
+    observedMemberArchivedRef.current = null;
   }, [productConversationId]);
 
   useEffect(() => {
@@ -460,6 +462,21 @@ function ProductConversationPageInner() {
     dispatch({ type: 'LOAD_BEGIN' });
     void refreshChain(chainRootId);
   }, [chainRootId, dispatch, refreshChain]);
+
+  useEffect(() => {
+    if (!latestProjection?.conversationId || !snapshot) return;
+    const observed = {
+      conversationId: latestProjection.conversationId,
+      isArchived: latestProjection.isArchived,
+    };
+    const previous = observedMemberArchivedRef.current;
+    observedMemberArchivedRef.current = observed;
+    if (previous?.conversationId === observed.conversationId
+      && previous.isArchived !== observed.isArchived
+      && observed.isArchived !== (snapshot.ordinary_lifecycle === 'history')) {
+      setSnapshotRetry((retry) => retry + 1);
+    }
+  }, [latestProjection?.conversationId, latestProjection?.isArchived, snapshot]);
 
   useEffect(() => {
     const projection = latestProjection;

@@ -122,28 +122,35 @@ export function CommandPalette({ conversations, productConversations = [], activ
         archiveCurrent: currentSlug || activeProduct?.ordinary_lifecycle === 'open'
           ? (() => {
               const activeRoute = activeConvId ?? activeProduct?.latest_transcript_row_id ?? currentSlug;
-              const conv = conversations.find(c => c.id === activeRoute || c.slug === activeRoute);
+              const conv = conversations.find(c => c.id === activeRoute || c.slug === activeRoute)
+                ?? (activeConversation?.id === activeRoute || activeConversation?.slug === activeRoute
+                  ? activeConversation
+                  : undefined);
+              const targetId = conv?.id ?? activeProduct?.latest_transcript_row_id;
               const isWritable = activeProduct
                 ? activeProduct.ordinary_lifecycle === 'open'
                 : conv?.archived !== true;
-              const chainRootId = computeChainRoots(conversations).get(conv?.id ?? '');
-              if (!conv || !isWritable || (chainRootId != null && !activeProduct)) return undefined;
+              const chainMembers = conv && !conversations.some(candidate => candidate.id === conv.id)
+                ? [...conversations, conv]
+                : conversations;
+              const chainRootId = computeChainRoots(chainMembers).get(conv?.id ?? '');
+              if (!targetId || !isWritable || (chainRootId != null && !activeProduct)) return undefined;
               return async () => {
                 try {
                   if (chainRootId != null) {
                     await api.archiveChain(chainRootId);
                   } else {
-                    await api.archiveConversation(conv.id);
+                    await api.archiveConversation(targetId);
                   }
                   navigate('/');
                 } catch (error) {
-                  if (!notifyArchiveCloseConflict(conv.id, error)) throw error;
+                  if (!notifyArchiveCloseConflict(targetId, error)) throw error;
                 }
               };
             })()
           : undefined,
       }),
-    [navigate, currentSlug, activeProduct, activeConvId, conversations],
+    [navigate, currentSlug, activeProduct, activeConvId, activeConversation, conversations],
   );
   const actionsRef = useRef(actions);
   useEffect(() => {

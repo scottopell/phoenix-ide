@@ -4497,12 +4497,18 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn list_usage_limit_errors(&self) -> DbResult<Vec<(String, schema::ConvState)>> {
         let rows: Vec<(String, String)> = sqlx::query(
-            "SELECT id, state FROM conversations
-             WHERE archived = 0
-               AND (user_initiated = 1 OR runtime_role = 'coordinator')
-               AND state_kind = 'error'
-               AND json_extract(state, '$.error_kind') = 'usage_limit_reached'
-               AND json_extract(state, '$.resets_at') IS NOT NULL",
+            "SELECT conversation.id, conversation.state
+             FROM conversations conversation
+             LEFT JOIN product_conversations product
+               ON product.id = conversation.product_conversation_id
+             WHERE (
+                 (product.kind = 'ordinary' AND product.ordinary_lifecycle = 'open')
+                 OR (COALESCE(product.kind, '') <> 'ordinary' AND conversation.archived = 0)
+             )
+               AND (conversation.user_initiated = 1 OR conversation.runtime_role = 'coordinator')
+               AND conversation.state_kind = 'error'
+               AND json_extract(conversation.state, '$.error_kind') = 'usage_limit_reached'
+               AND json_extract(conversation.state, '$.resets_at') IS NOT NULL",
         )
         .try_map(|row: SqliteRow| Ok((row.try_get("id")?, row.try_get("state")?)))
         .fetch_all(&self.pool)
@@ -17634,6 +17640,32 @@ mod tests {
         db.update_conversation_state("ul", &usage_limit_err(Some(reset)))
             .await
             .unwrap();
+        let ul_product_id: String =
+            sqlx::query_scalar("SELECT product_conversation_id FROM conversations WHERE id = 'ul'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        db.set_legacy_conversation_archived("ul").await.unwrap();
+        sqlx::query("UPDATE product_conversations SET ordinary_lifecycle = 'open' WHERE id = ?1")
+            .bind(&ul_product_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        // Excluded: an ordinary History aggregate even when its row bit remains unarchived.
+        db.create_conversation("history-ul", "s-history-ul", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.update_conversation_state("history-ul", &usage_limit_err(Some(reset)))
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history'
+             WHERE id = (SELECT product_conversation_id FROM conversations WHERE id = 'history-ul')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
 
         // Excluded: usage-limit error WITHOUT a reset time (no window to wait).
         db.create_conversation("ul-nores", "s-ulnr", "/tmp", true, None, None)
@@ -17687,7 +17719,7 @@ mod tests {
         assert_eq!(
             ids,
             vec!["ul", coordinator.id.as_str()],
-            "user-facing conversations include the singleton Coordinator"
+            "ordinary members follow aggregate lifecycle while non-ordinary rows follow archived"
         );
         assert!(matches!(
             got[0].1,

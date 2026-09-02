@@ -320,6 +320,24 @@ describe('ProductConversationPage', () => {
     vi.mocked(api.getChain).mockResolvedValue(makeChain());
   });
 
+  it('refetches the authoritative aggregate when SSE changes member archive state', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot({ ordinary_lifecycle: 'open' }))
+      .mockResolvedValueOnce(makeSnapshot({ ordinary_lifecycle: 'history' }));
+
+    renderPage();
+    await waitForPageReady();
+
+    act(() => emitLatestProjection({ isArchived: false }));
+    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(1);
+    act(() => emitLatestProjection({ isArchived: true }));
+
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByText('History is read-only.')).toBeInTheDocument());
+    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2);
+  });
+
   it('orders flattened segment messages chronologically', async () => {
     const { api } = await import('../api');
     vi.mocked(api.getProductConversationSnapshot).mockResolvedValueOnce(makeSnapshot({

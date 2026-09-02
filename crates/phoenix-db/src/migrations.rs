@@ -7996,8 +7996,30 @@ mod migration_094_tests {
              CREATE TABLE product_creation_jobs (
                  published_product_id TEXT, status TEXT NOT NULL
              );
+             CREATE TABLE workflows (
+                 workflow_id INTEGER PRIMARY KEY, profile_kind TEXT NOT NULL,
+                 version INTEGER NOT NULL, generation INTEGER NOT NULL,
+                 status TEXT NOT NULL, updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE workflow_transitions (
+                 workflow_id INTEGER NOT NULL, transition_id INTEGER NOT NULL,
+                 from_version INTEGER NOT NULL, to_version INTEGER NOT NULL,
+                 generation INTEGER NOT NULL, event_codec_family TEXT NOT NULL,
+                 event_codec_version INTEGER NOT NULL, event_payload BLOB NOT NULL,
+                 committed_at INTEGER NOT NULL,
+                 PRIMARY KEY (workflow_id, transition_id),
+                 UNIQUE (workflow_id, to_version),
+                 CHECK (to_version = from_version + 1)
+             );
+             CREATE TABLE workflow_effects (
+                 workflow_id INTEGER NOT NULL, effect_id INTEGER NOT NULL,
+                 status TEXT NOT NULL, next_eligible_at INTEGER,
+                 generation INTEGER NOT NULL, pending_reconciliation INTEGER NOT NULL,
+                 PRIMARY KEY (workflow_id, effect_id)
+             );
              CREATE TABLE durable_turns (
-                 turn_id INTEGER PRIMARY KEY, conversation_id TEXT NOT NULL,
+                 turn_id INTEGER PRIMARY KEY, workflow_id INTEGER NOT NULL UNIQUE,
+                 conversation_id TEXT NOT NULL,
                  disposition TEXT NOT NULL CHECK (disposition IN ('Runtime', 'Steering')),
                  terminal_kind TEXT, terminal_reason TEXT, generation INTEGER NOT NULL,
                  owns_conversation INTEGER NOT NULL,
@@ -8025,30 +8047,71 @@ mod migration_094_tests {
              INSERT INTO product_creation_jobs VALUES
                  ('delivery-pending-product', 'delivery_pending'),
                  ('published-history-product', 'published');
+             INSERT INTO workflows VALUES
+                 (11, 'direct_turn', 2, 7, 'Active', 100),
+                 (12, 'wake', 2, 7, 'Active', 100);
+             INSERT INTO workflow_transitions VALUES
+                 (11, 1, 0, 1, 0, 'direct_turn.event', 1, X'01', 90),
+                 (12, 1, 0, 1, 0, 'wake.event', 1, X'01', 90);
+             INSERT INTO workflow_effects VALUES
+                 (11, 1, 'Eligible', 200, 7, 1),
+                 (12, 1, 'Eligible', 200, 7, 1);
              INSERT INTO durable_turns VALUES
-                 (1, 'history-row', 'Runtime', NULL, NULL, 7, 1, NULL);",
+                 (1, 11, 'history-row', 'Runtime', NULL, NULL, 7, 1, NULL),
+                 (2, 12, 'subordinate', 'Runtime', NULL, NULL, 7, 1, NULL);",
         )
         .execute(&pool)
         .await
         .unwrap();
 
-        sqlx::query(
-            "UPDATE durable_turns
+        sqlx::raw_sql(
+            "CREATE TEMP TABLE migration_095_cancelled_direct_turns AS
+             SELECT turn.turn_id, turn.workflow_id, workflow.generation + 1 AS next_generation,
+                    workflow.version AS from_version, workflow.updated_at AS committed_at
+             FROM durable_turns turn
+             JOIN workflows workflow ON workflow.workflow_id = turn.workflow_id
+             JOIN conversations member ON member.id = turn.conversation_id
+             JOIN product_conversations product ON product.id = member.product_conversation_id
+             WHERE turn.terminal_kind IS NULL AND turn.canonical_message_id IS NULL
+               AND workflow.profile_kind = 'direct_turn'
+               AND workflow.status NOT IN ('Cancelled', 'Completed', 'Failed', 'Deleted')
+               AND product.kind = 'ordinary' AND NOT EXISTS (
+                 SELECT 1 FROM conversations latest
+                 WHERE latest.product_conversation_id = product.id
+                   AND latest.runtime_role = 'user'
+                   AND latest.parent_conversation_id IS NULL
+                   AND latest.continued_in_conv_id IS NULL
+                   AND latest.archived = 0
+               );
+             INSERT INTO workflow_transitions (
+                 workflow_id, transition_id, from_version, to_version, generation,
+                 event_codec_family, event_codec_version, event_payload, committed_at
+             )
+             SELECT workflow_id, 3, from_version, from_version + 1, next_generation,
+                    'direct_turn.event', 1,
+                    X'7b225465726d696e616c223a7b227465726d696e616c223a2243616e63656c6c6564227d7d',
+                    committed_at + 1
+             FROM migration_095_cancelled_direct_turns;
+             UPDATE workflow_effects
+             SET status = 'Invalidated', next_eligible_at = NULL,
+                 generation = generation + 1, pending_reconciliation = 0
+             WHERE workflow_id IN (SELECT workflow_id FROM migration_095_cancelled_direct_turns)
+               AND status NOT IN ('Receipted', 'Invalidated');
+             UPDATE durable_turns
              SET terminal_kind = 'Cancelled', terminal_reason = NULL,
-                 generation = generation + 1, owns_conversation = 0
-             WHERE terminal_kind IS NULL AND canonical_message_id IS NULL
-               AND conversation_id IN (
-                 SELECT member.id FROM conversations member
-                 JOIN product_conversations product ON product.id = member.product_conversation_id
-                 WHERE product.kind = 'ordinary' AND NOT EXISTS (
-                   SELECT 1 FROM conversations latest
-                   WHERE latest.product_conversation_id = product.id
-                     AND latest.runtime_role = 'user'
-                     AND latest.parent_conversation_id IS NULL
-                     AND latest.continued_in_conv_id IS NULL
-                     AND latest.archived = 0
-                 )
-               )",
+                 generation = (
+                     SELECT next_generation FROM migration_095_cancelled_direct_turns cancelled
+                     WHERE cancelled.turn_id = durable_turns.turn_id
+                 ),
+                 owns_conversation = 0
+             WHERE turn_id IN (SELECT turn_id FROM migration_095_cancelled_direct_turns);
+             UPDATE workflows
+             SET status = 'Cancelled', generation = (
+                     SELECT next_generation FROM migration_095_cancelled_direct_turns cancelled
+                     WHERE cancelled.workflow_id = workflows.workflow_id
+                 ), version = version + 1, updated_at = updated_at + 1
+             WHERE workflow_id IN (SELECT workflow_id FROM migration_095_cancelled_direct_turns);
+             DROP TABLE migration_095_cancelled_direct_turns;",
         )
         .execute(&pool)
         .await
@@ -8098,6 +8161,50 @@ mod migration_094_tests {
         .await
         .unwrap();
         assert_eq!(turn, ("Runtime".into(), "Cancelled".into(), None, 8, 0));
+        let untouched_wake_turn: (Option<String>, i64, i64) = sqlx::query_as(
+            "SELECT terminal_kind, generation, owns_conversation FROM durable_turns WHERE turn_id = 2",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(untouched_wake_turn, (None, 7, 1));
+        let workflow: (String, i64, i64, i64) = sqlx::query_as(
+            "SELECT status, version, generation, updated_at FROM workflows WHERE workflow_id = 11",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(workflow, ("Cancelled".into(), 3, 8, 101));
+        let transition: (i64, i64, i64, String, i64, Vec<u8>, i64) = sqlx::query_as(
+            "SELECT from_version, to_version, generation, event_codec_family,
+                    event_codec_version, event_payload, committed_at
+             FROM workflow_transitions WHERE workflow_id = 11 AND transition_id = 3",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(transition.0, 2);
+        assert_eq!(transition.1, 3);
+        assert_eq!(transition.2, 8);
+        assert_eq!(transition.3, "direct_turn.event");
+        assert_eq!(transition.4, 1);
+        assert_eq!(transition.5, br#"{"Terminal":{"terminal":"Cancelled"}}"#);
+        assert_eq!(transition.6, 101);
+        let effect: (String, Option<i64>, i64, i64) = sqlx::query_as(
+            "SELECT status, next_eligible_at, generation, pending_reconciliation
+             FROM workflow_effects WHERE workflow_id = 11 AND effect_id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(effect, ("Invalidated".into(), None, 8, 0));
+        let wake_workflow: (String, i64, i64) = sqlx::query_as(
+            "SELECT status, version, generation FROM workflows WHERE workflow_id = 12",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(wake_workflow, ("Active".into(), 2, 7));
 
         let row_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversations")
             .fetch_one(&pool)
@@ -8234,43 +8341,57 @@ BEGIN
     SELECT RAISE(ABORT, 'non-writable ProductConversation rejects new aggregate participants');
 END;
 
-UPDATE durable_turns
-SET terminal_kind = 'Cancelled',
-    terminal_reason = NULL,
-    generation = generation + 1,
-    owns_conversation = 0
-WHERE terminal_kind IS NULL
-  AND canonical_message_id IS NULL
-  AND conversation_id IN (
-    SELECT member.id
-    FROM conversations member
-    JOIN product_conversations product ON product.id = member.product_conversation_id
-    WHERE product.kind = 'ordinary'
-      AND NOT EXISTS (
-        SELECT 1 FROM conversations latest
-        WHERE latest.product_conversation_id = product.id
-          AND latest.runtime_role = 'user'
-          AND latest.parent_conversation_id IS NULL
-          AND latest.continued_in_conv_id IS NULL
-          AND latest.archived = 0
-      )
+CREATE TEMP TABLE migration_095_cancelled_direct_turns AS
+SELECT turn.turn_id, turn.workflow_id, workflow.generation + 1 AS next_generation,
+       workflow.version AS from_version, workflow.updated_at AS committed_at
+FROM durable_turns turn
+JOIN workflows workflow ON workflow.workflow_id = turn.workflow_id
+JOIN conversations member ON member.id = turn.conversation_id
+JOIN product_conversations product ON product.id = member.product_conversation_id
+WHERE turn.terminal_kind IS NULL
+  AND turn.canonical_message_id IS NULL
+  AND workflow.profile_kind = 'direct_turn'
+  AND workflow.status NOT IN ('Cancelled', 'Completed', 'Failed', 'Deleted')
+  AND product.kind = 'ordinary'
+  AND NOT EXISTS (
+    SELECT 1 FROM conversations latest
+    WHERE latest.product_conversation_id = product.id
+      AND latest.runtime_role = 'user'
+      AND latest.parent_conversation_id IS NULL
+      AND latest.continued_in_conv_id IS NULL
+      AND latest.archived = 0
   );
+INSERT INTO workflow_transitions (
+    workflow_id, transition_id, from_version, to_version, generation,
+    event_codec_family, event_codec_version, event_payload, committed_at
+)
+SELECT workflow_id, 3, from_version, from_version + 1, next_generation,
+       'direct_turn.event', 1,
+       X'7b225465726d696e616c223a7b227465726d696e616c223a2243616e63656c6c6564227d7d',
+       committed_at + 1
+FROM migration_095_cancelled_direct_turns;
 UPDATE workflow_effects
 SET status = 'Invalidated', next_eligible_at = NULL,
     generation = generation + 1, pending_reconciliation = 0
 WHERE workflow_id IN (
-    SELECT turn.workflow_id FROM durable_turns turn
-    JOIN workflows workflow ON workflow.workflow_id = turn.workflow_id
-    WHERE turn.terminal_kind = 'Cancelled' AND turn.owns_conversation = 0
-      AND workflow.status NOT IN ('Cancelled', 'Completed', 'Failed', 'Deleted')
+    SELECT workflow_id FROM migration_095_cancelled_direct_turns
 ) AND status NOT IN ('Receipted', 'Invalidated');
+UPDATE durable_turns
+SET terminal_kind = 'Cancelled', terminal_reason = NULL,
+    generation = (
+        SELECT next_generation FROM migration_095_cancelled_direct_turns cancelled
+        WHERE cancelled.turn_id = durable_turns.turn_id
+    ),
+    owns_conversation = 0
+WHERE turn_id IN (SELECT turn_id FROM migration_095_cancelled_direct_turns);
 UPDATE workflows
-SET status = 'Cancelled', generation = generation + 1,
+SET status = 'Cancelled', generation = (
+        SELECT next_generation FROM migration_095_cancelled_direct_turns cancelled
+        WHERE cancelled.workflow_id = workflows.workflow_id
+    ),
     version = version + 1, updated_at = updated_at + 1
-WHERE workflow_id IN (
-    SELECT workflow_id FROM durable_turns
-    WHERE terminal_kind = 'Cancelled' AND owns_conversation = 0
-) AND status NOT IN ('Cancelled', 'Completed', 'Failed', 'Deleted');
+WHERE workflow_id IN (SELECT workflow_id FROM migration_095_cancelled_direct_turns);
+DROP TABLE migration_095_cancelled_direct_turns;
 
 UPDATE product_creation_jobs
 SET status = 'delivery_failed', last_error = 'completed_close_won_cutover',
