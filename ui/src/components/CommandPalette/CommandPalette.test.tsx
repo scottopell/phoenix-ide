@@ -174,8 +174,8 @@ describe('CommandPalette lifecycle availability', () => {
     fireEvent.change(screen.getByRole('textbox'), { target: { value: '> close' } });
     fireEvent.click(screen.getByText('Close Current Conversation'));
 
-    await waitFor(() => expect(mocks.archiveConversation).toHaveBeenCalledWith('latest-id'));
-    expect(mocks.archiveChain).not.toHaveBeenCalled();
+    await waitFor(() => expect(mocks.archiveChain).toHaveBeenCalledWith('root-id'));
+    expect(mocks.archiveConversation).not.toHaveBeenCalled();
   });
 
   it('does not offer Close on a canonical History aggregate', () => {

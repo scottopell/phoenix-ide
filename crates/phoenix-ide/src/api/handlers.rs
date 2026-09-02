@@ -5532,6 +5532,9 @@ async fn dismiss_question(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
+    let admission = state.runtime.conversation_admission(&id).await;
+    let _admission_guard = admission.lock().await;
+
     let conv = state
         .runtime
         .db()
@@ -5544,6 +5547,36 @@ async fn dismiss_question(
             "Conversation is not awaiting a user response",
             "wrong_state",
         ))));
+    }
+
+    match state
+        .runtime
+        .db()
+        .message_target_admission(&id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+    {
+        phoenix_db::MessageTargetAdmission::Aggregate(
+            phoenix_db::ProductConversationAdmission::Accepted { .. },
+        )
+        | phoenix_db::MessageTargetAdmission::StandaloneAvailable => {}
+        phoenix_db::MessageTargetAdmission::Aggregate(
+            phoenix_db::ProductConversationAdmission::Refused(_),
+        ) => {
+            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                "Close admission fence rejects question dismissal",
+                "close_admission_fenced",
+            ))));
+        }
+        phoenix_db::MessageTargetAdmission::Aggregate(
+            phoenix_db::ProductConversationAdmission::History(_),
+        )
+        | phoenix_db::MessageTargetAdmission::StandaloneArchived => {
+            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                "Conversation is unavailable for question dismissal",
+                "target_unavailable",
+            ))));
+        }
     }
 
     state

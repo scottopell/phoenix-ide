@@ -471,9 +471,11 @@ function ProductConversationPageInner() {
     };
     const previous = observedMemberArchivedRef.current;
     observedMemberArchivedRef.current = observed;
-    if (previous?.conversationId === observed.conversationId
-      && previous.isArchived !== observed.isArchived
-      && observed.isArchived !== (snapshot.ordinary_lifecycle === 'history')) {
+    const lifecycleMismatch = observed.isArchived !== (snapshot.ordinary_lifecycle === 'history');
+    const firstObservation = previous === null;
+    const sameMemberChanged = previous?.conversationId === observed.conversationId
+      && previous.isArchived !== observed.isArchived;
+    if (lifecycleMismatch && (firstObservation || sameMemberChanged)) {
       setSnapshotRetry((retry) => retry + 1);
     }
   }, [latestProjection?.conversationId, latestProjection?.isArchived, snapshot]);
