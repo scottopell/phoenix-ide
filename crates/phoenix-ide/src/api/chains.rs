@@ -387,18 +387,7 @@ pub async fn archive_chain_handler(
         .chain_members_forward(&root_id)
         .await
         .map_err(db_to_app)?;
-    let aggregate_admission = state
-        .runtime
-        .mutation_admission(&root_id)
-        .await
-        .map_err(super::handlers::map_admission_db_error)?;
-    let _aggregate_admission_guard = aggregate_admission.lock_owned().await;
-    let non_root_member_ids = member_ids
-        .iter()
-        .filter(|member_id| member_id.as_str() != root_id)
-        .cloned()
-        .collect::<Vec<_>>();
-    let _member_admission_guards = lock_chain_admissions(&state, &non_root_member_ids).await;
+    let _admission_guards = lock_chain_admissions(&state, &root_id, &member_ids).await?;
     for id in &member_ids {
         super::handlers::refuse_if_coordinator(&state, id, "archive").await?;
     }
@@ -413,17 +402,25 @@ pub async fn archive_chain_handler(
 
 async fn lock_chain_admissions(
     state: &AppState,
+    root_id: &str,
     member_ids: &[String],
-) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
-    let mut sorted_ids = member_ids.to_vec();
-    sorted_ids.sort();
-    let mut guards = Vec::with_capacity(sorted_ids.len());
-    for id in sorted_ids {
+) -> Result<Vec<tokio::sync::OwnedMutexGuard<()>>, AppError> {
+    let root = state
+        .db
+        .get_conversation(root_id)
+        .await
+        .map_err(db_to_app)?;
+    let mut sorted_keys = member_ids.to_vec();
+    sorted_keys.push(root.product_conversation_id.to_string());
+    sorted_keys.sort();
+    sorted_keys.dedup();
+    let mut guards = Vec::with_capacity(sorted_keys.len());
+    for key in sorted_keys {
         let admission: Arc<tokio::sync::Mutex<()>> =
-            state.runtime.conversation_admission(&id).await;
+            state.runtime.conversation_admission(&key).await;
         guards.push(admission.lock_owned().await);
     }
-    guards
+    Ok(guards)
 }
 
 /// `DELETE /api/chains/:rootId` — hard-delete every member of the chain.
@@ -449,7 +446,7 @@ pub async fn delete_chain_handler(
         .chain_members_forward(&root_id)
         .await
         .map_err(db_to_app)?;
-    let _admission_guards = lock_chain_admissions(&state, &member_ids).await;
+    let _admission_guards = lock_chain_admissions(&state, &root_id, &member_ids).await?;
     require_hard_delete_admission(&state, &root_id).await?;
     for id in &member_ids {
         super::handlers::refuse_if_coordinator(&state, id, "delete").await?;
