@@ -3297,7 +3297,12 @@ impl WakeRepository {
                  FROM conversations conversation
                  JOIN product_conversations product
                    ON product.id = conversation.product_conversation_id
-                 WHERE conversation.id = ?1",
+                 WHERE conversation.id = ?1
+                   AND NOT EXISTS (
+                     SELECT 1 FROM close_obligations obligation
+                     WHERE obligation.product_conversation_id = product.id
+                       AND obligation.phase <> 'completed'
+                   )",
         )
         .bind(conversation_id)
         .fetch_optional(&mut *tx.tx)
@@ -6261,6 +6266,84 @@ mod tests {
             is_fired,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn active_close_preserves_materialized_pending_wake_without_starting_work() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let workflow_id = WorkflowId(8121);
+        let pending = create_pending_terminal_delivery(&repo, workflow_id).await;
+        materialize_pending(&repo, &pending, "wake complete", None, true, Timestamp(50)).await;
+        let db = crate::Database::from_pool_for_tests(
+            repo.workflow_repo.pool.clone(),
+            "wake-close.db".into(),
+        );
+        db.begin_close_foundation(
+            &phoenix_core::domain::product_conversation::ProductConversationId::parse(
+                "wake-product",
+            )
+            .unwrap(),
+            &TranscriptConversationId::parse("conv-1").unwrap(),
+            "wake-adoption-close",
+        )
+        .await
+        .unwrap();
+        let messages_at_close: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE conversation_id = 'conv-1'")
+                .fetch_one(&repo.workflow_repo.pool)
+                .await
+                .unwrap();
+        let turns_at_close: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM durable_turns WHERE conversation_id = 'conv-1'",
+        )
+        .fetch_one(&repo.workflow_repo.pool)
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            repo.adopt_materialized_pending_for_conversation("conv-1", Timestamp(51))
+                .await
+                .unwrap(),
+            WakeAdoptMaterializedPendingOutcome::NothingPending
+        ));
+
+        assert_eq!(repo.list_pending("conv-1").await.unwrap().len(), 1);
+        let (head, snapshot) = head_snapshot(&repo, workflow_id).await;
+        assert_eq!(head.version, Version(2));
+        assert_eq!(
+            snapshot.runtime_availability,
+            wake_profile::RuntimeAvailability::Idle
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id = 'conv-1'",
+            )
+            .fetch_one(&repo.workflow_repo.pool)
+            .await
+            .unwrap(),
+            messages_at_close,
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM durable_turns WHERE conversation_id = 'conv-1'",
+            )
+            .fetch_one(&repo.workflow_repo.pool)
+            .await
+            .unwrap(),
+            turns_at_close,
+        );
+        let (state_kind, adopted): (String, i64) = sqlx::query_as(
+            "SELECT conversation.state_kind,
+                    instr(COALESCE(message.display_data, ''), '\"adopted\":true')
+             FROM conversations conversation
+             JOIN messages message ON message.conversation_id = conversation.id
+             WHERE conversation.id = 'conv-1'",
+        )
+        .fetch_one(&repo.workflow_repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(state_kind, "idle");
+        assert_eq!(adopted, 0);
     }
 
     #[tokio::test]

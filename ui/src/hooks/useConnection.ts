@@ -524,7 +524,7 @@ export function useConnection({
               // RFC3339 → unix ms once at the SSE boundary (REQ-WPV-001).
               stateUpdatedAt: Date.parse(res.data.state_updated_at),
             });
-            notifyCloseSnapshotChanged(convId);
+            notifyCloseSnapshotChanged(convId, 'stream');
           });
 
           on('agent_done', (e) => {
@@ -673,7 +673,7 @@ export function useConnection({
               sequenceId: res.data.sequence_id,
               inventory: res.data.inventory,
             });
-            notifyCloseSnapshotChanged(convId);
+            notifyCloseSnapshotChanged(convId, 'stream');
           });
 
           // REQ-BED-032 step 6: hard-delete cascade emits this on the

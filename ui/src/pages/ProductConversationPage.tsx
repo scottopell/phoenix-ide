@@ -369,6 +369,7 @@ function ProductConversationPageInner() {
   const location = useLocation();
   const hashTargetMessageId = decodeMessageHash(location.hash);
   const [ownedSnapshot, setOwnedSnapshot] = useState<OwnedSnapshot | null>(null);
+  const ownedSnapshotRef = useRef<OwnedSnapshot | null>(null);
   const snapshot = ownedSnapshot && ownedSnapshot.productConversationId === productConversationId
     ? ownedSnapshot.value
     : null;
@@ -396,6 +397,7 @@ function ProductConversationPageInner() {
     [latestProjection, snapshot],
   );
   const aggregateMessageSlot = viewerSlot.slot.kind === 'message' ? viewerSlot.slot : null;
+  ownedSnapshotRef.current = ownedSnapshot;
   inflightRef.current = inflight;
 
   useEffect(() => {
@@ -411,7 +413,8 @@ function ProductConversationPageInner() {
   useEffect(() => {
     if (!productConversationId) return;
     let cancelled = false;
-    setLoading(true);
+    const isBackgroundRefresh = ownedSnapshotRef.current?.productConversationId === productConversationId;
+    if (!isBackgroundRefresh) setLoading(true);
     setError(null);
     setOlderError(null);
 
@@ -439,7 +442,10 @@ function ProductConversationPageInner() {
       ...((snapshot?.segments ?? []).map((segment) => segment.transcript_row_id)),
     ].filter((id): id is string => Boolean(id)));
     if (notificationIds.size === 0) return;
-    const refresh = () => setSnapshotRetry((retry) => retry + 1);
+    const refresh = (source: 'close' | 'stream') => {
+      const closeIsActive = snapshot?.close != null && snapshot.close.phase !== 'completed';
+      if (source === 'close' || closeIsActive) setSnapshotRetry((retry) => retry + 1);
+    };
     const unsubscribes = [...notificationIds].map((id) =>
       subscribeCloseSnapshotChanged(id, refresh));
     return () => unsubscribes.forEach((unsubscribe) => unsubscribe());

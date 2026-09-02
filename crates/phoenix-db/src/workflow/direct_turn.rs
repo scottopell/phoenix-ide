@@ -888,13 +888,16 @@ impl WorkflowRepository {
              WHERE disposition = 'Runtime'
                AND (
                  (product.kind = 'ordinary' AND product.ordinary_lifecycle = 'open'
-                   AND conversations.id = (
-                     SELECT latest.id FROM conversations latest
-                     WHERE latest.product_conversation_id = product.id
-                       AND latest.runtime_role = 'user'
-                       AND latest.parent_conversation_id IS NULL
-                       AND latest.continued_in_conv_id IS NULL
-                     ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1
+                   AND (
+                     conversations.runtime_role = 'sub_agent'
+                     OR conversations.id = (
+                       SELECT latest.id FROM conversations latest
+                       WHERE latest.product_conversation_id = product.id
+                         AND latest.runtime_role = 'user'
+                         AND latest.parent_conversation_id IS NULL
+                         AND latest.continued_in_conv_id IS NULL
+                       ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1
+                     )
                    ))
                  OR (product.kind <> 'ordinary' AND conversations.archived = 0)
                )
@@ -5636,6 +5639,55 @@ mod tests {
                 .filter(|row| row.turn_id == leaf_id)
                 .count(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn restarted_worker_discovers_accepted_subordinate_direct_turn() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("subordinate-recovery.db");
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        run_pending_migrations(db.pool()).await.unwrap();
+        db.create_conversation("conv-a", "A", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let parent = db.get_conversation("conv-a").await.unwrap();
+        db.create_subagent_conversation(
+            "conv-a-subordinate",
+            "conv-a-subordinate",
+            "/tmp",
+            "conv-a",
+            "test-model",
+            &crate::ConvMode::Direct,
+            phoenix_core::llm_language::LlmLanguage::default(),
+            parent.attached_work_scope_id.as_ref(),
+        )
+        .await
+        .unwrap();
+        let accepted = db
+            .workflow_repository()
+            .accept_authoritative_turn(&input("conv-a-subordinate", "subordinate", 33))
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
+            panic!("created subordinate turn")
+        };
+
+        drop(db);
+        let restarted = Database::open(path.to_str().unwrap()).await.unwrap();
+        let candidates = restarted
+            .workflow_repository()
+            .list_discoverable_accepted_runtime_direct_turns(None, 10)
+            .await
+            .unwrap()
+            .candidates;
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|candidate| candidate.turn_id == turn_id)
+                .map(|candidate| candidate.conversation.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["conv-a-subordinate"],
         );
     }
 

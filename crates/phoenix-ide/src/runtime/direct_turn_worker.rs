@@ -976,6 +976,51 @@ mod tests {
         (repo, Arc::new(RecordingDispatcher::default()))
     }
 
+    #[tokio::test]
+    async fn startup_recovery_dispatches_accepted_subordinate_direct_turn() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("recovery-parent", "Parent", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let parent = db.get_conversation("recovery-parent").await.unwrap();
+        db.create_subagent_conversation(
+            "recovery-subordinate",
+            "Recovery subordinate",
+            "/tmp",
+            "recovery-parent",
+            "test-model",
+            &phoenix_db::ConvMode::Direct,
+            phoenix_core::llm_language::LlmLanguage::default(),
+            parent.attached_work_scope_id.as_ref(),
+        )
+        .await
+        .unwrap();
+        let repo = db.workflow_repository();
+        let turn_id =
+            accept_for_conversation(&repo, "accepted-before-restart", "recovery-subordinate").await;
+        let dispatcher = Arc::new(RecordingDispatcher::default());
+
+        worker(repo.clone(), dispatcher.clone(), 10, 2)
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            dispatcher
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(conversation_id, _)| conversation_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["recovery-subordinate"],
+        );
+        let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
+        let attempts = repo.list_attempts(workflow_id, EffectId(1)).await.unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].status, phoenix_workflow::AttemptStatus::Begun);
+    }
+
     fn prepared_payload(message_id: &str) -> PreparedDirectTurnPayload {
         PreparedDirectTurnPayload::from_parts(
             phoenix_core::domain::sm_event::SubmittedDirectTurnIdentity {

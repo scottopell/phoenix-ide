@@ -167,9 +167,19 @@ export function getProductConversationListRevision(): number {
 
 const CLOSE_SNAPSHOT_CHANGED_EVENT = 'phoenix:close-snapshot-changed';
 
-export function notifyCloseSnapshotChanged(conversationId: string): void {
-  window.dispatchEvent(new CustomEvent<string>(CLOSE_SNAPSHOT_CHANGED_EVENT, {
-    detail: conversationId,
+export type CloseSnapshotInvalidationSource = 'close' | 'stream';
+
+type CloseSnapshotChangedDetail = {
+  conversationId: string;
+  source: CloseSnapshotInvalidationSource;
+};
+
+export function notifyCloseSnapshotChanged(
+  conversationId: string,
+  source: CloseSnapshotInvalidationSource = 'close',
+): void {
+  window.dispatchEvent(new CustomEvent<CloseSnapshotChangedDetail>(CLOSE_SNAPSHOT_CHANGED_EVENT, {
+    detail: { conversationId, source },
   }));
 }
 
@@ -192,10 +202,11 @@ export function notifyArchiveCloseConflict(conversationId: string, error: unknow
 
 export function subscribeCloseSnapshotChanged(
   conversationId: string,
-  listener: () => void,
+  listener: (source: CloseSnapshotInvalidationSource) => void,
 ): () => void {
   const handler = (event: Event) => {
-    if ((event as CustomEvent<string>).detail === conversationId) listener();
+    const detail = (event as CustomEvent<CloseSnapshotChangedDetail>).detail;
+    if (detail?.conversationId === conversationId) listener(detail.source);
   };
   window.addEventListener(CLOSE_SNAPSHOT_CHANGED_EVENT, handler);
   return () => window.removeEventListener(CLOSE_SNAPSHOT_CHANGED_EVENT, handler);

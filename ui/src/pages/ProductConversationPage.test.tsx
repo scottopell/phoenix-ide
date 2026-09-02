@@ -7,6 +7,8 @@ import { FileExplorerProvider } from '../components/FileExplorer';
 import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
 import { ChainProvider } from '../chain';
 import { ApiResponseError, type ChainView, type ProductConversationSnapshotView } from '../api';
+import type { ProductConversationCloseView } from '../generated/ProductConversationCloseView';
+import { notifyCloseSnapshotChanged } from '../notifications';
 
 const conversationNavStackSpy = vi.fn();
 const embeddedConversationPageSpy = vi.fn();
@@ -808,6 +810,70 @@ describe('ProductConversationPage', () => {
     expect(chainQaColumnSpy.mock.lastCall?.[0]?.['disabled']).toBe(true);
   });
 
+  it('background-refreshes active Close phases without replacing the page with a skeleton', async () => {
+    const { api } = await import('../api');
+    const activeClose = {
+      attempt_id: 'close-active',
+      phase: 'settling_active_work',
+      confirmation_snapshot: null,
+      inspections: [],
+      losses: [],
+      residuals: [],
+    } satisfies ProductConversationCloseView;
+    let resolveRefresh!: (value: ProductConversationSnapshotView) => void;
+    const refresh = new Promise<ProductConversationSnapshotView>((resolve) => { resolveRefresh = resolve; });
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot({ close: activeClose }))
+      .mockReturnValueOnce(refresh);
+
+    renderPage();
+    await waitForPageReady();
+    act(() => notifyCloseSnapshotChanged('row-2', 'stream'));
+
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
+    expect(screen.queryByTestId('skeleton')).not.toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Product Alpha' })).toBeInTheDocument();
+    await act(async () => resolveRefresh(makeSnapshot({
+      close: { ...activeClose, phase: 'awaiting_retirement_inspection' },
+    })));
+    expect(screen.getByRole('heading', { name: 'Product Alpha' })).toBeInTheDocument();
+  });
+
+  it('does not refetch an Open snapshot for ordinary state invalidations', async () => {
+    const { api } = await import('../api');
+    renderPage();
+    await waitForPageReady();
+
+    act(() => notifyCloseSnapshotChanged('row-2', 'stream'));
+    await act(async () => Promise.resolve());
+
+    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId('skeleton')).not.toBeInTheDocument();
+  });
+
+  it('discovers an explicitly-started Close while the loaded snapshot is Open', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot())
+      .mockResolvedValueOnce(makeSnapshot({
+        close: {
+          attempt_id: 'close-started-elsewhere',
+          phase: 'settling_active_work',
+          confirmation_snapshot: null,
+          inspections: [],
+          losses: [],
+          residuals: [],
+        },
+      }));
+    renderPage();
+    await waitForPageReady();
+
+    act(() => notifyCloseSnapshotChanged('row-2'));
+
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.['mutationEnabled']).toBe(false));
+  });
+
   it('keeps history snapshots read-only while retaining lineage recall', async () => {
     const { api } = await import('../api');
     vi.mocked(api.getProductConversationSnapshot).mockResolvedValueOnce(makeSnapshot({
@@ -968,6 +1034,41 @@ describe('ProductConversationPage', () => {
 
     expect(screen.queryByText('stale A failure')).not.toBeInTheDocument();
     expect(conversationNavStackSpy.mock.lastCall?.[0]?.['loadingOlderMessages']).toBe(false);
+  });
+
+  it('ignores an old stream Close invalidation after a new product route wins', async () => {
+    const { api } = await import('../api');
+    const activeClose = {
+      attempt_id: 'close-active',
+      phase: 'settling_active_work',
+      confirmation_snapshot: null,
+      inspections: [],
+      losses: [],
+      residuals: [],
+    } satisfies ProductConversationCloseView;
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot({ close: activeClose }))
+      .mockResolvedValueOnce(makeSnapshot({
+        product_conversation_id: 'pc-2',
+        canonical_route: '/product-conversations/pc-2',
+        presentation: { kind: 'state', display_name: 'Product Beta', presentation_mode: 'idle' },
+        segments: [{ segment_ordinal: 1, transcript_row_id: 'row-b', slug: 'row-b', title: 'Beta', messages: [makeMessage('beta-message', 1, 'beta')], handoff: null }],
+        latest_transcript_row_id: 'row-b',
+        writable_transcript_row_id: 'row-b',
+        before: null,
+        has_older: false,
+      }));
+
+    renderPage('/product-conversations/pc-1', true);
+    await waitForPageReady();
+    fireEvent.click(screen.getByRole('button', { name: 'open second product' }));
+    await screen.findByRole('heading', { name: 'Product Beta' });
+    act(() => notifyCloseSnapshotChanged('row-2', 'stream'));
+    await act(async () => Promise.resolve());
+
+    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole('heading', { name: 'Product Beta' })).toBeInTheDocument();
+    expect(screen.getByTestId('message-order')).toHaveTextContent('beta-message');
   });
 
   it('threads restore basis, root directory, system prompt, and explicit absent work scope', async () => {
