@@ -28,6 +28,25 @@ function toolbarButtons() {
 }
 
 describe('TaskApprovalReader markdown rendering', () => {
+  it('keeps the plan visible while disabling every approval mutation capability', () => {
+    const onApprove = vi.fn();
+    const onReject = vi.fn();
+    const onSendFeedback = vi.fn();
+    renderTaskApprovalReader('# Plan\n\nVisible context.', onApprove, {
+      mutationEnabled: false,
+      onReject,
+      onSendFeedback,
+    });
+
+    expect(screen.getByText('Visible context.')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Discard task' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Continue here' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Start in new conversation' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /Request changes/ })).toBeDisabled();
+    expect(onApprove).not.toHaveBeenCalled();
+    expect(onReject).not.toHaveBeenCalled();
+    expect(onSendFeedback).not.toHaveBeenCalled();
+  });
   it('renders fenced mermaid diagrams through the shared diagram component', async () => {
     const { container } = renderTaskApprovalReader([
       '# Plan',

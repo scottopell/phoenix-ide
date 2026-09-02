@@ -716,10 +716,11 @@ export function WorkControlBar({
     ? `${addressFeedbackLabel}. Review ${activePrLabel} diff separately if needed.`
     : addressFeedbackLabel;
 
+  const closeResolutionBusy = isLoading;
   const closePanel = closeSnapshot ? (
     <CloseStatusPanel
       snapshot={closeSnapshot}
-      busy={isLoading || readOnly}
+      busy={closeResolutionBusy}
       onConfirmLosses={() => { void confirmCloseLosses(); }}
       onConfirmStopWork={() => { void confirmCloseStopWork(); }}
       onCancel={() => { void cancelClose(); }}

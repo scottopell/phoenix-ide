@@ -198,6 +198,10 @@ pub async fn submit_chain_question(
     // surface as a 500 unless we map the variant explicitly.
     validate_chain_root(&state, &root_id).await?;
 
+    let admission = state.runtime.conversation_admission(&root_id).await;
+    let _admission_guard = admission.lock().await;
+    super::handlers::require_ordinary_mutation_admission(&state, &root_id, "chain Q&A").await?;
+
     let chain_qa_id = state
         .chain_qa
         .submit_question(&root_id, trimmed)

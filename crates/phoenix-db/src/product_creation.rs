@@ -1055,6 +1055,11 @@ impl Database {
                  WHERE product.id = product_creation_jobs.published_product_id
                    AND product.kind = 'ordinary'
                    AND product.ordinary_lifecycle = 'open'
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM close_obligations obligation
+                 WHERE obligation.product_conversation_id = product_creation_jobs.published_product_id
+                   AND obligation.phase <> 'completed'
                )",
         )
         .bind(now)
@@ -1076,6 +1081,10 @@ impl Database {
                       WHERE product.id = j.published_product_id
                         AND product.kind = 'ordinary'
                         AND product.ordinary_lifecycle = 'open'
+                    ) AND NOT EXISTS (
+                      SELECT 1 FROM close_obligations obligation
+                      WHERE obligation.product_conversation_id = j.published_product_id
+                        AND obligation.phase <> 'completed'
                     ) THEN 1 ELSE 0 END AS delivery_retryable,
                     COALESCE((SELECT json_group_array(json_object('media_type', ordered.media_type, 'data', ordered.data))
                               FROM (SELECT media_type, data FROM product_creation_job_images
@@ -3307,6 +3316,83 @@ mod product_creation_tests {
             .retry_failed_product_creation_delivery("req-published-lifecycle")
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn delivery_retryable_excludes_non_completed_close_obligations() {
+        let db = Database::open_in_memory().await.unwrap();
+        let now = Utc::now();
+        db.accept_product_creation("req-delivery-close", &intent("/repo/a", "delivery-close"))
+            .await
+            .unwrap();
+        let claimed = db
+            .claim_product_creation(
+                "req-delivery-close",
+                "worker",
+                "token",
+                now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let product_id = claimed.job.product_conversation_id.clone();
+        db.publish_product_creation_atomically(&ProductCreationPublishInput {
+            request_id: "req-delivery-close".to_string(),
+            claim: claimed.claim,
+            conversation: published_conversation(
+                "conv-delivery-close",
+                product_id.clone(),
+                WorkScopeId::new(),
+                "/repo/a",
+            ),
+            authority_kind: AuthorityKind::Work,
+            environment: EnvironmentContext::UnownedCwd {
+                cwd: "/repo/a".to_string(),
+            },
+            git_publication: Some(ProductCreationGitPublicationFacts {
+                repository_root: "/repo/a".to_string(),
+                exact_checkout_oid: "abc123".to_string(),
+            }),
+        })
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE product_creation_jobs
+             SET status = 'delivery_failed', delivery_retry_at_unix_micros = NULL,
+                 claim_worker_id = NULL, claim_token = NULL, claim_lease_until_unix_micros = NULL
+             WHERE request_id = 'req-delivery-close'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query("DROP TRIGGER close_obligations_require_admission_phase_on_insert")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO close_obligations (
+                 attempt_id, product_conversation_id, phase, created_at, updated_at, topology_sealed
+             ) VALUES (
+                 'close-noncompleted', ?1, 'awaiting_retirement_inspection',
+                 '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z', 1
+             )",
+        )
+        .bind(product_id.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        assert!(!db
+            .retry_failed_product_creation_delivery("req-delivery-close")
+            .await
+            .unwrap());
+        let rows = db.list_product_creation_recovery_jobs(None).await.unwrap();
+        let delivery = rows
+            .iter()
+            .find(|row| row.request_id == "req-delivery-close")
+            .unwrap();
+        assert!(!delivery.delivery_retryable);
     }
 
     #[tokio::test]

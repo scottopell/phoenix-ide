@@ -94,7 +94,11 @@ vi.mock('../components/TaskApprovalReader', () => ({
     <div data-testid="aggregate-task-approval-owner">
       <div data-testid="aggregate-task-approval-title">{String(props['title'])}</div>
       <div data-testid="aggregate-task-approval-copy">Continue here|Start in new conversation</div>
-      <button onClick={() => (props['onApprove'] as ((handoff: string) => void))('continue')}>approve task</button>
+      <div data-testid="aggregate-task-approval-handlers">
+        {String(typeof props['onApprove'] === 'function')}|{String(typeof props['onReject'] === 'function')}|{String(typeof props['onSendFeedback'] === 'function')}
+      </div>
+      <div data-testid="aggregate-task-approval-mutation-enabled">{String(props['mutationEnabled'])}</div>
+      <button disabled={props['mutationEnabled'] === false} onClick={() => (props['onApprove'] as ((handoff: string) => void))('continue')}>approve task</button>
     </div>
   ),
 }));
@@ -849,6 +853,25 @@ describe('ProductConversationPage', () => {
     await waitForPageReady();
 
     expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.['mutationEnabled']).toBe(true);
+  });
+  it('gates task approval mutations behind liveControlsEnabled', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValueOnce(makeSnapshot({
+      close: {
+        attempt_id: 'attempt-1',
+        phase: 'settling_active_work',
+        inspections: [],
+        losses: [],
+        residuals: [],
+        confirmation_snapshot: null,
+      },
+    }));
+
+    renderPage();
+    await waitForPageReady();
+
+    expect(screen.queryByTestId('aggregate-task-approval-owner')).not.toBeInTheDocument();
+    expect(vi.mocked(api.approveTask)).not.toHaveBeenCalled();
   });
 
   it('retries older-page fetch once with a fresh tail cursor after a stale 400 cursor error', async () => {

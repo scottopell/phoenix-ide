@@ -569,14 +569,16 @@ async fn cleanup_managed_worktree_inner(
             "worktree path is not a Phoenix-managed worktree path".to_string(),
         )
     })?;
-    if owners
-        .iter()
-        .any(|conv| crate::runtime::conversation_attachment_retains_work_scope(conv))
-    {
-        return Err((
-            StatusCode::CONFLICT,
-            "worktree is still owned by a live conversation".to_string(),
-        ));
+    for owner in &owners {
+        if crate::runtime::conversation_retains_work_scope(&state.db, owner)
+            .await
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        {
+            return Err((
+                StatusCode::CONFLICT,
+                "worktree is still owned by a live conversation".to_string(),
+            ));
+        }
     }
     if !worktree.exists() {
         return Ok(ManagedWorktreeCleanupResponse {
@@ -1053,8 +1055,23 @@ async fn managed_worktrees_disk(
         }
     };
 
+    let mut retained_conversation_ids = std::collections::HashSet::new();
+    for conversation in &conversations {
+        match crate::runtime::conversation_retains_work_scope(db, conversation).await {
+            Ok(true) | Err(_) => {
+                retained_conversation_ids.insert(conversation.id.clone());
+            }
+            Ok(false) => {}
+        }
+    }
     match tokio::task::spawn_blocking(move || {
-        managed_worktrees_from_conversations(LABEL, PATTERN, &conversations, &paths)
+        managed_worktrees_from_conversations_with_authority(
+            LABEL,
+            PATTERN,
+            &conversations,
+            &paths,
+            &retained_conversation_ids,
+        )
     })
     .await
     {
@@ -1081,11 +1098,35 @@ fn not_measured_managed_worktrees(
     )
 }
 
+#[cfg(test)]
 fn managed_worktrees_from_conversations(
     label: &str,
     pattern: &str,
     conversations: &[Conversation],
     paths: &[String],
+) -> (DiskEntry, Vec<ManagedWorktreeDiskEntry>) {
+    let retained = conversations
+        .iter()
+        .filter(|conversation| {
+            crate::runtime::conversation_attachment_retains_work_scope(conversation)
+        })
+        .map(|conversation| conversation.id.clone())
+        .collect();
+    managed_worktrees_from_conversations_with_authority(
+        label,
+        pattern,
+        conversations,
+        paths,
+        &retained,
+    )
+}
+
+fn managed_worktrees_from_conversations_with_authority(
+    label: &str,
+    pattern: &str,
+    conversations: &[Conversation],
+    paths: &[String],
+    retained_conversation_ids: &std::collections::HashSet<String>,
 ) -> (DiskEntry, Vec<ManagedWorktreeDiskEntry>) {
     let mut seen = BTreeSet::new();
     let mut roots: Vec<PathBuf> = Vec::new();
@@ -1114,7 +1155,13 @@ fn managed_worktrees_from_conversations(
             DiskSize::Absent
         };
         if let Some(convs) = by_path.get(path) {
-            details.push(managed_worktree_detail(path, size, repository, convs));
+            details.push(managed_worktree_detail(
+                path,
+                size,
+                repository,
+                convs,
+                retained_conversation_ids,
+            ));
         }
     }
 
@@ -1159,12 +1206,13 @@ fn managed_worktree_detail(
     size: DiskSize,
     repository: Option<String>,
     path_conversations: &[&Conversation],
+    retained_conversation_ids: &std::collections::HashSet<String>,
 ) -> ManagedWorktreeDiskEntry {
     let source = path_conversations[0];
     let live = path_conversations
         .iter()
         .copied()
-        .find(|conv| crate::runtime::conversation_attachment_retains_work_scope(conv));
+        .find(|conv| retained_conversation_ids.contains(&conv.id));
     let owner = live.unwrap_or(source);
     ManagedWorktreeDiskEntry {
         path: path.to_string(),

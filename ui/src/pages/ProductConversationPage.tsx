@@ -895,11 +895,18 @@ function ProductConversationPageInner() {
               plan={taskApprovalOverlay.plan}
               contextWindowUsed={approvalContextWindowUsed ?? undefined}
               modelContextWindow={latestProjection.modelContextWindow}
-              onApprove={(handoff) => api.approveTask(taskApprovalOverlay.conversationId, handoff)
-                .then((result) => { if (result.first_task) setShowFirstTaskWelcome(true); })
-                .catch(() => {})}
-              onReject={() => api.rejectTask(taskApprovalOverlay.conversationId).then(() => {}).catch(() => {})}
-              onSendFeedback={(annotations) => api.sendTaskFeedback(taskApprovalOverlay.conversationId, annotations).then(() => {}).catch(() => {})}
+              mutationEnabled={liveControlsEnabled}
+              {...(liveControlsEnabled ? {
+                onApprove: (handoff) => api.approveTask(taskApprovalOverlay.conversationId, handoff)
+                  .then((result) => { if (result.first_task) setShowFirstTaskWelcome(true); })
+                  .catch(() => {}),
+                onReject: () => api.rejectTask(taskApprovalOverlay.conversationId).then(() => {}).catch(() => {}),
+                onSendFeedback: (annotations: string) => api.sendTaskFeedback(taskApprovalOverlay.conversationId, annotations).then(() => {}).catch(() => {}),
+              } : {
+                onApprove: () => {},
+                onReject: () => {},
+                onSendFeedback: () => {},
+              })}
             />
           </Suspense>
         )}
