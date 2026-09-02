@@ -13,6 +13,8 @@ const mocks = vi.hoisted(() => ({
   searchConversationCode: vi.fn(),
   searchConversationContent: vi.fn(),
   openFile: vi.fn(),
+  archiveConversation: vi.fn(),
+  archiveChain: vi.fn(),
 }));
 
 vi.mock('../../api', async (importOriginal) => {
@@ -24,6 +26,8 @@ vi.mock('../../api', async (importOriginal) => {
       searchConversationFiles: mocks.searchConversationFiles,
       searchConversationCode: mocks.searchConversationCode,
       searchConversationContent: mocks.searchConversationContent,
+      archiveConversation: mocks.archiveConversation,
+      archiveChain: mocks.archiveChain,
     },
   };
 });
@@ -85,6 +89,8 @@ beforeEach(() => {
   mocks.searchConversationCode.mockReset();
   mocks.searchConversationContent.mockReset();
   mocks.openFile.mockReset();
+  mocks.archiveConversation.mockReset();
+  mocks.archiveChain.mockReset();
 });
 
 afterEach(() => {
@@ -92,25 +98,147 @@ afterEach(() => {
 });
 
 describe('CommandPalette lifecycle availability', () => {
-  it('does not offer archive for a continuation-linked row', () => {
+  it('does not offer Close for a continuation-linked row', () => {
     const root = makeConversation({ id: 'root-id', slug: 'root', continued_in_conv_id: 'leaf-id' });
     const leaf = makeConversation({ id: 'leaf-id', slug: 'leaf' });
     renderPalette(root, [root, leaf]);
 
     fireEvent.keyDown(window, { key: 'p', metaKey: true });
-    fireEvent.change(screen.getByRole('textbox'), { target: { value: '> archive' } });
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '> close' } });
 
-    expect(screen.queryByText('Archive Current Conversation')).toBeNull();
+    expect(screen.queryByText('Close Current Conversation')).toBeNull();
   });
 
-  it('keeps archive available for a standalone conversation', () => {
+  it('offers Close for a standalone conversation', () => {
     const standalone = makeConversation({ id: 'solo-id', slug: 'solo' });
     renderPalette(standalone, [standalone]);
 
     fireEvent.keyDown(window, { key: 'p', metaKey: true });
-    fireEvent.change(screen.getByRole('textbox'), { target: { value: '> archive' } });
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '> close' } });
 
-    expect(screen.getByText('Archive Current Conversation')).toBeInTheDocument();
+    expect(screen.getByText('Close Current Conversation')).toBeInTheDocument();
+  });
+
+  it('offers Close for an Open canonical aggregate despite archived row drift', () => {
+    const latest = makeConversation({ id: 'latest-id', slug: 'latest', archived: true });
+    render(
+      <MemoryRouter initialEntries={['/product-conversations/product-1']}>
+        <FileExplorerContext.Provider value={{
+          openFile: mocks.openFile,
+          activeFile: null,
+          closeFile: vi.fn(),
+          openFileState: null,
+        }}>
+          <CommandPalette
+            conversations={[latest]}
+            productConversations={[{
+              product_conversation_id: 'product-1',
+              canonical_route: '/product-conversations/product-1',
+              canonical_root: { transcript_row_id: 'root-id', slug: 'root', title: null },
+              ordinary_lifecycle: 'open',
+              latest_transcript_row_id: 'latest-id',
+              updated_at: '2026-01-01T00:00:00Z',
+              presentation: { kind: 'state', display_name: 'Product', presentation_mode: 'idle' },
+            }]}
+            activeConversation={latest}
+          />
+        </FileExplorerContext.Provider>
+      </MemoryRouter>,
+    );
+    fireEvent.keyDown(window, { key: 'p', metaKey: true });
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '> close' } });
+    expect(screen.getByText('Close Current Conversation')).toBeInTheDocument();
+  });
+
+  it('closes an Open canonical aggregate from the active atom when drift hides its row', async () => {
+    const latest = makeConversation({ id: 'latest-id', slug: 'latest', archived: true });
+    render(
+      <MemoryRouter initialEntries={['/product-conversations/product-1']}>
+        <FileExplorerContext.Provider value={{ openFile: mocks.openFile, activeFile: null, closeFile: vi.fn(), openFileState: null }}>
+          <CommandPalette
+            conversations={[]}
+            productConversations={[{
+              product_conversation_id: 'product-1', canonical_route: '/product-conversations/product-1',
+              canonical_root: { transcript_row_id: 'latest-id', slug: 'latest', title: null },
+              ordinary_lifecycle: 'open', latest_transcript_row_id: 'latest-id',
+              updated_at: '2026-01-01T00:00:00Z',
+              presentation: { kind: 'state', display_name: 'Product', presentation_mode: 'idle' },
+            }]}
+            activeConversation={latest}
+          />
+        </FileExplorerContext.Provider>
+      </MemoryRouter>,
+    );
+
+    fireEvent.keyDown(window, { key: 'p', metaKey: true });
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '> close' } });
+    fireEvent.click(screen.getByText('Close Current Conversation'));
+
+    await waitFor(() => expect(mocks.archiveConversation).toHaveBeenCalledWith('latest-id'));
+    expect(mocks.archiveChain).not.toHaveBeenCalled();
+  });
+
+  it('uses the canonical chain root when drift hides continuation members', async () => {
+    const active = makeConversation({ id: 'latest-id', slug: 'latest' });
+    render(
+      <MemoryRouter initialEntries={['/product-conversations/product-id']}>
+        <FileExplorerContext.Provider value={{ openFile: mocks.openFile, activeFile: null, closeFile: vi.fn(), openFileState: null }}>
+          <CommandPalette
+            conversations={[]}
+            productConversations={[{
+              product_conversation_id: 'product-id', canonical_route: '/product-conversations/product-id',
+              canonical_root: { transcript_row_id: 'root-id', slug: 'root', title: null },
+              ordinary_lifecycle: 'open', latest_transcript_row_id: 'latest-id',
+              updated_at: '2026-01-01T00:00:00Z',
+              presentation: { kind: 'state', display_name: 'Product', presentation_mode: 'idle' },
+            }]}
+            activeConversation={active}
+          />
+        </FileExplorerContext.Provider>
+      </MemoryRouter>,
+    );
+
+    fireEvent.keyDown(window, { key: 'p', metaKey: true });
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '> close' } });
+    fireEvent.click(screen.getByText('Close Current Conversation'));
+
+    await waitFor(() => expect(mocks.archiveChain).toHaveBeenCalledWith('root-id'));
+    expect(mocks.archiveConversation).not.toHaveBeenCalled();
+  });
+
+  it('does not offer Close on a canonical History aggregate', () => {
+    const latest = makeConversation({ id: 'latest-id', slug: 'latest', archived: false });
+    render(
+      <MemoryRouter initialEntries={['/product-conversations/product-1']}>
+        <FileExplorerContext.Provider value={{ openFile: mocks.openFile, activeFile: null, closeFile: vi.fn(), openFileState: null }}>
+          <CommandPalette
+            conversations={[latest]}
+            productConversations={[{
+              product_conversation_id: 'product-1', canonical_route: '/product-conversations/product-1',
+              canonical_root: { transcript_row_id: 'root-id', slug: 'root', title: null },
+              ordinary_lifecycle: 'history', latest_transcript_row_id: 'latest-id',
+              updated_at: '2026-01-01T00:00:00Z',
+              presentation: { kind: 'state', display_name: 'Product', presentation_mode: 'idle' },
+            }]}
+            activeConversation={latest}
+          />
+        </FileExplorerContext.Provider>
+      </MemoryRouter>,
+    );
+    fireEvent.keyDown(window, { key: 'p', metaKey: true });
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '> close' } });
+    expect(screen.queryByText('Close Current Conversation')).toBeNull();
+  });
+
+
+  it('does not offer Close for an archived conversation', () => {
+    const archived = makeConversation({ id: 'history-id', slug: 'history', archived: true });
+    renderPalette(archived, [archived]);
+
+    fireEvent.keyDown(window, { key: 'p', metaKey: true });
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '> close' } });
+
+    expect(screen.queryByText('Close Current Conversation')).toBeNull();
   });
 });
 

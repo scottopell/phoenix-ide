@@ -883,8 +883,24 @@ impl WorkflowRepository {
                     durable_turns.prepared_payload
              FROM durable_turns
              JOIN conversations ON conversations.id = durable_turns.conversation_id
+             JOIN product_conversations product
+               ON product.id = conversations.product_conversation_id
              WHERE disposition = 'Runtime'
-               AND conversations.archived = 0
+               AND (
+                 (product.kind = 'ordinary' AND product.ordinary_lifecycle = 'open'
+                   AND (
+                     conversations.runtime_role = 'sub_agent'
+                     OR conversations.id = (
+                       SELECT latest.id FROM conversations latest
+                       WHERE latest.product_conversation_id = product.id
+                         AND latest.runtime_role = 'user'
+                         AND latest.parent_conversation_id IS NULL
+                         AND latest.continued_in_conv_id IS NULL
+                       ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1
+                     )
+                   ))
+                 OR (product.kind <> 'ordinary' AND conversations.archived = 0)
+               )
                AND terminal_kind IS NULL
                AND canonical_message_id IS NULL
                AND workflow_id IS NOT NULL
@@ -5565,6 +5581,114 @@ mod tests {
             .unwrap()
             .candidates
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn global_discovery_uses_authoritative_live_leaf_despite_archived_drift() {
+        let repo = repo().await;
+        let db = Database::from_pool_for_tests(repo.pool.clone(), ":memory:".into());
+        db.update_conversation_state(
+            "conv-a",
+            &ConvState::ContextExhausted {
+                summary: "full".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let crate::ContinueOutcome::Created(leaf) =
+            db.continue_conversation("conv-a").await.unwrap()
+        else {
+            panic!("continuation created");
+        };
+        sqlx::query("UPDATE conversations SET archived = 1 WHERE id IN ('conv-a', ?1)")
+            .bind(&leaf.id)
+            .execute(&repo.pool)
+            .await
+            .unwrap();
+        let predecessor = repo
+            .accept_authoritative_turn(&input("conv-a", "old", 31))
+            .await
+            .unwrap();
+        let leaf = repo
+            .accept_authoritative_turn(&input(&leaf.id, "live", 32))
+            .await
+            .unwrap();
+        let TurnOutcome::Created {
+            turn_id: predecessor_id,
+            ..
+        } = predecessor.outcome
+        else {
+            panic!("created predecessor")
+        };
+        let TurnOutcome::Created {
+            turn_id: leaf_id, ..
+        } = leaf.outcome
+        else {
+            panic!("created leaf")
+        };
+
+        let candidates = repo
+            .list_discoverable_accepted_runtime_direct_turns(None, 10)
+            .await
+            .unwrap()
+            .candidates;
+        assert!(!candidates.iter().any(|row| row.turn_id == predecessor_id));
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|row| row.turn_id == leaf_id)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn restarted_worker_discovers_accepted_subordinate_direct_turn() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("subordinate-recovery.db");
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        run_pending_migrations(db.pool()).await.unwrap();
+        db.create_conversation("conv-a", "A", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let parent = db.get_conversation("conv-a").await.unwrap();
+        db.create_subagent_conversation(
+            "conv-a-subordinate",
+            "conv-a-subordinate",
+            "/tmp",
+            "conv-a",
+            "test-model",
+            &crate::ConvMode::Direct,
+            phoenix_core::llm_language::LlmLanguage::default(),
+            parent.attached_work_scope_id.as_ref(),
+        )
+        .await
+        .unwrap();
+        let accepted = db
+            .workflow_repository()
+            .accept_authoritative_turn(&input("conv-a-subordinate", "subordinate", 33))
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
+            panic!("created subordinate turn")
+        };
+
+        drop(db);
+        let restarted = Database::open(path.to_str().unwrap()).await.unwrap();
+        let candidates = restarted
+            .workflow_repository()
+            .list_discoverable_accepted_runtime_direct_turns(None, 10)
+            .await
+            .unwrap()
+            .candidates;
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|candidate| candidate.turn_id == turn_id)
+                .map(|candidate| candidate.conversation.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["conv-a-subordinate"],
+        );
     }
 
     #[tokio::test]

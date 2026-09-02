@@ -1261,6 +1261,23 @@ impl SteeringBeginTestLatch {
     }
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+struct SteeringDrainTestLatch {
+    transaction_entered: tokio::sync::Notify,
+    release_transaction: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl SteeringDrainTestLatch {
+    fn new() -> Self {
+        Self {
+            transaction_entered: tokio::sync::Notify::new(),
+            release_transaction: tokio::sync::Notify::new(),
+        }
+    }
+}
+
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Default)]
 pub(crate) struct SteeringCapacityTestControl {
@@ -1317,6 +1334,8 @@ pub struct Database {
     pub(crate) close_foundation_test_latch: Option<std::sync::Arc<CloseFoundationTestLatch>>,
     #[cfg(test)]
     steering_begin_test_latch: Option<std::sync::Arc<SteeringBeginTestLatch>>,
+    #[cfg(test)]
+    steering_drain_test_latch: Option<std::sync::Arc<SteeringDrainTestLatch>>,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) steering_capacity_test_control: SteeringCapacityTestControl,
 }
@@ -1336,6 +1355,8 @@ impl Clone for Database {
             close_foundation_test_latch: self.close_foundation_test_latch.clone(),
             #[cfg(test)]
             steering_begin_test_latch: self.steering_begin_test_latch.clone(),
+            #[cfg(test)]
+            steering_drain_test_latch: self.steering_drain_test_latch.clone(),
             #[cfg(any(test, feature = "test-support"))]
             steering_capacity_test_control: self.steering_capacity_test_control.clone(),
         }
@@ -1569,6 +1590,8 @@ impl Database {
             close_foundation_test_latch: None,
             #[cfg(test)]
             steering_begin_test_latch: None,
+            #[cfg(test)]
+            steering_drain_test_latch: None,
             #[cfg(any(test, feature = "test-support"))]
             steering_capacity_test_control: SteeringCapacityTestControl::default(),
         }
@@ -1881,7 +1904,7 @@ impl Database {
                AND owner.archived = 0
                AND NOT EXISTS (
                    SELECT 1
-                   FROM close_attempt_members captured
+                   FROM close_attempt_participants captured
                    WHERE captured.attempt_id = ?2
                      AND captured.conversation_id = owner.id
                )",
@@ -2089,7 +2112,7 @@ impl Database {
                     WHERE successor.work_scope_id = ?1 AND successor.runtime_role = 'user'
                       AND successor.archived = 0
                       AND (?2 IS NULL OR NOT EXISTS (
-                          SELECT 1 FROM close_attempt_members member
+                          SELECT 1 FROM close_attempt_participants member
                           WHERE member.attempt_id = ?2
                             AND member.conversation_id = successor.id
                       ))
@@ -4497,12 +4520,18 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn list_usage_limit_errors(&self) -> DbResult<Vec<(String, schema::ConvState)>> {
         let rows: Vec<(String, String)> = sqlx::query(
-            "SELECT id, state FROM conversations
-             WHERE archived = 0
-               AND (user_initiated = 1 OR runtime_role = 'coordinator')
-               AND state_kind = 'error'
-               AND json_extract(state, '$.error_kind') = 'usage_limit_reached'
-               AND json_extract(state, '$.resets_at') IS NOT NULL",
+            "SELECT conversation.id, conversation.state
+             FROM conversations conversation
+             LEFT JOIN product_conversations product
+               ON product.id = conversation.product_conversation_id
+             WHERE (
+                 (product.kind = 'ordinary' AND product.ordinary_lifecycle = 'open')
+                 OR (COALESCE(product.kind, '') <> 'ordinary' AND conversation.archived = 0)
+             )
+               AND (conversation.user_initiated = 1 OR conversation.runtime_role = 'coordinator')
+               AND conversation.state_kind = 'error'
+               AND json_extract(conversation.state, '$.error_kind') = 'usage_limit_reached'
+               AND json_extract(conversation.state, '$.resets_at') IS NOT NULL",
         )
         .try_map(|row: SqliteRow| Ok((row.try_get("id")?, row.try_get("state")?)))
         .fetch_all(&self.pool)
@@ -5279,6 +5308,23 @@ impl Database {
             tx.rollback().await?;
             return Err(DbError::Sqlx(sqlx::Error::RowNotFound));
         };
+        let active_close: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+               SELECT 1 FROM conversations conversation
+               JOIN close_obligations obligation
+                 ON obligation.product_conversation_id = conversation.product_conversation_id
+               WHERE conversation.id = ?1 AND obligation.phase <> 'completed'
+             )",
+        )
+        .bind(conversation_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if active_close {
+            tx.rollback().await?;
+            return Err(DbError::CloseFoundationConflict(
+                "active Close rejects conversation deletion".to_string(),
+            ));
+        }
         let result = sqlx::query(
             "UPDATE conversation_creation_jobs
              SET status = 'deletion_pending', generation = generation + 1,
@@ -6674,8 +6720,14 @@ impl Database {
         let state_json = serde_json::to_string(state)
             .map_err(|error| DbError::Serialization(error.to_string()))?;
         let now = Utc::now().to_rfc3339();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let mut statuses = Vec::with_capacity(messages.len());
+        require_product_conversation_admission_tx(&mut tx, id).await?;
+        #[cfg(test)]
+        if let Some(latch) = &self.steering_drain_test_latch {
+            latch.transaction_entered.notify_one();
+            latch.release_transaction.notified().await;
+        }
 
         for message in messages {
             if message.conversation_id != id {
@@ -9104,12 +9156,12 @@ impl Database {
         .map_err(DbError::Sqlx)
     }
 
-    /// Archive a conversation
+    /// Sets the legacy transcript-row archive bit without changing aggregate lifecycle.
     ///
     /// # Errors
     ///
     /// Returns a [`DbError`] if the underlying database operation fails.
-    pub async fn archive_conversation(&self, id: &str) -> DbResult<()> {
+    pub async fn set_legacy_conversation_archived(&self, id: &str) -> DbResult<()> {
         let now = Utc::now();
 
         let result =
@@ -9228,6 +9280,21 @@ impl Database {
         .bind(conversation_id)
         .execute(&mut *connection)
         .await?;
+        if creation_cleanup_claim.is_some() {
+            sqlx::query(
+                "UPDATE close_attempt_participants
+                 SET settlement_state = 'deleted'
+                 WHERE conversation_id = ?1 AND settlement_state = 'live'
+                   AND EXISTS (
+                     SELECT 1 FROM close_obligations obligation
+                     WHERE obligation.attempt_id = close_attempt_participants.attempt_id
+                       AND obligation.phase <> 'completed'
+                   )",
+            )
+            .bind(conversation_id)
+            .execute(&mut *connection)
+            .await?;
+        }
         let deleted = if let Some((cleanup, generation, now_str)) = creation_cleanup_claim {
             sqlx::query(
                 "DELETE FROM conversations
@@ -17602,6 +17669,32 @@ mod tests {
         db.update_conversation_state("ul", &usage_limit_err(Some(reset)))
             .await
             .unwrap();
+        let ul_product_id: String =
+            sqlx::query_scalar("SELECT product_conversation_id FROM conversations WHERE id = 'ul'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        db.set_legacy_conversation_archived("ul").await.unwrap();
+        sqlx::query("UPDATE product_conversations SET ordinary_lifecycle = 'open' WHERE id = ?1")
+            .bind(&ul_product_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        // Excluded: an ordinary History aggregate even when its row bit remains unarchived.
+        db.create_conversation("history-ul", "s-history-ul", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.update_conversation_state("history-ul", &usage_limit_err(Some(reset)))
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history'
+             WHERE id = (SELECT product_conversation_id FROM conversations WHERE id = 'history-ul')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
 
         // Excluded: usage-limit error WITHOUT a reset time (no window to wait).
         db.create_conversation("ul-nores", "s-ulnr", "/tmp", true, None, None)
@@ -17655,7 +17748,7 @@ mod tests {
         assert_eq!(
             ids,
             vec!["ul", coordinator.id.as_str()],
-            "user-facing conversations include the singleton Coordinator"
+            "ordinary members follow aggregate lifecycle while non-ordinary rows follow archived"
         );
         assert!(matches!(
             got[0].1,
@@ -19585,6 +19678,112 @@ mod tests {
         .await
         .unwrap();
         assert!(!db.has_committed_steering_turn("drain-ok").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn steering_drain_serializes_close_between_admission_and_message_insert() {
+        let (_dir, mut drain_db, close_db) = open_test_db_pair().await;
+        let observer = drain_db.clone();
+        drain_db
+            .create_conversation("drain-race", "drain-race", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        drain_db
+            .update_steering_queue("drain-race", &[steering_entry("queued")])
+            .await
+            .unwrap();
+        let conversation = drain_db.get_conversation("drain-race").await.unwrap();
+        let product_conversation_id = conversation.product_conversation_id.clone();
+        let product_conversation_id_for_close = product_conversation_id.clone();
+        let latch = std::sync::Arc::new(SteeringDrainTestLatch::new());
+        drain_db.steering_drain_test_latch = Some(latch.clone());
+
+        let drain = tokio::spawn(async move {
+            drain_db
+                .commit_steering_drain(
+                    "drain-race",
+                    &[steering_drain_message("drain-race", "queued", 10)],
+                    &ConvState::LlmRequesting { attempt: 1 },
+                    Utc::now(),
+                )
+                .await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            latch.transaction_entered.notified(),
+        )
+        .await
+        .expect("drain transaction must reach the causal test latch");
+        let close_attempted = std::sync::Arc::new(tokio::sync::Notify::new());
+        let close_attempted_for_task = close_attempted.clone();
+        let close = tokio::spawn(async move {
+            close_attempted_for_task.notify_one();
+            close_db
+                .begin_close_foundation(
+                    &product_conversation_id_for_close,
+                    &phoenix_core::domain::close::TranscriptConversationId::parse("drain-race")
+                        .unwrap(),
+                    "drain-race-close",
+                )
+                .await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            close_attempted.notified(),
+        )
+        .await
+        .expect("competing Close must start while the drain transaction is held");
+        latch.release_transaction.notify_one();
+        assert!(drain.await.unwrap().is_ok());
+        assert!(close.await.unwrap().is_ok());
+        let obligation = observer
+            .get_active_close_obligation_for_product(&product_conversation_id)
+            .await
+            .unwrap();
+        assert!(
+            obligation.is_some(),
+            "Close commits only after the complete drain"
+        );
+        assert_eq!(observer.get_messages("drain-race").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn steering_drain_refuses_close_fenced_aggregate_without_partial_write() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("drain-fenced", "drain-fenced", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.update_steering_queue("drain-fenced", &[steering_entry("queued")])
+            .await
+            .unwrap();
+        let conversation = db.get_conversation("drain-fenced").await.unwrap();
+        db.begin_close_foundation(
+            &conversation.product_conversation_id,
+            &phoenix_core::domain::close::TranscriptConversationId::parse("drain-fenced").unwrap(),
+            "drain-close-attempt",
+        )
+        .await
+        .unwrap();
+
+        let error = db
+            .commit_steering_drain(
+                "drain-fenced",
+                &[steering_drain_message("drain-fenced", "queued", 10)],
+                &ConvState::LlmRequesting { attempt: 1 },
+                Utc::now(),
+            )
+            .await
+            .expect_err("Close admission must fence queued steering materialization");
+        assert!(matches!(error, DbError::CloseAdmissionFenced(_)));
+        assert!(db.get_messages("drain-fenced").await.unwrap().is_empty());
+        assert_eq!(
+            db.get_steering_queue("drain-fenced").await.unwrap().len(),
+            1
+        );
+        assert_eq!(
+            db.get_conversation("drain-fenced").await.unwrap().state,
+            ConvState::Idle
+        );
     }
 
     #[tokio::test]
@@ -24932,7 +25131,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_attempt_blocks_same_aggregate_active_subagent_absent_from_capture() {
+    async fn close_attempt_rejects_same_aggregate_subagent_creation() {
         let db = Database::open_in_memory().await.unwrap();
         let scope = retirement_fixture(
             &db,
@@ -24953,32 +25152,35 @@ mod tests {
         )
         .await
         .unwrap();
-        db.create_conversation_with_project(
-            "uncaptured-active-child",
-            "uncaptured-active-child",
-            "/tmp/retirement",
-            false,
-            Some("captured-terminal-owner"),
-            None,
-            None,
-            &ConvMode::Direct,
-            None,
-            None,
-            None,
-            phoenix_core::llm_language::LlmLanguage::default(),
-        )
-        .await
-        .unwrap();
-
+        let error = db
+            .create_conversation_with_project(
+                "uncaptured-active-child",
+                "uncaptured-active-child",
+                "/tmp/retirement",
+                false,
+                Some("captured-terminal-owner"),
+                None,
+                None,
+                &ConvMode::Direct,
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("non-writable ProductConversation rejects new aggregate participants"));
         assert_eq!(
             db.retire_work_scope_for_close_attempt(
                 &attempt,
                 no_live_resource(scope),
-                "Close rejects uncaptured subordinate participant scope",
+                "Close retires sealed participant scope",
             )
             .await
             .unwrap(),
-            WorkScopeRetirementOutcome::Blocked(WorkScopeRetirementBlocker::ActiveSubAgent)
+            WorkScopeRetirementOutcome::Retired
         );
     }
 

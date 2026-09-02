@@ -2183,7 +2183,7 @@ mod tests {
         )
         .await
         .unwrap();
-        db.archive_conversation("c-b").await.unwrap();
+        db.set_legacy_conversation_archived("c-b").await.unwrap();
         let r = db.fts_retriever();
 
         let hits = r
@@ -2326,7 +2326,7 @@ mod tests {
         )
         .await
         .unwrap();
-        db.archive_conversation("c-b").await.unwrap();
+        db.set_legacy_conversation_archived("c-b").await.unwrap();
         let columns: Vec<String> = sqlx::query("PRAGMA table_info(conversation_creation_jobs)")
             .fetch_all(db.pool())
             .await

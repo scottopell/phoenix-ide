@@ -79,6 +79,7 @@ export interface TaskApprovalReaderProps {
   contextWindowUsed?: number | undefined;
   modelContextWindow?: number | undefined;
   approvalError?: string | null | undefined;
+  mutationEnabled?: boolean;
   onApprove: (handoff: TaskApprovalHandoff) => void;
   onReject: () => void;
   onSendFeedback: (annotations: string) => void;
@@ -315,6 +316,7 @@ export function TaskApprovalReader({
   modelContextWindow,
   approvalError,
   onApprove,
+  mutationEnabled = true,
   onReject,
   onSendFeedback,
 }: TaskApprovalReaderProps) {
@@ -747,6 +749,7 @@ export function TaskApprovalReader({
             className="task-approval-header-discard"
             onClick={handleDiscard}
             aria-label="Discard task"
+            disabled={!mutationEnabled}
             title="Discard task"
           >
             <X size={18} />
@@ -810,7 +813,7 @@ export function TaskApprovalReader({
             .filter(Boolean)
             .join(' ')}
           onClick={handleSendFeedback}
-          disabled={!hasUnsentNotes}
+          disabled={!mutationEnabled || !hasUnsentNotes}
           aria-label={`Request changes (${notes.length})`}
           title={
             !hasUnsentNotes
@@ -831,7 +834,7 @@ export function TaskApprovalReader({
           ]
             .filter(Boolean)
             .join(' ')}
-          disabled={approvingHandoff !== null}
+          disabled={!mutationEnabled || approvingHandoff !== null}
           onClick={() => handleApprove('continue_in_current_conversation')}
           aria-label="Continue here"
         >
@@ -857,7 +860,7 @@ export function TaskApprovalReader({
           ]
             .filter(Boolean)
             .join(' ')}
-          disabled={approvingHandoff !== null}
+          disabled={!mutationEnabled || approvingHandoff !== null}
           onClick={() => handleApprove('start_fresh_work_conversation')}
           aria-label="Start in new conversation"
         >

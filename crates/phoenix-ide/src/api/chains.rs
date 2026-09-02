@@ -37,12 +37,12 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use ts_rs::TS;
 
-use super::handlers::{run_archive_cascade, run_hard_delete_cascade, AppError};
+use super::handlers::{require_hard_delete_admission, run_hard_delete_cascade, AppError};
 use super::types::{ConflictErrorResponse, SuccessResponse};
 use super::wire::ChainSseWireEvent;
 use super::AppState;
 use crate::chain_qa::ChainQaError;
-use crate::db::{ChainQaRow, ConvMode, Conversation, DbError};
+use crate::db::{ChainQaRow, Conversation, DbError};
 use crate::state_machine::ConvState;
 
 /// Maximum length (in chars) of a user-set chain name. The cap is arbitrary
@@ -198,9 +198,17 @@ pub async fn submit_chain_question(
     // surface as a 500 unless we map the variant explicitly.
     validate_chain_root(&state, &root_id).await?;
 
+    let admission = state
+        .runtime
+        .mutation_admission(&root_id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    let admission_guard = admission.lock_owned().await;
+    super::handlers::require_ordinary_mutation_admission(&state, &root_id, "chain Q&A").await?;
+
     let chain_qa_id = state
         .chain_qa
-        .submit_question(&root_id, trimmed)
+        .submit_question(&root_id, trimmed, Some(admission_guard))
         .await
         .map_err(map_chain_qa_error)?;
     Ok(Json(SubmitChainQaResponse { chain_qa_id }))
@@ -364,24 +372,10 @@ fn chain_member_blocks_cascade(state: &ConvState) -> bool {
     state.is_busy() || matches!(state, ConvState::AwaitingContinuation { .. })
 }
 
-/// `POST /api/chains/:rootId/archive` — archive every member of the chain.
-/// Single-member roots are not chains; the per-conversation `/archive`
-/// endpoint owns those.
-///
-/// Performs the same resource cleanup (bash kill, tmux kill, worktree /
-/// branch removal) per member as the per-conversation archive cascade,
-/// then sets `archived = 1` on each member row via `archive_conversation`.
-/// Pre-checks every member's busy state up front and refuses the whole
-/// operation if any member is busy (no partial cleanup).
-///
-/// **Not atomic.** Side effects + DB writes happen per member. If a later
-/// member errors (e.g. TOCTOU-races into busy after the precheck), earlier
-/// members may already be cleaned up + archived while later members are
-/// untouched. The cascade itself can't be atomic (worktree/tmux kills are
-/// non-transactional), and we don't wrap the per-row `archived = 1` writes
-/// in a transaction either — keeping cleanup and the flag flip in lockstep
-/// per member is more useful than rolling back the flag while the resources
-/// are gone. Same shape as `delete_chain_handler`.
+/// Compatibility route for closing a legacy chain URL.
+/// Single-member roots use the per-conversation compatibility route. A chain
+/// resolves to its latest aggregate transcript and enters the same durable Close
+/// obligation, settlement, retirement, outcome, and History finalization path.
 pub async fn archive_chain_handler(
     State(state): State<AppState>,
     Path(root_id): Path<String>,
@@ -393,80 +387,46 @@ pub async fn archive_chain_handler(
         .chain_members_forward(&root_id)
         .await
         .map_err(db_to_app)?;
-    let _admission_guards = lock_chain_admissions(&state, &member_ids).await;
+    let _admission_guards = lock_chain_admissions(&state, &root_id, &member_ids).await?;
     for id in &member_ids {
         super::handlers::refuse_if_coordinator(&state, id, "archive").await?;
-    }
-
-    for id in &member_ids {
-        let conv = state.db.get_conversation(id).await.map_err(db_to_app)?;
-        if chain_member_blocks_cascade(&conv.state) {
-            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                format!(
-                    "Cannot archive chain: member {id} is busy. Cancel the in-flight \
-                     operation first, then retry.",
-                ),
-                "cancel_first",
-            ))));
-        }
-    }
-    let wake_repo = state.db.wake_repository();
-    for id in &member_ids {
-        if wake_repo
-            .has_owed_work_for_conversation(id)
-            .await
-            .map_err(|error| AppError::Internal(error.to_string()))?
-        {
-            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                format!("Cannot archive chain: member {id} has pending background work."),
-                "pending_wake",
-            ))));
-        }
     }
 
     let active_id = member_ids
         .last()
         .ok_or_else(|| AppError::NotFound("chain has no members".to_string()))?;
-    let active = state
-        .db
-        .get_conversation(active_id)
-        .await
-        .map_err(db_to_app)?;
-    if matches!(
-        active.conv_mode,
-        ConvMode::Explore {
-            worktree_path: Some(_),
-            ..
-        } | ConvMode::Work { .. }
-            | ConvMode::Branch { .. }
-    ) {
-        super::lifecycle_handlers::close_legacy_compat(&state, active_id, "archive chain").await?;
-    } else {
-        for id in &member_ids {
-            run_archive_cascade(&state, id).await?;
-        }
-    }
+    super::lifecycle_handlers::close_legacy_compat(&state, active_id, "archive chain").await?;
 
     Ok(Json(SuccessResponse { success: true }))
 }
 
 async fn lock_chain_admissions(
     state: &AppState,
+    root_id: &str,
     member_ids: &[String],
-) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
-    let mut sorted_ids = member_ids.to_vec();
-    sorted_ids.sort();
-    let mut guards = Vec::with_capacity(sorted_ids.len());
-    for id in sorted_ids {
+) -> Result<Vec<tokio::sync::OwnedMutexGuard<()>>, AppError> {
+    let root = state
+        .db
+        .get_conversation(root_id)
+        .await
+        .map_err(db_to_app)?;
+    let mut sorted_keys = member_ids.to_vec();
+    sorted_keys.push(root.product_conversation_id.to_string());
+    sorted_keys.sort();
+    sorted_keys.dedup();
+    let mut guards = Vec::with_capacity(sorted_keys.len());
+    for key in sorted_keys {
         let admission: Arc<tokio::sync::Mutex<()>> =
-            state.runtime.conversation_admission(&id).await;
+            state.runtime.conversation_admission(&key).await;
         guards.push(admission.lock_owned().await);
     }
-    guards
+    Ok(guards)
 }
 
 /// `DELETE /api/chains/:rootId` — hard-delete every member of the chain.
 ///
+/// Acquires every member's admission guard, then admits the aggregate exactly
+/// once through its root. Only History chains proceed to preflight and cleanup.
 /// Pre-checks every member's busy state up front and refuses the whole
 /// operation if any member is busy (atomic refuse — no partial wipe).
 /// Iterates root-first so the existing FK on `continued_in_conv_id`
@@ -486,7 +446,8 @@ pub async fn delete_chain_handler(
         .chain_members_forward(&root_id)
         .await
         .map_err(db_to_app)?;
-    let _admission_guards = lock_chain_admissions(&state, &member_ids).await;
+    let _admission_guards = lock_chain_admissions(&state, &root_id, &member_ids).await?;
+    require_hard_delete_admission(&state, &root_id).await?;
     for id in &member_ids {
         super::handlers::refuse_if_coordinator(&state, id, "delete").await?;
     }
@@ -517,12 +478,6 @@ pub async fn delete_chain_handler(
         }
     }
 
-    // TOCTOU note: the busy precheck is best-effort. A member can transition
-    // to busy after this loop and before/during its individual cascade, in
-    // which case `run_hard_delete_cascade` returns a 409 mid-iteration with
-    // earlier members already deleted. Same shape as per-conversation delete
-    // (which has no precheck at all). A locking mitigation belongs in a
-    // future task — not in this PR.
     for id in &member_ids {
         run_hard_delete_cascade(&state, id).await?;
     }

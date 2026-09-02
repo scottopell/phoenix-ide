@@ -235,6 +235,53 @@ function mergeOlderSegments(
   };
 }
 
+function mergeRefreshedTail(
+  current: ProductConversationSnapshotView,
+  refreshed: ProductConversationSnapshotView,
+): ProductConversationSnapshotView {
+  const segmentsByRowId = new Map(
+    refreshed.segments.map((segment) => [segment.transcript_row_id, segment]),
+  );
+  const earliestRefreshedOrdinal = refreshed.segments.length > 0
+    ? Math.min(...refreshed.segments.map((segment) => segment.segment_ordinal))
+    : null;
+  for (const retainedSegment of current.segments) {
+    const refreshedSegment = segmentsByRowId.get(retainedSegment.transcript_row_id);
+    if (!refreshedSegment) {
+      if (earliestRefreshedOrdinal != null
+        && retainedSegment.segment_ordinal < earliestRefreshedOrdinal) {
+        segmentsByRowId.set(retainedSegment.transcript_row_id, retainedSegment);
+      }
+      continue;
+    }
+    const refreshedMessageIds = new Set(
+      refreshedSegment.messages.map((message) => message.message_id),
+    );
+    segmentsByRowId.set(retainedSegment.transcript_row_id, {
+      ...retainedSegment,
+      ...refreshedSegment,
+      messages: [
+        ...retainedSegment.messages.filter(
+          (message) => !refreshedMessageIds.has(message.message_id),
+        ),
+        ...refreshedSegment.messages,
+      ],
+      handoff: refreshedSegment.handoff ?? retainedSegment.handoff,
+    });
+  }
+  const retainedPrefix = earliestRefreshedOrdinal != null
+    && current.segments.some(
+      (segment) => segment.segment_ordinal < earliestRefreshedOrdinal,
+    );
+  return {
+    ...refreshed,
+    segments: Array.from(segmentsByRowId.values())
+      .sort((a, b) => a.segment_ordinal - b.segment_ordinal),
+    before: retainedPrefix ? current.before : refreshed.before,
+    has_older: retainedPrefix ? current.has_older : refreshed.has_older,
+  };
+}
+
 function aggregateConversationState(snapshot: ProductConversationSnapshotView, loadingOlder: boolean, olderError: string | null): ConversationState {
   if (olderError) {
     return { type: 'error', message: olderError, error_kind: 'server_error' };
@@ -332,7 +379,7 @@ function SourceMeta({ snapshot }: { snapshot: ProductConversationSnapshotView })
       </div>
       <div className="product-conversation-meta__row">
         <span className="product-conversation-meta__label">Lifecycle</span>
-        <span>{snapshot.ordinary_lifecycle}</span>
+        <span>{snapshot.ordinary_lifecycle === 'history' ? 'History' : 'Open'}</span>
       </div>
       <div className="product-conversation-meta__row">
         <span className="product-conversation-meta__label">Canonical root</span>
@@ -369,6 +416,7 @@ function ProductConversationPageInner() {
   const location = useLocation();
   const hashTargetMessageId = decodeMessageHash(location.hash);
   const [ownedSnapshot, setOwnedSnapshot] = useState<OwnedSnapshot | null>(null);
+  const ownedSnapshotRef = useRef<OwnedSnapshot | null>(null);
   const snapshot = ownedSnapshot && ownedSnapshot.productConversationId === productConversationId
     ? ownedSnapshot.value
     : null;
@@ -390,11 +438,13 @@ function ProductConversationPageInner() {
   const { chain, inflight, inflightOrder, draft, submitting, sseLost, loadError } = atom;
   const activeTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const inflightRef = useRef(inflight);
+  const observedMemberProjectionRef = useRef<typeof latestProjection>(null);
   const aggregateMessages = useMemo(
     () => snapshot ? makeAggregateMessages(snapshot, latestProjection) : [],
     [latestProjection, snapshot],
   );
   const aggregateMessageSlot = viewerSlot.slot.kind === 'message' ? viewerSlot.slot : null;
+  ownedSnapshotRef.current = ownedSnapshot;
   inflightRef.current = inflight;
 
   useEffect(() => {
@@ -404,20 +454,27 @@ function ProductConversationPageInner() {
     setRestoreCommand(null);
     setOlderError(null);
     setLoadingOlder(false);
+    observedMemberProjectionRef.current = null;
   }, [productConversationId]);
 
   useEffect(() => {
     if (!productConversationId) return;
     let cancelled = false;
-    setLoading(true);
+    const isBackgroundRefresh = ownedSnapshotRef.current?.productConversationId === productConversationId;
+    if (!isBackgroundRefresh) setLoading(true);
     setError(null);
     setOlderError(null);
 
     api.getProductConversationSnapshot(productConversationId, { message_limit: PAGE_SIZE })
       .then((next) => {
         if (cancelled) return;
-        setOwnedSnapshot({ productConversationId, value: next });
-        setHistoryGeneration(0);
+        setOwnedSnapshot((current) => ({
+          productConversationId,
+          value: current?.productConversationId === productConversationId
+            ? mergeRefreshedTail(current.value, next)
+            : next,
+        }));
+        if (!isBackgroundRefresh) setHistoryGeneration(0);
       })
       .catch((err) => {
         if (cancelled) return;
@@ -430,12 +487,21 @@ function ProductConversationPageInner() {
   }, [productConversationId, snapshotRetry]);
 
   useEffect(() => {
-    const notificationId = snapshot?.latest_transcript_row_id ?? productConversationId;
-    if (!notificationId) return;
-    return subscribeCloseSnapshotChanged(notificationId, () => {
-      setSnapshotRetry((retry) => retry + 1);
-    });
-  }, [productConversationId, snapshot?.latest_transcript_row_id]);
+    const notificationIds = new Set([
+      productConversationId,
+      snapshot?.latest_transcript_row_id,
+      snapshot?.canonical_root.transcript_row_id,
+      ...((snapshot?.segments ?? []).map((segment) => segment.transcript_row_id)),
+    ].filter((id): id is string => Boolean(id)));
+    if (notificationIds.size === 0) return;
+    const refresh = (source: 'close' | 'stream') => {
+      const closeIsActive = snapshot?.close != null && snapshot.close.phase !== 'completed';
+      if (source === 'close' || closeIsActive) setSnapshotRetry((retry) => retry + 1);
+    };
+    const unsubscribes = [...notificationIds].map((id) =>
+      subscribeCloseSnapshotChanged(id, refresh));
+    return () => unsubscribes.forEach((unsubscribe) => unsubscribe());
+  }, [productConversationId, snapshot]);
 
   const refreshChain = useCallback(async (rootId: string) => {
     try {
@@ -456,8 +522,20 @@ function ProductConversationPageInner() {
   }, [chainRootId, dispatch, refreshChain]);
 
   useEffect(() => {
+    if (!latestProjection?.conversationId || !snapshot) return;
+    const previous = observedMemberProjectionRef.current;
+    observedMemberProjectionRef.current = latestProjection;
+    const lifecycleMismatch = latestProjection.serverArchived
+      !== (snapshot.ordinary_lifecycle === 'history');
+    const projectionChanged = previous !== latestProjection;
+    if (lifecycleMismatch && projectionChanged) {
+      setSnapshotRetry((retry) => retry + 1);
+    }
+  }, [latestProjection, snapshot]);
+
+  useEffect(() => {
     const projection = latestProjection;
-    if (!projection?.conversationId || projection.isArchived) {
+    if (!projection?.conversationId || snapshot?.ordinary_lifecycle === 'history') {
       setTaskApprovalOverlay(null);
       setApprovalContextWindowUsed(null);
       return;
@@ -486,7 +564,7 @@ function ProductConversationPageInner() {
     return () => {
       cancelled = true;
     };
-  }, [latestProjection]);
+  }, [latestProjection, snapshot?.ordinary_lifecycle]);
 
   useEffect(() => {
     const handler = (event: Event) => {
@@ -547,7 +625,9 @@ function ProductConversationPageInner() {
       if (routeGenerationRef.current !== routeGeneration || paginationRequestRef.current !== requestGeneration) return;
       setOwnedSnapshot((current) => {
         if (!current || current.productConversationId !== ownerId) return current;
-        const authoritativeTail = refreshedTail ?? current.value;
+        const authoritativeTail = refreshedTail
+          ? mergeRefreshedTail(current.value, refreshedTail)
+          : current.value;
         return { productConversationId: ownerId, value: mergeOlderSegments(authoritativeTail, older) };
       });
       setHistoryGeneration((generation) => generation + 1);
@@ -580,13 +660,18 @@ function ProductConversationPageInner() {
   }, [historyGeneration, latestProjection?.conversationId, loadingOlder, productConversationId, snapshot]);
 
   const messages = aggregateMessages;
+  const closeInProgress = snapshot?.close != null && snapshot.close.phase !== 'completed';
   const convState = useMemo(
-    () => latestProjection?.convState ?? (snapshot ? aggregateConversationState(snapshot, loadingOlder, olderError) : { type: 'idle' } satisfies ConversationState),
-    [latestProjection, loadingOlder, olderError, snapshot],
+    () => snapshot?.ordinary_lifecycle === 'history' || closeInProgress
+      ? ({ type: 'idle' } satisfies ConversationState)
+      : latestProjection?.convState ?? (snapshot ? aggregateConversationState(snapshot, loadingOlder, olderError) : { type: 'idle' } satisfies ConversationState),
+    [closeInProgress, latestProjection, loadingOlder, olderError, snapshot],
   );
   const latestSlug = latestProjection?.slug ?? snapshot?.latest_transcript_row_id ?? null;
   const latestConversationId = latestProjection?.conversationId ?? snapshot?.latest_transcript_row_id ?? undefined;
-  const latestWorkScopeKey = latestProjection?.isArchived ? undefined : latestProjection?.conversation?.work_scope_key;
+  const latestWorkScopeKey = snapshot?.ordinary_lifecycle === 'open'
+    ? latestProjection?.conversation?.work_scope_key
+    : undefined;
   const aggregateWorkIdentity = snapshot?.work_identity ?? null;
   const transcriptView = {
     conversationId: latestConversationId ?? snapshot?.product_conversation_id ?? '',
@@ -608,6 +693,7 @@ function ProductConversationPageInner() {
     }
     : { kind: 'idle' as const, view: transcriptView });
   const isOpen = snapshot?.ordinary_lifecycle === 'open';
+  const liveControlsEnabled = isOpen && !closeInProgress;
 
   useEffect(() => {
     if (!hashTargetMessageId || hashTargetLoaded || !snapshot?.has_older || loadingOlder || olderError) return;
@@ -723,10 +809,8 @@ function ProductConversationPageInner() {
     );
   }
 
-  if (error || !snapshot) {
-    const fallbackSlug = ownedSnapshot && ownedSnapshot.productConversationId === productConversationId
-      ? ownedSnapshot.value.latest_transcript_row_id
-      : productConversationId;
+  if (!snapshot) {
+    const fallbackSlug = productConversationId;
     return (
       <main className="product-conversation-page">
         <div role="alert">{error ?? 'Unable to open this product conversation.'} Showing cached row if available.</div>
@@ -736,6 +820,8 @@ function ProductConversationPageInner() {
             slug={fallbackSlug}
             routePrefix="/c"
             suppressCanonicalization
+            mutationEnabled={false}
+            aggregateLifecycleOpen={false}
           />
         )}
       </main>
@@ -751,6 +837,7 @@ function ProductConversationPageInner() {
           <p className="product-conversation-page__route">{snapshot.canonical_route}</p>
         </div>
         {olderError && <div className="product-conversation-page__status" role="alert">{olderError}</div>}
+        {error && <div className="product-conversation-page__status" role="alert">{error}</div>}
         {hashTargetExhausted && (
           <div className="product-conversation-page__status" role="alert">
             The linked message is not available in this conversation history.
@@ -807,8 +894,9 @@ function ProductConversationPageInner() {
                 setDraft={setDraft}
                 submitting={submitting}
                 sseLost={sseLost}
-                {...(!loadError ? { onSubmit: handleSubmit } : {})}
+                {...(!loadError && liveControlsEnabled ? { onSubmit: handleSubmit } : {})}
                 onReask={handleReask}
+                disabled={!liveControlsEnabled}
                 activeTextareaRef={activeTextareaRef}
                 onRetryConnection={() => {
                   dispatch({ type: 'SSE_RESTORED' });
@@ -824,7 +912,8 @@ function ProductConversationPageInner() {
                   suppressCanonicalization={true}
                   suppressMessageViewerOwner
                   suppressTaskApprovalOwner={true}
-                  ordinaryComposerEnabled={isOpen}
+                  mutationEnabled={liveControlsEnabled}
+                  aggregateLifecycleOpen={isOpen}
                   onProjectionChange={setLatestProjection}
                   onCloseCompleted={() => setSnapshotRetry((retry) => retry + 1)}
                 />
@@ -862,11 +951,18 @@ function ProductConversationPageInner() {
               plan={taskApprovalOverlay.plan}
               contextWindowUsed={approvalContextWindowUsed ?? undefined}
               modelContextWindow={latestProjection.modelContextWindow}
-              onApprove={(handoff) => api.approveTask(taskApprovalOverlay.conversationId, handoff)
-                .then((result) => { if (result.first_task) setShowFirstTaskWelcome(true); })
-                .catch(() => {})}
-              onReject={() => api.rejectTask(taskApprovalOverlay.conversationId).then(() => {}).catch(() => {})}
-              onSendFeedback={(annotations) => api.sendTaskFeedback(taskApprovalOverlay.conversationId, annotations).then(() => {}).catch(() => {})}
+              mutationEnabled={liveControlsEnabled}
+              {...(liveControlsEnabled ? {
+                onApprove: (handoff) => api.approveTask(taskApprovalOverlay.conversationId, handoff)
+                  .then((result) => { if (result.first_task) setShowFirstTaskWelcome(true); })
+                  .catch(() => {}),
+                onReject: () => api.rejectTask(taskApprovalOverlay.conversationId).then(() => {}).catch(() => {}),
+                onSendFeedback: (annotations: string) => api.sendTaskFeedback(taskApprovalOverlay.conversationId, annotations).then(() => {}).catch(() => {}),
+              } : {
+                onApprove: () => {},
+                onReject: () => {},
+                onSendFeedback: () => {},
+              })}
             />
           </Suspense>
         )}

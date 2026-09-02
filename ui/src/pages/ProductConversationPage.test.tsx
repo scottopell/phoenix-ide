@@ -7,6 +7,8 @@ import { FileExplorerProvider } from '../components/FileExplorer';
 import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
 import { ChainProvider } from '../chain';
 import { ApiResponseError, type ChainView, type ProductConversationSnapshotView } from '../api';
+import type { ProductConversationCloseView } from '../generated/ProductConversationCloseView';
+import { notifyCloseSnapshotChanged } from '../notifications';
 
 const conversationNavStackSpy = vi.fn();
 const embeddedConversationPageSpy = vi.fn();
@@ -73,6 +75,7 @@ vi.mock('./ChainPage', () => ({
         <textarea
           aria-label="recall draft"
           value={String(props['draft'] ?? '')}
+          disabled={Boolean(props['disabled'])}
           onChange={(event) => (props['setDraft'] as ((value: string) => void))(event.target.value)}
         />
       </div>
@@ -93,7 +96,11 @@ vi.mock('../components/TaskApprovalReader', () => ({
     <div data-testid="aggregate-task-approval-owner">
       <div data-testid="aggregate-task-approval-title">{String(props['title'])}</div>
       <div data-testid="aggregate-task-approval-copy">Continue here|Start in new conversation</div>
-      <button onClick={() => (props['onApprove'] as ((handoff: string) => void))('continue')}>approve task</button>
+      <div data-testid="aggregate-task-approval-handlers">
+        {String(typeof props['onApprove'] === 'function')}|{String(typeof props['onReject'] === 'function')}|{String(typeof props['onSendFeedback'] === 'function')}
+      </div>
+      <div data-testid="aggregate-task-approval-mutation-enabled">{String(props['mutationEnabled'])}</div>
+      <button disabled={props['mutationEnabled'] === false} onClick={() => (props['onApprove'] as ((handoff: string) => void))('continue')}>approve task</button>
     </div>
   ),
 }));
@@ -281,6 +288,7 @@ function emitLatestProjection(overrides: Partial<Record<string, unknown>> = {}) 
     }],
     convState: { type: 'awaiting_user_response', questions: [] },
     isArchived: false,
+    serverArchived: false,
     onRetryPending: vi.fn(),
     onCancelSteering: vi.fn(),
     onOpenFile: vi.fn(),
@@ -318,6 +326,24 @@ describe('ProductConversationPage', () => {
     vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(makeSnapshot());
     vi.mocked(api.getChain).mockReset();
     vi.mocked(api.getChain).mockResolvedValue(makeChain());
+  });
+
+  it('refetches the authoritative aggregate when SSE changes member archive state', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot({ ordinary_lifecycle: 'open' }))
+      .mockResolvedValueOnce(makeSnapshot({ ordinary_lifecycle: 'history' }));
+
+    renderPage();
+    await waitForPageReady();
+
+    act(() => emitLatestProjection({ isArchived: false, serverArchived: false }));
+    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(1);
+    act(() => emitLatestProjection({ isArchived: false, serverArchived: true }));
+
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByText('History is read-only.')).toBeInTheDocument());
+    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2);
   });
 
   it('orders flattened segment messages chronologically', async () => {
@@ -638,7 +664,7 @@ describe('ProductConversationPage', () => {
     expect(embeddedConversationPageSpy).toHaveBeenCalledWith(expect.objectContaining({
       slug: 'row-2',
       suppressCanonicalization: true,
-      ordinaryComposerEnabled: true,
+      mutationEnabled: true,
     }));
     expect(screen.getByTestId('chain-work-scope-dock')).toBeInTheDocument();
     expect(chainWorkScopeDockSpy).toHaveBeenLastCalledWith(expect.objectContaining({
@@ -708,7 +734,7 @@ describe('ProductConversationPage', () => {
     await screen.findByTestId('embedded-conversation-page');
     expect(embeddedConversationPageSpy).toHaveBeenCalledWith(expect.objectContaining({
       slug: 'row-2',
-      ordinaryComposerEnabled: true,
+      mutationEnabled: true,
       suppressCanonicalization: true,
     }));
   });
@@ -720,14 +746,14 @@ describe('ProductConversationPage', () => {
     emitLatestProjection({ convState: { type: 'awaiting_task_approval' } });
     await waitFor(() => {
       expect(embeddedConversationPageSpy).toHaveBeenLastCalledWith(expect.objectContaining({
-        ordinaryComposerEnabled: true,
+        mutationEnabled: true,
       }));
     });
 
     emitLatestProjection({ convState: { type: 'idle' } });
     await waitFor(() => {
       expect(embeddedConversationPageSpy).toHaveBeenLastCalledWith(expect.objectContaining({
-        ordinaryComposerEnabled: true,
+        mutationEnabled: true,
       }));
     });
   });
@@ -762,6 +788,260 @@ describe('ProductConversationPage', () => {
     });
   });
 
+  it('disables live transcript and recall controls while Close is active', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValueOnce(makeSnapshot({
+      close: {
+        attempt_id: 'close-active',
+        phase: 'settling_active_work',
+        confirmation_snapshot: null,
+        inspections: [],
+        losses: [],
+        residuals: [],
+      },
+    }));
+
+    renderPage();
+    await waitForPageReady();
+
+    expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.['mutationEnabled']).toBe(false);
+    expect(screen.getByRole('textbox', { name: 'recall draft' })).toBeDisabled();
+    expect(chainQaColumnSpy.mock.lastCall?.[0]?.['onSubmit']).toBeUndefined();
+    expect(chainQaColumnSpy.mock.lastCall?.[0]?.['disabled']).toBe(true);
+  });
+
+  it('background-refreshes active Close phases without replacing the page with a skeleton', async () => {
+    const { api } = await import('../api');
+    const activeClose = {
+      attempt_id: 'close-active',
+      phase: 'settling_active_work',
+      confirmation_snapshot: null,
+      inspections: [],
+      losses: [],
+      residuals: [],
+    } satisfies ProductConversationCloseView;
+    let resolveRefresh!: (value: ProductConversationSnapshotView) => void;
+    const refresh = new Promise<ProductConversationSnapshotView>((resolve) => { resolveRefresh = resolve; });
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot({ close: activeClose }))
+      .mockReturnValueOnce(refresh);
+
+    renderPage();
+    await waitForPageReady();
+    act(() => notifyCloseSnapshotChanged('row-2', 'stream'));
+
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
+    expect(screen.queryByTestId('skeleton')).not.toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Product Alpha' })).toBeInTheDocument();
+    await act(async () => resolveRefresh(makeSnapshot({
+      close: { ...activeClose, phase: 'awaiting_retirement_inspection' },
+    })));
+    expect(screen.getByRole('heading', { name: 'Product Alpha' })).toBeInTheDocument();
+  });
+
+  it('preserves loaded history across active Close refreshes', async () => {
+    const { api } = await import('../api');
+    const activeClose = {
+      attempt_id: 'close-active',
+      phase: 'settling_active_work',
+      confirmation_snapshot: null,
+      inspections: [],
+      losses: [],
+      residuals: [],
+    } satisfies ProductConversationCloseView;
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot({ close: activeClose }))
+      .mockResolvedValueOnce(makeSnapshot({
+        close: activeClose,
+        segments: [{ segment_ordinal: 0, transcript_row_id: 'row-old', slug: 'old', title: 'Old', messages: [makeMessage('old-message', 0)], handoff: null }],
+        before: null,
+        has_older: false,
+      }))
+      .mockResolvedValueOnce(makeSnapshot({
+        close: { ...activeClose, phase: 'awaiting_retirement_inspection' },
+        segments: [
+          {
+            segment_ordinal: 1,
+            transcript_row_id: 'row-1',
+            slug: 'row-1',
+            title: 'First',
+            messages: [makeMessage('m-2', 2)],
+            handoff: {
+              kind: 'historical',
+              predecessor_transcript_row_id: 'row-1',
+              successor_transcript_row_id: 'row-2',
+              continuation_message_id: 'cont-1',
+              summary: 'carry context',
+            },
+          },
+          {
+            segment_ordinal: 2,
+            transcript_row_id: 'row-2',
+            slug: 'row-2',
+            title: 'Second',
+            messages: [makeMessage('m-3', 3), makeMessage('m-4', 4)],
+            handoff: null,
+          },
+        ],
+      }));
+
+    renderPage();
+    await waitForPageReady();
+    fireEvent.click(screen.getByRole('button', { name: 'load older' }));
+    await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent('old-message'));
+
+    act(() => notifyCloseSnapshotChanged('row-2', 'stream'));
+
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent('old-message'));
+    expect(screen.getByTestId('message-order')).toHaveTextContent('old-message,m-1,m-2,product-handoff:pc-1:row-1:cont-1,m-3,m-4');
+    expect(screen.getByTestId('message-order').textContent?.split(',').filter((id) => id === 'old-message')).toHaveLength(1);
+    expect(conversationNavStackSpy.mock.lastCall?.[0]?.['transcriptPositioning']).toEqual(expect.objectContaining({ kind: 'idle' }));
+    expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.['mutationEnabled']).toBe(false);
+  });
+
+  it('does not retain a removed segment inside the authoritative refreshed tail range', async () => {
+    const { api } = await import('../api');
+    const activeClose = {
+      attempt_id: 'close-active',
+      phase: 'settling_active_work',
+      confirmation_snapshot: null,
+      inspections: [],
+      losses: [],
+      residuals: [],
+    } satisfies ProductConversationCloseView;
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot({
+        close: activeClose,
+        latest_transcript_row_id: 'row-stale',
+        writable_transcript_row_id: 'row-stale',
+        segments: [
+          {
+            segment_ordinal: 2,
+            transcript_row_id: 'row-2',
+            slug: 'row-2',
+            title: 'Second',
+            messages: [makeMessage('m-3', 3), makeMessage('m-4', 4)],
+            handoff: null,
+          },
+          {
+            segment_ordinal: 3,
+            transcript_row_id: 'row-stale',
+            slug: 'row-stale',
+            title: 'Removed',
+            messages: [makeMessage('stale-message', 5)],
+            handoff: null,
+          },
+        ],
+      }))
+      .mockResolvedValueOnce(makeSnapshot({
+        close: { ...activeClose, phase: 'awaiting_retirement_inspection' },
+        segments: [{
+          segment_ordinal: 2,
+          transcript_row_id: 'row-2',
+          slug: 'row-2',
+          title: 'Second',
+          messages: [makeMessage('m-3', 3), makeMessage('m-4', 4)],
+          handoff: null,
+        }],
+      }));
+    renderPage();
+    await waitForPageReady();
+
+    act(() => notifyCloseSnapshotChanged('pc-1', 'stream'));
+
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByTestId('message-order')).not.toHaveTextContent('stale-message'));
+    expect(screen.getByTestId('message-order')).toHaveTextContent('m-3,m-4');
+  });
+
+  it('does not preserve stale cached segments when the refreshed tail is empty', async () => {
+    const { api } = await import('../api');
+    const activeClose = {
+      attempt_id: 'close-active',
+      phase: 'settling_active_work',
+      confirmation_snapshot: null,
+      inspections: [],
+      losses: [],
+      residuals: [],
+    } satisfies ProductConversationCloseView;
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot({ close: activeClose }))
+      .mockResolvedValueOnce(makeSnapshot({
+        close: { ...activeClose, phase: 'awaiting_retirement_inspection' },
+        segments: [],
+      }));
+    renderPage();
+    await waitForPageReady();
+
+    act(() => notifyCloseSnapshotChanged('pc-1', 'stream'));
+
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByTestId('message-count')).toHaveTextContent('0'));
+  });
+
+  it('adopts a refreshed pagination boundary when no loaded prefix was retained', async () => {
+    const { api } = await import('../api');
+    const activeClose = {
+      attempt_id: 'close-active',
+      phase: 'settling_active_work',
+      confirmation_snapshot: null,
+      inspections: [],
+      losses: [],
+      residuals: [],
+    } satisfies ProductConversationCloseView;
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot({ close: activeClose, before: null, has_older: false }))
+      .mockResolvedValueOnce(makeSnapshot({
+        close: { ...activeClose, phase: 'awaiting_retirement_inspection' },
+        before: 'm-3',
+        has_older: true,
+      }));
+    renderPage();
+    await waitForPageReady();
+    expect(conversationNavStackSpy.mock.lastCall?.[0]?.['hasOlderMessages']).toBe(false);
+
+    act(() => notifyCloseSnapshotChanged('pc-1', 'stream'));
+
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.['hasOlderMessages']).toBe(true));
+  });
+
+  it('does not refetch an Open snapshot for ordinary state invalidations', async () => {
+    const { api } = await import('../api');
+    renderPage();
+    await waitForPageReady();
+
+    act(() => notifyCloseSnapshotChanged('row-2', 'stream'));
+    await act(async () => Promise.resolve());
+
+    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId('skeleton')).not.toBeInTheDocument();
+  });
+
+  it('discovers an explicitly-started Close while the loaded snapshot is Open', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot())
+      .mockResolvedValueOnce(makeSnapshot({
+        close: {
+          attempt_id: 'close-started-elsewhere',
+          phase: 'settling_active_work',
+          confirmation_snapshot: null,
+          inspections: [],
+          losses: [],
+          residuals: [],
+        },
+      }));
+    renderPage();
+    await waitForPageReady();
+
+    act(() => notifyCloseSnapshotChanged('row-2'));
+
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.['mutationEnabled']).toBe(false));
+  });
+
   it('keeps history snapshots read-only while retaining lineage recall', async () => {
     const { api } = await import('../api');
     vi.mocked(api.getProductConversationSnapshot).mockResolvedValueOnce(makeSnapshot({
@@ -775,6 +1055,11 @@ describe('ProductConversationPage', () => {
     expect(screen.getByTestId('chain-qa-column')).toBeInTheDocument();
     expect(screen.queryByTestId('embedded-conversation-page')).not.toBeInTheDocument();
     expect(screen.getByText('History is read-only.')).toBeInTheDocument();
+    expect(screen.getAllByText('History').length).toBeGreaterThan(0);
+    expect(screen.queryByText('history')).not.toBeInTheDocument();
+    expect(screen.getByRole('textbox', { name: 'recall draft' })).toBeDisabled();
+    expect(chainQaColumnSpy.mock.lastCall?.[0]?.['disabled']).toBe(true);
+    expect(chainQaColumnSpy.mock.lastCall?.[0]?.['onSubmit']).toBeUndefined();
   });
 
   it('keeps aggregate transcript viewer actions reachable while the aggregate route owns placement', async () => {
@@ -802,7 +1087,62 @@ describe('ProductConversationPage', () => {
     renderPage();
     await waitForPageReady();
 
-    expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.['ordinaryComposerEnabled']).toBe(true);
+    expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.['mutationEnabled']).toBe(true);
+  });
+
+  it('keeps an Open aggregate mutable after archived drift triggers a failed background refresh', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot({ ordinary_lifecycle: 'open' }))
+      .mockRejectedValueOnce(new Error('refresh failed'));
+    renderPage();
+    await waitForPageReady();
+
+    act(() => emitLatestProjection({ serverArchived: true }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('refresh failed');
+    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole('heading', { name: 'Product Alpha' })).toBeInTheDocument();
+    expect(screen.queryByText('Showing cached row if available.')).not.toBeInTheDocument();
+    expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.['mutationEnabled']).toBe(true);
+    expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.['aggregateLifecycleOpen']).toBe(true);
+  });
+
+  it('keeps a History aggregate read-only after a failed background refresh despite unarchived drift', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot({ ordinary_lifecycle: 'history' }))
+      .mockRejectedValueOnce(new Error('refresh failed'));
+    renderPage();
+    await waitForPageReady();
+
+    act(() => notifyCloseSnapshotChanged('row-2'));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('refresh failed');
+    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole('heading', { name: 'Product Alpha' })).toBeInTheDocument();
+    expect(screen.getByText('History is read-only.')).toBeInTheDocument();
+    expect(screen.queryByTestId('embedded-conversation-page')).not.toBeInTheDocument();
+    expect(screen.queryByText('Showing cached row if available.')).not.toBeInTheDocument();
+  });
+  it('gates task approval mutations behind liveControlsEnabled', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValueOnce(makeSnapshot({
+      close: {
+        attempt_id: 'attempt-1',
+        phase: 'settling_active_work',
+        inspections: [],
+        losses: [],
+        residuals: [],
+        confirmation_snapshot: null,
+      },
+    }));
+
+    renderPage();
+    await waitForPageReady();
+
+    expect(screen.queryByTestId('aggregate-task-approval-owner')).not.toBeInTheDocument();
+    expect(vi.mocked(api.approveTask)).not.toHaveBeenCalled();
   });
 
   it('retries older-page fetch once with a fresh tail cursor after a stale 400 cursor error', async () => {
@@ -839,6 +1179,45 @@ describe('ProductConversationPage', () => {
     await waitFor(() => {
       expect(conversationNavStackSpy.mock.lastCall?.[0]?.['transcriptPositioning']).toEqual(expect.objectContaining({ kind: 'idle' }));
     });
+  });
+
+  it('preserves multiple loaded pages through Close refresh and stale-cursor recovery', async () => {
+    const { api } = await import('../api');
+    const activeClose = {
+      attempt_id: 'close-active', phase: 'settling_active_work', confirmation_snapshot: null,
+      inspections: [], losses: [], residuals: [],
+    } satisfies ProductConversationCloseView;
+    const page = (id: string, ordinal: number, before: string | null, hasOlder: boolean) => makeSnapshot({
+      close: activeClose,
+      segments: [{ segment_ordinal: ordinal, transcript_row_id: `row-${id}`, slug: `row-${id}`, title: id, messages: [makeMessage(id, ordinal)], handoff: null }],
+      before,
+      has_older: hasOlder,
+    });
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot({ close: activeClose, before: 'cursor-1', has_older: true }))
+      .mockResolvedValueOnce(page('older-1', 0, 'cursor-0', true))
+      .mockResolvedValueOnce(page('older-0', -1, 'stale-cursor', true))
+      .mockResolvedValueOnce(makeSnapshot({ close: { ...activeClose, phase: 'awaiting_retirement_inspection' }, before: 'fresh-cursor', has_older: true }))
+      .mockRejectedValueOnce(new ApiResponseError('stale cursor', 400))
+      .mockResolvedValueOnce(makeSnapshot({ close: { ...activeClose, phase: 'awaiting_retirement_inspection' }, before: 'retry-cursor', has_older: true }))
+      .mockResolvedValueOnce(page('recovered', -2, null, false));
+
+    renderPage();
+    await waitForPageReady();
+    fireEvent.click(screen.getByRole('button', { name: 'load older' }));
+    await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent('older-1'));
+    fireEvent.click(screen.getByRole('button', { name: 'load older' }));
+    await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent('older-0'));
+    act(() => notifyCloseSnapshotChanged('pc-1', 'stream'));
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(4));
+    fireEvent.click(screen.getByRole('button', { name: 'load older' }));
+
+    const expected = 'recovered,older-0,older-1,m-1,m-2,product-handoff:pc-1:row-1:cont-1,m-3,m-4';
+    await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent(expected));
+    const ids = screen.getByTestId('message-order').textContent?.split(',') ?? [];
+    expect(new Set(ids).size).toBe(ids.length);
+    act(() => emitLatestProjection({ messages: [makeMessage('m-3', 3), makeMessage('m-4', 4)] as never }));
+    await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent(expected));
   });
 
   it('discards delayed older-page results after a new product route wins', async () => {
@@ -898,6 +1277,41 @@ describe('ProductConversationPage', () => {
 
     expect(screen.queryByText('stale A failure')).not.toBeInTheDocument();
     expect(conversationNavStackSpy.mock.lastCall?.[0]?.['loadingOlderMessages']).toBe(false);
+  });
+
+  it('ignores an old stream Close invalidation after a new product route wins', async () => {
+    const { api } = await import('../api');
+    const activeClose = {
+      attempt_id: 'close-active',
+      phase: 'settling_active_work',
+      confirmation_snapshot: null,
+      inspections: [],
+      losses: [],
+      residuals: [],
+    } satisfies ProductConversationCloseView;
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot({ close: activeClose }))
+      .mockResolvedValueOnce(makeSnapshot({
+        product_conversation_id: 'pc-2',
+        canonical_route: '/product-conversations/pc-2',
+        presentation: { kind: 'state', display_name: 'Product Beta', presentation_mode: 'idle' },
+        segments: [{ segment_ordinal: 1, transcript_row_id: 'row-b', slug: 'row-b', title: 'Beta', messages: [makeMessage('beta-message', 1, 'beta')], handoff: null }],
+        latest_transcript_row_id: 'row-b',
+        writable_transcript_row_id: 'row-b',
+        before: null,
+        has_older: false,
+      }));
+
+    renderPage('/product-conversations/pc-1', true);
+    await waitForPageReady();
+    fireEvent.click(screen.getByRole('button', { name: 'open second product' }));
+    await screen.findByRole('heading', { name: 'Product Beta' });
+    act(() => notifyCloseSnapshotChanged('row-2', 'stream'));
+    await act(async () => Promise.resolve());
+
+    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole('heading', { name: 'Product Beta' })).toBeInTheDocument();
+    expect(screen.getByTestId('message-order')).toHaveTextContent('beta-message');
   });
 
   it('threads restore basis, root directory, system prompt, and explicit absent work scope', async () => {

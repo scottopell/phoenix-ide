@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { cacheDB, PendingOperation } from '../cache';
-import { syncQueue } from '../syncQueue';
+import { processAndDeletePendingOperation } from '../syncQueue';
 import {
   transition,
   initialAppState,
@@ -52,8 +52,7 @@ export function useAppMachine() {
             let completed = 0;
             for (const op of pendingOps) {
               try {
-                await syncQueue.processOperation(op);
-                await cacheDB.deletePendingOp(op.id);
+                await processAndDeletePendingOperation(op);
                 completed++;
                 pendingOpsCountRef.current = Math.max(0, pendingOpsCountRef.current - 1);
                 setPendingOpsCount(prev => Math.max(0, prev - 1));

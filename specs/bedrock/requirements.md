@@ -1061,7 +1061,9 @@ AND SHALL NOT substitute a ProductConversation identity for a transcript-row ide
 AND SHALL require every durable conversation row to explicitly belong to exactly one ProductConversation
 AND SHALL distinguish parent transcript rows from subordinate execution participants within that aggregate
 AND SHALL derive root and latest parent transcript rows from the continuation topology within the ProductConversation rather than storing either as a second mutable aggregate authority
-AND SHALL keep provider prompt projection authority scoped to each current parent transcript row rather than deriving one flattened aggregate transcript
+AND SHALL make ProductConversation the authority for stable aggregate identity, aggregate membership, topology-derived canonical navigation, ordinary lifecycle, and aggregate presentation
+AND SHALL keep continuation-edge topology, message persistence, SSE publication, runtime and provider sessions, and generation-fenced prompt projection scoped to transcript members
+AND SHALL NOT create aggregate-native message persistence, SSE publication, or provider prompt projection as duplicate authority
 
 WHEN a parent transcript row has a continuation successor
 THE SYSTEM SHALL require that successor to be a parent transcript row in the same ProductConversation
@@ -1073,7 +1075,14 @@ AND THE SYSTEM SHALL model Open/History lifecycle for ordinary ProductConversati
 AND SHALL make Open/History lifecycle structurally inapplicable to coordinator ProductConversations rather than representing coordinator lifecycle as an optionally absent ordinary value
 AND SHALL expose ProductConversation lifecycle through one writable authority rather than parallel writable aggregate and transcript-row values
 
-**Rationale:** Aggregate identity, transcript membership, topology, and lifecycle are distinct facts. Keeping one authority for each prevents a transcript segment from becoming a second ProductConversation or lifecycle owner.
+WHEN persisted ordinary aggregate lifecycle disagrees with the latest parent transcript row's preserved legacy archived truth at compatibility upgrade
+THE SYSTEM SHALL reconcile every ordinary ProductConversation lifecycle from that preserved truth before aggregate lifecycle becomes reader authority
+AND SHALL preserve every ProductConversation, transcript member, message, and subordinate participant row during reconciliation
+AND SHALL leave coordinator lifecycle structurally inapplicable
+AND SHALL persist sealed Close participant capture time as a nonnegative INTEGER in an explicitly unit-named Unix-microseconds column under REQ-COMP-005
+AND SHALL preserve a durable cancel request across compatibility upgrade in its cancellation-settlement phase so recovery completes it with the cancelled outcome only after every owned authority releases
+
+**Rationale:** Aggregate identity, membership, navigation, lifecycle, and presentation are distinct from transcript-owned continuation edges and member execution authority. Keeping one authority for each prevents a transcript segment from becoming a second ProductConversation or lifecycle owner and prevents the aggregate from becoming a duplicate transcript, SSE, runtime, or provider-session authority.
 
 ---
 

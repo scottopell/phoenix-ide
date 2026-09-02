@@ -834,7 +834,7 @@ describe('Chain lifecycle UI (task 02701)', () => {
     }
   });
 
-  it('standalone row dropdown still shows Rename / Archive / Delete', () => {
+  it('standalone row dropdown shows Close without a legacy Archive action', () => {
     const { container } = render(
       <MemoryRouter>
         <ConversationList
@@ -850,7 +850,7 @@ describe('Chain lifecycle UI (task 02701)', () => {
         '.conv-item-actions .action-btn',
       ),
     ).map((b) => b.textContent?.trim());
-    expect(labels).toEqual(['Rename', 'Archive', 'Delete']);
+    expect(labels).toEqual(['Rename', 'Close', 'Delete']);
   });
 
   it('archived history title opens the retained compatibility route', () => {

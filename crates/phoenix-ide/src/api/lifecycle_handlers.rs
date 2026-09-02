@@ -91,11 +91,50 @@ async fn ensure_task_approval_authorized(
     }
 }
 
+async fn require_task_lifecycle_admission(
+    state: &AppState,
+    conversation_id: &str,
+) -> Result<(), AppError> {
+    match state
+        .runtime
+        .db()
+        .message_target_admission(conversation_id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+    {
+        phoenix_db::MessageTargetAdmission::Aggregate(
+            phoenix_db::ProductConversationAdmission::Accepted { .. },
+        )
+        | phoenix_db::MessageTargetAdmission::StandaloneAvailable => Ok(()),
+        phoenix_db::MessageTargetAdmission::Aggregate(
+            phoenix_db::ProductConversationAdmission::Refused(_),
+        ) => Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Close admission fence rejects task decision",
+            "close_admission_fenced",
+        )))),
+        phoenix_db::MessageTargetAdmission::Aggregate(
+            phoenix_db::ProductConversationAdmission::History(_),
+        )
+        | phoenix_db::MessageTargetAdmission::StandaloneArchived => {
+            Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                "Conversation is unavailable for task decisions",
+                "target_unavailable",
+            ))))
+        }
+    }
+}
+
 pub(crate) async fn approve_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
     body: Option<Json<TaskApprovalRequest>>,
 ) -> Result<Json<TaskApprovalResponse>, AppError> {
+    let admission = state
+        .runtime
+        .mutation_admission(&id)
+        .await
+        .map_err(super::handlers::map_admission_db_error)?;
+    let _admission_guard = admission.lock().await;
     // 1. Validate conversation exists and is in AwaitingTaskApproval state
     let conv = state
         .runtime
@@ -111,6 +150,7 @@ pub(crate) async fn approve_task(
     }
 
     ensure_task_approval_authorized(&state, &conv).await?;
+    require_task_lifecycle_admission(&state, &id).await?;
 
     let handoff = body.map(|Json(req)| req.handoff).unwrap_or_default();
     // 3. Dispatch approval event to state machine
@@ -135,6 +175,12 @@ pub(crate) async fn reject_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
+    let admission = state
+        .runtime
+        .mutation_admission(&id)
+        .await
+        .map_err(super::handlers::map_admission_db_error)?;
+    let _admission_guard = admission.lock().await;
     // Validate conversation exists and is in AwaitingTaskApproval state
     let conv = state
         .runtime
@@ -148,6 +194,8 @@ pub(crate) async fn reject_task(
             "Conversation is not awaiting task approval".to_string(),
         ));
     }
+
+    require_task_lifecycle_admission(&state, &id).await?;
 
     state
         .runtime
@@ -168,6 +216,12 @@ pub(crate) async fn task_feedback(
     Path(id): Path<String>,
     Json(req): Json<TaskFeedbackRequest>,
 ) -> Result<Json<SuccessResponse>, AppError> {
+    let admission = state
+        .runtime
+        .mutation_admission(&id)
+        .await
+        .map_err(super::handlers::map_admission_db_error)?;
+    let _admission_guard = admission.lock().await;
     // Validate conversation exists and is in AwaitingTaskApproval state
     let conv = state
         .runtime
@@ -181,6 +235,8 @@ pub(crate) async fn task_feedback(
             "Conversation is not awaiting task approval".to_string(),
         ));
     }
+
+    require_task_lifecycle_admission(&state, &id).await?;
 
     state
         .runtime
@@ -418,7 +474,11 @@ pub(crate) async fn confirm_close_stop_work(
     Path(id): Path<String>,
     Json(request): Json<ConfirmCloseStopWorkRequest>,
 ) -> Result<Json<SuccessResponse>, AppError> {
-    let admission = state.runtime.conversation_admission(&id).await;
+    let admission = state
+        .runtime
+        .mutation_admission(&id)
+        .await
+        .map_err(super::handlers::map_admission_db_error)?;
     let _guard = admission.lock().await;
     let transcript = state
         .db
@@ -507,7 +567,11 @@ pub(crate) async fn cancel_close_before_retirement(
     Path(id): Path<String>,
     Json(request): Json<CancelCloseBeforeRetirementRequest>,
 ) -> Result<Json<SuccessResponse>, AppError> {
-    let admission = state.runtime.conversation_admission(&id).await;
+    let admission = state
+        .runtime
+        .mutation_admission(&id)
+        .await
+        .map_err(super::handlers::map_admission_db_error)?;
     let _guard = admission.lock().await;
     let transcript = state
         .db
@@ -680,14 +744,17 @@ pub(crate) async fn retry_close_retirement(
 
 #[allow(clippy::too_many_lines, clippy::single_match_else)]
 async fn run_legacy_close_compat(state: &AppState, id: &str, action: &str) -> Result<(), AppError> {
-    use phoenix_core::domain::close::{CloseAttemptId, ClosePhase};
+    use phoenix_core::domain::close::{CloseAttemptId, CloseCompletionOutcome, ClosePhase};
 
     let transcript = state
         .db
         .get_conversation(id)
         .await
         .map_err(|error| AppError::NotFound(error.to_string()))?;
-    if transcript.conv_mode.worktree_path().is_none() {
+    if action != "archive"
+        && action != "archive chain"
+        && transcript.conv_mode.worktree_path().is_none()
+    {
         return Err(AppError::BadRequest(format!(
             "Conversation must own an allocated worktree to {action}"
         )));
@@ -717,6 +784,19 @@ async fn run_legacy_close_compat(state: &AppState, id: &str, action: &str) -> Re
     {
         Some(obligation) => obligation,
         None => {
+            if matches!(
+                state
+                    .db
+                    .product_conversation_admission(&transcript.id)
+                    .await
+                    .map_err(|error| AppError::Internal(error.to_string()))?,
+                phoenix_db::ProductConversationAdmission::History(_)
+            ) {
+                return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                    "ProductConversation is already in History",
+                    "close_already_history",
+                ))));
+            }
             let attempt_id = CloseAttemptId::parse(uuid::Uuid::new_v4().to_string())
                 .expect("UUID is a valid Close attempt id");
             state
@@ -860,7 +940,20 @@ async fn run_legacy_close_compat(state: &AppState, id: &str, action: &str) -> Re
                     "close_retirement_needs_repair",
                 ))));
             }
-            ClosePhase::Completed => return Ok(()),
+            ClosePhase::Completed => {
+                return match obligation.close_outcome() {
+                    Some(CloseCompletionOutcome::Archived) => Ok(()),
+                    Some(CloseCompletionOutcome::Cancelled) => {
+                        Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                            "Close was cancelled before archival completed",
+                            "close_cancelled",
+                        ))))
+                    }
+                    None => Err(AppError::Internal(
+                        "completed Close attempt has no terminal outcome".to_string(),
+                    )),
+                };
+            }
         };
     }
 }
@@ -877,7 +970,11 @@ pub(crate) async fn abandon_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
-    let admission = state.runtime.conversation_admission(&id).await;
+    let admission = state
+        .runtime
+        .mutation_admission(&id)
+        .await
+        .map_err(super::handlers::map_admission_db_error)?;
     let _admission = admission.lock().await;
     run_legacy_close_compat(&state, &id, "abandon").await?;
     Ok(Json(SuccessResponse { success: true }))
@@ -894,7 +991,11 @@ pub(crate) async fn mark_merged(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
-    let admission = state.runtime.conversation_admission(&id).await;
+    let admission = state
+        .runtime
+        .mutation_admission(&id)
+        .await
+        .map_err(super::handlers::map_admission_db_error)?;
     let _admission = admission.lock().await;
     run_legacy_close_compat(&state, &id, "mark as merged").await?;
     Ok(Json(SuccessResponse { success: true }))

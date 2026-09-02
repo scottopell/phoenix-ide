@@ -41,10 +41,22 @@ export function CommandPalette({ conversations, productConversations = [], activ
 
   // Extract current slug and active conversation
   const slugMatch = location.pathname.match(/^\/c\/(.+)$/);
+  const productMatch = location.pathname.match(/^\/product-conversations\/([^/]+)$/);
   const currentSlug = slugMatch?.[1] ?? null;
+  const activeProduct = productMatch
+    ? productConversations.find(row => row.product_conversation_id === productMatch[1])
+    : undefined;
 
   const activeConvId = activeConversation?.id ?? null;
-  const activeFileRoot = activeConversationFileRoot(activeConversation);
+  const activeProductConversation = activeProduct
+    ? conversations.find((conversation) => conversation.id === activeProduct.latest_transcript_row_id)
+      ?? (activeConversation?.id === activeProduct.latest_transcript_row_id ? activeConversation : undefined)
+    : undefined;
+  const activeFileRoot = activeProduct
+    ? (activeProduct.ordinary_lifecycle === 'open'
+      ? activeProductConversation?.worktree_path ?? activeProductConversation?.cwd ?? null
+      : null)
+    : activeConversationFileRoot(activeConversation);
 
   // Stable conversation ids string — only changes when the *set* of conversations changes.
   const conversationIdsKey = useMemo(
@@ -114,25 +126,43 @@ export function CommandPalette({ conversations, productConversations = [], activ
     () =>
       createBuiltInActions({
         navigate,
-        currentSlug,
-        archiveCurrent: currentSlug
+        currentSlug: currentSlug ?? activeProduct?.canonical_root.slug ?? null,
+        archiveCurrent: currentSlug || activeProduct?.ordinary_lifecycle === 'open'
           ? (() => {
-              const activeRoute = activeConvId ?? currentSlug;
-              const conv = conversations.find(c => c.id === activeRoute || c.slug === activeRoute);
-              if (!conv || computeChainRoots(conversations).get(conv.id) != null) return undefined;
+              const activeRoute = activeConvId ?? activeProduct?.latest_transcript_row_id ?? currentSlug;
+              const conv = conversations.find(c => c.id === activeRoute || c.slug === activeRoute)
+                ?? (activeConversation?.id === activeRoute || activeConversation?.slug === activeRoute
+                  ? activeConversation
+                  : undefined);
+              const targetId = conv?.id ?? activeProduct?.latest_transcript_row_id;
+              const isWritable = activeProduct
+                ? activeProduct.ordinary_lifecycle === 'open'
+                : conv?.archived !== true;
+              const chainMembers = conv && !conversations.some(candidate => candidate.id === conv.id)
+                ? [...conversations, conv]
+                : conversations;
+              const computedChainRootId = computeChainRoots(chainMembers).get(conv?.id ?? '');
+              const canonicalRootId = activeProduct?.canonical_root.transcript_row_id;
+              const chainRootId = canonicalRootId && canonicalRootId !== targetId
+                ? canonicalRootId
+                : computedChainRootId;
+              if (!targetId || !isWritable || (chainRootId != null && !activeProduct)) return undefined;
               return async () => {
                 try {
-                  await api.archiveConversation(conv.id);
+                  if (chainRootId != null) {
+                    await api.archiveChain(chainRootId);
+                  } else {
+                    await api.archiveConversation(targetId);
+                  }
                   navigate('/');
                 } catch (error) {
-                  notifyArchiveCloseConflict(conv.id, error);
-                  throw error;
+                  if (!notifyArchiveCloseConflict(targetId, error)) throw error;
                 }
               };
             })()
           : undefined,
       }),
-    [navigate, currentSlug, activeConvId, conversations],
+    [navigate, currentSlug, activeProduct, activeConvId, activeConversation, conversations],
   );
   const actionsRef = useRef(actions);
   useEffect(() => {

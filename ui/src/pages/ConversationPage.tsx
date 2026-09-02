@@ -185,6 +185,7 @@ export interface EmbeddedConversationProjection {
   pendingMessages: PendingUserMessage[];
   convState: ReturnType<typeof parseConversationState>;
   isArchived: boolean;
+  serverArchived: boolean;
   onRetryPending: (localId: string) => void;
   onCancelSteering: (localId: string) => void;
   onOpenFile: (filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void;
@@ -195,7 +196,8 @@ export interface EmbeddedConversationProjection {
 
 interface EmbeddedConversationHostProps {
   suppressCanonicalization?: boolean;
-  ordinaryComposerEnabled?: boolean;
+  mutationEnabled?: boolean;
+  aggregateLifecycleOpen?: boolean | undefined;
   suppressMessageViewerOwner?: boolean;
   suppressTaskApprovalOwner?: boolean;
   onProjectionChange?: (projection: EmbeddedConversationProjection | null) => void;
@@ -220,7 +222,8 @@ export function EmbeddedConversationPage({
   composerQuickAction,
   showTranscript = true,
   suppressCanonicalization = false,
-  ordinaryComposerEnabled = true,
+  mutationEnabled = true,
+  aggregateLifecycleOpen,
   onProjectionChange,
   suppressMessageViewerOwner = false,
   onCloseCompleted,
@@ -254,7 +257,8 @@ export function EmbeddedConversationPage({
         routePrefix={routePrefix}
         composerQuickAction={composerQuickAction}
         showTranscript={showTranscript}
-        ordinaryComposerEnabled={ordinaryComposerEnabled}
+        mutationEnabled={mutationEnabled}
+        aggregateLifecycleOpen={aggregateLifecycleOpen}
         suppressCanonicalization={suppressCanonicalization}
         suppressMessageViewerOwner={suppressMessageViewerOwner}
         suppressTaskApprovalOwner={suppressTaskApprovalOwner}
@@ -286,7 +290,8 @@ function ConversationPageContent({
   routePrefix,
   composerQuickAction,
   showTranscript,
-  ordinaryComposerEnabled,
+  mutationEnabled,
+  aggregateLifecycleOpen,
   suppressCanonicalization,
   onProjectionChange,
   suppressMessageViewerOwner,
@@ -297,7 +302,8 @@ function ConversationPageContent({
   routePrefix: '/c' | '/global';
   composerQuickAction?: ComposerQuickAction | undefined;
   showTranscript: boolean;
-  ordinaryComposerEnabled: boolean;
+  mutationEnabled: boolean;
+  aggregateLifecycleOpen?: boolean | undefined;
   suppressCanonicalization: boolean;
   onProjectionChange?: (projection: EmbeddedConversationProjection | null) => void;
   suppressMessageViewerOwner: boolean;
@@ -330,8 +336,18 @@ function ConversationPageContent({
   const archiveStatusConfirmed =
     conversationId !== undefined && archiveStatusConfirmedConversationId === conversationId;
   const serverArchived = conversation?.archived === true;
-  const isArchived = serverArchived || !archiveStatusConfirmed;
-  const confirmedLive = !!conversationId && archiveStatusConfirmed && !serverArchived;
+  const isArchived = aggregateLifecycleOpen === undefined
+    ? serverArchived || !archiveStatusConfirmed
+    : !aggregateLifecycleOpen;
+  const terminallyUnavailable = aggregateLifecycleOpen === undefined
+    ? serverArchived
+    : !aggregateLifecycleOpen;
+  const confirmedLive = !!conversationId && (
+    aggregateLifecycleOpen === undefined
+      ? archiveStatusConfirmed && !serverArchived
+      : aggregateLifecycleOpen
+  );
+  const readOnly = !mutationEnabled;
   const prStatusHandle = useConversationPrStatus({
     conversationId: confirmedLive ? conversationId : undefined,
     convModeLabel: conversation?.conv_mode_label,
@@ -697,9 +713,9 @@ function ConversationPageContent({
     () => deriveDisplayedPendingMessages(
       localPendingMessages,
       atom.steeringMessages,
-      atom.conversation?.archived === true,
+      terminallyUnavailable,
     ),
-    [atom.conversation?.archived, atom.steeringMessages, localPendingMessages],
+    [atom.steeringMessages, localPendingMessages, terminallyUnavailable],
   );
 
   const viewableMessages = atom.messages;
@@ -1342,7 +1358,7 @@ function ConversationPageContent({
   useEffect(() => { sendMessageRef.current = sendMessage; }, [sendMessage]);
 
   useEffect(() => {
-    if (!serverArchived) return;
+    if (!terminallyUnavailable) return;
     for (const msg of localPendingMessages) {
       dismiss(msg.localId);
     }
@@ -1351,7 +1367,7 @@ function ConversationPageContent({
         console.error('Failed to drop archived pending operations:', err);
       });
     }
-  }, [serverArchived, conversationId, localPendingMessages, dismiss, removePendingOperations]);
+  }, [terminallyUnavailable, conversationId, localPendingMessages, dismiss, removePendingOperations]);
 
   // Send queued messages when connection is restored. Iterate the derived
   // `pendingMessages` (NOT raw `queuedMessages`) so we don't re-POST entries
@@ -1764,6 +1780,7 @@ function ConversationPageContent({
       pendingMessages,
       convState: convStateForChildren,
       isArchived,
+      serverArchived,
       onRetryPending: handleRetry,
       onCancelSteering: handleCancelSteering,
       onOpenFile: handleOpenFileFromPatch,
@@ -1784,6 +1801,7 @@ function ConversationPageContent({
     convStateForChildren,
     isArchived,
     handleRetry,
+    serverArchived,
     handleCancelSteering,
     handleOpenFileFromPatch,
     conversation?.worktree_path,
@@ -2211,7 +2229,7 @@ function ConversationPageContent({
             pendingMessages={pendingMessages}
             convState={convStateForChildren}
             onRetry={handleRetry}
-            onCancelSteering={isArchived ? undefined : handleCancelSteering}
+            onCancelSteering={readOnly || isArchived ? undefined : handleCancelSteering}
             onOpenFile={isArchived ? undefined : handleOpenFileFromPatch}
             filePathRootDir={conversation.worktree_path ?? conversation.cwd ?? '/'}
             workScopeKey={isArchived ? undefined : conversation.work_scope_key}
@@ -2403,11 +2421,12 @@ function ConversationPageContent({
         </div>
       )}
       {!isArchived && <WorkControlBar
+        mutationEnabled={mutationEnabled}
         conversationId={conversation.id}
         convModeLabel={conversation.conv_mode_label}
         phaseType={convStateForChildren.type}
         continuedInConvId={conversation.continued_in_conv_id}
-        {...(ordinaryComposerEnabled && ordinaryComposerEligible ? { onSendMessage: handleSendTextOnly } : {})}
+        {...(mutationEnabled && ordinaryComposerEligible ? { onSendMessage: handleSendTextOnly } : {})}
         showError={showError}
         prStatusHandle={prStatusHandle}
         {...(onCloseCompleted ? { onCloseCompleted } : {})}
@@ -2452,8 +2471,8 @@ function ConversationPageContent({
         <ErrorBanner
           message={convStateForChildren.message}
           error={convStateForChildren.error}
-          onRetry={isArchived ? undefined : () => handleSend('continue', [])}
-          onDismiss={isArchived ? undefined : () => {
+          onRetry={readOnly || isArchived ? undefined : () => handleSend('continue', [])}
+          onDismiss={readOnly || isArchived ? undefined : () => {
             // No optimistic idle: `dismissError` resolves on enqueue, not on
             // persist, so faking idle could diverge if the executor races/
             // rejects. The server-broadcast state_change SSE drives idle.
@@ -2467,7 +2486,7 @@ function ConversationPageContent({
             banner's quick "retry/continue" so the user is not forced into the
             canned "continue" turn. Gated on can_user_resume to match the
             banner: a non-resumable error stays a dead end. */}
-        {(convStateForChildren.error?.can_user_resume ?? false) && !isArchived && (
+        {(convStateForChildren.error?.can_user_resume ?? false) && !isArchived && mutationEnabled && (
           <RenderProfiler id="InputArea">
           <ConnectedInputArea
             ref={inputRef}
@@ -2487,8 +2506,10 @@ function ConversationPageContent({
             onSend={handleSend}
             onCancel={handleCancel}
             onRetry={handleRetry}
-            onDismissError={dismiss}
-          />
+          onDismissError={dismiss}
+          readOnly={readOnly}
+        />
+
           </RenderProfiler>
         )}
         </>
@@ -2497,11 +2518,11 @@ function ConversationPageContent({
           questions={convStateForChildren.questions}
           conversationId={conversation.id}
           showToast={showInfo}
-          readOnly={isArchived}
+          readOnly={readOnly || isArchived}
           onAnswered={() => dispatch({ type: 'local_phase_change', phase: { type: 'llm_requesting', attempt: 1 }, expectedConversationId: conversation.id })}
           onDismissed={() => dispatch({ type: 'local_phase_change', phase: { type: 'idle' }, expectedConversationId: conversation.id })}
         />
-      ) : ordinaryComposerEnabled && ordinaryComposerEligible ? (
+      ) : mutationEnabled && ordinaryComposerEligible ? (
         <>
         {credentialStatus && credentialStatus !== 'not_configured' && credentialStatus !== 'valid' && (
           <Suspense fallback={null}>

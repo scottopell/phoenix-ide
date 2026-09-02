@@ -45,6 +45,7 @@ import {
   type ChainMemberSummary,
   type ChainSseEventData,
 } from '../api';
+import { notifyArchiveCloseConflict } from '../notifications';
 import { ChainDeleteConfirm } from '../components/ChainDeleteConfirm';
 import { WorkScopePanel } from '../components/WorkScopePanel';
 import { ChainWorkIdentityBlock } from '../components/ChainWorkIdentityBlock';
@@ -445,10 +446,11 @@ export function ChainPage() {
             await api.archiveChain(rootConvId);
             navigate('/');
           } catch (err) {
-            dispatch({
-              type: 'LOAD_FAIL',
-              error: err instanceof Error ? err.message : 'Failed to archive chain',
-            });
+            if (notifyArchiveCloseConflict(rootConvId, err)) {
+              navigate(`/c/${encodeURIComponent(rootConvId)}`);
+            } else {
+              showError(err instanceof Error ? err.message : 'Failed to archive chain');
+            }
           }
         }}
         onDelete={() => setDeleteConfirmOpen(true)}
@@ -846,6 +848,7 @@ interface ChainQaColumnProps {
   onReask: (question: string) => void;
   activeTextareaRef: React.RefObject<HTMLTextAreaElement>;
   onRetryConnection: () => void;
+  disabled?: boolean;
 }
 
 export function ChainQaColumn({
@@ -860,6 +863,7 @@ export function ChainQaColumn({
   onReask,
   activeTextareaRef,
   onRetryConnection,
+  disabled = false,
 }: ChainQaColumnProps) {
   return (
     <section className="chain-qa" aria-label="Chain questions and answers">
@@ -871,6 +875,7 @@ export function ChainQaColumn({
               draft={draft}
               setDraft={setDraft}
               submitting={submitting}
+              disabled={disabled}
               {...(onSubmit ? { onSubmit } : {})}
               activeTextareaRef={activeTextareaRef}
             />
@@ -880,7 +885,7 @@ export function ChainQaColumn({
               <ChainQaPairCard
                 variant={entry.error ? 'inflight-failed' : 'inflight-streaming'}
                 inflightEntry={entry}
-                onReask={onReask}
+                {...(!disabled ? { onReask } : {})}
               />
             </li>
           ))}
@@ -890,7 +895,7 @@ export function ChainQaColumn({
                 variant="persisted"
                 row={row}
                 chain={chain}
-                onReask={onReask}
+                {...(!disabled ? { onReask } : {})}
               />
             </li>
           ))}
@@ -940,6 +945,7 @@ interface ChainQaPairCardProps {
   draft?: string;
   setDraft?: (s: string) => void;
   submitting?: boolean;
+  disabled?: boolean;
   onSubmit?: (e: FormEvent<HTMLFormElement>) => void;
   activeTextareaRef?: React.RefObject<HTMLTextAreaElement>;
   // inflight variants
@@ -965,6 +971,7 @@ function ActivePairCard({
   draft = '',
   setDraft = () => {},
   submitting = false,
+  disabled = false,
   onSubmit,
   activeTextareaRef,
 }: ChainQaPairCardProps) {
@@ -975,7 +982,7 @@ function ActivePairCard({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const canSubmit = draft.trim().length > 0 && !submitting && !!onSubmit;
+  const canSubmit = draft.trim().length > 0 && !submitting && !disabled && !!onSubmit;
 
   return (
     <article className="chain-qa-pair chain-qa-pair--active">
@@ -987,6 +994,7 @@ function ActivePairCard({
               ref={activeTextareaRef}
               className="chain-qa-input"
               value={draft}
+              disabled={disabled}
               onChange={(e) => setDraft(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && !e.shiftKey) {

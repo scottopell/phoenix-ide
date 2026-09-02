@@ -490,6 +490,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "enforce_monotonic_message_sequences",
         sql: MIGRATION_094,
     },
+    Migration {
+        version: 95,
+        name: "reconcile_product_lifecycle_cutover",
+        sql: MIGRATION_095,
+    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -7924,7 +7929,729 @@ mod migration_094_tests {
             .is_err());
         }
     }
+
+    #[test]
+    fn lifecycle_cutover_preserves_timestamp_contract() {
+        assert!(super::MIGRATION_095.contains("captured_at_unix_micros INTEGER NOT NULL"));
+        assert!(super::MIGRATION_095.contains("CHECK (captured_at_unix_micros >= 0)"));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_cutover_resets_settlement_but_preserves_cancellation_for_recovery() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE close_obligations (
+                 attempt_id TEXT PRIMARY KEY, phase TEXT NOT NULL, updated_at TEXT NOT NULL
+             );
+             CREATE TABLE close_attempt_participants (
+                 attempt_id TEXT NOT NULL, conversation_id TEXT NOT NULL
+             );
+             CREATE TABLE durable_turns (
+                 turn_id INTEGER PRIMARY KEY, conversation_id TEXT NOT NULL,
+                 generation INTEGER NOT NULL, owns_conversation INTEGER NOT NULL,
+                 terminal_kind TEXT
+             );
+             CREATE TABLE close_attempt_direct_turn_settlement_captures (
+                 attempt_id TEXT PRIMARY KEY, captured_at TEXT NOT NULL
+             );
+             CREATE TABLE close_attempt_direct_turn_settlements (
+                 attempt_id TEXT NOT NULL, turn_id INTEGER NOT NULL,
+                 expected_generation INTEGER NOT NULL,
+                 PRIMARY KEY (attempt_id, turn_id)
+             );
+             INSERT INTO close_obligations VALUES
+                 ('settling', 'settling_active_work', 'settling-time'),
+                 ('cancelling', 'cancel_requested_during_settlement', 'cancelling-time');
+             INSERT INTO close_attempt_participants VALUES
+                 ('settling', 'settling-conv'), ('cancelling', 'cancelling-conv');
+             INSERT INTO durable_turns VALUES
+                 (11, 'settling-conv', 4, 1, NULL),
+                 (12, 'cancelling-conv', 7, 1, NULL);
+             INSERT INTO close_attempt_direct_turn_settlement_captures VALUES
+                 ('settling', 'stale-settling-time');
+             INSERT INTO close_attempt_direct_turn_settlements VALUES
+                 ('settling', 11, 3);
+             DELETE FROM close_attempt_direct_turn_settlements
+             WHERE attempt_id IN (
+                 SELECT attempt_id FROM close_obligations WHERE phase = 'settling_active_work'
+             );
+             DELETE FROM close_attempt_direct_turn_settlement_captures
+             WHERE attempt_id IN (
+                 SELECT attempt_id FROM close_obligations WHERE phase = 'settling_active_work'
+             );
+             UPDATE close_obligations
+             SET phase = 'awaiting_stop_work_confirmation', updated_at = 'cutover-time'
+             WHERE phase = 'settling_active_work';
+             INSERT OR IGNORE INTO close_attempt_direct_turn_settlement_captures (
+                 attempt_id, captured_at
+             )
+             SELECT obligation.attempt_id, obligation.updated_at
+             FROM close_obligations obligation
+             WHERE obligation.phase = 'cancel_requested_during_settlement';
+             INSERT OR IGNORE INTO close_attempt_direct_turn_settlements (
+                 attempt_id, turn_id, expected_generation
+             )
+             SELECT obligation.attempt_id, turn.turn_id, turn.generation
+             FROM close_obligations obligation
+             JOIN close_attempt_participants participant
+               ON participant.attempt_id = obligation.attempt_id
+             JOIN durable_turns turn ON turn.conversation_id = participant.conversation_id
+             WHERE obligation.phase = 'cancel_requested_during_settlement'
+               AND turn.owns_conversation = 1 AND turn.terminal_kind IS NULL;",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let phases = sqlx::query_as::<_, (String, String)>(
+            "SELECT attempt_id, phase FROM close_obligations ORDER BY attempt_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            phases,
+            vec![
+                (
+                    "cancelling".into(),
+                    "cancel_requested_during_settlement".into()
+                ),
+                ("settling".into(), "awaiting_stop_work_confirmation".into()),
+            ]
+        );
+        let captures = sqlx::query_as::<_, (String, String)>(
+            "SELECT attempt_id, captured_at FROM close_attempt_direct_turn_settlement_captures ORDER BY attempt_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            captures,
+            vec![("cancelling".into(), "cancelling-time".into())]
+        );
+        let targets = sqlx::query_as::<_, (String, i64, i64)>(
+            "SELECT attempt_id, turn_id, expected_generation FROM close_attempt_direct_turn_settlements ORDER BY attempt_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(targets, vec![("cancelling".into(), 12, 7)]);
+    }
+
+    #[test]
+    fn participant_snapshot_upgrade_captures_active_subordinates_and_cascades_delete() {
+        assert!(super::MIGRATION_095.contains("WHERE obligation.phase <> 'completed'"));
+        assert!(super::MIGRATION_095.contains("FOREIGN KEY (attempt_id, product_conversation_id)"));
+        assert!(super::MIGRATION_095
+            .contains("close participant must belong to the attempted ProductConversation"));
+        assert!(super::MIGRATION_095.contains("CHECK (settlement_state IN ('live', 'deleted'))"));
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn lifecycle_cutover_reconciles_released_drift_without_dropping_rows() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE product_conversations (
+                 id TEXT PRIMARY KEY, kind TEXT NOT NULL, ordinary_lifecycle TEXT
+             );
+             CREATE TABLE conversations (
+                 id TEXT PRIMARY KEY, product_conversation_id TEXT, runtime_role TEXT,
+                 parent_conversation_id TEXT, continued_in_conv_id TEXT, archived INTEGER,
+                 created_at TEXT NOT NULL
+             );
+             CREATE TABLE product_creation_jobs (
+                 request_id TEXT PRIMARY KEY, published_product_id TEXT, status TEXT NOT NULL,
+                 last_error TEXT, delivery_retry_at_unix_micros INTEGER,
+                 claim_worker_id TEXT, claim_token TEXT, claim_lease_until_unix_micros INTEGER
+             );
+             CREATE TABLE close_obligations (
+                 product_conversation_id TEXT, phase TEXT NOT NULL, close_outcome TEXT
+             );
+             CREATE TABLE workflows (
+                 workflow_id INTEGER PRIMARY KEY, profile_kind TEXT NOT NULL,
+                 version INTEGER NOT NULL, generation INTEGER NOT NULL,
+                 status TEXT NOT NULL, updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE workflow_transitions (
+                 workflow_id INTEGER NOT NULL, transition_id INTEGER NOT NULL,
+                 from_version INTEGER NOT NULL, to_version INTEGER NOT NULL,
+                 generation INTEGER NOT NULL, event_codec_family TEXT NOT NULL,
+                 event_codec_version INTEGER NOT NULL, event_payload BLOB NOT NULL,
+                 committed_at INTEGER NOT NULL,
+                 PRIMARY KEY (workflow_id, transition_id),
+                 UNIQUE (workflow_id, to_version),
+                 CHECK (to_version = from_version + 1)
+             );
+             CREATE TABLE workflow_effects (
+                 workflow_id INTEGER NOT NULL, effect_id INTEGER NOT NULL,
+                 status TEXT NOT NULL, next_eligible_at INTEGER,
+                 generation INTEGER NOT NULL, pending_reconciliation INTEGER NOT NULL,
+                 PRIMARY KEY (workflow_id, effect_id)
+             );
+             CREATE TABLE durable_turns (
+                 turn_id INTEGER PRIMARY KEY, workflow_id INTEGER NOT NULL UNIQUE,
+                 conversation_id TEXT NOT NULL,
+                 disposition TEXT NOT NULL CHECK (disposition IN ('Runtime', 'Steering')),
+                 terminal_kind TEXT, terminal_reason TEXT, generation INTEGER NOT NULL,
+                 owns_conversation INTEGER NOT NULL,
+                 canonical_message_id TEXT,
+                 CHECK (terminal_kind = 'Failed' OR terminal_reason IS NULL)
+             );",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO product_conversations VALUES
+                 ('open-product', 'ordinary', 'history'),
+                 ('history-product', 'ordinary', 'open'),
+                 ('delivery-pending-product', 'ordinary', 'history'),
+                 ('delivery-failed-product', 'ordinary', 'history'),
+                 ('published-history-product', 'ordinary', 'open'),
+                 ('coordinator', 'coordinator', NULL);
+             INSERT INTO conversations VALUES
+                 ('a-open-leaf', 'open-product', 'user', NULL, NULL, 0, '2026-01-02'),
+                 ('z-open-predecessor', 'open-product', 'user', NULL, 'a-open-leaf', 1, '2026-01-01'),
+                 ('history-row', 'history-product', 'user', NULL, NULL, 1, '2026-01-01'),
+                 ('subordinate', 'history-product', 'sub_agent', 'history-row', NULL, 0, '2026-01-01'),
+                 ('delivery-pending-row', 'delivery-pending-product', 'user', NULL, NULL, 1, '2026-01-01'),
+                 ('delivery-failed-row', 'delivery-failed-product', 'user', NULL, NULL, 1, '2026-01-01'),
+                 ('published-history-row', 'published-history-product', 'user', NULL, NULL, 1, '2026-01-01'),
+                 ('coordinator-row', 'coordinator', 'coordinator', NULL, NULL, 0, '2026-01-01');
+             INSERT INTO product_creation_jobs VALUES
+                 ('pending-request', 'delivery-pending-product', 'delivery_pending', NULL, 100, 'worker', 'token', 200),
+                 ('failed-request', 'delivery-failed-product', 'delivery_failed', 'transient', NULL, NULL, NULL, NULL),
+                 ('published-request', 'published-history-product', 'published', NULL, NULL, NULL, NULL, NULL);
+             INSERT INTO close_obligations VALUES
+                 ('delivery-pending-product', 'completed', 'archived');
+             INSERT INTO workflows VALUES
+                 (11, 'direct_turn', 2, 7, 'Active', 100),
+                 (12, 'wake', 2, 7, 'Active', 100),
+                 (13, 'direct_turn', 2, 7, 'Active', 100);
+             INSERT INTO workflow_transitions VALUES
+                 (11, 1, 0, 1, 0, 'direct_turn.event', 1, X'01', 90),
+                 (12, 1, 0, 1, 0, 'wake.event', 1, X'01', 90),
+                 (13, 1, 0, 1, 0, 'direct_turn.event', 1, X'01', 90);
+             INSERT INTO workflow_effects VALUES
+                 (11, 1, 'Eligible', 200, 7, 1),
+                 (12, 1, 'Eligible', 200, 7, 1),
+                 (13, 1, 'Eligible', 200, 7, 1);
+             INSERT INTO durable_turns VALUES
+                 (1, 11, 'history-row', 'Runtime', NULL, NULL, 7, 1, NULL),
+                 (2, 12, 'subordinate', 'Runtime', NULL, NULL, 7, 1, NULL),
+                 (3, 13, 'z-open-predecessor', 'Runtime', NULL, NULL, 7, 1, NULL);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(
+            "CREATE TEMP TABLE migration_095_cancelled_direct_turns AS
+             SELECT turn.turn_id, turn.workflow_id, workflow.generation + 1 AS next_generation,
+                    workflow.version AS from_version, workflow.updated_at AS committed_at
+             FROM durable_turns turn
+             JOIN workflows workflow ON workflow.workflow_id = turn.workflow_id
+             JOIN conversations member ON member.id = turn.conversation_id
+             JOIN product_conversations product ON product.id = member.product_conversation_id
+             WHERE turn.terminal_kind IS NULL AND turn.canonical_message_id IS NULL
+               AND workflow.profile_kind = 'direct_turn'
+               AND workflow.status NOT IN ('Cancelled', 'Completed', 'Failed', 'Deleted')
+               AND product.kind = 'ordinary' AND (
+                 NOT EXISTS (
+                   SELECT 1 FROM conversations latest
+                   WHERE latest.product_conversation_id = product.id
+                     AND latest.runtime_role = 'user'
+                     AND latest.parent_conversation_id IS NULL
+                     AND latest.continued_in_conv_id IS NULL
+                     AND latest.archived = 0
+                 ) OR (
+                   member.runtime_role = 'user'
+                   AND member.parent_conversation_id IS NULL
+                   AND member.id <> (
+                     SELECT latest.id FROM conversations latest
+                     WHERE latest.product_conversation_id = product.id
+                       AND latest.runtime_role = 'user'
+                       AND latest.parent_conversation_id IS NULL
+                       AND latest.continued_in_conv_id IS NULL
+                       AND latest.archived = 0
+                     ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1
+                   )
+                 )
+               );
+             INSERT INTO workflow_transitions (
+                 workflow_id, transition_id, from_version, to_version, generation,
+                 event_codec_family, event_codec_version, event_payload, committed_at
+             )
+             SELECT workflow_id, 3, from_version, from_version + 1, next_generation,
+                    'direct_turn.event', 1,
+                    X'7b225465726d696e616c223a7b227465726d696e616c223a2243616e63656c6c6564227d7d',
+                    committed_at + 1
+             FROM migration_095_cancelled_direct_turns;
+             UPDATE workflow_effects
+             SET status = 'Invalidated', next_eligible_at = NULL,
+                 generation = generation + 1, pending_reconciliation = 0
+             WHERE workflow_id IN (SELECT workflow_id FROM migration_095_cancelled_direct_turns)
+               AND status NOT IN ('Receipted', 'Invalidated');
+             UPDATE durable_turns
+             SET terminal_kind = 'Cancelled', terminal_reason = NULL,
+                 generation = (
+                     SELECT next_generation FROM migration_095_cancelled_direct_turns cancelled
+                     WHERE cancelled.turn_id = durable_turns.turn_id
+                 ),
+                 owns_conversation = 0
+             WHERE turn_id IN (SELECT turn_id FROM migration_095_cancelled_direct_turns);
+             UPDATE workflows
+             SET status = 'Cancelled', generation = (
+                     SELECT next_generation FROM migration_095_cancelled_direct_turns cancelled
+                     WHERE cancelled.workflow_id = workflows.workflow_id
+                 ), version = version + 1, updated_at = updated_at + 1
+             WHERE workflow_id IN (SELECT workflow_id FROM migration_095_cancelled_direct_turns);
+             DROP TABLE migration_095_cancelled_direct_turns;",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "UPDATE product_creation_jobs
+             SET status = 'delivery_failed', last_error = 'completed_close_won_cutover',
+                 delivery_retry_at_unix_micros = NULL,
+                 claim_worker_id = NULL, claim_token = NULL, claim_lease_until_unix_micros = NULL
+             WHERE status = 'delivery_pending'
+               AND published_product_id IN (
+                 SELECT obligation.product_conversation_id FROM close_obligations obligation
+                 WHERE obligation.phase = 'completed' AND obligation.close_outcome = 'archived'
+                   AND NOT EXISTS (
+                     SELECT 1 FROM conversations latest
+                     WHERE latest.product_conversation_id = obligation.product_conversation_id
+                       AND latest.runtime_role = 'user'
+                       AND latest.parent_conversation_id IS NULL
+                       AND latest.continued_in_conv_id IS NULL
+                       AND latest.archived = 0
+                   )
+               )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let creation_jobs = sqlx::query_as::<_, (String, String, Option<String>)>(
+            "SELECT request_id, status, last_error FROM product_creation_jobs ORDER BY request_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            creation_jobs,
+            vec![
+                (
+                    "failed-request".into(),
+                    "delivery_failed".into(),
+                    Some("transient".into())
+                ),
+                (
+                    "pending-request".into(),
+                    "delivery_failed".into(),
+                    Some("completed_close_won_cutover".into())
+                ),
+                ("published-request".into(), "published".into(), None),
+            ]
+        );
+
+        sqlx::query(
+            "UPDATE product_conversations
+             SET ordinary_lifecycle = CASE WHEN EXISTS (
+                 SELECT 1 FROM conversations latest
+                 WHERE latest.product_conversation_id = product_conversations.id
+                   AND latest.runtime_role = 'user'
+                   AND latest.parent_conversation_id IS NULL
+                   AND latest.continued_in_conv_id IS NULL
+                   AND latest.archived = 0
+             ) OR EXISTS (
+                 SELECT 1 FROM product_creation_jobs job
+                 WHERE job.published_product_id = product_conversations.id
+                   AND job.status IN ('delivery_pending', 'delivery_failed')
+                   AND NOT EXISTS (
+                     SELECT 1 FROM close_obligations obligation
+                     WHERE obligation.product_conversation_id = product_conversations.id
+                       AND obligation.phase = 'completed'
+                       AND obligation.close_outcome = 'archived'
+                       AND NOT EXISTS (
+                         SELECT 1 FROM conversations latest
+                         WHERE latest.product_conversation_id = product_conversations.id
+                           AND latest.runtime_role = 'user'
+                           AND latest.parent_conversation_id IS NULL
+                           AND latest.continued_in_conv_id IS NULL
+                           AND latest.archived = 0
+                       )
+                   )
+             ) THEN 'open' ELSE 'history' END
+             WHERE kind = 'ordinary'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let products = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT id, ordinary_lifecycle FROM product_conversations ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            products,
+            vec![
+                ("coordinator".into(), None),
+                ("delivery-failed-product".into(), Some("open".into())),
+                ("delivery-pending-product".into(), Some("history".into())),
+                ("history-product".into(), Some("history".into())),
+                ("open-product".into(), Some("open".into())),
+                ("published-history-product".into(), Some("history".into())),
+            ]
+        );
+        let turn: (String, String, Option<String>, i64, i64) = sqlx::query_as(
+            "SELECT disposition, terminal_kind, terminal_reason, generation, owns_conversation
+             FROM durable_turns WHERE turn_id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(turn, ("Runtime".into(), "Cancelled".into(), None, 8, 0));
+        let untouched_wake_turn: (Option<String>, i64, i64) = sqlx::query_as(
+            "SELECT terminal_kind, generation, owns_conversation FROM durable_turns WHERE turn_id = 2",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(untouched_wake_turn, (None, 7, 1));
+        let workflow: (String, i64, i64, i64) = sqlx::query_as(
+            "SELECT status, version, generation, updated_at FROM workflows WHERE workflow_id = 11",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(workflow, ("Cancelled".into(), 3, 8, 101));
+        let transition: (i64, i64, i64, String, i64, Vec<u8>, i64) = sqlx::query_as(
+            "SELECT from_version, to_version, generation, event_codec_family,
+                    event_codec_version, event_payload, committed_at
+             FROM workflow_transitions WHERE workflow_id = 11 AND transition_id = 3",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(transition.0, 2);
+        assert_eq!(transition.1, 3);
+        assert_eq!(transition.2, 8);
+        assert_eq!(transition.3, "direct_turn.event");
+        assert_eq!(transition.4, 1);
+        assert_eq!(transition.5, br#"{"Terminal":{"terminal":"Cancelled"}}"#);
+        assert_eq!(transition.6, 101);
+        let effect: (String, Option<i64>, i64, i64) = sqlx::query_as(
+            "SELECT status, next_eligible_at, generation, pending_reconciliation
+             FROM workflow_effects WHERE workflow_id = 11 AND effect_id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(effect, ("Invalidated".into(), None, 8, 0));
+        let predecessor_turn: (Option<String>, i64, i64) = sqlx::query_as(
+            "SELECT terminal_kind, generation, owns_conversation FROM durable_turns WHERE turn_id = 3",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(predecessor_turn, (Some("Cancelled".into()), 8, 0));
+        let predecessor_workflow: (String, i64, i64) = sqlx::query_as(
+            "SELECT status, version, generation FROM workflows WHERE workflow_id = 13",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(predecessor_workflow, ("Cancelled".into(), 3, 8));
+        let predecessor_effect: (String, Option<i64>, i64, i64) = sqlx::query_as(
+            "SELECT status, next_eligible_at, generation, pending_reconciliation
+             FROM workflow_effects WHERE workflow_id = 13 AND effect_id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(predecessor_effect, ("Invalidated".into(), None, 8, 0));
+        let wake_workflow: (String, i64, i64) = sqlx::query_as(
+            "SELECT status, version, generation FROM workflows WHERE workflow_id = 12",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(wake_workflow, ("Active".into(), 2, 7));
+
+        let row_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row_count, 8);
+    }
 }
+
+const MIGRATION_095: &str = r"
+CREATE UNIQUE INDEX close_obligations_attempt_product_identity
+ON close_obligations(attempt_id, product_conversation_id);
+CREATE UNIQUE INDEX conversations_member_product_identity
+ON conversations(id, product_conversation_id);
+CREATE TABLE close_attempt_participants (
+    attempt_id TEXT NOT NULL,
+    product_conversation_id TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    settlement_state TEXT NOT NULL DEFAULT 'live'
+        CHECK (settlement_state IN ('live', 'deleted')),
+    captured_at_unix_micros INTEGER NOT NULL
+        CHECK (typeof(captured_at_unix_micros) = 'integer')
+        CHECK (captured_at_unix_micros >= 0),
+    PRIMARY KEY (attempt_id, conversation_id),
+    FOREIGN KEY (attempt_id, product_conversation_id)
+        REFERENCES close_obligations(attempt_id, product_conversation_id) ON DELETE CASCADE
+);
+CREATE TRIGGER close_attempt_participants_require_same_product_on_insert
+BEFORE INSERT ON close_attempt_participants
+WHEN NOT EXISTS (
+    SELECT 1 FROM conversations participant
+    WHERE participant.id = NEW.conversation_id
+      AND participant.product_conversation_id = NEW.product_conversation_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'close participant must belong to the attempted ProductConversation');
+END;
+CREATE TRIGGER conversations_reject_sealed_participant_delete
+BEFORE DELETE ON conversations
+WHEN EXISTS (
+    SELECT 1
+    FROM close_attempt_participants participant
+    JOIN close_obligations obligation ON obligation.attempt_id = participant.attempt_id
+    WHERE participant.conversation_id = OLD.id
+      AND participant.settlement_state = 'live'
+      AND obligation.phase <> 'completed'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'active Close rejects sealed participant deletion');
+END;
+INSERT INTO close_attempt_participants (
+    attempt_id, product_conversation_id, conversation_id, captured_at_unix_micros
+)
+SELECT obligation.attempt_id, obligation.product_conversation_id, participant.id,
+       CAST(ROUND((julianday(obligation.created_at) - 2440587.5) * 86400000000.0) AS INTEGER)
+FROM close_obligations obligation
+JOIN conversations participant
+  ON participant.product_conversation_id = obligation.product_conversation_id
+WHERE obligation.phase <> 'completed';
+INSERT OR IGNORE INTO close_attempt_participants (
+    attempt_id, product_conversation_id, conversation_id, captured_at_unix_micros
+)
+SELECT member.attempt_id, obligation.product_conversation_id, member.conversation_id,
+       CAST(ROUND((julianday(member.captured_at) - 2440587.5) * 86400000000.0) AS INTEGER)
+FROM close_attempt_members member
+JOIN close_obligations obligation ON obligation.attempt_id = member.attempt_id;
+
+DROP TRIGGER close_attempt_direct_turn_settlement_target_requires_latest_member;
+CREATE TRIGGER close_attempt_direct_turn_settlement_target_requires_sealed_participant
+BEFORE INSERT ON close_attempt_direct_turn_settlements
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM durable_turns turn
+    JOIN close_attempt_participants participant
+      ON participant.conversation_id = turn.conversation_id
+    WHERE participant.attempt_id = NEW.attempt_id
+      AND turn.turn_id = NEW.turn_id
+      AND turn.generation = NEW.expected_generation
+      AND turn.owns_conversation = 1
+      AND turn.terminal_kind IS NULL
+)
+BEGIN
+    SELECT RAISE(ABORT, 'close direct-turn settlement target must be a sealed active participant');
+END;
+DROP TRIGGER close_obligations_transition_graph;
+
+DELETE FROM close_attempt_direct_turn_settlements
+WHERE attempt_id IN (
+    SELECT attempt_id FROM close_obligations WHERE phase = 'settling_active_work'
+);
+DELETE FROM close_attempt_direct_turn_settlement_captures
+WHERE attempt_id IN (
+    SELECT attempt_id FROM close_obligations WHERE phase = 'settling_active_work'
+);
+UPDATE close_obligations
+SET phase = 'awaiting_stop_work_confirmation',
+    updated_at = STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now')
+WHERE phase = 'settling_active_work';
+
+INSERT OR IGNORE INTO close_attempt_direct_turn_settlement_captures (
+    attempt_id, captured_at
+)
+SELECT obligation.attempt_id, obligation.updated_at
+FROM close_obligations obligation
+WHERE obligation.phase = 'cancel_requested_during_settlement';
+INSERT OR IGNORE INTO close_attempt_direct_turn_settlements (
+    attempt_id, turn_id, expected_generation
+)
+SELECT obligation.attempt_id, turn.turn_id, turn.generation
+FROM close_obligations obligation
+JOIN close_attempt_participants participant
+  ON participant.attempt_id = obligation.attempt_id
+JOIN durable_turns turn ON turn.conversation_id = participant.conversation_id
+WHERE obligation.phase = 'cancel_requested_during_settlement'
+  AND turn.owns_conversation = 1
+  AND turn.terminal_kind IS NULL;
+CREATE TRIGGER close_obligations_transition_graph
+BEFORE UPDATE OF phase ON close_obligations
+FOR EACH ROW
+WHEN NOT (
+    (OLD.phase = 'awaiting_blocker_resolution' AND NEW.phase IN ('awaiting_stop_work_confirmation', 'settling_active_work', 'completed'))
+    OR (OLD.phase = 'awaiting_stop_work_confirmation' AND NEW.phase IN ('settling_active_work', 'completed'))
+    OR (OLD.phase = 'settling_active_work' AND NEW.phase IN ('cancel_requested_during_settlement', 'awaiting_retirement_inspection'))
+    OR (OLD.phase = 'cancel_requested_during_settlement' AND NEW.phase = 'completed')
+    OR (OLD.phase = 'awaiting_retirement_inspection' AND NEW.phase IN ('awaiting_loss_confirmation', 'retirement_requested', 'needs_repair', 'completed'))
+    OR (OLD.phase = 'awaiting_loss_confirmation' AND NEW.phase IN ('awaiting_retirement_inspection', 'retirement_requested', 'completed'))
+    OR (OLD.phase = 'retirement_requested' AND NEW.phase IN ('awaiting_retirement_inspection', 'needs_repair', 'completed'))
+    OR (OLD.phase = 'needs_repair' AND NEW.phase IN ('awaiting_retirement_inspection', 'retirement_requested', 'completed'))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid close obligation phase transition');
+END;
+
+CREATE TRIGGER conversations_reject_participant_insert_during_close
+BEFORE INSERT ON conversations
+WHEN NEW.product_conversation_id IS NOT NULL
+ AND (
+    EXISTS (
+      SELECT 1 FROM close_obligations obligation
+      WHERE obligation.product_conversation_id = NEW.product_conversation_id
+        AND obligation.phase <> 'completed'
+    )
+    OR EXISTS (
+      SELECT 1 FROM product_conversations product
+      WHERE product.id = NEW.product_conversation_id
+        AND product.kind = 'ordinary'
+        AND product.ordinary_lifecycle = 'history'
+    )
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'non-writable ProductConversation rejects new aggregate participants');
+END;
+
+CREATE TEMP TABLE migration_095_cancelled_direct_turns AS
+SELECT turn.turn_id, turn.workflow_id, workflow.generation + 1 AS next_generation,
+       workflow.version AS from_version, workflow.updated_at AS committed_at
+FROM durable_turns turn
+JOIN workflows workflow ON workflow.workflow_id = turn.workflow_id
+JOIN conversations member ON member.id = turn.conversation_id
+JOIN product_conversations product ON product.id = member.product_conversation_id
+WHERE turn.terminal_kind IS NULL
+  AND turn.canonical_message_id IS NULL
+  AND workflow.profile_kind = 'direct_turn'
+  AND workflow.status NOT IN ('Cancelled', 'Completed', 'Failed', 'Deleted')
+  AND product.kind = 'ordinary'
+  AND (
+    NOT EXISTS (
+      SELECT 1 FROM conversations latest
+      WHERE latest.product_conversation_id = product.id
+        AND latest.runtime_role = 'user'
+        AND latest.parent_conversation_id IS NULL
+        AND latest.continued_in_conv_id IS NULL
+        AND latest.archived = 0
+    )
+    OR (
+      member.runtime_role = 'user'
+      AND member.parent_conversation_id IS NULL
+      AND member.id <> (
+        SELECT latest.id FROM conversations latest
+        WHERE latest.product_conversation_id = product.id
+          AND latest.runtime_role = 'user'
+          AND latest.parent_conversation_id IS NULL
+          AND latest.continued_in_conv_id IS NULL
+          AND latest.archived = 0
+        ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1
+      )
+    )
+  );
+INSERT INTO workflow_transitions (
+    workflow_id, transition_id, from_version, to_version, generation,
+    event_codec_family, event_codec_version, event_payload, committed_at
+)
+SELECT workflow_id, 3, from_version, from_version + 1, next_generation,
+       'direct_turn.event', 1,
+       X'7b225465726d696e616c223a7b227465726d696e616c223a2243616e63656c6c6564227d7d',
+       committed_at + 1
+FROM migration_095_cancelled_direct_turns;
+UPDATE workflow_effects
+SET status = 'Invalidated', next_eligible_at = NULL,
+    generation = generation + 1, pending_reconciliation = 0
+WHERE workflow_id IN (
+    SELECT workflow_id FROM migration_095_cancelled_direct_turns
+) AND status NOT IN ('Receipted', 'Invalidated');
+UPDATE durable_turns
+SET terminal_kind = 'Cancelled', terminal_reason = NULL,
+    generation = (
+        SELECT next_generation FROM migration_095_cancelled_direct_turns cancelled
+        WHERE cancelled.turn_id = durable_turns.turn_id
+    ),
+    owns_conversation = 0
+WHERE turn_id IN (SELECT turn_id FROM migration_095_cancelled_direct_turns);
+UPDATE workflows
+SET status = 'Cancelled', generation = (
+        SELECT next_generation FROM migration_095_cancelled_direct_turns cancelled
+        WHERE cancelled.workflow_id = workflows.workflow_id
+    ),
+    version = version + 1, updated_at = updated_at + 1
+WHERE workflow_id IN (SELECT workflow_id FROM migration_095_cancelled_direct_turns);
+DROP TABLE migration_095_cancelled_direct_turns;
+
+UPDATE product_creation_jobs
+SET status = 'delivery_failed', last_error = 'completed_close_won_cutover',
+    delivery_retry_at_unix_micros = NULL,
+    claim_worker_id = NULL, claim_token = NULL, claim_lease_until_unix_micros = NULL
+WHERE status = 'delivery_pending'
+  AND published_product_id IN (
+    SELECT obligation.product_conversation_id FROM close_obligations obligation
+    WHERE obligation.phase = 'completed' AND obligation.close_outcome = 'archived'
+      AND NOT EXISTS (
+        SELECT 1 FROM conversations latest
+        WHERE latest.product_conversation_id = obligation.product_conversation_id
+          AND latest.runtime_role = 'user'
+          AND latest.parent_conversation_id IS NULL
+          AND latest.continued_in_conv_id IS NULL
+          AND latest.archived = 0
+      )
+  );
+
+UPDATE product_conversations
+SET ordinary_lifecycle = CASE WHEN EXISTS (
+    SELECT 1
+    FROM conversations latest
+    WHERE latest.product_conversation_id = product_conversations.id
+      AND latest.runtime_role = 'user'
+      AND latest.parent_conversation_id IS NULL
+      AND latest.continued_in_conv_id IS NULL
+      AND latest.archived = 0
+) OR EXISTS (
+    SELECT 1 FROM product_creation_jobs job
+    WHERE job.published_product_id = product_conversations.id
+      AND job.status IN ('delivery_pending', 'delivery_failed')
+      AND NOT EXISTS (
+        SELECT 1 FROM close_obligations obligation
+        WHERE obligation.product_conversation_id = product_conversations.id
+          AND obligation.phase = 'completed'
+          AND obligation.close_outcome = 'archived'
+          AND NOT EXISTS (
+            SELECT 1 FROM conversations latest
+            WHERE latest.product_conversation_id = product_conversations.id
+              AND latest.runtime_role = 'user'
+              AND latest.parent_conversation_id IS NULL
+              AND latest.continued_in_conv_id IS NULL
+              AND latest.archived = 0
+          )
+      )
+) THEN 'open' ELSE 'history' END
+WHERE kind = 'ordinary';
+";
 
 const MIGRATION_094: &str = r"
 -- Released databases could contain duplicate conversation-local sequences because
@@ -13744,7 +14471,8 @@ mod tests {
                     (74, 'temporarily_skip_completed_continuation_handoffs'),
                     (91, 'temporarily_skip_product_creation_jobs'),
                     (92, 'temporarily_skip_creation_checkout_pin'),
-                    (93, 'temporarily_skip_product_creation_ownership')",
+                    (93, 'temporarily_skip_product_creation_ownership'),
+                    (95, 'temporarily_skip_product_lifecycle_reconciliation')",
         )
         .execute(&pool)
         .await
@@ -14635,7 +15363,8 @@ mod tests {
                     (74, 'temporarily_skip_completed_continuation_handoffs'),
                     (91, 'temporarily_skip_product_creation_jobs'),
                     (92, 'temporarily_skip_creation_checkout_pin'),
-                    (93, 'temporarily_skip_product_creation_ownership')",
+                    (93, 'temporarily_skip_product_creation_ownership'),
+                    (95, 'temporarily_skip_product_lifecycle_reconciliation')",
         )
         .execute(pool)
         .await

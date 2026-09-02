@@ -342,6 +342,31 @@ describe('WorkControlBar — persisted Close recovery', () => {
     expect(await screen.findByRole('button', { name: 'Stop work and continue closing' })).toBeVisible();
     expect(screen.queryByTestId('view-diff-button')).not.toBeInTheDocument();
   });
+  it('keeps close resolution controls enabled when ordinary mutators are read-only', async () => {
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(
+      closeSnapshot('awaiting_stop_work_confirmation') as never,
+    );
+
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-read-only-close"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle()}
+        mutationEnabled={false}
+      />,
+    );
+
+    const confirm = await screen.findByRole('button', { name: 'Stop work and continue closing' });
+    expect(confirm).toBeEnabled();
+    expect(screen.getByTestId('abandon-button')).toBeDisabled();
+    fireEvent.click(confirm);
+    await waitFor(() => expect(api.confirmCloseStopWork).toHaveBeenCalledWith(
+      'conv-read-only-close',
+      'attempt-close',
+    ));
+  });
 
   it.each([
     'awaiting_blocker_resolution',

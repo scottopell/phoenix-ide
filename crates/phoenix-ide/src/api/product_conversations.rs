@@ -119,7 +119,7 @@ pub async fn list_product_conversation_creations(
             images: job.intent.images,
             updated_at: job.updated_at.to_rfc3339(),
             last_error: job.last_error,
-            allowed_actions: creation_allowed_actions(&job.status),
+            allowed_actions: creation_allowed_actions(&job.status, job.delivery_retryable),
         })
         .collect();
     Ok(Json(ProductConversationCreationRecoveryResponse {
@@ -202,14 +202,17 @@ fn decode_recovery_cursor(cursor: &str) -> Result<(i64, String), AppError> {
     Ok((updated_at, request_id.to_string()))
 }
 
-fn creation_allowed_actions(status: &str) -> Vec<ProductConversationCreationAllowedActionView> {
+fn creation_allowed_actions(
+    status: &str,
+    delivery_retryable: bool,
+) -> Vec<ProductConversationCreationAllowedActionView> {
     let mut actions = Vec::with_capacity(2);
     match status {
         "accepted" | "claimed" | "retry_scheduled" => {
             actions.push(ProductConversationCreationAllowedActionView::Cancel);
             actions.push(ProductConversationCreationAllowedActionView::Delete);
         }
-        "delivery_failed" => {
+        "delivery_failed" if delivery_retryable => {
             actions.push(ProductConversationCreationAllowedActionView::RetryDelivery);
         }
         "failed" | "cancelled" => {
@@ -222,6 +225,21 @@ fn creation_allowed_actions(status: &str) -> Vec<ProductConversationCreationAllo
         _ => {}
     }
     actions
+}
+
+#[cfg(test)]
+mod creation_allowed_actions_tests {
+    use super::{creation_allowed_actions, ProductConversationCreationAllowedActionView};
+
+    #[test]
+    fn terminal_publication_has_no_retry_but_transient_delivery_failure_does() {
+        assert!(creation_allowed_actions("delivery_failed", false).is_empty());
+        assert!(creation_allowed_actions("published", false).is_empty());
+        assert_eq!(
+            creation_allowed_actions("delivery_failed", true),
+            vec![ProductConversationCreationAllowedActionView::RetryDelivery]
+        );
+    }
 }
 
 fn list_row(projection: &ProductConversationListProjection) -> ProductConversationListRow {
@@ -257,15 +275,10 @@ async fn snapshot_view(
     message_limit: usize,
     page: Vec<(i64, crate::db::Message)>,
 ) -> Result<ProductConversationSnapshotView, AppError> {
-    let lifecycle = lifecycle_from_archived(
-        aggregate
-            .segments
-            .last()
-            .expect("aggregate has segment")
-            .transcript_row
-            .conversation
-            .archived,
-    );
+    let lifecycle = aggregate
+        .product_conversation
+        .ordinary_lifecycle()
+        .expect("ordinary aggregate read returned Coordinator");
     let close = state
         .db
         .get_active_close_projection_for_product(aggregate.product_conversation.id())
@@ -533,14 +546,6 @@ fn work_identity(
         task_id: identity.task_id.clone(),
         task_title: identity.task_title.clone(),
     })
-}
-
-fn lifecycle_from_archived(archived: bool) -> OrdinaryProductConversationLifecycle {
-    if archived {
-        OrdinaryProductConversationLifecycle::History
-    } else {
-        OrdinaryProductConversationLifecycle::Open
-    }
 }
 
 fn source_view(source: &ProductConversationSource) -> ProductConversationSourceView {
@@ -829,6 +834,43 @@ mod tests {
             .await
             .unwrap();
         successor
+    }
+
+    async fn assert_list_and_snapshot_lifecycle(state: &AppState, reference: &str, expected: &str) {
+        let list = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/product-conversations")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list.status(), StatusCode::OK);
+        let list: serde_json::Value =
+            serde_json::from_slice(&to_bytes(list.into_body(), usize::MAX).await.unwrap()).unwrap();
+        let listed = list["product_conversations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["latest_transcript_row_id"] == reference)
+            .unwrap();
+        assert_eq!(listed["ordinary_lifecycle"], expected);
+
+        let snapshot = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/product-conversations/{reference}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(snapshot.status(), StatusCode::OK);
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(&to_bytes(snapshot.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(snapshot["ordinary_lifecycle"], expected);
     }
 
     #[test]
@@ -1348,56 +1390,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lifecycle_uses_shipped_archived_authority_not_dormant_product_lifecycle() {
+    async fn list_and_snapshot_use_aggregate_lifecycle_despite_legacy_archived_bit() {
         let state = make_test_state().await;
         let conversation = state
             .db
-            .create_conversation("archived", "archived", "/tmp", true, None, None)
+            .create_conversation("lifecycle", "lifecycle", "/tmp", true, None, None)
             .await
             .unwrap();
+
+        sqlx::query("UPDATE conversations SET archived = 1 WHERE id = ?")
+            .bind(&conversation.id)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        assert_list_and_snapshot_lifecycle(&state, &conversation.id, "open").await;
+
         sqlx::query("UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?")
             .bind(conversation.product_conversation_id.as_str())
             .execute(state.db.pool())
             .await
             .unwrap();
-
-        let response = create_router(state.clone())
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/api/product-conversations/{}", conversation.id))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let open: serde_json::Value =
-            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
-        assert_eq!(open["ordinary_lifecycle"], "open");
-
-        state
-            .db
-            .archive_conversation(&conversation.id)
-            .await
-            .unwrap();
-        sqlx::query("UPDATE product_conversations SET ordinary_lifecycle = 'open' WHERE id = ?")
-            .bind(conversation.product_conversation_id.as_str())
+        sqlx::query("UPDATE conversations SET archived = 0 WHERE id = ?")
+            .bind(&conversation.id)
             .execute(state.db.pool())
             .await
             .unwrap();
-        let response = create_router(state)
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/api/product-conversations/{}", conversation.id))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let archived: serde_json::Value =
-            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
-        assert_eq!(archived["ordinary_lifecycle"], "history");
+        assert_list_and_snapshot_lifecycle(&state, &conversation.id, "history").await;
     }
 
     #[tokio::test]

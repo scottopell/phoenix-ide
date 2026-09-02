@@ -85,22 +85,18 @@ impl RuntimeManager {
         &self,
         attempt_id: &CloseAttemptId,
     ) -> Result<(), String> {
-        let members = self
+        let participant_ids = self
             .db()
-            .list_close_attempt_members(attempt_id.as_str())
+            .list_close_retirement_archived_conversation_ids(attempt_id.as_str())
             .await
             .map_err(|error| error.to_string())?;
-        let mut published = std::collections::BTreeSet::new();
         let mut broadcasters = Vec::new();
-        for member in members {
-            let conversation_id = member.conversation_id.as_str();
-            if published.insert(conversation_id.to_string()) {
-                if let Some(broadcaster) = self
-                    .existing_conversation_broadcaster(conversation_id)
-                    .await
-                {
-                    broadcasters.push(broadcaster);
-                }
+        for conversation_id in participant_ids {
+            if let Some(broadcaster) = self
+                .existing_conversation_broadcaster(&conversation_id)
+                .await
+            {
+                broadcasters.push(broadcaster);
             }
         }
         self.db()

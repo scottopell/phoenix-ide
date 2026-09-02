@@ -1,7 +1,8 @@
 // Sync queue for handling offline operations
 
-import { api } from './api';
-import type { PendingOperation } from './cache';
+import { api, ConflictError } from './api';
+import { cacheDB, type PendingOperation } from './cache';
+import { notifyArchiveCloseConflict } from './notifications';
 
 export class SyncQueue {
   async processOperation(op: PendingOperation): Promise<void> {
@@ -13,22 +14,25 @@ export class SyncQueue {
         if (!op.payload.text && (op.payload.files || []).length === 0 && (op.payload.images || []).length === 0) {
           throw new Error('send_message requires text or attachments');
         }
-        const current = await api.getConversation(op.conversationId);
-        if (current.conversation.archived) {
-          console.debug('Draining queued send for archived conversation:', op.conversationId);
-          break;
+        try {
+          await api.sendMessage(
+            op.conversationId,
+            op.payload.text || '',
+            op.payload.images || [],
+            op.payload.files || [],
+            op.payload.localId,
+          );
+        } catch (error) {
+          if (!(error instanceof ConflictError && error.detail.error_type === 'target_unavailable')) throw error;
         }
-        await api.sendMessage(
-          op.conversationId,
-          op.payload.text || '',
-          op.payload.images || [],
-          op.payload.files || [],
-          op.payload.localId,
-        );
         break;
       }
       case 'archive':
-        await api.archiveConversation(op.conversationId);
+        try {
+          await api.archiveConversation(op.conversationId);
+        } catch (error) {
+          if (!notifyArchiveCloseConflict(op.conversationId, error)) throw error;
+        }
         break;
       
       case 'delete':
@@ -46,7 +50,11 @@ export class SyncQueue {
         break;
 
       case 'archive_chain':
-        await api.archiveChain(op.conversationId);
+        try {
+          await api.archiveChain(op.conversationId);
+        } catch (error) {
+          if (!notifyArchiveCloseConflict(op.conversationId, error)) throw error;
+        }
         break;
 
       case 'delete_chain':
@@ -94,3 +102,8 @@ export class SyncQueue {
 }
 
 export const syncQueue = new SyncQueue();
+
+export async function processAndDeletePendingOperation(op: PendingOperation): Promise<void> {
+  await syncQueue.processOperation(op);
+  await cacheDB.deletePendingOp(op.id);
+}

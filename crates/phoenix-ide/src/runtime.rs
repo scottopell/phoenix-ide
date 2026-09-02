@@ -2018,6 +2018,33 @@ pub(crate) fn conversation_attachment_retains_work_scope(conv: &crate::db::Conve
     }
 }
 
+pub(crate) async fn conversation_retains_work_scope(
+    db: &crate::db::Database,
+    conv: &crate::db::Conversation,
+) -> Result<bool, crate::db::DbError> {
+    let admission = db.message_target_admission(&conv.id).await?;
+    if matches!(
+        admission,
+        crate::db::MessageTargetAdmission::Aggregate(
+            crate::db::ProductConversationAdmission::History(_)
+        )
+    ) {
+        return Ok(false);
+    }
+    if conversation_attachment_retains_work_scope(conv) {
+        return Ok(true);
+    }
+    if !conv.archived || conv.state.is_terminal() {
+        return Ok(false);
+    }
+    Ok(matches!(
+        admission,
+        crate::db::MessageTargetAdmission::Aggregate(
+            crate::db::ProductConversationAdmission::Accepted { .. }
+        )
+    ))
+}
+
 fn conversation_resource_scope(conv: &crate::db::Conversation) -> Option<ResourceScopeKey> {
     match conv.attached_work_scope_id.clone() {
         Some(scope) => Some(ResourceScopeKey::Work(scope)),
@@ -3012,7 +3039,7 @@ impl RuntimeManager {
         let conversation = self.db().get_conversation(conversation_id).await?;
         Ok(
             conversation_resource_scope(&conversation).as_ref() == Some(work_scope)
-                && conversation_attachment_retains_work_scope(&conversation),
+                && conversation_retains_work_scope(self.db(), &conversation).await?,
         )
     }
 
@@ -3059,7 +3086,7 @@ impl RuntimeManager {
             };
             return Ok(
                 conversation_resource_scope(&conversation).as_ref() == Some(work_scope)
-                    && conversation_attachment_retains_work_scope(&conversation),
+                    && conversation_retains_work_scope(self.db(), &conversation).await?,
             );
         }
         let Some(work_scope_id) = work_scope.work_scope_id() else {
@@ -3074,15 +3101,7 @@ impl RuntimeManager {
             if excluded_conv_id == Some(conv.id.as_str()) {
                 continue;
             }
-            // An archived conversation is not a live owner even when its
-            // row still reads non-terminal: archiving a Work/Branch chain
-            // archives earlier members before the leaf's cleanup runs.
-            // Counting it as live would preserve the shared scope and leak
-            // its bash/tmux/browser/terminal resources.
-            if conv.archived {
-                continue;
-            }
-            if !conversation_attachment_retains_work_scope(&conv) {
+            if !conversation_retains_work_scope(self.db(), &conv).await? {
                 continue;
             }
             if conv.attached_work_scope_id.as_ref() == Some(work_scope_id) {
@@ -3295,6 +3314,11 @@ impl RuntimeManager {
                 manager
                     .db
                     .cancel_close_settlement_wakes(obligation.attempt_id().as_str())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                manager
+                    .db
+                    .suppress_materialized_close_settlement_wakes(obligation.attempt_id().as_str())
                     .await
                     .map_err(|error| error.to_string())?;
                 manager
@@ -6211,6 +6235,21 @@ impl RuntimeManager {
     }
 
     /// Get the database handle
+    pub(crate) async fn mutation_admission(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Arc<AsyncMutex<()>>, phoenix_db::DbError> {
+        let conversation = self.db.get_conversation(conversation_id).await?;
+        let key = match self.db.message_target_admission(conversation_id).await? {
+            phoenix_db::MessageTargetAdmission::Aggregate(_) => {
+                conversation.product_conversation_id.to_string()
+            }
+            phoenix_db::MessageTargetAdmission::StandaloneAvailable
+            | phoenix_db::MessageTargetAdmission::StandaloneArchived => conversation_id.to_string(),
+        };
+        Ok(self.conversation_admission(&key).await)
+    }
+
     pub(crate) async fn conversation_admission(
         &self,
         conversation_id: &str,
@@ -7545,6 +7584,15 @@ mod scope_liveness_tests {
             .create_conversation(conversation_id, conversation_id, "/tmp", true, None, None)
             .await
             .expect("create conversation");
+        prepare_existing_close_attempt_ready_for_completion(manager, &conversation, attempt).await
+    }
+
+    async fn prepare_existing_close_attempt_ready_for_completion(
+        manager: &RuntimeManager,
+        conversation: &crate::db::Conversation,
+        attempt: &str,
+    ) -> CloseAttemptId {
+        let conversation_id = conversation.id.as_str();
         let attempt_id = CloseAttemptId::parse(attempt).unwrap();
         manager
             .db()
@@ -7641,6 +7689,82 @@ mod scope_liveness_tests {
         assert!(
             published_history,
             "completion must publish the History transition"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_close_retirement_and_publish_notifies_subordinate_participant() {
+        let manager = test_manager().await;
+        let parent = manager
+            .db()
+            .create_conversation(
+                "close-retirement-participant-parent",
+                "close-retirement-participant-parent",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .expect("create parent");
+        let subordinate_id = "close-retirement-participant-subordinate";
+        manager
+            .db()
+            .create_subagent_conversation(
+                subordinate_id,
+                subordinate_id,
+                "/tmp",
+                &parent.id,
+                "gpt-5.4",
+                &ConvMode::Explore {
+                    worktree_path: None,
+                    next_taskmd_id_hint: None,
+                },
+                phoenix_core::llm_language::LlmLanguage::default(),
+                parent.attached_work_scope_id.as_ref(),
+            )
+            .await
+            .expect("create subordinate participant");
+        let attempt_id = prepare_existing_close_attempt_ready_for_completion(
+            &manager,
+            &parent,
+            "close-retirement-participant-attempt",
+        )
+        .await;
+        let broadcaster = manager.conversation_broadcaster(subordinate_id).await;
+        let mut receiver = broadcaster.subscribe();
+
+        manager
+            .retire_close_runtime_resources(attempt_id)
+            .await
+            .expect("retire resources, complete Close, and publish");
+
+        assert!(
+            manager
+                .db()
+                .get_conversation(subordinate_id)
+                .await
+                .expect("reload subordinate")
+                .archived
+        );
+        let mut published_history = false;
+        while let Ok(event) = receiver.try_recv() {
+            if matches!(
+                event,
+                SseEvent::ConversationUpdate {
+                    update: ConversationMetadataUpdate {
+                        archived: Some(true),
+                        ..
+                    },
+                    ..
+                }
+            ) {
+                published_history = true;
+            }
+        }
+        assert!(
+            published_history,
+            "subordinate participant must be notified"
         );
     }
 
@@ -11033,7 +11157,7 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
-    async fn archived_conversation_does_not_count_as_live() {
+    async fn open_aggregate_archived_drift_still_counts_as_live() {
         let mgr = test_manager().await;
         mgr.db()
             .create_conversation("conv-arch", "slug", "/tmp", true, None, None)
@@ -11048,7 +11172,7 @@ mod scope_liveness_tests {
         // Archive the (still non-terminal) conversation; the lingering
         // runtime handle stays registered, as it does in the real cascade.
         mgr.db()
-            .archive_conversation("conv-arch")
+            .set_legacy_conversation_archived("conv-arch")
             .await
             .expect("archive");
         let conv = mgr.db().get_conversation("conv-arch").await.expect("get");
@@ -11059,8 +11183,57 @@ mod scope_liveness_tests {
         );
 
         assert!(
+            mgr.scope_has_live_conversation(&scope).await.unwrap(),
+            "an Open aggregate must preserve its scope despite archived row drift"
+        );
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history'
+             WHERE id = (SELECT product_conversation_id FROM conversations WHERE id = 'conv-arch')",
+        )
+        .execute(mgr.db().pool())
+        .await
+        .unwrap();
+        assert!(
             !mgr.scope_has_live_conversation(&scope).await.unwrap(),
-            "an archived conversation must not preserve its scope"
+            "History aggregate releases its scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_subordinate_does_not_retain_scope_when_its_row_is_unarchived() {
+        let mgr = test_manager().await;
+        let worktree = "/repo/.phoenix/worktrees/history-subordinate";
+        let scope = create_handleless_work_conv(&mgr, "history-parent", worktree, None).await;
+        create_handleless_work_conv(
+            &mgr,
+            "history-subordinate",
+            worktree,
+            Some("history-parent"),
+        )
+        .await;
+        mgr.db()
+            .set_legacy_conversation_archived("history-parent")
+            .await
+            .expect("archive parent");
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history'
+             WHERE id = (
+                 SELECT product_conversation_id FROM conversations WHERE id = 'history-parent'
+             )",
+        )
+        .execute(mgr.db().pool())
+        .await
+        .unwrap();
+
+        let subordinate = mgr
+            .db()
+            .get_conversation("history-subordinate")
+            .await
+            .expect("get subordinate");
+        assert!(!subordinate.archived, "precondition: subordinate row drift");
+        assert!(
+            !mgr.scope_has_live_conversation(&scope).await.unwrap(),
+            "History lifecycle releases every ordinary aggregate member's scope"
         );
     }
 

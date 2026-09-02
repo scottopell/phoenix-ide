@@ -117,12 +117,6 @@ impl SendChatApplicationService {
         {
             return Ok(outcome);
         }
-        if conversation.archived {
-            return Ok(SendChatOutcome::Rejected {
-                message: "Conversation is archived and unavailable for messaging.".to_string(),
-                code: "target_unavailable",
-            });
-        }
         let acceptance_guard = self.runtime.lock_message_acceptance(&conversation.id).await;
 
         // The pre-lock lookup is only a fast path. A concurrent request with
@@ -182,15 +176,21 @@ impl SendChatApplicationService {
         match self
             .runtime
             .db()
-            .product_conversation_admission(&conversation.id)
+            .message_target_admission(&conversation.id)
             .await
             .map_err(map_conversation_load_error)?
         {
-            crate::db::ProductConversationAdmission::Accepted { .. } => {}
-            crate::db::ProductConversationAdmission::Refused(_) => {
-                return Ok(close_admission_fenced_outcome());
-            }
-            crate::db::ProductConversationAdmission::History(_) => {
+            crate::db::MessageTargetAdmission::Aggregate(
+                crate::db::ProductConversationAdmission::Accepted { .. },
+            )
+            | crate::db::MessageTargetAdmission::StandaloneAvailable => {}
+            crate::db::MessageTargetAdmission::Aggregate(
+                crate::db::ProductConversationAdmission::Refused(_),
+            ) => return Ok(close_admission_fenced_outcome()),
+            crate::db::MessageTargetAdmission::Aggregate(
+                crate::db::ProductConversationAdmission::History(_),
+            )
+            | crate::db::MessageTargetAdmission::StandaloneArchived => {
                 return Ok(history_unavailable_outcome());
             }
         }
@@ -1272,7 +1272,9 @@ mod tests {
         })
         .await
         .unwrap();
-        db.archive_conversation(&req.conversation_id).await.unwrap();
+        db.set_legacy_conversation_archived(&req.conversation_id)
+            .await
+            .unwrap();
 
         assert_eq!(
             lookup_durable_replay(&db, &req, &submitted_identity_from_request(&req))

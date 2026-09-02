@@ -239,7 +239,7 @@ async fn submit_question_rejects_single_member_root() {
     let qa = ChainQa::new(db.clone(), registry, test_retriever(&db));
 
     let err = qa
-        .submit_question("solo-root", "anything")
+        .submit_question("solo-root", "anything", None)
         .await
         .unwrap_err();
     assert!(matches!(err, ChainQaError::NotAChainRoot(_)));
@@ -256,7 +256,10 @@ async fn submit_question_rejects_non_root_member() {
     let registry = registry_with_service(llm.clone() as Arc<dyn LlmService>);
     let qa = ChainQa::new(db.clone(), registry, test_retriever(&db));
 
-    let err = qa.submit_question("nrr-mid", "anything").await.unwrap_err();
+    let err = qa
+        .submit_question("nrr-mid", "anything", None)
+        .await
+        .unwrap_err();
     assert!(matches!(err, ChainQaError::NotAChainRoot(_)));
 }
 
@@ -484,7 +487,7 @@ async fn submit_question_returns_qa_id_before_stream_completes() {
     let registry = registry_with_service(llm.clone() as Arc<dyn LlmService>);
     let qa = ChainQa::new(db.clone(), registry, test_retriever(&db));
 
-    let qa_id = qa.submit_question("sy-a", "?").await.unwrap();
+    let qa_id = qa.submit_question("sy-a", "?", None).await.unwrap();
 
     // The row exists in the DB (status may be in_flight or completed
     // depending on timing — the contract is "exists before submit returns").

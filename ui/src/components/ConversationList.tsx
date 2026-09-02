@@ -256,7 +256,7 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
       </button>
       {listDensity !== 'mobile' && (
         <div className="conv-item-secondary-row">
-          <span className="conv-item-secondary-badge">{row.ordinary_lifecycle === 'history' ? 'Archived' : 'Open'}</span>
+          <span className="conv-item-secondary-badge">{row.ordinary_lifecycle === 'history' ? 'History' : 'Open'}</span>
           <span className="conv-item-secondary-context">{statusTitle}</span>
         </div>
       )}
@@ -445,9 +445,9 @@ export const ConversationRow = memo(function ConversationRow({
                     onCloseMenu();
                     onArchive(conv);
                   }}
-                  title={`Archive conversation "${displayTitle}"`}
+                  title={`Close conversation "${displayTitle}"`}
                 >
-                  Archive
+                  Close
                 </button>
               )}
               <button
@@ -815,7 +815,7 @@ export function ConversationList({
                 onClick={() => { if (showArchived) onToggleArchived(); }}
                 disabled={!showArchived}
               >
-                Active
+                {usingProductRows ? 'Open' : 'Active'}
               </button>
               <span aria-hidden="true">·</span>
               <button
@@ -862,7 +862,7 @@ export function ConversationList({
       <ul id="conv-list">
         {isEmpty ? (
           <li className="empty-state">
-            <p>{`No ${showArchived ? 'archived' : 'active'} conversations${emptyScopeLabel ? ` in ${emptyScopeLabel}` : ''}`}</p>
+            <p>{`No ${usingProductRows ? (showArchived ? 'History' : 'Open') : (showArchived ? 'archived' : 'active')} conversations${emptyScopeLabel ? ` in ${emptyScopeLabel}` : ''}`}</p>
           </li>
         ) : usingProductRows ? (
           displayProductList.map((row) => (

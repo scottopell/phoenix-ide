@@ -662,7 +662,7 @@ async fn deliver_pending(
                 .reserve_next_range(1)
                 .map_err(|error| error.to_string())?;
             let sequence_id = sequence_ids[0];
-            let adopted_for_close = match repo
+            let _adopted_for_close = match repo
                 .materialize_pending_delivery_message(&MaterializePendingDeliveryMessageInput {
                     workflow_id: current.workflow_id,
                     delivery_id: current.canonical_delivery.delivery_id,
@@ -732,21 +732,19 @@ async fn deliver_pending(
                 }
             };
             drop(sequence_guard);
-            if adopted_for_close {
-                match manager
-                    .db()
-                    .wake_delivery_requires_close_settlement_recheck(close_settlement_workflow_id)
-                    .await
-                {
-                    Ok(true) => {
-                        if let Err(error) = manager.resume_pending_close_settlements().await {
-                            tracing::error!(%error, workflow_id = close_settlement_workflow_id.0, "failed to re-evaluate Close settlement after wake delivery");
-                        }
+            match manager
+                .db()
+                .wake_delivery_requires_close_settlement_recheck(close_settlement_workflow_id)
+                .await
+            {
+                Ok(true) => {
+                    if let Err(error) = manager.resume_pending_close_settlements().await {
+                        tracing::error!(%error, workflow_id = close_settlement_workflow_id.0, "failed to re-evaluate Close settlement after wake delivery");
                     }
-                    Ok(false) => {}
-                    Err(error) => {
-                        tracing::error!(%error, workflow_id = close_settlement_workflow_id.0, "failed to classify Close settlement wake delivery");
-                    }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::error!(%error, workflow_id = close_settlement_workflow_id.0, "failed to classify Close settlement wake delivery");
                 }
             }
             cursor = Some(next_cursor);
@@ -1703,6 +1701,89 @@ mod tests {
         let observed_sleep = sleep_rx.await.unwrap();
         assert_eq!(observed_sleep, ERROR_RETRY_MAX_INTERVAL);
         join.abort();
+    }
+
+    #[tokio::test]
+    async fn materialization_after_close_suppression_pass_rechecks_and_advances_close() {
+        let (db, repo, scope) = open_repo().await;
+        let workflow_id = register_bash(&repo, &scope, "b-close-race", 50).await;
+        let inspector = Arc::new(MockInspector::new());
+        inspector.push(
+            workflow_id,
+            InspectionOutcome::Terminal(WakeTerminalEvidence::Bash(BashTerminalEvidence {
+                identity: BashResourceIdentity {
+                    work_scope: scope,
+                    handle_id: "b-close-race".to_string(),
+                },
+                status: BashTerminalStatus::Exited,
+                occurred_at: Timestamp(10),
+                exit_code: Some(0),
+                duration_ms: Some(5),
+                signal_number: None,
+                kill_signal_sent: None,
+                final_tail: vec!["done".to_string()],
+            })),
+        );
+        WakeWorker::new(
+            repo.clone(),
+            inspector,
+            Arc::new(TestClock::new(10)),
+            ProcessIncarnation(1),
+        )
+        .run_once()
+        .await
+        .unwrap();
+        let product_conversation_id = db
+            .get_conversation("conv")
+            .await
+            .unwrap()
+            .product_conversation_id;
+        db.begin_close_foundation(
+            &product_conversation_id,
+            &TranscriptConversationId::parse("conv").unwrap(),
+            "wake-materialize-close-race",
+        )
+        .await
+        .unwrap();
+        db.confirm_close_stop_work("wake-materialize-close-race")
+            .await
+            .unwrap();
+        db.begin_close_active_work_settlement("wake-materialize-close-race")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.suppress_materialized_close_settlement_wakes("wake-materialize-close-race")
+                .await
+                .unwrap(),
+            0,
+        );
+        let manager = Arc::new(crate::runtime::RuntimeManager::new(
+            db.clone(),
+            Arc::new(phoenix_llm::ModelRegistry::new_empty()),
+            phoenix_core::platform::PlatformCapability::None {
+                details: "test".into(),
+            },
+            Arc::new(crate::tools::mcp::McpClientManager::new()),
+            None,
+        ));
+
+        deliver_pending(&manager, &repo, Timestamp(20))
+            .await
+            .unwrap();
+
+        assert!(repo.list_pending("conv").await.unwrap().is_empty());
+        let obligation = db
+            .get_close_obligation("wake-materialize-close-race")
+            .await
+            .unwrap();
+        assert_eq!(
+            obligation.phase(),
+            phoenix_core::domain::close::ClosePhase::Completed
+        );
+        deliver_pending(&manager, &repo, Timestamp(21))
+            .await
+            .unwrap();
+        assert!(repo.list_pending("conv").await.unwrap().is_empty());
     }
 
     #[tokio::test]

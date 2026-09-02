@@ -511,6 +511,12 @@ export function useConnection({
               nextPhase,
             );
             latestPhaseRef.current = nextPhase;
+            if (latestConversationRef.current) {
+              latestConversationRef.current = {
+                ...latestConversationRef.current,
+                state: nextPhase,
+              };
+            }
             stampedDispatch({
               type: 'sse_state_change',
               sequenceId: res.data.sequence_id,
@@ -518,6 +524,7 @@ export function useConnection({
               // RFC3339 → unix ms once at the SSE boundary (REQ-WPV-001).
               stateUpdatedAt: Date.parse(res.data.state_updated_at),
             });
+            notifyCloseSnapshotChanged(convId, 'stream');
           });
 
           on('agent_done', (e) => {
@@ -666,7 +673,7 @@ export function useConnection({
               sequenceId: res.data.sequence_id,
               inventory: res.data.inventory,
             });
-            notifyCloseSnapshotChanged(convId);
+            notifyCloseSnapshotChanged(convId, 'stream');
           });
 
           // REQ-BED-032 step 6: hard-delete cascade emits this on the

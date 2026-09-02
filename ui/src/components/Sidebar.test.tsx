@@ -107,8 +107,8 @@ describe('Sidebar — ProductConversation navigation', () => {
 
 
 
-  it('shows History when the active aggregate product conversation is archived', async () => {
-    const { container, getByRole } = render(
+  it('shows a History aggregate with no Archived terminology or legacy Archive action', async () => {
+    const { container, getByRole, getAllByText, queryByText, queryByTitle } = render(
       <MemoryRouter initialEntries={['/product-conversations/pc-archived']}>
         <Sidebar
           collapsed={false}
@@ -124,8 +124,11 @@ describe('Sidebar — ProductConversation navigation', () => {
     await waitFor(() => {
       expect(container.querySelector('[data-product-conversation-id="pc-archived"]')).not.toBeNull();
     });
-    const archivedTab = getByRole('button', { name: /History 1/ });
-    expect(archivedTab.getAttribute('aria-pressed')).toBe('true');
+    const historyTab = getByRole('button', { name: /History 1/ });
+    expect(historyTab.getAttribute('aria-pressed')).toBe('true');
+    expect(getAllByText('History').length).toBeGreaterThan(0);
+    expect(queryByText('Archived')).toBeNull();
+    expect(queryByTitle(/Archive conversation/)).toBeNull();
   });
 
 
@@ -234,7 +237,7 @@ describe('Sidebar — ProductConversation navigation', () => {
     expect(apiMock.listProductConversations).toHaveBeenCalledTimes(2);
   });
 
-  it('notifies the active Close surface when Archive starts a server-authoritative attempt', async () => {
+  it('notifies the active Close surface when Close starts a server-authoritative attempt', async () => {
     apiMock.listProductConversations.mockRejectedValueOnce(new Error('offline'));
     apiMock.archiveConversation.mockRejectedValueOnce(new ConflictError({
       error: 'close loss confirmation required',
@@ -257,12 +260,12 @@ describe('Sidebar — ProductConversation navigation', () => {
     );
 
     fireEvent.click(await waitFor(() => getByTitle('Actions')));
-    fireEvent.click(await waitFor(() => getByTitle('Archive conversation "cached-slug"')));
+    fireEvent.click(await waitFor(() => getByTitle('Close conversation "cached-slug"')));
     await waitFor(() => expect(listener).toHaveBeenCalledTimes(1));
     unsubscribe();
   });
 
-  it('does not notify the Close surface for non-close archive failures', async () => {
+  it('does not notify the Close surface for non-close compatibility failures', async () => {
     apiMock.listProductConversations.mockRejectedValueOnce(new Error('offline'));
     apiMock.archiveConversation.mockRejectedValueOnce(new ConflictError({
       error: 'other conflict',
@@ -285,7 +288,7 @@ describe('Sidebar — ProductConversation navigation', () => {
     );
 
     fireEvent.click(await waitFor(() => getByTitle('Actions')));
-    fireEvent.click(await waitFor(() => getByTitle('Archive conversation "cached-slug"')));
+    fireEvent.click(await waitFor(() => getByTitle('Close conversation "cached-slug"')));
     await waitFor(() => expect(apiMock.archiveConversation).toHaveBeenCalledTimes(1));
     expect(listener).toHaveBeenCalledTimes(0);
     unsubscribe();

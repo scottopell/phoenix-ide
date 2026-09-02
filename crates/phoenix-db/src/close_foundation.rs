@@ -66,6 +66,13 @@ pub enum ProductConversationAdmission {
     History(ProductConversationId),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MessageTargetAdmission {
+    Aggregate(ProductConversationAdmission),
+    StandaloneAvailable,
+    StandaloneArchived,
+}
+
 impl ProductConversationAdmission {
     #[must_use]
     pub fn is_accepted(&self) -> bool {
@@ -954,18 +961,6 @@ fn validate_begin_preconditions(
     let root = &topology.root;
     let latest = &topology.latest;
 
-    if root.archived {
-        return Err(close_precondition("root conversation is archived"));
-    }
-    if topology
-        .members
-        .iter()
-        .any(|member| member.conversation.archived)
-    {
-        return Err(close_precondition(
-            "Close topology contains an archived conversation",
-        ));
-    }
     if root.runtime_role != RuntimeRole::User {
         return Err(close_precondition(
             "root conversation must have runtime_role=user",
@@ -1038,6 +1033,35 @@ impl Database {
     ) -> DbResult<ProductConversationAdmission> {
         let mut tx = self.pool.begin().await?;
         let admission = admit_product_conversation_operation_tx(&mut tx, conversation_id).await?;
+        tx.commit().await?;
+        Ok(admission)
+    }
+
+    pub async fn message_target_admission(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<MessageTargetAdmission> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT conversation.archived, product.kind
+             FROM conversations conversation
+             JOIN product_conversations product
+               ON product.id = conversation.product_conversation_id
+             WHERE conversation.id = ?1",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| DbError::ConversationNotFound(conversation_id.to_string()))?;
+        let admission = if row.try_get::<String, _>("kind")? == "ordinary" {
+            MessageTargetAdmission::Aggregate(
+                admit_product_conversation_operation_tx(&mut tx, conversation_id).await?,
+            )
+        } else if row.try_get::<bool, _>("archived")? {
+            MessageTargetAdmission::StandaloneArchived
+        } else {
+            MessageTargetAdmission::StandaloneAvailable
+        };
         tx.commit().await?;
         Ok(admission)
     }
@@ -1124,6 +1148,25 @@ impl Database {
             return Ok(obligation);
         }
 
+        let lifecycle: Option<String> = sqlx::query_scalar(
+            "SELECT ordinary_lifecycle FROM product_conversations
+             WHERE id = ?1 AND kind = 'ordinary'",
+        )
+        .bind(product_conversation_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if lifecycle.as_deref() == Some("history") {
+            return Err(DbError::CloseFoundationConflict(format!(
+                "ProductConversation {product_conversation_id} is already in History"
+            )));
+        }
+        sqlx::query(
+            "UPDATE conversations SET archived = 0
+             WHERE product_conversation_id = ?1 AND archived = 1",
+        )
+        .bind(product_conversation_id.as_str())
+        .execute(&mut *tx)
+        .await?;
         let topology = read_topology_tx(&mut tx, product_conversation_id)
             .await?
             .ok_or_else(|| DbError::CloseFoundationNotFound(product_conversation_id.to_string()))?;
@@ -1148,7 +1191,9 @@ impl Database {
             )));
         }
 
-        let now = Utc::now().to_rfc3339();
+        let now_utc = Utc::now();
+        let now = now_utc.to_rfc3339();
+        let captured_at_unix_micros = now_utc.timestamp_micros();
         sqlx::query(
             "INSERT INTO close_obligations (
                  attempt_id, product_conversation_id, phase, created_at, updated_at, completed_at
@@ -1158,6 +1203,19 @@ impl Database {
         .bind(product_conversation_id.as_str())
         .bind(ClosePhase::AwaitingBlockerResolution.as_str())
         .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO close_attempt_participants (
+                 attempt_id, product_conversation_id, conversation_id, captured_at_unix_micros
+             )
+             SELECT ?1, ?3, id, ?2 FROM conversations
+             WHERE product_conversation_id = ?3",
+        )
+        .bind(attempt_id)
+        .bind(captured_at_unix_micros)
+        .bind(product_conversation_id.as_str())
         .execute(&mut *tx)
         .await?;
 
@@ -1260,10 +1318,9 @@ impl Database {
              )
              SELECT ?1, turn.turn_id, turn.generation
              FROM durable_turns turn
-             JOIN close_attempt_members member
-               ON member.conversation_id = turn.conversation_id
-             WHERE member.attempt_id = ?1
-               AND member.member_role IN ('latest', 'root_latest')
+             JOIN close_attempt_participants participant
+               ON participant.conversation_id = turn.conversation_id
+             WHERE participant.attempt_id = ?1
                AND turn.owns_conversation = 1 AND turn.terminal_kind IS NULL",
         )
         .bind(attempt_id)
@@ -1504,9 +1561,10 @@ impl Database {
         Self::reconcile_close_direct_turn_settlement_receipts_tx(&mut tx, attempt_id).await?;
         let active_members: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)
-             FROM close_attempt_members member
-             JOIN conversations participant ON participant.id = member.conversation_id
-             WHERE member.attempt_id = ?1
+             FROM close_attempt_participants captured
+             JOIN conversations participant ON participant.id = captured.conversation_id
+             WHERE captured.attempt_id = ?1
+               AND captured.settlement_state = 'live'
                AND (
                  EXISTS (
                    SELECT 1 FROM durable_turns turn
@@ -1523,7 +1581,7 @@ impl Database {
                    SELECT 1 FROM conversation_creation_jobs creation
                    WHERE creation.conversation_id = participant.id
                      AND (
-                       creation.status IN ('accepted', 'claimed', 'retry_scheduled', 'cancelling', 'deletion_pending')
+                       creation.status IN ('accepted', 'claimed', 'retry_scheduled', 'cancelling')
                        OR (creation.status = 'failed' AND EXISTS (
                          SELECT 1 FROM conversation_creation_resource_reservations reservation
                          WHERE reservation.job_id = creation.id AND reservation.status != 'released'
@@ -1582,10 +1640,10 @@ impl Database {
         attempt_id: &str,
     ) -> DbResult<Vec<String>> {
         let rows = sqlx::query_scalar(
-            "SELECT member.conversation_id
-             FROM close_attempt_members member
-             WHERE member.attempt_id = ?1
-             ORDER BY member.conversation_id",
+            "SELECT conversation_id
+             FROM close_attempt_participants
+             WHERE attempt_id = ?1
+             ORDER BY conversation_id",
         )
         .bind(attempt_id)
         .fetch_all(&self.pool)
@@ -1596,6 +1654,23 @@ impl Database {
         Ok(rows)
     }
 
+    pub async fn list_close_retirement_archived_conversation_ids(
+        &self,
+        attempt_id: &str,
+    ) -> DbResult<Vec<String>> {
+        sqlx::query_scalar(
+            "SELECT participant.conversation_id
+             FROM close_attempt_participants participant
+             JOIN conversations conversation ON conversation.id = participant.conversation_id
+             WHERE participant.attempt_id = ?1
+             ORDER BY participant.conversation_id",
+        )
+        .bind(attempt_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     pub async fn wake_delivery_requires_close_settlement_recheck(
         &self,
         workflow_id: phoenix_workflow::WorkflowId,
@@ -1603,9 +1678,9 @@ impl Database {
         let phase: Option<String> = sqlx::query_scalar(
             "SELECT obligation.phase
              FROM wake_bindings binding
-             JOIN close_attempt_members member
-               ON member.conversation_id = binding.conversation_id
-             JOIN close_obligations obligation ON obligation.attempt_id = member.attempt_id
+             JOIN close_attempt_participants participant
+               ON participant.conversation_id = binding.conversation_id
+             JOIN close_obligations obligation ON obligation.attempt_id = participant.attempt_id
              WHERE binding.workflow_id = ?1
                AND obligation.phase IN ('settling_active_work', 'cancel_requested_during_settlement')
              ORDER BY obligation.chronology_ordinal DESC
@@ -1622,15 +1697,76 @@ impl Database {
         ))
     }
 
+    pub async fn suppress_materialized_close_settlement_wakes(
+        &self,
+        attempt_id: &str,
+    ) -> DbResult<usize> {
+        let rows: Vec<i64> = sqlx::query_scalar(
+            "SELECT DISTINCT binding.workflow_id
+             FROM wake_bindings binding
+             JOIN close_attempt_participants participant
+               ON participant.conversation_id = binding.conversation_id
+             JOIN close_obligations obligation ON obligation.attempt_id = participant.attempt_id
+             WHERE participant.attempt_id = ?1
+               AND obligation.phase IN ('settling_active_work', 'cancel_requested_during_settlement')
+               AND EXISTS (
+                 SELECT 1 FROM workflow_deliveries delivery
+                 JOIN wake_delivery_messages message
+                   ON message.workflow_id = delivery.workflow_id
+                  AND message.delivery_id = delivery.delivery_id
+                 WHERE delivery.workflow_id = binding.workflow_id
+                   AND delivery.status = 'Pending'
+               )
+             ORDER BY binding.workflow_id",
+        )
+        .bind(attempt_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let wake_repo = crate::workflow::wake::WakeRepository::new(self.pool.clone());
+        let mut suppressed = 0;
+        for workflow_id in rows {
+            let outcome = wake_repo
+                .resolve_materialized_pending_for_workflow(
+                    phoenix_workflow::WorkflowId(u64::try_from(workflow_id).map_err(|_| {
+                        DbError::Serialization("negative wake workflow id".to_string())
+                    })?),
+                    crate::workflow::wake::WakeResolveMaterializedDecision::Suppress,
+                    phoenix_workflow::Timestamp(u64::try_from(Utc::now().timestamp()).map_err(
+                        |_| {
+                            DbError::Serialization(
+                                "negative wake suppression timestamp".to_string(),
+                            )
+                        },
+                    )?),
+                )
+                .await?;
+            match outcome {
+                Ok(
+                    crate::workflow::wake::WakeResolveMaterializedPendingOutcome::Resolved {
+                        ..
+                    }
+                    | crate::workflow::wake::WakeResolveMaterializedPendingOutcome::AlreadyResolved,
+                ) => suppressed += 1,
+                Ok(crate::workflow::wake::WakeResolveMaterializedPendingOutcome::NothingPending)
+                | Err(
+                    crate::workflow::wake::WakeResolveMaterializedPendingError::NotFullyMaterialized {
+                        ..
+                    },
+                ) => {}
+            }
+        }
+        Ok(suppressed)
+    }
+
     pub async fn cancel_close_settlement_wakes(&self, attempt_id: &str) -> DbResult<usize> {
         let wake_repo = crate::workflow::wake::WakeRepository::new(self.pool.clone());
         let rows: Vec<(i64, String, String)> = sqlx::query_as(
             "SELECT binding.workflow_id, binding.conversation_id, binding.contract_id
              FROM wake_bindings binding
              JOIN workflows workflow ON workflow.workflow_id = binding.workflow_id
-             JOIN close_attempt_members member
-               ON member.conversation_id = binding.conversation_id
-             WHERE member.attempt_id = ?1
+             JOIN close_attempt_participants participant
+               ON participant.conversation_id = binding.conversation_id
+             WHERE participant.attempt_id = ?1
                AND binding.resolved_at IS NULL
                AND workflow.status IN ('Active', 'Cancelling', 'ManualResolution', 'Incompatible', 'DeletionPending')
              ORDER BY binding.workflow_id",
@@ -3944,7 +4080,7 @@ impl Database {
             "UPDATE conversations
              SET archived = 1, updated_at = ?2
              WHERE id IN (
-                 SELECT conversation_id FROM close_attempt_members WHERE attempt_id = ?1
+                 SELECT conversation_id FROM close_attempt_participants WHERE attempt_id = ?1
              )",
         )
         .bind(attempt_id.as_str())
@@ -4879,6 +5015,171 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn begin_close_rejects_history_without_creating_second_attempt() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "history-retry").await;
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = 'history-retry'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let error = db
+            .begin_close_foundation(
+                &product_id("history-retry"),
+                &transcript_id("history-retry"),
+                "history-retry-attempt",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DbError::CloseFoundationConflict(_)));
+        let attempts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_obligations WHERE product_conversation_id = 'history-retry'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn participant_snapshot_rejects_cross_product_identity() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "participant-a").await;
+        create_root(&db, "participant-b").await;
+        let attempt = db
+            .begin_close_foundation(
+                &product_id("participant-a"),
+                &transcript_id("participant-a"),
+                "participant-attempt",
+            )
+            .await
+            .unwrap();
+
+        let error = sqlx::query(
+            "INSERT INTO close_attempt_participants (
+                 attempt_id, product_conversation_id, conversation_id, captured_at_unix_micros
+             ) VALUES (?1, ?2, ?3, 0)",
+        )
+        .bind(attempt.attempt_id().as_str())
+        .bind(product_id("participant-a").as_str())
+        .bind("participant-b")
+        .execute(db.pool())
+        .await
+        .expect_err("cross-product participant identity must be rejected");
+        assert!(error
+            .to_string()
+            .contains("close participant must belong to the attempted ProductConversation"));
+    }
+
+    #[tokio::test]
+    async fn completed_close_outcome_controls_new_participant_admission() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "completed-history").await;
+        create_root(&db, "completed-cancelled").await;
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history'
+             WHERE id = 'completed-history'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let history_parent = db.get_conversation("completed-history").await.unwrap();
+        let history_error = db
+            .create_subagent_conversation(
+                "history-child",
+                "history-child",
+                "/tmp",
+                "completed-history",
+                "test-model",
+                &crate::ConvMode::Direct,
+                phoenix_core::llm_language::LlmLanguage::default(),
+                history_parent.attached_work_scope_id.as_ref(),
+            )
+            .await
+            .expect_err("History aggregate must reject late participants");
+        assert!(
+            history_error
+                .to_string()
+                .contains("non-writable ProductConversation"),
+            "unexpected error: {history_error:?}"
+        );
+        let cancelled_parent = db.get_conversation("completed-cancelled").await.unwrap();
+        db.create_subagent_conversation(
+            "cancelled-child",
+            "cancelled-child",
+            "/tmp",
+            "completed-cancelled",
+            "test-model",
+            &crate::ConvMode::Direct,
+            phoenix_core::llm_language::LlmLanguage::default(),
+            cancelled_parent.attached_work_scope_id.as_ref(),
+        )
+        .await
+        .expect("completed-cancelled Open aggregate remains writable");
+    }
+
+    #[tokio::test]
+    async fn active_participant_cannot_delete_but_completed_close_cascades_cleanup() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "delete-sealed").await;
+        db.begin_close_foundation(
+            &product_id("delete-sealed"),
+            &transcript_id("delete-sealed"),
+            "delete-sealed-attempt",
+        )
+        .await
+        .unwrap();
+
+        let error = sqlx::query("DELETE FROM conversations WHERE id = 'delete-sealed'")
+            .execute(db.pool())
+            .await
+            .expect_err("active sealed participant must be undeletable");
+        assert!(error
+            .to_string()
+            .contains("active Close rejects sealed participant deletion"));
+        sqlx::query(
+            "UPDATE close_obligations
+             SET phase = 'completed', completed_at = updated_at, close_outcome = 'cancelled'
+             WHERE attempt_id = 'delete-sealed-attempt'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM conversations WHERE id = 'delete-sealed'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let participant: (i64, String) = sqlx::query_as(
+            "SELECT COUNT(*), MIN(settlement_state) FROM close_attempt_participants
+             WHERE attempt_id = 'delete-sealed-attempt'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(participant, (1, "live".to_string()));
+        sqlx::query("DELETE FROM close_attempt_members WHERE attempt_id = 'delete-sealed-attempt'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "DELETE FROM close_attempt_participants WHERE attempt_id = 'delete-sealed-attempt'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let participants: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_attempt_participants
+             WHERE attempt_id = 'delete-sealed-attempt'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(participants, 0);
+    }
+
+    #[tokio::test]
     async fn concurrent_begin_returns_domain_conflict_after_immediate_lock() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("close-race.db");
@@ -5032,7 +5333,131 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_turn_settlement_captures_only_latest_authority_and_receipts_exact_release() {
+    async fn active_close_rejects_new_aggregate_participant() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-seals-participants",
+        )
+        .await
+        .unwrap();
+
+        let error = db
+            .create_subagent_conversation(
+                "late-subordinate",
+                "late-subordinate",
+                "/tmp",
+                "root",
+                "test-model",
+                &crate::ConvMode::Direct,
+                phoenix_core::llm_language::LlmLanguage::default(),
+                db.get_conversation("root")
+                    .await
+                    .unwrap()
+                    .attached_work_scope_id
+                    .as_ref(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("non-writable ProductConversation rejects new aggregate participants"));
+        assert!(matches!(
+            db.get_conversation("late-subordinate").await,
+            Err(DbError::ConversationNotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn settlement_captures_live_subordinate_aggregate_participant() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        db.create_subagent_conversation(
+            "subordinate",
+            "subordinate",
+            "/tmp",
+            "root",
+            "test-model",
+            &crate::ConvMode::Direct,
+            phoenix_core::llm_language::LlmLanguage::default(),
+            db.get_conversation("root")
+                .await
+                .unwrap()
+                .attached_work_scope_id
+                .as_ref(),
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO conversation_creation_jobs (
+                 id, conversation_id, message_id, status, stage, attempt, generation,
+                 intent_json, error, accepted_at, provisioning_started_at, completed_at,
+                 failed_at, cancelled_at, deletion_requested_at, created_at, updated_at
+             ) VALUES (
+                 'subordinate-live', 'subordinate', NULL, 'accepted', 'validate_intent', 0, 0,
+                 '{}', NULL, '2025-01-01T00:00:00Z', NULL, NULL,
+                 NULL, NULL, NULL, '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z'
+             )",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-subordinate",
+        )
+        .await
+        .unwrap();
+        db.begin_close_idle_settlement("attempt-subordinate")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.list_close_settlement_conversation_ids("attempt-subordinate")
+                .await
+                .unwrap(),
+            vec!["root".to_string(), "subordinate".to_string()]
+        );
+        assert!(matches!(
+            db.advance_close_settlement_when_quiescent("attempt-subordinate")
+                .await
+                .unwrap_err(),
+            DbError::CloseFoundationPrecondition(message)
+                if message.contains("active durable member obligation")
+        ));
+        let lifecycle: String = sqlx::query_scalar(
+            "SELECT ordinary_lifecycle FROM product_conversations WHERE id = 'root'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(lifecycle, "open");
+
+        sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET status = 'cancelled', cancelled_at = '2025-01-01T00:00:01Z',
+                 updated_at = '2025-01-01T00:00:01Z'
+             WHERE id = 'subordinate-live'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            db.advance_close_settlement_when_quiescent("attempt-subordinate")
+                .await
+                .unwrap()
+                .phase(),
+            ClosePhase::AwaitingRetirementInspection
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_turn_settlement_captures_sealed_aggregate_authority_and_receipts_exact_release()
+    {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "latest", "root").await;
@@ -5079,26 +5504,30 @@ mod tests {
             .list_unsettled_close_direct_turn_settlement_targets("attempt-exact-receipt")
             .await
             .unwrap();
-        assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].conversation_id, "latest");
-        assert_eq!(targets[0].turn_id, 2);
-        assert_eq!(targets[0].expected_generation, 0);
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].conversation_id, "root");
+        assert_eq!(targets[0].turn_id, 1);
+        assert_eq!(targets[1].conversation_id, "latest");
+        assert_eq!(targets[1].turn_id, 2);
+        assert!(targets.iter().all(|target| target.expected_generation == 0));
         sqlx::query(
             "UPDATE durable_turns
              SET generation = generation + 1, terminal_kind = 'Completed', owns_conversation = 0
-             WHERE turn_id = 2",
+             WHERE turn_id IN (1, 2)",
         )
         .execute(db.pool())
         .await
         .unwrap();
-        assert!(db
-            .record_close_direct_turn_settlement_if_released("attempt-exact-receipt", &targets[0])
-            .await
-            .unwrap());
-        assert!(db
-            .record_close_direct_turn_settlement_if_released("attempt-exact-receipt", &targets[0])
-            .await
-            .unwrap());
+        for target in &targets {
+            assert!(db
+                .record_close_direct_turn_settlement_if_released("attempt-exact-receipt", target,)
+                .await
+                .unwrap());
+            assert!(db
+                .record_close_direct_turn_settlement_if_released("attempt-exact-receipt", target,)
+                .await
+                .unwrap());
+        }
         assert!(db
             .list_unsettled_close_direct_turn_settlement_targets("attempt-exact-receipt")
             .await
@@ -5197,7 +5626,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uncaptured_aggregate_participant_remains_a_settlement_blocker() {
+    async fn aggregate_participant_remains_unsettled_until_exact_receipt() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "participant", "root").await;
@@ -5240,14 +5669,19 @@ mod tests {
         db.begin_close_active_work_settlement("attempt-all-members")
             .await
             .unwrap();
-        let target = db
+        let targets = db
             .list_unsettled_close_direct_turn_settlement_targets("attempt-all-members")
             .await
-            .unwrap()
-            .into_iter()
-            .next()
             .unwrap();
-        assert_eq!(target.conversation_id, "latest");
+        assert_eq!(targets.len(), 2);
+        let latest_target = targets
+            .iter()
+            .find(|target| target.conversation_id == "latest")
+            .unwrap();
+        let participant_target = targets
+            .iter()
+            .find(|target| target.conversation_id == "participant")
+            .unwrap();
         sqlx::query(
             "UPDATE durable_turns SET generation = 1, terminal_kind = 'Completed', owns_conversation = 0 WHERE turn_id = 1",
         )
@@ -5255,7 +5689,7 @@ mod tests {
         .await
         .unwrap();
         assert!(db
-            .record_close_direct_turn_settlement_if_released("attempt-all-members", &target)
+            .record_close_direct_turn_settlement_if_released("attempt-all-members", latest_target)
             .await
             .unwrap());
 
@@ -5264,7 +5698,7 @@ mod tests {
                 .await
                 .unwrap_err(),
             DbError::CloseFoundationPrecondition(message)
-                if message.contains("active durable member obligation")
+                if message.contains("unsettled direct-turn receipt")
         ));
         sqlx::query(
             "UPDATE durable_turns SET generation = 1, terminal_kind = 'Completed', owns_conversation = 0 WHERE turn_id = 2",
@@ -5272,12 +5706,177 @@ mod tests {
         .execute(db.pool())
         .await
         .unwrap();
+        assert!(db
+            .record_close_direct_turn_settlement_if_released(
+                "attempt-all-members",
+                participant_target,
+            )
+            .await
+            .unwrap());
         assert_eq!(
             db.advance_close_settlement_when_quiescent("attempt-all-members")
                 .await
                 .unwrap()
                 .phase(),
             ClosePhase::AwaitingRetirementInspection
+        );
+    }
+
+    #[tokio::test]
+    async fn subordinate_direct_turn_is_captured_and_archived_with_aggregate() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        db.create_subagent_conversation(
+            "subordinate-turn",
+            "subordinate-turn",
+            "/tmp",
+            "root",
+            "test-model",
+            &crate::ConvMode::Direct,
+            phoenix_core::llm_language::LlmLanguage::default(),
+            db.get_conversation("root")
+                .await
+                .unwrap()
+                .attached_work_scope_id
+                .as_ref(),
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO workflows (
+                 workflow_id, profile_kind, profile_version, runtime_acceptance_enabled,
+                 external_acceptance_enabled, version, generation, status,
+                 snapshot_codec_family, snapshot_codec_version, snapshot_payload, created_at, updated_at
+             ) VALUES (31, 'direct_turn', 1, 1, 0, 0, 0, 'Active',
+                       'direct_turn', 1, X'00', 1, 1)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO durable_turns (
+                 turn_id, workflow_id, conversation_id, client_turn_key,
+                 prepared_fingerprint, prepared_payload, disposition, generation,
+                 terminal_kind, terminal_reason, owns_conversation, canonical_message_id
+             ) VALUES (31, 31, 'subordinate-turn', 'key', 'fingerprint', X'00',
+                       'Runtime', 0, NULL, NULL, 1, NULL)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            "attempt-subordinate-turn",
+        )
+        .await
+        .unwrap();
+        db.begin_close_idle_settlement("attempt-subordinate-turn")
+            .await
+            .unwrap();
+        let targets = db
+            .list_unsettled_close_direct_turn_settlement_targets("attempt-subordinate-turn")
+            .await
+            .unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].conversation_id, "subordinate-turn");
+
+        sqlx::query(
+            "UPDATE durable_turns
+             SET generation = 1, terminal_kind = 'Cancelled', owns_conversation = 0
+             WHERE turn_id = 31",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert!(db
+            .record_close_direct_turn_settlement_if_released(
+                "attempt-subordinate-turn",
+                &targets[0],
+            )
+            .await
+            .unwrap());
+        assert_eq!(
+            db.advance_close_settlement_when_quiescent("attempt-subordinate-turn")
+                .await
+                .unwrap()
+                .phase(),
+            ClosePhase::AwaitingRetirementInspection
+        );
+    }
+
+    #[tokio::test]
+    async fn deleted_participant_settlement_preserves_other_live_authority() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "deleted-a").await;
+        create_child(&db, "live-b", "deleted-a").await;
+        sqlx::query(
+            "INSERT INTO workflows (
+                 workflow_id, profile_kind, profile_version, runtime_acceptance_enabled,
+                 external_acceptance_enabled, version, generation, status,
+                 snapshot_codec_family, snapshot_codec_version, snapshot_payload, created_at, updated_at
+             ) VALUES (41, 'direct_turn', 1, 1, 0, 0, 0, 'Active', 'direct_turn', 1, X'00', 1, 1);
+             INSERT INTO durable_turns (
+                 turn_id, workflow_id, conversation_id, client_turn_key, prepared_fingerprint,
+                 prepared_payload, disposition, generation, terminal_kind, terminal_reason,
+                 owns_conversation, canonical_message_id
+             ) VALUES (41, 41, 'live-b', 'live-b-turn', 'prepared', X'00', 'Runtime', 0, NULL, NULL, 1, NULL);",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        db.begin_close_foundation(
+            &product_id("deleted-a"),
+            &transcript_id("live-b"),
+            "deleted-a-attempt",
+        )
+        .await
+        .unwrap();
+        db.confirm_close_stop_work("deleted-a-attempt")
+            .await
+            .unwrap();
+        db.begin_close_active_work_settlement("deleted-a-attempt")
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE close_attempt_participants SET settlement_state = 'deleted'
+             WHERE attempt_id = 'deleted-a-attempt' AND conversation_id = 'deleted-a'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let states: Vec<(String, String)> = sqlx::query_as(
+            "SELECT conversation_id, settlement_state FROM close_attempt_participants
+             WHERE attempt_id = 'deleted-a-attempt' ORDER BY conversation_id",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            states,
+            vec![
+                ("deleted-a".to_string(), "deleted".to_string()),
+                ("live-b".to_string(), "live".to_string()),
+            ]
+        );
+        assert!(db
+            .advance_close_settlement_when_quiescent("deleted-a-attempt")
+            .await
+            .is_err());
+        db.request_close_settlement_cancellation("deleted-a-attempt")
+            .await
+            .unwrap();
+        assert!(db
+            .advance_close_settlement_when_quiescent("deleted-a-attempt")
+            .await
+            .is_err());
+        assert_eq!(
+            db.get_close_obligation("deleted-a-attempt")
+                .await
+                .unwrap()
+                .phase(),
+            ClosePhase::CancelRequestedDuringSettlement
         );
     }
 
@@ -5524,6 +6123,48 @@ mod tests {
         assert_eq!(
             obligation.close_outcome(),
             Some(CloseCompletionOutcome::Cancelled)
+        );
+    }
+
+    #[tokio::test]
+    async fn message_admission_uses_typed_aggregate_or_standalone_authority() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "open-archived-drift").await;
+        create_root(&db, "history-target").await;
+        sqlx::query("UPDATE conversations SET archived = 1 WHERE id = 'open-archived-drift'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history'
+             WHERE id = 'history-target'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let coordinator = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE conversations SET archived = 1 WHERE id = ?1")
+            .bind(&coordinator.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            db.message_target_admission("open-archived-drift")
+                .await
+                .unwrap(),
+            MessageTargetAdmission::Aggregate(ProductConversationAdmission::Accepted { .. })
+        ));
+        assert!(matches!(
+            db.message_target_admission("history-target").await.unwrap(),
+            MessageTargetAdmission::Aggregate(ProductConversationAdmission::History(_))
+        ));
+        assert_eq!(
+            db.message_target_admission(&coordinator.id).await.unwrap(),
+            MessageTargetAdmission::StandaloneArchived
         );
     }
 
@@ -6637,38 +7278,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn archived_non_root_member_is_rejected() {
+    async fn open_aggregate_ignores_archived_member_drift() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "latest", "root").await;
         set_archived(&db, "latest", true).await;
-        let error = db
-            .begin_close_foundation(
-                &product_id("root"),
-                &transcript_id("latest"),
-                "attempt-archived-member",
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(error, DbError::CloseFoundationPrecondition(_)));
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("latest"),
+            "attempt-archived-member",
+        )
+        .await
+        .expect("aggregate lifecycle, not legacy archived drift, owns Close admission");
     }
 
     #[tokio::test]
     async fn archived_root_non_user_and_non_user_initiated_are_rejected() {
         let db = Database::open_in_memory().await.unwrap();
-        create_root(&db, "archived").await;
-        set_archived(&db, "archived", true).await;
-        assert!(matches!(
-            db.begin_close_foundation(
-                &product_id("archived"),
-                &transcript_id("archived"),
-                "attempt-a"
-            )
-            .await
-            .unwrap_err(),
-            DbError::CloseFoundationPrecondition(_)
-        ));
-
         create_root(&db, "subagent-parent").await;
         let parent = db.get_conversation("subagent-parent").await.unwrap();
         db.create_conversation_with_project(
@@ -8097,6 +8723,22 @@ mod tests {
         create_root(&db, "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
         create_child(&db, "latest", "root").await;
+        db.create_subagent_conversation(
+            "completion-subordinate",
+            "completion-subordinate",
+            "/tmp",
+            "latest",
+            "test-model",
+            &crate::ConvMode::Direct,
+            phoenix_core::llm_language::LlmLanguage::default(),
+            db.get_conversation("latest")
+                .await
+                .unwrap()
+                .attached_work_scope_id
+                .as_ref(),
+        )
+        .await
+        .unwrap();
         db.begin_close_foundation(
             &product_id("root"),
             &transcript_id("latest"),
@@ -8157,6 +8799,12 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(lifecycle, "history");
+        assert!(
+            db.get_conversation("completion-subordinate")
+                .await
+                .unwrap()
+                .archived
+        );
         let outcome: (String, String, String) = sqlx::query_as(
             "SELECT message_id, message_type, content
              FROM messages WHERE conversation_id = ?1",

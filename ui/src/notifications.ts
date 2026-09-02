@@ -167,15 +167,34 @@ export function getProductConversationListRevision(): number {
 
 const CLOSE_SNAPSHOT_CHANGED_EVENT = 'phoenix:close-snapshot-changed';
 
-export function notifyCloseSnapshotChanged(conversationId: string): void {
-  window.dispatchEvent(new CustomEvent<string>(CLOSE_SNAPSHOT_CHANGED_EVENT, {
-    detail: conversationId,
+export type CloseSnapshotInvalidationSource = 'close' | 'stream';
+
+type CloseSnapshotChangedDetail = {
+  conversationId: string;
+  source: CloseSnapshotInvalidationSource;
+};
+
+export function notifyCloseSnapshotChanged(
+  conversationId: string,
+  source: CloseSnapshotInvalidationSource = 'close',
+): void {
+  window.dispatchEvent(new CustomEvent<CloseSnapshotChangedDetail>(CLOSE_SNAPSHOT_CHANGED_EVENT, {
+    detail: { conversationId, source },
   }));
 }
 
 export function notifyArchiveCloseConflict(conversationId: string, error: unknown): boolean {
   if (!(error instanceof ConflictError)) return false;
-  if (error.detail.error_type !== 'close_loss_confirmation_required') return false;
+  if (![
+    'close_loss_confirmation_required',
+    'close_stop_work_confirmation_required',
+    'close_settlement_in_progress',
+    'close_cancelled',
+    'close_already_history',
+    'close_inspection_failed',
+    'close_retirement_needs_repair',
+    'stale_close_inspection',
+  ].includes(error.detail.error_type)) return false;
   notifyCloseSnapshotChanged(conversationId);
   notifyProductConversationListMayHaveChanged();
   return true;
@@ -183,10 +202,11 @@ export function notifyArchiveCloseConflict(conversationId: string, error: unknow
 
 export function subscribeCloseSnapshotChanged(
   conversationId: string,
-  listener: () => void,
+  listener: (source: CloseSnapshotInvalidationSource) => void,
 ): () => void {
   const handler = (event: Event) => {
-    if ((event as CustomEvent<string>).detail === conversationId) listener();
+    const detail = (event as CustomEvent<CloseSnapshotChangedDetail>).detail;
+    if (detail?.conversationId === conversationId) listener(detail.source);
   };
   window.addEventListener(CLOSE_SNAPSHOT_CHANGED_EVENT, handler);
   return () => window.removeEventListener(CLOSE_SNAPSHOT_CHANGED_EVENT, handler);
