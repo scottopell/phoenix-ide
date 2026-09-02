@@ -887,7 +887,16 @@ impl WorkflowRepository {
                ON product.id = conversations.product_conversation_id
              WHERE disposition = 'Runtime'
                AND (
-                 (product.kind = 'ordinary' AND product.ordinary_lifecycle = 'open')
+                 (product.kind = 'ordinary' AND product.ordinary_lifecycle = 'open'
+                   AND conversations.id = (
+                     SELECT latest.id FROM conversations latest
+                     WHERE latest.product_conversation_id = product.id
+                       AND latest.runtime_role = 'user'
+                       AND latest.parent_conversation_id IS NULL
+                       AND latest.continued_in_conv_id IS NULL
+                       AND latest.archived = 0
+                     ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1
+                   ))
                  OR (product.kind <> 'ordinary' AND conversations.archived = 0)
                )
                AND terminal_kind IS NULL

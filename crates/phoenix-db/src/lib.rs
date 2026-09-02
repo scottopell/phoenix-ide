@@ -6697,8 +6697,9 @@ impl Database {
         let state_json = serde_json::to_string(state)
             .map_err(|error| DbError::Serialization(error.to_string()))?;
         let now = Utc::now().to_rfc3339();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let mut statuses = Vec::with_capacity(messages.len());
+        require_product_conversation_admission_tx(&mut tx, id).await?;
 
         for message in messages {
             if message.conversation_id != id {
