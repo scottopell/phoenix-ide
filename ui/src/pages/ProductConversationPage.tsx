@@ -482,7 +482,7 @@ function ProductConversationPageInner() {
 
   useEffect(() => {
     const projection = latestProjection;
-    if (!projection?.conversationId || projection.isArchived) {
+    if (!projection?.conversationId || snapshot?.ordinary_lifecycle === 'history') {
       setTaskApprovalOverlay(null);
       setApprovalContextWindowUsed(null);
       return;
@@ -511,7 +511,7 @@ function ProductConversationPageInner() {
     return () => {
       cancelled = true;
     };
-  }, [latestProjection]);
+  }, [latestProjection, snapshot?.ordinary_lifecycle]);
 
   useEffect(() => {
     const handler = (event: Event) => {
