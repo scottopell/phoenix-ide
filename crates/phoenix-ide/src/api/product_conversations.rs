@@ -119,7 +119,7 @@ pub async fn list_product_conversation_creations(
             images: job.intent.images,
             updated_at: job.updated_at.to_rfc3339(),
             last_error: job.last_error,
-            allowed_actions: creation_allowed_actions(&job.status),
+            allowed_actions: creation_allowed_actions(&job.status, job.delivery_retryable),
         })
         .collect();
     Ok(Json(ProductConversationCreationRecoveryResponse {
@@ -202,14 +202,17 @@ fn decode_recovery_cursor(cursor: &str) -> Result<(i64, String), AppError> {
     Ok((updated_at, request_id.to_string()))
 }
 
-fn creation_allowed_actions(status: &str) -> Vec<ProductConversationCreationAllowedActionView> {
+fn creation_allowed_actions(
+    status: &str,
+    delivery_retryable: bool,
+) -> Vec<ProductConversationCreationAllowedActionView> {
     let mut actions = Vec::with_capacity(2);
     match status {
         "accepted" | "claimed" | "retry_scheduled" => {
             actions.push(ProductConversationCreationAllowedActionView::Cancel);
             actions.push(ProductConversationCreationAllowedActionView::Delete);
         }
-        "delivery_failed" => {
+        "delivery_failed" if delivery_retryable => {
             actions.push(ProductConversationCreationAllowedActionView::RetryDelivery);
         }
         "failed" | "cancelled" => {
@@ -222,6 +225,21 @@ fn creation_allowed_actions(status: &str) -> Vec<ProductConversationCreationAllo
         _ => {}
     }
     actions
+}
+
+#[cfg(test)]
+mod creation_allowed_actions_tests {
+    use super::{creation_allowed_actions, ProductConversationCreationAllowedActionView};
+
+    #[test]
+    fn terminal_publication_has_no_retry_but_transient_delivery_failure_does() {
+        assert!(creation_allowed_actions("delivery_failed", false).is_empty());
+        assert!(creation_allowed_actions("published", false).is_empty());
+        assert_eq!(
+            creation_allowed_actions("delivery_failed", true),
+            vec![ProductConversationCreationAllowedActionView::RetryDelivery]
+        );
+    }
 }
 
 fn list_row(projection: &ProductConversationListProjection) -> ProductConversationListRow {

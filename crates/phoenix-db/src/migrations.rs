@@ -8051,7 +8051,12 @@ mod migration_094_tests {
                  parent_conversation_id TEXT, continued_in_conv_id TEXT, archived INTEGER
              );
              CREATE TABLE product_creation_jobs (
-                 published_product_id TEXT, status TEXT NOT NULL
+                 request_id TEXT PRIMARY KEY, published_product_id TEXT, status TEXT NOT NULL,
+                 last_error TEXT, delivery_retry_at_unix_micros INTEGER,
+                 claim_worker_id TEXT, claim_token TEXT, claim_lease_until_unix_micros INTEGER
+             );
+             CREATE TABLE close_obligations (
+                 product_conversation_id TEXT, phase TEXT NOT NULL, close_outcome TEXT
              );
              CREATE TABLE workflows (
                  workflow_id INTEGER PRIMARY KEY, profile_kind TEXT NOT NULL,
@@ -8104,9 +8109,11 @@ mod migration_094_tests {
                  ('published-history-row', 'published-history-product', 'user', NULL, NULL, 1),
                  ('coordinator-row', 'coordinator', 'coordinator', NULL, NULL, 0);
              INSERT INTO product_creation_jobs VALUES
-                 ('delivery-pending-product', 'delivery_pending'),
-                 ('delivery-failed-product', 'delivery_failed'),
-                 ('published-history-product', 'published');
+                 ('pending-request', 'delivery-pending-product', 'delivery_pending', NULL, 100, 'worker', 'token', 200),
+                 ('failed-request', 'delivery-failed-product', 'delivery_failed', 'transient', NULL, NULL, NULL, NULL),
+                 ('published-request', 'published-history-product', 'published', NULL, NULL, NULL, NULL, NULL);
+             INSERT INTO close_obligations VALUES
+                 ('delivery-pending-product', 'completed', 'archived');
              INSERT INTO workflows VALUES
                  (11, 'direct_turn', 2, 7, 'Active', 100),
                  (12, 'wake', 2, 7, 'Active', 100);
@@ -8178,6 +8185,52 @@ mod migration_094_tests {
         .unwrap();
 
         sqlx::query(
+            "UPDATE product_creation_jobs
+             SET status = 'delivery_failed', last_error = 'completed_close_won_cutover',
+                 delivery_retry_at_unix_micros = NULL,
+                 claim_worker_id = NULL, claim_token = NULL, claim_lease_until_unix_micros = NULL
+             WHERE status = 'delivery_pending'
+               AND published_product_id IN (
+                 SELECT obligation.product_conversation_id FROM close_obligations obligation
+                 WHERE obligation.phase = 'completed' AND obligation.close_outcome = 'archived'
+                   AND NOT EXISTS (
+                     SELECT 1 FROM conversations latest
+                     WHERE latest.product_conversation_id = obligation.product_conversation_id
+                       AND latest.runtime_role = 'user'
+                       AND latest.parent_conversation_id IS NULL
+                       AND latest.continued_in_conv_id IS NULL
+                       AND latest.archived = 0
+                   )
+               )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let creation_jobs = sqlx::query_as::<_, (String, String, Option<String>)>(
+            "SELECT request_id, status, last_error FROM product_creation_jobs ORDER BY request_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            creation_jobs,
+            vec![
+                (
+                    "failed-request".into(),
+                    "delivery_failed".into(),
+                    Some("transient".into())
+                ),
+                (
+                    "pending-request".into(),
+                    "delivery_failed".into(),
+                    Some("completed_close_won_cutover".into())
+                ),
+                ("published-request".into(), "published".into(), None),
+            ]
+        );
+
+        sqlx::query(
             "UPDATE product_conversations
              SET ordinary_lifecycle = CASE WHEN EXISTS (
                  SELECT 1 FROM conversations latest
@@ -8190,6 +8243,20 @@ mod migration_094_tests {
                  SELECT 1 FROM product_creation_jobs job
                  WHERE job.published_product_id = product_conversations.id
                    AND job.status IN ('delivery_pending', 'delivery_failed')
+                   AND NOT EXISTS (
+                     SELECT 1 FROM close_obligations obligation
+                     WHERE obligation.product_conversation_id = product_conversations.id
+                       AND obligation.phase = 'completed'
+                       AND obligation.close_outcome = 'archived'
+                       AND NOT EXISTS (
+                         SELECT 1 FROM conversations latest
+                         WHERE latest.product_conversation_id = product_conversations.id
+                           AND latest.runtime_role = 'user'
+                           AND latest.parent_conversation_id IS NULL
+                           AND latest.continued_in_conv_id IS NULL
+                           AND latest.archived = 0
+                       )
+                   )
              ) THEN 'open' ELSE 'history' END
              WHERE kind = 'ordinary'",
         )
@@ -8208,7 +8275,7 @@ mod migration_094_tests {
             vec![
                 ("coordinator".into(), None),
                 ("delivery-failed-product".into(), Some("open".into())),
-                ("delivery-pending-product".into(), Some("open".into())),
+                ("delivery-pending-product".into(), Some("history".into())),
                 ("history-product".into(), Some("history".into())),
                 ("open-product".into(), Some("open".into())),
                 ("published-history-product".into(), Some("history".into())),

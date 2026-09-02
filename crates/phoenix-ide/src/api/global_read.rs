@@ -256,8 +256,13 @@ This is a bounded snapshot of current continuation leaves, not an open-work list
                AND EXISTS (
                    SELECT 1
                    FROM conversations owner
+                   LEFT JOIN product_conversations product
+                     ON product.id = owner.product_conversation_id
                    WHERE owner.work_scope_id = environment.id
-                     AND owner.archived = 0
+                     AND (
+                         (product.kind = 'ordinary' AND product.ordinary_lifecycle = 'open')
+                         OR (COALESCE(product.kind, '') <> 'ordinary' AND owner.archived = 0)
+                     )
                      AND json_extract(owner.state, '$.type') NOT IN (
                          'completed', 'failed', 'handed_off', 'creation_failed',
                          'creation_cancelled', 'terminal'
@@ -1370,12 +1375,26 @@ mod tests {
         assert!(service
             .resolve_active_work_scope_bash_target(work_scope_id.as_str())
             .await
+            .is_ok());
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history'
+             WHERE id = (SELECT product_conversation_id FROM conversations WHERE id = 'scope-owner')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert!(service
+            .resolve_active_work_scope_bash_target(work_scope_id.as_str())
+            .await
             .unwrap_err()
             .contains("live owner not found"));
-        sqlx::query("UPDATE conversations SET archived = 0 WHERE id = 'scope-owner'")
-            .execute(db.pool())
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'open'
+             WHERE id = (SELECT product_conversation_id FROM conversations WHERE id = 'scope-owner')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
 
         sqlx::query(
             "UPDATE work_scopes

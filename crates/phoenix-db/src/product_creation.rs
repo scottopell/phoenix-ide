@@ -74,6 +74,7 @@ pub struct ProductCreationJobRecord {
 pub struct ProductCreationRecoveryJobRecord {
     pub request_id: String,
     pub status: String,
+    pub delivery_retryable: bool,
     pub intent: ProductCreationIntent,
     pub published_product_conversation_id: Option<String>,
     pub updated_at: DateTime<Utc>,
@@ -1048,7 +1049,13 @@ impl Database {
             "UPDATE product_creation_jobs
              SET status = 'delivery_pending', delivery_attempt_count = 1,
                  delivery_retry_at_unix_micros = ?1, updated_at_unix_micros = ?1
-             WHERE request_id = ?2 AND status = 'delivery_failed'",
+             WHERE request_id = ?2 AND status = 'delivery_failed'
+               AND EXISTS (
+                 SELECT 1 FROM product_conversations product
+                 WHERE product.id = product_creation_jobs.published_product_id
+                   AND product.kind = 'ordinary'
+                   AND product.ordinary_lifecycle = 'open'
+               )",
         )
         .bind(now)
         .bind(request_id)
@@ -1064,6 +1071,12 @@ impl Database {
         sqlx::query(
             "SELECT request_id, cwd, objective, model, effort, llm_language, status,
                     published_product_id, updated_at_unix_micros, last_error,
+                    CASE WHEN j.status = 'delivery_failed' AND EXISTS (
+                      SELECT 1 FROM product_conversations product
+                      WHERE product.id = j.published_product_id
+                        AND product.kind = 'ordinary'
+                        AND product.ordinary_lifecycle = 'open'
+                    ) THEN 1 ELSE 0 END AS delivery_retryable,
                     COALESCE((SELECT json_group_array(json_object('media_type', ordered.media_type, 'data', ordered.data))
                               FROM (SELECT media_type, data FROM product_creation_job_images
                                     WHERE request_id = j.request_id ORDER BY ordinal) ordered), '[]') AS images_json
@@ -1093,6 +1106,7 @@ impl Database {
             Ok(ProductCreationRecoveryJobRecord {
                 request_id: row.try_get("request_id")?,
                 status: row.try_get("status")?,
+                delivery_retryable: row.try_get("delivery_retryable")?,
                 published_product_conversation_id: row.try_get("published_product_id")?,
                 intent: ProductCreationIntent {
                     cwd: row.try_get("cwd")?,
@@ -3287,6 +3301,10 @@ mod product_creation_tests {
             .unwrap());
         assert!(!db
             .request_product_creation_deletion("req-published-lifecycle", now)
+            .await
+            .unwrap());
+        assert!(!db
+            .retry_failed_product_creation_delivery("req-published-lifecycle")
             .await
             .unwrap());
     }
