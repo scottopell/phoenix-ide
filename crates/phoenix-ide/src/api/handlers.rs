@@ -14430,6 +14430,14 @@ pub(crate) mod hard_delete_cascade_tests {
             build_workmode_chain_with_shared_worktree(&state, &ids).await;
 
         assert!(worktree.exists(), "precondition: worktree must exist");
+        let root = state.db.get_conversation(ids[0]).await.expect("load root");
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1",
+        )
+        .bind(root.product_conversation_id.as_str())
+        .execute(state.db.pool())
+        .await
+        .expect("mark chain history");
 
         let _ = crate::api::chains::delete_chain_handler(
             axum::extract::State(state.clone()),
