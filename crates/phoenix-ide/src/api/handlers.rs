@@ -4998,6 +4998,13 @@ pub(super) fn map_hard_delete_admission(
     }
 }
 
+fn map_admission_db_error(error: DbError) -> AppError {
+    match error {
+        DbError::ConversationNotFound(id) => AppError::NotFound(id),
+        error => AppError::Internal(error.to_string()),
+    }
+}
+
 pub(super) async fn require_hard_delete_admission(
     state: &AppState,
     id: &str,
@@ -5007,7 +5014,7 @@ pub(super) async fn require_hard_delete_admission(
         .db()
         .message_target_admission(id)
         .await
-        .map_err(|error| AppError::Internal(error.to_string()))?;
+        .map_err(map_admission_db_error)?;
     map_hard_delete_admission(&admission)
 }
 
@@ -5021,7 +5028,7 @@ pub(super) async fn require_ordinary_mutation_admission(
         .db()
         .message_target_admission(id)
         .await
-        .map_err(|error| AppError::Internal(error.to_string()))?;
+        .map_err(map_admission_db_error)?;
     map_ordinary_mutation_admission(&admission, operation)
 }
 
@@ -12271,6 +12278,53 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("accept direct turn");
     }
 
+    #[tokio::test]
+    async fn admission_endpoints_map_missing_targets_to_not_found() {
+        let state = make_test_state().await;
+
+        let cancel_error = cancel_conversation(
+            State(state.clone()),
+            Path("missing-cancel-target".to_string()),
+        )
+        .await
+        .expect_err("missing cancellation target");
+        assert!(matches!(cancel_error, AppError::NotFound(_)));
+
+        let delete_error =
+            delete_conversation(State(state), Path("missing-delete-target".to_string()))
+                .await
+                .expect_err("missing delete target");
+        assert!(matches!(delete_error, AppError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn admission_endpoints_map_storage_failures_to_internal() {
+        for operation in ["cancel", "delete"] {
+            let state = make_test_state().await;
+            let id = format!("storage-error-{operation}-target");
+            state
+                .db
+                .create_conversation(&id, &id, "/tmp", true, None, None)
+                .await
+                .expect("create target");
+            sqlx::query("DROP TABLE close_obligations")
+                .execute(state.db.pool())
+                .await
+                .expect("break admission storage");
+
+            let error = if operation == "cancel" {
+                cancel_conversation(State(state), Path(id))
+                    .await
+                    .expect_err("cancellation storage failure")
+            } else {
+                delete_conversation(State(state), Path(id))
+                    .await
+                    .expect_err("delete storage failure")
+            };
+            assert!(matches!(error, AppError::Internal(_)));
+        }
+    }
+
     #[test]
     fn ordinary_and_hard_delete_admission_outcomes_are_complementary() {
         use phoenix_core::domain::close::{CloseAttemptId, ClosePhase};
@@ -13402,6 +13456,21 @@ pub(crate) mod hard_delete_cascade_tests {
         }
     }
 
+    async fn mark_chain_history(state: &AppState, member_id: &str) {
+        let conversation = state
+            .db
+            .get_conversation(member_id)
+            .await
+            .expect("load chain member");
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1",
+        )
+        .bind(conversation.product_conversation_id.as_str())
+        .execute(state.db.pool())
+        .await
+        .expect("mark chain History");
+    }
+
     /// Per-conversation `delete` must refuse a chain member with a 409
     /// pointing at the chain root. Solo conversations remain deletable.
     #[tokio::test]
@@ -13452,6 +13521,7 @@ pub(crate) mod hard_delete_cascade_tests {
     async fn chain_delete_handler_removes_every_member() {
         let state = make_test_state().await;
         build_chain_for_test(&state, &["cd-a", "cd-b", "cd-c"]).await;
+        mark_chain_history(&state, "cd-a").await;
 
         let _ = crate::api::chains::delete_chain_handler(
             axum::extract::State(state.clone()),
@@ -13464,6 +13534,67 @@ pub(crate) mod hard_delete_cascade_tests {
             assert!(
                 state.db.get_conversation(id).await.is_err(),
                 "{id} must be gone after chain delete"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn chain_delete_rejects_open_and_close_fenced_aggregates_without_cleanup() {
+        for (prefix, expected_error) in [
+            ("open-chain", "target_unavailable"),
+            ("closing-chain", "close_admission_fenced"),
+        ] {
+            let state = make_test_state().await;
+            let root_id = format!("{prefix}-a");
+            let leaf_id = format!("{prefix}-b");
+            build_chain_for_test(&state, &[&root_id, &leaf_id]).await;
+            let root = state
+                .db
+                .get_conversation(&root_id)
+                .await
+                .expect("load chain root");
+            let root_scope = conversation_scope(&state, &root_id).await;
+            let _ = state
+                .runtime
+                .bash_handles()
+                .get_or_create(&root_scope)
+                .await;
+
+            if expected_error == "close_admission_fenced" {
+                state
+                    .db
+                    .begin_close_foundation(
+                        &root.product_conversation_id,
+                        &phoenix_core::domain::close::TranscriptConversationId::parse(
+                            leaf_id.clone(),
+                        )
+                        .expect("transcript id"),
+                        &format!("{prefix}-attempt"),
+                    )
+                    .await
+                    .expect("begin Close");
+            }
+
+            let error = crate::api::chains::delete_chain_handler(
+                axum::extract::State(state.clone()),
+                axum::extract::Path(root_id.clone()),
+            )
+            .await
+            .expect_err("chain admission must reject delete");
+            assert!(matches!(
+                error,
+                AppError::Conflict(detail) if detail.error_type == expected_error
+            ));
+            assert!(state.db.get_conversation(&root_id).await.is_ok());
+            assert!(state.db.get_conversation(&leaf_id).await.is_ok());
+            assert!(
+                state
+                    .runtime
+                    .bash_handles()
+                    .reserve_spawn(&root_scope)
+                    .await
+                    .is_ok(),
+                "rejected chain delete must not start resource cleanup"
             );
         }
     }
@@ -13502,6 +13633,7 @@ pub(crate) mod hard_delete_cascade_tests {
     async fn chain_delete_refuses_if_any_member_busy() {
         let state = make_test_state().await;
         build_chain_for_test(&state, &["cb-a", "cb-b"]).await;
+        mark_chain_history(&state, "cb-a").await;
         state
             .db
             .update_conversation_state("cb-b", &ConvState::LlmRequesting { attempt: 0 })

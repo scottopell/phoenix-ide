@@ -37,7 +37,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use ts_rs::TS;
 
-use super::handlers::{run_hard_delete_cascade, AppError};
+use super::handlers::{require_hard_delete_admission, run_hard_delete_cascade, AppError};
 use super::types::{ConflictErrorResponse, SuccessResponse};
 use super::wire::ChainSseWireEvent;
 use super::AppState;
@@ -409,6 +409,8 @@ async fn lock_chain_admissions(
 
 /// `DELETE /api/chains/:rootId` — hard-delete every member of the chain.
 ///
+/// Acquires every member's admission guard, then admits the aggregate exactly
+/// once through its root. Only History chains proceed to preflight and cleanup.
 /// Pre-checks every member's busy state up front and refuses the whole
 /// operation if any member is busy (atomic refuse — no partial wipe).
 /// Iterates root-first so the existing FK on `continued_in_conv_id`
@@ -429,6 +431,7 @@ pub async fn delete_chain_handler(
         .await
         .map_err(db_to_app)?;
     let _admission_guards = lock_chain_admissions(&state, &member_ids).await;
+    require_hard_delete_admission(&state, &root_id).await?;
     for id in &member_ids {
         super::handlers::refuse_if_coordinator(&state, id, "delete").await?;
     }
@@ -459,12 +462,6 @@ pub async fn delete_chain_handler(
         }
     }
 
-    // TOCTOU note: the busy precheck is best-effort. A member can transition
-    // to busy after this loop and before/during its individual cascade, in
-    // which case `run_hard_delete_cascade` returns a 409 mid-iteration with
-    // earlier members already deleted. Same shape as per-conversation delete
-    // (which has no precheck at all). A locking mitigation belongs in a
-    // future task — not in this PR.
     for id in &member_ids {
         run_hard_delete_cascade(&state, id).await?;
     }
