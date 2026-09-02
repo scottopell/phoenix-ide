@@ -4454,7 +4454,11 @@ async fn send_chat(
     Path(id): Path<String>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, AppError> {
-    let admission = state.runtime.conversation_admission(&id).await;
+    let admission = state
+        .runtime
+        .mutation_admission(&id)
+        .await
+        .map_err(map_admission_db_error)?;
     let _admission_guard = admission.lock().await;
     let service = crate::send_chat_service::SendChatApplicationService::new(
         state.db.clone(),
@@ -4741,7 +4745,11 @@ async fn cancel_conversation_inner(
     state: AppState,
     id: String,
 ) -> Result<Json<CancelResponse>, AppError> {
-    let admission = state.runtime.conversation_admission(&id).await;
+    let admission = state
+        .runtime
+        .mutation_admission(&id)
+        .await
+        .map_err(map_admission_db_error)?;
     let _admission_guard = admission.lock().await;
     require_ordinary_mutation_admission(&state, &id, "conversation cancellation").await?;
     // Provisioning cancellation is DB-owned because no conversation runtime
@@ -4998,7 +5006,7 @@ pub(super) fn map_hard_delete_admission(
     }
 }
 
-fn map_admission_db_error(error: DbError) -> AppError {
+pub(super) fn map_admission_db_error(error: DbError) -> AppError {
     match error {
         DbError::ConversationNotFound(id) => AppError::NotFound(id),
         error => AppError::Internal(error.to_string()),
@@ -5046,7 +5054,11 @@ async fn upgrade_conversation_model(
     Json(req): Json<UpgradeModelRequest>,
 ) -> Result<Json<SuccessResponse>, AppError> {
     // Validate the target model exists
-    let admission = state.runtime.conversation_admission(&id).await;
+    let admission = state
+        .runtime
+        .mutation_admission(&id)
+        .await
+        .map_err(map_admission_db_error)?;
     let _admission = admission.lock().await;
 
     if state.llm_registry.get(&req.model).is_none() {
@@ -5160,7 +5172,11 @@ async fn trigger_continuation(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
-    let admission = state.runtime.conversation_admission(&id).await;
+    let admission = state
+        .runtime
+        .mutation_admission(&id)
+        .await
+        .map_err(map_admission_db_error)?;
     let _admission = admission.lock().await;
     require_ordinary_mutation_admission(&state, &id, "continuation retry").await?;
     let effective_state = match state.runtime.effective_conversation_state(&id).await {
@@ -5534,7 +5550,11 @@ async fn respond_to_question(
     Path(id): Path<String>,
     Json(req): Json<RespondToQuestionPayload>,
 ) -> Result<Json<SuccessResponse>, AppError> {
-    let admission = state.runtime.conversation_admission(&id).await;
+    let admission = state
+        .runtime
+        .mutation_admission(&id)
+        .await
+        .map_err(map_admission_db_error)?;
     let _admission_guard = admission.lock().await;
 
     let conv = state
@@ -5572,7 +5592,11 @@ async fn dismiss_question(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
-    let admission = state.runtime.conversation_admission(&id).await;
+    let admission = state
+        .runtime
+        .mutation_admission(&id)
+        .await
+        .map_err(map_admission_db_error)?;
     let _admission_guard = admission.lock().await;
 
     let conv = state
@@ -5612,7 +5636,11 @@ async fn dismiss_error(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
-    let admission = state.runtime.conversation_admission(&id).await;
+    let admission = state
+        .runtime
+        .mutation_admission(&id)
+        .await
+        .map_err(map_admission_db_error)?;
     let _admission_guard = admission.lock().await;
 
     let conv = state
@@ -5710,7 +5738,11 @@ async fn archive_conversation(
 ) -> Result<Json<SuccessResponse>, AppError> {
     refuse_if_chain_member(&state, &id, "archive").await?;
     refuse_if_coordinator(&state, &id, "archive").await?;
-    let admission = state.runtime.conversation_admission(&id).await;
+    let admission = state
+        .runtime
+        .mutation_admission(&id)
+        .await
+        .map_err(map_admission_db_error)?;
     let _admission_guard = admission.lock().await;
     super::lifecycle_handlers::close_legacy_compat(&state, &id, "archive").await?;
     Ok(Json(SuccessResponse { success: true }))
@@ -6094,7 +6126,11 @@ async fn delete_conversation(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
-    let admission = state.runtime.conversation_admission(&id).await;
+    let admission = state
+        .runtime
+        .mutation_admission(&id)
+        .await
+        .map_err(map_admission_db_error)?;
     let _admission_guard = admission.lock().await;
     let conv = state
         .runtime

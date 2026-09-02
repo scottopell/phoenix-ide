@@ -133,7 +133,7 @@ pub(crate) async fn approve_task(
         .runtime
         .mutation_admission(&id)
         .await
-        .map_err(|error| AppError::Internal(error.to_string()))?;
+        .map_err(super::handlers::map_admission_db_error)?;
     let _admission_guard = admission.lock().await;
     // 1. Validate conversation exists and is in AwaitingTaskApproval state
     let conv = state
@@ -179,7 +179,7 @@ pub(crate) async fn reject_task(
         .runtime
         .mutation_admission(&id)
         .await
-        .map_err(|error| AppError::Internal(error.to_string()))?;
+        .map_err(super::handlers::map_admission_db_error)?;
     let _admission_guard = admission.lock().await;
     // Validate conversation exists and is in AwaitingTaskApproval state
     let conv = state
@@ -220,7 +220,7 @@ pub(crate) async fn task_feedback(
         .runtime
         .mutation_admission(&id)
         .await
-        .map_err(|error| AppError::Internal(error.to_string()))?;
+        .map_err(super::handlers::map_admission_db_error)?;
     let _admission_guard = admission.lock().await;
     // Validate conversation exists and is in AwaitingTaskApproval state
     let conv = state
@@ -478,7 +478,7 @@ pub(crate) async fn confirm_close_stop_work(
         .runtime
         .mutation_admission(&id)
         .await
-        .map_err(|error| AppError::Internal(error.to_string()))?;
+        .map_err(super::handlers::map_admission_db_error)?;
     let _guard = admission.lock().await;
     let transcript = state
         .db
@@ -571,7 +571,7 @@ pub(crate) async fn cancel_close_before_retirement(
         .runtime
         .mutation_admission(&id)
         .await
-        .map_err(|error| AppError::Internal(error.to_string()))?;
+        .map_err(super::handlers::map_admission_db_error)?;
     let _guard = admission.lock().await;
     let transcript = state
         .db
@@ -974,7 +974,7 @@ pub(crate) async fn abandon_task(
         .runtime
         .mutation_admission(&id)
         .await
-        .map_err(|error| AppError::Internal(error.to_string()))?;
+        .map_err(super::handlers::map_admission_db_error)?;
     let _admission = admission.lock().await;
     run_legacy_close_compat(&state, &id, "abandon").await?;
     Ok(Json(SuccessResponse { success: true }))
@@ -995,7 +995,7 @@ pub(crate) async fn mark_merged(
         .runtime
         .mutation_admission(&id)
         .await
-        .map_err(|error| AppError::Internal(error.to_string()))?;
+        .map_err(super::handlers::map_admission_db_error)?;
     let _admission = admission.lock().await;
     run_legacy_close_compat(&state, &id, "mark as merged").await?;
     Ok(Json(SuccessResponse { success: true }))
