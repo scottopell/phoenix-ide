@@ -3932,6 +3932,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn endpoint_absence_without_registered_resource_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let registry = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), true);
+        let work_scope = scope("endpoint-only-absence");
+        let permit = registry
+            .begin_retirement_after_discovery(
+                &work_scope,
+                &PersistentTmuxDiscovery::EndpointAbsent,
+                close_deadline(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            registry.complete_retirement(&permit).await.unwrap(),
+            TmuxRetirementOutcome::AbsenceVerified
+        );
+    }
+
+    #[tokio::test]
     async fn unlinked_live_server_is_not_accepted_as_absent() {
         if which::which("tmux").is_err() {
             return;
