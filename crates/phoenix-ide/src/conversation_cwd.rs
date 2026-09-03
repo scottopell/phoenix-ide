@@ -515,9 +515,16 @@ mod tests {
     #[test]
     fn rejects_missing_product_directory_outside_allowed_roots() {
         let home = tempfile::tempdir().expect("home");
-        let requested = std::env::current_dir()
+        let filesystem_root = std::env::current_dir()
             .expect("current directory")
-            .join(format!("missing-product-cwd-{}", uuid::Uuid::new_v4()));
+            .canonicalize()
+            .expect("canonical current directory")
+            .ancestors()
+            .last()
+            .expect("filesystem root")
+            .to_path_buf();
+        let requested =
+            filesystem_root.join(format!("missing-product-cwd-{}", uuid::Uuid::new_v4()));
 
         let error = normalize_product_creation_cwd_intent(requested.to_string_lossy(), home.path())
             .expect_err("outside path rejected");
@@ -525,7 +532,6 @@ mod tests {
         assert!(error.to_string().contains("server home directory or /tmp"));
         assert!(!requested.exists());
     }
-
     #[test]
     fn accepts_deep_directory() {
         let tmp = tempfile::tempdir().expect("tempdir");
