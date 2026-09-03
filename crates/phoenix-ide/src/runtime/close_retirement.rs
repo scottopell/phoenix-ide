@@ -418,9 +418,10 @@ impl RuntimeManager {
             }
         };
         let tmux = match tmux_discovery {
-            PersistentTmuxDiscovery::Absent => match self
+            discovery @ (PersistentTmuxDiscovery::EndpointAbsent
+            | PersistentTmuxDiscovery::ServerAbsent) => match self
                 .tmux_registry()
-                .begin_retirement(&key, None, None, tmux_expires)
+                .begin_retirement_after_discovery(&key, &discovery, tmux_expires)
                 .await
             {
                 Ok(permit) => permit,
