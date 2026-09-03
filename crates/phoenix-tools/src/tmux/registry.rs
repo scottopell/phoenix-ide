@@ -2464,12 +2464,16 @@ impl TmuxRegistry {
         } else {
             None
         };
-        if matches!(pre_teardown, Some(PreTeardownSocket::NotSocket)) {
+        if permit.authority != TmuxRetirementAuthority::ServerAbsenceVerified
+            && matches!(pre_teardown, Some(PreTeardownSocket::NotSocket))
+        {
             return Ok(TmuxRetirementOutcome::IdentityNotProven {
                 reason: "tmux socket incarnation was unavailable before exact teardown".to_string(),
             });
         }
-        let kill_failure = if matches!(pre_teardown, Some(PreTeardownSocket::Incarnation(_))) {
+        let kill_failure = if permit.authority != TmuxRetirementAuthority::ServerAbsenceVerified
+            && matches!(pre_teardown, Some(PreTeardownSocket::Incarnation(_)))
+        {
             let token_test = format!(
                 "#{{==:#{{E:{SERVER_TOKEN_VAR}}},{}}}",
                 permit.instance.server_token
@@ -2535,11 +2539,9 @@ impl TmuxRegistry {
             ExactProcessState::Unproven
         };
         let verified = match (kill_failure.as_ref(), pre_teardown, permit.authority) {
-            (
-                None,
-                Some(PreTeardownSocket::Absent),
-                TmuxRetirementAuthority::ServerAbsenceVerified,
-            ) => TmuxRetirementOutcome::AbsenceVerified,
+            (None, _, TmuxRetirementAuthority::ServerAbsenceVerified) => {
+                TmuxRetirementOutcome::AbsenceVerified
+            }
             (None, Some(PreTeardownSocket::Absent), TmuxRetirementAuthority::ExactServer)
                 if exact_process_exit == ExactProcessState::DeadOrReused =>
             {
@@ -3977,6 +3979,33 @@ mod tests {
         ));
         assert!(registry.get_existing(&work_scope).await.is_some());
         owner.shutdown();
+    }
+
+    #[tokio::test]
+    async fn verified_server_absence_with_stale_socket_skips_teardown() {
+        let tmp = TempDir::new().unwrap();
+        let registry = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), true);
+        let work_scope = scope("verified-absent-stale-socket");
+        let socket_path = registry.derived_socket_path(&work_scope);
+        let _ = registry
+            .get_or_insert(&work_scope, socket_path.clone())
+            .await;
+        std::fs::write(&socket_path, b"stale endpoint").unwrap();
+        let permit = registry
+            .begin_retirement_after_discovery(
+                &work_scope,
+                &PersistentTmuxDiscovery::ServerAbsent,
+                close_deadline(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            registry.complete_retirement(&permit).await.unwrap(),
+            TmuxRetirementOutcome::Retired
+        );
+        assert_eq!(std::fs::read(&socket_path).unwrap(), b"stale endpoint");
+        assert!(registry.get_existing(&work_scope).await.is_none());
     }
 
     #[tokio::test]
