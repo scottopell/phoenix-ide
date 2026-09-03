@@ -2185,7 +2185,10 @@ impl TmuxRegistry {
             {
                 (authority, None)
             }
-            Some((_, None, Some(token))) if token == server.server_token => {
+            Some((_, None, Some(token)))
+                if authority != TmuxRetirementAuthority::ExactServer
+                    && token == server.server_token =>
+            {
                 return Err(TmuxRetirementOutcome::IdentityNotProven {
                     reason: "live tmux server appeared after verified absence discovery"
                         .to_string(),
