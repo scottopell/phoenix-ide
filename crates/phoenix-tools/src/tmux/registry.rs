@@ -2099,6 +2099,7 @@ impl TmuxRegistry {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn begin_retirement_inner(
         &self,
         work_scope: &ResourceScopeKey,
@@ -2156,7 +2157,14 @@ impl TmuxRegistry {
                 expires,
             )
             .await;
-            Some((identity, process))
+            let token = if process.is_none() {
+                read_server_token_until(&identity.socket_path, expires)
+                    .await
+                    .flatten()
+            } else {
+                None
+            };
+            Some((identity, process, token))
         };
         let Ok(mut server) = tokio::time::timeout_at(expires, entry.server.write()).await else {
             return Err(TmuxRetirementOutcome::RemovalFailed {
@@ -2165,16 +2173,28 @@ impl TmuxRegistry {
         };
         let (authority, exact_process) = match observed_entry {
             None => (TmuxRetirementAuthority::ServerAbsenceVerified, None),
-            Some((identity, _)) if server.exact_identity() != identity => {
+            Some((identity, _, _)) if server.exact_identity() != identity => {
                 return Err(TmuxRetirementOutcome::IdentityNotProven {
                     reason: "tmux server identity changed after retirement discovery".to_string(),
                 });
             }
-            Some((_, Some(process))) => (TmuxRetirementAuthority::ExactServer, Some(process)),
-            Some((_, None)) if authority == TmuxRetirementAuthority::ExactServer => {
+            Some((_, Some(process), _)) => (TmuxRetirementAuthority::ExactServer, Some(process)),
+            Some((_, None, token))
+                if authority == TmuxRetirementAuthority::ServerAbsenceVerified
+                    && token.is_none() =>
+            {
                 (authority, None)
             }
-            Some((_, None)) => {
+            Some((_, None, Some(token))) if token == server.server_token => {
+                return Err(TmuxRetirementOutcome::IdentityNotProven {
+                    reason: "live tmux server appeared after verified absence discovery"
+                        .to_string(),
+                });
+            }
+            Some((_, None, _)) if authority == TmuxRetirementAuthority::ExactServer => {
+                (authority, None)
+            }
+            Some((_, None, _)) => {
                 return Err(TmuxRetirementOutcome::IdentityNotProven {
                     reason:
                         "tmux server appeared after absence discovery without exact process authority"
@@ -2465,7 +2485,12 @@ impl TmuxRegistry {
                 reason: "tmux socket incarnation was unavailable before exact teardown".to_string(),
             });
         }
+        let process_state_before_teardown = permit
+            .exact_process
+            .map(exact_process_state)
+            .unwrap_or(ExactProcessState::Unproven);
         let kill_failure = if permit.authority != TmuxRetirementAuthority::ServerAbsenceVerified
+            && process_state_before_teardown != ExactProcessState::DeadOrReused
             && matches!(pre_teardown, Some(PreTeardownSocket::Incarnation(_)))
         {
             let token_test = format!(
@@ -2518,13 +2543,7 @@ impl TmuxRegistry {
         };
         drop(server);
 
-        let exact_process_exit = if matches!(
-            (pre_teardown, permit.authority),
-            (
-                Some(PreTeardownSocket::Absent),
-                TmuxRetirementAuthority::ExactServer
-            )
-        ) {
+        let exact_process_exit = if permit.authority == TmuxRetirementAuthority::ExactServer {
             match permit.exact_process {
                 Some(process) => exact_process_exit_until(process, permit.expires).await,
                 None => ExactProcessState::Unproven,
@@ -2536,7 +2555,7 @@ impl TmuxRegistry {
             (None, _, TmuxRetirementAuthority::ServerAbsenceVerified) => {
                 TmuxRetirementOutcome::AbsenceVerified
             }
-            (None, Some(PreTeardownSocket::Absent), TmuxRetirementAuthority::ExactServer)
+            (_, _, TmuxRetirementAuthority::ExactServer)
                 if exact_process_exit == ExactProcessState::DeadOrReused =>
             {
                 TmuxRetirementOutcome::AbsenceVerified
@@ -2555,7 +2574,9 @@ impl TmuxRegistry {
             _ => self.verify_exact_absence(permit).await?,
         };
         if let Some(failure) = kill_failure {
-            return Ok(failure);
+            if exact_process_exit != ExactProcessState::DeadOrReused {
+                return Ok(failure);
+            }
         }
 
         match verified {
