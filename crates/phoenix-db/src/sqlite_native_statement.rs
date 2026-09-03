@@ -347,10 +347,6 @@ impl NativeStatementCallbackContext {
                 kind: self.prepare_state.kind,
             }
         };
-        self.reset_prepare_state();
-        self.prepare_pending = false;
-        self.prepare_boundary_seen = false;
-        self.prepare_ambiguous = false;
         self.cache_statement_metadata(
             statement_identity,
             metadata.category,
@@ -358,6 +354,10 @@ impl NativeStatementCallbackContext {
             reprepare_count,
             metadata.kind,
         );
+        self.reset_prepare_state();
+        self.prepare_pending = false;
+        self.prepare_boundary_seen = false;
+        self.prepare_ambiguous = false;
         metadata
     }
 
@@ -1984,6 +1984,54 @@ mod tests {
     }
 
     #[test]
+    fn fresh_prepare_replaces_colliding_cached_statement_with_known_metadata() {
+        let collector = SqliteWorkloadCollector::new();
+        let mut context = NativeStatementCallbackContext::new(collector);
+        let evicted = 8usize;
+        let collision = evicted + (STATEMENT_CACHE_SIZE << 3);
+        context.cache_statement_metadata(
+            evicted,
+            SqliteWorkloadCategory::PrProjectData,
+            Some(SqliteAccessKind::Read),
+            0,
+            StatementKind::Ordinary,
+        );
+        context.note_statement_kind(StatementKind::TransactionControl);
+        context.note_prepare_metadata(
+            SqliteWorkloadCategory::Maintenance,
+            Some(SqliteAccessKind::Write),
+        );
+
+        let metadata = context.take_prepare_metadata_for_statement(collision, 1);
+
+        assert_eq!(
+            metadata,
+            CachedStatementMetadata {
+                statement_identity: collision,
+                category: SqliteWorkloadCategory::Maintenance,
+                access: Some(SqliteAccessKind::Write),
+                reprepare_count: 1,
+                kind: StatementKind::TransactionControl,
+            }
+        );
+        assert!(context.lookup_statement_metadata(evicted).is_none());
+        assert_eq!(context.lookup_statement_metadata(collision), Some(metadata));
+        assert_eq!(
+            context.prepare_state.category,
+            SqliteWorkloadCategory::Other
+        );
+        assert_eq!(context.prepare_state.access, None);
+        assert!(matches!(
+            context.prepare_state.kind,
+            StatementKind::Ordinary
+        ));
+        assert!(!context.prepare_pending);
+        assert!(!context.prepare_boundary_seen);
+        assert!(!context.prepare_ambiguous);
+        assert_eq!(report_now(&context.collector).classification_gap_count, 0);
+    }
+
+    #[test]
     fn first_run_without_fresh_metadata_replaces_reused_pointer_with_other() {
         let collector = SqliteWorkloadCollector::new();
         let mut context = NativeStatementCallbackContext::new(collector.clone());
@@ -2116,11 +2164,17 @@ mod tests {
             SqliteWorkloadCategory::DurableWorkflows,
             Some(SqliteAccessKind::Read),
         );
+        let collision_metadata = context.metadata_for_statement_run(collision, 0, 0);
         assert_eq!(
-            context.metadata_for_statement_run(collision, 0, 0).category,
+            collision_metadata.category,
             SqliteWorkloadCategory::DurableWorkflows,
         );
+        assert_eq!(
+            context.lookup_statement_metadata(collision),
+            Some(collision_metadata)
+        );
         assert!(context.lookup_statement_metadata(evicted).is_none());
+        assert_eq!(report_now(&collector).classification_gap_count, 0);
 
         context.note_prepare_metadata(SqliteWorkloadCategory::Fts, Some(SqliteAccessKind::Read));
         let stale = context.metadata_for_statement_run(evicted, 1, 0);
@@ -2130,7 +2184,7 @@ mod tests {
         let owner = context.metadata_for_statement_run(pending_owner, 0, 0);
         assert_eq!(owner.category, SqliteWorkloadCategory::Fts);
         assert_eq!(owner.access, Some(SqliteAccessKind::Read));
-        assert!(report_now(&collector).classification_gap_count >= 2);
+        assert_eq!(report_now(&collector).classification_gap_count, 1);
     }
 
     #[test]
