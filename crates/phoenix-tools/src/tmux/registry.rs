@@ -2164,7 +2164,7 @@ impl TmuxRegistry {
             });
         };
         let (authority, exact_process) = match observed_entry {
-            None => (authority, None),
+            None => (TmuxRetirementAuthority::ServerAbsenceVerified, None),
             Some((identity, _)) if server.exact_identity() != identity => {
                 return Err(TmuxRetirementOutcome::IdentityNotProven {
                     reason: "tmux server identity changed after retirement discovery".to_string(),
@@ -2172,9 +2172,6 @@ impl TmuxRegistry {
             }
             Some((_, Some(process))) => (TmuxRetirementAuthority::ExactServer, Some(process)),
             Some((_, None)) if authority == TmuxRetirementAuthority::ExactServer => {
-                (authority, None)
-            }
-            Some((_, None)) if authority == TmuxRetirementAuthority::ServerAbsenceVerified => {
                 (authority, None)
             }
             Some((_, None)) => {
@@ -2414,9 +2411,6 @@ impl TmuxRegistry {
         &self,
         permit: &TmuxRetirementPermit,
     ) -> Result<TmuxRetirementOutcome, TmuxError> {
-        if !permit.had_entry {
-            return Ok(TmuxRetirementOutcome::AbsenceVerified);
-        }
         let deadline = RetirementDeadline::new(permit.expires);
         let current_entry = match deadline
             .get_existing(self, &permit.work_scope, "retirement complete initial")
@@ -3934,7 +3928,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn endpoint_absence_without_registered_resource_is_idempotent() {
+    async fn endpoint_absence_without_registered_resource_retires_placeholder() {
         let tmp = TempDir::new().unwrap();
         let registry = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), true);
         let work_scope = scope("endpoint-only-absence");
@@ -3949,8 +3943,9 @@ mod tests {
 
         assert_eq!(
             registry.complete_retirement(&permit).await.unwrap(),
-            TmuxRetirementOutcome::AbsenceVerified
+            TmuxRetirementOutcome::Retired
         );
+        assert!(registry.get_existing(&work_scope).await.is_none());
     }
 
     #[tokio::test]
@@ -3987,9 +3982,6 @@ mod tests {
         let registry = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), true);
         let work_scope = scope("verified-absent-stale-socket");
         let socket_path = registry.derived_socket_path(&work_scope);
-        let _ = registry
-            .get_or_insert(&work_scope, socket_path.clone())
-            .await;
         std::fs::write(&socket_path, b"stale endpoint").unwrap();
         let permit = registry
             .begin_retirement_after_discovery(
@@ -4080,6 +4072,11 @@ mod tests {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => panic!("remove exact retired socket: {error}"),
         }
+        registry
+            .inner
+            .write()
+            .await
+            .remove(&work_scope.stable_key());
         let permit = registry
             .begin_retirement_after_discovery(&work_scope, &discovery, close_deadline())
             .await
