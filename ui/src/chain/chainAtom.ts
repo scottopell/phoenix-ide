@@ -33,6 +33,7 @@ export interface InflightQa {
 export interface ChainAtom {
   chain: ChainView | null;
   loadError: string | null;
+  submitError: string | null;
   loading: boolean;
   /** Keyed by chain_qa_id; values include question, answer accumulator,
    *  preToken state, and any error from the chain SSE stream. */
@@ -51,6 +52,7 @@ export function createInitialChainAtom(): ChainAtom {
   return {
     chain: null,
     loadError: null,
+    submitError: null,
     loading: true,
     inflight: {},
     inflightOrder: [],
@@ -127,7 +129,7 @@ export function chainReducer(atom: ChainAtom, action: ChainAction): ChainAtom {
 
     case 'SUBMIT_BEGIN': {
       if (atom.submitting) return atom;
-      return { ...atom, submitting: true };
+      return { ...atom, submitting: true, submitError: null };
     }
 
     case 'OPTIMISTIC_INFLIGHT_ADD': {
@@ -156,15 +158,11 @@ export function chainReducer(atom: ChainAtom, action: ChainAction): ChainAtom {
 
     case 'SUBMIT_OK': {
       if (!atom.submitting) return atom;
-      return { ...atom, submitting: false };
+      return { ...atom, submitting: false, submitError: null };
     }
 
     case 'SUBMIT_FAIL': {
-      // Keep the draft so the user can retry without retyping; surface the
-      // error via `loadError` (the page-level error banner). The
-      // optimistic inflight entry, if any, is left in place — the user
-      // sees their question; the server-side row never persisted.
-      return { ...atom, submitting: false, loadError: action.error };
+      return { ...atom, submitting: false, submitError: action.error };
     }
 
     case 'TOKEN_APPENDED': {

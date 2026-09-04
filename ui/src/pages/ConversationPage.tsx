@@ -2005,6 +2005,10 @@ function ConversationPageContent({
     );
   }
 
+  if (!conversation && !showTranscript) {
+    return null;
+  }
+
   if (!conversation) {
     return (
       <div id="app">

@@ -1,4 +1,4 @@
-import type { ConversationState, ProductConversationSnapshotView } from '../../api';
+import type { ChainView, ConversationState, ProductConversationSnapshotView } from '../../api';
 import { productConversationScenarioDefinitions } from './types';
 import type { ProductConversationScenario, ProductConversationScenarioId } from './types';
 
@@ -102,6 +102,45 @@ function makeSnapshot(overrides: Partial<ProductConversationSnapshotView> = {}):
   };
 }
 
+function makeChain(rootConvId = 'chain-root-product-alpha'): ChainView {
+  return {
+    root_conv_id: rootConvId,
+    chain_name: null,
+    display_name: 'Product Alpha',
+    archived: false,
+    members: [],
+    qa_history: [
+      {
+        id: 'fixture-recall-completed',
+        root_conv_id: rootConvId,
+        question: 'Which invariants carried across the whole conversation?',
+        answer: 'The lineage kept one chronological transcript, source provenance, and a single ordinary composer on the latest row.',
+        model: 'fixture-model',
+        status: 'completed',
+        chain_members_at_answer: 2,
+        chain_messages_at_answer: 4,
+        created_at: isoAgo(28),
+        completed_at: isoAgo(27),
+      },
+      {
+        id: 'fixture-recall-failed',
+        root_conv_id: rootConvId,
+        question: 'Did the first visual experiment survive?',
+        answer: 'The experiment showed that a full-height diagnostics column',
+        model: 'fixture-model',
+        status: 'failed',
+        chain_members_at_answer: 3,
+        chain_messages_at_answer: 6,
+        created_at: isoAgo(18),
+        completed_at: isoAgo(17),
+      },
+    ],
+    current_member_count: 3,
+    current_total_messages: 6,
+    work_identity: null,
+  };
+}
+
 function makeLongSnapshot(): ProductConversationSnapshotView {
   let sequenceId = 1;
   const segments = Array.from({ length: 4 }, (_, segmentIndex) => {
@@ -150,6 +189,7 @@ export const productConversationScenarios = [
   {
     ...productConversationScenarioDefinitions[0],
     snapshot: makeSnapshot(),
+    chain: makeChain(),
   },
   {
     ...productConversationScenarioDefinitions[1],
@@ -159,7 +199,7 @@ export const productConversationScenarios = [
       writable_transcript_row_id: 'row-mobile-1',
       source: null,
       work_identity: null,
-      chain_qa_compatibility: null,
+      chain_qa_compatibility: { root_transcript_row_id: 'chain-root-product-alpha', url: '/chains/chain-root-product-alpha' },
       segments: [
         segment(1, 'row-mobile-1', 'Mobile root', [
           textMessage('mobile-1', 1, 'user', 'Show how this page stacks on a phone.'),
@@ -167,6 +207,7 @@ export const productConversationScenarios = [
         ], 'The desktop investigation narrowed the mobile fixture to a compact transcript shell.'),
       ],
     }),
+    chain: makeChain(),
   },
   {
     ...productConversationScenarioDefinitions[2],
@@ -194,6 +235,7 @@ export const productConversationScenarios = [
         ], null),
       ],
     }),
+    chain: makeChain(),
   },
   {
     ...productConversationScenarioDefinitions[3],
