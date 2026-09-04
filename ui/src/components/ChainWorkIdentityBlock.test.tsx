@@ -56,6 +56,25 @@ describe('ChainWorkIdentityBlock', () => {
     });
   });
 
+
+  it('accepts product-conversation work identity and keys health by its transcript row', () => {
+    render(<ChainWorkIdentityBlock identity={{
+      work_transcript_row_id: 'row-work',
+      worktree_path: '/wt/product',
+      branch_name: 'feat-product',
+      base_branch: 'main',
+      task_id: '5001',
+      task_title: 'Product context',
+    }} title={null} />);
+
+    expect(mockUsePrStatus).toHaveBeenCalledWith({
+      conversationId: 'row-work',
+      convModeLabel: 'Work',
+      branchName: 'feat-product',
+    });
+    expect(screen.queryByText('Work identity')).not.toBeInTheDocument();
+  });
+
   it('treats a taskless worktree as Branch mode', () => {
     render(
       <ChainWorkIdentityBlock

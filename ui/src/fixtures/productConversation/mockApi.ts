@@ -24,6 +24,7 @@ function latestConversation(scenario: ProductConversationScenario): Conversation
 
 export function installProductConversationFixtureApi(scenario: ProductConversationScenario): () => void {
   const originalGetProductConversationSnapshot = api.getProductConversationSnapshot;
+  const originalGetPrStatus = api.getPrStatus;
   const originalGetConversationRoute = api.getConversationRoute;
   const originalGetConversationRouteBySlug = api.getConversationRouteBySlug;
   const originalGetConversation = api.getConversation;
@@ -50,6 +51,16 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     }
     return scenario.snapshot;
   };
+
+  api.getPrStatus = async () => ({
+    found: true as const,
+    number: 750,
+    display_state: 'open' as const,
+    check_state: 'passing' as const,
+    feedback_freshness: { state: 'new' as const, count: 2 },
+    refresh: { state: 'fresh' as const, stale: false, last_attempted_at: '2026-07-01T12:00:00Z' },
+    work_change: { kind: 'clean' as const },
+  });
 
   const conversation = latestConversation(scenario);
   const route = { id: conversation.id, slug: conversation.slug };
@@ -178,6 +189,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   globalThis.EventSource = FixtureEventSource as unknown as typeof EventSource;
 
   return () => {
+    api.getPrStatus = originalGetPrStatus;
     api.getProductConversationSnapshot = originalGetProductConversationSnapshot;
     api.getConversationRoute = originalGetConversationRoute;
     api.getConversationRouteBySlug = originalGetConversationRouteBySlug;

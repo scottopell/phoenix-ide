@@ -11,6 +11,19 @@ import { notifyCloseSnapshotChanged } from '../notifications';
 
 const conversationNavStackSpy = vi.fn();
 const embeddedConversationPageSpy = vi.fn();
+const viewerSpy = vi.fn();
+const viewportFlags = vi.hoisted(() => ({ isWideDesktop: true }));
+
+vi.mock('../hooks/useMediaQuery', () => ({
+  useIsWideDesktop: () => viewportFlags.isWideDesktop,
+}));
+
+vi.mock('../components/MessageViewer', () => ({
+  MessageViewer: (props: Record<string, unknown>) => {
+    viewerSpy(props);
+    return <div data-testid="aggregate-message-viewer" data-inline={String(props['inline'])} />;
+  },
+}));
 
 vi.mock('../components/ConversationNavStack', () => ({
   ConversationNavStack: (props: Record<string, unknown>) => {
@@ -93,6 +106,7 @@ vi.mock('../api', async () => {
     api: {
       ...actual.api,
       getProductConversationSnapshot: vi.fn(),
+      getPrStatus: vi.fn(),
       approveTask: vi.fn(),
     },
   };
@@ -229,6 +243,8 @@ beforeEach(() => {
   localStorage.clear();
   conversationNavStackSpy.mockClear();
   embeddedConversationPageSpy.mockClear();
+  viewerSpy.mockClear();
+  viewportFlags.isWideDesktop = true;
 });
 
 afterEach(() => {
@@ -244,6 +260,12 @@ describe('ProductConversationPage', () => {
     const { api } = await import('../api');
     vi.mocked(api.getProductConversationSnapshot).mockReset();
     vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(makeSnapshot());
+    vi.mocked(api.getPrStatus).mockReset();
+    vi.mocked(api.getPrStatus).mockResolvedValue({
+      found: false,
+      refresh: { state: 'fresh', stale: false, last_attempted_at: '2026-01-01T00:00:00Z' },
+      work_change: { kind: 'clean' },
+    });
   });
 
   it('refetches the authoritative aggregate when SSE changes member archive state', async () => {
@@ -538,7 +560,7 @@ describe('ProductConversationPage', () => {
     await waitForPageReady();
 
     const page = screen.getByTestId('product-conversation-page');
-    expect(page.querySelectorAll('#chat-view')).toHaveLength(1);
+    expect(page.querySelectorAll('#chat-view')).toHaveLength(0);
     expect(screen.getByTestId('embedded-conversation-page')).toHaveTextContent('embedded row-2');
     expect(embeddedConversationPageSpy).toHaveBeenLastCalledWith(expect.objectContaining({
       slug: 'row-2',
@@ -546,10 +568,100 @@ describe('ProductConversationPage', () => {
       mutationEnabled: true,
       showTranscript: false,
     }));
-    expect(page).not.toHaveTextContent('Product conversation');
     expect(page).not.toHaveTextContent('Presentation');
     expect(page).not.toHaveTextContent('Lifecycle');
+    expect(page).not.toHaveTextContent('Q&A history');
+    expect(page).not.toHaveTextContent('Aggregate');
     expect(page.querySelector('.product-conversation-page__layout')).toBeNull();
+  });
+
+
+  it('renders the aggregate title and present source link for Open and History', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot({ presentation: { kind: 'state', display_name: 'Open title', presentation_mode: 'idle' } }))
+      .mockResolvedValueOnce(makeSnapshot({
+        ordinary_lifecycle: 'history',
+        writable_transcript_row_id: null,
+        presentation: { kind: 'state', display_name: 'History title', presentation_mode: 'done' },
+      }));
+
+    const { unmount } = renderPage();
+    await waitForPageReady();
+    expect(screen.getByRole('heading', { name: 'Open title' })).toBeInTheDocument();
+    const source = screen.getByTestId('product-conversation-source');
+    expect(source).toHaveTextContent('Approved task from source conversation');
+    expect(screen.getByRole('link', { name: 'source conversation' })).toHaveAttribute('href', '/product-conversations/pc-source');
+
+    unmount();
+    renderPage();
+    await waitForPageReady();
+    expect(screen.getByRole('heading', { name: 'History title' })).toBeInTheDocument();
+    expect(screen.getByTestId('product-conversation-history')).toHaveTextContent('History is read-only.');
+    expect(screen.getByRole('link', { name: 'source conversation' })).toBeInTheDocument();
+  });
+
+  it('renders deleted source copy without a dead source link', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValueOnce(makeSnapshot({
+      source: { ...makeSnapshot().source!, status: 'deleted' },
+    }));
+    renderPage();
+    await waitForPageReady();
+
+    expect(screen.getByTestId('product-conversation-source')).toHaveTextContent('Approved task source unavailable or deleted');
+    expect(screen.queryByRole('link', { name: 'source conversation' })).not.toBeInTheDocument();
+  });
+
+  it('keeps Work collapsed until opened, then shows typed work and PR health in Open and History', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getPrStatus).mockResolvedValue({
+      found: true,
+      number: 248,
+      display_state: 'open',
+      check_state: 'passing',
+      feedback_freshness: { state: 'new', count: 3 },
+      work_change: { kind: 'clean' },
+      refresh: { state: 'fresh', stale: false, last_attempted_at: '2026-01-01T00:00:00Z' },
+    });
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot())
+      .mockResolvedValueOnce(makeSnapshot({ ordinary_lifecycle: 'history', writable_transcript_row_id: null }));
+
+    const { unmount } = renderPage();
+    await waitForPageReady();
+    const work = screen.getByTestId('product-conversation-work');
+    expect(work).not.toHaveAttribute('open');
+    fireEvent.click(screen.getByText('Work'));
+    expect(work).toHaveAttribute('open');
+    expect(screen.getByTitle('feature/test → main')).toBeInTheDocument();
+    expect(screen.getByText('/tmp/worktree')).toBeInTheDocument();
+    expect(screen.getByText('40012')).toBeInTheDocument();
+    expect(screen.getByTitle('Product foundation')).toBeInTheDocument();
+    expect(await screen.findByText('#248 checks ✓')).toBeInTheDocument();
+    expect(screen.getByText('3 new')).toBeInTheDocument();
+
+    unmount();
+    renderPage();
+    await waitForPageReady();
+    expect(screen.getByTestId('product-conversation-history')).toBeInTheDocument();
+    expect(screen.getByTestId('product-conversation-work')).toBeInTheDocument();
+  });
+
+  it('uses a split-pane viewer only at wide desktop and keeps the narrow viewer overlay-owned', async () => {
+    const wide = renderPage('/product-conversations/pc-1?viewer=message&presentation=pane&message=3&message_id=m-3');
+    await waitForPageReady();
+    expect(screen.getByTestId('product-conversation-page')).toHaveClass('product-conversation-page--split-pane');
+    expect(screen.getByTestId('aggregate-message-viewer')).toHaveAttribute('data-inline', 'true');
+    expect(screen.getByTestId('aggregate-message-viewer').parentElement).toHaveClass('product-conversation-page__viewer-pane');
+    wide.unmount();
+
+    viewportFlags.isWideDesktop = false;
+    renderPage('/product-conversations/pc-1?viewer=message&presentation=pane&message=3&message_id=m-3');
+    await waitForPageReady();
+    expect(screen.getByTestId('product-conversation-page')).not.toHaveClass('product-conversation-page--split-pane');
+    expect(screen.getByTestId('aggregate-message-viewer')).toHaveAttribute('data-inline', 'false');
+    expect(screen.getByTestId('aggregate-message-viewer').parentElement).not.toHaveClass('product-conversation-page__viewer-pane');
   });
 
   it('shows first-task onboarding after aggregate approval returns first_task', async () => {

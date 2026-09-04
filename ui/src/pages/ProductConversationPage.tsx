@@ -1,6 +1,7 @@
 import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useParams } from 'react-router-dom';
 import { ConversationNavStack } from '../components/ConversationNavStack';
+import { ChainWorkIdentityBlock } from '../components/ChainWorkIdentityBlock';
 import { MessageListSkeleton } from '../components/Skeleton';
 import {
   ApiResponseError,
@@ -16,6 +17,7 @@ import type { TranscriptPositioningInput } from '../conversation/transcriptPosit
 import { OPEN_MESSAGE_VIEWER_EVENT, type OpenMessageViewerEventDetail } from '../components/MessageContextMenu';
 import { useViewerSlot } from '../contexts/ViewerSlotContext';
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
+import { useIsWideDesktop } from '../hooks/useMediaQuery';
 import { EmbeddedConversationPage, type EmbeddedConversationProjection } from './ConversationPage';
 import { subscribeCloseSnapshotChanged } from '../notifications';
 import './ProductConversationPage.css';
@@ -293,6 +295,45 @@ function aggregateConversationState(snapshot: ProductConversationSnapshotView, l
   return parseConversationState(maybeState);
 }
 
+function sourceRelationLabel(source: NonNullable<ProductConversationSnapshotView['source']>): string {
+  switch (source.relation) {
+    case 'approved_task':
+      return 'Approved task';
+  }
+}
+
+function ProductConversationHeader({ snapshot }: { snapshot: ProductConversationSnapshotView }) {
+  const source = snapshot.source;
+  return (
+    <header className="product-conversation-page__header">
+      <h1 className="product-conversation-page__title" title={snapshot.presentation.display_name}>
+        {snapshot.presentation.display_name}
+      </h1>
+      <div className="product-conversation-page__context">
+        {source?.status === 'present' && (
+          <span className="product-conversation-page__source" data-testid="product-conversation-source">
+            {sourceRelationLabel(source)} from{' '}
+            <a href={`/product-conversations/${encodeURIComponent(source.source_product_conversation_id)}`}>
+              source conversation
+            </a>
+          </span>
+        )}
+        {source?.status === 'deleted' && (
+          <span className="product-conversation-page__source product-conversation-page__source--unavailable" data-testid="product-conversation-source">
+            {sourceRelationLabel(source)} source unavailable or deleted
+          </span>
+        )}
+        {snapshot.work_identity && (
+          <details className="product-conversation-page__work" data-testid="product-conversation-work">
+            <summary>Work</summary>
+            <ChainWorkIdentityBlock identity={snapshot.work_identity} title={null} />
+          </details>
+        )}
+      </div>
+    </header>
+  );
+}
+
 export function ProductConversationPage() {
   return <ProductConversationPageInner />;
 }
@@ -326,6 +367,8 @@ function ProductConversationPageInner() {
     [latestProjection, snapshot],
   );
   const aggregateMessageSlot = viewerSlot.slot.kind === 'message' ? viewerSlot.slot : null;
+  const isWideDesktop = useIsWideDesktop();
+  const showSplitPaneViewer = isWideDesktop && aggregateMessageSlot?.presentation === 'pane';
   ownedSnapshotRef.current = ownedSnapshot;
 
   useEffect(() => {
@@ -562,13 +605,17 @@ function ProductConversationPageInner() {
   }
 
   return (
-    <main className="product-conversation-page" data-testid="product-conversation-page">
+    <main
+      className={`product-conversation-page${showSplitPaneViewer ? ' product-conversation-page--split-pane' : ''}`}
+      data-testid="product-conversation-page"
+    >
+      <ProductConversationHeader snapshot={snapshot} />
       {(olderError || error || hashTargetExhausted) && (
         <div className="product-conversation-page__status" role="alert">
           {olderError ?? error ?? 'The linked message is not available in this conversation history.'}
         </div>
       )}
-      <section id="chat-view" className="view active product-conversation-page__transcript">
+      <section className="view active product-conversation-page__transcript" data-testid="product-conversation-transcript">
         <ConversationNavStack
           messages={messages}
           pendingMessages={latestProjection?.pendingMessages ?? []}
@@ -614,9 +661,10 @@ function ProductConversationPageInner() {
         <div className="product-conversation-page__composer-placeholder" data-testid="product-conversation-history">History is read-only.</div>
       )}
 
-        {aggregateMessageSlot && (
-          <ReviewNotesProvider scopeKey={latestConversationId ?? snapshot.product_conversation_id}>
-            <Suspense fallback={null}>
+      {aggregateMessageSlot && (
+        <ReviewNotesProvider scopeKey={latestConversationId ?? snapshot.product_conversation_id}>
+          <Suspense fallback={null}>
+            <div className={showSplitPaneViewer ? 'product-conversation-page__viewer-pane' : undefined}>
               <MessageViewer
                 sequenceId={aggregateMessageSlot.sequenceId}
                 messageId={aggregateMessageSlot.messageId}
@@ -625,13 +673,14 @@ function ProductConversationPageInner() {
                 onClose={viewerSlot.close}
                 onSendNotes={() => {}}
                 presentation={aggregateMessageSlot.presentation}
-                canTogglePresentation
+                canTogglePresentation={isWideDesktop}
                 onPresentationChange={viewerSlot.setPresentation}
-                inline={aggregateMessageSlot.presentation === 'pane'}
+                inline={showSplitPaneViewer}
               />
-            </Suspense>
-          </ReviewNotesProvider>
-        )}
+            </div>
+          </Suspense>
+        </ReviewNotesProvider>
+      )}
 
         {taskApprovalOverlay && latestProjection?.conversationId === taskApprovalOverlay.conversationId && (
           <Suspense fallback={null}>

@@ -6,7 +6,7 @@
 // path. When the chain owns no managed work scope the block says so rather than
 // rendering empty fields.
 
-import type { ChainWorkIdentity } from '../api';
+import type { ChainWorkIdentity, ProductConversationSnapshotView } from '../api';
 import { useConversationPrStatus } from '../hooks/useConversationPrStatus';
 import {
   prBadgeClass,
@@ -16,12 +16,25 @@ import {
   unavailablePrHint,
 } from './prBadge';
 
-export function ChainWorkIdentityBlock({ identity }: { identity: ChainWorkIdentity | null }) {
+type WorkIdentity = ChainWorkIdentity | NonNullable<ProductConversationSnapshotView['work_identity']>;
+
+function workConversationId(identity: WorkIdentity | null): string | null {
+  if (!identity) return null;
+  return 'work_conv_id' in identity ? identity.work_conv_id : identity.work_transcript_row_id;
+}
+
+export function ChainWorkIdentityBlock({
+  identity,
+  title = 'Work identity',
+}: {
+  identity: WorkIdentity | null;
+  title?: string | null;
+}) {
   // Work mode carries a task; Branch mode does not — the PR-status pipeline
   // only enables for those two modes, which is exactly when `identity` is
   // present. A null id keeps the hook disabled (no fetch) for the empty state.
   const prHandle = useConversationPrStatus({
-    conversationId: identity?.work_conv_id ?? null,
+    conversationId: workConversationId(identity),
     convModeLabel: identity ? (identity.task_id ? 'Work' : 'Branch') : undefined,
     branchName: identity?.branch_name ?? null,
   });
@@ -29,7 +42,7 @@ export function ChainWorkIdentityBlock({ identity }: { identity: ChainWorkIdenti
   if (!identity) {
     return (
       <section className="chain-work-identity chain-work-identity--empty">
-        <span className="chain-work-identity-title">Work identity</span>
+        {title && <span className="chain-work-identity-title">{title}</span>}
         <span className="chain-work-identity-empty">No managed work scope</span>
       </section>
     );
@@ -44,7 +57,7 @@ export function ChainWorkIdentityBlock({ identity }: { identity: ChainWorkIdenti
 
   return (
     <section className="chain-work-identity">
-      <span className="chain-work-identity-title">Work identity</span>
+      {title && <span className="chain-work-identity-title">{title}</span>}
       <dl className="chain-work-identity-fields">
         <div className="chain-work-identity-field">
           <dt>{identity.branch_name ? 'Branch' : 'Checkout'}</dt>
