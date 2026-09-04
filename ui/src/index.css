@@ -900,6 +900,18 @@ body.app-viewport-active #root {
   text-overflow: ellipsis;
 }
 
+.product-conversation-list-row__meta {
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.product-conversation-list-row__meta .conv-item-cwd {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
 
 
 #chat-view.view.active {
@@ -13130,6 +13142,14 @@ button.keyword-search-filepath:hover {
 .mobile-list-density .conv-item-messages,
 .mobile-list-density .conv-item-model,
 .mobile-list-density .conv-item-cwd {
+  display: none;
+}
+
+.mobile-list-density .product-conversation-list-row__meta {
+  display: flex;
+}
+
+.mobile-list-density .product-conversation-list-row__meta .conv-item-cwd {
   display: none;
 }
 

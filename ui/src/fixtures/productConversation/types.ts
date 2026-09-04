@@ -1,15 +1,15 @@
-import type { ChainView, ProductConversationSnapshotView } from '../../api';
+import type { ProductConversationSnapshotView } from '../../api';
 
 export const productConversationScenarioDefinitions = [
   {
     id: 'desktop-multi-segment-qa-work',
-    title: 'Desktop open product conversation / multi-segment + Q&A + work metadata / presentation-only',
+    title: 'Desktop open product conversation / continuous transcript + ordinary composer',
     viewport: 'desktop',
     state: 'ready',
   },
   {
     id: 'mobile-open',
-    title: 'Mobile open product conversation / compact stacked layout / presentation-only',
+    title: 'Mobile open product conversation / continuous transcript + ordinary composer',
     viewport: 'mobile',
     state: 'ready',
   },
@@ -52,6 +52,5 @@ export interface ProductConversationScenario {
   viewport: 'desktop' | 'mobile';
   state: 'ready' | 'loading' | 'error';
   snapshot?: ProductConversationSnapshotView;
-  chain?: ChainView;
   snapshotError?: string;
 }

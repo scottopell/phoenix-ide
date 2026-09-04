@@ -206,14 +206,12 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
   isActive,
   isKeyboardSelected,
   effectiveCwd,
-  listDensity,
   onClick,
 }: {
   row: ProductConversationListRow;
   isActive: boolean;
   isKeyboardSelected: boolean;
   effectiveCwd?: string | undefined;
-  listDensity: 'full' | 'mobile' | 'sidebar';
   onClick: (row: ProductConversationListRow) => void;
 }) {
   const classes = [
@@ -223,8 +221,8 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
     'product-conversation-list-row',
   ].filter(Boolean).join(' ');
   const displayTitle = productConversationDisplayTitle(row);
-  const presentationLabel = row.presentation.display_name;
   const statusTitle = productConversationStatusLabel(row);
+  const context = effectiveCwd ?? row.canonical_root.slug ?? null;
   return (
     <li
       className={classes}
@@ -246,20 +244,14 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
             <span className="conv-item-title">{displayTitle}</span>
           </span>
         </div>
-        <div className="conv-item-meta">
-          <span className="conv-item-context">{presentationLabel}</span>
+        <div className="conv-item-meta product-conversation-list-row__meta">
+          <span className="conv-item-secondary-badge">{statusTitle}</span>
           <span className="conv-item-date" title={formatShortDateTime(row.updated_at)}>
             {formatRelativeTime(row.updated_at)}
           </span>
-          {effectiveCwd && <span className="conv-item-cwd">{effectiveCwd}</span>}
+          {context && <span className="conv-item-cwd" title={context}>{context}</span>}
         </div>
       </button>
-      {listDensity !== 'mobile' && (
-        <div className="conv-item-secondary-row">
-          <span className="conv-item-secondary-badge">{row.ordinary_lifecycle === 'history' ? 'History' : 'Open'}</span>
-          <span className="conv-item-secondary-context">{statusTitle}</span>
-        </div>
-      )}
     </li>
   );
 });
@@ -876,7 +868,6 @@ export function ConversationList({
                 || conversation.id === row.canonical_root.transcript_row_id
                 || conversation.slug === row.canonical_root.slug
               ))?.cwd}
-              listDensity={effectiveListDensity}
               onClick={(productRow) => {
                 if (onProductConversationClick) onProductConversationClick(productRow);
                 else navigate(productRow.canonical_route);

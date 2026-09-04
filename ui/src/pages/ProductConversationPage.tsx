@@ -1,31 +1,22 @@
 import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { FormEvent } from 'react';
-import { Link, useLocation, useParams } from 'react-router-dom';
+import { useLocation, useParams } from 'react-router-dom';
 import { ConversationNavStack } from '../components/ConversationNavStack';
 import { MessageListSkeleton } from '../components/Skeleton';
 import {
   ApiResponseError,
   api,
-  streamApi,
-  type ChainQaRow,
-  type ChainSseEventData,
-  type ChainView,
   type ConversationState,
   type Message,
   type ProductConversationSnapshotView,
 } from '../api';
-import { useChainAtom, type InflightQa } from '../chain';
-import { ChainWorkIdentityBlock } from '../components/ChainWorkIdentityBlock';
 import { parseConversationState } from '../utils';
 import type { EnrichedMessage } from '../generated/EnrichedMessage';
 import type { RestoreBasis } from '../conversation/historyExpansion';
 import type { TranscriptPositioningInput } from '../conversation/transcriptPositioning';
-import { ChainQaColumn, ChainWorkScopeDock } from './ChainPage';
 import { OPEN_MESSAGE_VIEWER_EVENT, type OpenMessageViewerEventDetail } from '../components/MessageContextMenu';
 import { useViewerSlot } from '../contexts/ViewerSlotContext';
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
 import { EmbeddedConversationPage, type EmbeddedConversationProjection } from './ConversationPage';
-import { useIsDesktop } from '../hooks';
 import { subscribeCloseSnapshotChanged } from '../notifications';
 import './ProductConversationPage.css';
 
@@ -302,115 +293,11 @@ function aggregateConversationState(snapshot: ProductConversationSnapshotView, l
   return parseConversationState(maybeState);
 }
 
-function countSnapshotMessages(snapshot: ProductConversationSnapshotView): number {
-  return snapshot.segments.reduce((sum, segment) => sum + segment.messages.length, 0);
-}
-
-function chainFromSnapshot(snapshot: ProductConversationSnapshotView, qaHistory: ChainQaRow[]): ChainView {
-  return {
-    root_conv_id: snapshot.chain_qa_compatibility?.root_transcript_row_id ?? snapshot.requested_transcript_row_id,
-    chain_name: null,
-    display_name: snapshot.presentation.display_name,
-    archived: snapshot.ordinary_lifecycle === 'history',
-    members: snapshot.segments
-      .slice()
-      .sort((a, b) => a.segment_ordinal - b.segment_ordinal)
-      .map((segment, index, segments) => ({
-        conv_id: segment.transcript_row_id,
-        slug: segment.slug,
-        title: segment.title,
-        updated_at: snapshot.updated_at,
-        message_count: segment.messages.length,
-        has_worktree: snapshot.work_identity?.work_transcript_row_id === segment.transcript_row_id,
-        position: index === 0 ? 'root' : index === segments.length - 1 ? 'latest' : 'continuation',
-      })),
-    qa_history: qaHistory,
-    current_member_count: snapshot.segments.length,
-    current_total_messages: countSnapshotMessages(snapshot),
-    work_identity: snapshot.work_identity ? {
-      work_conv_id: snapshot.work_identity.work_transcript_row_id,
-      branch_name: snapshot.work_identity.branch_name,
-      base_branch: snapshot.work_identity.base_branch,
-      worktree_path: snapshot.work_identity.worktree_path,
-      task_id: snapshot.work_identity.task_id,
-      task_title: snapshot.work_identity.task_title,
-    } : null,
-  };
-}
-
-function SegmentLinks({ snapshot }: { snapshot: ProductConversationSnapshotView }) {
-  const segments = sortSegments(snapshot);
-  return (
-    <nav className="product-conversation-meta" aria-label="Product conversation segments">
-      {segments.map((segment) => (
-        <div key={segment.transcript_row_id} className="product-conversation-meta__row">
-          <span className="product-conversation-meta__label">Segment {segment.segment_ordinal}</span>
-          <span>
-            <Link to={`/c/${segment.slug ?? segment.transcript_row_id}`}>{segment.title ?? segment.slug ?? segment.transcript_row_id}</Link>
-            {segment.messages[0] ? (
-              <>
-                {' · '}
-                <Link to={`/product-conversations/${snapshot.product_conversation_id}#message-${encodeURIComponent(segment.messages[0].message_id)}`}>
-                  boundary
-                </Link>
-              </>
-            ) : null}
-            {segment.handoff ? (
-              <>
-                {' · '}
-                <Link to={`/product-conversations/${snapshot.product_conversation_id}#message-${encodeURIComponent(`product-handoff:${snapshot.product_conversation_id}:${segment.transcript_row_id}:${segment.handoff.continuation_message_id}`)}`}>
-                  handoff
-                </Link>
-              </>
-            ) : null}
-          </span>
-        </div>
-      ))}
-    </nav>
-  );
-}
-
-function SourceMeta({ snapshot }: { snapshot: ProductConversationSnapshotView }) {
-  return (
-    <section className="product-conversation-meta" aria-label="Product conversation metadata">
-      <div className="product-conversation-meta__row">
-        <span className="product-conversation-meta__label">Presentation</span>
-        <span>{snapshot.presentation.display_name}</span>
-      </div>
-      <div className="product-conversation-meta__row">
-        <span className="product-conversation-meta__label">Lifecycle</span>
-        <span>{snapshot.ordinary_lifecycle === 'history' ? 'History' : 'Open'}</span>
-      </div>
-      <div className="product-conversation-meta__row">
-        <span className="product-conversation-meta__label">Canonical root</span>
-        <span>{snapshot.canonical_root.title ?? snapshot.canonical_root.slug ?? snapshot.canonical_root.transcript_row_id}</span>
-      </div>
-      {snapshot.source && (
-        <div className="product-conversation-meta__row">
-          <span className="product-conversation-meta__label">Source</span>
-          <span>
-            {snapshot.source.relation} · {snapshot.source.relation_key} ·{' '}
-            {snapshot.source.status === 'present' ? (
-              <a href={`/product-conversations/${snapshot.source.source_product_conversation_id}`}>
-                Open source conversation
-              </a>
-            ) : (
-              <span>Source conversation deleted</span>
-            )}
-          </span>
-        </div>
-      )}
-    </section>
-  );
-}
-
-
 export function ProductConversationPage() {
   return <ProductConversationPageInner />;
 }
 
 function ProductConversationPageInner() {
-  const isDesktop = useIsDesktop();
   const { productConversationId } = useParams<{ productConversationId: string }>();
   const viewerSlot = useViewerSlot();
   const location = useLocation();
@@ -433,11 +320,6 @@ function ProductConversationPageInner() {
   const [restoreCommand, setRestoreCommand] = useState<TranscriptPositioningInput | null>(null);
   const routeGenerationRef = useRef(0);
   const paginationRequestRef = useRef(0);
-  const chainRootId = snapshot?.chain_qa_compatibility?.root_transcript_row_id ?? null;
-  const [atom, dispatch] = useChainAtom(chainRootId);
-  const { chain, inflight, inflightOrder, draft, submitting, sseLost, loadError } = atom;
-  const activeTextareaRef = useRef<HTMLTextAreaElement | null>(null);
-  const inflightRef = useRef(inflight);
   const observedMemberProjectionRef = useRef<typeof latestProjection>(null);
   const aggregateMessages = useMemo(
     () => snapshot ? makeAggregateMessages(snapshot, latestProjection) : [],
@@ -445,7 +327,6 @@ function ProductConversationPageInner() {
   );
   const aggregateMessageSlot = viewerSlot.slot.kind === 'message' ? viewerSlot.slot : null;
   ownedSnapshotRef.current = ownedSnapshot;
-  inflightRef.current = inflight;
 
   useEffect(() => {
     routeGenerationRef.current += 1;
@@ -503,24 +384,6 @@ function ProductConversationPageInner() {
     return () => unsubscribes.forEach((unsubscribe) => unsubscribe());
   }, [productConversationId, snapshot]);
 
-  const refreshChain = useCallback(async (rootId: string) => {
-    try {
-      const view = await api.getChain(rootId);
-      dispatch({ type: 'LOAD_OK', view });
-      return view;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Failed to load chain';
-      dispatch({ type: 'LOAD_FAIL', error: msg });
-      return null;
-    }
-  }, [dispatch]);
-
-  useEffect(() => {
-    if (!chainRootId) return;
-    dispatch({ type: 'LOAD_BEGIN' });
-    void refreshChain(chainRootId);
-  }, [chainRootId, dispatch, refreshChain]);
-
   useEffect(() => {
     if (!latestProjection?.conversationId || !snapshot) return;
     const previous = observedMemberProjectionRef.current;
@@ -576,36 +439,6 @@ function ProductConversationPageInner() {
     window.addEventListener(OPEN_MESSAGE_VIEWER_EVENT, handler);
     return () => window.removeEventListener(OPEN_MESSAGE_VIEWER_EVENT, handler);
   }, [viewerSlot]);
-
-  useEffect(() => {
-    if (!chainRootId) return;
-    const handleEvent = (evt: ChainSseEventData) => {
-      if (evt.type === 'chain_qa_token') {
-        dispatch({ type: 'TOKEN_APPENDED', chainQaId: evt.chain_qa_id, delta: evt.delta });
-      } else if (evt.type === 'chain_qa_completed') {
-        dispatch({ type: 'INFLIGHT_DROP', chainQaId: evt.chain_qa_id });
-        void refreshChain(chainRootId);
-      } else if (evt.type === 'chain_qa_failed') {
-        dispatch({
-          type: 'INFLIGHT_FAIL',
-          chainQaId: evt.chain_qa_id,
-          error: evt.error,
-          partialAnswer: evt.partial_answer ?? null,
-        });
-        void refreshChain(chainRootId).then(() => {
-          dispatch({ type: 'INFLIGHT_DROP', chainQaId: evt.chain_qa_id });
-        });
-      }
-    };
-    const handleErr = () => {
-      if (Object.keys(inflightRef.current).length > 0) {
-        dispatch({ type: 'SSE_LOST' });
-      }
-    };
-    const es = streamApi.subscribeToChainStream(chainRootId, handleEvent, handleErr);
-    dispatch({ type: 'SSE_RESTORED' });
-    return () => es.close();
-  }, [chainRootId, dispatch, refreshChain]);
 
   const loadOlderMessages = useCallback(async (restoreBasis?: RestoreBasis) => {
     if (!productConversationId || !snapshot?.has_older || !snapshot.before || loadingOlder) return;
@@ -672,7 +505,6 @@ function ProductConversationPageInner() {
   const latestWorkScopeKey = snapshot?.ordinary_lifecycle === 'open'
     ? latestProjection?.conversation?.work_scope_key
     : undefined;
-  const aggregateWorkIdentity = snapshot?.work_identity ?? null;
   const transcriptView = {
     conversationId: latestConversationId ?? snapshot?.product_conversation_id ?? '',
     generation: historyGeneration,
@@ -700,111 +532,12 @@ function ProductConversationPageInner() {
     void loadOlderMessages();
   }, [hashTargetLoaded, hashTargetMessageId, loadOlderMessages, loadingOlder, olderError, snapshot?.has_older]);
 
-  const synthChain = useMemo(() => {
-    if (!snapshot) return null;
-    const fallback = chainFromSnapshot(snapshot, []);
-    if (!chain) return fallback;
-    const realMessageCount = messages.filter((message) => (
-      !(message.display_data as { productHistoricalHandoff?: unknown } | null | undefined)?.productHistoricalHandoff
-    )).length;
-    return {
-      ...chain,
-      current_member_count: Math.max(chain.current_member_count, snapshot.segments.length),
-      current_total_messages: Math.max(chain.current_total_messages, realMessageCount, countSnapshotMessages(snapshot)),
-    };
-  }, [chain, messages, snapshot]);
-
-  const renderableQas = useMemo(() => {
-    const persisted: ChainQaRow[] = chain?.qa_history.slice() ?? [];
-    persisted.sort((a, b) => (a.created_at < b.created_at ? -1 : 1));
-    const inflightList: InflightQa[] = inflightOrder
-      .map((id) => inflight[id])
-      .filter((entry): entry is InflightQa => entry !== undefined);
-    return { persisted, inflightList };
-  }, [chain, inflight, inflightOrder]);
-
-  const submit = useCallback(async (question: string) => {
-    if (!chainRootId) return;
-    const trimmed = question.trim();
-    if (!trimmed) return;
-    const tempId = `temp-${crypto.randomUUID()}`;
-    dispatch({ type: 'OPTIMISTIC_INFLIGHT_ADD', chainQaId: tempId, question: trimmed });
-    dispatch({ type: 'SUBMIT_BEGIN' });
-    queueMicrotask(() => activeTextareaRef.current?.focus());
-    try {
-      const { chain_qa_id } = await api.submitChainQuestion(chainRootId, trimmed);
-      dispatch({ type: 'INFLIGHT_RECONCILE_ID', tempId, realId: chain_qa_id });
-      dispatch({ type: 'SUBMIT_OK' });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Failed to submit question';
-      dispatch({ type: 'INFLIGHT_DROP', chainQaId: tempId });
-      dispatch({ type: 'DRAFT_SET', value: trimmed });
-      dispatch({ type: 'SUBMIT_FAIL', error: msg });
-    }
-  }, [chainRootId, dispatch]);
-
-  const handleSubmit = (e: FormEvent<HTMLFormElement>) => {
-    e.preventDefault();
-    void submit(draft);
-  };
-
-  const draftRef = useRef(draft);
-  const hydratedDraftForRef = useRef<string | null>(null);
-  useEffect(() => {
-    draftRef.current = draft;
-  }, [draft]);
-
-  useEffect(() => {
-    if (!productConversationId || !chainRootId) return;
-    const hydrationOwner = `${productConversationId}:${chainRootId}`;
-    if (hydratedDraftForRef.current === hydrationOwner) return;
-    hydratedDraftForRef.current = hydrationOwner;
-    try {
-      const saved = localStorage.getItem(`phoenix:product-conversation-draft:${productConversationId}`);
-      if (saved && !draftRef.current.trim()) dispatch({ type: 'DRAFT_SET', value: saved });
-    } catch {
-      // Storage is optional; in-memory drafting remains available.
-    }
-  }, [chainRootId, dispatch, productConversationId]);
-
-  useEffect(() => {
-    if (!productConversationId || !chainRootId) return undefined;
-    const key = `phoenix:product-conversation-draft:${productConversationId}`;
-    if (draft === '') {
-      try { localStorage.removeItem(key); } catch { /* Storage is optional. */ }
-      return undefined;
-    }
-    const timer = window.setTimeout(() => {
-      try { localStorage.setItem(key, draft); } catch { /* Storage is optional. */ }
-    }, 300);
-    return () => window.clearTimeout(timer);
-  }, [chainRootId, draft, productConversationId]);
-
-  useEffect(() => {
-    if (!productConversationId || !chainRootId) return undefined;
-    const key = `phoenix:product-conversation-draft:${productConversationId}`;
-    return () => {
-      try {
-        if (draftRef.current === '') localStorage.removeItem(key);
-        else localStorage.setItem(key, draftRef.current);
-      } catch { /* Storage is optional. */ }
-    };
-  }, [chainRootId, productConversationId]);
-
-  const handleReask = useCallback((question: string) => {
-    dispatch({ type: 'DRAFT_SET', value: draftRef.current.trim() ? `${draftRef.current}\n\n${question}` : question });
-    queueMicrotask(() => activeTextareaRef.current?.focus());
-  }, [dispatch]);
-
-  const setDraft = useCallback((value: string) => dispatch({ type: 'DRAFT_CHANGED', value }), [dispatch]);
-
   if (loading) {
     return (
-      <main className="product-conversation-page">
-        <header className="product-conversation-page__header">
-          <h1>Product conversation</h1>
-        </header>
-        <MessageListSkeleton count={6} />
+      <main className="product-conversation-page" data-testid="product-conversation-page">
+        <section id="chat-view" className="view active product-conversation-page__transcript">
+          <div id="messages"><MessageListSkeleton count={6} /></div>
+        </section>
       </main>
     );
   }
@@ -814,7 +547,7 @@ function ProductConversationPageInner() {
     return (
       <main className="product-conversation-page">
         <div role="alert">{error ?? 'Unable to open this product conversation.'} Showing cached row if available.</div>
-        <button type="button" onClick={() => setSnapshotRetry((retry) => retry + 1)}>Retry</button>
+        <button className="btn-secondary" type="button" onClick={() => setSnapshotRetry((retry) => retry + 1)}>Retry</button>
         {fallbackSlug && (
           <EmbeddedConversationPage
             slug={fallbackSlug}
@@ -830,99 +563,56 @@ function ProductConversationPageInner() {
 
   return (
     <main className="product-conversation-page" data-testid="product-conversation-page">
-      <header className="product-conversation-page__header">
-        <div>
-          <div className="product-conversation-page__eyebrow">Product conversation</div>
-          <h1>{snapshot.presentation.display_name}</h1>
-          <p className="product-conversation-page__route">{snapshot.canonical_route}</p>
+      {(olderError || error || hashTargetExhausted) && (
+        <div className="product-conversation-page__status" role="alert">
+          {olderError ?? error ?? 'The linked message is not available in this conversation history.'}
         </div>
-        {olderError && <div className="product-conversation-page__status" role="alert">{olderError}</div>}
-        {error && <div className="product-conversation-page__status" role="alert">{error}</div>}
-        {hashTargetExhausted && (
-          <div className="product-conversation-page__status" role="alert">
-            The linked message is not available in this conversation history.
-          </div>
-        )}
-      </header>
-
-      <div className="product-conversation-page__layout">
-        <section className="product-conversation-page__history">
-          <SourceMeta snapshot={snapshot} />
-          <SegmentLinks snapshot={snapshot} />
-          <ChainWorkIdentityBlock identity={synthChain?.work_identity ?? null} />
-          <ConversationNavStack
-            messages={messages}
-            pendingMessages={latestProjection?.pendingMessages ?? []}
-            convState={convState}
-            onRetry={latestProjection?.onRetryPending ?? (() => {})}
-            onCancelSteering={latestProjection?.onCancelSteering}
-            onOpenFile={latestProjection?.onOpenFile}
-            filePathRootDir={latestProjection?.filePathRootDir}
-            systemPrompt={latestProjection?.systemPrompt}
-            enableMessageSidepanel
-            enableMessageFullscreen
-            conversationId={latestConversationId ?? snapshot.product_conversation_id}
-            slug={latestSlug ?? snapshot.canonical_root.slug ?? snapshot.requested_transcript_row_id}
-            hasOlderMessages={snapshot.has_older}
-            onLoadOlderMessages={snapshot.has_older ? (restoreBasis) => { void loadOlderMessages(restoreBasis); } : undefined}
-            loadingOlderMessages={loadingOlder}
-            olderHistoryError={olderError}
-            transcriptPositioning={transcriptPositioning}
-            onHistoryScrollCommandHandled={(token) => {
-              setRestoreCommand((current) => (
-                current?.kind === 'positioning' && current.command.token === token ? null : current
-              ));
-            }}
-            {...(latestWorkScopeKey ? { workScopeKey: latestWorkScopeKey } : {})}
+      )}
+      <section id="chat-view" className="view active product-conversation-page__transcript">
+        <ConversationNavStack
+          messages={messages}
+          pendingMessages={latestProjection?.pendingMessages ?? []}
+          convState={convState}
+          onRetry={latestProjection?.onRetryPending ?? (() => {})}
+          onCancelSteering={latestProjection?.onCancelSteering}
+          onOpenFile={latestProjection?.onOpenFile}
+          filePathRootDir={latestProjection?.filePathRootDir}
+          systemPrompt={latestProjection?.systemPrompt}
+          enableMessageSidepanel
+          enableMessageFullscreen
+          conversationId={latestConversationId ?? snapshot.product_conversation_id}
+          slug={latestSlug ?? snapshot.canonical_root.slug ?? snapshot.requested_transcript_row_id}
+          hasOlderMessages={snapshot.has_older}
+          onLoadOlderMessages={snapshot.has_older ? (restoreBasis) => { void loadOlderMessages(restoreBasis); } : undefined}
+          loadingOlderMessages={loadingOlder}
+          olderHistoryError={olderError}
+          transcriptPositioning={transcriptPositioning}
+          onHistoryScrollCommandHandled={(token) => {
+            setRestoreCommand((current) => (
+              current?.kind === 'positioning' && current.command.token === token ? null : current
+            ));
+          }}
+          {...(latestWorkScopeKey ? { workScopeKey: latestWorkScopeKey } : {})}
+        />
+      </section>
+      {isOpen && snapshot.latest_transcript_row_id ? (
+        <div className="product-conversation-page__composer" data-testid="product-conversation-composer">
+          <EmbeddedConversationPage
+            slug={snapshot.latest_transcript_row_id}
+            showTranscript={false}
+            embeddedShell
+            suppressCanonicalization={true}
+            suppressMessageViewerOwner
+            suppressTaskApprovalOwner={true}
+            mutationEnabled={liveControlsEnabled}
+            aggregateLifecycleOpen={isOpen}
+            onProjectionChange={setLatestProjection}
+            onCloseCompleted={() => setSnapshotRetry((retry) => retry + 1)}
           />
-        </section>
-
-        {(chainRootId || (isOpen && snapshot.latest_transcript_row_id)) && (
-          <section className="product-conversation-page__qa" aria-label="Product conversation recall and live controls">
-            {loadError && (
-              <div role="alert" className="product-conversation-page__error">
-                <span>Failed to load recall history: {loadError}</span>
-                <button type="button" onClick={() => { if (chainRootId) void refreshChain(chainRootId); }}>Retry</button>
-              </div>
-            )}
-            {synthChain && chainRootId && (
-              <ChainQaColumn
-                chain={synthChain}
-                persisted={renderableQas.persisted}
-                inflight={renderableQas.inflightList}
-                draft={draft}
-                setDraft={setDraft}
-                submitting={submitting}
-                sseLost={sseLost}
-                {...(!loadError && liveControlsEnabled ? { onSubmit: handleSubmit } : {})}
-                onReask={handleReask}
-                disabled={!liveControlsEnabled}
-                activeTextareaRef={activeTextareaRef}
-                onRetryConnection={() => {
-                  dispatch({ type: 'SSE_RESTORED' });
-                  void refreshChain(chainRootId);
-                }}
-              />
-            )}
-            {isOpen && snapshot.latest_transcript_row_id ? (
-              <div className="product-conversation-page__composer" data-testid="product-conversation-composer">
-                <EmbeddedConversationPage
-                  slug={snapshot.latest_transcript_row_id}
-                  showTranscript={false}
-                  suppressCanonicalization={true}
-                  suppressMessageViewerOwner
-                  suppressTaskApprovalOwner={true}
-                  mutationEnabled={liveControlsEnabled}
-                  aggregateLifecycleOpen={isOpen}
-                  onProjectionChange={setLatestProjection}
-                  onCloseCompleted={() => setSnapshotRetry((retry) => retry + 1)}
-                />
-              </div>
-            ) : (
-              <div className="product-conversation-page__composer-placeholder">History is read-only.</div>
-            )}
-          </section>
-        )}
+        </div>
+      ) : (
+        <div className="product-conversation-page__composer-placeholder" data-testid="product-conversation-history">History is read-only.</div>
+      )}
 
         {aggregateMessageSlot && (
           <ReviewNotesProvider scopeKey={latestConversationId ?? snapshot.product_conversation_id}>
@@ -972,23 +662,6 @@ function ProductConversationPageInner() {
             <FirstTaskWelcome visible onClose={() => setShowFirstTaskWelcome(false)} />
           </Suspense>
         )}
-
-        {!isDesktop && snapshot.latest_transcript_row_id && aggregateWorkIdentity && (
-          <aside className="product-conversation-page__dock">
-            <ChainWorkScopeDock
-              activeConvId={snapshot.latest_transcript_row_id}
-              workIdentity={{
-                work_conv_id: aggregateWorkIdentity.work_transcript_row_id,
-                worktree_path: aggregateWorkIdentity.worktree_path,
-                branch_name: aggregateWorkIdentity.branch_name,
-                base_branch: aggregateWorkIdentity.base_branch,
-                task_id: aggregateWorkIdentity.task_id,
-                task_title: aggregateWorkIdentity.task_title,
-              }}
-            />
-          </aside>
-        )}
-      </div>
     </main>
   );
 }

@@ -124,7 +124,7 @@ describe('Sidebar — ProductConversation navigation', () => {
     await waitFor(() => {
       expect(container.querySelector('[data-product-conversation-id="pc-archived"]')).not.toBeNull();
     });
-    const historyTab = getByRole('button', { name: /History 1/ });
+    const historyTab = getByRole('button', { name: /^History 1$/ });
     expect(historyTab.getAttribute('aria-pressed')).toBe('true');
     expect(getAllByText('History').length).toBeGreaterThan(0);
     expect(queryByText('Archived')).toBeNull();
