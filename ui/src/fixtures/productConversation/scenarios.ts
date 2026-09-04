@@ -1,4 +1,4 @@
-import type { ChainQaRow, ChainView, ConversationState, ProductConversationSnapshotView } from '../../api';
+import type { ConversationState, ProductConversationSnapshotView } from '../../api';
 import { productConversationScenarioDefinitions } from './types';
 import type { ProductConversationScenario, ProductConversationScenarioId } from './types';
 
@@ -24,7 +24,7 @@ function textMessage(id: string, sequenceId: number, messageType: 'user' | 'agen
     conversation_id: `conv-${id}`,
     sequence_id: sequenceId,
     message_type: messageType,
-    content: { text },
+    content: messageType === 'agent' ? [{ type: 'text' as const, text }] : { text },
     display_data: conversationState ? { conversation_state: conversationState } : null,
     usage_data: null,
     created_at: isoAgo(500 - sequenceId),
@@ -102,50 +102,6 @@ function makeSnapshot(overrides: Partial<ProductConversationSnapshotView> = {}):
   };
 }
 
-function makeQaRow(id: string, question: string, answer: string, createdAtMinutesAgo: number): ChainQaRow {
-  return {
-    id,
-    root_conv_id: 'chain-root-product-alpha',
-    question,
-    answer,
-    model: 'gpt-5',
-    status: 'completed',
-    chain_members_at_answer: 3,
-    chain_messages_at_answer: 6,
-    created_at: isoAgo(createdAtMinutesAgo),
-    completed_at: isoAgo(createdAtMinutesAgo - 1),
-  };
-}
-
-function makeChain(overrides: Partial<ChainView> = {}): ChainView {
-  return {
-    root_conv_id: 'chain-root-product-alpha',
-    chain_name: null,
-    display_name: 'Product Alpha',
-    archived: false,
-    members: [
-      { conv_id: 'row-root', slug: 'product-alpha-root', title: 'Discovery', updated_at: isoAgo(60), message_count: 2, has_worktree: false, position: 'root' },
-      { conv_id: 'row-qa', slug: 'row-qa', title: 'Question answering', updated_at: isoAgo(30), message_count: 2, has_worktree: false, position: 'continuation' },
-      { conv_id: 'row-work', slug: 'row-work', title: 'Implementation', updated_at: isoAgo(2), message_count: 2, has_worktree: true, position: 'latest' },
-    ],
-    qa_history: [
-      makeQaRow('qa-row-1', 'What user-visible surfaces must remain stable?', 'The route, title, lineage metadata, and transcript chronology must stay stable.', 18),
-      makeQaRow('qa-row-2', 'Why keep the fixture read-only?', 'It avoids broad EmbeddedConversationPage runtime dependencies while still exercising the real ProductConversationPage shell.', 10),
-    ],
-    current_member_count: 3,
-    current_total_messages: 6,
-    work_identity: {
-      work_conv_id: 'row-work',
-      branch_name: 'task-40012-retire-chain-product-surface',
-      base_branch: 'main',
-      worktree_path: '/Users/scottopell/dev/phoenix-ide/.phoenix/worktrees/product-alpha',
-      task_id: '40012',
-      task_title: 'Retire chain product surface',
-    },
-    ...overrides,
-  };
-}
-
 function makeLongSnapshot(): ProductConversationSnapshotView {
   let sequenceId = 1;
   const segments = Array.from({ length: 4 }, (_, segmentIndex) => {
@@ -177,6 +133,8 @@ function makeLongSnapshot(): ProductConversationSnapshotView {
     product_conversation_id: 'pc-long-history',
     canonical_route: '/product-conversations/pc-long-history',
     requested_transcript_row_id: 'row-long-4',
+    latest_transcript_row_id: 'row-long-4',
+    writable_transcript_row_id: 'row-long-4',
     canonical_root: { transcript_row_id: 'row-long-1', slug: 'long-root', title: 'Long history root' },
     presentation: { kind: 'state', display_name: 'Long fixture conversation', presentation_mode: 'idle' },
     work_identity: null,
@@ -192,12 +150,13 @@ export const productConversationScenarios = [
   {
     ...productConversationScenarioDefinitions[0],
     snapshot: makeSnapshot(),
-    chain: makeChain(),
   },
   {
     ...productConversationScenarioDefinitions[1],
     snapshot: makeSnapshot({
       presentation: { kind: 'state', display_name: 'Product Alpha mobile', presentation_mode: 'idle' },
+      latest_transcript_row_id: 'row-mobile-1',
+      writable_transcript_row_id: 'row-mobile-1',
       source: null,
       work_identity: null,
       chain_qa_compatibility: null,
@@ -235,7 +194,6 @@ export const productConversationScenarios = [
         ], null),
       ],
     }),
-    chain: makeChain({ archived: true }),
   },
   {
     ...productConversationScenarioDefinitions[3],

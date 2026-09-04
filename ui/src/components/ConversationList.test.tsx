@@ -310,7 +310,7 @@ const defaultProps = {
 };
 
 describe('ConversationList — product conversations', () => {
-  it('renders open and archived product conversation aggregates with compatibility labels', () => {
+  it('renders one semantic title with compact inline status, time, and context', () => {
     const open = makeProductConversation('pc-open', {
       canonical_root: { transcript_row_id: 'root-open', slug: 'root-open', title: 'Open Root' },
       presentation: { kind: 'state', display_name: 'Working surface', presentation_mode: 'working' },
@@ -332,9 +332,14 @@ describe('ConversationList — product conversations', () => {
       </MemoryRouter>,
     );
 
+    const openRow = container.querySelector('[data-product-conversation-id="pc-open"]') as HTMLElement;
     expect(getByText('Open Root')).toBeInTheDocument();
-    expect(getByText('Working surface')).toBeInTheDocument();
-    expect(container.querySelector('[data-product-conversation-id="pc-open"]')).not.toBeNull();
+    expect(openRow).toHaveTextContent('Working');
+    expect(openRow).toHaveTextContent('rel-2024-01-01T00:00:00Z');
+    expect(openRow).toHaveTextContent('root-open');
+    expect(openRow).not.toHaveTextContent('Working surface');
+    expect(openRow.querySelectorAll('.conv-item-title')).toHaveLength(1);
+    expect(openRow.querySelectorAll('.conv-item-secondary-row')).toHaveLength(0);
 
     rerender(
       <MemoryRouter>
@@ -348,8 +353,10 @@ describe('ConversationList — product conversations', () => {
       </MemoryRouter>,
     );
 
+    const historyRow = container.querySelector('[data-product-conversation-id="pc-archived"]') as HTMLElement;
     expect(getByText('Archived Root')).toBeInTheDocument();
-    expect(getByText('Retained history')).toBeInTheDocument();
+    expect(historyRow).toHaveTextContent('Completed');
+    expect(historyRow).not.toHaveTextContent('Retained history');
   });
 
   it('renders History working directory from archived member rows', () => {

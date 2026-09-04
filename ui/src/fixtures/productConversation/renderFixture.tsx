@@ -17,19 +17,21 @@ interface Props {
 
 function pageHasSettled(root: HTMLElement, scenario: ProductConversationScenario): boolean {
   if (scenario.state === 'loading') {
-    return root.querySelector('.message-list-skeleton') !== null || root.textContent?.includes('Product conversation') === true;
+    return root.querySelector('.skeleton-message') !== null
+      || root.querySelector('[data-testid="product-conversation-page"] #messages') !== null;
   }
   if (scenario.state === 'error') {
     return root.textContent?.includes(scenario.snapshotError ?? 'Fixture failed to fetch product conversation snapshot') ?? false;
   }
   const page = root.querySelector('[data-testid="product-conversation-page"]');
   if (!page) return false;
-  const title = page.querySelector('h1')?.textContent;
-  const route = page.querySelector('.product-conversation-page__route')?.textContent;
-  const historyLabel = page.querySelector('.product-conversation-meta');
-  return title === scenario.snapshot?.presentation.display_name
-    && route === scenario.snapshot?.canonical_route
-    && historyLabel !== null;
+  const hasConversation = page.querySelector('#chat-view') !== null;
+  if (scenario.snapshot?.ordinary_lifecycle === 'history') {
+    return hasConversation
+      && page.querySelector('[data-testid="product-conversation-history"]') !== null;
+  }
+  return hasConversation
+    && page.querySelector('.product-conversation-page__composer .embedded-conversation-shell') !== null;
 }
 
 function ProductConversationFixtureBody({ scenario }: Props) {

@@ -195,6 +195,8 @@ export interface EmbeddedConversationProjection {
 }
 
 interface EmbeddedConversationHostProps {
+  /** Makes the legacy application shell an owned class rather than a globally-unique id. */
+  embeddedShell?: boolean;
   suppressCanonicalization?: boolean;
   mutationEnabled?: boolean;
   aggregateLifecycleOpen?: boolean | undefined;
@@ -221,6 +223,7 @@ export function EmbeddedConversationPage({
   routePrefix = '/c',
   composerQuickAction,
   showTranscript = true,
+  embeddedShell = false,
   suppressCanonicalization = false,
   mutationEnabled = true,
   aggregateLifecycleOpen,
@@ -257,6 +260,7 @@ export function EmbeddedConversationPage({
         routePrefix={routePrefix}
         composerQuickAction={composerQuickAction}
         showTranscript={showTranscript}
+        embeddedShell={embeddedShell}
         mutationEnabled={mutationEnabled}
         aggregateLifecycleOpen={aggregateLifecycleOpen}
         suppressCanonicalization={suppressCanonicalization}
@@ -290,6 +294,7 @@ function ConversationPageContent({
   routePrefix,
   composerQuickAction,
   showTranscript,
+  embeddedShell,
   mutationEnabled,
   aggregateLifecycleOpen,
   suppressCanonicalization,
@@ -302,6 +307,7 @@ function ConversationPageContent({
   routePrefix: '/c' | '/global';
   composerQuickAction?: ComposerQuickAction | undefined;
   showTranscript: boolean;
+  embeddedShell: boolean;
   mutationEnabled: boolean;
   aggregateLifecycleOpen?: boolean | undefined;
   suppressCanonicalization: boolean;
@@ -2201,9 +2207,12 @@ function ConversationPageContent({
       onError={showError}
     >
     <div
-      id="app"
+      {...(embeddedShell ? {} : { id: 'app' })}
       ref={setAppElement}
-      className={showSplitPaneViewer ? 'app-split-pane' : undefined}
+      className={[
+        embeddedShell ? 'embedded-conversation-shell' : '',
+        showSplitPaneViewer ? 'app-split-pane' : '',
+      ].filter(Boolean).join(' ') || undefined}
     >
       <div className="conversation-column">
       <ConversationReturnBreadcrumb />
