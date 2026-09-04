@@ -1,18 +1,33 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { useEffect } from 'react';
 import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom';
 import { ProductConversationPage } from './ProductConversationPage';
 import { ConversationReadinessProvider } from '../contexts/ConversationReadinessContext';
 import { FileExplorerProvider } from '../components/FileExplorer';
 import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
-import { ApiResponseError, type ProductConversationSnapshotView } from '../api';
+import { ChainProvider } from '../chain';
+import { ApiResponseError, type ChainView, type ProductConversationSnapshotView } from '../api';
 import type { ProductConversationCloseView } from '../generated/ProductConversationCloseView';
 import { notifyCloseSnapshotChanged } from '../notifications';
 
 const conversationNavStackSpy = vi.fn();
 const embeddedConversationPageSpy = vi.fn();
 const viewerSpy = vi.fn();
+const chainQaColumnSpy = vi.fn();
 const viewportFlags = vi.hoisted(() => ({ isWideDesktop: true }));
+const chainStream = vi.hoisted(() => {
+  const close = vi.fn();
+  const subscribe = vi.fn((...args: [
+    string,
+    (event: import('../api').ChainSseEventData) => void,
+    (error: Event) => void,
+  ]) => {
+    void args;
+    return { close };
+  });
+  return { close, subscribe };
+});
 
 vi.mock('../hooks/useMediaQuery', () => ({
   useIsWideDesktop: () => viewportFlags.isWideDesktop,
@@ -75,6 +90,52 @@ vi.mock('./ConversationPage', () => ({
   },
 }));
 
+vi.mock('./ChainPage', () => ({
+  ChainQaColumn: (props: Record<string, unknown>) => {
+    chainQaColumnSpy(props);
+    const activeTextareaRef = props['activeTextareaRef'] as React.MutableRefObject<HTMLTextAreaElement | null>;
+    const autoFocusActive = Boolean(props['autoFocusActive']);
+    const disabled = Boolean(props['disabled']);
+    const onActiveTextareaFocused = props['onActiveTextareaFocused'] as (() => void) | undefined;
+    useEffect(() => {
+      if (!autoFocusActive || disabled) return;
+      activeTextareaRef.current?.focus();
+      onActiveTextareaFocused?.();
+    }, [activeTextareaRef, autoFocusActive, disabled, onActiveTextareaFocused]);
+    const inflight = Array.isArray(props['inflight']) ? props['inflight'] as Array<{
+      chainQaId: string;
+      answer: string;
+      error: string | null;
+    }> : [];
+    return (
+      <div data-testid="chain-qa-column">
+        <div data-testid="chain-qa-root">{String((props['chain'] as ChainView | undefined)?.root_conv_id ?? '')}</div>
+        <div data-testid="chain-qa-persisted-count">{Array.isArray(props['persisted']) ? props['persisted'].length : 0}</div>
+        <div data-testid="chain-qa-inflight">{inflight.map((entry) => `${entry.chainQaId}:${entry.answer}:${entry.error ?? ''}`).join('|')}</div>
+        <form onSubmit={(event) => (props['onSubmit'] as ((event: React.FormEvent<HTMLFormElement>) => void) | undefined)?.(event)}>
+          <textarea
+            ref={activeTextareaRef}
+            aria-label="recall draft"
+            value={String(props['draft'] ?? '')}
+            disabled={Boolean(props['disabled'])}
+            onChange={(event) => (props['setDraft'] as ((value: string) => void))(event.target.value)}
+          />
+          <button type="submit" disabled={!props['onSubmit']}>Ask recall</button>
+        </form>
+        <button type="button" onClick={() => (props['onRetryConnection'] as (() => void) | undefined)?.()}>Retry recall connection</button>
+        <button
+          type="button"
+          disabled={Boolean(props['disabled'])}
+          onClick={() => (props['onReask'] as ((question: string) => void) | undefined)?.('What changed?')}
+        >
+          Re-ask recall
+        </button>
+        <div data-testid="chain-qa-sse-lost">{String(props['sseLost'])}</div>
+      </div>
+    );
+  },
+}));
+
 vi.mock('../components/Skeleton', () => ({
   MessageListSkeleton: ({ count }: { count: number }) => <div data-testid="skeleton">skeleton {count}</div>,
 }));
@@ -107,7 +168,13 @@ vi.mock('../api', async () => {
       ...actual.api,
       getProductConversationSnapshot: vi.fn(),
       getPrStatus: vi.fn(),
+      getChain: vi.fn(),
+      submitChainQuestion: vi.fn(),
       approveTask: vi.fn(),
+    },
+    streamApi: {
+      ...actual.streamApi,
+      subscribeToChainStream: chainStream.subscribe,
     },
   };
 });
@@ -189,6 +256,34 @@ function makeSnapshot(overrides: Partial<ProductConversationSnapshotView> = {}):
   };
 }
 
+function makeChain(overrides: Partial<ChainView> = {}): ChainView {
+  return {
+    root_conv_id: 'root-chain',
+    chain_name: null,
+    display_name: 'Product Alpha',
+    archived: false,
+    members: [],
+    qa_history: [
+      {
+        id: 'qa-1',
+        root_conv_id: 'root-chain',
+        question: 'What changed?',
+        answer: 'A lot.',
+        model: 'gpt-5',
+        status: 'completed',
+        chain_members_at_answer: 2,
+        chain_messages_at_answer: 4,
+        created_at: '2026-01-01T00:00:10Z',
+        completed_at: '2026-01-01T00:00:20Z',
+      },
+    ],
+    current_member_count: 2,
+    current_total_messages: 4,
+    work_identity: null,
+    ...overrides,
+  };
+}
+
 function NavigateToSecondProduct() {
   const navigate = useNavigate();
   return <button onClick={() => navigate('/product-conversations/pc-2')}>open second product</button>;
@@ -199,12 +294,14 @@ function renderPage(initialEntry = '/product-conversations/pc-1', withRouteSwitc
     <ConversationReadinessProvider>
       <MemoryRouter initialEntries={[initialEntry]}>
         <ViewerSlotProvider browserSessionActive={false}>
-          <FileExplorerProvider>
-          {withRouteSwitch && <NavigateToSecondProduct />}
-          <Routes>
-            <Route path="/product-conversations/:productConversationId" element={<ProductConversationPage />} />
-          </Routes>
-          </FileExplorerProvider>
+          <ChainProvider>
+            <FileExplorerProvider>
+            {withRouteSwitch && <NavigateToSecondProduct />}
+            <Routes>
+              <Route path="/product-conversations/:productConversationId" element={<ProductConversationPage />} />
+            </Routes>
+            </FileExplorerProvider>
+          </ChainProvider>
         </ViewerSlotProvider>
       </MemoryRouter>
     </ConversationReadinessProvider>,
@@ -244,6 +341,9 @@ beforeEach(() => {
   conversationNavStackSpy.mockClear();
   embeddedConversationPageSpy.mockClear();
   viewerSpy.mockClear();
+  chainQaColumnSpy.mockClear();
+  chainStream.close.mockClear();
+  chainStream.subscribe.mockClear();
   viewportFlags.isWideDesktop = true;
 });
 
@@ -260,6 +360,10 @@ describe('ProductConversationPage', () => {
     const { api } = await import('../api');
     vi.mocked(api.getProductConversationSnapshot).mockReset();
     vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(makeSnapshot());
+    vi.mocked(api.getChain).mockReset();
+    vi.mocked(api.getChain).mockResolvedValue(makeChain());
+    vi.mocked(api.submitChainQuestion).mockReset();
+    vi.mocked(api.submitChainQuestion).mockResolvedValue({ chain_qa_id: 'qa-new' });
     vi.mocked(api.getPrStatus).mockReset();
     vi.mocked(api.getPrStatus).mockResolvedValue({
       found: false,
@@ -652,7 +756,7 @@ describe('ProductConversationPage', () => {
     const wide = renderPage('/product-conversations/pc-1?viewer=message&presentation=pane&message=3&message_id=m-3');
     await waitForPageReady();
     expect(screen.getByTestId('product-conversation-page')).toHaveClass('product-conversation-page--split-pane');
-    expect(screen.getByTestId('aggregate-message-viewer')).toHaveAttribute('data-inline', 'true');
+    expect(await screen.findByTestId('aggregate-message-viewer')).toHaveAttribute('data-inline', 'true');
     expect(screen.getByTestId('aggregate-message-viewer').parentElement).toHaveClass('product-conversation-page__viewer-pane');
     wide.unmount();
 
@@ -660,7 +764,7 @@ describe('ProductConversationPage', () => {
     renderPage('/product-conversations/pc-1?viewer=message&presentation=pane&message=3&message_id=m-3');
     await waitForPageReady();
     expect(screen.getByTestId('product-conversation-page')).not.toHaveClass('product-conversation-page--split-pane');
-    expect(screen.getByTestId('aggregate-message-viewer')).toHaveAttribute('data-inline', 'false');
+    expect(await screen.findByTestId('aggregate-message-viewer')).toHaveAttribute('data-inline', 'false');
     expect(screen.getByTestId('aggregate-message-viewer').parentElement).not.toHaveClass('product-conversation-page__viewer-pane');
   });
 
@@ -1323,6 +1427,247 @@ describe('ProductConversationPage', () => {
     expect(conversationNavStackSpy.mock.lastCall?.[0]?.['filePathRootDir']).toBe('/tmp/latest-root');
     expect(conversationNavStackSpy.mock.lastCall?.[0]?.['systemPrompt']).toBe('Preserve this system prompt');
     expect(conversationNavStackSpy.mock.lastCall?.[0]?.['workScopeKey']).toBeUndefined();
+  });
+
+  it('keeps Recall collapsed with no Q&A load, subscription, timers, or autofocus side effects', async () => {
+    const { api } = await import('../api');
+    const setTimeoutSpy = vi.spyOn(window, 'setTimeout');
+    const focusSpy = vi.spyOn(HTMLTextAreaElement.prototype, 'focus');
+
+    renderPage();
+    await waitForPageReady();
+
+    expect(screen.getByRole('button', { name: 'Recall' })).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByTestId('chain-qa-column')).not.toBeInTheDocument();
+    expect(api.getChain).not.toHaveBeenCalled();
+    expect(chainStream.subscribe).not.toHaveBeenCalled();
+    expect(setTimeoutSpy).not.toHaveBeenCalledWith(expect.any(Function), 300);
+    expect(focusSpy).not.toHaveBeenCalled();
+
+    setTimeoutSpy.mockRestore();
+    focusSpy.mockRestore();
+  });
+
+  it('gates Recall actions until the deferred persisted chain hydrates, then submits exactly once', async () => {
+    const { api } = await import('../api');
+    let resolveChain: ((chain: ChainView) => void) | undefined;
+    vi.mocked(api.getChain).mockImplementationOnce(() => new Promise((resolve) => { resolveChain = resolve; }));
+    renderPage();
+    await waitForPageReady();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Recall' }));
+    expect(await screen.findByRole('status')).toHaveTextContent('Loading Recall…');
+    expect(screen.queryByLabelText('recall draft')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Ask recall' })).not.toBeInTheDocument();
+    expect(chainQaColumnSpy).not.toHaveBeenCalled();
+
+    act(() => resolveChain?.(makeChain()));
+    const draft = await screen.findByLabelText('recall draft');
+    fireEvent.change(draft, { target: { value: 'Where did this land?' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Ask recall' }));
+    await waitFor(() => expect(api.submitChainQuestion).toHaveBeenCalledTimes(1));
+    expect(api.submitChainQuestion).toHaveBeenCalledWith('root-chain', 'Where did this land?');
+  });
+
+  it('focuses the hydrated Open Recall question once, but uses Close Recall for History', async () => {
+    const { api } = await import('../api');
+    let resolveOpenChain: ((chain: ChainView) => void) | undefined;
+    vi.mocked(api.getChain).mockImplementationOnce(() => new Promise((resolve) => { resolveOpenChain = resolve; }));
+    renderPage();
+    await waitForPageReady();
+
+    const trigger = screen.getByRole('button', { name: 'Recall' });
+    trigger.focus();
+    fireEvent.click(trigger);
+    expect(trigger).toHaveFocus();
+    expect(screen.queryByLabelText('recall draft')).not.toBeInTheDocument();
+    act(() => resolveOpenChain?.(makeChain()));
+    expect(await screen.findByLabelText('recall draft')).toHaveFocus();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close Recall' }));
+    expect(trigger).toHaveFocus();
+    fireEvent.click(trigger);
+    expect(await screen.findByLabelText('recall draft')).toHaveFocus();
+
+    cleanup();
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValueOnce(makeSnapshot({
+      ordinary_lifecycle: 'history',
+      writable_transcript_row_id: null,
+    }));
+    renderPage();
+    await waitForPageReady();
+    fireEvent.click(screen.getByRole('button', { name: 'Recall' }));
+    expect(await screen.findByRole('button', { name: 'Close Recall' })).toHaveFocus();
+    expect(screen.getByLabelText('recall draft')).toBeDisabled();
+  });
+
+  it('lazily loads persisted Recall and subscribes until close, then restores trigger focus', async () => {
+    const { api } = await import('../api');
+    renderPage();
+    await waitForPageReady();
+
+    const trigger = screen.getByRole('button', { name: 'Recall' });
+    fireEvent.click(trigger);
+
+    expect(await screen.findByTestId('chain-qa-column')).toBeInTheDocument();
+    expect(await screen.findByLabelText('recall draft')).toHaveFocus();
+    await waitFor(() => expect(api.getChain).toHaveBeenCalledWith('root-chain'));
+    await waitFor(() => expect(screen.getByTestId('chain-qa-persisted-count')).toHaveTextContent('1'));
+    expect(chainStream.subscribe).toHaveBeenCalledWith('root-chain', expect.any(Function), expect.any(Function));
+    expect(screen.getByTestId('product-conversation-composer')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close Recall' }));
+    expect(screen.queryByTestId('chain-qa-column')).not.toBeInTheDocument();
+    expect(chainStream.close).toHaveBeenCalledTimes(1);
+    expect(trigger).toHaveFocus();
+  });
+
+  it('closes Recall with Escape, tears down streaming, and restores trigger focus', async () => {
+    renderPage();
+    await waitForPageReady();
+    const trigger = screen.getByRole('button', { name: 'Recall' });
+    fireEvent.click(trigger);
+    await screen.findByTestId('chain-qa-column');
+
+    fireEvent.keyDown(window, { key: 'Escape' });
+
+    expect(screen.queryByTestId('chain-qa-column')).not.toBeInTheDocument();
+    expect(chainStream.close).toHaveBeenCalledTimes(1);
+    expect(trigger).toHaveFocus();
+  });
+
+  it('streams Recall through the existing chain reducer and refetches persisted completion', async () => {
+    const { api } = await import('../api');
+    renderPage();
+    await waitForPageReady();
+    fireEvent.click(screen.getByRole('button', { name: 'Recall' }));
+    await screen.findByTestId('chain-qa-column');
+
+    fireEvent.change(screen.getByLabelText('recall draft'), { target: { value: 'Where did this land?' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Ask recall' }));
+    await waitFor(() => expect(api.submitChainQuestion).toHaveBeenCalledWith('root-chain', 'Where did this land?'));
+
+    const handleEvent = chainStream.subscribe.mock.calls.at(-1)?.[1];
+    expect(handleEvent).toEqual(expect.any(Function));
+    act(() => handleEvent?.({ type: 'chain_qa_token', chain_qa_id: 'qa-new', delta: 'In main' }));
+    expect(screen.getByTestId('chain-qa-inflight')).toHaveTextContent('qa-new:In main:');
+
+    act(() => handleEvent?.({ type: 'chain_qa_completed', chain_qa_id: 'qa-new', full_answer: 'In main' }));
+    await waitFor(() => expect(api.getChain).toHaveBeenCalledTimes(2));
+    expect(screen.getByTestId('chain-qa-inflight')).toHaveTextContent('');
+  });
+
+  it('surfaces failed streams and retry through the existing authoritative reducer path', async () => {
+    renderPage();
+    await waitForPageReady();
+    fireEvent.click(screen.getByRole('button', { name: 'Recall' }));
+    await screen.findByTestId('chain-qa-column');
+    fireEvent.change(screen.getByLabelText('recall draft'), { target: { value: 'What failed?' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Ask recall' }));
+    await waitFor(() => expect(screen.getByTestId('chain-qa-inflight')).toHaveTextContent('qa-new'));
+
+    const handleEvent = chainStream.subscribe.mock.calls.at(-1)?.[1];
+    const handleError = chainStream.subscribe.mock.calls.at(-1)?.[2];
+    act(() => handleError?.(new Event('error')));
+    expect(screen.getByTestId('chain-qa-sse-lost')).toHaveTextContent('true');
+
+    act(() => handleEvent?.({
+      type: 'chain_qa_failed',
+      chain_qa_id: 'qa-new',
+      error: 'stream stopped',
+      partial_answer: 'Partial',
+    }));
+    await waitFor(() => expect(screen.getByTestId('chain-qa-inflight')).toHaveTextContent(''));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Retry recall connection' }));
+    expect(screen.getByTestId('chain-qa-sse-lost')).toHaveTextContent('false');
+  });
+
+  it('keeps failed submissions editable for retry', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.submitChainQuestion).mockRejectedValueOnce(new Error('submit failed'));
+    renderPage();
+    await waitForPageReady();
+    fireEvent.click(screen.getByRole('button', { name: 'Recall' }));
+    await screen.findByTestId('chain-qa-column');
+
+    fireEvent.change(screen.getByLabelText('recall draft'), { target: { value: 'Try again' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Ask recall' }));
+
+    await waitFor(() => expect(screen.getByLabelText('recall draft')).toHaveValue('Try again'));
+    expect(screen.getByRole('alert')).toHaveTextContent('submit failed');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Ask recall' }));
+    await waitFor(() => expect(api.submitChainQuestion).toHaveBeenCalledTimes(2));
+    expect(api.submitChainQuestion).toHaveBeenLastCalledWith('root-chain', 'Try again');
+  });
+
+  it('keeps History Recall persisted but disables asking and re-ask mutations', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValueOnce(makeSnapshot({
+      ordinary_lifecycle: 'history',
+      writable_transcript_row_id: null,
+    }));
+    renderPage();
+    await waitForPageReady();
+    fireEvent.click(screen.getByRole('button', { name: 'Recall' }));
+
+    expect(await screen.findByTestId('chain-qa-persisted-count')).toHaveTextContent('1');
+    expect(screen.getByLabelText('recall draft')).toBeDisabled();
+    expect(chainQaColumnSpy.mock.lastCall?.[0]?.['onSubmit']).toBeUndefined();
+    fireEvent.click(screen.getByRole('button', { name: 'Re-ask recall' }));
+    expect(screen.getByLabelText('recall draft')).toHaveValue('');
+  });
+
+  it('persists Recall drafts by ProductConversation identity across close and unmount', async () => {
+    const first = renderPage();
+    await waitForPageReady();
+    fireEvent.click(screen.getByRole('button', { name: 'Recall' }));
+    fireEvent.change(await screen.findByLabelText('recall draft'), { target: { value: 'durable aggregate draft' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Close Recall' }));
+    expect(localStorage.getItem('phoenix:product-conversation-draft:pc-1')).toBe('durable aggregate draft');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Recall' }));
+    expect(await screen.findByLabelText('recall draft')).toHaveValue('durable aggregate draft');
+    first.unmount();
+
+    renderPage();
+    await waitForPageReady();
+    fireEvent.click(screen.getByRole('button', { name: 'Recall' }));
+    expect(await screen.findByLabelText('recall draft')).toHaveValue('durable aggregate draft');
+    expect(localStorage.getItem('phoenix:chain-draft:root-chain')).toBeNull();
+  });
+
+  it('collapses Recall and isolates chain state when a new ProductConversation route wins', async () => {
+    const { api } = await import('../api');
+    let resolveOldChain: ((chain: ChainView) => void) | undefined;
+    vi.mocked(api.getChain)
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveOldChain = resolve; }))
+      .mockResolvedValueOnce(makeChain({ root_conv_id: 'root-chain-2', display_name: 'Product Beta' }));
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot())
+      .mockResolvedValueOnce(makeSnapshot({
+        product_conversation_id: 'pc-2',
+        canonical_route: '/product-conversations/pc-2',
+        presentation: { kind: 'state', display_name: 'Product Beta', presentation_mode: 'idle' },
+        chain_qa_compatibility: { root_transcript_row_id: 'root-chain-2', url: '/chains/root-chain-2' },
+      }));
+
+    renderPage(undefined, true);
+    await waitForPageReady();
+    fireEvent.click(screen.getByRole('button', { name: 'Recall' }));
+    await waitFor(() => expect(api.getChain).toHaveBeenCalledWith('root-chain'));
+    fireEvent.click(screen.getByRole('button', { name: 'open second product' }));
+
+    expect(await screen.findByRole('heading', { name: 'Product Beta' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Recall' })).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByTestId('chain-qa-column')).not.toBeInTheDocument();
+    expect(chainStream.close).toHaveBeenCalledTimes(1);
+
+    act(() => resolveOldChain?.(makeChain({ display_name: 'Stale Alpha' })));
+    fireEvent.click(screen.getByRole('button', { name: 'Recall' }));
+    await waitFor(() => expect(api.getChain).toHaveBeenCalledWith('root-chain-2'));
+    expect(screen.getByTestId('chain-qa-root')).toHaveTextContent('root-chain-2');
   });
 
   it('keeps successful pagination visually silent and ignores malformed message hashes', async () => {

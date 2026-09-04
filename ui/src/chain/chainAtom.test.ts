@@ -205,10 +205,15 @@ describe('chainReducer', () => {
 
   describe('SUBMIT lifecycle', () => {
     it('SUBMIT_BEGIN sets submitting; SUBMIT_OK clears it', () => {
-      let atom = dispatch(createInitialChainAtom(), { type: 'SUBMIT_BEGIN' });
+      let atom = dispatch(
+        { ...createInitialChainAtom(), submitError: 'previous failure' },
+        { type: 'SUBMIT_BEGIN' },
+      );
       expect(atom.submitting).toBe(true);
+      expect(atom.submitError).toBeNull();
       atom = dispatch(atom, { type: 'SUBMIT_OK' });
       expect(atom.submitting).toBe(false);
+      expect(atom.submitError).toBeNull();
     });
 
     it('SUBMIT_FAIL stores the error and keeps draft for retry', () => {
@@ -220,7 +225,8 @@ describe('chainReducer', () => {
       atom = dispatch(atom, { type: 'SUBMIT_FAIL', error: '503' });
       expect(atom.submitting).toBe(false);
       expect(atom.draft).toBe('unsent');
-      expect(atom.loadError).toBe('503');
+      expect(atom.loadError).toBeNull();
+      expect(atom.submitError).toBe('503');
     });
   });
 

@@ -1,4 +1,5 @@
 import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { FormEvent } from 'react';
 import { useLocation, useParams } from 'react-router-dom';
 import { ConversationNavStack } from '../components/ConversationNavStack';
 import { ChainWorkIdentityBlock } from '../components/ChainWorkIdentityBlock';
@@ -6,10 +7,15 @@ import { MessageListSkeleton } from '../components/Skeleton';
 import {
   ApiResponseError,
   api,
+  streamApi,
+  type ChainQaRow,
+  type ChainSseEventData,
+  type ChainView,
   type ConversationState,
   type Message,
   type ProductConversationSnapshotView,
 } from '../api';
+import { useChainAtom, type InflightQa } from '../chain';
 import { parseConversationState } from '../utils';
 import type { EnrichedMessage } from '../generated/EnrichedMessage';
 import type { RestoreBasis } from '../conversation/historyExpansion';
@@ -31,6 +37,9 @@ const TaskApprovalReader = lazy(() =>
 );
 const FirstTaskWelcome = lazy(() =>
   import('../components/FirstTaskWelcome').then((m) => ({ default: m.FirstTaskWelcome })),
+);
+const ChainQaColumn = lazy(() =>
+  import('./ChainPage').then((m) => ({ default: m.ChainQaColumn })),
 );
 
 
@@ -295,6 +304,330 @@ function aggregateConversationState(snapshot: ProductConversationSnapshotView, l
   return parseConversationState(maybeState);
 }
 
+function countSnapshotMessages(snapshot: ProductConversationSnapshotView): number {
+  return snapshot.segments.reduce((sum, segment) => sum + segment.messages.length, 0);
+}
+
+function chainFromSnapshot(snapshot: ProductConversationSnapshotView, qaHistory: ChainQaRow[]): ChainView {
+  return {
+    root_conv_id: snapshot.chain_qa_compatibility?.root_transcript_row_id ?? snapshot.requested_transcript_row_id,
+    chain_name: null,
+    display_name: snapshot.presentation.display_name,
+    archived: snapshot.ordinary_lifecycle === 'history',
+    members: snapshot.segments
+      .slice()
+      .sort((a, b) => a.segment_ordinal - b.segment_ordinal)
+      .map((segment, index, segments) => ({
+        conv_id: segment.transcript_row_id,
+        slug: segment.slug,
+        title: segment.title,
+        updated_at: snapshot.updated_at,
+        message_count: segment.messages.length,
+        has_worktree: snapshot.work_identity?.work_transcript_row_id === segment.transcript_row_id,
+        position: index === 0 ? 'root' : index === segments.length - 1 ? 'latest' : 'continuation',
+      })),
+    qa_history: qaHistory,
+    current_member_count: snapshot.segments.length,
+    current_total_messages: countSnapshotMessages(snapshot),
+    work_identity: snapshot.work_identity ? {
+      work_conv_id: snapshot.work_identity.work_transcript_row_id,
+      branch_name: snapshot.work_identity.branch_name,
+      base_branch: snapshot.work_identity.base_branch,
+      worktree_path: snapshot.work_identity.worktree_path,
+      task_id: snapshot.work_identity.task_id,
+      task_title: snapshot.work_identity.task_title,
+    } : null,
+  };
+}
+
+function RecallPanel({
+  snapshot,
+  productConversationId,
+  messages,
+  disabled,
+  onClose,
+}: {
+  snapshot: ProductConversationSnapshotView;
+  productConversationId: string;
+  messages: Message[];
+  disabled: boolean;
+  onClose: () => void;
+}) {
+  const chainRootId = snapshot.chain_qa_compatibility?.root_transcript_row_id ?? null;
+  const [atom, dispatch] = useChainAtom(chainRootId);
+  const { chain, inflight, inflightOrder, draft, submitting, sseLost, loadError, submitError } = atom;
+  const activeTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const closeButtonRef = useRef<HTMLButtonElement | null>(null);
+  const initialFocusHandledRef = useRef(false);
+  const [shouldFocusAction, setShouldFocusAction] = useState(false);
+  const inflightRef = useRef(inflight);
+  const draftRef = useRef(draft);
+  const hydratedDraftForRef = useRef<string | null>(null);
+  inflightRef.current = inflight;
+  draftRef.current = draft;
+
+  const refreshChain = useCallback(async (rootId: string) => {
+    try {
+      const view = await api.getChain(rootId);
+      dispatch({ type: 'LOAD_OK', view });
+      return view;
+    } catch (err) {
+      dispatch({
+        type: 'LOAD_FAIL',
+        error: err instanceof Error ? err.message : 'Failed to load chain',
+      });
+      return null;
+    }
+  }, [dispatch]);
+
+  useEffect(() => {
+    if (!chainRootId) return;
+    dispatch({ type: 'LOAD_BEGIN' });
+    void refreshChain(chainRootId);
+  }, [chainRootId, dispatch, refreshChain]);
+
+  useEffect(() => {
+    if (!chainRootId) return;
+    const handleEvent = (evt: ChainSseEventData) => {
+      if (evt.type === 'chain_qa_token') {
+        dispatch({ type: 'TOKEN_APPENDED', chainQaId: evt.chain_qa_id, delta: evt.delta });
+      } else if (evt.type === 'chain_qa_completed') {
+        dispatch({ type: 'INFLIGHT_DROP', chainQaId: evt.chain_qa_id });
+        void refreshChain(chainRootId);
+      } else if (evt.type === 'chain_qa_failed') {
+        dispatch({
+          type: 'INFLIGHT_FAIL',
+          chainQaId: evt.chain_qa_id,
+          error: evt.error,
+          partialAnswer: evt.partial_answer ?? null,
+        });
+        void refreshChain(chainRootId).then(() => {
+          dispatch({ type: 'INFLIGHT_DROP', chainQaId: evt.chain_qa_id });
+        });
+      }
+    };
+    const handleError = () => {
+      if (Object.keys(inflightRef.current).length > 0) dispatch({ type: 'SSE_LOST' });
+    };
+    const eventSource = streamApi.subscribeToChainStream(chainRootId, handleEvent, handleError);
+    dispatch({ type: 'SSE_RESTORED' });
+    return () => eventSource.close();
+  }, [chainRootId, dispatch, refreshChain]);
+
+  useEffect(() => {
+    if (!chainRootId) return;
+    const owner = `${productConversationId}:${chainRootId}`;
+    if (hydratedDraftForRef.current === owner) return;
+    hydratedDraftForRef.current = owner;
+    try {
+      const saved = localStorage.getItem(`phoenix:product-conversation-draft:${productConversationId}`);
+      if (saved && !draftRef.current.trim()) dispatch({ type: 'DRAFT_SET', value: saved });
+    } catch {
+      // Storage is optional; the routed atom still preserves the open-session draft.
+    }
+  }, [chainRootId, dispatch, productConversationId]);
+
+  useEffect(() => {
+    if (!chainRootId) return undefined;
+    const key = `phoenix:product-conversation-draft:${productConversationId}`;
+    if (draft === '') {
+      try { localStorage.removeItem(key); } catch { /* Storage is optional. */ }
+      return undefined;
+    }
+    const timer = window.setTimeout(() => {
+      try { localStorage.setItem(key, draft); } catch { /* Storage is optional. */ }
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [chainRootId, draft, productConversationId]);
+
+  useEffect(() => {
+    if (!chainRootId) return undefined;
+    const key = `phoenix:product-conversation-draft:${productConversationId}`;
+    return () => {
+      try {
+        if (draftRef.current === '') localStorage.removeItem(key);
+        else localStorage.setItem(key, draftRef.current);
+      } catch { /* Storage is optional. */ }
+    };
+  }, [chainRootId, productConversationId]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      event.stopPropagation();
+      onClose();
+    };
+    window.addEventListener('keydown', handleKeyDown, true);
+    return () => window.removeEventListener('keydown', handleKeyDown, true);
+  }, [onClose]);
+
+  useEffect(() => {
+    if (!chain || loadError || initialFocusHandledRef.current) return;
+    initialFocusHandledRef.current = true;
+    if (disabled) {
+      closeButtonRef.current?.focus();
+      return;
+    }
+    setShouldFocusAction(true);
+  }, [chain, disabled, loadError]);
+
+  const markInitialFocusHandled = useCallback(() => {
+    setShouldFocusAction(false);
+  }, []);
+
+  const synthChain = useMemo(() => {
+    const fallback = chainFromSnapshot(snapshot, []);
+    if (!chain) return fallback;
+    const realMessageCount = messages.filter((message) => (
+      !(message.display_data as { productHistoricalHandoff?: unknown } | null | undefined)?.productHistoricalHandoff
+    )).length;
+    return {
+      ...chain,
+      current_member_count: Math.max(chain.current_member_count, snapshot.segments.length),
+      current_total_messages: Math.max(chain.current_total_messages, realMessageCount, countSnapshotMessages(snapshot)),
+    };
+  }, [chain, messages, snapshot]);
+
+  const renderableQas = useMemo(() => {
+    const persisted = chain?.qa_history.slice() ?? [];
+    persisted.sort((a, b) => (a.created_at < b.created_at ? -1 : 1));
+    const inflightList: InflightQa[] = inflightOrder
+      .map((id) => inflight[id])
+      .filter((entry): entry is InflightQa => entry !== undefined);
+    return { persisted, inflightList };
+  }, [chain, inflight, inflightOrder]);
+
+  const submit = useCallback(async (question: string) => {
+    if (!chainRootId || !chain) return;
+    const trimmed = question.trim();
+    if (!trimmed) return;
+    const tempId = `temp-${crypto.randomUUID()}`;
+    dispatch({ type: 'OPTIMISTIC_INFLIGHT_ADD', chainQaId: tempId, question: trimmed });
+    dispatch({ type: 'SUBMIT_BEGIN' });
+    queueMicrotask(() => activeTextareaRef.current?.focus());
+    try {
+      const { chain_qa_id } = await api.submitChainQuestion(chainRootId, trimmed);
+      dispatch({ type: 'INFLIGHT_RECONCILE_ID', tempId, realId: chain_qa_id });
+      dispatch({ type: 'SUBMIT_OK' });
+    } catch (err) {
+      dispatch({ type: 'INFLIGHT_DROP', chainQaId: tempId });
+      dispatch({ type: 'DRAFT_SET', value: trimmed });
+      dispatch({
+        type: 'SUBMIT_FAIL',
+        error: err instanceof Error ? err.message : 'Failed to submit question',
+      });
+    }
+  }, [chain, chainRootId, dispatch]);
+
+  const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    void submit(draft);
+  };
+  const handleReask = useCallback((question: string) => {
+    dispatch({ type: 'DRAFT_SET', value: draftRef.current.trim() ? `${draftRef.current}\n\n${question}` : question });
+    queueMicrotask(() => activeTextareaRef.current?.focus());
+  }, [dispatch]);
+  const setDraft = useCallback((value: string) => dispatch({ type: 'DRAFT_CHANGED', value }), [dispatch]);
+
+  return (
+    <section
+      id="product-conversation-recall-panel"
+      className="product-conversation-page__recall-panel"
+      role="dialog"
+      aria-label="Recall"
+      aria-modal="false"
+    >
+      <div className="product-conversation-page__recall-heading">
+        <div>
+          <strong>Recall</strong>
+          <span>Ask across this conversation’s full lineage</span>
+        </div>
+        <button ref={closeButtonRef} type="button" className="product-conversation-page__recall-close" onClick={onClose} aria-label="Close Recall">×</button>
+      </div>
+      {loadError && (
+        <div role="alert" className="product-conversation-page__recall-error">
+          <span>Failed to load recall history: {loadError}</span>
+          <button type="button" className="btn-link" onClick={() => { void refreshChain(chainRootId!); }}>Retry</button>
+        </div>
+      )}
+      {submitError && (
+        <div role="alert" className="product-conversation-page__recall-error">
+          <span>Failed to ask Recall: {submitError}</span>
+        </div>
+      )}
+      {!chain && !loadError ? (
+        <div className="product-conversation-page__recall-loading" role="status">Loading Recall…</div>
+      ) : chain ? (
+        <Suspense fallback={<div className="product-conversation-page__recall-loading" role="status">Loading Recall…</div>}>
+          <ChainQaColumn
+            chain={synthChain}
+            persisted={renderableQas.persisted}
+            inflight={renderableQas.inflightList}
+            draft={draft}
+            setDraft={setDraft}
+            submitting={submitting}
+            sseLost={sseLost}
+            {...(!disabled ? { onSubmit: handleSubmit } : {})}
+            onReask={handleReask}
+            disabled={disabled}
+            activeTextareaRef={activeTextareaRef}
+            autoFocusActive={shouldFocusAction}
+            onActiveTextareaFocused={markInitialFocusHandled}
+            onRetryConnection={() => {
+              dispatch({ type: 'SSE_RESTORED' });
+              void refreshChain(chainRootId!);
+            }}
+          />
+        </Suspense>
+      ) : null}
+    </section>
+  );
+}
+
+function RecallDisclosure({
+  snapshot,
+  productConversationId,
+  messages,
+  disabled,
+}: {
+  snapshot: ProductConversationSnapshotView;
+  productConversationId: string;
+  messages: Message[];
+  disabled: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const close = useCallback(() => {
+    setOpen(false);
+    triggerRef.current?.focus();
+  }, []);
+
+  return (
+    <div className="product-conversation-page__recall">
+      <button
+        ref={triggerRef}
+        type="button"
+        className="product-conversation-page__recall-trigger"
+        aria-expanded={open}
+        aria-controls="product-conversation-recall-panel"
+        onClick={() => setOpen((value) => !value)}
+      >
+        Recall
+      </button>
+      {open && (
+        <RecallPanel
+          snapshot={snapshot}
+          productConversationId={productConversationId}
+          messages={messages}
+          disabled={disabled}
+          onClose={close}
+        />
+      )}
+    </div>
+  );
+}
+
 function sourceRelationLabel(source: NonNullable<ProductConversationSnapshotView['source']>): string {
   switch (source.relation) {
     case 'approved_task':
@@ -302,7 +635,17 @@ function sourceRelationLabel(source: NonNullable<ProductConversationSnapshotView
   }
 }
 
-function ProductConversationHeader({ snapshot }: { snapshot: ProductConversationSnapshotView }) {
+function ProductConversationHeader({
+  snapshot,
+  productConversationId,
+  messages,
+  recallDisabled,
+}: {
+  snapshot: ProductConversationSnapshotView;
+  productConversationId: string;
+  messages: Message[];
+  recallDisabled: boolean;
+}) {
   const source = snapshot.source;
   return (
     <header className="product-conversation-page__header">
@@ -322,6 +665,15 @@ function ProductConversationHeader({ snapshot }: { snapshot: ProductConversation
           <span className="product-conversation-page__source product-conversation-page__source--unavailable" data-testid="product-conversation-source">
             {sourceRelationLabel(source)} source unavailable or deleted
           </span>
+        )}
+        {snapshot.chain_qa_compatibility && (
+          <RecallDisclosure
+            key={productConversationId}
+            snapshot={snapshot}
+            productConversationId={productConversationId}
+            messages={messages}
+            disabled={recallDisabled}
+          />
         )}
         {snapshot.work_identity && (
           <details className="product-conversation-page__work" data-testid="product-conversation-work">
@@ -609,7 +961,12 @@ function ProductConversationPageInner() {
       className={`product-conversation-page${showSplitPaneViewer ? ' product-conversation-page--split-pane' : ''}`}
       data-testid="product-conversation-page"
     >
-      <ProductConversationHeader snapshot={snapshot} />
+      <ProductConversationHeader
+        snapshot={snapshot}
+        productConversationId={snapshot.product_conversation_id}
+        messages={messages}
+        recallDisabled={!liveControlsEnabled}
+      />
       {(olderError || error || hashTargetExhausted) && (
         <div className="product-conversation-page__status" role="alert">
           {olderError ?? error ?? 'The linked message is not available in this conversation history.'}

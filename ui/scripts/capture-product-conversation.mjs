@@ -9,14 +9,26 @@ runSurfaceCapture({
     { name: 'mobile', width: 390, height: 844 },
   ],
   captureStory: async ({ page, id, outDir, viewport }) => {
-    if (id !== 'desktop-multi-segment-qa-work' || viewport.name !== 'desktop') return false;
+    const capturesRecall = id === 'desktop-multi-segment-qa-work' || id === 'mobile-open';
+    if (!capturesRecall) return false;
+
     await page.screenshot({ path: `${outDir}/${id}--${viewport.name}.png`, fullPage: true });
-    await page.getByText('Work', { exact: true }).click();
-    await page.locator('[data-testid="product-conversation-work"][open] .chain-work-identity').waitFor();
+    await page.getByRole('button', { name: 'Recall' }).click();
+    await page.getByRole('dialog', { name: 'Recall' }).waitFor();
     await page.screenshot({
-      path: `${outDir}/${id}--${viewport.name}--work-expanded.png`,
+      path: `${outDir}/${id}--${viewport.name}--recall-expanded.png`,
       fullPage: true,
     });
+    await page.getByRole('button', { name: 'Close Recall' }).click();
+
+    if (id === 'desktop-multi-segment-qa-work' && viewport.name === 'desktop') {
+      await page.getByText('Work', { exact: true }).click();
+      await page.locator('[data-testid="product-conversation-work"][open] .chain-work-identity').waitFor();
+      await page.screenshot({
+        path: `${outDir}/${id}--${viewport.name}--work-expanded.png`,
+        fullPage: true,
+      });
+    }
     return true;
   },
 });

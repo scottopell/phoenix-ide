@@ -849,6 +849,9 @@ interface ChainQaColumnProps {
   activeTextareaRef: React.RefObject<HTMLTextAreaElement>;
   onRetryConnection: () => void;
   disabled?: boolean;
+  /** ProductConversation owns whether opening Recall should move focus. */
+  autoFocusActive?: boolean;
+  onActiveTextareaFocused?: () => void;
 }
 
 export function ChainQaColumn({
@@ -864,6 +867,8 @@ export function ChainQaColumn({
   activeTextareaRef,
   onRetryConnection,
   disabled = false,
+  autoFocusActive = true,
+  onActiveTextareaFocused,
 }: ChainQaColumnProps) {
   return (
     <section className="chain-qa" aria-label="Chain questions and answers">
@@ -878,6 +883,8 @@ export function ChainQaColumn({
               disabled={disabled}
               {...(onSubmit ? { onSubmit } : {})}
               activeTextareaRef={activeTextareaRef}
+              autoFocusActive={autoFocusActive}
+              {...(onActiveTextareaFocused ? { onActiveTextareaFocused } : {})}
             />
           </li>
           {[...inflight].reverse().map((entry) => (
@@ -948,6 +955,8 @@ interface ChainQaPairCardProps {
   disabled?: boolean;
   onSubmit?: (e: FormEvent<HTMLFormElement>) => void;
   activeTextareaRef?: React.RefObject<HTMLTextAreaElement>;
+  autoFocusActive?: boolean;
+  onActiveTextareaFocused?: () => void;
   // inflight variants
   inflightEntry?: InflightQa;
   // persisted variant
@@ -974,13 +983,16 @@ function ActivePairCard({
   disabled = false,
   onSubmit,
   activeTextareaRef,
+  autoFocusActive = true,
+  onActiveTextareaFocused,
 }: ChainQaPairCardProps) {
-  // Autofocus on mount. The ref is also used by the parent to refocus after
-  // submit (which doesn't unmount this component — same node, just cleared).
+  // The product conversation owns opening focus; ChainPage retains the
+  // default. This effect runs after a lazy ChainQaColumn has mounted its ref.
   useEffect(() => {
-    activeTextareaRef?.current?.focus();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    if (!autoFocusActive || disabled || !activeTextareaRef?.current) return;
+    activeTextareaRef.current.focus();
+    onActiveTextareaFocused?.();
+  }, [activeTextareaRef, autoFocusActive, disabled, onActiveTextareaFocused]);
 
   const canSubmit = draft.trim().length > 0 && !submitting && !disabled && !!onSubmit;
 

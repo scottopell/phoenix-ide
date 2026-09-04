@@ -24,6 +24,8 @@ function latestConversation(scenario: ProductConversationScenario): Conversation
 
 export function installProductConversationFixtureApi(scenario: ProductConversationScenario): () => void {
   const originalGetProductConversationSnapshot = api.getProductConversationSnapshot;
+  const originalGetChain = api.getChain;
+  const originalSubmitChainQuestion = api.submitChainQuestion;
   const originalGetPrStatus = api.getPrStatus;
   const originalGetConversationRoute = api.getConversationRoute;
   const originalGetConversationRouteBySlug = api.getConversationRouteBySlug;
@@ -51,6 +53,12 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     }
     return scenario.snapshot;
   };
+
+  api.getChain = async (rootConvId) => {
+    if (!scenario.chain) throw new Error(`Scenario ${scenario.id} is missing Recall data`);
+    return { ...scenario.chain, root_conv_id: rootConvId };
+  };
+  api.submitChainQuestion = async () => ({ chain_qa_id: 'fixture-recall-new' });
 
   api.getPrStatus = async () => ({
     found: true as const,
@@ -191,6 +199,8 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   return () => {
     api.getPrStatus = originalGetPrStatus;
     api.getProductConversationSnapshot = originalGetProductConversationSnapshot;
+    api.getChain = originalGetChain;
+    api.submitChainQuestion = originalSubmitChainQuestion;
     api.getConversationRoute = originalGetConversationRoute;
     api.getConversationRouteBySlug = originalGetConversationRouteBySlug;
     api.getConversation = originalGetConversation;

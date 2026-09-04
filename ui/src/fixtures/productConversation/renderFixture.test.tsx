@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { api } from '../../api';
 import { ProductConversationFixture } from './renderFixture';
 import { getProductConversationScenario } from './scenarios';
@@ -36,6 +36,13 @@ describe('ProductConversationFixture', () => {
     expect(screen.getByRole('heading', { name: 'Product Alpha' })).toBeInTheDocument();
     expect(screen.getByTestId('product-conversation-source')).toHaveTextContent('Approved task from source conversation');
     expect(screen.getByTestId('product-conversation-work')).not.toHaveAttribute('open');
+    expect(screen.getByRole('button', { name: 'Recall' })).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByRole('dialog', { name: 'Recall' })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Recall' }));
+    expect(await screen.findByText('Which invariants carried across the whole conversation?')).toBeInTheDocument();
+    expect(screen.getByTestId('product-conversation-composer')).toBeInTheDocument();
+
     expect(container).not.toHaveTextContent('Presentation');
     expect(container).not.toHaveTextContent('Q&A history');
     expect(container).not.toHaveTextContent('Aggregate diagnostics');
@@ -45,6 +52,8 @@ describe('ProductConversationFixture', () => {
     const scenario = getProductConversationScenario('mobile-open');
     const originalGetSnapshot = api.getProductConversationSnapshot;
     const originalGetPrStatus = api.getPrStatus;
+    const originalGetChain = api.getChain;
+    const originalSubmitChainQuestion = api.submitChainQuestion;
     const originalGetRoute = api.getConversationRoute;
     const originalGetRouteBySlug = api.getConversationRouteBySlug;
     const originalGetConversation = api.getConversation;
@@ -56,6 +65,8 @@ describe('ProductConversationFixture', () => {
 
     expect(api.getProductConversationSnapshot).not.toBe(originalGetSnapshot);
     expect(api.getPrStatus).not.toBe(originalGetPrStatus);
+    expect(api.getChain).not.toBe(originalGetChain);
+    expect(api.submitChainQuestion).not.toBe(originalSubmitChainQuestion);
     expect(api.getConversationRoute).not.toBe(originalGetRoute);
     expect(api.getConversationRouteBySlug).not.toBe(originalGetRouteBySlug);
     expect(api.getConversation).not.toBe(originalGetConversation);
@@ -64,6 +75,8 @@ describe('ProductConversationFixture', () => {
 
     expect(api.getProductConversationSnapshot).toBe(originalGetSnapshot);
     expect(api.getPrStatus).toBe(originalGetPrStatus);
+    expect(api.getChain).toBe(originalGetChain);
+    expect(api.submitChainQuestion).toBe(originalSubmitChainQuestion);
     expect(api.getConversationRoute).toBe(originalGetRoute);
     expect(api.getConversationRouteBySlug).toBe(originalGetRouteBySlug);
     expect(api.getConversation).toBe(originalGetConversation);

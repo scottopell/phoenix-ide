@@ -1,4 +1,4 @@
-import type { ProductConversationSnapshotView } from '../../api';
+import type { ChainView, ProductConversationSnapshotView } from '../../api';
 
 export const productConversationScenarioDefinitions = [
   {
@@ -52,5 +52,6 @@ export interface ProductConversationScenario {
   viewport: 'desktop' | 'mobile';
   state: 'ready' | 'loading' | 'error';
   snapshot?: ProductConversationSnapshotView;
+  chain?: ChainView;
   snapshotError?: string;
 }
