@@ -107,6 +107,11 @@ protocol ConversationPersistenceStore {
         aggregateId: String,
         scope: PersistenceScopeIdentity
     ) -> Set<String>
+    func persistedConversationIds(
+        aggregateId: String,
+        scope: PersistenceScopeIdentity,
+        legacyScope: PersistenceScopeIdentity?
+    ) -> Set<String>
     func resetConversationListCache() async
     func removePersistedConversationState(conversationId: String) async
     func removeAuthoritativePersistedConversationState(
@@ -121,6 +126,14 @@ protocol ConversationPersistenceStore {
 }
 
 extension ConversationPersistenceStore {
+    func persistedConversationIds(
+        aggregateId: String,
+        scope: PersistenceScopeIdentity,
+        legacyScope: PersistenceScopeIdentity?
+    ) -> Set<String> {
+        persistedConversationIds(aggregateId: aggregateId, scope: scope)
+    }
+
     func removeAuthoritativePersistedConversationState(
         conversationId: String,
         configurationIdentity: APIConfigurationIdentity,
@@ -305,6 +318,14 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
         aggregateId: String,
         scope: PersistenceScopeIdentity
     ) -> Set<String> {
+        persistedConversationIds(aggregateId: aggregateId, scope: scope, legacyScope: nil)
+    }
+
+    func persistedConversationIds(
+        aggregateId: String,
+        scope: PersistenceScopeIdentity,
+        legacyScope: PersistenceScopeIdentity?
+    ) -> Set<String> {
         let snapshotIds = Set(DiskStore.names(in: directory, withPrefix: "conv-").compactMap { name -> String? in
             guard name.hasPrefix("conv-") else { return nil }
             let conversationId = String(name.dropFirst("conv-".count))
@@ -317,12 +338,13 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
                   case .value(let snapshot) = loaded,
                   snapshot.conversation?.product_conversation_id == aggregateId,
                   snapshot.conversation?.id == conversationId,
-                  let authority = snapshot.authoritative,
-                  authority.configurationIdentity.persistenceScope == scope,
-                  authority.aggregateAuthority == aggregateId,
                   snapshot.syncedAt != nil
             else { return nil }
-            return conversationId
+            let currentAuthorityMatches = snapshot.authoritative?.configurationIdentity.persistenceScope == scope
+                && snapshot.authoritative?.aggregateAuthority == aggregateId
+            let provenLegacyMatches = snapshot.authoritative == nil
+                && legacyScope == scope
+            return currentAuthorityMatches || provenLegacyMatches ? conversationId : nil
         })
         let outboxIds = Set(DiskStore.names(in: directory, withPrefix: "outbox-").compactMap { name -> String? in
             guard name.hasPrefix("outbox-") else { return nil }
@@ -1013,7 +1035,8 @@ final class AppModel {
         guard let api else { return }
         let persistedMembers = conversationPersistenceStore.persistedConversationIds(
             aggregateId: aggregateId,
-            scope: api.configurationIdentity.persistenceScope)
+            scope: api.configurationIdentity.persistenceScope,
+            legacyScope: legacySnapshotPersistenceScope)
         let listMembers = Set(listStore.transcriptToAggregate.compactMap { id, aggregate in
             aggregate == aggregateId ? id : nil
         })
@@ -1041,7 +1064,19 @@ final class AppModel {
                 persistenceScope: context.configurationIdentity.persistenceScope,
                 aggregateAuthority: context.aggregateAuthority,
                 memberConversationIds: context.memberConversationIds.sorted())
-            guard await conversationPersistenceStore.persistHardDeleteFence(fence) else { return }
+            guard await conversationPersistenceStore.persistHardDeleteFence(fence) else {
+                guard contextIsCurrent() else { return }
+                let memberIds = Set(fence.memberConversationIds)
+                _ = beginHardDeleteCleanup(conversationIds: memberIds)
+                productConversationDetails[context.aggregateAuthority]?.invalidateHardDeleted()
+                productConversationDetails.removeValue(forKey: context.aggregateAuthority)
+                for id in memberIds {
+                    sessions.removeValue(forKey: id)?.revokeForHardDelete()
+                    drainSessions.removeValue(forKey: id)?.revokeForHardDelete()
+                }
+                _ = await listStore.removeAndPersist(aggregateId: context.aggregateAuthority)
+                return
+            }
             guard contextIsCurrent() else { return }
         case .committed(let persisted):
             fence = persisted
