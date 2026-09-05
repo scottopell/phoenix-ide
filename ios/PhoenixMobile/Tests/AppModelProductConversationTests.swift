@@ -1785,12 +1785,15 @@ final class AppModelProductConversationTests: XCTestCase {
         detail.applyForTesting(testProductConversationSnapshot())
 
         model.triggerPersistedOutboxDrainIfNeededForTesting()
+        let drainGeneration = try! XCTUnwrap(model.currentPersistedOutboxDrainGenerationForTesting())
         await blocker.waitForEntry()
+        let chatPostsBeforeDelete = probe.chatPostPaths
         session?.receive(.conversationHardDeleted(seq: 1, conversationId: "row-1"))
         await model.awaitHardDeleteCleanupForTesting(conversationId: "row-1")
         await blocker.release()
+        _ = await model.awaitPersistedOutboxDrainForTesting(generation: drainGeneration)
 
-        XCTAssertEqual(probe.chatPostPaths.count, 0)
+        XCTAssertEqual(probe.chatPostPaths, chatPostsBeforeDelete)
         if case .missing = store.inspectOutbox(conversationId: "row-1").state {} else { XCTFail("expected deleted row state removed") }
         if case .missing = store.inspectOutbox(conversationId: "row-0").state {} else { XCTFail("expected sibling row state removed") }
         XCTAssertFalse(store.persistedOutboxOwnerTranscriptRowIdsSnapshot(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default")).contains("row-1"))
