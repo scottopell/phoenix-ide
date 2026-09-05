@@ -416,6 +416,7 @@ final class AppModel {
     private var hardDeleteCleanupGenerationByConversationId: [String: Int] = [:]
     private var hardDeleteCleanupWaiters: [Int: [CheckedContinuation<Void, Never>]] = [:]
     private var completedHardDeleteCleanupGenerations: Set<Int> = []
+    private var hardDeletedConversationIds: Set<String> = []
     private var nextHardDeleteCleanupGeneration = 0
 
     static func randomCredentialGenerationForTestsAndDefaults() -> String {
@@ -910,6 +911,7 @@ final class AppModel {
     private func beginHardDeleteCleanup(conversationIds: Set<String>) -> Int {
         nextHardDeleteCleanupGeneration &+= 1
         let generation = nextHardDeleteCleanupGeneration
+        hardDeletedConversationIds.formUnion(conversationIds)
         for conversationId in conversationIds {
             hardDeleteCleanupGenerationByConversationId[conversationId] = generation
         }
@@ -1276,6 +1278,9 @@ final class AppModel {
                   currentAPIIdentity == apiIdentity
             else { return drainedConversationIds }
             guard sessions[conversationId] == nil else {
+                continue
+            }
+            guard !hardDeletedConversationIds.contains(conversationId) else {
                 continue
             }
             let drainSession: ConversationSession
