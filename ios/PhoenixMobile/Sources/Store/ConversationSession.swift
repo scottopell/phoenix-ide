@@ -914,6 +914,13 @@ final class ConversationSession {
                 onSessionEvent?(.connectionChanged(.live))
                 for try await event in events {
                     guard isCurrentLiveWork(generation, apiIdentity: apiIdentity) else { return }
+                    if case .initSnapshot(let snapshot) = event,
+                       !matchesSessionBinding(snapshot.conversation)
+                    {
+                        reportMisroutedInit()
+                        invalidateLiveWork()
+                        return
+                    }
                     receive(event)
                 }
             } catch is CancellationError {
@@ -982,13 +989,8 @@ final class ConversationSession {
         guard !isHardDeleted else { return }
         switch event {
         case .initSnapshot(let snap):
-            guard snap.conversation.aggregateIdentity == aggregateAuthority else {
-                let error = APIError.decoding(underlying: NSError(
-                    domain: "ConversationSession",
-                    code: 1,
-                    userInfo: [NSLocalizedDescriptionKey: "Conversation aggregate identity does not match this session."]))
-                lastErrorToast = error.errorDescription
-                onSessionEvent?(.errorToastChanged(lastErrorToast))
+            guard matchesSessionBinding(snap.conversation) else {
+                reportMisroutedInit()
                 return
             }
             retryDelay = 1
@@ -1066,6 +1068,20 @@ final class ConversationSession {
 
     /// Sequence-guarded application of non-init events. Events at or below
     /// the current floor were already absorbed via a snapshot — drop them.
+    private func matchesSessionBinding(_ conversation: Conversation) -> Bool {
+        conversation.id == conversationId
+            && conversation.aggregateIdentity == aggregateAuthority
+    }
+
+    private func reportMisroutedInit() {
+        let error = APIError.decoding(underlying: NSError(
+            domain: "ConversationSession",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "Conversation identity does not match this session."]))
+        lastErrorToast = error.errorDescription
+        onSessionEvent?(.errorToastChanged(lastErrorToast))
+    }
+
     private func applyLive(_ event: PhoenixEvent) {
         switch event {
         case .initSnapshot:

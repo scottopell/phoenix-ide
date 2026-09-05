@@ -949,6 +949,26 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertEqual(model.navigationConversationId(for: aggregateConversation), "row-1")
     }
 
+    func testAggregateNavigationDestinationRemainsAggregateAcrossConnectivityChanges() {
+        let model = makeModel(hasCachedSnapshot: { $0 == "row-1" })
+        let aggregate = conversation(id: "row-2", aggregateId: "pc-1")
+        model.listStore.upsert(conversation(id: "row-1", aggregateId: "pc-1"))
+        model.listStore.upsert(aggregate)
+        model.connectivity.setOnlineForTesting(true)
+        let selected = model.navigationDestination(for: aggregate)
+
+        model.connectivity.setOnlineForTesting(false)
+
+        guard case .aggregate(let aggregateId, let initialTranscriptRowId) = selected else {
+            return XCTFail("expected aggregate destination")
+        }
+        XCTAssertEqual(aggregateId, "pc-1")
+        XCTAssertEqual(initialTranscriptRowId, "row-2")
+        guard case .aggregate = model.navigationDestination(for: aggregate) else {
+            return XCTFail("offline selection must remain on aggregate detail")
+        }
+    }
+
     func testOfflineNavigationUsesCachedAggregateMemberAfterRestart() {
         let baseDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("phoenix-appmodel-tests-\(UUID().uuidString)", isDirectory: true)
@@ -2215,18 +2235,19 @@ final class AppModelProductConversationTests: XCTestCase {
             messages: [], agentWorking: false,
             presentationMode: "idle", lastSequenceId: 0,
             pendingAnchorSequenceId: 0, pendingEvents: [], pendingTruncated: false)))
-        let waiter = Task { await model.awaitHardDeleteCleanupForTesting(conversationId: "row-1") }
-
         session?.receive(.conversationHardDeleted(seq: 1, conversationId: "row-1"))
         await blocker.waitForEntry()
+        let waiter = Task { await model.awaitHardDeleteCleanupForTesting(conversationId: "row-1") }
 
         XCTAssertNil(model.existingSession(for: "row-1"))
         let completedBeforeRelease = await removedProbe.isCompleted()
         XCTAssertFalse(completedBeforeRelease)
+        model.pendingOpenConversationId = "row-0"
 
         await blocker.release()
         await removedProbe.wait()
         await waiter.value
+        XCTAssertNil(model.pendingOpenConversationId)
 
         let lateWaiter = Task { await model.awaitHardDeleteCleanupForTesting(conversationId: "row-1") }
         await lateWaiter.value
@@ -2376,10 +2397,11 @@ final class AppModelProductConversationTests: XCTestCase {
     }
 
     func testArchiveProceedsForSingleSegmentProductConversation() async {
-        let store = MutableTestConversationPersistenceStore(
-            owners: ["row-1"],
-            contentsByConversationId: ["row-1": .entries([])],
-            aggregateMembersById: ["pc-1": ["row-1"]])
+        let baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-archive-tests-\(UUID().uuidString)")
+        let store = DiskConversationPersistenceStore(
+            baseDirectory: baseDirectory,
+            context: DiskStore.versionedContext(baseDirectory: baseDirectory))
         let probe = SendProbe()
         let (api, registration) = makeHTTPAPI(probe: probe)
         defer { TestURLProtocol.uninstall(host: "phoenix.invalid", owner: registration) }
@@ -2396,6 +2418,12 @@ final class AppModelProductConversationTests: XCTestCase {
 
         XCTAssertTrue(archived)
         XCTAssertEqual(probe.archivePostPaths, ["/api/conversations/row-1/archive"])
+        XCTAssertTrue(model.listStore.conversations.isEmpty)
+
+        let restored = ConversationListStore(
+            hasCachedSnapshot: { _ in false },
+            context: store.listPersistenceContext!)
+        XCTAssertTrue(restored.conversations.isEmpty)
     }
 
     func testAggregateNotFoundCleanupOnlyRemovesExactScopedPersistedMembers() async throws {
