@@ -274,8 +274,8 @@ final class ConversationSession {
             // same user message never renders twice while offline.
             reconcileOutbox()
         } else if case .value(let snap) = loadedSnapshot,
-                  legacySnapshotPersistenceScope == api.configurationIdentity.persistenceScope,
-                  snap.authoritative == nil
+                  (snap.authoritative == nil
+                    && legacySnapshotPersistenceScope == api.configurationIdentity.persistenceScope)
                     || snap.authoritative?.configurationIdentity.persistenceScope == api.configurationIdentity.persistenceScope,
                   let persistedConversation = snap.conversation,
                   Self.receiptIdentity(
