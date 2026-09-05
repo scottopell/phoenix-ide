@@ -14,14 +14,32 @@ private struct TestPersistedOutboxStore {
 final class ProductConversationDetailModelTests: XCTestCase {
 
     private func makeAPI() -> PhoenixAPI {
-        PhoenixAPI(baseURL: URL(string: "https://example.com")!, password: nil, allowSelfSigned: true)!
+        PhoenixAPI(
+            baseURL: URL(string: "https://example.com")!,
+            password: nil,
+            allowSelfSigned: true,
+            configurationIdentity: APIConfigurationIdentity(serverURL: "https://example.com", credentialGeneration: "test-detail", trustSelfSigned: true))!
     }
 
     private func makeSession(id: String) -> ConversationSession {
-        ConversationSession(conversationId: id, api: makeAPI(), connectivity: ConnectivityMonitor())
+        let baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-detail-tests-\(UUID().uuidString)")
+        let snapshotDestination = baseDirectory
+            .appendingPathComponent("PhoenixMobile", isDirectory: true)
+            .appendingPathComponent("conv-\(id)")
+            .appendingPathExtension("json")
+        return ConversationSession(
+            conversationId: id,
+            api: makeAPI(),
+            connectivity: ConnectivityMonitor(),
+            outboxPersistence: OutboxPersistenceHandle.disk(conversationId: id, baseDirectory: baseDirectory),
+            snapshotPersistence: DiskStore.versionedContext(baseDirectory: baseDirectory).writer(destinationURL: snapshotDestination, version: ConversationSession.snapshotSchemaVersion),
+            retryTiming: LiveSessionTiming(),
+            staleCheckTiming: LiveSessionTiming())
     }
 
     private func snapshot(
+        productConversationId: String = "pc-1",
         lifecycle: ProductConversationOrdinaryLifecycle = .open,
         latest: String = "row-2",
         writable: String? = "row-2",
@@ -29,9 +47,9 @@ final class ProductConversationDetailModelTests: XCTestCase {
         hasOlder: Bool = false
     ) -> ProductConversationSnapshot {
         ProductConversationSnapshot(
-            product_conversation_id: "pc-1",
+            product_conversation_id: productConversationId,
             close: nil,
-            canonical_route: "/product-conversations/pc-1",
+            canonical_route: "/product-conversations/\(productConversationId)",
             requested_transcript_row_id: latest,
             canonical_root: .init(transcript_row_id: "row-1", slug: "root", title: "Root"),
             ordinary_lifecycle: lifecycle,
@@ -201,8 +219,24 @@ final class ProductConversationDetailModelTests: XCTestCase {
     func testOutboxProjectionIncludesPredecessorEntriesWithOwningSession() async {
         let connectivity = ConnectivityMonitor()
         connectivity.setOnlineForTesting(false)
-        let row1 = ConversationSession(conversationId: "row-1", api: makeAPI(), connectivity: connectivity)
-        let row2 = ConversationSession(conversationId: "row-2", api: makeAPI(), connectivity: connectivity)
+        let baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-detail-tests-\(UUID().uuidString)")
+        let row1 = ConversationSession(
+            conversationId: "row-1",
+            api: makeAPI(),
+            connectivity: connectivity,
+            outboxPersistence: OutboxPersistenceHandle.disk(conversationId: "row-1", baseDirectory: baseDirectory),
+            snapshotPersistence: DiskStore.versionedContext(baseDirectory: baseDirectory).writer(destinationURL: baseDirectory.appendingPathComponent("PhoenixMobile", isDirectory: true).appendingPathComponent("conv-row-1").appendingPathExtension("json"), version: ConversationSession.snapshotSchemaVersion),
+            retryTiming: LiveSessionTiming(),
+            staleCheckTiming: LiveSessionTiming())
+        let row2 = ConversationSession(
+            conversationId: "row-2",
+            api: makeAPI(),
+            connectivity: connectivity,
+            outboxPersistence: OutboxPersistenceHandle.disk(conversationId: "row-2", baseDirectory: baseDirectory),
+            snapshotPersistence: DiskStore.versionedContext(baseDirectory: baseDirectory).writer(destinationURL: baseDirectory.appendingPathComponent("PhoenixMobile", isDirectory: true).appendingPathComponent("conv-row-2").appendingPathExtension("json"), version: ConversationSession.snapshotSchemaVersion),
+            retryTiming: LiveSessionTiming(),
+            staleCheckTiming: LiveSessionTiming())
         row1.receive(.initSnapshot(.init(
             conversation: try! conversation(id: "row-1"),
             messages: [], agentWorking: false, presentationMode: "idle", lastSequenceId: 1,
@@ -225,65 +259,106 @@ final class ProductConversationDetailModelTests: XCTestCase {
     }
 
     func testTopologyInvalidationBurstUsesSingleFlightCoalescingWithoutSleep() async {
-        final class Counter {
+        actor Counter {
             var refreshCalls = 0
-            weak var model: ProductConversationDetailModel?
+
+            func increment() -> Int {
+                refreshCalls += 1
+                return refreshCalls
+            }
+
+            func value() -> Int { refreshCalls }
         }
         let counter = Counter()
-        let model = ProductConversationDetailModel(
+        let gate = RefreshGate()
+        let detailModel = ProductConversationDetailModel(
             aggregateId: "pc-1",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
             sessionProvider: { _ in nil },
-            loadSnapshot: { _, _ in self.snapshot() },
-            didStartRefresh: { cause in
-                _ = cause
-                counter.refreshCalls += 1
-                if counter.refreshCalls == 1 {
-                    counter.model?.invalidateAggregateTopologyForTesting(
-                        ProductConversationTopologyInvalidation(
-                            transcriptRowId: "row-2",
-                            aggregateIdentity: "pc-1",
-                            reason: .awaitingContinuation))
-                    counter.model?.invalidateAggregateTopologyForTesting(
-                        ProductConversationTopologyInvalidation(
-                            transcriptRowId: "row-2",
-                            aggregateIdentity: "pc-1",
-                            reason: .handedOff(successorConversationId: "row-3")))
+            loadSnapshot: { _, _ in
+                switch await counter.increment() {
+                case 1:
+                    return self.snapshot()
+                case 2:
+                    await gate.enterAndWaitForRelease()
+                    return self.snapshot()
+                case 3:
+                    return self.snapshot()
+                default:
+                    XCTFail("unexpected extra refresh")
+                    throw CancellationError()
                 }
             })
-        counter.model = model
 
-        model.invalidateAggregateTopologyForTesting(
+        await detailModel.start()
+        detailModel.invalidateAggregateTopologyForTesting(
             ProductConversationTopologyInvalidation(
                 transcriptRowId: "row-2",
                 aggregateIdentity: "pc-1",
                 reason: .contextExhausted))
+        await gate.waitForEntry()
+        detailModel.invalidateAggregateTopologyForTesting(
+            ProductConversationTopologyInvalidation(
+                transcriptRowId: "row-2",
+                aggregateIdentity: "pc-1",
+                reason: .awaitingContinuation))
+        detailModel.invalidateAggregateTopologyForTesting(
+            ProductConversationTopologyInvalidation(
+                transcriptRowId: "row-2",
+                aggregateIdentity: "pc-1",
+                reason: .handedOff(successorConversationId: "row-3")))
+        await gate.release()
+        await detailModel.awaitCurrentLoadForTesting()
 
-        while counter.refreshCalls < 2 { await Task.yield() }
-        XCTAssertEqual(counter.refreshCalls, 2)
+        let refreshCalls = await counter.value()
+        XCTAssertEqual(refreshCalls, 3)
     }
 
     func testRepeatedIdenticalInvalidationDoesNotRequireMoreThanOneFollowupRefresh() async {
-        final class Counter { var refreshCalls = 0 }
+        actor Counter {
+            var refreshCalls = 0
+
+            func increment() -> Int {
+                refreshCalls += 1
+                return refreshCalls
+            }
+
+            func value() -> Int { refreshCalls }
+        }
         let counter = Counter()
+        let gate = RefreshGate()
         let model = ProductConversationDetailModel(
             aggregateId: "pc-1",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
             sessionProvider: { _ in nil },
-            loadSnapshot: { _, _ in self.snapshot() },
-            didStartRefresh: { _ in counter.refreshCalls += 1 })
+            loadSnapshot: { _, _ in
+                switch await counter.increment() {
+                case 1:
+                    return self.snapshot()
+                case 2:
+                    await gate.enterAndWaitForRelease()
+                    return self.snapshot()
+                default:
+                    XCTFail("unexpected extra refresh")
+                    throw CancellationError()
+                }
+            })
 
+        await model.start()
         let invalidation = ProductConversationTopologyInvalidation(
             transcriptRowId: "row-2",
             aggregateIdentity: "pc-1",
             reason: .awaitingContinuation)
         model.invalidateAggregateTopologyForTesting(invalidation)
         model.invalidateAggregateTopologyForTesting(invalidation)
+        await gate.waitForEntry()
+        await gate.release()
+        await model.awaitCurrentLoadForTesting()
 
-        while counter.refreshCalls < 1 { await Task.yield() }
-        XCTAssertEqual(counter.refreshCalls, 1)
+        let refreshCalls = await counter.value()
+        XCTAssertEqual(refreshCalls, 2)
     }
 
     func testAggregateSnapshotAuthorityWinsOverHandoffHintForSuccessorRebind() {
@@ -327,7 +402,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
                 return pages[min(box.index, pages.count - 1)]
             })
 
-        await model.refresh(cause: .manual)
+        await model.start()
         XCTAssertEqual(model.olderCursor, "cursor-1")
         await model.loadOlder()
         XCTAssertEqual(box.calls, [nil, "cursor-1"])
@@ -385,33 +460,81 @@ final class ProductConversationDetailModelTests: XCTestCase {
     }
 
     func testLateCancelledLoadCannotClearNewFlight() async {
-        final class Gate {
-            var firstStarted = false
-            var firstCanFinish = false
-            var secondCount = 0
+        actor Gate {
+            private var blockedRefreshStarted = false
+            private var blockedRefreshEntered: CheckedContinuation<Void, Never>?
+            private var blockedRefreshRelease: CheckedContinuation<Void, Never>?
+            private var restartedFlightCount = 0
+            private var restartedFlightEntered: CheckedContinuation<Void, Never>?
+
+            func enterBlockedRefreshAndWaitForRelease() async {
+                blockedRefreshStarted = true
+                blockedRefreshEntered?.resume()
+                blockedRefreshEntered = nil
+                await withCheckedContinuation { blockedRefreshRelease = $0 }
+            }
+
+            func waitForBlockedRefreshEntry() async {
+                if blockedRefreshStarted { return }
+                await withCheckedContinuation { blockedRefreshEntered = $0 }
+            }
+
+            func releaseBlockedRefresh() async {
+                blockedRefreshRelease?.resume()
+                blockedRefreshRelease = nil
+            }
+
+            func noteRestartedFlight() {
+                restartedFlightCount += 1
+                restartedFlightEntered?.resume()
+                restartedFlightEntered = nil
+            }
+
+            func waitForRestartedFlight() async {
+                if restartedFlightCount > 0 { return }
+                await withCheckedContinuation { restartedFlightEntered = $0 }
+            }
         }
         let gate = Gate()
+        actor Calls {
+            var refreshCount = 0
+
+            func next() -> Int {
+                refreshCount += 1
+                return refreshCount
+            }
+        }
+        let calls = Calls()
         let model = ProductConversationDetailModel(
             aggregateId: "pc-1",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
             sessionProvider: { _ in nil },
             loadSnapshot: { _, _ in
-                if !gate.firstStarted {
-                    gate.firstStarted = true
-                    while !gate.firstCanFinish { await Task.yield() }
+                switch await calls.next() {
+                case 1:
                     return self.snapshot(latest: "row-2", writable: "row-2")
+                case 2:
+                    await gate.enterBlockedRefreshAndWaitForRelease()
+                    return self.snapshot(latest: "row-stale", writable: "row-stale")
+                case 3:
+                    await gate.noteRestartedFlight()
+                    return self.snapshot(latest: "row-3", writable: "row-3")
+                default:
+                    XCTFail("unexpected extra load")
+                    return self.snapshot(latest: "row-3", writable: "row-3")
                 }
-                gate.secondCount += 1
-                return self.snapshot(latest: "row-3", writable: "row-3")
             })
 
-        Task { await model.refresh(cause: .manual) }
-        while !gate.firstStarted { await Task.yield() }
+        await model.start()
+        async let blockedRefresh: Void = model.refresh(cause: .manual)
+        await gate.waitForBlockedRefreshEntry()
         model.stop()
-        Task { await model.refresh(cause: .manual) }
-        gate.firstCanFinish = true
-        while gate.secondCount < 1 { await Task.yield() }
+        async let restartedStart: Void = model.start()
+        await gate.waitForRestartedFlight()
+        await gate.releaseBlockedRefresh()
+        _ = await (blockedRefresh, restartedStart)
+
         XCTAssertEqual(model.latestTranscriptRowId, "row-3")
     }
 
@@ -433,7 +556,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
                 return responses[min(box.index, responses.count - 1)]
             })
 
-        await model.refresh(cause: .manual)
+        await model.start()
         await model.loadOlder()
         await model.refresh(cause: .manual)
 
@@ -451,7 +574,16 @@ final class ProductConversationDetailModelTests: XCTestCase {
             let connectivity = ConnectivityMonitor()
             connectivity.setOnlineForTesting(false)
             let registry = SessionRegistry()
-            let row1 = ConversationSession(conversationId: "row-1", api: self.makeAPI(), connectivity: connectivity)
+            let baseDirectory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("phoenix-detail-tests-\(UUID().uuidString)")
+            let row1 = ConversationSession(
+                conversationId: "row-1",
+                api: self.makeAPI(),
+                connectivity: connectivity,
+                outboxPersistence: OutboxPersistenceHandle.disk(conversationId: "row-1", baseDirectory: baseDirectory),
+                snapshotPersistence: DiskStore.versionedContext(baseDirectory: baseDirectory).writer(destinationURL: baseDirectory.appendingPathComponent("PhoenixMobile", isDirectory: true).appendingPathComponent("conv-row-1").appendingPathExtension("json"), version: ConversationSession.snapshotSchemaVersion),
+                retryTiming: LiveSessionTiming(),
+                staleCheckTiming: LiveSessionTiming())
             row1.receive(.initSnapshot(.init(
                 conversation: try! self.conversation(id: "row-1"),
                 messages: [], agentWorking: false, presentationMode: "idle", lastSequenceId: 1,
@@ -498,7 +630,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
             sessionProvider: { _ in nil },
             loadSnapshot: { _, _ in defer { box.index += 1 }; return pages[min(box.index, pages.count - 1)] })
 
-        await model.refresh(cause: .manual)
+        await model.start()
         await model.loadOlder()
         await model.refresh(cause: .delegateConversationChanged)
 
@@ -597,23 +729,45 @@ final class ProductConversationDetailModelTests: XCTestCase {
     }
 
     func testChatCapabilityInvalidationTriggersRefreshAndRestoresWritableComposerState() async {
-        final class Box { var refreshes = 0 }
-        let box = Box()
+        let initial = snapshot(lifecycle: .open, writable: "row-2")
         let refreshed = snapshot(lifecycle: .open, writable: "row-2")
+        let gate = RefreshGate()
+        actor Calls {
+            var count = 0
+
+            func next() -> Int {
+                count += 1
+                return count
+            }
+        }
+        let calls = Calls()
         let model = ProductConversationDetailModel(
             aggregateId: "pc-1",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
             sessionProvider: { _ in nil },
-            loadSnapshot: { _, _ in refreshed },
-            didStartRefresh: { _ in box.refreshes += 1 })
+            loadSnapshot: { _, _ in
+                switch await calls.next() {
+                case 1:
+                    return initial
+                case 2:
+                    await gate.enterAndWaitForRelease()
+                    return refreshed
+                default:
+                    XCTFail("unexpected extra refresh")
+                    return refreshed
+                }
+            })
 
+        await model.start()
         model.applyForTesting(snapshot(lifecycle: .open, writable: nil))
         model.invalidateAggregateTopologyForTesting(.init(
             transcriptRowId: "row-2",
             aggregateIdentity: "pc-1",
             reason: .awaitingContinuation))
-        while box.refreshes < 1 { await Task.yield() }
+        await gate.waitForEntry()
+        await gate.release()
+        await model.awaitCurrentLoadForTesting()
 
         XCTAssertTrue(model.canSendChat)
         XCTAssertEqual(model.actionTranscriptRowId, "row-2")
@@ -699,7 +853,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
             connectivity: ConnectivityMonitor(),
             sessionProvider: { _ in nil },
             existingSession: { _ in nil },
-            handleDefinitiveNotFound: { transcriptRowId in
+            handleDefinitiveNotFound: { transcriptRowId, _ in
                 box.cleanedTranscriptRowId = transcriptRowId
             },
             loadSnapshot: { _, _ in throw APIError.http(status: 404, body: "gone") })
@@ -740,6 +894,352 @@ final class ProductConversationDetailModelTests: XCTestCase {
         XCTAssertEqual(model.fallbackSession?.conversationId, "row-2")
         XCTAssertEqual(model.selectedTranscriptRowId, "row-2")
         XCTAssertTrue(model.outboxProjections.isEmpty)
+    }
+
+    private actor AsyncGate {
+        private var enteredCount = 0
+        private var enteredContinuation: CheckedContinuation<Void, Never>?
+        private var releaseContinuation: CheckedContinuation<Void, Never>?
+        private var released = false
+
+        func waitUntilStarted(count: Int = 1) async {
+            if enteredCount >= count { return }
+            await withCheckedContinuation { continuation in
+                enteredContinuation = continuation
+            }
+        }
+
+        func signalStartedAndWaitForRelease() async {
+            enteredCount += 1
+            enteredContinuation?.resume()
+            enteredContinuation = nil
+            if !released {
+                await withCheckedContinuation { continuation in
+                    releaseContinuation = continuation
+                }
+            }
+        }
+
+        func release() async {
+            guard !released else { return }
+            released = true
+            releaseContinuation?.resume()
+            releaseContinuation = nil
+        }
+    }
+
+    private actor RefreshGate {
+        private var entered = 0
+        private var enteredContinuation: CheckedContinuation<Void, Never>?
+        private var releaseContinuation: CheckedContinuation<Void, Never>?
+        private var released = false
+
+        func waitForEntry(count: Int = 1) async {
+            if entered >= count { return }
+            await withCheckedContinuation { enteredContinuation = $0 }
+        }
+
+        func enterAndWaitForRelease() async {
+            entered += 1
+            if let continuation = enteredContinuation, entered >= 1 {
+                continuation.resume()
+                enteredContinuation = nil
+            }
+            if !released {
+                await withCheckedContinuation { releaseContinuation = $0 }
+            }
+        }
+
+        func release() async {
+            guard !released else { return }
+            released = true
+            releaseContinuation?.resume()
+            releaseContinuation = nil
+        }
+    }
+
+    func testLoadOlderQueuedDuringRefreshUsesFreshCursorAfterRefresh() async {
+        actor Box {
+            var cursors: [String?] = []
+            var callCount = 0
+
+            func record(_ cursor: String?) -> Int {
+                cursors.append(cursor)
+                callCount += 1
+                return callCount
+            }
+
+            func allCursors() -> [String?] { cursors }
+        }
+        let box = Box()
+        let gate = AsyncGate()
+        let first = snapshot(before: "older-1", hasOlder: true)
+        let refreshed = snapshot(before: "older-2", hasOlder: true)
+        let older = snapshot(before: nil as String?, hasOlder: false)
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-1",
+            api: makeAPI(),
+            connectivity: ConnectivityMonitor(),
+            sessionProvider: { _ in nil },
+            existingSession: { _ in nil },
+            loadSnapshot: { _, before in
+                let call = await box.record(before)
+                switch (before, call) {
+                case (nil, 1):
+                    return first
+                case (nil, 2):
+                    await gate.signalStartedAndWaitForRelease()
+                    return refreshed
+                case ("older-2", _):
+                    return older
+                default:
+                    XCTFail("stale cursor used: \(before ?? "nil")")
+                    return older
+                }
+            })
+
+        await model.start()
+        async let topologyRefresh: Void = model.refresh(cause: .delegateConversationChanged)
+        await gate.waitUntilStarted()
+        async let olderLoad: Void = model.loadOlder()
+        await gate.release()
+        _ = await (topologyRefresh, olderLoad)
+
+        let cursors = await box.allCursors()
+        XCTAssertEqual(cursors, [nil, nil, "older-2"])
+    }
+
+    func testForeignAggregateTopologyInvalidationDoesNotRefresh() async {
+        actor Calls {
+            var count = 0
+            func next() -> Int { count += 1; return count }
+            func value() -> Int { count }
+        }
+        let calls = Calls()
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-a",
+            api: makeAPI(),
+            connectivity: ConnectivityMonitor(),
+            sessionProvider: { _ in nil },
+            existingSession: { _ in nil },
+            loadSnapshot: { _, _ in
+                let count = await calls.next()
+                if count > 1 {
+                    XCTFail("foreign aggregate invalidation should not refresh this detail")
+                }
+                return self.snapshot(productConversationId: "pc-a", before: "older-a", hasOlder: true)
+            })
+
+        await model.start()
+        model.handleSessionEvent(
+            transcriptRowId: "row-foreign",
+            generation: model.observerGenerationForTesting,
+            event: .aggregateTopologyInvalidated(.init(
+                transcriptRowId: "row-foreign",
+                aggregateIdentity: "pc-foreign",
+                reason: .terminal)))
+        await model.awaitCurrentLoadForTesting()
+
+        let callCount = await calls.value()
+        XCTAssertEqual(callCount, 1)
+    }
+
+    func testForeignAggregateRefreshIsRejected() async {
+        actor Box {
+            var cursors: [String?] = []
+            var callCount = 0
+
+            func record(_ cursor: String?) -> Int {
+                cursors.append(cursor)
+                callCount += 1
+                return callCount
+            }
+
+            func allCursors() -> [String?] { cursors }
+        }
+        let box = Box()
+        let gate = AsyncGate()
+        let first = snapshot(productConversationId: "pc-a", before: "older-a", hasOlder: true)
+        let switched = snapshot(productConversationId: "pc-b", before: "older-b", hasOlder: true)
+        var invalidated = false
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-a",
+            api: makeAPI(),
+            connectivity: ConnectivityMonitor(),
+            sessionProvider: { _ in nil },
+            existingSession: { _ in nil },
+            loadSnapshot: { _, before in
+                let call = await box.record(before)
+                switch (before, call) {
+                case (nil, 1):
+                    return first
+                case (nil, 2):
+                    await gate.signalStartedAndWaitForRelease()
+                    return switched
+                case ("older-b", _):
+                    XCTFail("older intent should not run after foreign aggregate response")
+                    return switched
+                default:
+                    XCTFail("unexpected cursor used: \(before ?? "nil")")
+                    return switched
+                }
+            },
+            onConfigurationInvalidated: { _ in invalidated = true })
+
+        await model.start()
+        async let topologyRefresh: Void = model.refresh(cause: .delegateConversationChanged)
+        await gate.waitUntilStarted()
+        async let olderLoad: Void = model.loadOlder()
+        await gate.release()
+        _ = await (topologyRefresh, olderLoad)
+
+        let cursors = await box.allCursors()
+        XCTAssertEqual(cursors, [nil, nil])
+        XCTAssertTrue(invalidated)
+        XCTAssertNil(model.snapshot)
+        XCTAssertNil(model.selectedTranscriptRowId)
+    }
+
+    func testStartIsIdempotentWhileAlreadyActive() async {
+        actor Calls {
+            var count = 0
+            func next() -> Int { count += 1; return count }
+            func value() -> Int { count }
+        }
+        let calls = Calls()
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-1",
+            api: makeAPI(),
+            connectivity: ConnectivityMonitor(),
+            sessionProvider: { _ in nil },
+            loadSnapshot: { _, _ in
+                let call = await calls.next()
+                if call > 1 {
+                    XCTFail("start should not enqueue a second initial refresh")
+                }
+                return self.snapshot()
+            })
+
+        await model.start()
+        await model.start()
+        await model.awaitCurrentLoadForTesting()
+
+        let count = await calls.value()
+        XCTAssertEqual(count, 1)
+    }
+
+
+    func testTopologyRefreshDominatesManualRefreshWhenQueued() async {
+        actor Box {
+            var calls: [String?] = []
+            var callCount = 0
+
+            func record(_ cursor: String?) -> Int {
+                calls.append(cursor)
+                callCount += 1
+                return callCount
+            }
+
+            func allCalls() -> [String?] { calls }
+        }
+        let box = Box()
+        let gate = AsyncGate()
+        let initial = snapshot(before: "cursor-1", hasOlder: true)
+        let older = snapshot(before: nil as String?, hasOlder: false)
+        let refreshed = snapshot(before: "cursor-2", hasOlder: true)
+        var observedCauses: [ProductConversationRefreshCause] = []
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-1",
+            api: makeAPI(),
+            connectivity: ConnectivityMonitor(),
+            sessionProvider: { _ in nil },
+            existingSession: { _ in nil },
+            loadSnapshot: { _, before in
+                let call = await box.record(before)
+                switch (before, call) {
+                case (nil, 1):
+                    return initial
+                case ("cursor-1", 2):
+                    return older
+                case (nil, 3):
+                    await gate.signalStartedAndWaitForRelease()
+                    return refreshed
+                case ("cursor-2", 4):
+                    return older
+                default:
+                    XCTFail("unexpected cursor sequence: \(before ?? "nil")")
+                    return older
+                }
+            },
+            didStartRefresh: { cause in
+                observedCauses.append(cause)
+            })
+
+        await model.start()
+        await model.loadOlder()
+        async let topologyRefresh: Void = model.refresh(cause: ProductConversationRefreshCause.delegateConversationChanged)
+        await gate.waitUntilStarted()
+        async let manualRefresh: Void = model.refresh(cause: ProductConversationRefreshCause.manual)
+        async let olderLoad: Void = model.loadOlder()
+        await gate.release()
+        _ = await (topologyRefresh, manualRefresh, olderLoad)
+
+        let calls = await box.allCalls()
+        XCTAssertEqual(calls, [nil, "cursor-1", nil, "cursor-2"])
+        XCTAssertEqual(observedCauses, [.initial, .delegateConversationChanged])
+        XCTAssertEqual(model.olderCursor, nil)
+    }
+
+    func testStopClearsQueuedLoadPlanBeforeRestart() async {
+        actor Box {
+            var cursors: [String?] = []
+            var callCount = 0
+
+            func record(_ cursor: String?) -> Int {
+                cursors.append(cursor)
+                callCount += 1
+                return callCount
+            }
+
+            func allCursors() -> [String?] { cursors }
+        }
+        let box = Box()
+        let gate = AsyncGate()
+        let first = snapshot(before: "older-1", hasOlder: true)
+        let refreshed = snapshot(before: "older-2", hasOlder: true)
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-1",
+            api: makeAPI(),
+            connectivity: ConnectivityMonitor(),
+            sessionProvider: { _ in nil },
+            existingSession: { _ in nil },
+            loadSnapshot: { _, before in
+                let call = await box.record(before)
+                switch (before, call) {
+                case (nil, 1):
+                    return first
+                case (nil, 2):
+                    await gate.signalStartedAndWaitForRelease()
+                    return refreshed
+                case ("older-2", _):
+                    XCTFail("stale older intent survived stop/restart")
+                    return refreshed
+                default:
+                    return refreshed
+                }
+            })
+
+        await model.start()
+        async let refresh: Void = model.refresh(cause: .delegateConversationChanged)
+        await gate.waitUntilStarted()
+        async let older: Void = model.loadOlder()
+        model.stop()
+        await gate.release()
+        _ = await (refresh, older)
+        await model.start()
+
+        let cursors = await box.allCursors()
+        XCTAssertEqual(cursors, [nil, nil, nil])
     }
 
     func testPersistedOutboxRemovalReleasesFallbackOwnerWhenNoLongerNeeded() async {

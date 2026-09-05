@@ -124,8 +124,9 @@ final class DiskStoreVersioningTests: XCTestCase {
     @MainActor
     func testWriterHandlesShareOneDestinationRevisionFence() async {
         freshDiskStore()
-        let first = DiskStore.versionedWriter(name: "records", version: 1)
-        let replacement = DiskStore.versionedWriter(name: "records", version: 1)
+        let context = DiskStore.versionedContext()
+        let first = context.writer(name: "records", version: 1)
+        let replacement = context.writer(name: "records", version: 1)
         let oldRevision = first.reserveRevision()
         let newRevision = replacement.reserveRevision()
 
