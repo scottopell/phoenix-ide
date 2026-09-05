@@ -471,6 +471,7 @@ final class ConversationSessionReducerTests: XCTestCase {
         openEventStream: @escaping ConversationEventStreamOpener = defaultConversationEventStreamOpener,
         baseDirectory: URL? = nil,
         context: VersionedDiskContext? = nil,
+        legacySnapshotPersistenceScope: PersistenceScopeIdentity? = nil,
         aggregateAuthority: String? = nil
     ) -> ConversationSession {
         let resolvedBaseDirectory = baseDirectory ?? FileManager.default.temporaryDirectory
@@ -494,6 +495,7 @@ final class ConversationSessionReducerTests: XCTestCase {
             retryTiming: retryTiming,
             staleCheckTiming: staleCheckTiming,
             openEventStream: openEventStream,
+            legacySnapshotPersistenceScope: legacySnapshotPersistenceScope,
             aggregateAuthority: aggregateAuthority,
             onConversationUpdate: onConversationUpdate,
             onHardDeleted: onHardDeleted)
@@ -899,7 +901,7 @@ final class ConversationSessionReducerTests: XCTestCase {
         let context = DiskStore.versionedContext(baseDirectory: baseDirectory)
         let legacySnapshot = ConversationSession.PersistedSnapshot(
             conversation: try conversation(id: "c1", aggregateId: "pc-1"),
-            messages: [],
+            messages: [try message(id: "m-legacy", content: "\"offline history\"")],
             lastSequenceId: 0,
             transcriptGeneration: nil,
             syncedAt: Date(),
@@ -926,9 +928,15 @@ final class ConversationSessionReducerTests: XCTestCase {
         defer { DiskStore.baseDirectory = previousBaseDirectory }
         XCTAssertTrue(DiskStore.saveVersioned([pending], name: "outbox-c1", version: 1))
 
-        let reopened = makeSession(api: api, baseDirectory: baseDirectory, context: context, aggregateAuthority: "pc-1")
-        XCTAssertNil(reopened.conversation)
-        XCTAssertTrue(reopened.messages.isEmpty)
+        let reopened = makeSession(
+            api: api,
+            baseDirectory: baseDirectory,
+            context: context,
+            legacySnapshotPersistenceScope: api.configurationIdentity.persistenceScope,
+            aggregateAuthority: "pc-1")
+        XCTAssertEqual(reopened.conversation?.id, "c1")
+        XCTAssertEqual(reopened.messages.map(\.message_id), ["m-legacy"])
+        XCTAssertNil(reopened.authoritativeSnapshotReceipt)
         XCTAssertTrue(reopened.outbox.entries.isEmpty)
         XCTAssertFalse(reopened.outbox.persistenceHealthy)
         XCTAssertFalse(reopened.canSendPersistedOutbox)
@@ -966,6 +974,38 @@ final class ConversationSessionReducerTests: XCTestCase {
         {} else {
             XCTFail("expected unreadable schema-v1 outbox to remain unmodified")
         }
+    }
+
+    @MainActor
+    func testLegacySnapshotWithoutProvenInstallationScopeFailsClosed() async throws {
+        let baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-session-tests-\(UUID().uuidString)")
+        let context = DiskStore.versionedContext(baseDirectory: baseDirectory)
+        let snapshotWriter = context.writer(
+            destinationURL: DiskStore.phoenixMobileDirectory(baseDirectory: baseDirectory)
+                .appendingPathComponent("conv-c1")
+                .appendingPathExtension("json"),
+            version: ConversationSession.snapshotSchemaVersion)
+        _ = await snapshotWriter.save(
+            ConversationSession.PersistedSnapshot(
+                conversation: try conversation(id: "c1", aggregateId: "pc-1"),
+                messages: [try message(id: "m1", content: "\"legacy\"")],
+                lastSequenceId: 1,
+                transcriptGeneration: nil,
+                syncedAt: Date(),
+                authoritative: nil),
+            revision: snapshotWriter.reserveRevision())
+
+        let reopened = makeSession(
+            baseDirectory: baseDirectory,
+            context: context,
+            legacySnapshotPersistenceScope: nil,
+            aggregateAuthority: "pc-1")
+
+        XCTAssertNil(reopened.conversation)
+        XCTAssertTrue(reopened.messages.isEmpty)
+        XCTAssertNil(reopened.authoritativeSnapshotReceipt)
+        XCTAssertFalse(reopened.canSendPersistedOutbox)
     }
 
     @MainActor

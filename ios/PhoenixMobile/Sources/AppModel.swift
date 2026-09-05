@@ -59,12 +59,12 @@ enum HardDeleteFenceLoadResult: Equatable, Sendable {
 }
 
 struct PersistedHardDeleteFence: Codable, Equatable, Sendable {
-    let configurationIdentity: APIConfigurationIdentity
+    let persistenceScope: PersistenceScopeIdentity
     let aggregateAuthority: String
     let memberConversationIds: [String]
 
     var storageName: String {
-        let identity = "\(configurationIdentity.serverURL)\u{1f}\(configurationIdentity.credentialGeneration)\u{1f}\(configurationIdentity.trustSelfSigned)\u{1f}\(aggregateAuthority)"
+        let identity = "\(persistenceScope.serverEndpoint)\u{1f}\(persistenceScope.credentialGeneration)\u{1f}\(aggregateAuthority)"
         let digest = SHA256.hash(data: Data(identity.utf8))
         return "hard-delete-" + digest.map { String(format: "%02x", $0) }.joined()
     }
@@ -116,7 +116,7 @@ protocol ConversationPersistenceStore {
     ) async -> Bool
     func removeAllPersistedConversationState() async
     func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool
-    func hardDeleteFences(configurationIdentity: APIConfigurationIdentity) -> HardDeleteFenceLoadResult
+    func hardDeleteFences(persistenceScope: PersistenceScopeIdentity) -> HardDeleteFenceLoadResult
     func retireHardDeleteFence(_ fence: PersistedHardDeleteFence) async
 }
 
@@ -200,6 +200,25 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
             version: ConversationSession.snapshotSchemaVersion)
         else { return false }
         return snapshot.conversation != nil && snapshot.syncedAt != nil
+    }
+
+    func hasCachedSnapshot(
+        conversationId: String,
+        currentScope: PersistenceScopeIdentity,
+        legacyScope: PersistenceScopeIdentity?
+    ) -> Bool {
+        let source = directory.appendingPathComponent("conv-\(conversationId)").appendingPathExtension("json")
+        guard case .value(let snapshot) = DiskStore.loadVersionedResult(
+            ConversationSession.PersistedSnapshot.self,
+            source: source,
+            version: ConversationSession.snapshotSchemaVersion),
+            snapshot.conversation?.id == conversationId,
+            snapshot.syncedAt != nil
+        else { return false }
+        if let authority = snapshot.authoritative {
+            return authority.configurationIdentity.persistenceScope == currentScope
+        }
+        return legacyScope == currentScope
     }
 
     func hasAuthoritativeCachedSnapshot(
@@ -334,7 +353,7 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
             break
         case .value(let snapshot):
             if snapshot.conversation?.id == conversationId,
-               snapshot.authoritative?.configurationIdentity == configurationIdentity,
+               snapshot.authoritative?.configurationIdentity.persistenceScope == configurationIdentity.persistenceScope,
                snapshot.authoritative?.aggregateAuthority == aggregateAuthority
             {
                 let writer = context.writer(destinationURL: snapshotSource, version: ConversationSession.snapshotSchemaVersion)
@@ -371,7 +390,7 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
         {
         case .missing: snapshotResolved = true
         case .value(let snapshot):
-            snapshotResolved = snapshot.authoritative?.configurationIdentity != configurationIdentity
+            snapshotResolved = snapshot.authoritative?.configurationIdentity.persistenceScope != configurationIdentity.persistenceScope
                 || snapshot.authoritative?.aggregateAuthority != aggregateAuthority
         case .incompatible, .unreadable: snapshotResolved = false
         }
@@ -398,7 +417,7 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
         return await writer.save(fence, revision: writer.reserveRevision())
     }
 
-    func hardDeleteFences(configurationIdentity: APIConfigurationIdentity) -> HardDeleteFenceLoadResult {
+    func hardDeleteFences(persistenceScope: PersistenceScopeIdentity) -> HardDeleteFenceLoadResult {
         var fences: [PersistedHardDeleteFence] = []
         for name in DiskStore.names(in: directory, withPrefix: "hard-delete-") {
             let source = directory.appendingPathComponent(name).appendingPathExtension("json")
@@ -410,7 +429,7 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
             case .missing:
                 continue
             case .value(let fence):
-                if fence.configurationIdentity == configurationIdentity {
+                if fence.persistenceScope == persistenceScope {
                     fences.append(fence)
                 }
             case .incompatible, .unreadable:
@@ -427,43 +446,26 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
     }
 
     func removeAllPersistedConversationState() async {
-        let fenceSources = DiskStore.names(in: directory, withPrefix: "hard-delete-")
-            .map { directory.appendingPathComponent($0).appendingPathExtension("json") }
-        let snapshotSources = DiskStore.names(in: directory, withPrefix: "conv-")
-            .map { directory.appendingPathComponent($0).appendingPathExtension("json") }
-        let outboxSources = DiskStore.names(in: directory, withPrefix: "outbox-")
-            .map { directory.appendingPathComponent($0).appendingPathExtension("json") }
-        let fenceWriters = fenceSources.map {
-            context.writer(destinationURL: $0, version: 1)
-        }
-        let snapshotWriters = snapshotSources.map {
-            context.writer(destinationURL: $0, version: ConversationSession.snapshotSchemaVersion)
-        }
-        let outboxWriters = outboxSources.map {
-            context.writer(destinationURL: $0, version: Outbox.schemaVersion)
-        }
-        let fenceRemovals = zip(fenceWriters, fenceWriters.map { $0.reserveRevision() })
-        let snapshotRemovals = zip(snapshotWriters, snapshotWriters.map { $0.reserveRevision() })
-        let outboxRemovals = zip(outboxWriters, outboxWriters.map { $0.reserveRevision() })
-        for (writer, revision) in fenceRemovals {
-            await writer.remove(revision: revision)
-        }
-        for (writer, revision) in snapshotRemovals {
-            await writer.remove(revision: revision)
-        }
-        for (writer, revision) in outboxRemovals {
-            await writer.remove(revision: revision)
-        }
+        await context.removeAllAndWait()
     }
 }
 
 protocol CredentialStore {
+    func loadLegacyPassword(account: String) -> String?
     func loadRecord(account: String) -> AppModel.CredentialRecord?
     func saveRecord(_ record: AppModel.CredentialRecord, account: String) throws
     func deleteRecord(account: String)
 }
 
+extension CredentialStore {
+    func loadLegacyPassword(account: String) -> String? { nil }
+}
+
 struct KeychainCredentialStore: CredentialStore {
+    func loadLegacyPassword(account: String) -> String? {
+        Keychain.password(account: account)
+    }
+
     func loadRecord(account: String) -> AppModel.CredentialRecord? {
         guard let data = Keychain.data(account: account),
               case .value(let record) = DiskStore.loadVersionedResult(
@@ -493,6 +495,7 @@ final class AppModel {
     private static let serverURLKey = "phoenix.serverURL"
     private static let trustSelfSignedKey = "phoenix.trustSelfSigned"
     nonisolated fileprivate static let credentialRecordAccount = "server-credentials"
+    nonisolated fileprivate static let legacyPasswordAccount = "server-password"
     /// Shared with NewConversationView's @AppStorage. Cleared on sign-out:
     /// the value is a server-local filesystem path and must not leak (or be
     /// sent) to a different server configured later.
@@ -509,6 +512,7 @@ final class AppModel {
 
     private(set) var password: String
     private(set) var credentialGeneration: String
+    private let legacySnapshotPersistenceScope: PersistenceScopeIdentity?
 
     var configurationIdentity: APIConfigurationIdentity? {
         api?.configurationIdentity
@@ -577,6 +581,13 @@ final class AppModel {
         randomCredentialGenerationForTestsAndDefaults()
     }
 
+    private static func legacyCredentialGeneration(serverURL: String, password: String) -> String {
+        let scope = "\(PersistenceScopeIdentity(serverURL: serverURL, credentialGeneration: "").serverEndpoint)\u{1f}\(password)"
+        return "legacy-" + SHA256.hash(data: Data(scope.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+
     private static func loadCredentialRecord(from credentialStore: CredentialStore) -> CredentialRecord? {
         credentialStore.loadRecord(account: Self.credentialRecordAccount)
     }
@@ -598,10 +609,22 @@ final class AppModel {
         self.credentialStore = credentialStore
         let listContext = self.conversationPersistenceStore.listPersistenceContext ?? DiskStore.versionedContext()
         listStore = ConversationListStore(hasCachedSnapshot: self.hasCachedSnapshot, context: listContext)
-        serverURLString = UserDefaults.standard.string(forKey: Self.serverURLKey) ?? ""
+        let persistedServerURL = UserDefaults.standard.string(forKey: Self.serverURLKey) ?? ""
+        serverURLString = persistedServerURL
         let credentialRecord = Self.loadCredentialRecord(from: credentialStore)
-        password = credentialRecord?.password ?? ""
-        credentialGeneration = credentialRecord?.generation ?? ""
+        let legacyPassword = credentialRecord == nil
+            ? credentialStore.loadLegacyPassword(account: Self.legacyPasswordAccount)
+            : nil
+        password = credentialRecord?.password ?? legacyPassword ?? ""
+        let loadedCredentialGeneration = credentialRecord?.generation
+            ?? legacyPassword.map { Self.legacyCredentialGeneration(serverURL: persistedServerURL, password: $0) }
+            ?? ""
+        credentialGeneration = loadedCredentialGeneration
+        legacySnapshotPersistenceScope = legacyPassword.map { _ in
+            PersistenceScopeIdentity(
+                serverURL: persistedServerURL,
+                credentialGeneration: loadedCredentialGeneration)
+        }
         trustSelfSigned = UserDefaults.standard.object(forKey: Self.trustSelfSignedKey) as? Bool ?? true
         attention = AttentionMonitor(
             currentConversations: listStore.conversations,
@@ -624,7 +647,7 @@ final class AppModel {
         let identity = api.configurationIdentity
         let generation = apiGeneration
         let fences: [PersistedHardDeleteFence]
-        switch conversationPersistenceStore.hardDeleteFences(configurationIdentity: identity) {
+        switch conversationPersistenceStore.hardDeleteFences(persistenceScope: identity.persistenceScope) {
         case .accessible(let loaded):
             fences = loaded
         case .inaccessible:
@@ -682,9 +705,11 @@ final class AppModel {
     }
 
     private func completePersistedHardDeleteFence(_ fence: PersistedHardDeleteFence) async {
+        guard let identity = api?.configurationIdentity,
+              identity.persistenceScope == fence.persistenceScope else { return }
         await runHardDeleteCleanup(.init(
             configurationEpoch: apiGeneration,
-            configurationIdentity: fence.configurationIdentity,
+            configurationIdentity: identity,
             aggregateAuthority: fence.aggregateAuthority,
             triggerConversationId: nil,
             memberConversationIds: Set(fence.memberConversationIds),
@@ -873,6 +898,7 @@ final class AppModel {
                 deliveryTriggerAllowed: { [weak self] in
                     self?.persistedOutboxHydrated == true
                 },
+                legacySnapshotPersistenceScope: legacySnapshotPersistenceScope,
                 aggregateAuthority: aggregateIdentity(forTranscriptRowId: conversationId),
                 onConversationUpdate: onConversationUpdate,
                 onHardDeleted: onHardDeleted)
@@ -974,7 +1000,7 @@ final class AppModel {
         switch context.fenceState {
         case .needsCommit:
             fence = PersistedHardDeleteFence(
-                configurationIdentity: context.configurationIdentity,
+                persistenceScope: context.configurationIdentity.persistenceScope,
                 aggregateAuthority: context.aggregateAuthority,
                 memberConversationIds: context.memberConversationIds.sorted())
             guard await conversationPersistenceStore.persistHardDeleteFence(fence) else { return }
@@ -1252,10 +1278,20 @@ final class AppModel {
             },
             hasCachedSnapshot: { [weak self] transcriptRowId in
                 guard let self, let api = self.api else { return false }
-                return self.conversationPersistenceStore.hasAuthoritativeCachedSnapshot(
+                if self.conversationPersistenceStore.hasAuthoritativeCachedSnapshot(
                     conversationId: transcriptRowId,
                     configurationIdentity: api.configurationIdentity,
                     aggregateAuthority: aggregateId)
+                {
+                    return true
+                }
+                guard let store = self.conversationPersistenceStore as? DiskConversationPersistenceStore else {
+                    return false
+                }
+                return store.hasCachedSnapshot(
+                    conversationId: transcriptRowId,
+                    currentScope: api.configurationIdentity.persistenceScope,
+                    legacyScope: self.legacySnapshotPersistenceScope)
             },
             handleDefinitiveNotFound: { [weak self] transcriptRowId, segmentTranscriptRowIds in
                 await self?.handleAggregateHardDeleted(
@@ -1584,6 +1620,7 @@ final class AppModel {
                     deliveryTriggerAllowed: { [weak self] in
                         self?.persistedOutboxHydrated == true
                     },
+                    legacySnapshotPersistenceScope: legacySnapshotPersistenceScope,
                     aggregateAuthority: aggregateIdentity(forTranscriptRowId: conversationId))
                 drainSessions[conversationId] = drainSession
             }

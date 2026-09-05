@@ -122,6 +122,28 @@ final class DiskStoreVersioningTests: XCTestCase {
     }
 
     @MainActor
+    func testSignOutResetFencesPendingHardDeleteFenceSaveBeforePublication() async throws {
+        let baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-signout-fence-\(UUID().uuidString)")
+        let context = DiskStore.versionedContext(baseDirectory: baseDirectory)
+        let destination = DiskStore.phoenixMobileDirectory(baseDirectory: baseDirectory)
+            .appendingPathComponent("hard-delete-pending")
+            .appendingPathExtension("json")
+        let writer = context.writer(destinationURL: destination, version: 1)
+        let pendingSaveRevision = writer.reserveRevision()
+        let fence = PersistedHardDeleteFence(
+            persistenceScope: .init(serverURL: "https://phoenix.invalid", credentialGeneration: "credential"),
+            aggregateAuthority: "pc-1",
+            memberConversationIds: ["row-1"])
+
+        await context.removeAllAndWait()
+        let lateSaveCompleted = await writer.save(fence, revision: pendingSaveRevision)
+
+        XCTAssertTrue(lateSaveCompleted)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+    }
+
+    @MainActor
     func testWriterHandlesShareOneDestinationRevisionFence() async {
         freshDiskStore()
         let context = DiskStore.versionedContext()

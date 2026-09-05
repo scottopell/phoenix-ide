@@ -58,6 +58,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [044](044_creation-publication-uses-request-bound-identity-and-immutable-pins.md) | Creation publication uses request-bound identity and immutable starting pins | Accepted | REQ-CCR-001/002/003/005/005A/006A, REQ-DWF-CREATE-001/002/003/004, REQ-PROJ-017/022, REQ-GITREP-003 |
 | [045](045_provider-prompts-use-persisted-generation-fenced-projections.md) | Provider prompts use persisted generation-fenced projections | Accepted | REQ-BED-018A, REQ-BED-020, REQ-BED-030A |
 | [046](046_productconversation-owns-aggregate-presentation.md) | ProductConversation owns aggregate presentation without duplicating transcript authority | Accepted | REQ-BED-030A; `ProductConversation`, transcript members |
+| [047](047_ios-legacy-snapshots-render-read-only.md) | Proven same-installation legacy iOS snapshots render read-only | Accepted | REQ-IOS-002, REQ-IOS-005, compatibility requirements |
 
 ## For agents: which decisions bind your task
 
