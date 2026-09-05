@@ -65,13 +65,16 @@ final class ConversationSession {
     private(set) var streamingText = ""
     private(set) var lastErrorToast: String?
     private(set) var isHardDeleted = false
+    private(set) var isHardDeletePending = false
     private(set) var isArchiving = false
     var acceptsChatMessage: Bool {
         acceptsConversationActions && typedState.acceptsChatMessage
     }
     var acceptsConversationActions: Bool {
-        guard hydrationAuthority != .legacyReadOnly else { return false }
-        return !isHardDeleted && !isArchiving && conversation?.archived != true
+        guard case .legacyReadOnly = hydrationAuthority else {
+            return !isHardDeleted && !isHardDeletePending && !isArchiving && conversation?.archived != true
+        }
+        return false
     }
     /// tool_use_id -> the invoking block's tool name + input. Lets a tool
     /// result message (which carries only `tool_use_id`) find its native
@@ -134,7 +137,7 @@ final class ConversationSession {
 
     enum HydrationAuthority: Equatable {
         case none
-        case legacyReadOnly
+        case legacyReadOnly(PersistedSnapshotAuthority?)
         case current(AuthoritativeSnapshotReceipt)
     }
 
@@ -292,7 +295,7 @@ final class ConversationSession {
             presentationMode = persistedConversation.presentation_mode
             agentWorking = presentationMode == "working"
             rebuildToolUseIndex()
-            hydrationAuthority = .legacyReadOnly
+            hydrationAuthority = .legacyReadOnly(snap.authoritative)
         }
     }
 
@@ -327,8 +330,19 @@ final class ConversationSession {
 
     func revokeForHardDelete() {
         isHardDeleted = true
+        isHardDeletePending = false
         snapshotPersistenceEnabled = false
         invalidateOutboxAuthority()
+        conversation = nil
+        messages = []
+        durableMessageSequenceCeiling = 0
+        presentationMode = "done"
+        agentWorking = false
+        streamingText = ""
+        streamingRequestId = nil
+        pendingMessagePatches.removeAll()
+        toolUseIndex = [:]
+        hydrationAuthority = .none
         stop()
     }
 
@@ -483,6 +497,12 @@ final class ConversationSession {
                 aggregateAuthority: receipt.aggregateId,
                 syncedAt: receipt.syncedAt)
             syncedAt = receipt.syncedAt
+        } else if case .legacyReadOnly(let persistedAuthority) = hydrationAuthority,
+                  let persistedAuthority,
+                  persistedAuthority.configurationIdentity.persistenceScope == api.configurationIdentity.persistenceScope
+        {
+            authority = persistedAuthority
+            syncedAt = persistedAuthority.syncedAt
         } else {
             authority = nil
             syncedAt = snapshotSyncedAt
@@ -612,7 +632,8 @@ final class ConversationSession {
     // MARK: - Sending
 
     var canSendPersistedOutbox: Bool {
-        authoritativeSnapshotReceipt?.configurationIdentity == api.configurationIdentity
+        !isHardDeletePending
+            && authoritativeSnapshotReceipt?.configurationIdentity == api.configurationIdentity
     }
 
     // MARK: - Sending
@@ -1260,39 +1281,22 @@ final class ConversationSession {
     }
 
     private func handleHardDeletion() {
-        guard !isHardDeleted else { return }
+        guard !isHardDeleted, !isHardDeletePending else { return }
         invalidateOutboxAuthority()
+        invalidateLiveWork()
         streamTask?.cancel()
         streamTask = nil
         drainTask?.cancel()
         drainTask = nil
         staleCheckTask?.cancel()
         staleCheckTask = nil
-        if let token = connectivityToken {
-            connectivity.removePathObserver(token)
-            connectivityToken = nil
-        }
         let hardDeleteContext = HardDeleteContext(
             conversationId: conversationId,
             aggregateAuthority: conversation?.aggregateIdentity ?? aggregateAuthority,
             configurationIdentity: api.configurationIdentity)
-        inFlight.removeAll()
-        isHardDeleted = true
-        conversation = nil
-        messages = []
-        durableMessageSequenceCeiling = 0
-        presentationMode = "done"
-        agentWorking = false
-        streamingText = ""
-        streamingRequestId = nil
-        pendingMessagePatches.removeAll()
-        toolUseIndex = [:]
+        isHardDeletePending = true
         actionAttempt = nil
         connection = .idle
-        snapshotPersistenceEnabled = false
-        snapshotNeedsOutboxReconciliation = false
-        snapshotNeedsOutboxDrain = false
-        hydrationAuthority = .none
         hardDeleteReportTask = Task { @MainActor [hardDeleteContext, onHardDeleted] in
             await onHardDeleted(hardDeleteContext)
         }

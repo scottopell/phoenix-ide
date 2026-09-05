@@ -692,7 +692,11 @@ final class ConversationSessionReducerTests: XCTestCase {
     @MainActor
     func testHardDeleteClearsLocalTranscriptAndSignalsOwner() async throws {
         var deletedContext: ConversationSession.HardDeleteContext?
-        let session = makeSession { deletedContext = $0 }
+        var session: ConversationSession!
+        session = makeSession {
+            deletedContext = $0
+            session.revokeForHardDelete()
+        }
         session.receive(.initSnapshot(.init(
             conversation: try conversation(),
             messages: [try message(id: "m1", content: "[]")],
@@ -703,6 +707,9 @@ final class ConversationSessionReducerTests: XCTestCase {
         XCTAssertTrue(( { if case .value = DiskStore.loadVersionedResult(ConversationSession.PersistedSnapshot.self, source: DiskStore.phoenixMobileDirectory(baseDirectory: DiskStore.baseDirectory).appendingPathComponent("conv-c1").appendingPathExtension("json"), version: ConversationSession.snapshotSchemaVersion) { return true } else { return false } }() ))
 
         session.receive(.conversationHardDeleted(seq: 1, conversationId: "c1"))
+        XCTAssertTrue(session.isHardDeletePending)
+        XCTAssertFalse(session.messages.isEmpty)
+        XCTAssertNotNil(session.conversation)
         await session.clearCachedSnapshotAndWait()
 
         XCTAssertTrue(session.isHardDeleted)
@@ -770,7 +777,14 @@ final class ConversationSessionReducerTests: XCTestCase {
 
     @MainActor
     func testHardDeleteClearsAuthoritativeSnapshotReceipt() async throws {
-        let session = makeSession(aggregateAuthority: "pc-1")
+        var releaseFinalRevocation: CheckedContinuation<Void, Never>?
+        var session: ConversationSession!
+        session = makeSession(
+            onHardDeleted: { _ in
+                await withCheckedContinuation { releaseFinalRevocation = $0 }
+                session.revokeForHardDelete()
+            },
+            aggregateAuthority: "pc-1")
         session.receive(.initSnapshot(.init(
             conversation: try conversation(id: "c1", aggregateId: "pc-1"),
             messages: [], agentWorking: false,
@@ -781,7 +795,17 @@ final class ConversationSessionReducerTests: XCTestCase {
         XCTAssertNotNil(session.authoritativeSnapshotReceipt)
 
         session.receive(.conversationHardDeleted(seq: 1, conversationId: "c1"))
+        await Task.yield()
 
+        XCTAssertTrue(session.isHardDeletePending)
+        XCTAssertNotNil(session.authoritativeSnapshotReceipt)
+        XCTAssertFalse(session.acceptsConversationActions)
+        XCTAssertFalse(session.canSendPersistedOutbox)
+
+        releaseFinalRevocation?.resume()
+        await session.clearCachedSnapshotAndWait()
+
+        XCTAssertTrue(session.isHardDeleted)
         XCTAssertNil(session.authoritativeSnapshotReceipt)
         XCTAssertFalse(session.canSendPersistedOutbox)
     }
@@ -937,7 +961,7 @@ final class ConversationSessionReducerTests: XCTestCase {
         XCTAssertEqual(reopened.conversation?.id, "c1")
         XCTAssertEqual(reopened.messages.map(\.message_id), ["m-legacy"])
         XCTAssertNil(reopened.authoritativeSnapshotReceipt)
-        XCTAssertEqual(reopened.hydrationAuthority, .legacyReadOnly)
+        XCTAssertEqual(reopened.hydrationAuthority, .legacyReadOnly(nil))
         XCTAssertFalse(reopened.acceptsChatMessage)
         XCTAssertFalse(reopened.acceptsConversationActions)
         let acceptedLegacySend = await reopened.send(text: "must not enqueue")
@@ -1377,7 +1401,15 @@ final class ConversationSessionReducerTests: XCTestCase {
             configurationIdentity: APIConfigurationIdentity(serverURL: "https://\(host)", credentialGeneration: host, trustSelfSigned: false),
             session: urlSession,
             streamSession: urlSession)!
-        let session = makeSession(api: api, aggregateAuthority: "pc-1")
+        var releaseFinalRevocation: CheckedContinuation<Void, Never>?
+        var session: ConversationSession!
+        session = makeSession(
+            onHardDeleted: { _ in
+                await withCheckedContinuation { releaseFinalRevocation = $0 }
+                session.revokeForHardDelete()
+            },
+            api: api,
+            aggregateAuthority: "pc-1")
         session.receive(.initSnapshot(.init(
             conversation: try conversation(id: "c1", aggregateId: "pc-1"),
             messages: [], agentWorking: false,
@@ -1397,12 +1429,21 @@ final class ConversationSessionReducerTests: XCTestCase {
             return
         }
         session.receive(.conversationHardDeleted(seq: 1, conversationId: "c1"))
+        await Task.yield()
+        XCTAssertTrue(session.isHardDeletePending)
+        XCTAssertFalse(session.acceptsConversationActions)
+        XCTAssertFalse(session.canSendPersistedOutbox)
+
         gate.release()
         _ = await task.value
-
         XCTAssertEqual(postCount.snapshot(), 1)
         XCTAssertEqual(session.outbox.entries.count, 1)
+
+        releaseFinalRevocation?.resume()
+        await session.clearCachedSnapshotAndWait()
         XCTAssertTrue(session.isHardDeleted)
+        XCTAssertFalse(session.canSendPersistedOutbox)
+        XCTAssertNil(session.authoritativeSnapshotReceipt)
     }
 
     @MainActor
