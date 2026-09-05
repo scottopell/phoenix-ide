@@ -23,7 +23,6 @@ final class ProductConversationDetailModel {
     private(set) var loadError: String?
     private(set) var selectedTranscriptRowId: String?
     private(set) var actionTranscriptRowId: String?
-    private(set) var lastDelegatedError: String?
     private(set) var lastDelegatedConnection: ConversationSession.ConnectionState = .idle
     private(set) var observedSessionIds: Set<String> = []
 
@@ -204,7 +203,13 @@ final class ProductConversationDetailModel {
     }
 
     var delegatedConnectivityAllowsActions: Bool {
-        connectivity.isOnline && currentOwnerConnection != .offline
+        guard connectivity.isOnline else { return false }
+        switch currentOwnerConnection {
+        case .idle, .live:
+            return true
+        case .connecting, .waitingToRetry, .offline:
+            return false
+        }
     }
 
     var currentOwnerConnection: ConversationSession.ConnectionState {
@@ -241,7 +246,6 @@ final class ProductConversationDetailModel {
             self.startedTranscriptRowId = nil
         }
         lastDelegatedConnection = .idle
-        lastDelegatedError = nil
     }
 
     func invalidateConfiguration() {
@@ -281,7 +285,6 @@ final class ProductConversationDetailModel {
 
     func dismissDelegatedError() {
         currentOwnerSession?.clearErrorToast()
-        lastDelegatedError = nil
     }
 
     func primeInitialTranscriptRowId(_ transcriptRowId: String?) {
@@ -317,8 +320,8 @@ final class ProductConversationDetailModel {
         switch event {
         case .connectionChanged(let connection):
             lastDelegatedConnection = connection
-        case .errorToastChanged(let message):
-            lastDelegatedError = message
+        case .errorToastChanged:
+            break
         default:
             break
         }
@@ -347,10 +350,8 @@ final class ProductConversationDetailModel {
             refreshPersistedOutboxDiscovery()
             syncObserversAndSessions()
             projectDelegatedStateFromCurrentOwner()
-        case .errorToastChanged(let message):
-            if transcriptRowId == ownerTranscriptRowId {
-                lastDelegatedError = message
-            }
+        case .errorToastChanged:
+            break
         }
     }
 
@@ -430,7 +431,6 @@ final class ProductConversationDetailModel {
                    let session = retainedFallbackSession
                 {
                     lastDelegatedConnection = session.connection
-                    lastDelegatedError = session.lastErrorToast
                 }
             }
             loadError = (error as? APIError)?.errorDescription ?? error.localizedDescription
@@ -704,14 +704,11 @@ final class ProductConversationDetailModel {
                (isActive || (ownerTranscriptRowId == nil && initialTranscriptRowId == nil))
             {
                 lastDelegatedConnection = .idle
-                lastDelegatedError = nil
                 return
             }
             lastDelegatedConnection = projectedOwner.connection
-            lastDelegatedError = projectedOwner.lastErrorToast
         } else {
             lastDelegatedConnection = .idle
-            lastDelegatedError = nil
         }
     }
 

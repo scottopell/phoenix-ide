@@ -652,11 +652,38 @@ final class ProductConversationDetailModelTests: XCTestCase {
             existingSession: { id in id == "row-2" ? latest : nil })
 
         model.applyForTesting(snapshot(lifecycle: .open, writable: nil))
-        model.applyOwnerEventForTesting(.connectionChanged(.offline))
+        for connection in [
+            ConversationSession.ConnectionState.connecting,
+            .waitingToRetry(nextAttempt: Date()),
+            .offline
+        ] {
+            model.applyOwnerEventForTesting(.connectionChanged(connection))
+            XCTAssertEqual(model.currentOwnerConnection, connection)
+            XCTAssertFalse(model.delegatedConnectivityAllowsActions)
+        }
 
         XCTAssertFalse(model.canSendChat)
-        XCTAssertEqual(model.currentOwnerConnection, .offline)
-        XCTAssertFalse(model.delegatedConnectivityAllowsActions)
+    }
+
+    func testWritableChatOwnerDisablesDelegatedActionsWhileReconnecting() {
+        let writable = makeSession(id: "row-2")
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-1",
+            api: makeAPI(),
+            connectivity: ConnectivityMonitor(),
+            sessionProvider: { id in id == "row-2" ? writable : nil },
+            existingSession: { id in id == "row-2" ? writable : nil })
+
+        model.applyForTesting(snapshot(lifecycle: .open, writable: "row-2"))
+        for connection in [
+            ConversationSession.ConnectionState.connecting,
+            .waitingToRetry(nextAttempt: Date()),
+            .offline
+        ] {
+            model.applyOwnerEventForTesting(.connectionChanged(connection))
+            XCTAssertTrue(model.currentOwnerSession === writable)
+            XCTAssertFalse(model.delegatedConnectivityAllowsActions)
+        }
     }
 
     func testDismissDelegatedErrorTargetsCurrentLifecycleOwnerAndDoesNotResurrectOnRefresh() async {
@@ -676,7 +703,6 @@ final class ProductConversationDetailModelTests: XCTestCase {
         await model.refresh(cause: .manual)
 
         XCTAssertNil(latest.lastErrorToast)
-        XCTAssertNil(model.lastDelegatedError)
     }
 
     func testInitialAggregateLoadFailureFallsBackToCachedMemberSession() async throws {
@@ -791,7 +817,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
         model.applyForTesting(snapshot(lifecycle: .open, writable: "row-2"))
         await model.start()
 
-        XCTAssertEqual(model.lastDelegatedError, "cached error")
+        XCTAssertEqual(model.currentOwnerSession?.lastErrorToast, "cached error")
     }
 
     func testRepeatedProjectionReadsDoNotCreateAdditionalSessions() {
