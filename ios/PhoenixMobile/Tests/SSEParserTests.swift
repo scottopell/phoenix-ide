@@ -323,18 +323,29 @@ final class SSEParserTests: XCTestCase {
         DiskStore.baseDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("phoenix-connectivity-tests-\(UUID().uuidString)")
         let connectivity = ConnectivityMonitor()
+        let baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-connectivity-tests-\(UUID().uuidString)")
+        let snapshotDestination = baseDirectory
+            .appendingPathComponent("PhoenixMobile", isDirectory: true)
+            .appendingPathComponent("conv-c1")
+            .appendingPathExtension("json")
         let session = ConversationSession(
             conversationId: "c1",
             api: PhoenixAPI(
                 baseURL: URL(string: "https://phoenix.invalid")!,
                 password: nil,
-                allowSelfSigned: false)!,
-            connectivity: connectivity)
+                allowSelfSigned: false,
+                configurationIdentity: APIConfigurationIdentity(serverURL: "https://phoenix.invalid", credentialGeneration: "test-sse", trustSelfSigned: false))!,
+            connectivity: connectivity,
+            outboxPersistence: OutboxPersistenceHandle.disk(conversationId: "c1", baseDirectory: baseDirectory),
+            snapshotPersistence: DiskStore.versionedContext(baseDirectory: baseDirectory).writer(destinationURL: snapshotDestination, version: ConversationSession.snapshotSchemaVersion),
+            retryTiming: LiveSessionTiming(),
+            staleCheckTiming: LiveSessionTiming())
 
         session.start()
         connectivity.setOnlineForTesting(false)
 
-        XCTAssertEqual(session.connection, .offline)
+        XCTAssertEqual(session.connection, ConversationSession.ConnectionState.offline)
         session.stop()
     }
 
