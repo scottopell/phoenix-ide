@@ -120,6 +120,20 @@ protocol ConversationPersistenceStore {
     func retireHardDeleteFence(_ fence: PersistedHardDeleteFence) async
 }
 
+extension ConversationPersistenceStore {
+    func removeAuthoritativePersistedConversationState(
+        conversationId: String,
+        configurationIdentity: APIConfigurationIdentity,
+        aggregateAuthority: String,
+        legacyScope: PersistenceScopeIdentity?
+    ) async -> Bool {
+        await removeAuthoritativePersistedConversationState(
+            conversationId: conversationId,
+            configurationIdentity: configurationIdentity,
+            aggregateAuthority: aggregateAuthority)
+    }
+}
+
 @MainActor
 struct DiskConversationPersistenceStore: ConversationPersistenceStore {
     let baseDirectory: URL
@@ -204,7 +218,8 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
 
     func hasCachedSnapshot(
         conversationId: String,
-        currentScope: PersistenceScopeIdentity,
+        configurationIdentity: APIConfigurationIdentity,
+        aggregateAuthority: String,
         legacyScope: PersistenceScopeIdentity?
     ) -> Bool {
         let source = directory.appendingPathComponent("conv-\(conversationId)").appendingPathExtension("json")
@@ -215,10 +230,12 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
             snapshot.conversation?.id == conversationId,
             snapshot.syncedAt != nil
         else { return false }
+        guard snapshot.conversation?.aggregateIdentity == aggregateAuthority else { return false }
         if let authority = snapshot.authoritative {
-            return authority.configurationIdentity.persistenceScope == currentScope
+            return authority.configurationIdentity == configurationIdentity
+                && authority.aggregateAuthority == aggregateAuthority
         }
-        return legacyScope == currentScope
+        return legacyScope == configurationIdentity.persistenceScope
     }
 
     func hasAuthoritativeCachedSnapshot(
@@ -343,6 +360,19 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
         configurationIdentity: APIConfigurationIdentity,
         aggregateAuthority: String
     ) async -> Bool {
+        await removeAuthoritativePersistedConversationState(
+            conversationId: conversationId,
+            configurationIdentity: configurationIdentity,
+            aggregateAuthority: aggregateAuthority,
+            legacyScope: nil)
+    }
+
+    func removeAuthoritativePersistedConversationState(
+        conversationId: String,
+        configurationIdentity: APIConfigurationIdentity,
+        aggregateAuthority: String,
+        legacyScope: PersistenceScopeIdentity?
+    ) async -> Bool {
         let snapshotSource = directory.appendingPathComponent("conv-\(conversationId)").appendingPathExtension("json")
         switch DiskStore.loadVersionedResult(
             ConversationSession.PersistedSnapshot.self,
@@ -352,9 +382,13 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
         case .missing:
             break
         case .value(let snapshot):
+            let currentAuthorityMatches = snapshot.authoritative?.configurationIdentity.persistenceScope == configurationIdentity.persistenceScope
+                && snapshot.authoritative?.aggregateAuthority == aggregateAuthority
+            let provenLegacyMatches = snapshot.authoritative == nil
+                && legacyScope == configurationIdentity.persistenceScope
+                && snapshot.conversation?.aggregateIdentity == aggregateAuthority
             if snapshot.conversation?.id == conversationId,
-               snapshot.authoritative?.configurationIdentity.persistenceScope == configurationIdentity.persistenceScope,
-               snapshot.authoritative?.aggregateAuthority == aggregateAuthority
+               currentAuthorityMatches || provenLegacyMatches
             {
                 let writer = context.writer(destinationURL: snapshotSource, version: ConversationSession.snapshotSchemaVersion)
                 await writer.remove(revision: writer.reserveRevision())
@@ -390,8 +424,12 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
         {
         case .missing: snapshotResolved = true
         case .value(let snapshot):
-            snapshotResolved = snapshot.authoritative?.configurationIdentity.persistenceScope != configurationIdentity.persistenceScope
-                || snapshot.authoritative?.aggregateAuthority != aggregateAuthority
+            let currentAuthorityMatches = snapshot.authoritative?.configurationIdentity.persistenceScope == configurationIdentity.persistenceScope
+                && snapshot.authoritative?.aggregateAuthority == aggregateAuthority
+            let provenLegacyMatches = snapshot.authoritative == nil
+                && legacyScope == configurationIdentity.persistenceScope
+                && snapshot.conversation?.aggregateIdentity == aggregateAuthority
+            snapshotResolved = !(currentAuthorityMatches || provenLegacyMatches)
         case .incompatible, .unreadable: snapshotResolved = false
         }
         let outboxResolved: Bool
@@ -1030,7 +1068,8 @@ final class AppModel {
             let removed = await conversationPersistenceStore.removeAuthoritativePersistedConversationState(
                 conversationId: id,
                 configurationIdentity: context.configurationIdentity,
-                aggregateAuthority: context.aggregateAuthority)
+                aggregateAuthority: context.aggregateAuthority,
+                legacyScope: legacySnapshotPersistenceScope)
             guard contextIsCurrent() else { return }
             removedAll = removedAll && removed
         }
@@ -1290,7 +1329,8 @@ final class AppModel {
                 }
                 return store.hasCachedSnapshot(
                     conversationId: transcriptRowId,
-                    currentScope: api.configurationIdentity.persistenceScope,
+                    configurationIdentity: api.configurationIdentity,
+                    aggregateAuthority: aggregateId,
                     legacyScope: self.legacySnapshotPersistenceScope)
             },
             handleDefinitiveNotFound: { [weak self] transcriptRowId, segmentTranscriptRowIds in
@@ -1661,6 +1701,7 @@ final class AppModel {
         CertPinStore.forget()
         password = ""
         credentialStore.deleteRecord(account: Self.credentialRecordAccount)
+        credentialStore.deleteRecord(account: Self.legacyPasswordAccount)
         credentialGeneration = Self.mintedCredentialGeneration()
         serverURLString = ""
         trustSelfSigned = false
@@ -1695,6 +1736,7 @@ final class AppModel {
             UserDefaults.standard.removePersistentDomain(forName: bundleIdentifier)
         }
         KeychainCredentialStore().deleteRecord(account: Self.credentialRecordAccount)
+        KeychainCredentialStore().deleteRecord(account: Self.legacyPasswordAccount)
         DiskStore.removeAll()
         let center = UNUserNotificationCenter.current()
         center.removeAllDeliveredNotifications()
