@@ -12,10 +12,10 @@ final class ProductConversationDetailModel {
     private let existingSession: (String) -> ConversationSession?
     private let persistedOutboxContents: (String) -> Outbox.StoredContents
     private let hasCachedSnapshot: (String) -> Bool
-    private let handleDefinitiveNotFound: @MainActor (String?) async -> Void
+    private let handleDefinitiveNotFound: @MainActor (String?, Set<String>) async -> Void
     private let loadSnapshot: (String, String?) async throws -> ProductConversationSnapshot
     private let didStartRefresh: @MainActor (ProductConversationRefreshCause) -> Void
-    private let onConfigurationInvalidated: @MainActor () -> Void
+    private let onConfigurationInvalidated: @MainActor (ProductConversationDetailModel) -> Void
 
     private(set) var snapshot: ProductConversationSnapshot?
     private(set) var loading = false
@@ -32,7 +32,6 @@ final class ProductConversationDetailModel {
     private var isActive = false
     private var loadTask: Task<Void, Never>?
     private var loadGeneration = 0
-    private var pendingLoad: PendingLoad?
     private var observerGeneration = 0
     private var sessionSlots: [String: ConversationSession] = [:]
     private var retainedFallbackSession: ConversationSession?
@@ -40,6 +39,8 @@ final class ProductConversationDetailModel {
     private var persistedOutboxOwnerIndex = PersistedOutboxOwnerIndex()
     private var aggregateTranscriptRowIds: Set<String> = []
     private var lastTranscriptMutation: TranscriptMutation = .unknown
+    private var pendingLoadPlan = PendingLoadPlan()
+    private var activeRefreshCause: ProductConversationRefreshCause?
 
     init(
         aggregateId: String,
@@ -50,10 +51,10 @@ final class ProductConversationDetailModel {
         existingSession: @escaping (String) -> ConversationSession? = { _ in nil },
         persistedOutboxContents: @escaping (String) -> Outbox.StoredContents = { _ in .empty },
         hasCachedSnapshot: @escaping (String) -> Bool = { _ in false },
-        handleDefinitiveNotFound: @escaping @MainActor (String?) async -> Void = { _ in },
+        handleDefinitiveNotFound: @escaping @MainActor (String?, Set<String>) async -> Void = { _, _ in },
         loadSnapshot: ((String, String?) async throws -> ProductConversationSnapshot)? = nil,
         didStartRefresh: @escaping @MainActor (ProductConversationRefreshCause) -> Void = { _ in },
-        onConfigurationInvalidated: @escaping @MainActor () -> Void = {}
+        onConfigurationInvalidated: @escaping @MainActor (ProductConversationDetailModel) -> Void = { _ in }
     ) {
         self.aggregateId = aggregateId
         self.initialTranscriptRowId = initialTranscriptRowId
@@ -129,6 +130,10 @@ final class ProductConversationDetailModel {
     }
 
     var transcriptMutation: TranscriptMutation { lastTranscriptMutation }
+
+    var aggregateMemberTranscriptRowIds: Set<String> {
+        aggregateTranscriptRowIds
+    }
 
     var fallbackSession: ConversationSession? {
         retainedFallbackSession
@@ -207,6 +212,7 @@ final class ProductConversationDetailModel {
     }
 
     func start() async {
+        guard !isActive else { return }
         isActive = true
         activateInitialFallbackIfAvailable()
         ensureProjectedSessionsMaterialized()
@@ -223,7 +229,8 @@ final class ProductConversationDetailModel {
         loadGeneration &+= 1
         loadTask?.cancel()
         loadTask = nil
-        pendingLoad = nil
+        pendingLoadPlan = PendingLoadPlan()
+        activeRefreshCause = nil
         sessionSlots.removeAll()
         persistedOutboxOwnerIndex = PersistedOutboxOwnerIndex()
         retainedFallbackSession = nil
@@ -246,7 +253,7 @@ final class ProductConversationDetailModel {
         loadError = nil
         loading = false
         loadingOlder = false
-        onConfigurationInvalidated()
+        onConfigurationInvalidated(self)
     }
 
     func refresh(cause: ProductConversationRefreshCause = .manual) async {
@@ -254,8 +261,7 @@ final class ProductConversationDetailModel {
     }
 
     func loadOlder() async {
-        guard let before = olderCursor else { return }
-        await enqueueLoad(.older(before: before))
+        await enqueueLoad(.older)
     }
 
     func selectTranscriptRow(id: String) {
@@ -282,9 +288,9 @@ final class ProductConversationDetailModel {
     }
 
     func invalidateAggregateTopologyForTesting(_ invalidation: ProductConversationTopologyInvalidation) {
+        guard isActive else { return }
         if invalidatesThisAggregate(invalidation) {
-            pendingLoad = pendingLoad?.merged(with: .refresh(.delegateConversationChanged))
-                ?? .refresh(.delegateConversationChanged)
+            pendingLoadPlan.enqueueRefresh(.delegateConversationChanged, active: activeRefreshCause)
             if loadTask == nil {
                 loadGeneration &+= 1
                 let generation = loadGeneration
@@ -316,7 +322,12 @@ final class ProductConversationDetailModel {
         switch event {
         case .aggregateTopologyInvalidated(let invalidation):
             if invalidatesThisAggregate(invalidation) {
-                Task { await self.enqueueLoad(.refresh(.delegateConversationChanged)) }
+                let observerGeneration = self.observerGeneration
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    guard self.observerGeneration == observerGeneration, self.isActive else { return }
+                    await self.enqueueLoad(.refresh(.delegateConversationChanged))
+                }
             }
         case .connectionChanged(let connection):
             if transcriptRowId == ownerTranscriptRowId {
@@ -336,18 +347,16 @@ final class ProductConversationDetailModel {
     }
 
     private func enqueueLoad(_ request: PendingLoad) async {
+        guard isActive else { return }
         switch request {
         case .refresh(let cause):
             loading = true
             if cause != .initial { loadError = nil }
+            pendingLoadPlan.enqueueRefresh(cause, active: activeRefreshCause)
         case .older:
             loadingOlder = true
             loadError = nil
-        }
-        if let pendingLoad {
-            self.pendingLoad = pendingLoad.merged(with: request)
-        } else {
-            pendingLoad = request
+            pendingLoadPlan.enqueueOlder()
         }
         if loadTask == nil {
             loadGeneration &+= 1
@@ -360,13 +369,18 @@ final class ProductConversationDetailModel {
     }
 
     private func runLoadLoop(generation: Int) async {
-        while !Task.isCancelled, generation == loadGeneration, let request = pendingLoad {
-            pendingLoad = nil
-            switch request {
-            case .refresh(let cause):
+        while !Task.isCancelled, generation == loadGeneration, !pendingLoadPlan.isEmpty {
+            if let cause = pendingLoadPlan.consumeRefresh() {
+                activeRefreshCause = cause
                 await performRefresh(cause: cause, generation: generation)
-            case .older(let before):
-                await performLoadOlder(before: before, generation: generation)
+                if generation == loadGeneration {
+                    activeRefreshCause = nil
+                }
+                continue
+            }
+            if pendingLoadPlan.consumeOlder() {
+                await performLoadOlder(generation: generation)
+                continue
             }
         }
         guard generation == loadGeneration else { return }
@@ -391,7 +405,7 @@ final class ProductConversationDetailModel {
         } catch {
             guard generation == loadGeneration, !Task.isCancelled else { return }
             if let apiError = error as? APIError, apiError.isNotFound {
-                await handleDefinitiveNotFound(selectedTranscriptRowId ?? initialTranscriptRowId)
+                await handleDefinitiveNotFound(selectedTranscriptRowId ?? initialTranscriptRowId, aggregateMemberTranscriptRowIds)
                 invalidateConfiguration()
                 loadError = nil
                 return
@@ -416,20 +430,31 @@ final class ProductConversationDetailModel {
         if generation == loadGeneration { loading = false }
     }
 
-    private func performLoadOlder(before: String, generation: Int) async {
+    private func performLoadOlder(generation: Int) async {
         guard connectivity.isOnline else {
+            if generation == loadGeneration { loadingOlder = false }
+            return
+        }
+        guard let before = olderCursor else {
             if generation == loadGeneration { loadingOlder = false }
             return
         }
         do {
             let older = try await loadSnapshot(aggregateId, before)
             guard generation == loadGeneration, !Task.isCancelled else { return }
+            guard older.product_conversation_id == aggregateId else {
+                invalidateConfiguration()
+                if generation == loadGeneration { loadingOlder = false }
+                return
+            }
             retainedOlderPages.append(older)
             let newestPage = snapshot ?? older
             var composed = composeSnapshot(currentPage: newestPage, retainedOlderPages: retainedOlderPages)
             composed.before = older.before
             composed.has_older = older.has_older
+            let previousItems = transcriptItems
             applySnapshot(composed, resetRetainedPages: false)
+            updateTranscriptMutation(from: previousItems, to: transcriptItems)
             loadError = nil
         } catch {
             guard generation == loadGeneration, !Task.isCancelled else { return }
@@ -439,13 +464,15 @@ final class ProductConversationDetailModel {
     }
 
     private func applyRefreshedSnapshot(_ fresh: ProductConversationSnapshot, cause: ProductConversationRefreshCause) {
-        let resetForIdentity = snapshot?.product_conversation_id != fresh.product_conversation_id
+        guard fresh.product_conversation_id == aggregateId else {
+            invalidateConfiguration()
+            return
+        }
         let resetForTopology = cause == .delegateConversationChanged
-        let resetRetainedPages = resetForIdentity || resetForTopology
-        let retainedPages = resetRetainedPages ? [] : retainedOlderPages.filter { $0.product_conversation_id == fresh.product_conversation_id }
+        let retainedPages = resetForTopology ? [] : retainedOlderPages.filter { $0.product_conversation_id == fresh.product_conversation_id }
         let composed = composeSnapshot(currentPage: fresh, retainedOlderPages: retainedPages)
-        if resetRetainedPages { retainedOlderPages.removeAll() }
-        applySnapshot(composed, resetRetainedPages: resetRetainedPages)
+        if resetForTopology { retainedOlderPages.removeAll() }
+        applySnapshot(composed, resetRetainedPages: resetForTopology)
     }
 
     private func applySnapshot(_ newSnapshot: ProductConversationSnapshot, resetRetainedPages: Bool) {
@@ -707,6 +734,12 @@ final class ProductConversationDetailModel {
         persistedOutboxOwnerIndex = PersistedOutboxOwnerIndex(transcriptRowIds: [transcriptRowId])
     }
 
+    func awaitCurrentLoadForTesting() async {
+        await loadTask?.value
+    }
+
+    var observerGenerationForTesting: Int { observerGeneration }
+
     private func updatePersistedOutboxSessions(from sourceSnapshot: ProductConversationSnapshot) {
         _ = sourceSnapshot
         refreshPersistedOutboxDiscovery()
@@ -856,16 +889,65 @@ enum TranscriptMutation: Equatable {
 
 private enum PendingLoad: Equatable {
     case refresh(ProductConversationRefreshCause)
-    case older(before: String)
+    case older
+}
 
-    func merged(with newer: PendingLoad) -> PendingLoad {
-        switch (self, newer) {
-        case (_, .refresh(let cause)):
-            .refresh(cause)
-        case (.refresh(let cause), .older):
-            .refresh(cause)
-        case (.older, .older(let before)):
-            .older(before: before)
+private struct PendingLoadPlan: Equatable {
+    var refreshCause: ProductConversationRefreshCause?
+    var wantsOlder = false
+
+    var isEmpty: Bool { refreshCause == nil && !wantsOlder }
+
+    mutating func enqueueRefresh(_ cause: ProductConversationRefreshCause, active: ProductConversationRefreshCause?) {
+        if let active {
+            switch comparePriority(active, cause) {
+            case .orderedDescending:
+                return
+            case .orderedSame, .orderedAscending:
+                break
+            }
         }
+        refreshCause = refreshCause.map { existing in
+            stronger(existing, cause)
+        } ?? cause
+    }
+
+    private func comparePriority(_ lhs: ProductConversationRefreshCause, _ rhs: ProductConversationRefreshCause) -> ComparisonResult {
+        let left = priority(lhs)
+        let right = priority(rhs)
+        if left < right { return .orderedAscending }
+        if left > right { return .orderedDescending }
+        return .orderedSame
+    }
+
+    private func stronger(_ lhs: ProductConversationRefreshCause, _ rhs: ProductConversationRefreshCause) -> ProductConversationRefreshCause {
+        comparePriority(lhs, rhs) != .orderedAscending ? lhs : rhs
+    }
+
+    private func priority(_ cause: ProductConversationRefreshCause) -> Int {
+        switch cause {
+        case .initial:
+            0
+        case .manual:
+            1
+        case .delegateConversationChanged:
+            2
+        }
+    }
+
+    mutating func enqueueOlder() {
+        wantsOlder = true
+    }
+
+    mutating func consumeRefresh() -> ProductConversationRefreshCause? {
+        let cause = refreshCause
+        refreshCause = nil
+        return cause
+    }
+
+    mutating func consumeOlder() -> Bool {
+        let wantsOlder = wantsOlder
+        self.wantsOlder = false
+        return wantsOlder
     }
 }

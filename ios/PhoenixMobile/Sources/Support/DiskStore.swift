@@ -28,9 +28,11 @@ private actor VersionedDiskSink {
 @MainActor
 private final class VersionedDiskDestination {
     let sink: VersionedDiskSink
+    let destinationURL: URL
     private var nextRevision = 0
 
     init(destination: URL) {
+        destinationURL = destination
         sink = VersionedDiskSink(destination: destination)
     }
 
@@ -46,6 +48,8 @@ private final class VersionedDiskDestination {
 final class VersionedDiskWriter {
     private let destination: VersionedDiskDestination
     private let version: Int
+
+    var destinationURL: URL { destination.destinationURL }
 
     fileprivate init(destination: VersionedDiskDestination, version: Int) {
         self.destination = destination
@@ -65,6 +69,39 @@ final class VersionedDiskWriter {
     }
 }
 
+@MainActor
+final class VersionedDiskContext {
+    let rootDirectory: URL
+    private var destinations: [URL: VersionedDiskDestination] = [:]
+
+    init(rootDirectory: URL) {
+        self.rootDirectory = rootDirectory.standardizedFileURL
+    }
+
+    func writer(destinationURL: URL, version: Int) -> VersionedDiskWriter {
+        let normalizedURL = destinationURL.standardizedFileURL
+        let destination = destinations[normalizedURL] ?? VersionedDiskDestination(destination: normalizedURL)
+        destinations[normalizedURL] = destination
+        return VersionedDiskWriter(destination: destination, version: version)
+    }
+
+    func writer(name: String, version: Int) -> VersionedDiskWriter {
+        writer(destinationURL: rootDirectory.appendingPathComponent(name).appendingPathExtension("json"), version: version)
+    }
+
+    func removeAllAndWait() async {
+        let removals = destinations.values.compactMap { destination -> (VersionedDiskSink, Int)? in
+            let destinationURL = destination.destinationURL.standardizedFileURL
+            guard destinationURL.path.hasPrefix(rootDirectory.path + "/") else { return nil }
+            return (destination.sink, destination.reserveRevision())
+        }
+        for (sink, revision) in removals {
+            await sink.remove(revision: revision)
+        }
+        try? FileManager.default.removeItem(at: rootDirectory)
+    }
+}
+
 /// Main-actor JSON persistence under Application Support. Versioned loads
 /// decode matching envelopes, delegate older payloads to the supplied
 /// migration, reject newer envelopes, and accept bare legacy payloads as v0.
@@ -75,7 +112,6 @@ enum DiskStore {
     static var baseDirectory: URL = FileManager.default.urls(
         for: .applicationSupportDirectory, in: .userDomainMask)[0]
 
-    private static var versionedDestinations: [URL: VersionedDiskDestination] = [:]
 
     private static var directory: URL {
         let dir = baseDirectory.appendingPathComponent("PhoenixMobile", isDirectory: true)
@@ -83,7 +119,7 @@ enum DiskStore {
         return dir
     }
 
-    private static func url(for name: String) -> URL {
+    static func url(for name: String) -> URL {
         directory.appendingPathComponent(name + ".json")
     }
     static func listNames(prefix: String) -> [String] {
@@ -146,9 +182,74 @@ enum DiskStore {
         case unreadable
     }
 
+    nonisolated static func phoenixMobileDirectory(baseDirectory: URL) -> URL {
+        baseDirectory.appendingPathComponent("PhoenixMobile", isDirectory: true)
+    }
+
+    static func versionedContext(baseDirectory: URL? = nil) -> VersionedDiskContext {
+        let resolvedBaseDirectory = baseDirectory ?? self.baseDirectory
+        return VersionedDiskContext(rootDirectory: phoenixMobileDirectory(baseDirectory: resolvedBaseDirectory))
+    }
+
+    nonisolated static func names(in directory: URL, withPrefix prefix: String) -> [String] {
+        let urls = (try? FileManager.default.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: nil)) ?? []
+        return urls.compactMap { url in
+            guard url.pathExtension == "json" else { return nil }
+            let name = url.deletingPathExtension().lastPathComponent
+            return name.hasPrefix(prefix) ? name : nil
+        }
+    }
+
+    nonisolated static func loadVersionedResult<T: Decodable>(
+        _ type: T.Type,
+        source: URL,
+        version: Int,
+        migrate: ((_ storedVersion: Int, _ fileData: Data) -> T?)? = nil
+    ) -> VersionedLoad<T> {
+        guard let data = try? Data(contentsOf: source) else {
+            return FileManager.default.fileExists(atPath: source.path) ? .unreadable : .missing
+        }
+
+        return loadVersionedResult(type, fileData: data, version: version, migrate: migrate)
+    }
+
+    nonisolated static func loadVersionedResult<T: Decodable>(
+        _ type: T.Type,
+        fileData data: Data,
+        version: Int,
+        migrate: ((_ storedVersion: Int, _ fileData: Data) -> T?)? = nil
+    ) -> VersionedLoad<T> {
+        if let stored = (try? JSONDecoder().decode(VersionProbe.self, from: data))?
+            .schema_version
+        {
+            if stored == version {
+                guard let payload = try? JSONDecoder().decode(LoadEnvelope<T>.self, from: data)
+                    .payload
+                else { return .unreadable }
+                return .value(payload)
+            }
+            if stored > version {
+                return .incompatible(storedVersion: stored)
+            }
+            guard let migrated = migrate?(stored, data) else { return .unreadable }
+            return .value(migrated)
+        }
+
+        if let bare = try? JSONDecoder().decode(T.self, from: data) {
+            return .value(bare)
+        }
+        guard let migrated = migrate?(0, data) else { return .unreadable }
+        return .value(migrated)
+    }
+
     @discardableResult
     static func saveVersioned<T: Encodable>(_ value: T, name: String, version: Int) -> Bool {
         writeVersioned(value, to: url(for: name), version: version)
+    }
+
+    nonisolated static func encodeVersioned<T: Encodable>(_ value: T, version: Int) throws -> Data {
+        try JSONEncoder().encode(SaveEnvelope(schema_version: version, payload: value))
     }
 
     nonisolated fileprivate static func writeVersioned<T: Encodable>(
@@ -173,8 +274,7 @@ enum DiskStore {
             // the cache; ordinary writes stay fail-closed until then.
             return false
         }
-        guard let data = try? JSONEncoder().encode(
-            SaveEnvelope(schema_version: version, payload: value))
+        guard let data = try? encodeVersioned(value, version: version)
         else { return false }
         do {
             try data.write(to: destination, options: .atomic)
@@ -182,14 +282,6 @@ enum DiskStore {
         } catch {
             return false
         }
-    }
-
-    static func versionedWriter(name: String, version: Int) -> VersionedDiskWriter {
-        let destinationURL = url(for: name)
-        let destination = versionedDestinations[destinationURL]
-            ?? VersionedDiskDestination(destination: destinationURL)
-        versionedDestinations[destinationURL] = destination
-        return VersionedDiskWriter(destination: destination, version: version)
     }
 
     /// Load a versioned store. `migrate` receives the stored version and
@@ -210,59 +302,25 @@ enum DiskStore {
         _ type: T.Type, name: String, version: Int,
         migrate: ((_ storedVersion: Int, _ fileData: Data) -> T?)? = nil
     ) -> VersionedLoad<T> {
-        let source = url(for: name)
-        guard let data = try? Data(contentsOf: source) else {
-            return FileManager.default.fileExists(atPath: source.path) ? .unreadable : .missing
-        }
-
-        if let stored = (try? JSONDecoder().decode(VersionProbe.self, from: data))?
-            .schema_version
-        {
-            if stored == version {
-                guard let payload = try? JSONDecoder().decode(LoadEnvelope<T>.self, from: data)
-                    .payload
-                else { return .unreadable }
-                return .value(payload)
-            }
-            if stored > version {
-                return .incompatible(storedVersion: stored)
-            }
-            guard let migrated = migrate?(stored, data) else { return .unreadable }
-            return .value(migrated)
-        }
-
-        // Legacy pre-envelope file: the payload was stored bare.
-        if let bare = try? JSONDecoder().decode(T.self, from: data) {
-            return .value(bare)
-        }
-        guard let migrated = migrate?(0, data) else { return .unreadable }
-        return .value(migrated)
+        loadVersionedResult(type, source: url(for: name), version: version, migrate: migrate)
     }
 
     /// Names (without extension) of stored files matching a prefix. Used to
     /// discover persisted per-conversation outboxes independently of which
     /// sessions are currently open.
     static func names(withPrefix prefix: String) -> [String] {
-        let urls = (try? FileManager.default.contentsOfDirectory(
-            at: directory, includingPropertiesForKeys: nil)) ?? []
-        return urls.compactMap { url in
-            guard url.pathExtension == "json" else { return nil }
-            let name = url.deletingPathExtension().lastPathComponent
-            return name.hasPrefix(prefix) ? name : nil
-        }
+        names(in: directory, withPrefix: prefix)
     }
 
     static func removeAll() {
         try? FileManager.default.removeItem(at: directory)
     }
 
+    static func removeDirectoryAndWait(_ directory: URL) async {
+        await VersionedDiskContext(rootDirectory: directory).removeAllAndWait()
+    }
+
     static func removeAllAndWait() async {
-        let removals = versionedDestinations.values.map { destination in
-            (destination.sink, destination.reserveRevision())
-        }
-        for (sink, revision) in removals {
-            await sink.remove(revision: revision)
-        }
-        removeAll()
+        await versionedContext().removeAllAndWait()
     }
 }

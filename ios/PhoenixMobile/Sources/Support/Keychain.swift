@@ -4,18 +4,26 @@ import Security
 /// Minimal generic-password Keychain wrapper. Stores the Phoenix server
 /// password; everything else (server URL, toggles) lives in UserDefaults.
 enum Keychain {
-    private static let service = "com.phoenix.mobile"
+    static let service = "com.phoenix.mobile"
 
     struct StoreError: LocalizedError {
         let status: OSStatus
 
         var errorDescription: String? {
-            "Password could not be saved securely (Keychain status \(status))."
+            "Keychain value could not be saved securely (status \(status))."
         }
     }
 
     static func setPassword(_ password: String, account: String) throws {
-        let data = Data(password.utf8)
+        try setData(Data(password.utf8), account: account)
+    }
+
+    static func password(account: String) -> String? {
+        guard let data = data(account: account) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    static func setData(_ data: Data, account: String) throws {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -36,7 +44,7 @@ enum Keychain {
         guard addStatus == errSecSuccess else { throw StoreError(status: addStatus) }
     }
 
-    static func password(account: String) -> String? {
+    static func data(account: String) -> Data? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -47,10 +55,10 @@ enum Keychain {
         var result: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
         guard status == errSecSuccess, let data = result as? Data else { return nil }
-        return String(data: data, encoding: .utf8)
+        return data
     }
 
-    static func deletePassword(account: String) {
+    static func delete(account: String) {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,

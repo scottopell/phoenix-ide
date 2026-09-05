@@ -55,7 +55,7 @@ B2 may read and consume B1-owned files to integrate the shipped seam. After B1 m
 B1 is merged/retired and no concurrent owner remains. For this task, B2 may make the following narrow post-B1 integration edits:
 
 - `ios/PhoenixMobile/Sources/API/PhoenixAPI.swift` only for configuration identity used to fence transport handles.
-- `ios/PhoenixMobile/Sources/AppModel.swift` only for ProductConversation detail/session composition, instance-owned Coordinator/cache/outbox dependencies, startup drain, and reconfiguration invalidation.
+- `ios/PhoenixMobile/Sources/AppModel.swift` only for ProductConversation detail/session composition, instance-owned Coordinator/cache/outbox dependencies, startup drain, reconfiguration invalidation, and sign-out-owned local reset. Standalone user-facing cache reset is out of scope for this task/release.
 - `ios/PhoenixMobile/Sources/Store/ConversationListStore.swift` only to inject the existing cache-availability capability without changing aggregate identity/mapping semantics.
 - `ios/PhoenixMobile/Sources/Views/ConversationListView.swift` only to enter the merged aggregate detail route while preserving B1 resolver authority.
 - Matching seam tests covering these edits are in scope.
@@ -76,6 +76,7 @@ Still prohibited within this handoff:
 - No aggregate SSE store, no aggregate outbox, no duplicated durable message cache.
 - B2 consumes only B1's shared ProductConversation seam. Formerly B1-owned list/cache/API-model/navigation files may be touched only within the Coordinator-approved post-B1 integration handoff below; no ProductConversation DTO/wire-shape changes, list identity-semantic changes, alternate caches/resolvers, or B1 API endpoint-contract changes are allowed.
 - Focused simulator/mock-server validation and applicable iOS checks pass.
+- Standalone user-facing cache reset is out of scope; sign-out owns the total local reset path for server/account state.
 - Adversarial review, independent review, separate PR exact-head CI/review, and zero unresolved threads are completed before merge request handoff.
 
 ## Out of scope

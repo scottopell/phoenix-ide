@@ -114,7 +114,8 @@ final class ModelCompatibilityTests: XCTestCase {
         let api = PhoenixAPI(
             baseURL: URL(string: "https://phoenix.invalid")!,
             password: nil,
-            allowSelfSigned: false)!
+            allowSelfSigned: false,
+            configurationIdentity: APIConfigurationIdentity(serverURL: "https://phoenix.invalid", credentialGeneration: "test-credential-generation", trustSelfSigned: false))!
         let row = try JSONDecoder().decode(
             ProductConversationListRow.self,
             from: Data(#"{"product_conversation_id":"pc-map","canonical_route":"/product-conversations/pc-map","canonical_root":{"transcript_row_id":"root-map","slug":"root-map","title":"Mapped"},"ordinary_lifecycle":"history","latest_transcript_row_id":"latest-map","updated_at":"2025-01-02T03:04:05Z","presentation":{"kind":"needs_action","display_name":"Mapped"}}"#.utf8))
