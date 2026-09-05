@@ -58,6 +58,57 @@ describe('MessageViewer', () => {
     expect(screen.getByText('Second proposal line')).toBeInTheDocument();
   });
 
+  it('does not offer annotation when no composer capability exists', () => {
+    render(
+      <ReviewNotesProvider>
+        <MessageViewer
+          sequenceId={1}
+          messages={[agentTextMessage(1, 'Archived message')]}
+          onClose={vi.fn()}
+          inline
+        />
+      </ReviewNotesProvider>,
+    );
+
+    expect(screen.queryByRole('button', { name: 'Add note to line 1' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Send notes' })).not.toBeInTheDocument();
+  });
+
+  it('closes an open notes panel when composer capability disappears', async () => {
+    const messages = [agentTextMessage(1, 'Mutable message')];
+    const { rerender } = render(
+      <ReviewNotesProvider>
+        <MessageViewer
+          sequenceId={1}
+          messages={messages}
+          onClose={vi.fn()}
+          onSendNotes={vi.fn()}
+          inline
+        />
+      </ReviewNotesProvider>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Add note to line 1' }));
+    fireEvent.change(screen.getByPlaceholderText('Add your note… (Cmd/Ctrl+Enter to save)'), { target: { value: 'pending note' } });
+    fireEvent.click(screen.getByRole('button', { name: /^Add Note$/ }));
+    fireEvent.click(screen.getByRole('button', { name: '1 notes' }));
+    expect(screen.getByRole('button', { name: 'Send All' })).toBeInTheDocument();
+
+    rerender(
+      <ReviewNotesProvider>
+        <MessageViewer
+          sequenceId={1}
+          messages={messages}
+          onClose={vi.fn()}
+          inline
+        />
+      </ReviewNotesProvider>,
+    );
+
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Send All' })).not.toBeInTheDocument());
+    expect(screen.queryByRole('button', { name: 'Add note to line 1' })).not.toBeInTheDocument();
+  });
+
   it('closes the notes panel when switching messages', async () => {
     const messages = [
       agentTextMessage(1, 'First proposal line'),

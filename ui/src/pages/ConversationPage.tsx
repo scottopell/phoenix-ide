@@ -189,6 +189,7 @@ export interface EmbeddedConversationProjection {
   onRetryPending: (localId: string) => void;
   onCancelSteering: (localId: string) => void;
   onOpenFile: (filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void;
+  appendReviewNotesToComposer: (formattedNotes: string) => void;
   filePathRootDir: string;
   systemPrompt?: string | undefined;
   modelContextWindow?: number | undefined;
@@ -1790,6 +1791,7 @@ function ConversationPageContent({
       onRetryPending: handleRetry,
       onCancelSteering: handleCancelSteering,
       onOpenFile: handleOpenFileFromPatch,
+      appendReviewNotesToComposer: handleSendNotes,
       filePathRootDir: conversation?.worktree_path ?? conversation?.cwd ?? '/',
       systemPrompt: atom.systemPrompt ?? undefined,
       ...(actualModelContextWindow ? { modelContextWindow: actualModelContextWindow } : {}),
@@ -1810,6 +1812,7 @@ function ConversationPageContent({
     serverArchived,
     handleCancelSteering,
     handleOpenFileFromPatch,
+    handleSendNotes,
     conversation?.worktree_path,
     conversation?.cwd,
     atom.systemPrompt,

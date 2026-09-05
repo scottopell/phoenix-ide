@@ -1,6 +1,6 @@
 import { writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { runSurfaceCapture } from './capture-ladle-surface.mjs';
+import { buildLadleStoryUrl, runSurfaceCapture } from './capture-ladle-surface.mjs';
 
 const measurements = [];
 const journeys = [];
@@ -69,8 +69,26 @@ async function assertViewer(page, viewport, outDir) {
     const transcript = await page.locator('.product-conversation-page__transcript').boundingBox();
     if (!transcript || transcript.width <= 0 || transcript.height <= 0) throw new Error('split pane removed transcript geometry');
   }
-  await viewer.getByRole('button', { name: /Close/ }).click();
-  await viewer.waitFor({ state: 'hidden' });
+  let viewerClosedBySend = false;
+  if (viewport.name === 'mobile-dark') {
+    const uniqueNote = 'aggregate-viewer-note-5c47a2';
+    await viewer.getByRole('button', { name: 'Add note to line 1' }).click({ force: true });
+    await page.locator('.annotation-dialog .annotation-dialog-input').fill(uniqueNote);
+    await page.getByRole('button', { name: 'Add Note', exact: true }).click();
+    await viewer.getByRole('button', { name: 'Send notes' }).click();
+    const composer = page.locator('[data-testid="product-conversation-composer"] #message-input');
+    await composer.waitFor();
+    if (!(await composer.inputValue()).includes(uniqueNote)) {
+      throw new Error('aggregate viewer notes did not reach the real ProductConversation composer');
+    }
+    await viewer.waitFor({ state: 'hidden' });
+    viewerClosedBySend = true;
+    journeys.push('viewer notes: aggregate annotation reached the real latest-row composer draft');
+  }
+  if (!viewerClosedBySend) {
+    await viewer.getByRole('button', { name: /Close/ }).click();
+    await viewer.waitFor({ state: 'hidden' });
+  }
   journeys.push(`viewer ${viewport.name}: overlay/pane in bounds and closes`);
 }
 
@@ -95,13 +113,29 @@ async function assertRetry(page, viewport, theme) {
 
 async function assertReconnect(page) {
   const beforeRows = await page.locator('.virtual-transcript__row').count();
-  await page.evaluate(() => window.dispatchEvent(new CustomEvent('product-conversation-fixture-reconnect-request')));
-  // The fixture route exposes this observed event by its API marker; it does not alter transcript DOM.
-  await page.locator('html[data-product-conversation-fixture-event-source-reconnects="1"]').waitFor();
-  await page.locator('html[data-product-conversation-fixture-event-source-opens]').waitFor();
+  const beforeOpens = Number(await fixtureValue(page, 'event-source-opens') ?? '0');
+  const beforeInits = Number(await fixtureValue(page, 'event-source-inits') ?? '0');
+  const beforeInstance = Number(await fixtureValue(page, 'event-source-last-instance') ?? '0');
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent('product-conversation-fixture-stream-failure')));
+  await page.waitForFunction(
+    ({ opens, inits, instance }) => {
+      const dataset = document.documentElement.dataset;
+      return Number(dataset.productConversationFixtureEventSourceOpens ?? '0') === opens + 1
+        && Number(dataset.productConversationFixtureEventSourceInits ?? '0') === inits + 1
+        && Number(dataset.productConversationFixtureEventSourceLastInitializedInstance ?? '0') > instance;
+    },
+    { opens: beforeOpens, inits: beforeInits, instance: beforeInstance },
+  );
+  const replacementUrl = await fixtureValue(page, 'event-source-last-url') ?? '';
+  const replacementParams = new URL(replacementUrl, page.url()).searchParams;
+  if (Number(replacementParams.get('after_event_sequence') ?? '0') <= 0
+    || replacementParams.get('transcript_generation') !== '1') {
+    throw new Error(`replacement SSE omitted replay cursor/generation: ${replacementUrl}`);
+  }
+  await page.locator('[data-testid="product-conversation-composer"] .state-text').getByText('reconnected', { exact: true }).waitFor();
   const afterRows = await page.locator('.virtual-transcript__row').count();
   if (afterRows !== beforeRows) throw new Error(`reconnect duplicated transcript rows (${beforeRows} -> ${afterRows})`);
-  journeys.push('ordinary latest-row SSE error/reopen: transcript retained with no duplicate rows');
+  journeys.push('ordinary latest-row SSE recovery: native failure caused production backoff, replacement EventSource, replay init, and no duplicate rows');
 }
 
 async function assertLongHistory(page) {
@@ -170,8 +204,9 @@ runSurfaceCapture({
   ],
   urlForStory: ({ storyKey, id, viewport }) => {
     const theme = viewport.name.endsWith('-light') ? 'light' : 'dark';
-    const hash = id === 'long-history-110-messages' ? encodeURIComponent('#message-long-older-target') : '';
-    return `http://127.0.0.1:${process.env.LADLE_PORT ?? 61123}/?story=${storyKey}&mode=preview&fixtureTheme=${theme}&fixtureHash=${hash}`;
+    const fixtureHash = id === 'long-history-110-messages' ? '#message-long-older-target' : '';
+    const baseUrl = process.env.LADLE_URL ?? `http://127.0.0.1:${process.env.LADLE_PORT ?? 61123}/`;
+    return buildLadleStoryUrl(baseUrl, storyKey, { fixtureTheme: theme, fixtureHash });
   },
   captureStory: async ({ page, id, outDir, viewport }) => {
     const theme = await fixtureValue(page, 'theme') ?? 'dark';

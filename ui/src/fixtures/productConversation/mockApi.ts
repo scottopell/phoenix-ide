@@ -45,6 +45,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   let initialSnapshotFailuresRemaining = scenario.initialSnapshotFailures ?? 0;
   let sendCount = 0;
   let eventSourceOpenCount = 0;
+  let eventSourceInitCount = 0;
   let latestEventSource: FixtureEventSource | null = null;
 
   const record = (name: string, value: number | string) => {
@@ -187,22 +188,23 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     onerror: ((event: Event) => void) | null = null;
     onopen: ((event: Event) => void) | null = null;
     private readonly listeners = new Map<string, Set<(event: MessageEvent<string>) => void>>();
+    private readonly instanceId: number;
 
     constructor(url: string) {
-      void url;
-      latestEventSource = this; // eslint-disable-line @typescript-eslint/no-this-alias
       eventSourceOpenCount += 1;
+      this.instanceId = eventSourceOpenCount;
+      latestEventSource = this; // eslint-disable-line @typescript-eslint/no-this-alias
       record('EventSourceOpens', eventSourceOpenCount);
+      record('EventSourceLastInstance', this.instanceId);
+      record('EventSourceLastUrl', url);
       queueMicrotask(() => this.onopen?.(new Event('open')));
     }
 
-    triggerErrorAndReopen(): void {
+    triggerNativeError(): void {
       this.readyState = FixtureEventSource.CONNECTING;
-      this.onerror?.(new Event('error'));
-      for (const listener of this.listeners.get('error') ?? []) listener(new MessageEvent('error'));
-      this.readyState = FixtureEventSource.OPEN;
-      this.onopen?.(new Event('open'));
-      record('EventSourceReconnects', Number(document.documentElement.dataset['productConversationFixtureEventSourceReconnects'] ?? '0') + 1);
+      const event = new MessageEvent<string>('error', { data: '' });
+      this.onerror?.(event);
+      for (const listener of this.listeners.get('error') ?? []) listener(event);
     }
 
     addEventListener(type: string, listener: EventListenerOrEventListenerObject): void {
@@ -212,6 +214,10 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
       this.listeners.set(type, listeners);
       if (type === 'init') {
         queueMicrotask(() => {
+          if (this.readyState === FixtureEventSource.CLOSED) return;
+          eventSourceInitCount += 1;
+          record('EventSourceInits', eventSourceInitCount);
+          record('EventSourceLastInitializedInstance', this.instanceId);
           const init = {
             sequence_id: 1,
             conversation,
@@ -221,7 +227,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
             steering_messages: [],
             agent_working: false,
             last_sequence_id: 1,
-            stream_incarnation: 'fixture-stream',
+            stream_incarnation: `fixture-stream-${this.instanceId}`,
             presentation_mode: 'idle',
             context_window_size: 128_000,
             project_name: null,
@@ -241,11 +247,11 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     close(): void { this.readyState = FixtureEventSource.CLOSED; }
   }
   globalThis.EventSource = FixtureEventSource as unknown as typeof EventSource;
-  const reconnectLatestEventSource = () => latestEventSource?.triggerErrorAndReopen();
-  window.addEventListener('product-conversation-fixture-reconnect-request', reconnectLatestEventSource);
+  const failLatestEventSource = () => latestEventSource?.triggerNativeError();
+  window.addEventListener('product-conversation-fixture-stream-failure', failLatestEventSource);
 
   return () => {
-    window.removeEventListener('product-conversation-fixture-reconnect-request', reconnectLatestEventSource);
+    window.removeEventListener('product-conversation-fixture-stream-failure', failLatestEventSource);
     api.getPrStatus = originalGetPrStatus;
     api.getProductConversationSnapshot = originalGetProductConversationSnapshot;
     api.getChain = originalGetChain;

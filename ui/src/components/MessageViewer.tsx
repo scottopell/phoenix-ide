@@ -18,7 +18,7 @@ interface MessageViewerProps {
   occurrenceToken?: string | undefined;
   messages: Message[];
   onClose: () => void;
-  onSendNotes: (notes: string) => void | Promise<void>;
+  onSendNotes?: ((notes: string) => void | Promise<void>) | undefined;
   presentation?: 'pane' | 'fullscreen' | undefined;
   canTogglePresentation?: boolean | undefined;
   onPresentationChange?: ((presentation: 'pane' | 'fullscreen') => void) | undefined;
@@ -44,7 +44,7 @@ export function MessageViewer({ sequenceId, messageId, occurrenceToken, messages
   const focused = presentation === 'fullscreen' && canTogglePresentation;
   const returnToPane = useCallback(() => onPresentationChange?.('pane'), [onPresentationChange]);
   const focusedExit = useFocusedReviewExit({
-    noteCount: notes.messageNotes.length,
+    noteCount: onSendNotes ? notes.messageNotes.length : 0,
     send: notes.send,
     discard: notes.clearAll,
     returnToPane,
@@ -94,7 +94,7 @@ export function MessageViewer({ sequenceId, messageId, occurrenceToken, messages
       title={title}
       titleTooltip={message ? `Conversation message #${sequenceId}` : undefined}
       headerExtras={headerExtras}
-      noteCount={notes.messageNotes.length}
+      noteCount={onSendNotes ? notes.messageNotes.length : 0}
       onToggleNotes={notes.togglePanel}
       onSend={focused ? focusedExit.sendAndReturn : () => { void notes.send(); }}
       onClose={focused ? focusedExit.requestClose : onClose}
@@ -139,7 +139,7 @@ export function MessageViewer({ sequenceId, messageId, occurrenceToken, messages
             content={content}
             modifiedLines={EMPTY_SET}
             highlightedLine={notes.highlightedLine}
-            onAnnotate={notes.startAnnotate}
+            onAnnotate={onSendNotes ? notes.startAnnotate : undefined}
             registerLineRef={registerLineRef}
           />
         ) : (
@@ -166,7 +166,7 @@ function useMessageReviewNotes(
   sequenceId: number,
   messageId: string | undefined,
   occurrenceToken: string | undefined,
-  onSendNotes: (notes: string) => void | Promise<void>,
+  onSendNotes: ((notes: string) => void | Promise<void>) | undefined,
 ) {
   const commands = useReviewNotesCommands();
   const messageNotes = useMessageReviewNotesData(sequenceId, occurrenceToken);
@@ -186,9 +186,17 @@ function useMessageReviewNotes(
     setShowPanel(false);
   }, [occurrenceToken, sequenceId]);
 
+  useEffect(() => {
+    if (onSendNotes) return;
+    setAnnotating(null);
+    setHighlightedLine(null);
+    setShowPanel(false);
+  }, [onSendNotes]);
+
   const startAnnotate = useCallback((lineNumber: number, lineContent: string) => {
+    if (!onSendNotes) return;
     setAnnotating({ sequenceId, lineNumber, lineContent });
-  }, [sequenceId]);
+  }, [onSendNotes, sequenceId]);
   const cancelAnnotate = useCallback(() => setAnnotating(null), []);
   const submitNote = useCallback(
     (body: string) => {
@@ -211,7 +219,7 @@ function useMessageReviewNotes(
 
   const send = useCallback(async () => {
     const formatted = formatNotesForSend(commands.getSnapshot());
-    if (!formatted) return;
+    if (!formatted || !onSendNotes) return;
     await onSendNotes(formatted);
     commands.clear();
     setShowPanel(false);

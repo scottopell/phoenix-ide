@@ -31,6 +31,42 @@ const browserName = process.env.PLAYWRIGHT_BROWSER ?? 'chromium';
 const browserType = browserName === 'webkit' ? webkit : browserName === 'chromium' ? chromium : null;
 if (!browserType) throw new Error(`Unsupported PLAYWRIGHT_BROWSER ${browserName}; use chromium or webkit`);
 
+function playwrightInstallArgs(name) {
+  if (name !== 'chromium' && name !== 'webkit') {
+    throw new Error(`Unsupported PLAYWRIGHT_BROWSER ${name}; use chromium or webkit`);
+  }
+  return ['exec', 'playwright', 'install', name];
+}
+
+function run(command, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { stdio: 'inherit', env: process.env });
+    child.once('error', reject);
+    child.once('exit', (code, signal) => {
+      if (code === 0) resolve();
+      else reject(new Error(`${command} ${args.join(' ')} failed (${signal ?? code})`));
+    });
+  });
+}
+
+function normalizeBaseUrl(value) {
+  const url = new URL(value);
+  if (!url.pathname.endsWith('/')) url.pathname += '/';
+  return url;
+}
+
+export function buildLadleStoryUrl(base, storyKey, params = {}) {
+  const url = normalizeBaseUrl(base);
+  url.search = '';
+  url.hash = '';
+  url.searchParams.set('story', storyKey);
+  url.searchParams.set('mode', 'preview');
+  for (const [key, value] of Object.entries(params)) {
+    url.searchParams.set(key, value);
+  }
+  return url.href;
+}
+
 function normalizeViewportMatrix(viewportMatrix, viewport) {
   if (!Array.isArray(viewportMatrix) || viewportMatrix.length === 0) {
     return [viewport];
@@ -52,6 +88,7 @@ function screenshotFileName(id, viewport) {
 
 export const __testables = {
   normalizeViewportMatrix,
+  playwrightInstallArgs,
   screenshotFileName,
 };
 
@@ -73,9 +110,10 @@ async function waitForLadle() {
 // stories (and through them the shared scenarios) as the single source of
 // truth — a scenario added or removed can't silently fall out of capture.
 async function discoverStories(storyPrefix) {
-  const response = await fetch(`${baseUrl}/meta.json`);
+  const manifestUrl = new URL('meta.json', normalizeBaseUrl(baseUrl));
+  const response = await fetch(manifestUrl);
   if (!response.ok) {
-    throw new Error(`Could not fetch Ladle story manifest at ${baseUrl}/meta.json (${response.status})`);
+    throw new Error(`Could not fetch Ladle story manifest at ${manifestUrl.href} (${response.status})`);
   }
   const meta = await response.json();
   const stories = Object.keys(meta.stories ?? {})
@@ -113,18 +151,19 @@ export async function captureSurface(config) {
   await mkdir(resolvedOut, { recursive: true });
 
   const captureViewports = normalizeViewportMatrix(viewportMatrix, viewport);
+  await run('pnpm', playwrightInstallArgs(browserName));
 
-  const ladle = spawn('pnpm', ['exec', 'ladle', 'serve', '--port', String(port), '--host', '127.0.0.1'], {
+  const ladle = process.env.LADLE_URL ? null : spawn('pnpm', ['exec', 'ladle', 'serve', '--port', String(port), '--host', '127.0.0.1'], {
     stdio: ['ignore', 'pipe', 'pipe'],
     env: process.env,
     detached: true,
   });
-  ladle.stdout.on('data', (chunk) => process.stdout.write(chunk));
-  ladle.stderr.on('data', (chunk) => process.stderr.write(chunk));
+  ladle?.stdout.on('data', (chunk) => process.stdout.write(chunk));
+  ladle?.stderr.on('data', (chunk) => process.stderr.write(chunk));
 
   let ladleStopped = false;
   const stopLadle = () => {
-    if (ladleStopped || ladle.pid === undefined) return;
+    if (ladleStopped || !ladle || ladle.pid === undefined) return;
     ladleStopped = true;
     try {
       process.kill(-ladle.pid, 'SIGTERM');
@@ -149,7 +188,11 @@ export async function captureSurface(config) {
     if (message.type() === 'error') consoleErrors.push(message.text());
   });
   page.on('pageerror', (error) => consoleErrors.push(error.message));
-  page.on('requestfailed', (request) => consoleErrors.push(`Network request failed: ${request.url()} (${request.failure()?.errorText ?? 'unknown'})`));
+  page.on('requestfailed', (request) => {
+    const errorText = request.failure()?.errorText ?? 'unknown';
+    if (request.resourceType() === 'font' && errorText === 'net::ERR_ABORTED') return;
+    consoleErrors.push(`Network request failed: ${request.url()} (${errorText})`);
+  });
   page.on('response', (response) => {
     if (response.status() >= 400) consoleErrors.push(`Network response ${response.status()}: ${response.url()}`);
   });
@@ -160,7 +203,7 @@ export async function captureSurface(config) {
         consoleErrors.length = 0;
         await page.setViewportSize({ width: currentViewport.width, height: currentViewport.height });
         const url = urlForStory?.({ storyKey, id, viewport: currentViewport })
-          ?? `${baseUrl}/?story=${storyKey}&mode=preview`;
+          ?? buildLadleStoryUrl(baseUrl, storyKey);
         await page.goto(url, { waitUntil: 'networkidle' });
         await page.waitForSelector(`[${readyAttribute}="${id}"]`, { timeout: 10_000 });
         const captured = await captureStory?.({ page, id, outDir: resolvedOut, viewport: currentViewport }) ?? false;

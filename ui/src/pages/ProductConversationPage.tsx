@@ -1028,7 +1028,7 @@ function ProductConversationPageInner() {
                 occurrenceToken={aggregateMessageSlot.occurrenceToken}
                 messages={aggregateMessages}
                 onClose={viewerSlot.close}
-                onSendNotes={() => {}}
+                onSendNotes={isOpen ? latestProjection?.appendReviewNotesToComposer : undefined}
                 presentation={aggregateMessageSlot.presentation}
                 canTogglePresentation={isWideDesktop}
                 onPresentationChange={viewerSlot.setPresentation}

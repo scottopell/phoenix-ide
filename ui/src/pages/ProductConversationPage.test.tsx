@@ -329,6 +329,7 @@ function emitLatestProjection(overrides: Partial<Record<string, unknown>> = {}) 
     onRetryPending: vi.fn(),
     onCancelSteering: vi.fn(),
     onOpenFile: vi.fn(),
+    appendReviewNotesToComposer: vi.fn(),
     filePathRootDir: '/tmp/latest-root',
     systemPrompt: 'Preserve this system prompt',
     ...overrides,
@@ -766,6 +767,33 @@ describe('ProductConversationPage', () => {
     expect(screen.getByTestId('product-conversation-page')).not.toHaveClass('product-conversation-page--split-pane');
     expect(await screen.findByTestId('aggregate-message-viewer')).toHaveAttribute('data-inline', 'false');
     expect(screen.getByTestId('aggregate-message-viewer').parentElement).not.toHaveClass('product-conversation-page__viewer-pane');
+  });
+
+  it('routes aggregate viewer notes to the embedded latest-row composer capability', async () => {
+    const appendReviewNotesToComposer = vi.fn();
+    renderPage('/product-conversations/pc-1?viewer=message&presentation=pane&message=3&message_id=m-3');
+    await waitForPageReady();
+
+    act(() => emitLatestProjection({ appendReviewNotesToComposer }));
+    const viewerProps = viewerSpy.mock.lastCall?.[0] as Record<string, unknown> | undefined;
+    const onSendNotes = viewerProps?.['onSendNotes'] as ((notes: string) => void) | undefined;
+    expect(onSendNotes).toBe(appendReviewNotesToComposer);
+
+    onSendNotes?.('## Review notes\n\nunique aggregate note');
+    expect(appendReviewNotesToComposer).toHaveBeenCalledWith('## Review notes\n\nunique aggregate note');
+  });
+
+  it('does not expose note sending when History has no composer capability', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValueOnce(makeSnapshot({
+      ordinary_lifecycle: 'history',
+      writable_transcript_row_id: null,
+    }));
+    renderPage('/product-conversations/pc-1?viewer=message&presentation=pane&message=3&message_id=m-3');
+    await waitForPageReady();
+
+    const viewerProps = viewerSpy.mock.lastCall?.[0] as Record<string, unknown> | undefined;
+    expect(viewerProps?.['onSendNotes']).toBeUndefined();
   });
 
   it('shows first-task onboarding after aggregate approval returns first_task', async () => {
