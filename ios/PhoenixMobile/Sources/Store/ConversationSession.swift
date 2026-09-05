@@ -70,7 +70,7 @@ final class ConversationSession {
         acceptsConversationActions && typedState.acceptsChatMessage
     }
     var acceptsConversationActions: Bool {
-        guard case .current = hydrationAuthority else { return false }
+        guard hydrationAuthority != .legacyReadOnly else { return false }
         return !isHardDeleted && !isArchiving && conversation?.archived != true
     }
     /// tool_use_id -> the invoking block's tool name + input. Lets a tool
@@ -274,8 +274,9 @@ final class ConversationSession {
             // same user message never renders twice while offline.
             reconcileOutbox()
         } else if case .value(let snap) = loadedSnapshot,
-                  snap.authoritative == nil,
                   legacySnapshotPersistenceScope == api.configurationIdentity.persistenceScope,
+                  snap.authoritative == nil
+                    || snap.authoritative?.configurationIdentity.persistenceScope == api.configurationIdentity.persistenceScope,
                   let persistedConversation = snap.conversation,
                   Self.receiptIdentity(
                       for: persistedConversation,
