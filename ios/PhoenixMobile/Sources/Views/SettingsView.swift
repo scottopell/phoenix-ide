@@ -4,7 +4,6 @@ struct SettingsView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
 
-    @State private var confirmClearCache = false
     @State private var confirmSignOut = false
     @State private var confirmForgetPin = false
     /// Bumped after forgetting the pin so the static CertPinStore values
@@ -93,18 +92,6 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    Button("Clear offline cache", role: .destructive) {
-                        confirmClearCache = true
-                    }
-                } header: {
-                    Text("Storage")
-                } footer: {
-                    Text(
-                        "Removes cached conversations and message history from this "
-                        + "device. Queued unsent messages are also removed.")
-                }
-
-                Section {
                     Button("Sign out", role: .destructive) {
                         confirmSignOut = true
                     }
@@ -115,14 +102,6 @@ struct SettingsView: View {
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }
-                }
-            }
-            .confirmationDialog(
-                "Clear cached data? Unsent queued messages will be lost.",
-                isPresented: $confirmClearCache, titleVisibility: .visible
-            ) {
-                Button("Clear cache", role: .destructive) {
-                    Task { await model.clearCache() }
                 }
             }
             .confirmationDialog(
