@@ -70,7 +70,8 @@ final class ConversationSession {
         acceptsConversationActions && typedState.acceptsChatMessage
     }
     var acceptsConversationActions: Bool {
-        !isHardDeleted && !isArchiving && conversation?.archived != true
+        guard case .current = hydrationAuthority else { return false }
+        return !isHardDeleted && !isArchiving && conversation?.archived != true
     }
     /// tool_use_id -> the invoking block's tool name + input. Lets a tool
     /// result message (which carries only `tool_use_id`) find its native
@@ -131,7 +132,17 @@ final class ConversationSession {
     /// Retain the newest fields until the identity-bearing message arrives.
     private var pendingMessagePatches: [String: PendingMessagePatch] = [:]
 
-    private(set) var authoritativeSnapshotReceipt: AuthoritativeSnapshotReceipt?
+    enum HydrationAuthority: Equatable {
+        case none
+        case legacyReadOnly
+        case current(AuthoritativeSnapshotReceipt)
+    }
+
+    private(set) var hydrationAuthority: HydrationAuthority = .none
+    var authoritativeSnapshotReceipt: AuthoritativeSnapshotReceipt? {
+        guard case .current(let receipt) = hydrationAuthority else { return nil }
+        return receipt
+    }
     // MARK: - Persistence
 
     struct PersistedSnapshotAuthority: Codable, Equatable, Sendable {
@@ -245,12 +256,12 @@ final class ConversationSession {
             lastSequenceId = snap.lastSequenceId
             transcriptGeneration = snap.transcriptGeneration
             snapshotSyncedAt = snap.syncedAt
-            authoritativeSnapshotReceipt = AuthoritativeSnapshotReceipt(
+            hydrationAuthority = .current(AuthoritativeSnapshotReceipt(
                 conversationId: receiptIdentity.conversationId,
                 aggregateId: receiptIdentity.aggregateId,
                 configurationIdentity: api.configurationIdentity,
                 revision: 0,
-                syncedAt: authority.syncedAt)
+                syncedAt: authority.syncedAt))
             replayFromPendingAnchor = true
             presentationMode = persistedConversation.presentation_mode
             // Busy flag follows the cached mode the same way live
@@ -280,6 +291,7 @@ final class ConversationSession {
             presentationMode = persistedConversation.presentation_mode
             agentWorking = presentationMode == "working"
             rebuildToolUseIndex()
+            hydrationAuthority = .legacyReadOnly
         }
     }
 
@@ -301,7 +313,7 @@ final class ConversationSession {
         self.api = api
         pendingSnapshotConfigurationIdentity = nil
         pendingAuthoritativeSnapshot = nil
-        authoritativeSnapshotReceipt = nil
+        hydrationAuthority = .none
         streamBlockedUntilConfigurationChange = false
         if viewIsActive {
             streamTask?.cancel()
@@ -333,7 +345,7 @@ final class ConversationSession {
         drainTask = nil
         pendingSnapshotConfigurationIdentity = nil
         pendingAuthoritativeSnapshot = nil
-        authoritativeSnapshotReceipt = nil
+        hydrationAuthority = .none
         actionAttempt = nil
         connection = .idle
         onSessionEvent?(.connectionChanged(.idle))
@@ -533,12 +545,12 @@ final class ConversationSession {
                    sessionConversationId: conversationId,
                    expectedAggregateAuthority: self.aggregateAuthority)
             {
-                authoritativeSnapshotReceipt = AuthoritativeSnapshotReceipt(
+                hydrationAuthority = .current(AuthoritativeSnapshotReceipt(
                     conversationId: receiptIdentity.conversationId,
                     aggregateId: receiptIdentity.aggregateId,
                     configurationIdentity: authority.configurationIdentity,
                     revision: revision,
-                    syncedAt: authority.syncedAt)
+                    syncedAt: authority.syncedAt))
             }
             if snapshotNeedsOutboxReconciliation {
                 snapshotNeedsOutboxReconciliation = false
@@ -590,7 +602,7 @@ final class ConversationSession {
         drainGeneration &+= 1
         drainTask?.cancel()
         drainTask = nil
-        authoritativeSnapshotReceipt = nil
+        hydrationAuthority = .none
         let revision = snapshotWriter.reserveRevision()
         latestSnapshotRevision = revision
         await snapshotWriter.remove(revision: revision)
@@ -1279,7 +1291,7 @@ final class ConversationSession {
         snapshotPersistenceEnabled = false
         snapshotNeedsOutboxReconciliation = false
         snapshotNeedsOutboxDrain = false
-        authoritativeSnapshotReceipt = nil
+        hydrationAuthority = .none
         hardDeleteReportTask = Task { @MainActor [hardDeleteContext, onHardDeleted] in
             await onHardDeleted(hardDeleteContext)
         }

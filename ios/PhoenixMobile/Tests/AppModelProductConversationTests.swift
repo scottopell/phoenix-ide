@@ -36,6 +36,7 @@ private final class InMemoryCredentialStore: CredentialStore {
 
     var record: AppModel.CredentialRecord?
     var failNextSave = false
+    private(set) var deletedAccounts: [String] = []
 
     func loadRecord(account: String) -> AppModel.CredentialRecord? { record }
     func saveRecord(_ record: AppModel.CredentialRecord, account: String) throws {
@@ -47,6 +48,7 @@ private final class InMemoryCredentialStore: CredentialStore {
     }
     func deleteRecord(account: String) {
         record = nil
+        deletedAccounts.append(account)
     }
 }
 
@@ -1536,6 +1538,18 @@ final class AppModelProductConversationTests: XCTestCase {
         if case .value = snapshotBValue {} else { XCTFail("expected base B snapshot retained") }
     }
     @MainActor
+    func testSignOutDeletesVersionedAndLegacyCredentialAccounts() async {
+        let credentialStore = InMemoryCredentialStore()
+        let model = AppModel(credentialStore: credentialStore)
+
+        await model.signOut()
+
+        XCTAssertEqual(
+            Set(credentialStore.deletedAccounts),
+            ["server-credentials", "server-password"])
+    }
+
+    @MainActor
     func testSignOutResetsConfigurationAndEvictsOwnedSessionAndDetailState() async {
         let model = makeModel()
         let (api, registration) = makeHTTPAPI(probe: SendProbe())
@@ -2049,6 +2063,50 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("conv-row-1.json").path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("outbox-row-1.json").path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent(fence.storageName).appendingPathExtension("json").path))
+    }
+
+    func testHardDeleteCleanupRemovesProvenLegacySnapshotButPreservesForeignUnscopedSnapshot() async throws {
+        let baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-legacy-cleanup-\(UUID().uuidString)")
+        let context = DiskStore.versionedContext(baseDirectory: baseDirectory)
+        let store = DiskConversationPersistenceStore(baseDirectory: baseDirectory, context: context)
+        let identity = APIConfigurationIdentity(
+            serverURL: "https://phoenix.invalid",
+            credentialGeneration: "legacy-installation",
+            trustSelfSigned: false)
+        let directory = DiskStore.phoenixMobileDirectory(baseDirectory: baseDirectory)
+        for (row, aggregate) in [("row-proven", "pc-1"), ("row-foreign", "pc-other")] {
+            let writer = context.writer(
+                destinationURL: directory.appendingPathComponent("conv-\(row).json"),
+                version: ConversationSession.snapshotSchemaVersion)
+            _ = await writer.save(
+                ConversationSession.PersistedSnapshot(
+                    conversation: conversation(id: row, aggregateId: aggregate),
+                    messages: [],
+                    lastSequenceId: 0,
+                    transcriptGeneration: nil,
+                    syncedAt: Date(),
+                    authoritative: nil),
+                revision: writer.reserveRevision())
+        }
+
+        let removed = await store.removeAuthoritativePersistedConversationState(
+            conversationId: "row-proven",
+            configurationIdentity: identity,
+            aggregateAuthority: "pc-1",
+            legacyScope: identity.persistenceScope)
+        let foreignSnapshotIgnored = await store.removeAuthoritativePersistedConversationState(
+            conversationId: "row-foreign",
+            configurationIdentity: identity,
+            aggregateAuthority: "pc-1",
+            legacyScope: identity.persistenceScope)
+
+        XCTAssertTrue(removed)
+        XCTAssertTrue(foreignSnapshotIgnored)
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: directory.appendingPathComponent("conv-row-proven.json").path))
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: directory.appendingPathComponent("conv-row-foreign.json").path))
     }
 
     func testStartupRecoversFenceAfterTrustToggleBeforeDrain() async {
