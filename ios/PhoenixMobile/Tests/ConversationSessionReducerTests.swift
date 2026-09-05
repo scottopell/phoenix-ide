@@ -1350,6 +1350,80 @@ final class ConversationSessionReducerTests: XCTestCase {
     }
 
     @MainActor
+    func testInitWithSiblingRowInSameAggregateDoesNotMutateSession() throws {
+        let session = makeSession(aggregateAuthority: "pc-1")
+        session.receive(.initSnapshot(.init(
+            conversation: try conversation(id: "c1", aggregateId: "pc-1"),
+            messages: [try message(id: "m-old", content: "\"retained\"")],
+            agentWorking: false, presentationMode: "idle", lastSequenceId: 2,
+            pendingAnchorSequenceId: 2, pendingEvents: [], pendingTruncated: false)))
+        let conversationBefore = session.conversation
+        let messagesBefore = session.messages
+        let receiptBefore = session.authoritativeSnapshotReceipt
+        let revisionBefore = session.latestSnapshotRevisionForTesting
+
+        session.receive(.initSnapshot(.init(
+            conversation: try conversation(id: "sibling", aggregateId: "pc-1"),
+            messages: [try message(id: "m-new", content: "\"rejected\"")],
+            agentWorking: true, presentationMode: "working", lastSequenceId: 9,
+            pendingAnchorSequenceId: 9, pendingEvents: [], pendingTruncated: false)))
+
+        XCTAssertEqual(session.conversation, conversationBefore)
+        XCTAssertEqual(session.messages, messagesBefore)
+        XCTAssertEqual(session.authoritativeSnapshotReceipt, receiptBefore)
+        XCTAssertEqual(session.latestSnapshotRevisionForTesting, revisionBefore)
+    }
+
+    @MainActor
+    func testInvalidStreamInitRejectsLaterEventsAndFreshGenerationRecovers() async throws {
+        let invalidStream = AsyncThrowingStream<PhoenixEvent, Error> { continuation in
+            continuation.yield(.initSnapshot(.init(
+                conversation: try! self.conversation(id: "sibling", aggregateId: "pc-1"),
+                messages: [], agentWorking: false, presentationMode: "idle",
+                lastSequenceId: 0, pendingAnchorSequenceId: 0,
+                pendingEvents: [], pendingTruncated: false)))
+            continuation.yield(.message(seq: 1, message: try! self.message(id: "m-invalid", content: "\"invalid\"")))
+            continuation.yield(.stateChange(
+                seq: 2, state: .string("working"), presentationMode: "working",
+                stateUpdatedAt: nil))
+            continuation.yield(.conversationHardDeleted(seq: 3, conversationId: "c1"))
+            continuation.finish()
+        }
+        let validStream = AsyncThrowingStream<PhoenixEvent, Error> { continuation in
+            continuation.yield(.initSnapshot(.init(
+                conversation: try! self.conversation(id: "c1", aggregateId: "pc-1"),
+                messages: [try! self.message(id: "m-valid", content: "\"valid\"")],
+                agentWorking: false, presentationMode: "idle",
+                lastSequenceId: 1, pendingAnchorSequenceId: 1,
+                pendingEvents: [], pendingTruncated: false)))
+            continuation.finish()
+        }
+        let opener = ScriptedStreamOpeningFactory(
+            steps: [invalidStream, validStream], blockedOrdinals: [])
+        let updates = ConversationUpdateGate()
+        let session = makeSession(
+            onConversationUpdate: { updates.observe($0) },
+            retryTiming: ImmediateCancellationTiming(),
+            staleCheckTiming: ImmediateCancellationTiming(),
+            openEventStream: opener.openEventStream,
+            aggregateAuthority: "pc-1")
+
+        session.start()
+        await opener.waitForOpen()
+        XCTAssertNil(session.conversation)
+        XCTAssertTrue(session.messages.isEmpty)
+        XCTAssertFalse(session.isHardDeleted)
+
+        session.stop()
+        session.start()
+        await opener.waitForOpen(count: 2)
+        await updates.wait()
+        XCTAssertEqual(session.conversation?.id, "c1")
+        XCTAssertEqual(session.messages.map(\.message_id), ["m-valid"])
+        XCTAssertFalse(session.isHardDeleted)
+    }
+
+    @MainActor
     func testCanonicalAuthoritativeMessageReconcilesOptimisticEntry() async throws {
         let session = makeSession()
         let entry = await session.outbox.enqueue(text: "sent once")!
