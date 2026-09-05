@@ -35,7 +35,8 @@ final class ProductConversationDetailModelTests: XCTestCase {
             outboxPersistence: OutboxPersistenceHandle.disk(conversationId: id, baseDirectory: baseDirectory),
             snapshotPersistence: DiskStore.versionedContext(baseDirectory: baseDirectory).writer(destinationURL: snapshotDestination, version: ConversationSession.snapshotSchemaVersion),
             retryTiming: LiveSessionTiming(),
-            staleCheckTiming: LiveSessionTiming())
+            staleCheckTiming: LiveSessionTiming(),
+            aggregateAuthority: "pc-1")
     }
 
     private func snapshot(
@@ -228,7 +229,8 @@ final class ProductConversationDetailModelTests: XCTestCase {
             outboxPersistence: OutboxPersistenceHandle.disk(conversationId: "row-1", baseDirectory: baseDirectory),
             snapshotPersistence: DiskStore.versionedContext(baseDirectory: baseDirectory).writer(destinationURL: baseDirectory.appendingPathComponent("PhoenixMobile", isDirectory: true).appendingPathComponent("conv-row-1").appendingPathExtension("json"), version: ConversationSession.snapshotSchemaVersion),
             retryTiming: LiveSessionTiming(),
-            staleCheckTiming: LiveSessionTiming())
+            staleCheckTiming: LiveSessionTiming(),
+            aggregateAuthority: "pc-1")
         let row2 = ConversationSession(
             conversationId: "row-2",
             api: makeAPI(),
@@ -236,7 +238,8 @@ final class ProductConversationDetailModelTests: XCTestCase {
             outboxPersistence: OutboxPersistenceHandle.disk(conversationId: "row-2", baseDirectory: baseDirectory),
             snapshotPersistence: DiskStore.versionedContext(baseDirectory: baseDirectory).writer(destinationURL: baseDirectory.appendingPathComponent("PhoenixMobile", isDirectory: true).appendingPathComponent("conv-row-2").appendingPathExtension("json"), version: ConversationSession.snapshotSchemaVersion),
             retryTiming: LiveSessionTiming(),
-            staleCheckTiming: LiveSessionTiming())
+            staleCheckTiming: LiveSessionTiming(),
+            aggregateAuthority: "pc-1")
         row1.receive(.initSnapshot(.init(
             conversation: try! conversation(id: "row-1"),
             messages: [], agentWorking: false, presentationMode: "idle", lastSequenceId: 1,
@@ -446,19 +449,6 @@ final class ProductConversationDetailModelTests: XCTestCase {
         XCTAssertTrue(model.stateDetailSession === latest)
     }
 
-    func testAggregateIdentityInvalidatesBothOldAndNewOwners() {
-        let model = ProductConversationDetailModel(
-            aggregateId: "pc-old",
-            api: makeAPI(),
-            connectivity: ConnectivityMonitor(),
-            sessionProvider: { _, _ in nil })
-
-        XCTAssertTrue(model.invalidatesAggregateForTesting(.init(
-            transcriptRowId: "row-2",
-            aggregateIdentity: "pc-new",
-            reason: .aggregateIdentityChanged(previous: "pc-old", current: "pc-new"))))
-    }
-
     func testLateCancelledLoadCannotClearNewFlight() async {
         actor Gate {
             private var blockedRefreshStarted = false
@@ -583,7 +573,8 @@ final class ProductConversationDetailModelTests: XCTestCase {
                 outboxPersistence: OutboxPersistenceHandle.disk(conversationId: "row-1", baseDirectory: baseDirectory),
                 snapshotPersistence: DiskStore.versionedContext(baseDirectory: baseDirectory).writer(destinationURL: baseDirectory.appendingPathComponent("PhoenixMobile", isDirectory: true).appendingPathComponent("conv-row-1").appendingPathExtension("json"), version: ConversationSession.snapshotSchemaVersion),
                 retryTiming: LiveSessionTiming(),
-                staleCheckTiming: LiveSessionTiming())
+                staleCheckTiming: LiveSessionTiming(),
+                aggregateAuthority: "pc-1")
             row1.receive(.initSnapshot(.init(
                 conversation: try! self.conversation(id: "row-1"),
                 messages: [], agentWorking: false, presentationMode: "idle", lastSequenceId: 1,

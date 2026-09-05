@@ -191,7 +191,7 @@ final class ConversationSessionReducerTests: XCTestCase {
         private var waiters: [CheckedContinuation<Void, Never>] = []
 
         func observe(_ conversation: Conversation) {
-            guard conversation.product_conversation_id == "pc-new" else { return }
+            guard conversation.id == "c1" else { return }
             let continuations = withLock { state -> [CheckedContinuation<Void, Never>] in
                 if state.matched { return [] }
                 state.matched = true
@@ -1289,35 +1289,63 @@ final class ConversationSessionReducerTests: XCTestCase {
     }
 
     @MainActor
-    func testReconnectInitEmitsAggregateTopologyInvalidationFromPreviousAggregateAndState() throws {
-        let session = makeSession()
-        var invalidations: [ProductConversationTopologyInvalidation] = []
-        session.setSessionEventObserver { event in
-            if case .aggregateTopologyInvalidated(let invalidation) = event {
-                invalidations.append(invalidation)
-            }
-        }
-
+    func testInitWithForeignAggregateFailsBeforeStateCallbacksPersistenceOrOutboxMutation() async throws {
+        let baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-session-tests-\(UUID().uuidString)")
+        let context = DiskStore.versionedContext(baseDirectory: baseDirectory)
+        var conversationUpdates: [Conversation] = []
+        let session = makeSession(
+            onConversationUpdate: { conversationUpdates.append($0) },
+            baseDirectory: baseDirectory,
+            context: context,
+            aggregateAuthority: "agg-old")
         session.receive(.initSnapshot(.init(
-            conversation: try conversation(id: "row-1", aggregateId: "agg-old", state: "{\"type\":\"working\"}"),
-            messages: [], agentWorking: true, presentationMode: "working",
-            lastSequenceId: 0, pendingAnchorSequenceId: 0, pendingEvents: [], pendingTruncated: false,
+            conversation: try conversation(id: "c1", aggregateId: "agg-old", state: "{\"type\":\"working\"}"),
+            messages: [try message(id: "m-old", content: "\"retained\"")],
+            agentWorking: true, presentationMode: "working",
+            lastSequenceId: 2, pendingAnchorSequenceId: 2,
+            pendingEvents: [], pendingTruncated: false,
             transcriptGeneration: 1)))
-        invalidations.removeAll()
+        let persisted = await session.flushSnapshotPersistence()
+        let queued = await session.outbox.enqueue(text: "queued")
+        XCTAssertTrue(persisted)
+        XCTAssertNotNil(queued)
+        let snapshotURL = baseDirectory
+            .appendingPathComponent("PhoenixMobile", isDirectory: true)
+            .appendingPathComponent("conv-c1")
+            .appendingPathExtension("json")
+        let persistedBefore = try Data(contentsOf: snapshotURL)
+        let conversationBefore = session.conversation
+        let messagesBefore = session.messages
+        let outboxBefore = session.outbox.entries
+        let receiptBefore = session.authoritativeSnapshotReceipt
+        let revisionBefore = session.latestSnapshotRevisionForTesting
+        let updateCountBefore = conversationUpdates.count
+        var sessionEvents: [ProductConversationSessionEvent] = []
+        session.setSessionEventObserver { sessionEvents.append($0) }
 
         session.receive(.initSnapshot(.init(
-            conversation: try conversation(id: "row-1", aggregateId: "agg-new", state: "{\"type\":\"idle\"}"),
-            messages: [], agentWorking: false, presentationMode: "idle",
-            lastSequenceId: 0, pendingAnchorSequenceId: 0, pendingEvents: [], pendingTruncated: false,
+            conversation: try conversation(id: "c1", aggregateId: "agg-new", state: "{\"type\":\"idle\"}"),
+            messages: [try message(id: "m-new", content: "\"rejected\"")],
+            agentWorking: false, presentationMode: "idle",
+            lastSequenceId: 9, pendingAnchorSequenceId: 9,
+            pendingEvents: [], pendingTruncated: false,
             transcriptGeneration: 2)))
 
-        XCTAssertEqual(invalidations.count, 1)
-        XCTAssertEqual(invalidations.first?.aggregateIdentity, "agg-new")
-        if case .aggregateIdentityChanged(let previous, let current) = invalidations.first?.reason {
-            XCTAssertEqual(previous, "agg-old")
-            XCTAssertEqual(current, "agg-new")
+        XCTAssertEqual(session.conversation, conversationBefore)
+        XCTAssertEqual(session.messages, messagesBefore)
+        XCTAssertTrue(session.agentWorking)
+        XCTAssertEqual(session.presentationMode, "working")
+        XCTAssertEqual(session.authoritativeSnapshotReceipt, receiptBefore)
+        XCTAssertEqual(session.outbox.entries, outboxBefore)
+        XCTAssertEqual(session.latestSnapshotRevisionForTesting, revisionBefore)
+        XCTAssertEqual(conversationUpdates.count, updateCountBefore)
+        XCTAssertEqual(try Data(contentsOf: snapshotURL), persistedBefore)
+        XCTAssertEqual(sessionEvents.count, 1)
+        if case .errorToastChanged(let message) = sessionEvents.first {
+            XCTAssertTrue(message?.hasPrefix("Unexpected server response:") == true)
         } else {
-            XCTFail("expected aggregate identity change")
+            XCTFail("expected existing session error path")
         }
     }
 
@@ -1540,7 +1568,8 @@ final class ConversationSessionReducerTests: XCTestCase {
         let session = makeSession(
             retryTiming: ImmediateCancellationTiming(),
             staleCheckTiming: ImmediateCancellationTiming(),
-            openEventStream: openerFactory.openEventStream)
+            openEventStream: openerFactory.openEventStream,
+            aggregateAuthority: "pc-1")
 
         session.start()
         await openerFactory.waitForOpen()
@@ -1555,7 +1584,7 @@ final class ConversationSessionReducerTests: XCTestCase {
     func testAPIReplacementMakesOldLateStreamIgnored() async throws {
         let oldStream = AsyncThrowingStream<PhoenixEvent, Error> { continuation in
             continuation.yield(.initSnapshot(.init(
-                conversation: try! self.conversation(id: "c1", aggregateId: "pc-old"),
+                conversation: try! self.conversation(id: "c1"),
                 messages: [try! self.message(id: "m-old", content: "[{\"type\":\"text\",\"text\":\"stale\"}]")],
                 agentWorking: false,
                 presentationMode: "idle", lastSequenceId: 1,
@@ -1564,7 +1593,7 @@ final class ConversationSessionReducerTests: XCTestCase {
         }
         let newStream = AsyncThrowingStream<PhoenixEvent, Error> { continuation in
             continuation.yield(.initSnapshot(.init(
-                conversation: try! self.conversation(id: "c1", aggregateId: "pc-new"),
+                conversation: try! self.conversation(id: "c1"),
                 messages: [try! self.message(id: "m-new", content: "[{\"type\":\"text\",\"text\":\"fresh\"}]")],
                 agentWorking: false,
                 presentationMode: "idle",
@@ -1611,8 +1640,6 @@ final class ConversationSessionReducerTests: XCTestCase {
         XCTAssertEqual(recordedIdentities[1], replacement.configurationIdentity)
         let connection = session.connection
         XCTAssertEqual(connection, ConversationSession.ConnectionState.live)
-        let conversationBeforeOldRelease = session.conversation
-        XCTAssertEqual(conversationBeforeOldRelease?.product_conversation_id, "pc-new")
         let firstMessageBeforeOldRelease = session.messages.first
         XCTAssertEqual(firstMessageBeforeOldRelease?.message_id, "m-new")
         XCTAssertEqual(firstMessageBeforeOldRelease?.content.arrayValue?.first?["text"]?.stringValue, "fresh")
@@ -1620,12 +1647,9 @@ final class ConversationSessionReducerTests: XCTestCase {
         try await openerFactory.releaseOpen(ordinal: 1)
         await oldTask.value
 
-        let finalConversation = session.conversation
-        XCTAssertEqual(finalConversation?.product_conversation_id, "pc-new")
         let finalFirstMessage = session.messages.first
         XCTAssertEqual(finalFirstMessage?.message_id, "m-new")
         XCTAssertEqual(finalFirstMessage?.content.arrayValue?.first?["text"]?.stringValue, "fresh")
-        XCTAssertNotEqual(finalConversation?.product_conversation_id, "pc-old")
         XCTAssertNotEqual(finalFirstMessage?.message_id, "m-old")
     }
 

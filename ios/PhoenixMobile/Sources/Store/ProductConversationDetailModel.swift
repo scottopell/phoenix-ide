@@ -314,10 +314,6 @@ final class ProductConversationDetailModel {
         }
     }
 
-    func invalidatesAggregateForTesting(_ invalidation: ProductConversationTopologyInvalidation) -> Bool {
-        invalidatesThisAggregate(invalidation)
-    }
-
     func applyOwnerEventForTesting(_ event: ProductConversationSessionEvent) {
         switch event {
         case .connectionChanged(let connection):
@@ -830,12 +826,7 @@ final class ProductConversationDetailModel {
     }
 
     private func invalidatesThisAggregate(_ invalidation: ProductConversationTopologyInvalidation) -> Bool {
-        switch invalidation.reason {
-        case .aggregateIdentityChanged(let previous, let current):
-            return previous == aggregateId || current == aggregateId
-        default:
-            return invalidation.aggregateIdentity == aggregateId
-        }
+        invalidation.aggregateIdentity == aggregateId
     }
 
     private func dedupeMessages(_ messages: [Message]) -> [Message] {
