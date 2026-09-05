@@ -65,6 +65,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [051](051_predecessor-recall-is-bound-to-the-executing-transcript.md) | Predecessor recall is bound to the executing transcript | Accepted | REQ-RET-009, REQ-GR-007 |
 | [052](052_workers-and-tiers-resolve-usable-model-routes.md) | Workers and tiers resolve usable model routes | Accepted | REQ-AG-001–012, REQ-SA-007, REQ-SA-011 |
 | [053](053_invalid-continuation-intents-retire-without-fabricated-identity.md) | Invalid continuation intents retire without fabricated identity | Accepted | REQ-BED-021, REQ-COMP-001, REQ-COMP-002 |
+| [054](054_ios-legacy-snapshots-render-read-only.md) | Proven same-installation legacy iOS snapshots render read-only | Accepted | REQ-IOS-002, REQ-IOS-005, compatibility requirements |
 
 ## For agents: which decisions bind your task
 
