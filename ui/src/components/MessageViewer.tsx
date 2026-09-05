@@ -18,7 +18,7 @@ interface MessageViewerProps {
   occurrenceToken?: string | undefined;
   messages: Message[];
   onClose: () => void;
-  onSendNotes: (notes: string) => void | Promise<void>;
+  onSendNotes?: ((notes: string) => void | Promise<void>) | undefined;
   presentation?: 'pane' | 'fullscreen' | undefined;
   canTogglePresentation?: boolean | undefined;
   onPresentationChange?: ((presentation: 'pane' | 'fullscreen') => void) | undefined;
@@ -45,6 +45,7 @@ export function MessageViewer({ sequenceId, messageId, occurrenceToken, messages
   const returnToPane = useCallback(() => onPresentationChange?.('pane'), [onPresentationChange]);
   const focusedExit = useFocusedReviewExit({
     noteCount: notes.messageNotes.length,
+    unsavedDraft: notes.annotationDraftDirty,
     send: notes.send,
     discard: notes.clearAll,
     returnToPane,
@@ -96,8 +97,10 @@ export function MessageViewer({ sequenceId, messageId, occurrenceToken, messages
       headerExtras={headerExtras}
       noteCount={notes.messageNotes.length}
       onToggleNotes={notes.togglePanel}
-      onSend={focused ? focusedExit.sendAndReturn : () => { void notes.send(); }}
-      onClose={focused ? focusedExit.requestClose : onClose}
+      onSend={onSendNotes
+        ? (focused ? focusedExit.sendAndReturn : () => { void notes.send(); })
+        : undefined}
+      onClose={focusedExit.requestClose}
       onEscape={focused ? focusedExit.requestReturn : undefined}
       bodyScroll="shell"
       panel={
@@ -107,7 +110,9 @@ export function MessageViewer({ sequenceId, messageId, occurrenceToken, messages
             onJumpTo={handleJumpTo}
             onRemove={notes.removeNote}
             onClearAll={notes.clearAll}
-            onSend={focused ? focusedExit.sendAndReturn : () => { void notes.send(); }}
+            onSend={onSendNotes
+              ? (focused ? focusedExit.sendAndReturn : () => { void notes.send(); })
+              : undefined}
             onClose={notes.closePanel}
           />
         ) : null
@@ -117,7 +122,8 @@ export function MessageViewer({ sequenceId, messageId, occurrenceToken, messages
           <AnnotationDialog
             anchorLabel={`Line ${notes.annotating.lineNumber}`}
             lineContent={notes.annotating.lineContent}
-            onSubmit={notes.submitNote}
+            onDirtyChange={notes.setAnnotationDraftDirty}
+            onSubmit={onSendNotes ? notes.submitNote : undefined}
             onCancel={notes.cancelAnnotate}
           />
         ) : null
@@ -127,6 +133,7 @@ export function MessageViewer({ sequenceId, messageId, occurrenceToken, messages
           target={focusedExit.exitTarget}
           sending={focusedExit.sending}
           error={focusedExit.error}
+          canSend={Boolean(onSendNotes)}
           onSend={() => { void focusedExit.sendAndReturn(); }}
           onDiscard={focusedExit.discardAndReturn}
           onKeepReviewing={focusedExit.keepReviewing}
@@ -139,7 +146,7 @@ export function MessageViewer({ sequenceId, messageId, occurrenceToken, messages
             content={content}
             modifiedLines={EMPTY_SET}
             highlightedLine={notes.highlightedLine}
-            onAnnotate={notes.startAnnotate}
+            onAnnotate={onSendNotes ? notes.startAnnotate : undefined}
             registerLineRef={registerLineRef}
           />
         ) : (
@@ -166,11 +173,12 @@ function useMessageReviewNotes(
   sequenceId: number,
   messageId: string | undefined,
   occurrenceToken: string | undefined,
-  onSendNotes: (notes: string) => void | Promise<void>,
+  onSendNotes: ((notes: string) => void | Promise<void>) | undefined,
 ) {
   const commands = useReviewNotesCommands();
   const messageNotes = useMessageReviewNotesData(sequenceId, occurrenceToken);
   const [annotating, setAnnotating] = useState<{ sequenceId: number; lineNumber: number; lineContent: string } | null>(null);
+  const [annotationDraftDirty, setAnnotationDraftDirty] = useState(false);
   const [showPanel, setShowPanel] = useState(false);
   const [highlightedLine, setHighlightedLine] = useState<number | null>(null);
 
@@ -182,14 +190,25 @@ function useMessageReviewNotes(
 
   useEffect(() => {
     setAnnotating(null);
+    setAnnotationDraftDirty(false);
     setHighlightedLine(null);
     setShowPanel(false);
   }, [occurrenceToken, sequenceId]);
 
+  useEffect(() => {
+    if (onSendNotes) return;
+    setHighlightedLine(null);
+    setShowPanel(false);
+  }, [onSendNotes]);
+
   const startAnnotate = useCallback((lineNumber: number, lineContent: string) => {
+    if (!onSendNotes) return;
     setAnnotating({ sequenceId, lineNumber, lineContent });
-  }, [sequenceId]);
-  const cancelAnnotate = useCallback(() => setAnnotating(null), []);
+  }, [onSendNotes, sequenceId]);
+  const cancelAnnotate = useCallback(() => {
+    setAnnotating(null);
+    setAnnotationDraftDirty(false);
+  }, []);
   const submitNote = useCallback(
     (body: string) => {
       if (!annotating || annotating.sequenceId !== sequenceId) return;
@@ -205,13 +224,14 @@ function useMessageReviewNotes(
         body,
       );
       setAnnotating(null);
+      setAnnotationDraftDirty(false);
     },
     [annotating, commands, messageId, occurrenceToken, sequenceId],
   );
 
   const send = useCallback(async () => {
     const formatted = formatNotesForSend(commands.getSnapshot());
-    if (!formatted) return;
+    if (!formatted || !onSendNotes) return;
     await onSendNotes(formatted);
     commands.clear();
     setShowPanel(false);
@@ -228,6 +248,8 @@ function useMessageReviewNotes(
   return {
     messageNotes,
     annotating,
+    annotationDraftDirty,
+    setAnnotationDraftDirty,
     startAnnotate,
     cancelAnnotate,
     submitNote,

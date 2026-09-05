@@ -38,18 +38,39 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   const originalGetSystemPrompt = api.getSystemPrompt;
   const originalGetWorkScopeInventory = api.getWorkScopeInventory;
   const originalListForkProposals = api.listForkProposals;
+  const originalReconcileAcceptedMessages = api.reconcileAcceptedMessages;
   const originalFetch = globalThis.fetch;
   const OriginalWebSocket = globalThis.WebSocket;
+  let snapshotRequestCount = 0;
+  let initialSnapshotFailuresRemaining = scenario.initialSnapshotFailures ?? 0;
+  let sendCount = 0;
+  let eventSourceOpenCount = 0;
+  let eventSourceInitCount = 0;
+  let latestEventSource: FixtureEventSource | null = null;
 
-  api.getProductConversationSnapshot = async () => {
+  const record = (name: string, value: number | string) => {
+    document.documentElement.dataset[`productConversationFixture${name}`] = String(value);
+  };
+
+  api.getProductConversationSnapshot = async (_productConversationId, options = {}) => {
+    snapshotRequestCount += 1;
+    record('SnapshotRequests', snapshotRequestCount);
     if (scenario.state === 'loading') {
       return new Promise(() => {}) as ReturnType<typeof api.getProductConversationSnapshot>;
     }
-    if (scenario.state === 'error') {
+    if (initialSnapshotFailuresRemaining > 0) {
+      initialSnapshotFailuresRemaining -= 1;
       throw new Error(scenario.snapshotError ?? 'Fixture failed to fetch product conversation snapshot');
     }
     if (!scenario.snapshot) {
       throw new Error(`Scenario ${scenario.id} is missing snapshot data`);
+    }
+    if (options.before) {
+      if (!scenario.olderSnapshot || options.before !== scenario.snapshot.before) {
+        throw new Error(`Scenario ${scenario.id} received an unexpected older-history cursor`);
+      }
+      record('OlderSnapshotRequests', Number(document.documentElement.dataset['productConversationFixtureOlderSnapshotRequests'] ?? '0') + 1);
+      return scenario.olderSnapshot;
     }
     return scenario.snapshot;
   };
@@ -101,10 +122,24 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     browser: null,
   });
   api.listForkProposals = async () => [];
+  api.reconcileAcceptedMessages = async (_conversationId, messageIds) => ({
+    conversation_idle: false,
+    entries: messageIds.map((messageId) => ({
+      message_id: messageId,
+      status: 'steering_queued' as const,
+    })),
+  });
   globalThis.fetch = async (input, init) => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
     if (url.endsWith('/api/telemetry/conversation-open')) {
       return new Response(null, { status: 204 });
+    }
+    if (url.endsWith(`/api/conversations/${conversation.id}/chat`) && init?.method === 'POST') {
+      const body = JSON.parse(String(init.body)) as { text?: string };
+      sendCount += 1;
+      record('SendCount', sendCount);
+      record('LastSentText', body.text ?? '');
+      return Response.json({ queued: false, already_persisted: true });
     }
     return originalFetch(input, init);
   };
@@ -153,10 +188,23 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     onerror: ((event: Event) => void) | null = null;
     onopen: ((event: Event) => void) | null = null;
     private readonly listeners = new Map<string, Set<(event: MessageEvent<string>) => void>>();
+    private readonly instanceId: number;
 
     constructor(url: string) {
-      void url;
+      eventSourceOpenCount += 1;
+      this.instanceId = eventSourceOpenCount;
+      latestEventSource = this; // eslint-disable-line @typescript-eslint/no-this-alias
+      record('EventSourceOpens', eventSourceOpenCount);
+      record('EventSourceLastInstance', this.instanceId);
+      record('EventSourceLastUrl', url);
       queueMicrotask(() => this.onopen?.(new Event('open')));
+    }
+
+    triggerNativeError(): void {
+      this.readyState = FixtureEventSource.CONNECTING;
+      const event = new MessageEvent<string>('error', { data: '' });
+      this.onerror?.(event);
+      for (const listener of this.listeners.get('error') ?? []) listener(event);
     }
 
     addEventListener(type: string, listener: EventListenerOrEventListenerObject): void {
@@ -166,6 +214,10 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
       this.listeners.set(type, listeners);
       if (type === 'init') {
         queueMicrotask(() => {
+          if (this.readyState === FixtureEventSource.CLOSED) return;
+          eventSourceInitCount += 1;
+          record('EventSourceInits', eventSourceInitCount);
+          record('EventSourceLastInitializedInstance', this.instanceId);
           const init = {
             sequence_id: 1,
             conversation,
@@ -175,7 +227,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
             steering_messages: [],
             agent_working: false,
             last_sequence_id: 1,
-            stream_incarnation: 'fixture-stream',
+            stream_incarnation: `fixture-stream-${this.instanceId}`,
             presentation_mode: 'idle',
             context_window_size: 128_000,
             project_name: null,
@@ -195,8 +247,11 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     close(): void { this.readyState = FixtureEventSource.CLOSED; }
   }
   globalThis.EventSource = FixtureEventSource as unknown as typeof EventSource;
+  const failLatestEventSource = () => latestEventSource?.triggerNativeError();
+  window.addEventListener('product-conversation-fixture-stream-failure', failLatestEventSource);
 
   return () => {
+    window.removeEventListener('product-conversation-fixture-stream-failure', failLatestEventSource);
     api.getPrStatus = originalGetPrStatus;
     api.getProductConversationSnapshot = originalGetProductConversationSnapshot;
     api.getChain = originalGetChain;
@@ -212,8 +267,12 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     api.getSystemPrompt = originalGetSystemPrompt;
     api.getWorkScopeInventory = originalGetWorkScopeInventory;
     api.listForkProposals = originalListForkProposals;
+    api.reconcileAcceptedMessages = originalReconcileAcceptedMessages;
     globalThis.fetch = originalFetch;
     globalThis.WebSocket = OriginalWebSocket;
+    for (const key of Object.keys(document.documentElement.dataset)) {
+      if (key.startsWith('productConversationFixture')) delete document.documentElement.dataset[key];
+    }
     globalThis.EventSource = OriginalEventSource;
   };
 }

@@ -32,3 +32,4 @@ scripts/install.sh
 # Local QA screenshots — generated on demand, not committed
 ui/qa-artifacts/
 qa-artifacts/
+ui/.artifacts/

@@ -11,7 +11,7 @@ export interface AnnotatableBlockProps {
   as?: React.ElementType;
   lineNumber: number;
   lineContent: string;
-  onAnnotate: (lineNumber: number, lineContent: string) => void;
+  onAnnotate?: ((lineNumber: number, lineContent: string) => void) | undefined;
   isModified?: boolean;
   isHighlighted?: boolean;
   lineRef?: (el: HTMLElement | null) => void;
@@ -33,7 +33,10 @@ export function AnnotatableBlock({
   ...rest
 }: AnnotatableBlockProps) {
   const lp = useLongPress<{ lineNumber: number; lineContent: string }>(
-    ({ lineNumber: ln, lineContent: lc }) => onAnnotate(ln, lc),
+    ({ lineNumber: ln, lineContent: lc }) => onAnnotate?.(ln, lc),
+    500,
+    10,
+    Boolean(onAnnotate),
   );
   const cls = [
     'annotatable',
@@ -57,17 +60,19 @@ export function AnnotatableBlock({
       {...rest}
     >
       {children}
-      <button
-        className="annotatable__btn"
-        onClick={(e: React.MouseEvent) => {
-          e.stopPropagation();
-          onAnnotate(lineNumber, lineContent);
-        }}
-        aria-label={`Add note to line ${lineNumber}`}
-        title="Add note"
-      >
-        <MessageSquarePlus size={14} />
-      </button>
+      {onAnnotate && (
+        <button
+          className="annotatable__btn"
+          onClick={(e: React.MouseEvent) => {
+            e.stopPropagation();
+            onAnnotate(lineNumber, lineContent);
+          }}
+          aria-label={`Add note to line ${lineNumber}`}
+          title="Add note"
+        >
+          <MessageSquarePlus size={14} />
+        </button>
+      )}
     </Tag>
   );
 }
@@ -81,7 +86,7 @@ export interface ViewerBodyProps {
   content: string;
   modifiedLines: Set<number>;
   highlightedLine: number | null;
-  onAnnotate: (lineNumber: number, lineContent: string) => void;
+  onAnnotate?: ((lineNumber: number, lineContent: string) => void) | undefined;
   registerLineRef: (lineNumber: number, el: HTMLElement | null) => void;
   findQuery?: string | undefined;
   activeFindOccurrence?: number | null | undefined;

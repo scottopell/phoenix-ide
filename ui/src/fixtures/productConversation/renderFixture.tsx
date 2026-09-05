@@ -41,8 +41,11 @@ function ProductConversationFixtureBody({ scenario }: Props) {
 
   useEffect(() => {
     const previousTheme = document.documentElement.getAttribute('data-theme');
-    document.documentElement.dataset['theme'] = 'dark';
+    const theme = new URLSearchParams(window.location.search).get('fixtureTheme') === 'light' ? 'light' : 'dark';
+    document.documentElement.dataset['theme'] = theme;
+    document.documentElement.dataset['productConversationFixtureTheme'] = theme;
     return () => {
+      delete document.documentElement.dataset['productConversationFixtureTheme'];
       if (previousTheme === null) document.documentElement.removeAttribute('data-theme');
       else document.documentElement.dataset['theme'] = previousTheme;
     };
@@ -70,13 +73,15 @@ function ProductConversationFixtureBody({ scenario }: Props) {
     };
   }, [scenario]);
 
+  const fixtureHash = new URLSearchParams(window.location.search).get('fixtureHash') ?? '';
+
   return (
     <main
       ref={rootRef}
       data-product-conversation-fixture={scenario.id}
       {...(ready ? { 'data-product-conversation-fixture-ready': scenario.id } : {})}
     >
-      <MemoryRouter initialEntries={['/product-conversations/fixture-product-conversation']}>
+      <MemoryRouter initialEntries={[`/product-conversations/fixture-product-conversation${fixtureHash}`]}>
         <ConversationProvider>
           <ConversationReadinessProvider>
             <ChainProvider>

@@ -189,6 +189,7 @@ export interface EmbeddedConversationProjection {
   onRetryPending: (localId: string) => void;
   onCancelSteering: (localId: string) => void;
   onOpenFile: (filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void;
+  appendReviewNotesToComposer?: ((formattedNotes: string) => void) | undefined;
   filePathRootDir: string;
   systemPrompt?: string | undefined;
   modelContextWindow?: number | undefined;
@@ -1772,9 +1773,14 @@ function ConversationPageContent({
     && convStateForChildren.type !== 'creation_failed'
     && convStateForChildren.type !== 'creation_cancelled'
     && convStateForChildren.type !== 'context_exhausted'
+    && convStateForChildren.type !== 'awaiting_user_response'
     && convStateForChildren.type !== 'awaiting_task_approval'
     && convStateForChildren.type !== 'handed_off'
     && convStateForChildren.type !== 'terminal';
+  const writableComposerMounted = mutationEnabled
+    && ordinaryComposerEligible
+    && (convStateForChildren.type !== 'error'
+      || (convStateForChildren.error?.can_user_resume ?? false));
 
   useEffect(() => {
     if (!onProjectionChange) return;
@@ -1790,6 +1796,9 @@ function ConversationPageContent({
       onRetryPending: handleRetry,
       onCancelSteering: handleCancelSteering,
       onOpenFile: handleOpenFileFromPatch,
+      ...(writableComposerMounted
+        ? { appendReviewNotesToComposer: handleSendFocusedNotes }
+        : {}),
       filePathRootDir: conversation?.worktree_path ?? conversation?.cwd ?? '/',
       systemPrompt: atom.systemPrompt ?? undefined,
       ...(actualModelContextWindow ? { modelContextWindow: actualModelContextWindow } : {}),
@@ -1810,6 +1819,8 @@ function ConversationPageContent({
     serverArchived,
     handleCancelSteering,
     handleOpenFileFromPatch,
+    handleSendFocusedNotes,
+    writableComposerMounted,
     conversation?.worktree_path,
     conversation?.cwd,
     atom.systemPrompt,
@@ -1882,7 +1893,7 @@ function ConversationPageContent({
   const browserViewerOpen = !isArchived && browserOpen;
   const inspectViewerOpen = !isArchived && inspectOpen;
   const canOpenMessageSidepanel = !isArchived && !isTerminalConversationState(convStateForChildren);
-  const messageViewerOpen = canOpenMessageSidepanel && messageOpen;
+  const messageViewerOpen = !suppressMessageViewerOwner && canOpenMessageSidepanel && messageOpen;
   const stateBarContinuation = useMemo(
     () => !isArchived && convStateForChildren.type === 'idle'
       ? { phase: 'idle' as const, onTrigger: handleTriggerContinuation }
@@ -2771,7 +2782,9 @@ function ConversationPageContent({
             sequenceId={messageSlot.sequenceId}
             messages={viewableMessages}
             onClose={handleCloseMessageViewer}
-            onSendNotes={isWideDesktop && messageSlot.presentation === 'fullscreen' ? handleSendFocusedNotes : handleSendNotes}
+            onSendNotes={writableComposerMounted
+              ? (isWideDesktop && messageSlot.presentation === 'fullscreen' ? handleSendFocusedNotes : handleSendNotes)
+              : undefined}
             presentation={messageSlot.presentation}
             canTogglePresentation={isWideDesktop}
             onPresentationChange={viewerSlot.setPresentation}
@@ -2858,7 +2871,9 @@ function ConversationPageContent({
                   sequenceId={messageSlot.sequenceId}
                   messages={viewableMessages}
                   onClose={handleCloseMessageViewer}
-                  onSendNotes={isWideDesktop && messageSlot.presentation === 'fullscreen' ? handleSendFocusedNotes : handleSendNotes}
+                  onSendNotes={writableComposerMounted
+                    ? (isWideDesktop && messageSlot.presentation === 'fullscreen' ? handleSendFocusedNotes : handleSendNotes)
+                    : undefined}
                   presentation={messageSlot.presentation}
                   canTogglePresentation
                   onPresentationChange={viewerSlot.setPresentation}

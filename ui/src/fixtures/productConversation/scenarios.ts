@@ -102,45 +102,6 @@ function makeSnapshot(overrides: Partial<ProductConversationSnapshotView> = {}):
   };
 }
 
-function makeChain(rootConvId = 'chain-root-product-alpha'): ChainView {
-  return {
-    root_conv_id: rootConvId,
-    chain_name: null,
-    display_name: 'Product Alpha',
-    archived: false,
-    members: [],
-    qa_history: [
-      {
-        id: 'fixture-recall-completed',
-        root_conv_id: rootConvId,
-        question: 'Which invariants carried across the whole conversation?',
-        answer: 'The lineage kept one chronological transcript, source provenance, and a single ordinary composer on the latest row.',
-        model: 'fixture-model',
-        status: 'completed',
-        chain_members_at_answer: 2,
-        chain_messages_at_answer: 4,
-        created_at: isoAgo(28),
-        completed_at: isoAgo(27),
-      },
-      {
-        id: 'fixture-recall-failed',
-        root_conv_id: rootConvId,
-        question: 'Did the first visual experiment survive?',
-        answer: 'The experiment showed that a full-height diagnostics column',
-        model: 'fixture-model',
-        status: 'failed',
-        chain_members_at_answer: 3,
-        chain_messages_at_answer: 6,
-        created_at: isoAgo(18),
-        completed_at: isoAgo(17),
-      },
-    ],
-    current_member_count: 3,
-    current_total_messages: 6,
-    work_identity: null,
-  };
-}
-
 function makeLongSnapshot(): ProductConversationSnapshotView {
   let sequenceId = 1;
   const segments = Array.from({ length: 4 }, (_, segmentIndex) => {
@@ -180,6 +141,68 @@ function makeLongSnapshot(): ProductConversationSnapshotView {
     source: null,
     chain_qa_compatibility: null,
     segments,
+    has_older: true,
+    before: 'fixture-older-cursor',
+  });
+}
+
+function makeChain(rootConvId = 'chain-root-product-alpha'): ChainView {
+  return {
+    root_conv_id: rootConvId,
+    chain_name: null,
+    display_name: 'Product Alpha',
+    archived: false,
+    members: [],
+    qa_history: [
+      {
+        id: 'fixture-recall-completed',
+        root_conv_id: rootConvId,
+        question: 'Which invariants carried across the whole conversation?',
+        answer: 'The lineage kept one chronological transcript, source provenance, and a single ordinary composer on the latest row.',
+        model: 'fixture-model',
+        status: 'completed',
+        chain_members_at_answer: 2,
+        chain_messages_at_answer: 4,
+        created_at: isoAgo(28),
+        completed_at: isoAgo(27),
+      },
+      {
+        id: 'fixture-recall-failed',
+        root_conv_id: rootConvId,
+        question: 'Did the first visual experiment survive?',
+        answer: 'The experiment showed that a full-height diagnostics column',
+        model: 'fixture-model',
+        status: 'failed',
+        chain_members_at_answer: 3,
+        chain_messages_at_answer: 6,
+        created_at: isoAgo(18),
+        completed_at: isoAgo(17),
+      },
+    ],
+    current_member_count: 3,
+    current_total_messages: 6,
+    work_identity: null,
+  };
+}
+
+function makeOlderPage(): ProductConversationSnapshotView {
+  return makeSnapshot({
+    product_conversation_id: 'pc-long-history',
+    canonical_route: '/product-conversations/pc-long-history',
+    requested_transcript_row_id: 'row-long-4',
+    latest_transcript_row_id: 'row-long-4',
+    writable_transcript_row_id: 'row-long-4',
+    canonical_root: { transcript_row_id: 'row-long-0', slug: 'long-older-root', title: 'Long older root' },
+    presentation: { kind: 'state', display_name: 'Long fixture conversation', presentation_mode: 'idle' },
+    work_identity: null,
+    source: null,
+    chain_qa_compatibility: null,
+    segments: [
+      segment(0, 'row-long-0', 'Earlier discovery', [
+        textMessage('long-older-target', 0, 'user', 'Older deep-link target from the real cursor page.'),
+        textMessage('long-older-response', 0, 'agent', 'The older segment is merged through the page cursor path.'),
+      ], 'A historical handoff boundary survives pagination.'),
+    ],
     has_older: false,
     before: null,
   });
@@ -242,11 +265,17 @@ export const productConversationScenarios = [
   },
   {
     ...productConversationScenarioDefinitions[4],
+    initialSnapshotFailures: 1,
     snapshotError: 'Fixture failed to fetch product conversation snapshot',
+    snapshot: makeSnapshot({
+      presentation: { kind: 'state', display_name: 'Recovered fixture conversation', presentation_mode: 'idle' },
+      writable_transcript_row_id: 'row-work',
+    }),
   },
   {
     ...productConversationScenarioDefinitions[5],
     snapshot: makeLongSnapshot(),
+    olderSnapshot: makeOlderPage(),
   },
 ] as const satisfies readonly ProductConversationScenario[];
 

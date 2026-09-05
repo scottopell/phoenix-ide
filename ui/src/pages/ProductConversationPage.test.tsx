@@ -329,6 +329,7 @@ function emitLatestProjection(overrides: Partial<Record<string, unknown>> = {}) 
     onRetryPending: vi.fn(),
     onCancelSteering: vi.fn(),
     onOpenFile: vi.fn(),
+    appendReviewNotesToComposer: vi.fn(),
     filePathRootDir: '/tmp/latest-root',
     systemPrompt: 'Preserve this system prompt',
     ...overrides,
@@ -768,6 +769,69 @@ describe('ProductConversationPage', () => {
     expect(screen.getByTestId('aggregate-message-viewer').parentElement).not.toHaveClass('product-conversation-page__viewer-pane');
   });
 
+  it('routes aggregate viewer notes to the embedded latest-row composer capability', async () => {
+    const appendReviewNotesToComposer = vi.fn();
+    renderPage('/product-conversations/pc-1?viewer=message&presentation=pane&message=3&message_id=m-3');
+    await waitForPageReady();
+
+    act(() => emitLatestProjection({ appendReviewNotesToComposer }));
+    const viewerProps = viewerSpy.mock.lastCall?.[0] as Record<string, unknown> | undefined;
+    const onSendNotes = viewerProps?.['onSendNotes'] as ((notes: string) => void) | undefined;
+    expect(onSendNotes).toBeTypeOf('function');
+
+    act(() => onSendNotes?.('## Review notes\n\nunique aggregate note'));
+    expect(appendReviewNotesToComposer).toHaveBeenCalledWith('## Review notes\n\nunique aggregate note');
+    await waitFor(() => expect(screen.queryByTestId('aggregate-message-viewer')).not.toBeInTheDocument());
+  });
+
+  it('keeps fullscreen aggregate review open so successful notes can return to its pane', async () => {
+    const appendReviewNotesToComposer = vi.fn();
+    renderPage('/product-conversations/pc-1?viewer=message&presentation=fullscreen&message=3&message_id=m-3');
+    await waitForPageReady();
+
+    act(() => emitLatestProjection({ appendReviewNotesToComposer }));
+    const viewerProps = viewerSpy.mock.lastCall?.[0] as Record<string, unknown> | undefined;
+    const onSendNotes = viewerProps?.['onSendNotes'] as ((notes: string) => void) | undefined;
+    act(() => onSendNotes?.('## Review notes\n\nfocused aggregate note'));
+
+    expect(appendReviewNotesToComposer).toHaveBeenCalledWith('## Review notes\n\nfocused aggregate note');
+    expect(screen.getByTestId('aggregate-message-viewer')).toBeInTheDocument();
+  });
+
+  it('does not expose note sending while the latest row shows a question-only response panel', async () => {
+    renderPage('/product-conversations/pc-1?viewer=message&presentation=pane&message=3&message_id=m-3');
+    await waitForPageReady();
+    act(() => emitLatestProjection({
+      convState: {
+        type: 'awaiting_user_response',
+        questions: [{
+          question: 'Choose a direction',
+          header: 'Direction',
+          options: [{ label: 'A', description: 'First' }, { label: 'B', description: 'Second' }],
+          multiSelect: false,
+        }],
+        answers: [],
+      },
+      appendReviewNotesToComposer: undefined,
+    }));
+
+    const viewerProps = viewerSpy.mock.lastCall?.[0] as Record<string, unknown> | undefined;
+    expect(viewerProps?.['onSendNotes']).toBeUndefined();
+  });
+
+  it('does not expose note sending when History has no composer capability', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValueOnce(makeSnapshot({
+      ordinary_lifecycle: 'history',
+      writable_transcript_row_id: null,
+    }));
+    renderPage('/product-conversations/pc-1?viewer=message&presentation=pane&message=3&message_id=m-3');
+    await waitForPageReady();
+
+    const viewerProps = viewerSpy.mock.lastCall?.[0] as Record<string, unknown> | undefined;
+    expect(viewerProps?.['onSendNotes']).toBeUndefined();
+  });
+
   it('shows first-task onboarding after aggregate approval returns first_task', async () => {
     const { api } = await import('../api');
     vi.mocked(api.approveTask).mockResolvedValueOnce({ success: true, first_task: true });
@@ -901,6 +965,27 @@ describe('ProductConversationPage', () => {
     await waitForPageReady();
 
     expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.['mutationEnabled']).toBe(false);
+  });
+
+  it('does not expose aggregate note sending while Close makes the composer read-only', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValueOnce(makeSnapshot({
+      close: {
+        attempt_id: 'close-active',
+        phase: 'settling_active_work',
+        confirmation_snapshot: null,
+        inspections: [],
+        losses: [],
+        residuals: [],
+      },
+    }));
+
+    renderPage('/product-conversations/pc-1?viewer=message&presentation=pane&message=3&message_id=m-3');
+    await waitForPageReady();
+    act(() => emitLatestProjection({ appendReviewNotesToComposer: undefined }));
+
+    const viewerProps = viewerSpy.mock.lastCall?.[0] as Record<string, unknown> | undefined;
+    expect(viewerProps?.['onSendNotes']).toBeUndefined();
   });
 
   it('background-refreshes active Close phases without replacing the page with a skeleton', async () => {

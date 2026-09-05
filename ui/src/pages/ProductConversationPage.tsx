@@ -721,6 +721,13 @@ function ProductConversationPageInner() {
   const aggregateMessageSlot = viewerSlot.slot.kind === 'message' ? viewerSlot.slot : null;
   const isWideDesktop = useIsWideDesktop();
   const showSplitPaneViewer = isWideDesktop && aggregateMessageSlot?.presentation === 'pane';
+  const closeAggregateMessageViewer = viewerSlot.close;
+  const appendAggregateReviewNotes = useCallback((formattedNotes: string) => {
+    latestProjection?.appendReviewNotesToComposer?.(formattedNotes);
+    if (!(isWideDesktop && aggregateMessageSlot?.presentation === 'fullscreen')) {
+      closeAggregateMessageViewer();
+    }
+  }, [aggregateMessageSlot?.presentation, closeAggregateMessageViewer, isWideDesktop, latestProjection]);
   ownedSnapshotRef.current = ownedSnapshot;
 
   useEffect(() => {
@@ -1027,8 +1034,10 @@ function ProductConversationPageInner() {
                 messageId={aggregateMessageSlot.messageId}
                 occurrenceToken={aggregateMessageSlot.occurrenceToken}
                 messages={aggregateMessages}
-                onClose={viewerSlot.close}
-                onSendNotes={() => {}}
+                onClose={closeAggregateMessageViewer}
+                onSendNotes={liveControlsEnabled && latestProjection?.appendReviewNotesToComposer
+                  ? appendAggregateReviewNotes
+                  : undefined}
                 presentation={aggregateMessageSlot.presentation}
                 canTogglePresentation={isWideDesktop}
                 onPresentationChange={viewerSlot.setPresentation}

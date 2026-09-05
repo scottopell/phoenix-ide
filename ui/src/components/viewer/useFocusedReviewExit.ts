@@ -4,12 +4,14 @@ export type FocusedReviewExitTarget = 'pane' | 'closed';
 
 export function useFocusedReviewExit({
   noteCount,
+  unsavedDraft = false,
   send,
   discard,
   returnToPane,
   closeViewer,
 }: {
   noteCount: number;
+  unsavedDraft?: boolean | undefined;
   send: () => Promise<void>;
   discard: () => void;
   returnToPane: () => void;
@@ -21,13 +23,13 @@ export function useFocusedReviewExit({
 
   const requestExit = useCallback((target: FocusedReviewExitTarget) => {
     setError(null);
-    if (noteCount > 0) {
+    if (noteCount > 0 || unsavedDraft) {
       setExitTarget(target);
       return;
     }
     if (target === 'pane') returnToPane();
     else closeViewer();
-  }, [closeViewer, noteCount, returnToPane]);
+  }, [closeViewer, noteCount, returnToPane, unsavedDraft]);
 
   const requestReturn = useCallback(() => requestExit('pane'), [requestExit]);
   const requestClose = useCallback(() => requestExit('closed'), [requestExit]);

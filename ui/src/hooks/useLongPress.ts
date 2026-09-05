@@ -17,6 +17,7 @@ export function useLongPress<T>(
   onLongPress: (payload: T, event: React.TouchEvent | React.MouseEvent) => void,
   thresholdMs = 500,
   movementThresholdPx = 10,
+  enabled = true,
 ) {
   const timerRef = useRef<number | null>(null);
   const startPosRef = useRef<{ x: number; y: number } | null>(null);
@@ -31,6 +32,7 @@ export function useLongPress<T>(
 
   const start = useCallback(
     (e: React.TouchEvent | React.MouseEvent, payload: T) => {
+      if (!enabled) return;
       // Clear any previous pending timer before scheduling a new one. A
       // stray prior `start` (e.g. multi-touch, browser-synthesised
       // mousedown after touchstart) would otherwise leave its timer
@@ -49,7 +51,7 @@ export function useLongPress<T>(
         cancel();
       }, thresholdMs);
     },
-    [onLongPress, thresholdMs, cancel],
+    [cancel, enabled, onLongPress, thresholdMs],
   );
 
   const move = useCallback(
@@ -65,6 +67,10 @@ export function useLongPress<T>(
     },
     [movementThresholdPx, cancel],
   );
+
+  useEffect(() => {
+    if (!enabled) cancel();
+  }, [cancel, enabled]);
 
   // Clear any pending timer on unmount. Without this, a viewer that
   // closes mid-press would fire `onLongPress` against unmounted state

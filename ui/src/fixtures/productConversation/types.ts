@@ -52,6 +52,10 @@ export interface ProductConversationScenario {
   viewport: 'desktop' | 'mobile';
   state: 'ready' | 'loading' | 'error';
   snapshot?: ProductConversationSnapshotView;
+  /** A real cursor page returned only when the page requests snapshot.before. */
+  olderSnapshot?: ProductConversationSnapshotView;
+  /** Initial requests fail this many times, allowing the real Retry control to recover. */
+  initialSnapshotFailures?: number;
   chain?: ChainView;
   snapshotError?: string;
 }

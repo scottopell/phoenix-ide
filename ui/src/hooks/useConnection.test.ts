@@ -625,6 +625,48 @@ describe('useConnection epoch stamping (task 08683)', () => {
     expect((opens[2] as { epoch: number }).epoch).toBe(3);
   });
 
+  it('replaces a failed stream and requires the replacement init to complete reconnect', () => {
+    vi.useFakeTimers();
+    try {
+      const captured: SSEAction[] = [];
+      const onValidatedInit = vi.fn();
+      const { result } = renderHook(() => useConnection({
+        conversationId: 'conv-A',
+        dispatch: (action) => captured.push(action),
+        getLastAppliedEventSeq: () => 42,
+        getTranscriptGeneration: () => 7,
+        onValidatedInit,
+      }));
+      const initial = FakeEventSource.instances[0]!;
+      act(() => initial.emit('init', makeInitPayload('conv-A', 'slug-A')));
+      expect(result.current.state).toBe('connected');
+
+      act(() => initial.emit('error', ''));
+      expect(initial.closed).toBe(true);
+      expect(result.current.state).toBe('reconnecting');
+
+      act(() => vi.advanceTimersByTime(1000));
+      expect(FakeEventSource.instances).toHaveLength(2);
+      const replacement = FakeEventSource.instances[1]!;
+      expect(replacement).not.toBe(initial);
+      expect(replacement.url).toMatch(/after_event_sequence=42/);
+      expect(replacement.url).toMatch(/transcript_generation=7/);
+      expect(result.current.state).toBe('reconnecting');
+
+      act(() => replacement.emit('init', {
+        ...makeInitPayload('conv-A', 'slug-A'),
+        transcript_generation: 7,
+        last_sequence_id: 42,
+        stream_incarnation: 'replacement-stream',
+      }));
+      expect(result.current.state).toBe('reconnected');
+      expect(onValidatedInit).toHaveBeenCalledTimes(2);
+      expect(captured.filter((action) => action.type === 'sse_init')).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('does not schedule duplicate retry timers under StrictMode (regression: setTimeout-in-functional-updater)', async () => {
     // The pre-08683 implementation called `setTimeout(executeEffects, 0)`
     // *inside* setMachineState's functional updater. StrictMode invokes
