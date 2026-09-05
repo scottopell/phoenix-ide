@@ -963,7 +963,7 @@ final class AppModelProductConversationTests: XCTestCase {
             return XCTFail("expected aggregate destination")
         }
         XCTAssertEqual(aggregateId, "pc-1")
-        XCTAssertEqual(initialTranscriptRowId, "row-2")
+        XCTAssertEqual(initialTranscriptRowId, "row-1")
         guard case .aggregate = model.navigationDestination(for: aggregate) else {
             return XCTFail("offline selection must remain on aggregate detail")
         }
@@ -2344,6 +2344,15 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertEqual(model.listStore.aggregateId(forTranscriptRowId: "row-1"), "pc-old")
     }
 
+    func testCloseAvailabilityRequiresKnownProductConversationCardinality() {
+        let model = makeModel()
+        let legacy = conversation(id: "legacy", aggregateId: nil)
+        XCTAssertEqual(
+            model.closeUnavailableExplanation(for: legacy),
+            "Close is unavailable until conversation type is confirmed.")
+
+    }
+
     func testArchiveBlocksWhenPredecessorMemberHasVisibleOutbox() async {
         let store = MutableTestConversationPersistenceStore(
             owners: ["row-old", "row-latest"],
@@ -2408,11 +2417,13 @@ final class AppModelProductConversationTests: XCTestCase {
         let model = makeModel(conversationPersistenceStore: store)
         model.replaceAPIForTesting(api)
         model.connectivity.setOnlineForTesting(true)
-        model.listStore.upsert(conversation(id: "row-1", aggregateId: "pc-1"))
+        let knownSingleSegment = conversation(id: "row-1", aggregateId: "pc-1")
+        model.listStore.upsert(knownSingleSegment)
         model.productConversationDetailModel(
             for: "pc-1",
             initialTranscriptRowId: "row-1"
         ).applyForTesting(testSingleSegmentProductConversationSnapshot())
+        XCTAssertNil(model.closeUnavailableExplanation(for: knownSingleSegment))
 
         let archived = await model.archive(conversationId: "row-1")
 
