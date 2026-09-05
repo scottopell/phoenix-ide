@@ -52,6 +52,12 @@ struct UserDefaultsCoordinatorIdentityStore: CoordinatorIdentityStore {
     }
 }
 
+struct PersistedHardDeleteFence: Codable, Equatable, Sendable {
+    let configurationIdentity: APIConfigurationIdentity
+    let aggregateAuthority: String
+    let memberConversationIds: [String]
+}
+
 @MainActor
 protocol ConversationPersistenceStore {
     var listPersistenceContext: VersionedDiskContext? { get }
@@ -81,8 +87,11 @@ protocol ConversationPersistenceStore {
         conversationId: String,
         configurationIdentity: APIConfigurationIdentity,
         aggregateAuthority: String
-    ) async
+    ) async -> Bool
     func removeAllPersistedConversationState() async
+    func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool
+    func hardDeleteFences(configurationIdentity: APIConfigurationIdentity) -> [PersistedHardDeleteFence]
+    func retireHardDeleteFence(aggregateAuthority: String) async
 }
 
 @MainActor
@@ -178,6 +187,7 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
             source: source,
             version: ConversationSession.snapshotSchemaVersion),
             snapshot.conversation?.id == conversationId,
+            snapshot.conversation?.aggregateIdentity == aggregateAuthority,
             snapshot.syncedAt != nil,
             snapshot.authoritative?.configurationIdentity == configurationIdentity,
             snapshot.authoritative?.aggregateAuthority == aggregateAuthority
@@ -233,7 +243,7 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
         aggregateId: String,
         scope: PersistenceScopeIdentity
     ) -> Set<String> {
-        Set(DiskStore.names(in: directory, withPrefix: "conv-").compactMap { name -> String? in
+        let snapshotIds = Set(DiskStore.names(in: directory, withPrefix: "conv-").compactMap { name -> String? in
             guard name.hasPrefix("conv-") else { return nil }
             let conversationId = String(name.dropFirst("conv-".count))
             let source = directory.appendingPathComponent(name).appendingPathExtension("json")
@@ -252,6 +262,21 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
             else { return nil }
             return conversationId
         })
+        let outboxIds = Set(DiskStore.names(in: directory, withPrefix: "outbox-").compactMap { name -> String? in
+            guard name.hasPrefix("outbox-") else { return nil }
+            let conversationId = String(name.dropFirst("outbox-".count))
+            let source = directory.appendingPathComponent(name).appendingPathExtension("json")
+            guard case .value(let envelope) = DiskStore.loadVersionedResult(
+                PersistedOutboxEnvelope.self,
+                source: source,
+                version: Outbox.schemaVersion),
+                envelope.scope == scope,
+                envelope.aggregateAuthority == aggregateId,
+                envelope.entries.contains(where: { $0.conversationId == conversationId && $0.isVisible })
+            else { return nil }
+            return conversationId
+        })
+        return snapshotIds.union(outboxIds)
     }
 
     func resetConversationListCache() async {
@@ -272,45 +297,122 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
         conversationId: String,
         configurationIdentity: APIConfigurationIdentity,
         aggregateAuthority: String
-    ) async {
+    ) async -> Bool {
         let snapshotSource = directory.appendingPathComponent("conv-\(conversationId)").appendingPathExtension("json")
-        if hasAuthoritativeCachedSnapshot(
-            conversationId: conversationId,
-            configurationIdentity: configurationIdentity,
-            aggregateAuthority: aggregateAuthority)
+        switch DiskStore.loadVersionedResult(
+            ConversationSession.PersistedSnapshot.self,
+            source: snapshotSource,
+            version: ConversationSession.snapshotSchemaVersion)
         {
-            let writer = context.writer(
-                destinationURL: snapshotSource,
-                version: ConversationSession.snapshotSchemaVersion)
-            await writer.remove(revision: writer.reserveRevision())
+        case .missing:
+            break
+        case .value(let snapshot):
+            if snapshot.conversation?.id == conversationId,
+               snapshot.authoritative?.configurationIdentity == configurationIdentity,
+               snapshot.authoritative?.aggregateAuthority == aggregateAuthority
+            {
+                let writer = context.writer(destinationURL: snapshotSource, version: ConversationSession.snapshotSchemaVersion)
+                await writer.remove(revision: writer.reserveRevision())
+            }
+        case .incompatible, .unreadable:
+            return false
         }
 
         let outboxSource = directory.appendingPathComponent("outbox-\(conversationId)").appendingPathExtension("json")
-        if case .value(let envelope) = DiskStore.loadVersionedResult(
+        switch DiskStore.loadVersionedResult(
             PersistedOutboxEnvelope.self,
             source: outboxSource,
-            version: Outbox.schemaVersion),
-            envelope.scope == configurationIdentity.persistenceScope,
-            envelope.aggregateAuthority == aggregateAuthority
+            version: Outbox.schemaVersion)
         {
-            let writer = context.writer(destinationURL: outboxSource, version: Outbox.schemaVersion)
-            await writer.remove(revision: writer.reserveRevision())
+        case .missing:
+            break
+        case .value(let envelope):
+            if envelope.scope == configurationIdentity.persistenceScope,
+               envelope.aggregateAuthority == aggregateAuthority
+            {
+                let writer = context.writer(destinationURL: outboxSource, version: Outbox.schemaVersion)
+                await writer.remove(revision: writer.reserveRevision())
+            }
+        case .incompatible, .unreadable:
+            return false
+        }
+
+        let snapshotResolved: Bool
+        switch DiskStore.loadVersionedResult(
+            ConversationSession.PersistedSnapshot.self,
+            source: snapshotSource,
+            version: ConversationSession.snapshotSchemaVersion)
+        {
+        case .missing: snapshotResolved = true
+        case .value(let snapshot):
+            snapshotResolved = snapshot.authoritative?.configurationIdentity != configurationIdentity
+                || snapshot.authoritative?.aggregateAuthority != aggregateAuthority
+        case .incompatible, .unreadable: snapshotResolved = false
+        }
+        let outboxResolved: Bool
+        switch DiskStore.loadVersionedResult(
+            PersistedOutboxEnvelope.self,
+            source: outboxSource,
+            version: Outbox.schemaVersion)
+        {
+        case .missing: outboxResolved = true
+        case .value(let envelope):
+            outboxResolved = envelope.scope != configurationIdentity.persistenceScope
+                || envelope.aggregateAuthority != aggregateAuthority
+        case .incompatible, .unreadable: outboxResolved = false
+        }
+        return snapshotResolved && outboxResolved
+    }
+
+    func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool {
+        let source = directory
+            .appendingPathComponent("hard-delete-\(fence.aggregateAuthority)")
+            .appendingPathExtension("json")
+        let writer = context.writer(destinationURL: source, version: 1)
+        return await writer.save(fence, revision: writer.reserveRevision())
+    }
+
+    func hardDeleteFences(configurationIdentity: APIConfigurationIdentity) -> [PersistedHardDeleteFence] {
+        DiskStore.names(in: directory, withPrefix: "hard-delete-").compactMap { name in
+            let source = directory.appendingPathComponent(name).appendingPathExtension("json")
+            guard case .value(let fence) = DiskStore.loadVersionedResult(
+                PersistedHardDeleteFence.self,
+                source: source,
+                version: 1),
+                fence.configurationIdentity == configurationIdentity
+            else { return nil }
+            return fence
         }
     }
 
+    func retireHardDeleteFence(aggregateAuthority: String) async {
+        let source = directory.appendingPathComponent("hard-delete-\(aggregateAuthority)").appendingPathExtension("json")
+        let writer = context.writer(destinationURL: source, version: 1)
+        await writer.remove(revision: writer.reserveRevision())
+    }
+
     func removeAllPersistedConversationState() async {
+        let fenceSources = DiskStore.names(in: directory, withPrefix: "hard-delete-")
+            .map { directory.appendingPathComponent($0).appendingPathExtension("json") }
         let snapshotSources = DiskStore.names(in: directory, withPrefix: "conv-")
             .map { directory.appendingPathComponent($0).appendingPathExtension("json") }
         let outboxSources = DiskStore.names(in: directory, withPrefix: "outbox-")
             .map { directory.appendingPathComponent($0).appendingPathExtension("json") }
+        let fenceWriters = fenceSources.map {
+            context.writer(destinationURL: $0, version: 1)
+        }
         let snapshotWriters = snapshotSources.map {
             context.writer(destinationURL: $0, version: ConversationSession.snapshotSchemaVersion)
         }
         let outboxWriters = outboxSources.map {
             context.writer(destinationURL: $0, version: Outbox.schemaVersion)
         }
+        let fenceRemovals = zip(fenceWriters, fenceWriters.map { $0.reserveRevision() })
         let snapshotRemovals = zip(snapshotWriters, snapshotWriters.map { $0.reserveRevision() })
         let outboxRemovals = zip(outboxWriters, outboxWriters.map { $0.reserveRevision() })
+        for (writer, revision) in fenceRemovals {
+            await writer.remove(revision: revision)
+        }
         for (writer, revision) in snapshotRemovals {
             await writer.remove(revision: revision)
         }
@@ -409,6 +511,7 @@ final class AppModel {
     private let credentialStore: CredentialStore
     private var persistedOutboxHydrated = false
     private var startupDrainGeneration = 0
+    private var startupHardDeleteRecoveryTask: Task<Void, Never>?
     private var lastCompletedDrainGeneration = 0
     private var persistedOutboxDrainTask: Task<Void, Never>?
     private var persistedOutboxDrainTaskGeneration: Int?
@@ -482,8 +585,40 @@ final class AppModel {
     }
 
     private func finishStartupHydration() {
-        persistedOutboxHydrated = true
-        schedulePersistedOutboxDrain()
+        guard let api else { return }
+        let identity = api.configurationIdentity
+        let fences = conversationPersistenceStore.hardDeleteFences(
+            configurationIdentity: identity)
+        hardDeletedConversationIds.formUnion(fences.flatMap(\.memberConversationIds))
+        guard !fences.isEmpty else {
+            persistedOutboxHydrated = true
+            schedulePersistedOutboxDrain()
+            return
+        }
+        startupHardDeleteRecoveryTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            for fence in fences {
+                await self.completePersistedHardDeleteFence(fence)
+            }
+            guard self.api?.configurationIdentity == identity else { return }
+            self.persistedOutboxHydrated = true
+            self.schedulePersistedOutboxDrain()
+        }
+    }
+
+    private func completePersistedHardDeleteFence(_ fence: PersistedHardDeleteFence) async {
+        var removedAll = true
+        for conversationId in fence.memberConversationIds {
+            let removed = await conversationPersistenceStore.removeAuthoritativePersistedConversationState(
+                conversationId: conversationId,
+                configurationIdentity: fence.configurationIdentity,
+                aggregateAuthority: fence.aggregateAuthority)
+            removedAll = removedAll && removed
+        }
+        guard removedAll else { return }
+        listStore.remove(aggregateId: fence.aggregateAuthority)
+        await conversationPersistenceStore.retireHardDeleteFence(
+            aggregateAuthority: fence.aggregateAuthority)
     }
 
     private func schedulePersistedOutboxDrain() {
@@ -635,6 +770,7 @@ final class AppModel {
 
     func session(for conversationId: String) -> ConversationSession? {
         guard let api else { return nil }
+        guard !hardDeletedConversationIds.contains(conversationId) else { return nil }
         if let existing = sessions[conversationId] { return existing }
         let onConversationUpdate: (Conversation) -> Void = { [weak self] conversation in
             self?.handleSessionConversationUpdate(conversation, transcriptRowId: conversationId)
@@ -743,12 +879,17 @@ final class AppModel {
         .union(segmentTranscriptRowIds)
         .union(Set([transcriptRowId].compactMap { $0 }))
         .union(persistedConversationIds)
+        let fence = PersistedHardDeleteFence(
+            configurationIdentity: api.configurationIdentity,
+            aggregateAuthority: aggregateId,
+            memberConversationIds: aggregateConversationIds.sorted())
+        productConversationDetails[aggregateId]?.invalidateHardDeleted()
+        guard await conversationPersistenceStore.persistHardDeleteFence(fence) else { return }
         let cleanupGeneration = beginHardDeleteCleanup(conversationIds: aggregateConversationIds)
         let ownedSessions = aggregateConversationIds.compactMap { sessions.removeValue(forKey: $0) }
         let ownedDrainSessions = aggregateConversationIds.compactMap { drainSessions.removeValue(forKey: $0) }
         for session in ownedSessions { session.stop() }
         for session in ownedDrainSessions { session.stop() }
-        productConversationDetails[aggregateId]?.stop()
         productConversationDetails.removeValue(forKey: aggregateId)
         listStore.remove(aggregateId: aggregateId)
         if pendingOpenConversationId == transcriptRowId || pendingOpenConversationId == aggregateId {
@@ -758,19 +899,18 @@ final class AppModel {
             withIdentifiers: ["attention-\(aggregateId)"])
         UNUserNotificationCenter.current().removePendingNotificationRequests(
             withIdentifiers: ["attention-\(aggregateId)"])
+        var removedAll = true
         for conversationId in aggregateConversationIds {
-            await conversationPersistenceStore.removeAuthoritativePersistedConversationState(
+            let removed = await conversationPersistenceStore.removeAuthoritativePersistedConversationState(
                 conversationId: conversationId,
                 configurationIdentity: api.configurationIdentity,
                 aggregateAuthority: aggregateId)
+            removedAll = removedAll && removed
         }
-        for session in ownedSessions {
-            await session.clearCachedSnapshotAndWait()
-            await session.outbox.clearAndWait()
-        }
-        for session in ownedDrainSessions {
-            await session.clearCachedSnapshotAndWait()
-            await session.outbox.clearAndWait()
+        _ = ownedSessions
+        _ = ownedDrainSessions
+        if removedAll {
+            await conversationPersistenceStore.retireHardDeleteFence(aggregateAuthority: aggregateId)
         }
         completeHardDeleteCleanup(generation: cleanupGeneration, conversationIds: aggregateConversationIds)
     }
@@ -885,6 +1025,15 @@ final class AppModel {
         case completed(Int)
         case noCurrentDrain
         case notReady
+    }
+
+    func triggerStartupHardDeleteRecoveryForTesting() {
+        persistedOutboxHydrated = false
+        finishStartupHydration()
+    }
+
+    func awaitStartupHardDeleteRecoveryForTesting() async {
+        await startupHardDeleteRecoveryTask?.value
     }
 
     func currentPersistedOutboxDrainGenerationForTesting() -> Int? {
