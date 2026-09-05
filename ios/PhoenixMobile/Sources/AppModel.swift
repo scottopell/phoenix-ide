@@ -1020,6 +1020,28 @@ final class AppModel {
     }
 
     private func handleSessionConversationUpdate(_ conversation: Conversation, transcriptRowId: String) {
+        if let session = sessions[transcriptRowId],
+           let previousAggregate = session.authoritativeSnapshotReceipt?.aggregateId,
+           previousAggregate != conversation.aggregateIdentity
+        {
+            session.invalidateForAggregateReplacement()
+            sessions.removeValue(forKey: transcriptRowId)
+            listStore.upsert(conversation)
+            let replacement = self.session(
+                for: transcriptRowId,
+                aggregateAuthority: conversation.aggregateIdentity)
+            replacement?.receive(.initSnapshot(.init(
+                conversation: conversation,
+                messages: [],
+                agentWorking: false,
+                presentationMode: conversation.presentation_mode,
+                lastSequenceId: 0,
+                pendingAnchorSequenceId: 0,
+                pendingEvents: [],
+                pendingTruncated: false)))
+            replacement?.start()
+            return
+        }
         guard let aggregateIdentity = aggregateIdentity(forTranscriptRowId: transcriptRowId),
               let existing = listStore.conversations.first(where: { $0.aggregateIdentity == aggregateIdentity })
         else {
@@ -1241,6 +1263,13 @@ final class AppModel {
 
     func awaitStartupHardDeleteRecoveryForTesting() async {
         await startupHardDeleteRecoveryTask?.value
+    }
+
+    func applySessionConversationUpdateForTesting(
+        _ conversation: Conversation,
+        transcriptRowId: String
+    ) {
+        handleSessionConversationUpdate(conversation, transcriptRowId: transcriptRowId)
     }
 
     func currentPersistedOutboxDrainGenerationForTesting() -> Int? {
