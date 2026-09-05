@@ -346,13 +346,6 @@ final class ConversationSession {
         stop()
     }
 
-    func invalidateForAggregateReplacement() {
-        invalidateOutboxAuthority()
-        invalidateLiveWork()
-        hydrationAuthority = .none
-        stop()
-    }
-
     func invalidateConfiguration() {
         invalidateOutboxAuthority()
         invalidateLiveWork()
@@ -777,7 +770,7 @@ final class ConversationSession {
     }
 
     #if DEBUG
-    var aggregateAuthorityForTesting: String { aggregateAuthority }
+    var latestSnapshotRevisionForTesting: Int { latestSnapshotRevision }
 
     func currentDrainGenerationForTesting() -> Int? {
         drainTask == nil ? nil : drainGeneration
@@ -989,9 +982,17 @@ final class ConversationSession {
         guard !isHardDeleted else { return }
         switch event {
         case .initSnapshot(let snap):
+            guard snap.conversation.aggregateIdentity == aggregateAuthority else {
+                let error = APIError.decoding(underlying: NSError(
+                    domain: "ConversationSession",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "Conversation aggregate identity does not match this session."]))
+                lastErrorToast = error.errorDescription
+                onSessionEvent?(.errorToastChanged(lastErrorToast))
+                return
+            }
             retryDelay = 1
             let previousSequenceFloor = lastSequenceId
-            let previousConversation = conversation
             let previousTypedState = typedState
             let generationMatches = transcriptGeneration == snap.transcriptGeneration
             let mustReplayFromAnchor = replayFromPendingAnchor
@@ -1045,7 +1046,6 @@ final class ConversationSession {
             if let conversation {
                 onConversationUpdate?(conversation)
                 emitAggregateTopologyInvalidationIfNeeded(
-                    previousConversation: previousConversation,
                     previousState: previousTypedState,
                     conversation: conversation)
             }
@@ -1082,13 +1082,11 @@ final class ConversationSession {
                let messageDate = message.createdAtDate,
                var conversation,
                conversation.updatedAtDate.map({ messageDate > $0 }) ?? true {
-                let previousConversation = self.conversation
                 let previousState = typedState
                 conversation.updated_at = createdAt
                 self.conversation = conversation
                 onConversationUpdate?(conversation)
                 emitAggregateTopologyInvalidationIfNeeded(
-                    previousConversation: previousConversation,
                     previousState: previousState,
                     conversation: conversation)
             }
@@ -1147,7 +1145,6 @@ final class ConversationSession {
             cancelNeedsAgentDoneFallback = false
             if let mode { presentationMode = mode }
             if var conversation {
-                let previousConversation = self.conversation
                 let previousState = typedState
                 conversation.state = state
                 if let stateUpdatedAt { conversation.state_updated_at = stateUpdatedAt }
@@ -1159,7 +1156,6 @@ final class ConversationSession {
                 persistSnapshot(authoritative: true)
                 onConversationUpdate?(conversation)
                 emitAggregateTopologyInvalidationIfNeeded(
-                    previousConversation: previousConversation,
                     previousState: previousState,
                     conversation: conversation)
             }
@@ -1214,7 +1210,6 @@ final class ConversationSession {
                 actionAttempt = nil
             }
             if shouldMoveToIdle {
-                let previousConversation = conversation
                 let previousState = typedState
                 conversation?.state = .string("idle")
                 // The mode must move with the state, or the snapshot
@@ -1226,7 +1221,6 @@ final class ConversationSession {
                 if let conversation {
                     onConversationUpdate?(conversation)
                     emitAggregateTopologyInvalidationIfNeeded(
-                        previousConversation: previousConversation,
                         previousState: previousState,
                         conversation: conversation)
                 }
@@ -1246,7 +1240,6 @@ final class ConversationSession {
             // conversation — this event exists precisely so clients don't
             // need a reconnect to see it.
             if var conv = conversation {
-                let previousConversation = conversation
                 let previousState = typedState
                 if let v = update["cwd"]?.stringValue { conv.cwd = v }
                 if let v = update["branch_name"]?.stringValue { conv.branch_name = v }
@@ -1260,7 +1253,6 @@ final class ConversationSession {
                 persistSnapshot(authoritative: true)
                 onConversationUpdate?(conv)
                 emitAggregateTopologyInvalidationIfNeeded(
-                    previousConversation: previousConversation,
                     previousState: previousState,
                     conversation: conv)
             }
@@ -1503,23 +1495,10 @@ final class ConversationSession {
     }
 
     private func emitAggregateTopologyInvalidationIfNeeded(
-        previousConversation: Conversation?,
         previousState: ConversationState,
         conversation: Conversation
     ) {
         let currentState = typedState
-        if previousConversation?.aggregateIdentity != conversation.aggregateIdentity,
-           let previousAggregateIdentity = previousConversation?.aggregateIdentity {
-            onSessionEvent?(
-                .aggregateTopologyInvalidated(
-                    ProductConversationTopologyInvalidation(
-                        transcriptRowId: conversation.transcriptRowIdentity,
-                        aggregateIdentity: conversation.aggregateIdentity,
-                        reason: .aggregateIdentityChanged(
-                            previous: previousAggregateIdentity,
-                            current: conversation.aggregateIdentity))))
-            return
-        }
         guard previousState != currentState else { return }
         let reason: ProductConversationTopologyInvalidation.Reason
         if let topologyReason = currentState.productConversationTopologyInvalidationReason {
