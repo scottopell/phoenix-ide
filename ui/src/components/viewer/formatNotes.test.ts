@@ -44,6 +44,24 @@ describe('formatNotesForSend', () => {
     expect(out).toContain('respond to this point');
   });
 
+  it('keeps repeated aggregate message occurrences in distinct labeled sections', () => {
+    const out = formatNotesForSend([
+      note({
+        anchor: { kind: 'message', sequenceId: 9, messageId: 'agent-9-a', occurrenceToken: 'row-a:agent-9-a', lineNumber: 1 },
+        body: 'first occurrence',
+      }),
+      note({
+        anchor: { kind: 'message', sequenceId: 9, messageId: 'agent-9-b', occurrenceToken: 'row-b:agent-9-b', lineNumber: 1 },
+        body: 'second occurrence',
+      }),
+    ]);
+
+    expect(out).toContain('### Message #9 (`row-a:agent-9-a`)');
+    expect(out).toContain('### Message #9 (`row-b:agent-9-b`)');
+    expect(out).toContain('first occurrence');
+    expect(out).toContain('second occurrence');
+  });
+
   it('groups file notes by path and diff notes by (filePath, section)', () => {
     const out = formatNotesForSend([
       note({

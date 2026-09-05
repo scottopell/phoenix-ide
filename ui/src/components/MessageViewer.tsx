@@ -45,6 +45,7 @@ export function MessageViewer({ sequenceId, messageId, occurrenceToken, messages
   const returnToPane = useCallback(() => onPresentationChange?.('pane'), [onPresentationChange]);
   const focusedExit = useFocusedReviewExit({
     noteCount: notes.messageNotes.length,
+    unsavedDraft: notes.annotationDraftDirty,
     send: notes.send,
     discard: notes.clearAll,
     returnToPane,
@@ -121,7 +122,8 @@ export function MessageViewer({ sequenceId, messageId, occurrenceToken, messages
           <AnnotationDialog
             anchorLabel={`Line ${notes.annotating.lineNumber}`}
             lineContent={notes.annotating.lineContent}
-            onSubmit={notes.submitNote}
+            onDirtyChange={notes.setAnnotationDraftDirty}
+            onSubmit={onSendNotes ? notes.submitNote : undefined}
             onCancel={notes.cancelAnnotate}
           />
         ) : null
@@ -176,6 +178,7 @@ function useMessageReviewNotes(
   const commands = useReviewNotesCommands();
   const messageNotes = useMessageReviewNotesData(sequenceId, occurrenceToken);
   const [annotating, setAnnotating] = useState<{ sequenceId: number; lineNumber: number; lineContent: string } | null>(null);
+  const [annotationDraftDirty, setAnnotationDraftDirty] = useState(false);
   const [showPanel, setShowPanel] = useState(false);
   const [highlightedLine, setHighlightedLine] = useState<number | null>(null);
 
@@ -187,13 +190,13 @@ function useMessageReviewNotes(
 
   useEffect(() => {
     setAnnotating(null);
+    setAnnotationDraftDirty(false);
     setHighlightedLine(null);
     setShowPanel(false);
   }, [occurrenceToken, sequenceId]);
 
   useEffect(() => {
     if (onSendNotes) return;
-    setAnnotating(null);
     setHighlightedLine(null);
     setShowPanel(false);
   }, [onSendNotes]);
@@ -202,7 +205,10 @@ function useMessageReviewNotes(
     if (!onSendNotes) return;
     setAnnotating({ sequenceId, lineNumber, lineContent });
   }, [onSendNotes, sequenceId]);
-  const cancelAnnotate = useCallback(() => setAnnotating(null), []);
+  const cancelAnnotate = useCallback(() => {
+    setAnnotating(null);
+    setAnnotationDraftDirty(false);
+  }, []);
   const submitNote = useCallback(
     (body: string) => {
       if (!annotating || annotating.sequenceId !== sequenceId) return;
@@ -218,6 +224,7 @@ function useMessageReviewNotes(
         body,
       );
       setAnnotating(null);
+      setAnnotationDraftDirty(false);
     },
     [annotating, commands, messageId, occurrenceToken, sequenceId],
   );
@@ -241,6 +248,8 @@ function useMessageReviewNotes(
   return {
     messageNotes,
     annotating,
+    annotationDraftDirty,
+    setAnnotationDraftDirty,
     startAnnotate,
     cancelAnnotate,
     submitNote,

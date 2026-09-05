@@ -777,10 +777,25 @@ describe('ProductConversationPage', () => {
     act(() => emitLatestProjection({ appendReviewNotesToComposer }));
     const viewerProps = viewerSpy.mock.lastCall?.[0] as Record<string, unknown> | undefined;
     const onSendNotes = viewerProps?.['onSendNotes'] as ((notes: string) => void) | undefined;
-    expect(onSendNotes).toBe(appendReviewNotesToComposer);
+    expect(onSendNotes).toBeTypeOf('function');
 
-    onSendNotes?.('## Review notes\n\nunique aggregate note');
+    act(() => onSendNotes?.('## Review notes\n\nunique aggregate note'));
     expect(appendReviewNotesToComposer).toHaveBeenCalledWith('## Review notes\n\nunique aggregate note');
+    await waitFor(() => expect(screen.queryByTestId('aggregate-message-viewer')).not.toBeInTheDocument());
+  });
+
+  it('keeps fullscreen aggregate review open so successful notes can return to its pane', async () => {
+    const appendReviewNotesToComposer = vi.fn();
+    renderPage('/product-conversations/pc-1?viewer=message&presentation=fullscreen&message=3&message_id=m-3');
+    await waitForPageReady();
+
+    act(() => emitLatestProjection({ appendReviewNotesToComposer }));
+    const viewerProps = viewerSpy.mock.lastCall?.[0] as Record<string, unknown> | undefined;
+    const onSendNotes = viewerProps?.['onSendNotes'] as ((notes: string) => void) | undefined;
+    act(() => onSendNotes?.('## Review notes\n\nfocused aggregate note'));
+
+    expect(appendReviewNotesToComposer).toHaveBeenCalledWith('## Review notes\n\nfocused aggregate note');
+    expect(screen.getByTestId('aggregate-message-viewer')).toBeInTheDocument();
   });
 
   it('does not expose note sending when History has no composer capability', async () => {

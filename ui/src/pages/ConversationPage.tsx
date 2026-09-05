@@ -1776,6 +1776,10 @@ function ConversationPageContent({
     && convStateForChildren.type !== 'awaiting_task_approval'
     && convStateForChildren.type !== 'handed_off'
     && convStateForChildren.type !== 'terminal';
+  const writableComposerMounted = mutationEnabled
+    && ordinaryComposerEligible
+    && (convStateForChildren.type !== 'error'
+      || (convStateForChildren.error?.can_user_resume ?? false));
 
   useEffect(() => {
     if (!onProjectionChange) return;
@@ -1791,8 +1795,8 @@ function ConversationPageContent({
       onRetryPending: handleRetry,
       onCancelSteering: handleCancelSteering,
       onOpenFile: handleOpenFileFromPatch,
-      ...(mutationEnabled && ordinaryComposerEligible
-        ? { appendReviewNotesToComposer: handleSendNotes }
+      ...(writableComposerMounted
+        ? { appendReviewNotesToComposer: handleSendFocusedNotes }
         : {}),
       filePathRootDir: conversation?.worktree_path ?? conversation?.cwd ?? '/',
       systemPrompt: atom.systemPrompt ?? undefined,
@@ -1814,9 +1818,8 @@ function ConversationPageContent({
     serverArchived,
     handleCancelSteering,
     handleOpenFileFromPatch,
-    handleSendNotes,
-    mutationEnabled,
-    ordinaryComposerEligible,
+    handleSendFocusedNotes,
+    writableComposerMounted,
     conversation?.worktree_path,
     conversation?.cwd,
     atom.systemPrompt,
@@ -2778,7 +2781,9 @@ function ConversationPageContent({
             sequenceId={messageSlot.sequenceId}
             messages={viewableMessages}
             onClose={handleCloseMessageViewer}
-            onSendNotes={isWideDesktop && messageSlot.presentation === 'fullscreen' ? handleSendFocusedNotes : handleSendNotes}
+            onSendNotes={writableComposerMounted
+              ? (isWideDesktop && messageSlot.presentation === 'fullscreen' ? handleSendFocusedNotes : handleSendNotes)
+              : undefined}
             presentation={messageSlot.presentation}
             canTogglePresentation={isWideDesktop}
             onPresentationChange={viewerSlot.setPresentation}
@@ -2865,7 +2870,9 @@ function ConversationPageContent({
                   sequenceId={messageSlot.sequenceId}
                   messages={viewableMessages}
                   onClose={handleCloseMessageViewer}
-                  onSendNotes={isWideDesktop && messageSlot.presentation === 'fullscreen' ? handleSendFocusedNotes : handleSendNotes}
+                  onSendNotes={writableComposerMounted
+                    ? (isWideDesktop && messageSlot.presentation === 'fullscreen' ? handleSendFocusedNotes : handleSendNotes)
+                    : undefined}
                   presentation={messageSlot.presentation}
                   canTogglePresentation
                   onPresentationChange={viewerSlot.setPresentation}

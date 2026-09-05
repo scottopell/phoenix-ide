@@ -9,7 +9,8 @@ interface AnnotationDialogProps {
   lineContent: string;
   /** Initial textarea value (when editing an existing note). */
   initialBody?: string;
-  onSubmit: (body: string) => void;
+  onSubmit?: ((body: string) => void) | undefined;
+  onDirtyChange?: ((dirty: boolean) => void) | undefined;
   onCancel: () => void;
 }
 
@@ -25,10 +26,15 @@ export function AnnotationDialog({
   lineContent,
   initialBody = '',
   onSubmit,
+  onDirtyChange,
   onCancel,
 }: AnnotationDialogProps) {
   const [body, setBody] = useState(initialBody);
   const taRef = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    onDirtyChange?.(body !== initialBody);
+  }, [body, initialBody, onDirtyChange]);
 
   useEffect(() => {
     taRef.current?.focus();
@@ -40,7 +46,7 @@ export function AnnotationDialog({
         e.stopPropagation();
         onCancel();
       } else if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
-        if (body.trim()) {
+        if (body.trim() && onSubmit) {
           e.preventDefault();
           onSubmit(body.trim());
         }
@@ -82,10 +88,10 @@ export function AnnotationDialog({
           <button onClick={onCancel}>Cancel</button>
           <button
             className="primary"
-            onClick={() => body.trim() && onSubmit(body.trim())}
-            disabled={!body.trim()}
+            onClick={() => body.trim() && onSubmit?.(body.trim())}
+            disabled={!body.trim() || !onSubmit}
           >
-            {initialBody ? 'Save' : 'Add Note'}
+            {onSubmit ? (initialBody ? 'Save' : 'Add Note') : 'Composer unavailable'}
           </button>
         </div>
       </div>

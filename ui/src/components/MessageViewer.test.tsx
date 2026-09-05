@@ -106,6 +106,31 @@ describe('MessageViewer', () => {
     vi.useRealTimers();
   });
 
+  it('preserves and close-guards an in-progress annotation draft when composer capability disappears', () => {
+    const onClose = vi.fn();
+    const messages = [agentTextMessage(1, 'Mutable message')];
+    const { rerender } = render(
+      <ReviewNotesProvider>
+        <MessageViewer sequenceId={1} messages={messages} onClose={onClose} onSendNotes={vi.fn()} inline />
+      </ReviewNotesProvider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Add note to line 1' }));
+    const draft = screen.getByPlaceholderText('Add your note… (Cmd/Ctrl+Enter to save)');
+    fireEvent.change(draft, { target: { value: 'do not lose this draft' } });
+
+    rerender(
+      <ReviewNotesProvider>
+        <MessageViewer sequenceId={1} messages={messages} onClose={onClose} inline />
+      </ReviewNotesProvider>,
+    );
+
+    expect(screen.getByDisplayValue('do not lose this draft')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Composer unavailable' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: 'Close viewer' }));
+    expect(screen.getByRole('dialog', { name: 'Resolve feedback before closing' })).toBeInTheDocument();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
   it('closes an open notes panel when composer capability disappears', async () => {
     const messages = [agentTextMessage(1, 'Mutable message')];
     const { rerender } = render(
