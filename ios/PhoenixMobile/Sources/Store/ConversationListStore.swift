@@ -283,6 +283,24 @@ final class ConversationListStore {
     }
 
     func remove(aggregateId: String) {
+        removeFromMemory(aggregateId: aggregateId)
+        persistCache()
+    }
+
+    func removeAndPersist(aggregateId: String) async -> Bool {
+        removeFromMemory(aggregateId: aggregateId)
+        guard let lastRefreshed else { return true }
+        let revision = cacheWriter.reserveRevision()
+        return await cacheWriter.save(
+            Cache(
+                conversations: conversations,
+                transcriptToAggregate: transcriptToAggregate,
+                aggregateToCachedTranscript: aggregateToCachedTranscript,
+                lastRefreshed: lastRefreshed),
+            revision: revision)
+    }
+
+    private func removeFromMemory(aggregateId: String) {
         externalMutationGeneration += 1
         upsertsDuringRefresh[aggregateId] = nil
         if isRefreshing {
@@ -291,7 +309,6 @@ final class ConversationListStore {
         conversations.removeAll { $0.aggregateIdentity == aggregateId }
         transcriptToAggregate = transcriptToAggregate.filter { $0.value != aggregateId }
         aggregateToCachedTranscript[aggregateId] = nil
-        persistCache()
     }
 
     func aggregateId(forTranscriptRowId transcriptRowId: String) -> String? {

@@ -1352,7 +1352,8 @@ final class ConversationSessionReducerTests: XCTestCase {
         _ = await task.value
 
         XCTAssertEqual(postCount.snapshot(), 1)
-        XCTAssertTrue(session.outbox.entries.isEmpty)
+        XCTAssertEqual(session.outbox.entries.count, 1)
+        XCTAssertTrue(session.isHardDeleted)
     }
 
     @MainActor

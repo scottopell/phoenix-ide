@@ -217,7 +217,7 @@ private final class TestConversationPersistenceStore: ConversationPersistenceSto
     }
     func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool { true }
     func hardDeleteFences(configurationIdentity: APIConfigurationIdentity) -> [PersistedHardDeleteFence] { [] }
-    func retireHardDeleteFence(aggregateAuthority: String) async {}
+    func retireHardDeleteFence(_ fence: PersistedHardDeleteFence) async {}
     func removeAllPersistedConversationState() async {
         for conversationId in outboxStore.ownerTranscriptRowIds {
             await outboxStore.removePersistedConversationState(conversationId: conversationId)
@@ -416,7 +416,7 @@ final class ResettableConversationPersistenceStore: ConversationPersistenceStore
     }
     func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool { true }
     func hardDeleteFences(configurationIdentity: APIConfigurationIdentity) -> [PersistedHardDeleteFence] { [] }
-    func retireHardDeleteFence(aggregateAuthority: String) async {}
+    func retireHardDeleteFence(_ fence: PersistedHardDeleteFence) async {}
     func removeAllPersistedConversationState() async {
         await wrapped.removeAllPersistedConversationState()
     }
@@ -471,7 +471,7 @@ final class HardDeleteGatedConversationPersistenceStore: ConversationPersistence
     }
     func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool { true }
     func hardDeleteFences(configurationIdentity: APIConfigurationIdentity) -> [PersistedHardDeleteFence] { [] }
-    func retireHardDeleteFence(aggregateAuthority: String) async {}
+    func retireHardDeleteFence(_ fence: PersistedHardDeleteFence) async {}
     func removeAllPersistedConversationState() async {}
 }
 
@@ -534,7 +534,7 @@ final class GatedConversationPersistenceStore: ConversationPersistenceStore {
     }
     func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool { true }
     func hardDeleteFences(configurationIdentity: APIConfigurationIdentity) -> [PersistedHardDeleteFence] { [] }
-    func retireHardDeleteFence(aggregateAuthority: String) async {}
+    func retireHardDeleteFence(_ fence: PersistedHardDeleteFence) async {}
     func removeAllPersistedConversationState() async {
         for conversationId in outboxStore.ownerTranscriptRowIds {
             await outboxStore.removePersistedConversationState(conversationId: conversationId)
@@ -598,7 +598,7 @@ final class MutableTestConversationPersistenceStore: ConversationPersistenceStor
     }
     func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool { true }
     func hardDeleteFences(configurationIdentity: APIConfigurationIdentity) -> [PersistedHardDeleteFence] { [] }
-    func retireHardDeleteFence(aggregateAuthority: String) async {}
+    func retireHardDeleteFence(_ fence: PersistedHardDeleteFence) async {}
     func removeAllPersistedConversationState() async {
         for conversationId in outboxStore.ownerTranscriptRowIds {
             await outboxStore.removePersistedConversationState(conversationId: conversationId)

@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import Observation
 import UserNotifications
 
@@ -56,6 +57,12 @@ struct PersistedHardDeleteFence: Codable, Equatable, Sendable {
     let configurationIdentity: APIConfigurationIdentity
     let aggregateAuthority: String
     let memberConversationIds: [String]
+
+    var storageName: String {
+        let identity = "\(configurationIdentity.serverURL)\u{1f}\(configurationIdentity.credentialGeneration)\u{1f}\(configurationIdentity.trustSelfSigned)\u{1f}\(aggregateAuthority)"
+        let digest = SHA256.hash(data: Data(identity.utf8))
+        return "hard-delete-" + digest.map { String(format: "%02x", $0) }.joined()
+    }
 }
 
 @MainActor
@@ -91,7 +98,7 @@ protocol ConversationPersistenceStore {
     func removeAllPersistedConversationState() async
     func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool
     func hardDeleteFences(configurationIdentity: APIConfigurationIdentity) -> [PersistedHardDeleteFence]
-    func retireHardDeleteFence(aggregateAuthority: String) async
+    func retireHardDeleteFence(_ fence: PersistedHardDeleteFence) async
 }
 
 @MainActor
@@ -366,7 +373,7 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
 
     func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool {
         let source = directory
-            .appendingPathComponent("hard-delete-\(fence.aggregateAuthority)")
+            .appendingPathComponent(fence.storageName)
             .appendingPathExtension("json")
         let writer = context.writer(destinationURL: source, version: 1)
         return await writer.save(fence, revision: writer.reserveRevision())
@@ -385,8 +392,8 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
         }
     }
 
-    func retireHardDeleteFence(aggregateAuthority: String) async {
-        let source = directory.appendingPathComponent("hard-delete-\(aggregateAuthority)").appendingPathExtension("json")
+    func retireHardDeleteFence(_ fence: PersistedHardDeleteFence) async {
+        let source = directory.appendingPathComponent(fence.storageName).appendingPathExtension("json")
         let writer = context.writer(destinationURL: source, version: 1)
         await writer.remove(revision: writer.reserveRevision())
     }
@@ -616,9 +623,8 @@ final class AppModel {
             removedAll = removedAll && removed
         }
         guard removedAll else { return }
-        listStore.remove(aggregateId: fence.aggregateAuthority)
-        await conversationPersistenceStore.retireHardDeleteFence(
-            aggregateAuthority: fence.aggregateAuthority)
+        guard await listStore.removeAndPersist(aggregateId: fence.aggregateAuthority) else { return }
+        await conversationPersistenceStore.retireHardDeleteFence(fence)
     }
 
     private func schedulePersistedOutboxDrain() {
@@ -719,6 +725,10 @@ final class AppModel {
     private func rebuildAPI() {
 
         cancelPersistedOutboxDrainAuthority()
+        startupHardDeleteRecoveryTask?.cancel()
+        startupHardDeleteRecoveryTask = nil
+        persistedOutboxHydrated = false
+        hardDeletedConversationIds.removeAll()
         apiGeneration += 1
         let configuredAPI: PhoenixAPI?
         if let url = URL(string: serverURLString), url.host != nil {
@@ -753,7 +763,7 @@ final class AppModel {
         guard let configuredAPI else { return }
         for session in sessions.values { session.replaceAPI(configuredAPI) }
         for session in drainSessions.values { session.replaceAPI(configuredAPI) }
-        schedulePersistedOutboxDrain()
+        finishStartupHydration()
     }
 
     func configure(serverURL: String, password: String, trustSelfSigned: Bool) throws {
@@ -885,13 +895,13 @@ final class AppModel {
             memberConversationIds: aggregateConversationIds.sorted())
         productConversationDetails[aggregateId]?.invalidateHardDeleted()
         guard await conversationPersistenceStore.persistHardDeleteFence(fence) else { return }
+        guard api.configurationIdentity == fence.configurationIdentity else { return }
         let cleanupGeneration = beginHardDeleteCleanup(conversationIds: aggregateConversationIds)
         let ownedSessions = aggregateConversationIds.compactMap { sessions.removeValue(forKey: $0) }
         let ownedDrainSessions = aggregateConversationIds.compactMap { drainSessions.removeValue(forKey: $0) }
         for session in ownedSessions { session.stop() }
         for session in ownedDrainSessions { session.stop() }
         productConversationDetails.removeValue(forKey: aggregateId)
-        listStore.remove(aggregateId: aggregateId)
         if pendingOpenConversationId == transcriptRowId || pendingOpenConversationId == aggregateId {
             pendingOpenConversationId = nil
         }
@@ -909,8 +919,10 @@ final class AppModel {
         }
         _ = ownedSessions
         _ = ownedDrainSessions
-        if removedAll {
-            await conversationPersistenceStore.retireHardDeleteFence(aggregateAuthority: aggregateId)
+        if removedAll,
+           await listStore.removeAndPersist(aggregateId: aggregateId)
+        {
+            await conversationPersistenceStore.retireHardDeleteFence(fence)
         }
         completeHardDeleteCleanup(generation: cleanupGeneration, conversationIds: aggregateConversationIds)
     }
