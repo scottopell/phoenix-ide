@@ -8,7 +8,7 @@ interface NotesPanelProps {
   onJumpTo?: ((note: ReviewNote) => void) | undefined;
   onRemove: (id: string) => void;
   onClearAll: () => void;
-  onSend: () => void;
+  onSend?: (() => void) | undefined;
   onClose: () => void;
 }
 
@@ -68,10 +68,12 @@ export function NotesPanel({
       </div>
       <div className="notes-panel-actions">
         <button onClick={onClearAll}>Clear All</button>
-        <button className="primary" onClick={onSend}>
-          <Send size={16} />
-          Send All
-        </button>
+        {onSend && (
+          <button className="primary" onClick={onSend}>
+            <Send size={16} />
+            Send All
+          </button>
+        )}
       </div>
     </div>
   );

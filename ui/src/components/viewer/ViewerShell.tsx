@@ -33,9 +33,9 @@ interface ViewerShellProps {
   /** Toggle the notes side panel. The panel itself is rendered by the
    *  caller via `panel` so each viewer owns its own scroll/jump logic. */
   onToggleNotes: () => void;
-  /** Send the entire review-notes pile and clear it. Called from the
-   *  header send button. */
-  onSend: () => void;
+  /** Send the entire review-notes pile and clear it. Omit while the owning
+   *  composer is read-only so pending notes remain visible without a dead action. */
+  onSend?: (() => void) | undefined;
   /** Optional banner shown below the header (e.g. "viewing N changes
    *  from patch"). */
   banner?: ReactNode;
@@ -198,13 +198,15 @@ export function ViewerShell({
                 <MessageSquare size={18} />
                 <span>{noteCount}</span>
               </button>
-              <button
-                className="viewer-shell-send-btn"
-                onClick={onSend}
-                aria-label="Send notes"
-              >
-                <Send size={18} />
-              </button>
+              {onSend && (
+                <button
+                  className="viewer-shell-send-btn"
+                  onClick={onSend}
+                  aria-label="Send notes"
+                >
+                  <Send size={18} />
+                </button>
+              )}
             </>
           )}
         </div>
@@ -251,6 +253,7 @@ export function FocusedReviewExitDialog({
   target,
   sending,
   error,
+  canSend = true,
   onSend,
   onDiscard,
   onKeepReviewing,
@@ -258,6 +261,7 @@ export function FocusedReviewExitDialog({
   target: FocusedReviewExitTarget;
   sending: boolean;
   error: string | null;
+  canSend?: boolean | undefined;
   onSend: () => void;
   onDiscard: () => void;
   onKeepReviewing: () => void;
@@ -285,9 +289,11 @@ export function FocusedReviewExitDialog({
         <div className="modal-actions focused-review-exit-actions">
           <button className="btn-secondary" type="button" onClick={onKeepReviewing} disabled={sending}>Keep reviewing</button>
           <button className="btn-danger" type="button" onClick={onDiscard} disabled={sending}>{discardLabel}</button>
-          <button className="btn-primary" type="button" onClick={onSend} disabled={sending}>
-            {sending ? 'Sending…' : sendLabel}
-          </button>
+          {canSend && (
+            <button className="btn-primary" type="button" onClick={onSend} disabled={sending}>
+              {sending ? 'Sending…' : sendLabel}
+            </button>
+          )}
         </div>
       </div>
     </div>

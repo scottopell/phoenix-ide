@@ -58,8 +58,11 @@ describe('MessageViewer', () => {
     expect(screen.getByText('Second proposal line')).toBeInTheDocument();
   });
 
-  it('does not offer annotation when no composer capability exists', () => {
-    render(
+  it('does not offer annotation or long-press haptics when no composer capability exists', () => {
+    vi.useFakeTimers();
+    const vibrate = vi.fn();
+    Object.defineProperty(navigator, 'vibrate', { configurable: true, value: vibrate });
+    const { container } = render(
       <ReviewNotesProvider>
         <MessageViewer
           sequenceId={1}
@@ -72,6 +75,35 @@ describe('MessageViewer', () => {
 
     expect(screen.queryByRole('button', { name: 'Add note to line 1' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Send notes' })).not.toBeInTheDocument();
+    const block = container.querySelector('.annotatable') as HTMLElement;
+    fireEvent.mouseDown(block, { clientX: 10, clientY: 10 });
+    vi.advanceTimersByTime(500);
+    expect(vibrate).not.toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+
+  it('cancels an armed long press when composer capability disappears', () => {
+    vi.useFakeTimers();
+    const vibrate = vi.fn();
+    Object.defineProperty(navigator, 'vibrate', { configurable: true, value: vibrate });
+    const messages = [agentTextMessage(1, 'Mutable message')];
+    const { container, rerender } = render(
+      <ReviewNotesProvider>
+        <MessageViewer sequenceId={1} messages={messages} onClose={vi.fn()} onSendNotes={vi.fn()} inline />
+      </ReviewNotesProvider>,
+    );
+    fireEvent.mouseDown(container.querySelector('.annotatable') as HTMLElement, { clientX: 10, clientY: 10 });
+
+    rerender(
+      <ReviewNotesProvider>
+        <MessageViewer sequenceId={1} messages={messages} onClose={vi.fn()} inline />
+      </ReviewNotesProvider>,
+    );
+    vi.advanceTimersByTime(500);
+
+    expect(vibrate).not.toHaveBeenCalled();
+    expect(screen.queryByText('Add a note')).not.toBeInTheDocument();
+    vi.useRealTimers();
   });
 
   it('closes an open notes panel when composer capability disappears', async () => {
@@ -107,6 +139,49 @@ describe('MessageViewer', () => {
 
     await waitFor(() => expect(screen.queryByRole('button', { name: 'Send All' })).not.toBeInTheDocument());
     expect(screen.queryByRole('button', { name: 'Add note to line 1' })).not.toBeInTheDocument();
+  });
+
+  it('preserves focused exit protection when composer capability disappears', async () => {
+    const onClose = vi.fn();
+    const messages = [agentTextMessage(1, 'Mutable message')];
+    const { rerender } = render(
+      <ReviewNotesProvider>
+        <MessageViewer
+          sequenceId={1}
+          messages={messages}
+          onClose={onClose}
+          onSendNotes={vi.fn()}
+          presentation="fullscreen"
+          canTogglePresentation
+          inline
+        />
+      </ReviewNotesProvider>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Add note to line 1' }));
+    fireEvent.change(screen.getByPlaceholderText('Add your note… (Cmd/Ctrl+Enter to save)'), { target: { value: 'pending note' } });
+    fireEvent.click(screen.getByRole('button', { name: /^Add Note$/ }));
+
+    rerender(
+      <ReviewNotesProvider>
+        <MessageViewer
+          sequenceId={1}
+          messages={messages}
+          onClose={onClose}
+          presentation="fullscreen"
+          canTogglePresentation
+          inline
+        />
+      </ReviewNotesProvider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Close viewer' }));
+
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.getByRole('dialog', { name: 'Resolve feedback before closing' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Send notes' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Send All' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Send feedback and close' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Discard notes and close' })).toBeInTheDocument();
   });
 
   it('closes the notes panel when switching messages', async () => {

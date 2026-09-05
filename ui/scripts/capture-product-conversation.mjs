@@ -28,6 +28,9 @@ async function assertTranscriptGeometry(page, id, viewport, theme) {
     const intersects = (a, b) => a.width > 0 && a.height > 0
       && a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
     const viewportBox = { x: 0, y: 0, width: window.innerWidth, height: window.innerHeight };
+    const contained = (rect) => rect.x >= 0 && rect.y >= 0
+      && rect.x + rect.width <= window.innerWidth
+      && rect.y + rect.height <= window.innerHeight;
     const rows = [...document.querySelectorAll('.virtual-transcript__row')];
     return {
       display: getComputedStyle(required.transcript).display,
@@ -36,14 +39,18 @@ async function assertTranscriptGeometry(page, id, viewport, theme) {
       visibleRealMessageRow: rows.some((row) => row.querySelector('.message.user, .message.agent') && intersects(box(row), viewportBox)),
       positiveRows: rows.filter((row) => { const rect = row.getBoundingClientRect(); return rect.width > 0 && rect.height > 0; }).length,
       horizontalOverflow: document.documentElement.scrollWidth > window.innerWidth,
-      viewportContained: document.documentElement.scrollWidth <= window.innerWidth && document.documentElement.scrollHeight >= window.innerHeight,
+      documentOverflow: document.documentElement.scrollWidth > window.innerWidth || document.documentElement.scrollHeight > window.innerHeight,
+      viewportContained: contained(box(required.title)) && contained(box(required.composer))
+        && contained(box(required.transcript)) && contained(box(required.mainArea))
+        && contained(box(required.chatView)) && contained(box(required.virtualTranscript)),
     };
   });
   if ('missing' in geometry) throw new Error(`${id}/${theme}: missing ${geometry.missing.join(', ')}`);
   for (const name of ['transcript', 'mainArea', 'chatView', 'virtualTranscript']) {
     if (geometry[name].height <= 0 || geometry[name].width <= 0) throw new Error(`${id}/${theme}: ${name} has non-positive geometry`);
   }
-  if (geometry.display !== 'flex' || !geometry.visibleRealMessageRow || geometry.positiveRows === 0 || geometry.horizontalOverflow || !geometry.viewportContained) {
+  if (geometry.display !== 'flex' || !geometry.visibleRealMessageRow || geometry.positiveRows === 0
+    || geometry.horizontalOverflow || geometry.documentOverflow || !geometry.viewportContained) {
     throw new Error(`${id}/${theme}: transcript/viewport containment assertion failed: ${JSON.stringify(geometry)}`);
   }
   measurements.push({ id, viewport: viewport.name, theme, ...geometry });

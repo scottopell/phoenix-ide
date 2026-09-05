@@ -44,7 +44,7 @@ export function MessageViewer({ sequenceId, messageId, occurrenceToken, messages
   const focused = presentation === 'fullscreen' && canTogglePresentation;
   const returnToPane = useCallback(() => onPresentationChange?.('pane'), [onPresentationChange]);
   const focusedExit = useFocusedReviewExit({
-    noteCount: onSendNotes ? notes.messageNotes.length : 0,
+    noteCount: notes.messageNotes.length,
     send: notes.send,
     discard: notes.clearAll,
     returnToPane,
@@ -94,10 +94,12 @@ export function MessageViewer({ sequenceId, messageId, occurrenceToken, messages
       title={title}
       titleTooltip={message ? `Conversation message #${sequenceId}` : undefined}
       headerExtras={headerExtras}
-      noteCount={onSendNotes ? notes.messageNotes.length : 0}
+      noteCount={notes.messageNotes.length}
       onToggleNotes={notes.togglePanel}
-      onSend={focused ? focusedExit.sendAndReturn : () => { void notes.send(); }}
-      onClose={focused ? focusedExit.requestClose : onClose}
+      onSend={onSendNotes
+        ? (focused ? focusedExit.sendAndReturn : () => { void notes.send(); })
+        : undefined}
+      onClose={focusedExit.requestClose}
       onEscape={focused ? focusedExit.requestReturn : undefined}
       bodyScroll="shell"
       panel={
@@ -107,7 +109,9 @@ export function MessageViewer({ sequenceId, messageId, occurrenceToken, messages
             onJumpTo={handleJumpTo}
             onRemove={notes.removeNote}
             onClearAll={notes.clearAll}
-            onSend={focused ? focusedExit.sendAndReturn : () => { void notes.send(); }}
+            onSend={onSendNotes
+              ? (focused ? focusedExit.sendAndReturn : () => { void notes.send(); })
+              : undefined}
             onClose={notes.closePanel}
           />
         ) : null
@@ -127,6 +131,7 @@ export function MessageViewer({ sequenceId, messageId, occurrenceToken, messages
           target={focusedExit.exitTarget}
           sending={focusedExit.sending}
           error={focusedExit.error}
+          canSend={Boolean(onSendNotes)}
           onSend={() => { void focusedExit.sendAndReturn(); }}
           onDiscard={focusedExit.discardAndReturn}
           onKeepReviewing={focusedExit.keepReviewing}

@@ -34,6 +34,9 @@ export function AnnotatableBlock({
 }: AnnotatableBlockProps) {
   const lp = useLongPress<{ lineNumber: number; lineContent: string }>(
     ({ lineNumber: ln, lineContent: lc }) => onAnnotate?.(ln, lc),
+    500,
+    10,
+    Boolean(onAnnotate),
   );
   const cls = [
     'annotatable',
