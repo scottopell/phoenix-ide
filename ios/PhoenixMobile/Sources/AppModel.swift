@@ -56,13 +56,20 @@ struct UserDefaultsCoordinatorIdentityStore: CoordinatorIdentityStore {
 protocol ConversationPersistenceStore {
     var listPersistenceContext: VersionedDiskContext? { get }
     var persistenceScope: PersistenceScopeIdentity? { get }
-    func pendingOutboxOwnerTranscriptRowIds() async -> Set<String>
-    func persistedOutboxOwnerTranscriptRowIdsSnapshot() -> Set<String>
+    func pendingOutboxOwnerTranscriptRowIds(scope: PersistenceScopeIdentity) async -> Set<String>
+    func persistedOutboxOwnerTranscriptRowIdsSnapshot(scope: PersistenceScopeIdentity) -> Set<String>
     func hasCachedSnapshot(conversationId: String) -> Bool
     func inspectOutbox(conversationId: String) -> OutboxStoreInspection
-    func outboxPersistence(conversationId: String, aggregateAuthority: String?) -> OutboxPersistenceHandle
+    func outboxPersistence(
+        conversationId: String,
+        aggregateAuthority: String?,
+        scope: PersistenceScopeIdentity
+    ) -> OutboxPersistenceHandle
     func snapshotPersistence(conversationId: String) -> VersionedDiskWriter
-    func persistedConversationIds(aggregateId: String) -> Set<String>
+    func persistedConversationIds(
+        aggregateId: String,
+        scope: PersistenceScopeIdentity
+    ) -> Set<String>
     func resetConversationListCache() async
     func removePersistedConversationState(conversationId: String) async
     func removeAllPersistedConversationState() async
@@ -86,7 +93,7 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
         self.persistenceScope = nil
     }
 
-    func pendingOutboxOwnerTranscriptRowIds() async -> Set<String> {
+    func pendingOutboxOwnerTranscriptRowIds(scope: PersistenceScopeIdentity) async -> Set<String> {
         let schemaVersion = Outbox.schemaVersion
         let directory = directory
         return await Task.detached(priority: nil) {
@@ -98,21 +105,12 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
                 switch DiskStore.loadVersionedResult(
                     PersistedOutboxEnvelope.self,
                     source: source,
-                    version: schemaVersion,
-                    migrate: { storedVersion, fileData in
-                        guard let entries = migrateLegacyOutboxEnvelope(
-                            storedVersion: storedVersion,
-                            fileData: fileData)
-                        else { return nil }
-                        return PersistedOutboxEnvelope(
-                            scope: nil,
-                            aggregateAuthority: nil,
-                            entries: entries)
-                    })
+                    version: schemaVersion)
                 {
                 case .missing:
                     return nil
                 case .value(let envelope):
+                    guard envelope.scope == scope else { return nil }
                     let hasVisiblePendingEntries = envelope.entries.contains {
                         $0.conversationId == conversationId &&
                         $0.isVisible &&
@@ -127,7 +125,7 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
         }.value
     }
 
-    func persistedOutboxOwnerTranscriptRowIdsSnapshot() -> Set<String> {
+    func persistedOutboxOwnerTranscriptRowIdsSnapshot(scope: PersistenceScopeIdentity) -> Set<String> {
         Set(DiskStore.names(in: directory, withPrefix: "outbox-").compactMap { name in
             guard name.hasPrefix("outbox-") else { return nil }
             let conversationId = String(name.dropFirst("outbox-".count))
@@ -135,20 +133,11 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
             guard case .value(let envelope) = DiskStore.loadVersionedResult(
                 PersistedOutboxEnvelope.self,
                 source: source,
-                version: Outbox.schemaVersion,
-                migrate: { storedVersion, fileData in
-                    guard let entries = migrateLegacyOutboxEnvelope(
-                        storedVersion: storedVersion,
-                        fileData: fileData)
-                    else { return nil }
-                    return PersistedOutboxEnvelope(
-                        scope: nil,
-                        aggregateAuthority: nil,
-                        entries: entries)
-                })
+                version: Outbox.schemaVersion)
             else {
                 return nil
             }
+            guard envelope.scope == scope else { return nil }
             return envelope.entries.contains {
                 $0.conversationId == conversationId &&
                 $0.isVisible &&
@@ -173,14 +162,7 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
         switch DiskStore.loadVersionedResult(
             PersistedOutboxEnvelope.self,
             source: source,
-            version: Outbox.schemaVersion,
-            migrate: { storedVersion, fileData in
-                guard let entries = migrateLegacyOutboxEnvelope(
-                    storedVersion: storedVersion,
-                    fileData: fileData)
-                else { return nil }
-                return PersistedOutboxEnvelope(scope: nil, aggregateAuthority: nil, entries: entries)
-            })
+            version: Outbox.schemaVersion)
         {
         case .missing:
             return OutboxStoreInspection(conversationId: conversationId, state: .missing)
@@ -198,7 +180,11 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
         }
     }
 
-    func outboxPersistence(conversationId: String, aggregateAuthority: String?) -> OutboxPersistenceHandle {
+    func outboxPersistence(
+        conversationId: String,
+        aggregateAuthority: String?,
+        scope: PersistenceScopeIdentity
+    ) -> OutboxPersistenceHandle {
         let source = directory.appendingPathComponent("outbox-\(conversationId)").appendingPathExtension("json")
         let writer = context.writer(destinationURL: source, version: Outbox.schemaVersion)
         return OutboxPersistenceHandle(
@@ -215,7 +201,10 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
         return context.writer(destinationURL: destination, version: ConversationSession.snapshotSchemaVersion)
     }
 
-    func persistedConversationIds(aggregateId: String) -> Set<String> {
+    func persistedConversationIds(
+        aggregateId: String,
+        scope: PersistenceScopeIdentity
+    ) -> Set<String> {
         Set(DiskStore.names(in: directory, withPrefix: "conv-").compactMap { name -> String? in
             guard name.hasPrefix("conv-") else { return nil }
             let conversationId = String(name.dropFirst("conv-".count))
@@ -228,6 +217,9 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
                   case .value(let snapshot) = loaded,
                   snapshot.conversation?.product_conversation_id == aggregateId,
                   snapshot.conversation?.id == conversationId,
+                  let authority = snapshot.authoritative,
+                  authority.configurationIdentity.persistenceScope == scope,
+                  authority.aggregateAuthority == aggregateId,
                   snapshot.syncedAt != nil
             else { return nil }
             return conversationId
@@ -606,7 +598,10 @@ final class AppModel {
                 conversationId: conversationId,
                 api: api,
                 connectivity: connectivity,
-                outboxPersistence: conversationPersistenceStore.outboxPersistence(conversationId: conversationId, aggregateAuthority: aggregateIdentity(forTranscriptRowId: conversationId)),
+                outboxPersistence: conversationPersistenceStore.outboxPersistence(
+                    conversationId: conversationId,
+                    aggregateAuthority: aggregateIdentity(forTranscriptRowId: conversationId),
+                    scope: api.configurationIdentity.persistenceScope),
                 snapshotPersistence: conversationPersistenceStore.snapshotPersistence(conversationId: conversationId),
                 retryTiming: LiveSessionTiming(),
                 staleCheckTiming: LiveSessionTiming(),
@@ -624,8 +619,12 @@ final class AppModel {
         }
         let persistedAggregateIds = Set(listStore.transcriptToAggregate.values)
             .union(productConversationDetails.keys)
+        guard let scope = api?.configurationIdentity.persistenceScope else { return nil }
         for aggregateId in persistedAggregateIds {
-            if conversationPersistenceStore.persistedConversationIds(aggregateId: aggregateId).contains(transcriptRowId) {
+            if conversationPersistenceStore.persistedConversationIds(
+                aggregateId: aggregateId,
+                scope: scope).contains(transcriptRowId)
+            {
                 return aggregateId
             }
         }
@@ -679,12 +678,17 @@ final class AppModel {
         transcriptRowId: String?,
         segmentTranscriptRowIds: Set<String>
     ) async {
+        let persistedConversationIds = api.map {
+            conversationPersistenceStore.persistedConversationIds(
+                aggregateId: aggregateId,
+                scope: $0.configurationIdentity.persistenceScope)
+        } ?? []
         let aggregateConversationIds = Set(listStore.transcriptToAggregate.compactMap { key, value in
             value == aggregateId ? key : nil
         })
         .union(segmentTranscriptRowIds)
         .union(Set([transcriptRowId].compactMap { $0 }))
-        .union(conversationPersistenceStore.persistedConversationIds(aggregateId: aggregateId))
+        .union(persistedConversationIds)
         let cleanupGeneration = beginHardDeleteCleanup(conversationIds: aggregateConversationIds)
         let ownedSessions = aggregateConversationIds.compactMap { sessions.removeValue(forKey: $0) }
         let ownedDrainSessions = aggregateConversationIds.compactMap { drainSessions.removeValue(forKey: $0) }
@@ -1176,7 +1180,8 @@ final class AppModel {
         else { return [] }
         var drainedConversationIds: [String] = []
         let currentAPIIdentity = api.configurationIdentity
-        let candidateConversationIds = await conversationPersistenceStore.pendingOutboxOwnerTranscriptRowIds()
+        let candidateConversationIds = await conversationPersistenceStore.pendingOutboxOwnerTranscriptRowIds(
+            scope: api.configurationIdentity.persistenceScope)
         guard persistedOutboxDrainAuthorityGeneration == authorityGeneration,
               currentAPIIdentity == apiIdentity
         else { return drainedConversationIds }
@@ -1195,7 +1200,10 @@ final class AppModel {
                     conversationId: conversationId,
                     api: api,
                     connectivity: connectivity,
-                    outboxPersistence: conversationPersistenceStore.outboxPersistence(conversationId: conversationId, aggregateAuthority: aggregateIdentity(forTranscriptRowId: conversationId)),
+                    outboxPersistence: conversationPersistenceStore.outboxPersistence(
+                    conversationId: conversationId,
+                    aggregateAuthority: aggregateIdentity(forTranscriptRowId: conversationId),
+                    scope: api.configurationIdentity.persistenceScope),
                     snapshotPersistence: conversationPersistenceStore.snapshotPersistence(conversationId: conversationId),
                     retryTiming: LiveSessionTiming(),
                     staleCheckTiming: LiveSessionTiming(),
