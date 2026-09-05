@@ -4,7 +4,7 @@ import Security
 /// Minimal generic-password Keychain wrapper. Stores the Phoenix server
 /// password; everything else (server URL, toggles) lives in UserDefaults.
 enum Keychain {
-    private static let service = "com.phoenix.mobile"
+    private static let service = "com.scottopell.phoenix-ide"
 
     struct StoreError: LocalizedError {
         let status: OSStatus

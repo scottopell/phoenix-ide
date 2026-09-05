@@ -16,7 +16,7 @@ targets:
       - Sources
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.phoenix.mobile
+        PRODUCT_BUNDLE_IDENTIFIER: com.scottopell.phoenix-ide
         MARKETING_VERSION: "0.1.0"
         CURRENT_PROJECT_VERSION: "1"
         SWIFT_VERSION: "5.9"
@@ -40,9 +40,10 @@ targets:
         UIBackgroundModes:
           - fetch
         BGTaskSchedulerPermittedIdentifiers:
-          - com.phoenix.mobile.refresh
+          - com.scottopell.phoenix-ide.refresh
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
 

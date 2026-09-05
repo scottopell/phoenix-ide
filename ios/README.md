@@ -92,7 +92,7 @@ cd ios/PhoenixMobile
 xcodegen generate
 xcrun simctl boot 'iPhone 16' 2>/dev/null || true
 xcrun simctl bootstatus 'iPhone 16' -b
-xcrun simctl uninstall 'iPhone 16' com.phoenix.mobile 2>/dev/null || true
+xcrun simctl uninstall 'iPhone 16' com.scottopell.phoenix-ide 2>/dev/null || true
 xcodebuild test -project PhoenixMobile.xcodeproj -scheme PhoenixMobileUIQA \
   -destination 'platform=iOS Simulator,name=iPhone 16' \
   PHOENIX_UI_TEST_SERVER_URL_VALUE=https://127.0.0.1:<port> \
