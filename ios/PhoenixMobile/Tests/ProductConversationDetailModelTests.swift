@@ -109,7 +109,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
             aggregateId: "pc-1",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
-            sessionProvider: { id in
+            sessionProvider: { id, _ in
                 switch id {
                 case "row-1": row1
                 case "row-2": row2
@@ -134,7 +134,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
             aggregateId: "pc-1",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
-            sessionProvider: { id in id == "row-2" ? row2 : nil })
+            sessionProvider: { id, _ in id == "row-2" ? row2 : nil })
 
         model.applyForTesting(snapshot(lifecycle: .open, writable: nil))
         XCTAssertFalse(model.canSendChat)
@@ -151,7 +151,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
             aggregateId: "pc-1",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
-            sessionProvider: { _ in nil })
+            sessionProvider: { _, _ in nil })
 
         model.applyForTesting(snapshot())
 
@@ -167,7 +167,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
             aggregateId: "pc-1",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
-            sessionProvider: { id in id == "row-1" ? row1 : (id == "row-2" ? row2 : nil) })
+            sessionProvider: { id, _ in id == "row-1" ? row1 : (id == "row-2" ? row2 : nil) })
 
         model.applyForTesting(snapshot())
         model.selectTranscriptRow(id: "row-1")
@@ -190,7 +190,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
             aggregateId: "pc-1",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
-            sessionProvider: { id in id == "row-2" ? row2 : nil })
+            sessionProvider: { id, _ in id == "row-2" ? row2 : nil })
 
         model.applyForTesting(snapshot())
         let labels = model.transcriptItems.map(\.debugLabel)
@@ -202,7 +202,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
             aggregateId: "pc-1",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
-            sessionProvider: { _ in nil })
+            sessionProvider: { _, _ in nil })
         var snap = snapshot()
         snap.segments[0].messages = [
             .init(message_id: "tool-msg", conversation_id: "row-1", sequence_id: 4, message_type: "agent", content: .array([
@@ -246,7 +246,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
             aggregateId: "pc-1",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
-            sessionProvider: { id in id == "row-1" ? row1 : (id == "row-2" ? row2 : nil) },
+            sessionProvider: { id, _ in id == "row-1" ? row1 : (id == "row-2" ? row2 : nil) },
             existingSession: { id in id == "row-1" ? row1 : (id == "row-2" ? row2 : nil) })
 
         model.applyForTesting(snapshot())
@@ -275,7 +275,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
             aggregateId: "pc-1",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
-            sessionProvider: { _ in nil },
+            sessionProvider: { _, _ in nil },
             loadSnapshot: { _, _ in
                 switch await counter.increment() {
                 case 1:
@@ -332,7 +332,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
             aggregateId: "pc-1",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
-            sessionProvider: { _ in nil },
+            sessionProvider: { _, _ in nil },
             loadSnapshot: { _, _ in
                 switch await counter.increment() {
                 case 1:
@@ -368,7 +368,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
             aggregateId: "pc-1",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
-            sessionProvider: { id in id == "row-2" ? row2 : (id == "row-4" ? row4 : nil) })
+            sessionProvider: { id, _ in id == "row-2" ? row2 : (id == "row-4" ? row4 : nil) })
 
         model.handleSessionEvent(
             transcriptRowId: "row-2",
@@ -395,7 +395,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
             aggregateId: "pc-1",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
-            sessionProvider: { _ in nil },
+            sessionProvider: { _, _ in nil },
             loadSnapshot: { _, before in
                 box.calls.append(before)
                 defer { box.index += 1 }
@@ -417,7 +417,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
             aggregateId: "pc-1",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
-            sessionProvider: { id in counter.created.append(id); return self.makeSession(id: id) })
+            sessionProvider: { id, _ in counter.created.append(id); return self.makeSession(id: id) })
 
         model.applyForTesting(snapshot(lifecycle: .history, writable: nil))
         _ = model.stateDetailSession
@@ -436,7 +436,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
             aggregateId: "pc-1",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
-            sessionProvider: { id in id == "row-2" ? latest : nil },
+            sessionProvider: { id, _ in id == "row-2" ? latest : nil },
             existingSession: { id in id == "row-2" ? latest : nil })
 
         model.applyForTesting(snapshot(lifecycle: .open, writable: nil))
@@ -451,7 +451,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
             aggregateId: "pc-old",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
-            sessionProvider: { _ in nil })
+            sessionProvider: { _, _ in nil })
 
         XCTAssertTrue(model.invalidatesAggregateForTesting(.init(
             transcriptRowId: "row-2",
@@ -509,7 +509,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
             aggregateId: "pc-1",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
-            sessionProvider: { _ in nil },
+            sessionProvider: { _, _ in nil },
             loadSnapshot: { _, _ in
                 switch await calls.next() {
                 case 1:
@@ -549,7 +549,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
             aggregateId: "pc-1",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
-            sessionProvider: { _ in nil },
+            sessionProvider: { _, _ in nil },
             loadSnapshot: { _, before in
                 box.calls.append(before)
                 defer { box.index += 1 }
@@ -594,7 +594,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
                 aggregateId: "pc-1",
                 api: self.makeAPI(),
                 connectivity: connectivity,
-                sessionProvider: { id in
+                sessionProvider: { id, _ in
                     registry.created.append(id)
                     if registry.sessions[id] == nil, id == "row-1" {
                         registry.sessions[id] = row1
@@ -627,7 +627,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
             aggregateId: "pc-1",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
-            sessionProvider: { _ in nil },
+            sessionProvider: { _, _ in nil },
             loadSnapshot: { _, _ in defer { box.index += 1 }; return pages[min(box.index, pages.count - 1)] })
 
         await model.start()
@@ -648,7 +648,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
             aggregateId: "pc-1",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
-            sessionProvider: { id in id == "row-2" ? latest : nil },
+            sessionProvider: { id, _ in id == "row-2" ? latest : nil },
             existingSession: { id in id == "row-2" ? latest : nil })
 
         model.applyForTesting(snapshot(lifecycle: .open, writable: nil))
@@ -671,7 +671,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
             aggregateId: "pc-1",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
-            sessionProvider: { id in id == "row-2" ? writable : nil },
+            sessionProvider: { id, _ in id == "row-2" ? writable : nil },
             existingSession: { id in id == "row-2" ? writable : nil })
 
         model.applyForTesting(snapshot(lifecycle: .open, writable: "row-2"))
@@ -693,7 +693,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
             aggregateId: "pc-1",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
-            sessionProvider: { id in id == "row-2" ? latest : nil },
+            sessionProvider: { id, _ in id == "row-2" ? latest : nil },
             existingSession: { id in id == "row-2" ? latest : nil },
             loadSnapshot: { _, _ in self.snapshot(lifecycle: .open, writable: nil) })
 
@@ -720,7 +720,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
                 initialTranscriptRowId: "row-2",
                 api: self.makeAPI(),
                 connectivity: ConnectivityMonitor(),
-                sessionProvider: { id in id == "row-2" ? cached : nil },
+                sessionProvider: { id, _ in id == "row-2" ? cached : nil },
                 existingSession: { id in id == "row-2" ? cached : nil },
                 persistedOutboxContents: { persisted.contents(for: $0) },
                 hasCachedSnapshot: { $0 == "row-2" },
@@ -746,7 +746,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
             aggregateId: "pc-1",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
-            sessionProvider: { id in id == "row-2" ? existing : nil },
+            sessionProvider: { id, _ in id == "row-2" ? existing : nil },
             existingSession: { id in id == "row-2" ? existing : nil })
 
         model.applyForTesting(snapshot(lifecycle: .history, writable: nil))
@@ -771,7 +771,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
             aggregateId: "pc-1",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
-            sessionProvider: { _ in nil },
+            sessionProvider: { _, _ in nil },
             loadSnapshot: { _, _ in
                 switch await calls.next() {
                 case 1:
@@ -810,7 +810,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
             aggregateId: "pc-1",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
-            sessionProvider: { id in id == "row-2" ? cached : nil },
+            sessionProvider: { id, _ in id == "row-2" ? cached : nil },
             existingSession: { id in id == "row-2" ? cached : nil },
             loadSnapshot: { _, _ in throw URLError(.timedOut) })
 
@@ -828,7 +828,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
             aggregateId: "pc-1",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
-            sessionProvider: { id in
+            sessionProvider: { id, _ in
                 counter.created.append(id)
                 return id == "row-2" ? row2 : nil
             },
@@ -856,7 +856,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
             initialTranscriptRowId: "row-2",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
-            sessionProvider: { id in id == "row-2" ? uncached : nil },
+            sessionProvider: { id, _ in id == "row-2" ? uncached : nil },
             existingSession: { _ in nil },
             hasCachedSnapshot: { _ in false },
             loadSnapshot: { _, _ in throw APIError.transport(underlying: URLError(.notConnectedToInternet)) })
@@ -877,7 +877,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
             initialTranscriptRowId: "row-2",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
-            sessionProvider: { _ in nil },
+            sessionProvider: { _, _ in nil },
             existingSession: { _ in nil },
             handleDefinitiveNotFound: { transcriptRowId, _ in
                 box.cleanedTranscriptRowId = transcriptRowId
@@ -900,7 +900,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
             initialTranscriptRowId: nil,
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
-            sessionProvider: { id in
+            sessionProvider: { id, _ in
                 switch id {
                 case "row-1": row1
                 case "row-2": row2
@@ -1006,7 +1006,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
             aggregateId: "pc-1",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
-            sessionProvider: { _ in nil },
+            sessionProvider: { _, _ in nil },
             existingSession: { _ in nil },
             loadSnapshot: { _, before in
                 let call = await box.record(before)
@@ -1046,7 +1046,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
             aggregateId: "pc-a",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
-            sessionProvider: { _ in nil },
+            sessionProvider: { _, _ in nil },
             existingSession: { _ in nil },
             loadSnapshot: { _, _ in
                 let count = await calls.next()
@@ -1092,7 +1092,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
             aggregateId: "pc-a",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
-            sessionProvider: { _ in nil },
+            sessionProvider: { _, _ in nil },
             existingSession: { _ in nil },
             loadSnapshot: { _, before in
                 let call = await box.record(before)
@@ -1132,7 +1132,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
             aggregateId: "pc-1",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
-            sessionProvider: { $0 == "row-2" ? row2 : nil })
+            sessionProvider: { id, _ in id == "row-2" ? row2 : nil })
         model.applyForTesting(snapshot())
         XCTAssertFalse(model.transcriptItems.isEmpty)
         XCTAssertNotNil(model.actionSession)
@@ -1157,7 +1157,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
             aggregateId: "pc-1",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
-            sessionProvider: { _ in nil },
+            sessionProvider: { _, _ in nil },
             loadSnapshot: { _, _ in
                 let call = await calls.next()
                 if call > 1 {
@@ -1198,7 +1198,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
             aggregateId: "pc-1",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
-            sessionProvider: { _ in nil },
+            sessionProvider: { _, _ in nil },
             existingSession: { _ in nil },
             loadSnapshot: { _, before in
                 let call = await box.record(before)
@@ -1257,7 +1257,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
             aggregateId: "pc-1",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
-            sessionProvider: { _ in nil },
+            sessionProvider: { _, _ in nil },
             existingSession: { _ in nil },
             loadSnapshot: { _, before in
                 let call = await box.record(before)
@@ -1300,7 +1300,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
             aggregateId: "pc-1",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
-            sessionProvider: { id in
+            sessionProvider: { id, _ in
                 box.created.append(id)
                 if box.sessions[id] == nil, id == "row-1" { box.sessions[id] = row1 }
                 return box.sessions[id]
