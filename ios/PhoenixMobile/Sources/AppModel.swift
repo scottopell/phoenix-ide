@@ -53,6 +53,11 @@ struct UserDefaultsCoordinatorIdentityStore: CoordinatorIdentityStore {
     }
 }
 
+enum HardDeleteFenceLoadResult: Equatable, Sendable {
+    case accessible([PersistedHardDeleteFence])
+    case inaccessible
+}
+
 struct PersistedHardDeleteFence: Codable, Equatable, Sendable {
     let configurationIdentity: APIConfigurationIdentity
     let aggregateAuthority: String
@@ -111,7 +116,7 @@ protocol ConversationPersistenceStore {
     ) async -> Bool
     func removeAllPersistedConversationState() async
     func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool
-    func hardDeleteFences(configurationIdentity: APIConfigurationIdentity) -> [PersistedHardDeleteFence]
+    func hardDeleteFences(configurationIdentity: APIConfigurationIdentity) -> HardDeleteFenceLoadResult
     func retireHardDeleteFence(_ fence: PersistedHardDeleteFence) async
 }
 
@@ -393,17 +398,26 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
         return await writer.save(fence, revision: writer.reserveRevision())
     }
 
-    func hardDeleteFences(configurationIdentity: APIConfigurationIdentity) -> [PersistedHardDeleteFence] {
-        DiskStore.names(in: directory, withPrefix: "hard-delete-").compactMap { name in
+    func hardDeleteFences(configurationIdentity: APIConfigurationIdentity) -> HardDeleteFenceLoadResult {
+        var fences: [PersistedHardDeleteFence] = []
+        for name in DiskStore.names(in: directory, withPrefix: "hard-delete-") {
             let source = directory.appendingPathComponent(name).appendingPathExtension("json")
-            guard case .value(let fence) = DiskStore.loadVersionedResult(
+            switch DiskStore.loadVersionedResult(
                 PersistedHardDeleteFence.self,
                 source: source,
-                version: 1),
-                fence.configurationIdentity == configurationIdentity
-            else { return nil }
-            return fence
+                version: 1)
+            {
+            case .missing:
+                continue
+            case .value(let fence):
+                if fence.configurationIdentity == configurationIdentity {
+                    fences.append(fence)
+                }
+            case .incompatible, .unreadable:
+                return .inaccessible
+            }
         }
+        return .accessible(fences)
     }
 
     func retireHardDeleteFence(_ fence: PersistedHardDeleteFence) async {
@@ -608,8 +622,14 @@ final class AppModel {
     private func finishStartupHydration() {
         guard let api else { return }
         let identity = api.configurationIdentity
-        let fences = conversationPersistenceStore.hardDeleteFences(
-            configurationIdentity: identity)
+        let fences: [PersistedHardDeleteFence]
+        switch conversationPersistenceStore.hardDeleteFences(configurationIdentity: identity) {
+        case .accessible(let loaded):
+            fences = loaded
+        case .inaccessible:
+            persistedOutboxHydrated = false
+            return
+        }
         hardDeletedConversationIds.formUnion(fences.flatMap(\.memberConversationIds))
         guard !fences.isEmpty else {
             persistedOutboxHydrated = true
@@ -909,6 +929,10 @@ final class AppModel {
     }
 
     private func runHardDeleteCleanup(_ context: HardDeleteCleanupContext) async {
+        func contextIsCurrent() -> Bool {
+            apiGeneration == context.configurationEpoch
+                && api?.configurationIdentity == context.configurationIdentity
+        }
         let fence: PersistedHardDeleteFence
         switch context.fenceState {
         case .needsCommit:
@@ -917,21 +941,20 @@ final class AppModel {
                 aggregateAuthority: context.aggregateAuthority,
                 memberConversationIds: context.memberConversationIds.sorted())
             guard await conversationPersistenceStore.persistHardDeleteFence(fence) else { return }
+            guard contextIsCurrent() else { return }
         case .committed(let persisted):
             fence = persisted
         }
 
-        guard apiGeneration == context.configurationEpoch,
-              api?.configurationIdentity == context.configurationIdentity
-        else { return }
+        guard contextIsCurrent() else { return }
 
         let memberIds = Set(fence.memberConversationIds)
         let cleanupGeneration = beginHardDeleteCleanup(conversationIds: memberIds)
         productConversationDetails[context.aggregateAuthority]?.invalidateHardDeleted()
         productConversationDetails.removeValue(forKey: context.aggregateAuthority)
         for id in memberIds {
-            sessions.removeValue(forKey: id)?.invalidateConfiguration()
-            drainSessions.removeValue(forKey: id)?.invalidateConfiguration()
+            sessions.removeValue(forKey: id)?.revokeForHardDelete()
+            drainSessions.removeValue(forKey: id)?.revokeForHardDelete()
         }
         if pendingOpenConversationId == context.triggerConversationId
             || pendingOpenConversationId == context.aggregateAuthority
@@ -945,15 +968,18 @@ final class AppModel {
                 conversationId: id,
                 configurationIdentity: context.configurationIdentity,
                 aggregateAuthority: context.aggregateAuthority)
+            guard contextIsCurrent() else { return }
             removedAll = removedAll && removed
         }
         guard removedAll,
-              await listStore.removeAndPersist(aggregateId: context.aggregateAuthority)
+              await listStore.removeAndPersist(aggregateId: context.aggregateAuthority),
+              contextIsCurrent()
         else {
             completeHardDeleteCleanup(generation: cleanupGeneration, conversationIds: memberIds)
             return
         }
         await conversationPersistenceStore.retireHardDeleteFence(fence)
+        guard contextIsCurrent() else { return }
         completeHardDeleteCleanup(generation: cleanupGeneration, conversationIds: memberIds)
         UNUserNotificationCenter.current().removeDeliveredNotifications(
             withIdentifiers: ["attention-\(context.aggregateAuthority)"])
@@ -1360,6 +1386,10 @@ final class AppModel {
             ?? productConversationDetails.first(where: {
                 $0.value.aggregateMemberTranscriptRowIds.contains(conversationId)
             })?.key
+        let archiveConversationId = aggregateId.flatMap { aggregate in
+            listStore.conversations.first(where: { $0.aggregateIdentity == aggregate })?.id
+                ?? productConversationDetails[aggregate]?.snapshot?.canonical_root.transcript_row_id
+        } ?? conversationId
         let memberIds = aggregateId.map {
             authoritativeAggregateMemberIds(
                 aggregateId: $0,
@@ -1397,7 +1427,7 @@ final class AppModel {
             if !archived { session.endArchiving() }
         }
         do {
-            try await api.archive(conversationId: conversationId)
+            try await api.archive(conversationId: archiveConversationId)
             archived = true
             session.stop()
             await session.clearCachedSnapshotAndWait()

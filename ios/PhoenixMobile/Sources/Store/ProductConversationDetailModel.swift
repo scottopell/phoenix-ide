@@ -466,6 +466,14 @@ final class ProductConversationDetailModel {
             loadError = nil
         } catch {
             guard generation == loadGeneration, !Task.isCancelled else { return }
+            if let apiError = error as? APIError, apiError.isNotFound {
+                await handleDefinitiveNotFound(
+                    selectedTranscriptRowId ?? initialTranscriptRowId,
+                    aggregateMemberTranscriptRowIds)
+                invalidateHardDeleted()
+                loadError = nil
+                return
+            }
             loadError = (error as? APIError)?.errorDescription ?? error.localizedDescription
         }
         if generation == loadGeneration { loadingOlder = false }

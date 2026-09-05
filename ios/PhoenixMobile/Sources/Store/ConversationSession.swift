@@ -290,6 +290,13 @@ final class ConversationSession {
         drainOutbox()
     }
 
+    func revokeForHardDelete() {
+        isHardDeleted = true
+        snapshotPersistenceEnabled = false
+        invalidateOutboxAuthority()
+        stop()
+    }
+
     func invalidateConfiguration() {
         invalidateOutboxAuthority()
         invalidateLiveWork()
