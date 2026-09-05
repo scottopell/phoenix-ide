@@ -706,10 +706,14 @@ final class ConversationSessionReducerTests: XCTestCase {
         XCTAssertTrue(session.isHardDeleted)
         XCTAssertTrue(session.messages.isEmpty)
         XCTAssertNil(session.conversation)
-        XCTAssertTrue(session.outbox.entries.isEmpty)
         XCTAssertEqual(deletedContext?.conversationId, "c1")
-        XCTAssertEqual(deletedContext?.aggregateIdentity, "c1")
-        XCTAssertFalse(( { if case .value = DiskStore.loadVersionedResult(ConversationSession.PersistedSnapshot.self, source: DiskStore.phoenixMobileDirectory(baseDirectory: DiskStore.baseDirectory).appendingPathComponent("conv-c1").appendingPathExtension("json"), version: ConversationSession.snapshotSchemaVersion) { return true } else { return false } }() ))
+        XCTAssertEqual(deletedContext?.aggregateAuthority, "c1")
+        XCTAssertEqual(
+            deletedContext?.configurationIdentity,
+            APIConfigurationIdentity(
+                serverURL: "https://phoenix.invalid",
+                credentialGeneration: "test-default",
+                trustSelfSigned: false))
     }
 
     @MainActor

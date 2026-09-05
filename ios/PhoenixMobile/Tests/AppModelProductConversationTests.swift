@@ -1852,6 +1852,58 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertFalse(detail.canSendChat)
     }
 
+    func testSessionHardDeleteBeforeInitStillCommitsFenceAndRemovesState() async {
+        let baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-pre-init-delete-\(UUID().uuidString)")
+        let context = DiskStore.versionedContext(baseDirectory: baseDirectory)
+        let store = DiskConversationPersistenceStore(baseDirectory: baseDirectory, context: context)
+        let model = makeModel(conversationPersistenceStore: store)
+        model.configureForTesting(serverURL: "https://example.com", trustSelfSigned: true)
+        let session = try! XCTUnwrap(model.session(for: "row-1"))
+
+        session.receive(.conversationHardDeleted(seq: 1, conversationId: "row-1"))
+        await session.awaitHardDeleteReportForTesting()
+        await model.awaitHardDeleteCleanupForTesting(conversationId: "row-1")
+
+        XCTAssertTrue(store.hardDeleteFences(
+            configurationIdentity: APIConfigurationIdentity(
+                serverURL: "https://example.com",
+                credentialGeneration: "test-default",
+                trustSelfSigned: true)).isEmpty)
+        XCTAssertNil(model.existingSession(for: "row-1"))
+    }
+
+    func testHardDeleteFenceStorageIdentitySeparatesConfigurationsAndRetiresExactPath() async {
+        let baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-fence-identity-\(UUID().uuidString)")
+        let store = DiskConversationPersistenceStore(
+            baseDirectory: baseDirectory,
+            context: DiskStore.versionedContext(baseDirectory: baseDirectory))
+        let identityA = defaultConfigurationIdentity
+        let identityB = APIConfigurationIdentity(
+            serverURL: identityA.serverURL,
+            credentialGeneration: "other-credential",
+            trustSelfSigned: identityA.trustSelfSigned)
+        let fenceA = PersistedHardDeleteFence(
+            configurationIdentity: identityA,
+            aggregateAuthority: "pc-1",
+            memberConversationIds: ["row-1"])
+        let fenceB = PersistedHardDeleteFence(
+            configurationIdentity: identityB,
+            aggregateAuthority: "pc-1",
+            memberConversationIds: ["row-1"])
+
+        XCTAssertNotEqual(fenceA.storageName, fenceB.storageName)
+        let savedA = await store.persistHardDeleteFence(fenceA)
+        let savedB = await store.persistHardDeleteFence(fenceB)
+        XCTAssertTrue(savedA)
+        XCTAssertTrue(savedB)
+        await store.retireHardDeleteFence(fenceA)
+
+        XCTAssertTrue(store.hardDeleteFences(configurationIdentity: identityA).isEmpty)
+        XCTAssertEqual(store.hardDeleteFences(configurationIdentity: identityB), [fenceB])
+    }
+
     func testStartupRecoversDurableHardDeleteFenceBeforeOutboxDrain() async {
         let baseDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("phoenix-hard-delete-recovery-\(UUID().uuidString)")
@@ -1881,10 +1933,11 @@ final class AppModelProductConversationTests: XCTestCase {
                 syncedAt: Date()))
         let snapshotWriter = store.snapshotPersistence(conversationId: "row-1")
         _ = await snapshotWriter.save(snapshot, revision: snapshotWriter.reserveRevision())
-        _ = await store.persistHardDeleteFence(.init(
+        let fence = PersistedHardDeleteFence(
             configurationIdentity: identity,
             aggregateAuthority: "pc-1",
-            memberConversationIds: ["row-1"]))
+            memberConversationIds: ["row-1"])
+        _ = await store.persistHardDeleteFence(fence)
 
         let model = makeModel(conversationPersistenceStore: store)
         model.replaceAPIForTesting(api)
@@ -1897,7 +1950,7 @@ final class AppModelProductConversationTests: XCTestCase {
         let directory = DiskStore.phoenixMobileDirectory(baseDirectory: baseDirectory)
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("conv-row-1.json").path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("outbox-row-1.json").path))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("hard-delete-pc-1.json").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent(fence.storageName).appendingPathExtension("json").path))
     }
 
     func testStartupRecoversPartialHardDeleteAndRetiresFence() async {
@@ -1919,10 +1972,11 @@ final class AppModelProductConversationTests: XCTestCase {
                 aggregateAuthority: "pc-1",
                 entries: [entry]),
             revision: outbox.reserveRevision())
-        _ = await store.persistHardDeleteFence(.init(
+        let fence = PersistedHardDeleteFence(
             configurationIdentity: identity,
             aggregateAuthority: "pc-1",
-            memberConversationIds: ["row-1"]))
+            memberConversationIds: ["row-1"])
+        _ = await store.persistHardDeleteFence(fence)
 
         let model = makeModel(conversationPersistenceStore: store)
         model.replaceAPIForTesting(api)
@@ -1931,7 +1985,7 @@ final class AppModelProductConversationTests: XCTestCase {
 
         let directory = DiskStore.phoenixMobileDirectory(baseDirectory: baseDirectory)
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("outbox-row-1.json").path))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("hard-delete-pc-1.json").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent(fence.storageName).appendingPathExtension("json").path))
     }
 
     func testHardDeleteCleanupWaitsForPersistedRemovalAfterSessionEviction() async {
