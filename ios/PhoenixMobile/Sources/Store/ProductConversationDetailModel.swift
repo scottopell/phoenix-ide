@@ -671,7 +671,7 @@ final class ProductConversationDetailModel {
         let desiredStarted: String?
         if canSendChat {
             desiredStarted = actionTranscriptRowId
-        } else if canMutateLifecycle {
+        } else if !isHistoryReadOnly {
             desiredStarted = latestTranscriptRowId
         } else {
             desiredStarted = nil
