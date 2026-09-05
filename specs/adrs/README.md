@@ -59,6 +59,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [045](045_provider-prompts-use-persisted-generation-fenced-projections.md) | Provider prompts use persisted generation-fenced projections | Accepted | REQ-BED-018A, REQ-BED-020, REQ-BED-030A |
 | [046](046_productconversation-owns-aggregate-presentation.md) | ProductConversation owns aggregate presentation without duplicating transcript authority | Accepted | REQ-BED-030A; `ProductConversation`, transcript members |
 | [047](047_global-coordinator-unsandboxed-bash.md) | Global Coordinator uses explicitly targeted unsandboxed Bash | Accepted | REQ-BASH-012/013, REQ-GR-007; singleton Coordinator, explicit active WorkScope target |
+| [048](048_ios-legacy-snapshots-render-read-only.md) | Proven same-installation legacy iOS snapshots render read-only | Accepted | REQ-IOS-002, REQ-IOS-005, compatibility requirements |
 
 ## For agents: which decisions bind your task
 

@@ -198,6 +198,7 @@ final class ConversationSession {
         staleCheckTiming: any SessionTiming,
         openEventStream: @escaping ConversationEventStreamOpener = defaultConversationEventStreamOpener,
         deliveryTriggerAllowed: @escaping () -> Bool = { true },
+        legacySnapshotPersistenceScope: PersistenceScopeIdentity? = nil,
         aggregateAuthority: String? = nil,
         onConversationUpdate: ((Conversation) -> Void)? = nil,
         onHardDeleted: @escaping @MainActor (HardDeleteContext) async -> Void = { _ in }
@@ -261,6 +262,24 @@ final class ConversationSession {
             // the matching outbox row not yet pruned. Reconcile at load so the
             // same user message never renders twice while offline.
             reconcileOutbox()
+        } else if case .value(let snap) = loadedSnapshot,
+                  snap.authoritative == nil,
+                  legacySnapshotPersistenceScope == api.configurationIdentity.persistenceScope,
+                  let persistedConversation = snap.conversation,
+                  Self.receiptIdentity(
+                      for: persistedConversation,
+                      sessionConversationId: conversationId,
+                      expectedAggregateAuthority: self.aggregateAuthority) != nil
+        {
+            conversation = persistedConversation
+            messages = snap.messages
+            durableMessageSequenceCeiling = snap.messages.map { $0.sequence_id }.max() ?? 0
+            lastSequenceId = snap.lastSequenceId
+            transcriptGeneration = snap.transcriptGeneration
+            snapshotSyncedAt = snap.syncedAt
+            presentationMode = persistedConversation.presentation_mode
+            agentWorking = presentationMode == "working"
+            rebuildToolUseIndex()
         }
     }
 

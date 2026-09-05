@@ -233,7 +233,7 @@ private final class TestConversationPersistenceStore: ConversationPersistenceSto
         return true
     }
     func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool { true }
-    func hardDeleteFences(configurationIdentity: APIConfigurationIdentity) -> HardDeleteFenceLoadResult { .accessible([]) }
+    func hardDeleteFences(persistenceScope: PersistenceScopeIdentity) -> HardDeleteFenceLoadResult { .accessible([]) }
     func retireHardDeleteFence(_ fence: PersistedHardDeleteFence) async {}
     func removeAllPersistedConversationState() async {
         for conversationId in outboxStore.ownerTranscriptRowIds {
@@ -432,7 +432,7 @@ final class ResettableConversationPersistenceStore: ConversationPersistenceStore
         return true
     }
     func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool { true }
-    func hardDeleteFences(configurationIdentity: APIConfigurationIdentity) -> HardDeleteFenceLoadResult { .accessible([]) }
+    func hardDeleteFences(persistenceScope: PersistenceScopeIdentity) -> HardDeleteFenceLoadResult { .accessible([]) }
     func retireHardDeleteFence(_ fence: PersistedHardDeleteFence) async {}
     func removeAllPersistedConversationState() async {
         await wrapped.removeAllPersistedConversationState()
@@ -487,7 +487,7 @@ final class HardDeleteGatedConversationPersistenceStore: ConversationPersistence
         return true
     }
     func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool { true }
-    func hardDeleteFences(configurationIdentity: APIConfigurationIdentity) -> HardDeleteFenceLoadResult { .accessible([]) }
+    func hardDeleteFences(persistenceScope: PersistenceScopeIdentity) -> HardDeleteFenceLoadResult { .accessible([]) }
     func retireHardDeleteFence(_ fence: PersistedHardDeleteFence) async {}
     func removeAllPersistedConversationState() async {}
 }
@@ -550,7 +550,7 @@ final class GatedConversationPersistenceStore: ConversationPersistenceStore {
         return true
     }
     func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool { true }
-    func hardDeleteFences(configurationIdentity: APIConfigurationIdentity) -> HardDeleteFenceLoadResult { .accessible([]) }
+    func hardDeleteFences(persistenceScope: PersistenceScopeIdentity) -> HardDeleteFenceLoadResult { .accessible([]) }
     func retireHardDeleteFence(_ fence: PersistedHardDeleteFence) async {}
     func removeAllPersistedConversationState() async {
         for conversationId in outboxStore.ownerTranscriptRowIds {
@@ -618,7 +618,7 @@ final class MutableTestConversationPersistenceStore: ConversationPersistenceStor
         return true
     }
     func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool { true }
-    func hardDeleteFences(configurationIdentity: APIConfigurationIdentity) -> HardDeleteFenceLoadResult {
+    func hardDeleteFences(persistenceScope: PersistenceScopeIdentity) -> HardDeleteFenceLoadResult {
         hardDeleteFenceLoadCount += 1
         return hardDeleteFenceLoadResult
     }
@@ -776,7 +776,8 @@ final class AppModelProductConversationTests: XCTestCase {
         productConversationStatusCode: Int = 200,
         productConversationBody: Data = Data("{}".utf8),
         chatStatusCode: Int = 200,
-        chatBody: Data = Data("{\"queued\":false}".utf8)
+        chatBody: Data = Data("{\"queued\":false}".utf8),
+        configurationIdentity: APIConfigurationIdentity? = nil
     ) -> (api: PhoenixAPI, registration: UUID) {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [TestURLProtocol.self]
@@ -799,7 +800,7 @@ final class AppModelProductConversationTests: XCTestCase {
             baseURL: URL(string: "https://\(host)")!,
             password: nil,
             allowSelfSigned: false,
-            configurationIdentity: APIConfigurationIdentity(serverURL: "https://\(host)", credentialGeneration: host, trustSelfSigned: false),
+            configurationIdentity: configurationIdentity ?? APIConfigurationIdentity(serverURL: "https://\(host)", credentialGeneration: host, trustSelfSigned: false),
             session: session,
             streamSession: session)!
         return (api, registration)
@@ -1963,10 +1964,10 @@ final class AppModelProductConversationTests: XCTestCase {
         await session.awaitHardDeleteReportForTesting()
         await model.awaitHardDeleteCleanupForTesting(conversationId: "row-1")
 
-        XCTAssertTrue(store.hardDeleteFences(configurationIdentity: APIConfigurationIdentity(
+        XCTAssertTrue(store.hardDeleteFences(persistenceScope: APIConfigurationIdentity(
                 serverURL: "https://example.com",
                 credentialGeneration: "test-default",
-                trustSelfSigned: true)) == .accessible([]))
+                trustSelfSigned: true).persistenceScope) == .accessible([]))
         XCTAssertNil(model.existingSession(for: "row-1"))
     }
 
@@ -1982,11 +1983,11 @@ final class AppModelProductConversationTests: XCTestCase {
             credentialGeneration: "other-credential",
             trustSelfSigned: identityA.trustSelfSigned)
         let fenceA = PersistedHardDeleteFence(
-            configurationIdentity: identityA,
+            persistenceScope: identityA.persistenceScope,
             aggregateAuthority: "pc-1",
             memberConversationIds: ["row-1"])
         let fenceB = PersistedHardDeleteFence(
-            configurationIdentity: identityB,
+            persistenceScope: identityB.persistenceScope,
             aggregateAuthority: "pc-1",
             memberConversationIds: ["row-1"])
 
@@ -1997,8 +1998,8 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertTrue(savedB)
         await store.retireHardDeleteFence(fenceA)
 
-        XCTAssertTrue(store.hardDeleteFences(configurationIdentity: identityA) == .accessible([]))
-        XCTAssertEqual(store.hardDeleteFences(configurationIdentity: identityB), .accessible([fenceB]))
+        XCTAssertTrue(store.hardDeleteFences(persistenceScope: identityA.persistenceScope) == .accessible([]))
+        XCTAssertEqual(store.hardDeleteFences(persistenceScope: identityB.persistenceScope), .accessible([fenceB]))
     }
 
     func testStartupRecoversDurableHardDeleteFenceBeforeOutboxDrain() async {
@@ -2031,7 +2032,7 @@ final class AppModelProductConversationTests: XCTestCase {
         let snapshotWriter = store.snapshotPersistence(conversationId: "row-1")
         _ = await snapshotWriter.save(snapshot, revision: snapshotWriter.reserveRevision())
         let fence = PersistedHardDeleteFence(
-            configurationIdentity: identity,
+            persistenceScope: identity.persistenceScope,
             aggregateAuthority: "pc-1",
             memberConversationIds: ["row-1"])
         _ = await store.persistHardDeleteFence(fence)
@@ -2048,6 +2049,51 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("conv-row-1.json").path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("outbox-row-1.json").path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent(fence.storageName).appendingPathExtension("json").path))
+    }
+
+    func testStartupRecoversFenceAfterTrustToggleBeforeDrain() async {
+        let baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-hard-delete-trust-toggle-\(UUID().uuidString)")
+        let context = DiskStore.versionedContext(baseDirectory: baseDirectory)
+        let store = DiskConversationPersistenceStore(baseDirectory: baseDirectory, context: context)
+        let identityBeforeCrash = APIConfigurationIdentity(
+            serverURL: "https://phoenix.invalid",
+            credentialGeneration: "same-credential",
+            trustSelfSigned: false)
+        let fence = PersistedHardDeleteFence(
+            persistenceScope: identityBeforeCrash.persistenceScope,
+            aggregateAuthority: "pc-1",
+            memberConversationIds: ["row-1"])
+        _ = await store.persistHardDeleteFence(fence)
+        let entry = makePendingOutboxEntry(conversationId: "row-1")
+        let outbox = store.outboxPersistence(
+            conversationId: "row-1",
+            aggregateAuthority: "pc-1",
+            scope: identityBeforeCrash.persistenceScope)
+        _ = await outbox.save(
+            .init(scope: identityBeforeCrash.persistenceScope, aggregateAuthority: "pc-1", entries: [entry]),
+            revision: outbox.reserveRevision())
+        let probe = SendProbe()
+        let (api, registration) = makeHTTPAPI(
+            probe: probe,
+            configurationIdentity: .init(
+                serverURL: "https://phoenix.invalid",
+                credentialGeneration: "same-credential",
+                trustSelfSigned: true))
+        defer { TestURLProtocol.uninstall(host: "phoenix.invalid", owner: registration) }
+        let model = makeModel(conversationPersistenceStore: store)
+        model.replaceAPIForTesting(api)
+        model.connectivity.setOnlineForTesting(true)
+        model.triggerStartupHardDeleteRecoveryForTesting()
+        await model.awaitStartupHardDeleteRecoveryForTesting()
+
+        XCTAssertTrue(probe.chatPostPaths.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: DiskStore.phoenixMobileDirectory(baseDirectory: baseDirectory)
+                .appendingPathComponent(fence.storageName).appendingPathExtension("json").path))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: DiskStore.phoenixMobileDirectory(baseDirectory: baseDirectory)
+                .appendingPathComponent("outbox-row-1.json").path))
     }
 
     func testStartupRecoversPartialHardDeleteAndRetiresFence() async {
@@ -2070,7 +2116,7 @@ final class AppModelProductConversationTests: XCTestCase {
                 entries: [entry]),
             revision: outbox.reserveRevision())
         let fence = PersistedHardDeleteFence(
-            configurationIdentity: identity,
+            persistenceScope: identity.persistenceScope,
             aggregateAuthority: "pc-1",
             memberConversationIds: ["row-1"])
         _ = await store.persistHardDeleteFence(fence)
