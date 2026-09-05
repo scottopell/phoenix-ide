@@ -245,15 +245,23 @@ final class ProductConversationDetailModel {
     }
 
     func invalidateConfiguration() {
+        invalidate(clearError: true)
+        onConfigurationInvalidated(self)
+    }
+
+    func invalidateHardDeleted() {
+        invalidate(clearError: false)
+    }
+
+    private func invalidate(clearError: Bool) {
         stop()
         snapshot = nil
         retainedOlderPages.removeAll()
         selectedTranscriptRowId = nil
         actionTranscriptRowId = nil
-        loadError = nil
+        if clearError { loadError = nil }
         loading = false
         loadingOlder = false
-        onConfigurationInvalidated(self)
     }
 
     func refresh(cause: ProductConversationRefreshCause = .manual) async {
