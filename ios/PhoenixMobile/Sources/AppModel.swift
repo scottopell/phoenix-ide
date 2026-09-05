@@ -1134,7 +1134,8 @@ final class AppModel {
         else { return }
         let persistedMembers = conversationPersistenceStore.persistedConversationIds(
             aggregateId: report.aggregateAuthority,
-            scope: report.configurationIdentity.persistenceScope)
+            scope: report.configurationIdentity.persistenceScope,
+            legacyScope: legacySnapshotPersistenceScope)
         let listMembers = Set(listStore.transcriptToAggregate.compactMap { id, aggregate in
             aggregate == report.aggregateAuthority ? id : nil
         })
