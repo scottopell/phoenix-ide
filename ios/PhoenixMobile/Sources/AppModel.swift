@@ -608,7 +608,7 @@ final class AppModel {
             transcriptToAggregate: listStore.transcriptToAggregate)
         rebuildAPI()
         _ = connectivity.addRestoreObserver { [weak self] in
-            self?.resumeStartupHydrationOrScheduleDrain()
+            self?.scheduleDeliveryTrigger(.connectivityRestore)
             Task { await self?.refreshList() }
         }
         notificationRouter.model = self
@@ -656,11 +656,28 @@ final class AppModel {
         }
     }
 
-    private func resumeStartupHydrationOrScheduleDrain() {
-        if persistedOutboxHydrated {
-            schedulePersistedOutboxDrain()
-        } else if startupHardDeleteRecoveryTask == nil {
+    private enum DeliveryTrigger {
+        case connectivityRestore
+        case foreground
+    }
+
+    private func resumeAfterDeliveryTrigger(_ trigger: DeliveryTrigger) async {
+        let classifiedOnThisTrigger = !persistedOutboxHydrated
+        if classifiedOnThisTrigger {
             finishStartupHydration()
+            await startupHardDeleteRecoveryTask?.value
+        }
+        guard persistedOutboxHydrated else { return }
+        for session in sessions.values {
+            switch trigger {
+            case .connectivityRestore:
+                session.resyncAfterConnectivityRestore()
+            case .foreground:
+                session.resyncAfterForeground()
+            }
+        }
+        if !classifiedOnThisTrigger {
+            schedulePersistedOutboxDrain()
         }
     }
 
@@ -853,6 +870,9 @@ final class AppModel {
                 snapshotPersistence: conversationPersistenceStore.snapshotPersistence(conversationId: conversationId),
                 retryTiming: LiveSessionTiming(),
                 staleCheckTiming: LiveSessionTiming(),
+                deliveryTriggerAllowed: { [weak self] in
+                    self?.persistedOutboxHydrated == true
+                },
                 aggregateAuthority: aggregateIdentity(forTranscriptRowId: conversationId),
                 onConversationUpdate: onConversationUpdate,
                 onHardDeleted: onHardDeleted)
@@ -1384,6 +1404,17 @@ final class AppModel {
                 scope: api.configurationIdentity.persistenceScope))
     }
 
+    func closeUnavailableExplanation(for conversation: Conversation) -> String? {
+        guard conversation.product_conversation_id != nil else { return nil }
+        guard let snapshot = productConversationDetails[conversation.aggregateIdentity]?.snapshot else {
+            return "Open the conversation before closing it."
+        }
+        guard snapshot.segments.count == 1 else {
+            return "Close is unavailable for continued conversations."
+        }
+        return nil
+    }
+
     @discardableResult
     func archive(conversationId: String) async -> Bool {
         guard ClientOperation.archive.policy == .onlineOnly else { return false }
@@ -1403,6 +1434,12 @@ final class AppModel {
             ?? productConversationDetails.first(where: {
                 $0.value.aggregateMemberTranscriptRowIds.contains(conversationId)
             })?.key
+        if let aggregateId {
+            guard productConversationDetails[aggregateId]?.snapshot?.segments.count == 1 else {
+                lastActionError = "Close is unavailable for continued conversations."
+                return false
+            }
+        }
         let archiveConversationId = aggregateId.flatMap { aggregate in
             productConversationDetails[aggregate]?.snapshot?.canonical_root.transcript_row_id
                 ?? listStore.conversations.first(where: { $0.aggregateIdentity == aggregate })?.id
@@ -1467,11 +1504,24 @@ final class AppModel {
     }
 
     func foregrounded() {
-        for session in sessions.values {
-            session.resyncAfterForeground()
-        }
-        resumeStartupHydrationOrScheduleDrain()
+        scheduleDeliveryTrigger(.foreground)
         Task { await refreshList() }
+    }
+
+    private func scheduleDeliveryTrigger(_ trigger: DeliveryTrigger) {
+        if persistedOutboxHydrated {
+            for session in sessions.values {
+                switch trigger {
+                case .connectivityRestore:
+                    session.resyncAfterConnectivityRestore()
+                case .foreground:
+                    session.resyncAfterForeground()
+                }
+            }
+            schedulePersistedOutboxDrain()
+        } else {
+            Task { await resumeAfterDeliveryTrigger(trigger) }
+        }
     }
 
     func integrateBackgroundConversationUpdate(existing: Conversation, update: Conversation) -> Conversation {

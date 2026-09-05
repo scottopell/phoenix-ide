@@ -147,13 +147,21 @@ struct ConversationListView: View {
                     .accessibilityIdentifier("conversationList.row.\(conversation.aggregateIdentity)")
                     .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                         if !isCoordinator {
-                            Button {
-                                Task { await model.archive(conversationId: transcriptRowId) }
-                            } label: {
-                                Label("Archive", systemImage: "archivebox")
+                            if let explanation = model.closeUnavailableExplanation(for: conversation) {
+                                Button {} label: {
+                                    Label("Close unavailable", systemImage: "archivebox")
+                                }
+                                .disabled(true)
+                                .accessibilityHint(explanation)
+                            } else {
+                                Button {
+                                    Task { await model.archive(conversationId: transcriptRowId) }
+                                } label: {
+                                    Label("Archive", systemImage: "archivebox")
+                                }
+                                .tint(.orange)
+                                .disabled(!model.connectivity.isOnline)
                             }
-                            .tint(.orange)
-                            .disabled(!model.connectivity.isOnline)
                         }
                     }
                 }
