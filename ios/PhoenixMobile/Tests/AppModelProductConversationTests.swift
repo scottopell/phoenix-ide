@@ -216,7 +216,7 @@ private final class TestConversationPersistenceStore: ConversationPersistenceSto
         return true
     }
     func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool { true }
-    func hardDeleteFences(configurationIdentity: APIConfigurationIdentity) -> [PersistedHardDeleteFence] { [] }
+    func hardDeleteFences(configurationIdentity: APIConfigurationIdentity) -> HardDeleteFenceLoadResult { .accessible([]) }
     func retireHardDeleteFence(_ fence: PersistedHardDeleteFence) async {}
     func removeAllPersistedConversationState() async {
         for conversationId in outboxStore.ownerTranscriptRowIds {
@@ -415,7 +415,7 @@ final class ResettableConversationPersistenceStore: ConversationPersistenceStore
         return true
     }
     func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool { true }
-    func hardDeleteFences(configurationIdentity: APIConfigurationIdentity) -> [PersistedHardDeleteFence] { [] }
+    func hardDeleteFences(configurationIdentity: APIConfigurationIdentity) -> HardDeleteFenceLoadResult { .accessible([]) }
     func retireHardDeleteFence(_ fence: PersistedHardDeleteFence) async {}
     func removeAllPersistedConversationState() async {
         await wrapped.removeAllPersistedConversationState()
@@ -470,7 +470,7 @@ final class HardDeleteGatedConversationPersistenceStore: ConversationPersistence
         return true
     }
     func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool { true }
-    func hardDeleteFences(configurationIdentity: APIConfigurationIdentity) -> [PersistedHardDeleteFence] { [] }
+    func hardDeleteFences(configurationIdentity: APIConfigurationIdentity) -> HardDeleteFenceLoadResult { .accessible([]) }
     func retireHardDeleteFence(_ fence: PersistedHardDeleteFence) async {}
     func removeAllPersistedConversationState() async {}
 }
@@ -533,7 +533,7 @@ final class GatedConversationPersistenceStore: ConversationPersistenceStore {
         return true
     }
     func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool { true }
-    func hardDeleteFences(configurationIdentity: APIConfigurationIdentity) -> [PersistedHardDeleteFence] { [] }
+    func hardDeleteFences(configurationIdentity: APIConfigurationIdentity) -> HardDeleteFenceLoadResult { .accessible([]) }
     func retireHardDeleteFence(_ fence: PersistedHardDeleteFence) async {}
     func removeAllPersistedConversationState() async {
         for conversationId in outboxStore.ownerTranscriptRowIds {
@@ -597,7 +597,7 @@ final class MutableTestConversationPersistenceStore: ConversationPersistenceStor
         return true
     }
     func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool { true }
-    func hardDeleteFences(configurationIdentity: APIConfigurationIdentity) -> [PersistedHardDeleteFence] { [] }
+    func hardDeleteFences(configurationIdentity: APIConfigurationIdentity) -> HardDeleteFenceLoadResult { .accessible([]) }
     func retireHardDeleteFence(_ fence: PersistedHardDeleteFence) async {}
     func removeAllPersistedConversationState() async {
         for conversationId in outboxStore.ownerTranscriptRowIds {
@@ -1865,11 +1865,10 @@ final class AppModelProductConversationTests: XCTestCase {
         await session.awaitHardDeleteReportForTesting()
         await model.awaitHardDeleteCleanupForTesting(conversationId: "row-1")
 
-        XCTAssertTrue(store.hardDeleteFences(
-            configurationIdentity: APIConfigurationIdentity(
+        XCTAssertTrue(store.hardDeleteFences(configurationIdentity: APIConfigurationIdentity(
                 serverURL: "https://example.com",
                 credentialGeneration: "test-default",
-                trustSelfSigned: true)).isEmpty)
+                trustSelfSigned: true)) == .accessible([]))
         XCTAssertNil(model.existingSession(for: "row-1"))
     }
 
@@ -1900,8 +1899,8 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertTrue(savedB)
         await store.retireHardDeleteFence(fenceA)
 
-        XCTAssertTrue(store.hardDeleteFences(configurationIdentity: identityA).isEmpty)
-        XCTAssertEqual(store.hardDeleteFences(configurationIdentity: identityB), [fenceB])
+        XCTAssertTrue(store.hardDeleteFences(configurationIdentity: identityA) == .accessible([]))
+        XCTAssertEqual(store.hardDeleteFences(configurationIdentity: identityB), .accessible([fenceB]))
     }
 
     func testStartupRecoversDurableHardDeleteFenceBeforeOutboxDrain() async {
