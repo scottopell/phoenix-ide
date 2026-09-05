@@ -553,6 +553,11 @@ struct KeychainCredentialStore: CredentialStore {
     }
 }
 
+enum ConversationNavigationDestination: Hashable {
+    case aggregate(aggregateId: String, initialTranscriptRowId: String)
+    case ordinary(transcriptRowId: String)
+}
+
 @MainActor
 @Observable
 final class AppModel {
@@ -1123,6 +1128,11 @@ final class AppModel {
         }
         await conversationPersistenceStore.retireHardDeleteFence(fence)
         guard contextIsCurrent() else { return }
+        if pendingOpenConversationId == context.aggregateAuthority
+            || pendingOpenConversationId.map(memberIds.contains) == true
+        {
+            pendingOpenConversationId = nil
+        }
         completeHardDeleteCleanup(generation: cleanupGeneration, conversationIds: memberIds)
         UNUserNotificationCenter.current().removeDeliveredNotifications(
             withIdentifiers: ["attention-\(context.aggregateAuthority)"])
@@ -1199,6 +1209,26 @@ final class AppModel {
         resolvedNavigationConversationId(
             aggregateId: conversation.product_conversation_id,
             latestTranscriptRowId: conversation.transcriptRowIdentity)
+    }
+
+    func navigationDestination(
+        aggregateId: String?,
+        transcriptRowId: String
+    ) -> ConversationNavigationDestination {
+        guard let aggregateId else {
+            return .ordinary(transcriptRowId: transcriptRowId)
+        }
+        return .aggregate(
+            aggregateId: aggregateId,
+            initialTranscriptRowId: resolvedNavigationConversationId(
+                aggregateId: aggregateId,
+                latestTranscriptRowId: transcriptRowId))
+    }
+
+    func navigationDestination(for conversation: Conversation) -> ConversationNavigationDestination {
+        navigationDestination(
+            aggregateId: conversation.product_conversation_id,
+            transcriptRowId: conversation.transcriptRowIdentity)
     }
 
     func existingSession(for conversationId: String) -> ConversationSession? {
@@ -1606,7 +1636,11 @@ final class AppModel {
             await session.outbox.clearAndWait()
             sessions[conversationId] = nil
             if let aggregateId {
-                listStore.remove(aggregateId: aggregateId)
+                let removed = await listStore.removeAndPersist(aggregateId: aggregateId)
+                guard removed else {
+                    lastActionError = "The conversation closed, but its local list cache could not be updated."
+                    return false
+                }
             }
             let notificationId = aggregateId ?? conversationId
             UNUserNotificationCenter.current().removeDeliveredNotifications(
