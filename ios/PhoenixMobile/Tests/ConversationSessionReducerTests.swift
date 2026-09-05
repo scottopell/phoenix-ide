@@ -817,9 +817,10 @@ final class ConversationSessionReducerTests: XCTestCase {
                 syncedAt: Date()))
         _ = await snapshotWriter.save(scopedSnapshot, revision: snapshotWriter.reserveRevision())
         let outboxWriter = OutboxPersistenceHandle.disk(conversationId: "c1", baseDirectory: baseDirectory, context: context, aggregateAuthority: "pc-1")
-        _ = await outboxWriter.save(PersistedOutboxEnvelope(scope: nil, aggregateAuthority: "pc-1", entries: [entry]), revision: outboxWriter.reserveRevision())
+        _ = await outboxWriter.save(PersistedOutboxEnvelope(scope: api.configurationIdentity.persistenceScope, aggregateAuthority: "pc-1", entries: [entry]), revision: outboxWriter.reserveRevision())
 
         let reopened = makeSession(api: api, baseDirectory: baseDirectory, context: context, aggregateAuthority: "pc-1")
+        XCTAssertEqual(reopened.conversation?.id, "c1")
         XCTAssertTrue(reopened.canSendPersistedOutbox)
         let generation = try XCTUnwrap(reopened.drainOutbox())
         let result = await reopened.awaitDrainOutbox(generation: generation)
@@ -862,15 +863,25 @@ final class ConversationSessionReducerTests: XCTestCase {
         let originalPersisted = await original.flushSnapshotPersistence()
         XCTAssertTrue(originalPersisted)
 
+        let outboxURL = DiskStore.phoenixMobileDirectory(baseDirectory: baseDirectory)
+            .appendingPathComponent("outbox-c1")
+            .appendingPathExtension("json")
+        let persistedOutboxBeforeReopen = try Data(contentsOf: outboxURL)
+
         let differentAPI = PhoenixAPI(baseURL: URL(string: "https://other.invalid")!, password: nil, allowSelfSigned: false, configurationIdentity: APIConfigurationIdentity(serverURL: "https://other.invalid", credentialGeneration: "other.invalid", trustSelfSigned: false))!
         let reopened = makeSession(api: differentAPI, baseDirectory: baseDirectory, context: DiskStore.versionedContext(baseDirectory: baseDirectory), aggregateAuthority: "pc-1")
 
+        XCTAssertNil(reopened.conversation)
+        XCTAssertTrue(reopened.messages.isEmpty)
         XCTAssertFalse(reopened.canSendPersistedOutbox)
         XCTAssertNil(reopened.authoritativeSnapshotReceipt)
         let generation = try XCTUnwrap(reopened.drainOutbox())
         let completed = await reopened.awaitDrainOutbox(generation: generation)
         XCTAssertFalse(completed)
         XCTAssertEqual(recorder.exactChatPosts(host: host).count, 0)
+        XCTAssertTrue(reopened.outbox.entries.isEmpty)
+        XCTAssertFalse(reopened.outbox.persistenceHealthy)
+        XCTAssertEqual(try Data(contentsOf: outboxURL), persistedOutboxBeforeReopen)
     }
 
     @MainActor
@@ -895,7 +906,6 @@ final class ConversationSessionReducerTests: XCTestCase {
                 .appendingPathExtension("json"),
             version: ConversationSession.snapshotSchemaVersion)
         _ = await snapshotWriter.save(legacySnapshot, revision: snapshotWriter.reserveRevision())
-        let outboxWriter = OutboxPersistenceHandle.disk(conversationId: "c1", baseDirectory: baseDirectory, context: context, aggregateAuthority: "pc-1")
         let pending = OutboxEntry(
             localId: UUID().uuidString.lowercased(),
             conversationId: "c1",
@@ -907,14 +917,30 @@ final class ConversationSessionReducerTests: XCTestCase {
             acceptedAt: nil,
             lastError: nil,
             attemptCount: 0)
-        _ = await outboxWriter.save(PersistedOutboxEnvelope(scope: nil, aggregateAuthority: "pc-1", entries: [pending]), revision: outboxWriter.reserveRevision())
+        let previousBaseDirectory = DiskStore.baseDirectory
+        DiskStore.baseDirectory = baseDirectory
+        defer { DiskStore.baseDirectory = previousBaseDirectory }
+        XCTAssertTrue(DiskStore.saveVersioned([pending], name: "outbox-c1", version: 1))
 
         let reopened = makeSession(api: api, baseDirectory: baseDirectory, context: context, aggregateAuthority: "pc-1")
+        XCTAssertNil(reopened.conversation)
+        XCTAssertTrue(reopened.messages.isEmpty)
+        XCTAssertTrue(reopened.outbox.entries.isEmpty)
+        XCTAssertFalse(reopened.outbox.persistenceHealthy)
         XCTAssertFalse(reopened.canSendPersistedOutbox)
         let blockedGeneration = try XCTUnwrap(reopened.drainOutbox())
         let blockedCompleted = await reopened.awaitDrainOutbox(generation: blockedGeneration)
         XCTAssertFalse(blockedCompleted)
         XCTAssertEqual(recorder.exactChatPosts(host: host).count, 0)
+        if case .unreadable = DiskStore.loadVersionedResult(
+            PersistedOutboxEnvelope.self,
+            source: DiskStore.phoenixMobileDirectory(baseDirectory: baseDirectory)
+                .appendingPathComponent("outbox-c1")
+                .appendingPathExtension("json"),
+            version: Outbox.schemaVersion)
+        {} else {
+            XCTFail("expected preserved unreadable schema-v1 outbox")
+        }
 
         reopened.receive(.initSnapshot(.init(
             conversation: try conversation(id: "c1", aggregateId: "pc-1"),
@@ -926,7 +952,16 @@ final class ConversationSessionReducerTests: XCTestCase {
         let generation = try XCTUnwrap(reopened.drainOutbox())
         let drainCompleted = await reopened.awaitDrainOutbox(generation: generation)
         XCTAssertTrue(drainCompleted)
-        XCTAssertEqual(recorder.exactChatPosts(host: host).count, 1)
+        XCTAssertEqual(recorder.exactChatPosts(host: host).count, 0)
+        if case .unreadable = DiskStore.loadVersionedResult(
+            PersistedOutboxEnvelope.self,
+            source: DiskStore.phoenixMobileDirectory(baseDirectory: baseDirectory)
+                .appendingPathComponent("outbox-c1")
+                .appendingPathExtension("json"),
+            version: Outbox.schemaVersion)
+        {} else {
+            XCTFail("expected unreadable schema-v1 outbox to remain unmodified")
+        }
     }
 
     @MainActor
@@ -1006,7 +1041,7 @@ final class ConversationSessionReducerTests: XCTestCase {
                 syncedAt: Date()))
         _ = await snapshotWriter.save(ordinarySnapshot, revision: snapshotWriter.reserveRevision())
         let outboxWriter = OutboxPersistenceHandle.disk(conversationId: "c1", baseDirectory: baseDirectory, context: context, aggregateAuthority: "c1")
-        _ = await outboxWriter.save(PersistedOutboxEnvelope(scope: nil, aggregateAuthority: "c1", entries: [entry]), revision: outboxWriter.reserveRevision())
+        _ = await outboxWriter.save(PersistedOutboxEnvelope(scope: api.configurationIdentity.persistenceScope, aggregateAuthority: "c1", entries: [entry]), revision: outboxWriter.reserveRevision())
 
         let reopened = makeSession(api: api, baseDirectory: baseDirectory, context: context, aggregateAuthority: "c1")
         XCTAssertTrue(reopened.canSendPersistedOutbox)
