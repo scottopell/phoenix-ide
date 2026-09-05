@@ -211,9 +211,13 @@ private final class TestConversationPersistenceStore: ConversationPersistenceSto
         return DiskStore.versionedContext(baseDirectory: FileManager.default.temporaryDirectory).writer(destinationURL: destination, version: ConversationSession.snapshotSchemaVersion)
     }
     func removePersistedConversationState(conversationId: String) async { await outboxStore.removePersistedConversationState(conversationId: conversationId) }
-    func removeAuthoritativePersistedConversationState(conversationId: String, configurationIdentity: APIConfigurationIdentity, aggregateAuthority: String) async {
+    func removeAuthoritativePersistedConversationState(conversationId: String, configurationIdentity: APIConfigurationIdentity, aggregateAuthority: String) async -> Bool {
         await removePersistedConversationState(conversationId: conversationId)
+        return true
     }
+    func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool { true }
+    func hardDeleteFences(configurationIdentity: APIConfigurationIdentity) -> [PersistedHardDeleteFence] { [] }
+    func retireHardDeleteFence(aggregateAuthority: String) async {}
     func removeAllPersistedConversationState() async {
         for conversationId in outboxStore.ownerTranscriptRowIds {
             await outboxStore.removePersistedConversationState(conversationId: conversationId)
@@ -406,9 +410,13 @@ final class ResettableConversationPersistenceStore: ConversationPersistenceStore
         await wrapped.removePersistedConversationState(conversationId: conversationId)
     }
 
-    func removeAuthoritativePersistedConversationState(conversationId: String, configurationIdentity: APIConfigurationIdentity, aggregateAuthority: String) async {
+    func removeAuthoritativePersistedConversationState(conversationId: String, configurationIdentity: APIConfigurationIdentity, aggregateAuthority: String) async -> Bool {
         await removePersistedConversationState(conversationId: conversationId)
+        return true
     }
+    func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool { true }
+    func hardDeleteFences(configurationIdentity: APIConfigurationIdentity) -> [PersistedHardDeleteFence] { [] }
+    func retireHardDeleteFence(aggregateAuthority: String) async {}
     func removeAllPersistedConversationState() async {
         await wrapped.removeAllPersistedConversationState()
     }
@@ -457,9 +465,13 @@ final class HardDeleteGatedConversationPersistenceStore: ConversationPersistence
         await outboxStore.removePersistedConversationState(conversationId: conversationId)
         await removedProbe.markCompleted()
     }
-    func removeAuthoritativePersistedConversationState(conversationId: String, configurationIdentity: APIConfigurationIdentity, aggregateAuthority: String) async {
+    func removeAuthoritativePersistedConversationState(conversationId: String, configurationIdentity: APIConfigurationIdentity, aggregateAuthority: String) async -> Bool {
         await removePersistedConversationState(conversationId: conversationId)
+        return true
     }
+    func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool { true }
+    func hardDeleteFences(configurationIdentity: APIConfigurationIdentity) -> [PersistedHardDeleteFence] { [] }
+    func retireHardDeleteFence(aggregateAuthority: String) async {}
     func removeAllPersistedConversationState() async {}
 }
 
@@ -516,9 +528,13 @@ final class GatedConversationPersistenceStore: ConversationPersistenceStore {
             aggregateMembersById[aggregateId]?.remove(conversationId)
         }
     }
-    func removeAuthoritativePersistedConversationState(conversationId: String, configurationIdentity: APIConfigurationIdentity, aggregateAuthority: String) async {
+    func removeAuthoritativePersistedConversationState(conversationId: String, configurationIdentity: APIConfigurationIdentity, aggregateAuthority: String) async -> Bool {
         await removePersistedConversationState(conversationId: conversationId)
+        return true
     }
+    func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool { true }
+    func hardDeleteFences(configurationIdentity: APIConfigurationIdentity) -> [PersistedHardDeleteFence] { [] }
+    func retireHardDeleteFence(aggregateAuthority: String) async {}
     func removeAllPersistedConversationState() async {
         for conversationId in outboxStore.ownerTranscriptRowIds {
             await outboxStore.removePersistedConversationState(conversationId: conversationId)
@@ -576,9 +592,13 @@ final class MutableTestConversationPersistenceStore: ConversationPersistenceStor
             aggregateMembersById[aggregateId]?.remove(conversationId)
         }
     }
-    func removeAuthoritativePersistedConversationState(conversationId: String, configurationIdentity: APIConfigurationIdentity, aggregateAuthority: String) async {
+    func removeAuthoritativePersistedConversationState(conversationId: String, configurationIdentity: APIConfigurationIdentity, aggregateAuthority: String) async -> Bool {
         await removePersistedConversationState(conversationId: conversationId)
+        return true
     }
+    func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool { true }
+    func hardDeleteFences(configurationIdentity: APIConfigurationIdentity) -> [PersistedHardDeleteFence] { [] }
+    func retireHardDeleteFence(aggregateAuthority: String) async {}
     func removeAllPersistedConversationState() async {
         for conversationId in outboxStore.ownerTranscriptRowIds {
             await outboxStore.removePersistedConversationState(conversationId: conversationId)
@@ -1077,6 +1097,8 @@ final class AppModelProductConversationTests: XCTestCase {
         model.configureForTesting(serverURL: "https://example.com", trustSelfSigned: true)
         model.replaceAPIForTesting(api)
 
+        model.triggerStartupHardDeleteRecoveryForTesting()
+        await model.awaitStartupHardDeleteRecoveryForTesting()
         model.connectivity.setOnlineForTesting(true)
         await gate.waitForEntry()
         guard let generation = model.currentPersistedOutboxDrainGenerationForTesting() else {
@@ -1126,6 +1148,8 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertEqual(notReady, .notReady)
         XCTAssertNil(model.existingSession(for: "row-1"))
 
+        model.triggerStartupHardDeleteRecoveryForTesting()
+        await model.awaitStartupHardDeleteRecoveryForTesting()
         model.connectivity.setOnlineForTesting(true)
         await gate.waitForEntry()
         guard let generation = model.currentPersistedOutboxDrainGenerationForTesting() else {
@@ -1805,6 +1829,111 @@ final class AppModelProductConversationTests: XCTestCase {
     }
 
     @MainActor
+    func testHardDeleteClearsRetainedProductConversationProjection() async {
+        let store = MutableTestConversationPersistenceStore(
+            contentsByConversationId: ["row-1": .entries([])],
+            aggregateMembersById: ["pc-1": ["row-1"]])
+        let model = makeModel(conversationPersistenceStore: store)
+        model.configureForTesting(serverURL: "https://example.com", trustSelfSigned: true)
+        let detail = model.productConversationDetailModel(for: "pc-1")
+        detail.applyForTesting(testProductConversationSnapshot())
+        XCTAssertFalse(detail.transcriptItems.isEmpty)
+        XCTAssertNotNil(detail.actionSession)
+
+        await model.forceAggregateNotFoundCleanupForTesting(
+            aggregateId: "pc-1",
+            transcriptRowId: "row-1",
+            memberIds: ["row-1"])
+
+        XCTAssertNil(detail.snapshot)
+        XCTAssertTrue(detail.transcriptItems.isEmpty)
+        XCTAssertNil(detail.actionSession)
+        XCTAssertNil(detail.writableTranscriptRowId)
+        XCTAssertFalse(detail.canSendChat)
+    }
+
+    func testStartupRecoversDurableHardDeleteFenceBeforeOutboxDrain() async {
+        let baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-hard-delete-recovery-\(UUID().uuidString)")
+        let context = DiskStore.versionedContext(baseDirectory: baseDirectory)
+        let store = DiskConversationPersistenceStore(baseDirectory: baseDirectory, context: context)
+        let probe = SendProbe()
+        let (api, registration) = makeHTTPAPI(probe: probe)
+        defer { TestURLProtocol.uninstall(host: "phoenix.invalid", owner: registration) }
+        let identity = api.configurationIdentity
+        let entry = makePendingOutboxEntry(conversationId: "row-1")
+        let outbox = store.outboxPersistence(
+            conversationId: "row-1",
+            aggregateAuthority: "pc-1",
+            scope: identity.persistenceScope)
+        _ = await outbox.save(
+            PersistedOutboxEnvelope(
+                scope: identity.persistenceScope,
+                aggregateAuthority: "pc-1",
+                entries: [entry]),
+            revision: outbox.reserveRevision())
+        let snapshot = ConversationSession.PersistedSnapshot(
+            conversation: conversation(id: "row-1", aggregateId: "pc-1"),
+            messages: [], lastSequenceId: 0, transcriptGeneration: nil, syncedAt: Date(),
+            authoritative: .init(
+                configurationIdentity: identity,
+                aggregateAuthority: "pc-1",
+                syncedAt: Date()))
+        let snapshotWriter = store.snapshotPersistence(conversationId: "row-1")
+        _ = await snapshotWriter.save(snapshot, revision: snapshotWriter.reserveRevision())
+        _ = await store.persistHardDeleteFence(.init(
+            configurationIdentity: identity,
+            aggregateAuthority: "pc-1",
+            memberConversationIds: ["row-1"]))
+
+        let model = makeModel(conversationPersistenceStore: store)
+        model.replaceAPIForTesting(api)
+        model.connectivity.setOnlineForTesting(true)
+        model.triggerStartupHardDeleteRecoveryForTesting()
+        await model.awaitStartupHardDeleteRecoveryForTesting()
+
+        XCTAssertTrue(probe.chatPostPaths.isEmpty)
+        XCTAssertNil(model.session(for: "row-1"))
+        let directory = DiskStore.phoenixMobileDirectory(baseDirectory: baseDirectory)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("conv-row-1.json").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("outbox-row-1.json").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("hard-delete-pc-1.json").path))
+    }
+
+    func testStartupRecoversPartialHardDeleteAndRetiresFence() async {
+        let baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-hard-delete-partial-\(UUID().uuidString)")
+        let context = DiskStore.versionedContext(baseDirectory: baseDirectory)
+        let store = DiskConversationPersistenceStore(baseDirectory: baseDirectory, context: context)
+        let (api, registration) = makeHTTPAPI(probe: SendProbe())
+        defer { TestURLProtocol.uninstall(host: "phoenix.invalid", owner: registration) }
+        let identity = api.configurationIdentity
+        let entry = makePendingOutboxEntry(conversationId: "row-1")
+        let outbox = store.outboxPersistence(
+            conversationId: "row-1",
+            aggregateAuthority: "pc-1",
+            scope: identity.persistenceScope)
+        _ = await outbox.save(
+            PersistedOutboxEnvelope(
+                scope: identity.persistenceScope,
+                aggregateAuthority: "pc-1",
+                entries: [entry]),
+            revision: outbox.reserveRevision())
+        _ = await store.persistHardDeleteFence(.init(
+            configurationIdentity: identity,
+            aggregateAuthority: "pc-1",
+            memberConversationIds: ["row-1"]))
+
+        let model = makeModel(conversationPersistenceStore: store)
+        model.replaceAPIForTesting(api)
+        model.triggerStartupHardDeleteRecoveryForTesting()
+        await model.awaitStartupHardDeleteRecoveryForTesting()
+
+        let directory = DiskStore.phoenixMobileDirectory(baseDirectory: baseDirectory)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("outbox-row-1.json").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("hard-delete-pc-1.json").path))
+    }
+
     func testHardDeleteCleanupWaitsForPersistedRemovalAfterSessionEviction() async {
         let blocker = DrainBlocker()
         let removedProbe = CompletionProbe()
