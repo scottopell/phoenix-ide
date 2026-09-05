@@ -127,6 +127,10 @@ entity ConversationClientStateDeletionOccurrence {
     session: IosConversationSession
 }
 
+entity DurableHardDeleteFence {
+    scope: ConversationScope
+}
+
 ------------------------------------------------------------
 -- Rules -- ownership and app lifecycle
 ------------------------------------------------------------
@@ -479,6 +483,23 @@ rule StaleOrDuplicateEventDiscarded {
 ------------------------------------------------------------
 -- Rules -- terminal deletion
 ------------------------------------------------------------
+
+rule HardDeletionFencePrecedesCleanup {
+    when: ConversationHardDeleted(session)
+
+    requires: session.state = live
+
+    ensures: DurableHardDeleteFence.created(scope: session.scope)
+    ensures: session.view_open = false
+    ensures: session.interaction_enabled = false
+    ensures: session.state = deleted
+    @guidance {
+        Persist the fence before starting asynchronous local deletion. Startup
+        recovery consumes matching fences before session materialization or
+        persisted queue delivery. Retire a fence only after its authoritative
+        cached transcript and queued delivery state are absent.
+    }
+}
 
 rule HardDeletionEventReceived {
     -- REQ-IOS-005

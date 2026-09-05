@@ -1100,6 +1100,26 @@ final class ProductConversationDetailModelTests: XCTestCase {
         XCTAssertNil(model.selectedTranscriptRowId)
     }
 
+    func testHardDeleteInvalidationClearsRetainedProjectionAndActions() async {
+        let row2 = makeSession(id: "row-2")
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-1",
+            api: makeAPI(),
+            connectivity: ConnectivityMonitor(),
+            sessionProvider: { $0 == "row-2" ? row2 : nil })
+        model.applyForTesting(snapshot())
+        XCTAssertFalse(model.transcriptItems.isEmpty)
+        XCTAssertNotNil(model.actionSession)
+
+        model.invalidateHardDeleted()
+
+        XCTAssertNil(model.snapshot)
+        XCTAssertTrue(model.transcriptItems.isEmpty)
+        XCTAssertNil(model.actionSession)
+        XCTAssertNil(model.writableTranscriptRowId)
+        XCTAssertFalse(model.canSendChat)
+    }
+
     func testStartIsIdempotentWhileAlreadyActive() async {
         actor Calls {
             var count = 0
