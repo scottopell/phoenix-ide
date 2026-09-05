@@ -61,12 +61,19 @@ final class OutboxPersistenceHandle {
         inspectImpl(conversationId)
     }
 
-    func loadVisibleEntries(conversationId: String) -> PersistedOutboxStoreContents {
+    func loadVisibleEntries(
+        conversationId: String,
+        scope: PersistenceScopeIdentity?,
+        aggregateAuthority: String?
+    ) -> PersistedOutboxStoreContents {
         let inspection = inspect(conversationId: conversationId)
         switch inspection.state {
         case .missing:
             return .missing
-        case .accessible:
+        case .accessible(let persistedScope, let persistedAuthority, _):
+            guard persistedScope == scope,
+                  persistedAuthority == aggregateAuthority
+            else { return .inaccessible }
             return .entries(inspection.visibleEntries)
         case .inaccessible, .incompatibleNewerVersion:
             return .inaccessible
@@ -95,17 +102,7 @@ final class OutboxPersistenceHandle {
                 switch DiskStore.loadVersionedResult(
                     PersistedOutboxEnvelope.self,
                     source: source,
-                    version: Outbox.schemaVersion,
-                    migrate: { storedVersion, fileData in
-                        guard let entries = migrateLegacyOutboxEnvelope(
-                            storedVersion: storedVersion,
-                            fileData: fileData)
-                        else { return nil }
-                        return PersistedOutboxEnvelope(
-                            scope: scope,
-                            aggregateAuthority: aggregateAuthority,
-                            entries: entries)
-                    })
+                    version: Outbox.schemaVersion)
                 {
                 case .missing:
                     return OutboxStoreInspection(conversationId: requestedConversationId, state: .missing)
@@ -126,15 +123,6 @@ final class OutboxPersistenceHandle {
             save: { envelope, revision in await writer.save(envelope, revision: revision) },
             remove: { revision in await writer.remove(revision: revision) })
     }
-}
-
-private struct LegacyPersistedOutboxEnvelope: Decodable {
-    let payload: [OutboxEntry]
-}
-
-func migrateLegacyOutboxEnvelope(storedVersion: Int, fileData: Data) -> [OutboxEntry]? {
-    guard storedVersion == 1 else { return nil }
-    return try? JSONDecoder().decode(LegacyPersistedOutboxEnvelope.self, from: fileData).payload
 }
 
 struct PersistedOutboxEnvelope: Codable, Equatable, Sendable {
@@ -256,7 +244,11 @@ final class Outbox {
         // Rehydrate only entries tagged with this conversation — a foreign
         // entry can never reconcile here and must not render (spec rule
         // RehydrateQueueForConversationOnly).
-        switch persistence.loadVisibleEntries(conversationId: conversationId) {
+        switch persistence.loadVisibleEntries(
+            conversationId: conversationId,
+            scope: persistenceScope,
+            aggregateAuthority: aggregateAuthority)
+        {
         case .missing:
             entries = []
         case .entries(let loaded):
