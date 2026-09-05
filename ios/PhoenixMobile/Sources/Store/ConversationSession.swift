@@ -918,8 +918,7 @@ final class ConversationSession {
                        !matchesSessionBinding(snapshot.conversation)
                     {
                         reportMisroutedInit()
-                        invalidateLiveWork()
-                        return
+                        break
                     }
                     receive(event)
                 }

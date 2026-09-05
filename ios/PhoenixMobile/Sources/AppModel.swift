@@ -1220,8 +1220,8 @@ final class AppModel {
         }
         return .aggregate(
             aggregateId: aggregateId,
-            initialTranscriptRowId: resolvedNavigationConversationId(
-                aggregateId: aggregateId,
+            initialTranscriptRowId: listStore.cachedNavigationTranscriptRowId(
+                forAggregateId: aggregateId,
                 latestTranscriptRowId: transcriptRowId))
     }
 
@@ -1553,7 +1553,9 @@ final class AppModel {
     }
 
     func closeUnavailableExplanation(for conversation: Conversation) -> String? {
-        guard conversation.product_conversation_id != nil else { return nil }
+        guard conversation.product_conversation_id != nil else {
+            return "Close is unavailable until conversation type is confirmed."
+        }
         guard let snapshot = productConversationDetails[conversation.aggregateIdentity]?.snapshot else {
             return "Open the conversation before closing it."
         }
