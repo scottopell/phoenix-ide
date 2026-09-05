@@ -46,7 +46,7 @@ on-device build and an airplane-mode queue/drain test pass.
 | REQ-IOS-009 creation flow | `NewConversationView` |
 | REQ-IOS-010 rendering | `MessageViews.swift` (generic fallback), `ToolViews.swift` (dispatch + native bash/think renderers), `ConversationSession.toolUseIndex` (result join) |
 | REQ-IOS-011 typed state | `ConversationState.swift` (decode + fallback, tested), `StateViews.swift` (detail dispatch) |
-| REQ-IOS-012 action policy | `ConversationAction.swift` (policy axis), `ConversationSession.perform`, `AppModel.archive` |
+| REQ-IOS-012 action policy | `ConversationAction.swift` (policy axis), `ConversationSession.perform`, `AppModel.archive`; Close is offered only for authoritative single-segment ProductConversations because the server exposes no aggregate-capable Close endpoint |
 | REQ-IOS-013 task approval | `TaskApprovalCard` (StateViews.swift), approve/reject/feedback actions |
 | REQ-IOS-014 versioned persistence | `DiskStore.saveVersioned/loadVersioned` (tested), per-store schema version constants |
 | REQ-IOS-015 image attachments | `AttachmentViews.swift`, `ImageProcessing` (tested), composer PhotosPicker, outbox `images` |
@@ -94,8 +94,9 @@ remain blocked until independently scheduled.
   tracked as `tasks/20004` (blocked on the durable-workflows stack) — at
   which point the stopgap is deleted, not extended.
 - Steering-queue entries are not reorderable/deletable server-side from the app.
-- No archived-conversations view, rename, or delete (archive itself is
-  wired via swipe).
+- No archived-conversations view, rename, or delete. Close is wired via swipe
+  only for authoritative single-segment ProductConversations; continued
+  aggregates remain viewable but have no aggregate-capable server Close API.
 - Task approval and question answering are resolvable in-app; commission
   review approval renders as a generic needs-action card and resolves from
   the web UI. Complete state/action coverage belongs to the blocked iOS vNext

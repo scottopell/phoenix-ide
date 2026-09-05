@@ -74,6 +74,23 @@ private func testProductConversationSnapshot() -> ProductConversationSnapshot {
         has_older: false)
 }
 
+private func testSingleSegmentProductConversationSnapshot() -> ProductConversationSnapshot {
+    var snapshot = testProductConversationSnapshot()
+    snapshot.requested_transcript_row_id = "row-1"
+    snapshot.latest_transcript_row_id = "row-1"
+    snapshot.writable_transcript_row_id = "row-1"
+    snapshot.segments = [
+        .init(
+            segment_ordinal: 0,
+            transcript_row_id: "row-1",
+            slug: "root",
+            title: "Root",
+            messages: [],
+            handoff: nil)
+    ]
+    return snapshot
+}
+
 @MainActor
 private final class InMemoryOutboxStore {
     private var entriesByConversationId: [String: [OutboxEntry]]
@@ -1158,6 +1175,20 @@ final class AppModelProductConversationTests: XCTestCase {
         let host = "transient-fence-recovery.invalid"
         let (api, registration) = makeHTTPAPI(probe: probe, host: host)
         defer { TestURLProtocol.uninstall(host: host, owner: registration) }
+        let snapshotWriter = store.snapshotPersistence(conversationId: "row-1")
+        let snapshotSyncedAt = Date()
+        _ = await snapshotWriter.save(
+            ConversationSession.PersistedSnapshot(
+                conversation: conversation(id: "row-1", aggregateId: "pc-1"),
+                messages: [],
+                lastSequenceId: 0,
+                transcriptGeneration: nil,
+                syncedAt: snapshotSyncedAt,
+                authoritative: ConversationSession.PersistedSnapshotAuthority(
+                    configurationIdentity: api.configurationIdentity,
+                    aggregateAuthority: "pc-1",
+                    syncedAt: snapshotSyncedAt)),
+            revision: snapshotWriter.reserveRevision())
         let model = AppModel(
             conversationPersistenceStore: store,
             credentialStore: InMemoryCredentialStore())
@@ -1171,28 +1202,24 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertEqual(store.pendingOutboxDiscoveryCount, 0)
         XCTAssertTrue(probe.chatPostPaths.isEmpty)
 
+        let session = model.session(for: "row-1")
+
         store.hardDeleteFenceLoadResult = .accessible([])
         model.connectivity.setOnlineForTesting(true)
         await gate.waitForEntry()
+        XCTAssertTrue(probe.chatPostPaths.isEmpty)
         guard let generation = model.currentPersistedOutboxDrainGenerationForTesting() else {
             XCTFail("expected connectivity recovery to schedule a persisted outbox drain")
             return
         }
-        let session = model.existingSession(for: "row-1") ?? model.session(for: "row-1")
-        session?.receive(.initSnapshot(.init(
-            conversation: conversation(id: "row-1", aggregateId: "pc-1"),
-            messages: [],
-            agentWorking: false,
-            presentationMode: "idle",
-            lastSequenceId: 0,
-            pendingAnchorSequenceId: 0,
-            pendingEvents: [],
-            pendingTruncated: false)))
-        _ = await session?.flushSnapshotPersistence()
         await gate.release()
         let drain = await model.awaitPersistedOutboxDrainForTesting(generation: generation)
 
         XCTAssertEqual(drain, .completed(generation))
+        let sessionDrainGeneration = session?.currentDrainGenerationForTesting()
+        if let sessionDrainGeneration {
+            _ = await session?.awaitDrainOutbox(generation: sessionDrainGeneration)
+        }
         XCTAssertEqual(store.hardDeleteFenceLoadCount, inaccessibleLoadCount + 1)
         XCTAssertEqual(store.pendingOutboxDiscoveryCount, 1)
         XCTAssertEqual(probe.chatPostPaths, ["/api/conversations/row-1/chat"])
@@ -2169,7 +2196,7 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertTrue(probe.archivePostPaths.isEmpty)
     }
 
-    func testArchiveRoutesContinuedAggregateThroughAuthoritativeCanonicalRoot() async {
+    func testArchiveDoesNotCallConversationEndpointForContinuedAggregate() async {
         let store = MutableTestConversationPersistenceStore(
             owners: ["row-root", "row-successor"],
             contentsByConversationId: [
@@ -2194,27 +2221,32 @@ final class AppModelProductConversationTests: XCTestCase {
 
         let archived = await model.archive(conversationId: "row-successor")
 
-        XCTAssertTrue(archived)
-        XCTAssertEqual(probe.archivePostPaths, ["/api/conversations/row-1/archive"])
+        XCTAssertFalse(archived)
+        XCTAssertTrue(probe.archivePostPaths.isEmpty)
+        XCTAssertEqual(model.lastActionError, "Close is unavailable for continued conversations.")
     }
 
-    func testArchiveProceedsWhenEveryAggregateMemberOutboxIsEmpty() async {
+    func testArchiveProceedsForSingleSegmentProductConversation() async {
         let store = MutableTestConversationPersistenceStore(
-            owners: ["row-old", "row-latest"],
-            contentsByConversationId: ["row-old": .entries([]), "row-latest": .entries([])],
-            aggregateMembersById: ["pc-1": ["row-old", "row-latest"]])
+            owners: ["row-1"],
+            contentsByConversationId: ["row-1": .entries([])],
+            aggregateMembersById: ["pc-1": ["row-1"]])
         let probe = SendProbe()
         let (api, registration) = makeHTTPAPI(probe: probe)
         defer { TestURLProtocol.uninstall(host: "phoenix.invalid", owner: registration) }
         let model = makeModel(conversationPersistenceStore: store)
         model.replaceAPIForTesting(api)
         model.connectivity.setOnlineForTesting(true)
-        model.listStore.upsert(conversation(id: "row-latest", aggregateId: "pc-1"))
+        model.listStore.upsert(conversation(id: "row-1", aggregateId: "pc-1"))
+        model.productConversationDetailModel(
+            for: "pc-1",
+            initialTranscriptRowId: "row-1"
+        ).applyForTesting(testSingleSegmentProductConversationSnapshot())
 
-        let archived = await model.archive(conversationId: "row-latest")
+        let archived = await model.archive(conversationId: "row-1")
 
         XCTAssertTrue(archived)
-        XCTAssertEqual(probe.archivePostPaths.count, 1)
+        XCTAssertEqual(probe.archivePostPaths, ["/api/conversations/row-1/archive"])
     }
 
     func testAggregateNotFoundCleanupOnlyRemovesExactScopedPersistedMembers() async throws {
