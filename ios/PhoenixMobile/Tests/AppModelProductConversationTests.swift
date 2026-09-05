@@ -197,6 +197,7 @@ private final class TestConversationPersistenceStore: ConversationPersistenceSto
     }
 
     func hasCachedSnapshot(conversationId: String) -> Bool { snapshotsByConversationId.contains(conversationId) }
+    func hasAuthoritativeCachedSnapshot(conversationId: String, configurationIdentity: APIConfigurationIdentity, aggregateAuthority: String) -> Bool { snapshotsByConversationId.contains(conversationId) }
     func inspectOutbox(conversationId: String) -> OutboxStoreInspection {
         outboxStore.inspect(
             conversationId: conversationId,
@@ -210,6 +211,9 @@ private final class TestConversationPersistenceStore: ConversationPersistenceSto
         return DiskStore.versionedContext(baseDirectory: FileManager.default.temporaryDirectory).writer(destinationURL: destination, version: ConversationSession.snapshotSchemaVersion)
     }
     func removePersistedConversationState(conversationId: String) async { await outboxStore.removePersistedConversationState(conversationId: conversationId) }
+    func removeAuthoritativePersistedConversationState(conversationId: String, configurationIdentity: APIConfigurationIdentity, aggregateAuthority: String) async {
+        await removePersistedConversationState(conversationId: conversationId)
+    }
     func removeAllPersistedConversationState() async {
         for conversationId in outboxStore.ownerTranscriptRowIds {
             await outboxStore.removePersistedConversationState(conversationId: conversationId)
@@ -225,6 +229,7 @@ private final class SendProbe {
     private let lock = NSLock()
     private var chatPostPathsStorage: [String] = []
     private var aggregateGetPathsStorage: [String] = []
+    private var archivePostPathsStorage: [String] = []
 
     func record(_ request: URLRequest) {
         let path = request.url!.path
@@ -236,12 +241,21 @@ private final class SendProbe {
         if request.httpMethod == "GET", path.contains("/api/product-conversations/") {
             aggregateGetPathsStorage.append(path)
         }
+        if request.httpMethod == "POST", path.contains("/archive") {
+            archivePostPathsStorage.append(path)
+        }
     }
 
     var chatPostPaths: [String] {
         lock.lock()
         defer { lock.unlock() }
         return chatPostPathsStorage
+    }
+
+    var archivePostPaths: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return archivePostPathsStorage
     }
 
     var aggregateGetPaths: [String] {
@@ -353,6 +367,17 @@ final class ResettableConversationPersistenceStore: ConversationPersistenceStore
         wrapped.hasCachedSnapshot(conversationId: conversationId)
     }
 
+    func hasAuthoritativeCachedSnapshot(
+        conversationId: String,
+        configurationIdentity: APIConfigurationIdentity,
+        aggregateAuthority: String
+    ) -> Bool {
+        wrapped.hasAuthoritativeCachedSnapshot(
+            conversationId: conversationId,
+            configurationIdentity: configurationIdentity,
+            aggregateAuthority: aggregateAuthority)
+    }
+
     func inspectOutbox(conversationId: String) -> OutboxStoreInspection {
         wrapped.inspectOutbox(conversationId: conversationId)
     }
@@ -381,6 +406,9 @@ final class ResettableConversationPersistenceStore: ConversationPersistenceStore
         await wrapped.removePersistedConversationState(conversationId: conversationId)
     }
 
+    func removeAuthoritativePersistedConversationState(conversationId: String, configurationIdentity: APIConfigurationIdentity, aggregateAuthority: String) async {
+        await removePersistedConversationState(conversationId: conversationId)
+    }
     func removeAllPersistedConversationState() async {
         await wrapped.removeAllPersistedConversationState()
     }
@@ -411,6 +439,7 @@ final class HardDeleteGatedConversationPersistenceStore: ConversationPersistence
     func pendingOutboxOwnerTranscriptRowIds(scope: PersistenceScopeIdentity) async -> Set<String> { outboxStore.ownerTranscriptRowIds }
     func persistedOutboxOwnerTranscriptRowIdsSnapshot(scope: PersistenceScopeIdentity) -> Set<String> { outboxStore.ownerTranscriptRowIds }
     func hasCachedSnapshot(conversationId: String) -> Bool { false }
+    func hasAuthoritativeCachedSnapshot(conversationId: String, configurationIdentity: APIConfigurationIdentity, aggregateAuthority: String) -> Bool { false }
     func inspectOutbox(conversationId: String) -> OutboxStoreInspection {
         outboxStore.inspect(
             conversationId: conversationId,
@@ -427,6 +456,9 @@ final class HardDeleteGatedConversationPersistenceStore: ConversationPersistence
         await blocker.block()
         await outboxStore.removePersistedConversationState(conversationId: conversationId)
         await removedProbe.markCompleted()
+    }
+    func removeAuthoritativePersistedConversationState(conversationId: String, configurationIdentity: APIConfigurationIdentity, aggregateAuthority: String) async {
+        await removePersistedConversationState(conversationId: conversationId)
     }
     func removeAllPersistedConversationState() async {}
 }
@@ -463,6 +495,7 @@ final class GatedConversationPersistenceStore: ConversationPersistenceStore {
     }
 
     func hasCachedSnapshot(conversationId: String) -> Bool { snapshotsByConversationId.contains(conversationId) }
+    func hasAuthoritativeCachedSnapshot(conversationId: String, configurationIdentity: APIConfigurationIdentity, aggregateAuthority: String) -> Bool { snapshotsByConversationId.contains(conversationId) }
     func inspectOutbox(conversationId: String) -> OutboxStoreInspection {
         outboxStore.inspect(
             conversationId: conversationId,
@@ -482,6 +515,9 @@ final class GatedConversationPersistenceStore: ConversationPersistenceStore {
         for aggregateId in aggregateMembersById.keys {
             aggregateMembersById[aggregateId]?.remove(conversationId)
         }
+    }
+    func removeAuthoritativePersistedConversationState(conversationId: String, configurationIdentity: APIConfigurationIdentity, aggregateAuthority: String) async {
+        await removePersistedConversationState(conversationId: conversationId)
     }
     func removeAllPersistedConversationState() async {
         for conversationId in outboxStore.ownerTranscriptRowIds {
@@ -519,6 +555,7 @@ final class MutableTestConversationPersistenceStore: ConversationPersistenceStor
         })
     }
     func hasCachedSnapshot(conversationId: String) -> Bool { snapshotsByConversationId.contains(conversationId) }
+    func hasAuthoritativeCachedSnapshot(conversationId: String, configurationIdentity: APIConfigurationIdentity, aggregateAuthority: String) -> Bool { snapshotsByConversationId.contains(conversationId) }
     func inspectOutbox(conversationId: String) -> OutboxStoreInspection {
         outboxStore.inspect(
             conversationId: conversationId,
@@ -538,6 +575,9 @@ final class MutableTestConversationPersistenceStore: ConversationPersistenceStor
         for aggregateId in aggregateMembersById.keys {
             aggregateMembersById[aggregateId]?.remove(conversationId)
         }
+    }
+    func removeAuthoritativePersistedConversationState(conversationId: String, configurationIdentity: APIConfigurationIdentity, aggregateAuthority: String) async {
+        await removePersistedConversationState(conversationId: conversationId)
     }
     func removeAllPersistedConversationState() async {
         for conversationId in outboxStore.ownerTranscriptRowIds {
@@ -1801,6 +1841,102 @@ final class AppModelProductConversationTests: XCTestCase {
         await lateWaiter.value
     }
 
+    func testAuthoritativeCacheEligibilityRequiresExactConfigurationAndAggregate() async {
+        let baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-cache-authority-\(UUID().uuidString)")
+        let context = DiskStore.versionedContext(baseDirectory: baseDirectory)
+        let store = DiskConversationPersistenceStore(baseDirectory: baseDirectory, context: context)
+
+        func writeSnapshot(
+            conversationId: String,
+            configurationIdentity: APIConfigurationIdentity,
+            aggregateAuthority: String
+        ) async {
+            let snapshot = ConversationSession.PersistedSnapshot(
+                conversation: conversation(id: conversationId, aggregateId: "pc-1"),
+                messages: [],
+                lastSequenceId: 0,
+                transcriptGeneration: nil,
+                syncedAt: Date(),
+                authoritative: .init(
+                    configurationIdentity: configurationIdentity,
+                    aggregateAuthority: aggregateAuthority,
+                    syncedAt: Date()))
+            let writer = store.snapshotPersistence(conversationId: conversationId)
+            _ = await writer.save(snapshot, revision: writer.reserveRevision())
+        }
+
+        await writeSnapshot(
+            conversationId: "row-exact",
+            configurationIdentity: defaultConfigurationIdentity,
+            aggregateAuthority: "pc-1")
+        await writeSnapshot(
+            conversationId: "row-stale-config",
+            configurationIdentity: APIConfigurationIdentity(
+                serverURL: "https://stale.example.com",
+                credentialGeneration: "stale",
+                trustSelfSigned: false),
+            aggregateAuthority: "pc-1")
+        await writeSnapshot(
+            conversationId: "row-wrong-aggregate",
+            configurationIdentity: defaultConfigurationIdentity,
+            aggregateAuthority: "pc-other")
+
+        XCTAssertTrue(store.hasAuthoritativeCachedSnapshot(
+            conversationId: "row-exact",
+            configurationIdentity: defaultConfigurationIdentity,
+            aggregateAuthority: "pc-1"))
+        XCTAssertFalse(store.hasAuthoritativeCachedSnapshot(
+            conversationId: "row-stale-config",
+            configurationIdentity: defaultConfigurationIdentity,
+            aggregateAuthority: "pc-1"))
+        XCTAssertFalse(store.hasAuthoritativeCachedSnapshot(
+            conversationId: "row-wrong-aggregate",
+            configurationIdentity: defaultConfigurationIdentity,
+            aggregateAuthority: "pc-1"))
+    }
+
+    func testArchiveBlocksWhenPredecessorMemberHasVisibleOutbox() async {
+        let store = MutableTestConversationPersistenceStore(
+            owners: ["row-old", "row-latest"],
+            contentsByConversationId: [
+                "row-old": .entries([makePendingOutboxEntry(conversationId: "row-old")]),
+                "row-latest": .entries([])
+            ],
+            aggregateMembersById: ["pc-1": ["row-old", "row-latest"]])
+        let probe = SendProbe()
+        let (api, registration) = makeHTTPAPI(probe: probe)
+        defer { TestURLProtocol.uninstall(host: "phoenix.invalid", owner: registration) }
+        let model = makeModel(conversationPersistenceStore: store)
+        model.replaceAPIForTesting(api)
+        model.connectivity.setOnlineForTesting(true)
+        model.listStore.upsert(conversation(id: "row-latest", aggregateId: "pc-1"))
+
+        let archived = await model.archive(conversationId: "row-latest")
+
+        XCTAssertFalse(archived)
+        XCTAssertTrue(probe.archivePostPaths.isEmpty)
+    }
+
+    func testArchiveProceedsWhenEveryAggregateMemberOutboxIsEmpty() async {
+        let store = MutableTestConversationPersistenceStore(
+            owners: ["row-old", "row-latest"],
+            contentsByConversationId: ["row-old": .entries([]), "row-latest": .entries([])],
+            aggregateMembersById: ["pc-1": ["row-old", "row-latest"]])
+        let probe = SendProbe()
+        let (api, registration) = makeHTTPAPI(probe: probe)
+        defer { TestURLProtocol.uninstall(host: "phoenix.invalid", owner: registration) }
+        let model = makeModel(conversationPersistenceStore: store)
+        model.replaceAPIForTesting(api)
+        model.connectivity.setOnlineForTesting(true)
+        model.listStore.upsert(conversation(id: "row-latest", aggregateId: "pc-1"))
+
+        let archived = await model.archive(conversationId: "row-latest")
+
+        XCTAssertTrue(archived)
+        XCTAssertEqual(probe.archivePostPaths.count, 1)
+    }
+
     func testAggregateNotFoundCleanupOnlyRemovesExactScopedPersistedMembers() async throws {
         let baseDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("phoenix-aggregate-cleanup-scope-\(UUID().uuidString)")
@@ -1850,8 +1986,8 @@ final class AppModelProductConversationTests: XCTestCase {
             configurationIdentity: defaultConfigurationIdentity)!)
         await model.forceAggregateNotFoundCleanupForTesting(
             aggregateId: "pc-1",
-            transcriptRowId: nil,
-            memberIds: [])
+            transcriptRowId: foreignId,
+            memberIds: [exactId, foreignId, unscopedId])
 
         let directory = DiskStore.phoenixMobileDirectory(baseDirectory: baseDirectory)
         XCTAssertFalse(FileManager.default.fileExists(

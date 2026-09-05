@@ -59,6 +59,11 @@ protocol ConversationPersistenceStore {
     func pendingOutboxOwnerTranscriptRowIds(scope: PersistenceScopeIdentity) async -> Set<String>
     func persistedOutboxOwnerTranscriptRowIdsSnapshot(scope: PersistenceScopeIdentity) -> Set<String>
     func hasCachedSnapshot(conversationId: String) -> Bool
+    func hasAuthoritativeCachedSnapshot(
+        conversationId: String,
+        configurationIdentity: APIConfigurationIdentity,
+        aggregateAuthority: String
+    ) -> Bool
     func inspectOutbox(conversationId: String) -> OutboxStoreInspection
     func outboxPersistence(
         conversationId: String,
@@ -72,6 +77,11 @@ protocol ConversationPersistenceStore {
     ) -> Set<String>
     func resetConversationListCache() async
     func removePersistedConversationState(conversationId: String) async
+    func removeAuthoritativePersistedConversationState(
+        conversationId: String,
+        configurationIdentity: APIConfigurationIdentity,
+        aggregateAuthority: String
+    ) async
     func removeAllPersistedConversationState() async
 }
 
@@ -157,6 +167,24 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
         return snapshot.conversation != nil && snapshot.syncedAt != nil
     }
 
+    func hasAuthoritativeCachedSnapshot(
+        conversationId: String,
+        configurationIdentity: APIConfigurationIdentity,
+        aggregateAuthority: String
+    ) -> Bool {
+        let source = directory.appendingPathComponent("conv-\(conversationId)").appendingPathExtension("json")
+        guard case .value(let snapshot) = DiskStore.loadVersionedResult(
+            ConversationSession.PersistedSnapshot.self,
+            source: source,
+            version: ConversationSession.snapshotSchemaVersion),
+            snapshot.conversation?.id == conversationId,
+            snapshot.syncedAt != nil,
+            snapshot.authoritative?.configurationIdentity == configurationIdentity,
+            snapshot.authoritative?.aggregateAuthority == aggregateAuthority
+        else { return false }
+        return true
+    }
+
     func inspectOutbox(conversationId: String) -> OutboxStoreInspection {
         let source = directory.appendingPathComponent("outbox-\(conversationId)").appendingPathExtension("json")
         switch DiskStore.loadVersionedResult(
@@ -234,14 +262,40 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
     func removePersistedConversationState(conversationId: String) async {
         let snapshotSource = directory.appendingPathComponent("conv-\(conversationId)").appendingPathExtension("json")
         let outboxSource = directory.appendingPathComponent("outbox-\(conversationId)").appendingPathExtension("json")
-        let snapshotWriter = context.writer(
-            destinationURL: snapshotSource, version: ConversationSession.snapshotSchemaVersion)
-        let outboxWriter = context.writer(
-            destinationURL: outboxSource, version: Outbox.schemaVersion)
-        let snapshotRevision = snapshotWriter.reserveRevision()
-        let outboxRevision = outboxWriter.reserveRevision()
-        await snapshotWriter.remove(revision: snapshotRevision)
-        await outboxWriter.remove(revision: outboxRevision)
+        let snapshotWriter = context.writer(destinationURL: snapshotSource, version: ConversationSession.snapshotSchemaVersion)
+        let outboxWriter = context.writer(destinationURL: outboxSource, version: Outbox.schemaVersion)
+        await snapshotWriter.remove(revision: snapshotWriter.reserveRevision())
+        await outboxWriter.remove(revision: outboxWriter.reserveRevision())
+    }
+
+    func removeAuthoritativePersistedConversationState(
+        conversationId: String,
+        configurationIdentity: APIConfigurationIdentity,
+        aggregateAuthority: String
+    ) async {
+        let snapshotSource = directory.appendingPathComponent("conv-\(conversationId)").appendingPathExtension("json")
+        if hasAuthoritativeCachedSnapshot(
+            conversationId: conversationId,
+            configurationIdentity: configurationIdentity,
+            aggregateAuthority: aggregateAuthority)
+        {
+            let writer = context.writer(
+                destinationURL: snapshotSource,
+                version: ConversationSession.snapshotSchemaVersion)
+            await writer.remove(revision: writer.reserveRevision())
+        }
+
+        let outboxSource = directory.appendingPathComponent("outbox-\(conversationId)").appendingPathExtension("json")
+        if case .value(let envelope) = DiskStore.loadVersionedResult(
+            PersistedOutboxEnvelope.self,
+            source: outboxSource,
+            version: Outbox.schemaVersion),
+            envelope.scope == configurationIdentity.persistenceScope,
+            envelope.aggregateAuthority == aggregateAuthority
+        {
+            let writer = context.writer(destinationURL: outboxSource, version: Outbox.schemaVersion)
+            await writer.remove(revision: writer.reserveRevision())
+        }
     }
 
     func removeAllPersistedConversationState() async {
@@ -678,11 +732,10 @@ final class AppModel {
         transcriptRowId: String?,
         segmentTranscriptRowIds: Set<String>
     ) async {
-        let persistedConversationIds = api.map {
-            conversationPersistenceStore.persistedConversationIds(
-                aggregateId: aggregateId,
-                scope: $0.configurationIdentity.persistenceScope)
-        } ?? []
+        guard let api else { return }
+        let persistedConversationIds = conversationPersistenceStore.persistedConversationIds(
+            aggregateId: aggregateId,
+            scope: api.configurationIdentity.persistenceScope)
         let aggregateConversationIds = Set(listStore.transcriptToAggregate.compactMap { key, value in
             value == aggregateId ? key : nil
         })
@@ -705,7 +758,10 @@ final class AppModel {
         UNUserNotificationCenter.current().removePendingNotificationRequests(
             withIdentifiers: ["attention-\(aggregateId)"])
         for conversationId in aggregateConversationIds {
-            await conversationPersistenceStore.removePersistedConversationState(conversationId: conversationId)
+            await conversationPersistenceStore.removeAuthoritativePersistedConversationState(
+                conversationId: conversationId,
+                configurationIdentity: api.configurationIdentity,
+                aggregateAuthority: aggregateId)
         }
         for session in ownedSessions {
             await session.clearCachedSnapshotAndWait()
@@ -944,7 +1000,11 @@ final class AppModel {
                 self?.persistedOutboxContents(for: transcriptRowId) ?? .empty
             },
             hasCachedSnapshot: { [weak self] transcriptRowId in
-                self?.hasCachedSnapshot(transcriptRowId) ?? false
+                guard let self, let api = self.api else { return false }
+                return self.conversationPersistenceStore.hasAuthoritativeCachedSnapshot(
+                    conversationId: transcriptRowId,
+                    configurationIdentity: api.configurationIdentity,
+                    aggregateAuthority: aggregateId)
             },
             handleDefinitiveNotFound: { [weak self] transcriptRowId, segmentTranscriptRowIds in
                 await self?.handleAggregateHardDeleted(
@@ -1076,6 +1136,23 @@ final class AppModel {
     /// Online-only archive. Returns false with `lastActionError` on failure.
     var lastActionError: String?
 
+    private func authoritativeAggregateMemberIds(
+        aggregateId: String,
+        triggeringTranscriptRowId: String
+    ) -> Set<String> {
+        let detailMembers = productConversationDetails[aggregateId]?.aggregateMemberTranscriptRowIds ?? []
+        let listMembers = Set(listStore.transcriptToAggregate.compactMap { transcriptRowId, mappedAggregateId in
+            mappedAggregateId == aggregateId ? transcriptRowId : nil
+        })
+        guard let api else { return detailMembers.union(listMembers).union([triggeringTranscriptRowId]) }
+        return detailMembers
+            .union(listMembers)
+            .union([triggeringTranscriptRowId])
+            .union(conversationPersistenceStore.persistedConversationIds(
+                aggregateId: aggregateId,
+                scope: api.configurationIdentity.persistenceScope))
+    }
+
     @discardableResult
     func archive(conversationId: String) async -> Bool {
         guard ClientOperation.archive.policy == .onlineOnly else { return false }
@@ -1091,26 +1168,36 @@ final class AppModel {
             lastActionError = "Archiving needs a connection — it can't be queued."
             return false
         }
-        let hasInMemoryMessages = sessions[conversationId]?.outbox.visibleEntries.isEmpty == false
-        guard !hasInMemoryMessages else {
-            lastActionError =
-                "This conversation has queued or unconfirmed messages. Retry or discard them before archiving."
-            return false
-        }
-        if let session = sessions[conversationId] {
-            _ = await session.outbox.flushPersistence()
-        }
-        switch persistedOutboxContents(for: conversationId) {
-        case .empty:
-            break
-        case .hasVisibleEntries:
-            lastActionError =
-                "This conversation has queued or unconfirmed messages. Retry or discard them before archiving."
-            return false
-        case .inaccessible:
-            lastActionError =
-                "This conversation's queued-message store can't be read by this app version. Upgrade or clear the cache before archiving."
-            return false
+        let aggregateId = listStore.aggregateId(forTranscriptRowId: conversationId)
+            ?? productConversationDetails.first(where: {
+                $0.value.aggregateMemberTranscriptRowIds.contains(conversationId)
+            })?.key
+        let memberIds = aggregateId.map {
+            authoritativeAggregateMemberIds(
+                aggregateId: $0,
+                triggeringTranscriptRowId: conversationId)
+        } ?? [conversationId]
+        for memberId in memberIds {
+            if sessions[memberId]?.outbox.visibleEntries.isEmpty == false {
+                lastActionError =
+                    "This conversation has queued or unconfirmed messages. Retry or discard them before archiving."
+                return false
+            }
+            if let session = sessions[memberId] {
+                _ = await session.outbox.flushPersistence()
+            }
+            switch persistedOutboxContents(for: memberId) {
+            case .empty:
+                break
+            case .hasVisibleEntries:
+                lastActionError =
+                    "This conversation has queued or unconfirmed messages. Retry or discard them before archiving."
+                return false
+            case .inaccessible:
+                lastActionError =
+                    "This conversation's queued-message store can't be read by this app version. Upgrade or clear the cache before archiving."
+                return false
+            }
         }
         guard let session = session(for: conversationId), session.beginArchiving() else {
             lastActionError =
@@ -1128,7 +1215,6 @@ final class AppModel {
             await session.clearCachedSnapshotAndWait()
             await session.outbox.clearAndWait()
             sessions[conversationId] = nil
-            let aggregateId = listStore.aggregateId(forTranscriptRowId: conversationId)
             if let aggregateId {
                 listStore.remove(aggregateId: aggregateId)
             }
