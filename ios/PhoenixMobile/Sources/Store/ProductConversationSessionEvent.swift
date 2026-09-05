@@ -19,6 +19,7 @@ struct ProductConversationTopologyInvalidation: Equatable {
         case handedOff(successorConversationId: String?)
         case terminal
         case aggregateIdentityChanged(previous: String, current: String)
+        case chatCapabilityChanged
     }
 }
 
