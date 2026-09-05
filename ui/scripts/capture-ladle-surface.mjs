@@ -1,4 +1,4 @@
-import { chromium } from 'playwright';
+import { chromium, webkit } from 'playwright';
 import { spawn } from 'node:child_process';
 import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
@@ -21,10 +21,15 @@ import process from 'node:process';
  * @property {{name:string,width:number,height:number}[]} [viewportMatrix]  Optional named viewport set; captures each story once per viewport.
  * @property {Map<string,string[]>} [expectedConsoleErrors]  scenario id → console-error substrings to tolerate.
  * @property {(context:{page:import('playwright').Page,id:string,outDir:string,viewport:{name?:string,width:number,height:number}}) => Promise<boolean>} [captureStory] Optional event-driven capture; return true when it produced artifacts.
+ * @property {(context:{storyKey:string,id:string,viewport:{name?:string,width:number,height:number}}) => string} [urlForStory] Optional route/query/hash builder for deterministic fixture journeys.
+ * @property {(outDir:string) => Promise<void>} [onComplete] Optional report writer after every scenario succeeds.
  */
 
 const port = Number(process.env.LADLE_PORT ?? 61123);
 const baseUrl = process.env.LADLE_URL ?? `http://127.0.0.1:${port}`;
+const browserName = process.env.PLAYWRIGHT_BROWSER ?? 'chromium';
+const browserType = browserName === 'webkit' ? webkit : browserName === 'chromium' ? chromium : null;
+if (!browserType) throw new Error(`Unsupported PLAYWRIGHT_BROWSER ${browserName}; use chromium or webkit`);
 
 function normalizeViewportMatrix(viewportMatrix, viewport) {
   if (!Array.isArray(viewportMatrix) || viewportMatrix.length === 0) {
@@ -101,6 +106,8 @@ export async function captureSurface(config) {
     viewportMatrix,
     expectedConsoleErrors = new Map(),
     captureStory,
+    urlForStory,
+    onComplete,
   } = config;
   const resolvedOut = path.resolve(outDir);
   await mkdir(resolvedOut, { recursive: true });
@@ -132,7 +139,7 @@ export async function captureSurface(config) {
   await waitForLadle();
   const stories = await discoverStories(storyPrefix);
   console.log(`Capturing ${stories.length} ${surface} stories`);
-  const browser = await chromium.launch();
+  const browser = await browserType.launch();
   const page = await browser.newPage({
     viewport: { width: captureViewports[0].width, height: captureViewports[0].height },
     deviceScaleFactor: 1,
@@ -142,13 +149,18 @@ export async function captureSurface(config) {
     if (message.type() === 'error') consoleErrors.push(message.text());
   });
   page.on('pageerror', (error) => consoleErrors.push(error.message));
+  page.on('requestfailed', (request) => consoleErrors.push(`Network request failed: ${request.url()} (${request.failure()?.errorText ?? 'unknown'})`));
+  page.on('response', (response) => {
+    if (response.status() >= 400) consoleErrors.push(`Network response ${response.status()}: ${response.url()}`);
+  });
 
   try {
     for (const { storyKey, id } of stories) {
       for (const currentViewport of captureViewports) {
         consoleErrors.length = 0;
         await page.setViewportSize({ width: currentViewport.width, height: currentViewport.height });
-        const url = `${baseUrl}/?story=${storyKey}&mode=preview`;
+        const url = urlForStory?.({ storyKey, id, viewport: currentViewport })
+          ?? `${baseUrl}/?story=${storyKey}&mode=preview`;
         await page.goto(url, { waitUntil: 'networkidle' });
         await page.waitForSelector(`[${readyAttribute}="${id}"]`, { timeout: 10_000 });
         const captured = await captureStory?.({ page, id, outDir: resolvedOut, viewport: currentViewport }) ?? false;
@@ -165,6 +177,7 @@ export async function captureSurface(config) {
         console.log(`✓ captured ${id}${currentViewport.name ? ` [${currentViewport.name}]` : ''}`);
       }
     }
+    await onComplete?.(resolvedOut);
   } finally {
     await browser.close();
     stopLadle();

@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { api } from '../../api';
@@ -18,7 +19,18 @@ vi.mock('../../cache', () => ({
 
 afterEach(() => cleanup());
 
+const productConversationCss = readFileSync(`${process.cwd()}/src/pages/ProductConversationPage.css`, 'utf8');
+
 describe('ProductConversationFixture', () => {
+  it('makes the active transcript the bounded flex owner instead of inheriting .view.active block layout', () => {
+    const activeTranscriptRule = productConversationCss.match(/\.product-conversation-page__transcript\.view\.active\s*{([^}]*)}/s)?.[1];
+
+    expect(activeTranscriptRule).toMatch(/display:\s*flex/);
+    expect(activeTranscriptRule).toMatch(/flex-direction:\s*column/);
+    expect(activeTranscriptRule).toMatch(/min-height:\s*0/);
+    expect(activeTranscriptRule).toMatch(/overflow:\s*hidden/);
+  });
+
   it('renders the real aggregate transcript and latest-row ordinary composer runtime', async () => {
     const scenario = getProductConversationScenario('desktop-multi-segment-qa-work');
     const { container } = render(<ProductConversationFixture scenario={scenario} />);

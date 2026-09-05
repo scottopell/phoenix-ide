@@ -1882,7 +1882,7 @@ function ConversationPageContent({
   const browserViewerOpen = !isArchived && browserOpen;
   const inspectViewerOpen = !isArchived && inspectOpen;
   const canOpenMessageSidepanel = !isArchived && !isTerminalConversationState(convStateForChildren);
-  const messageViewerOpen = canOpenMessageSidepanel && messageOpen;
+  const messageViewerOpen = !suppressMessageViewerOwner && canOpenMessageSidepanel && messageOpen;
   const stateBarContinuation = useMemo(
     () => !isArchived && convStateForChildren.type === 'idle'
       ? { phase: 'idle' as const, onTrigger: handleTriggerContinuation }

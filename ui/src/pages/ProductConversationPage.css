@@ -275,9 +275,12 @@
   }
 }
 
-.product-conversation-page__transcript {
+.product-conversation-page__transcript.view.active {
+  display: flex;
   flex: 1 1 auto;
+  flex-direction: column;
   min-height: 0;
+  overflow: hidden;
 }
 
 .product-conversation-page__composer {

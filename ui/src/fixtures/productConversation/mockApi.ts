@@ -38,18 +38,38 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   const originalGetSystemPrompt = api.getSystemPrompt;
   const originalGetWorkScopeInventory = api.getWorkScopeInventory;
   const originalListForkProposals = api.listForkProposals;
+  const originalReconcileAcceptedMessages = api.reconcileAcceptedMessages;
   const originalFetch = globalThis.fetch;
   const OriginalWebSocket = globalThis.WebSocket;
+  let snapshotRequestCount = 0;
+  let initialSnapshotFailuresRemaining = scenario.initialSnapshotFailures ?? 0;
+  let sendCount = 0;
+  let eventSourceOpenCount = 0;
+  let latestEventSource: FixtureEventSource | null = null;
 
-  api.getProductConversationSnapshot = async () => {
+  const record = (name: string, value: number | string) => {
+    document.documentElement.dataset[`productConversationFixture${name}`] = String(value);
+  };
+
+  api.getProductConversationSnapshot = async (_productConversationId, options = {}) => {
+    snapshotRequestCount += 1;
+    record('SnapshotRequests', snapshotRequestCount);
     if (scenario.state === 'loading') {
       return new Promise(() => {}) as ReturnType<typeof api.getProductConversationSnapshot>;
     }
-    if (scenario.state === 'error') {
+    if (initialSnapshotFailuresRemaining > 0) {
+      initialSnapshotFailuresRemaining -= 1;
       throw new Error(scenario.snapshotError ?? 'Fixture failed to fetch product conversation snapshot');
     }
     if (!scenario.snapshot) {
       throw new Error(`Scenario ${scenario.id} is missing snapshot data`);
+    }
+    if (options.before) {
+      if (!scenario.olderSnapshot || options.before !== scenario.snapshot.before) {
+        throw new Error(`Scenario ${scenario.id} received an unexpected older-history cursor`);
+      }
+      record('OlderSnapshotRequests', Number(document.documentElement.dataset['productConversationFixtureOlderSnapshotRequests'] ?? '0') + 1);
+      return scenario.olderSnapshot;
     }
     return scenario.snapshot;
   };
@@ -101,10 +121,24 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     browser: null,
   });
   api.listForkProposals = async () => [];
+  api.reconcileAcceptedMessages = async (_conversationId, messageIds) => ({
+    conversation_idle: false,
+    entries: messageIds.map((messageId) => ({
+      message_id: messageId,
+      status: 'steering_queued' as const,
+    })),
+  });
   globalThis.fetch = async (input, init) => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
     if (url.endsWith('/api/telemetry/conversation-open')) {
       return new Response(null, { status: 204 });
+    }
+    if (url.endsWith(`/api/conversations/${conversation.id}/chat`) && init?.method === 'POST') {
+      const body = JSON.parse(String(init.body)) as { text?: string };
+      sendCount += 1;
+      record('SendCount', sendCount);
+      record('LastSentText', body.text ?? '');
+      return Response.json({ queued: false, already_persisted: true });
     }
     return originalFetch(input, init);
   };
@@ -156,7 +190,19 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
 
     constructor(url: string) {
       void url;
+      latestEventSource = this; // eslint-disable-line @typescript-eslint/no-this-alias
+      eventSourceOpenCount += 1;
+      record('EventSourceOpens', eventSourceOpenCount);
       queueMicrotask(() => this.onopen?.(new Event('open')));
+    }
+
+    triggerErrorAndReopen(): void {
+      this.readyState = FixtureEventSource.CONNECTING;
+      this.onerror?.(new Event('error'));
+      for (const listener of this.listeners.get('error') ?? []) listener(new MessageEvent('error'));
+      this.readyState = FixtureEventSource.OPEN;
+      this.onopen?.(new Event('open'));
+      record('EventSourceReconnects', Number(document.documentElement.dataset['productConversationFixtureEventSourceReconnects'] ?? '0') + 1);
     }
 
     addEventListener(type: string, listener: EventListenerOrEventListenerObject): void {
@@ -195,8 +241,11 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     close(): void { this.readyState = FixtureEventSource.CLOSED; }
   }
   globalThis.EventSource = FixtureEventSource as unknown as typeof EventSource;
+  const reconnectLatestEventSource = () => latestEventSource?.triggerErrorAndReopen();
+  window.addEventListener('product-conversation-fixture-reconnect-request', reconnectLatestEventSource);
 
   return () => {
+    window.removeEventListener('product-conversation-fixture-reconnect-request', reconnectLatestEventSource);
     api.getPrStatus = originalGetPrStatus;
     api.getProductConversationSnapshot = originalGetProductConversationSnapshot;
     api.getChain = originalGetChain;
@@ -212,8 +261,12 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     api.getSystemPrompt = originalGetSystemPrompt;
     api.getWorkScopeInventory = originalGetWorkScopeInventory;
     api.listForkProposals = originalListForkProposals;
+    api.reconcileAcceptedMessages = originalReconcileAcceptedMessages;
     globalThis.fetch = originalFetch;
     globalThis.WebSocket = OriginalWebSocket;
+    for (const key of Object.keys(document.documentElement.dataset)) {
+      if (key.startsWith('productConversationFixture')) delete document.documentElement.dataset[key];
+    }
     globalThis.EventSource = OriginalEventSource;
   };
 }
