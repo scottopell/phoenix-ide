@@ -608,7 +608,7 @@ final class AppModel {
             transcriptToAggregate: listStore.transcriptToAggregate)
         rebuildAPI()
         _ = connectivity.addRestoreObserver { [weak self] in
-            self?.schedulePersistedOutboxDrain()
+            self?.resumeStartupHydrationOrScheduleDrain()
             Task { await self?.refreshList() }
         }
         notificationRouter.model = self
@@ -620,8 +620,9 @@ final class AppModel {
     }
 
     private func finishStartupHydration() {
-        guard let api else { return }
+        guard startupHardDeleteRecoveryTask == nil, let api else { return }
         let identity = api.configurationIdentity
+        let generation = apiGeneration
         let fences: [PersistedHardDeleteFence]
         switch conversationPersistenceStore.hardDeleteFences(configurationIdentity: identity) {
         case .accessible(let loaded):
@@ -638,12 +639,28 @@ final class AppModel {
         }
         startupHardDeleteRecoveryTask = Task { @MainActor [weak self] in
             guard let self else { return }
+            defer {
+                if self.apiGeneration == generation,
+                   self.api?.configurationIdentity == identity {
+                    self.startupHardDeleteRecoveryTask = nil
+                }
+            }
             for fence in fences {
                 await self.completePersistedHardDeleteFence(fence)
             }
-            guard self.api?.configurationIdentity == identity else { return }
+            guard !Task.isCancelled,
+                  self.apiGeneration == generation,
+                  self.api?.configurationIdentity == identity else { return }
             self.persistedOutboxHydrated = true
             self.schedulePersistedOutboxDrain()
+        }
+    }
+
+    private func resumeStartupHydrationOrScheduleDrain() {
+        if persistedOutboxHydrated {
+            schedulePersistedOutboxDrain()
+        } else if startupHardDeleteRecoveryTask == nil {
+            finishStartupHydration()
         }
     }
 
@@ -1387,8 +1404,8 @@ final class AppModel {
                 $0.value.aggregateMemberTranscriptRowIds.contains(conversationId)
             })?.key
         let archiveConversationId = aggregateId.flatMap { aggregate in
-            listStore.conversations.first(where: { $0.aggregateIdentity == aggregate })?.id
-                ?? productConversationDetails[aggregate]?.snapshot?.canonical_root.transcript_row_id
+            productConversationDetails[aggregate]?.snapshot?.canonical_root.transcript_row_id
+                ?? listStore.conversations.first(where: { $0.aggregateIdentity == aggregate })?.id
         } ?? conversationId
         let memberIds = aggregateId.map {
             authoritativeAggregateMemberIds(
@@ -1453,7 +1470,7 @@ final class AppModel {
         for session in sessions.values {
             session.resyncAfterForeground()
         }
-        schedulePersistedOutboxDrain()
+        resumeStartupHydrationOrScheduleDrain()
         Task { await refreshList() }
     }
 
