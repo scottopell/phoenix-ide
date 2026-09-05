@@ -346,6 +346,13 @@ final class ConversationSession {
         stop()
     }
 
+    func invalidateForAggregateReplacement() {
+        invalidateOutboxAuthority()
+        invalidateLiveWork()
+        hydrationAuthority = .none
+        stop()
+    }
+
     func invalidateConfiguration() {
         invalidateOutboxAuthority()
         invalidateLiveWork()
@@ -687,7 +694,7 @@ final class ConversationSession {
     /// genuine resends no-ops.
     @discardableResult
     func drainOutbox() -> Int? {
-        guard !isHardDeleted else { return nil }
+        guard !isHardDeleted, deliveryTriggerAllowed() else { return nil }
         if drainTask != nil {
             return drainGeneration
         }
@@ -770,6 +777,8 @@ final class ConversationSession {
     }
 
     #if DEBUG
+    var aggregateAuthorityForTesting: String { aggregateAuthority }
+
     func currentDrainGenerationForTesting() -> Int? {
         drainTask == nil ? nil : drainGeneration
     }

@@ -144,6 +144,25 @@ final class DiskStoreVersioningTests: XCTestCase {
     }
 
     @MainActor
+    func testSupersededSaveReportsFailureWhenNewerRevisionDidNotCommit() async throws {
+        freshDiskStore()
+        let context = DiskStore.versionedContext()
+        let first = context.writer(name: "records", version: 2)
+        let replacement = context.writer(name: "records", version: 1)
+        XCTAssertTrue(DiskStore.saveVersioned([Record(name: "future", count: 3)], name: "records", version: 3))
+        let oldRevision = first.reserveRevision()
+        let newRevision = replacement.reserveRevision()
+
+        let newerCommitted = await replacement.save(
+            [Record(name: "new", count: 2)], revision: newRevision)
+        let supersededCommitted = await first.save(
+            [Record(name: "old", count: 1)], revision: oldRevision)
+
+        XCTAssertFalse(newerCommitted)
+        XCTAssertFalse(supersededCommitted)
+    }
+
+    @MainActor
     func testWriterHandlesShareOneDestinationRevisionFence() async {
         freshDiskStore()
         let context = DiskStore.versionedContext()

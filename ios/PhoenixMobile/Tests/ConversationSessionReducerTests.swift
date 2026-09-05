@@ -471,6 +471,7 @@ final class ConversationSessionReducerTests: XCTestCase {
         openEventStream: @escaping ConversationEventStreamOpener = defaultConversationEventStreamOpener,
         baseDirectory: URL? = nil,
         context: VersionedDiskContext? = nil,
+        deliveryTriggerAllowed: @escaping () -> Bool = { true },
         legacySnapshotPersistenceScope: PersistenceScopeIdentity? = nil,
         aggregateAuthority: String? = nil
     ) -> ConversationSession {
@@ -495,6 +496,7 @@ final class ConversationSessionReducerTests: XCTestCase {
             retryTiming: retryTiming,
             staleCheckTiming: staleCheckTiming,
             openEventStream: openEventStream,
+            deliveryTriggerAllowed: deliveryTriggerAllowed,
             legacySnapshotPersistenceScope: legacySnapshotPersistenceScope,
             aggregateAuthority: aggregateAuthority,
             onConversationUpdate: onConversationUpdate,
@@ -773,6 +775,27 @@ final class ConversationSessionReducerTests: XCTestCase {
             session.authoritativeSnapshotReceipt?.configurationIdentity,
             PhoenixAPI(baseURL: URL(string: "https://phoenix.invalid")!, password: nil, allowSelfSigned: false, configurationIdentity: APIConfigurationIdentity(serverURL: "https://phoenix.invalid", credentialGeneration: "test-default", trustSelfSigned: false))!.configurationIdentity)
         XCTAssertTrue(session.canSendPersistedOutbox)
+    }
+
+    @MainActor
+    func testDrainOutboxChokepointRejectsRecoveryBlockedSession() async throws {
+        var recoveryAllowed = false
+        let session = makeSession(
+            deliveryTriggerAllowed: { recoveryAllowed },
+            aggregateAuthority: "pc-1")
+        session.receive(.initSnapshot(.init(
+            conversation: try conversation(id: "c1", aggregateId: "pc-1"),
+            messages: [], agentWorking: false,
+            presentationMode: "idle", lastSequenceId: 0,
+            pendingAnchorSequenceId: 0, pendingEvents: [], pendingTruncated: false)))
+        let persisted = await session.flushSnapshotPersistence()
+        XCTAssertTrue(persisted)
+        _ = await session.outbox.enqueue(text: "blocked")
+
+        XCTAssertNil(session.drainOutbox())
+
+        recoveryAllowed = true
+        XCTAssertNotNil(session.drainOutbox())
     }
 
     @MainActor

@@ -2283,6 +2283,50 @@ final class AppModelProductConversationTests: XCTestCase {
             aggregateAuthority: "pc-1"))
     }
 
+    func testAggregateRebindReplacesSessionWithoutDeletingOrCrossPostingOldOutbox() async throws {
+        let store = MutableTestConversationPersistenceStore(
+            owners: ["row-1"],
+            contentsByConversationId: ["row-1": .entries([])],
+            aggregateMembersById: ["pc-old": ["row-1"], "pc-new": ["row-1"]])
+        let probe = SendProbe()
+        let host = "aggregate-rebind.invalid"
+        let (api, registration) = makeHTTPAPI(
+            probe: probe,
+            host: host,
+            configurationIdentity: .init(
+                serverURL: "https://\(host)",
+                credentialGeneration: "credential",
+                trustSelfSigned: false))
+        defer { TestURLProtocol.uninstall(host: host, owner: registration) }
+        let model = AppModel(
+            conversationPersistenceStore: store,
+            credentialStore: InMemoryCredentialStore())
+        model.replaceAPIForTesting(api)
+        model.connectivity.setOnlineForTesting(false)
+        model.listStore.upsert(conversation(id: "row-1", aggregateId: "pc-old"))
+        let oldSession = try XCTUnwrap(model.session(for: "row-1", aggregateAuthority: "pc-old"))
+        oldSession.receive(.initSnapshot(.init(
+            conversation: conversation(id: "row-1", aggregateId: "pc-old"),
+            messages: [], agentWorking: false,
+            presentationMode: "idle", lastSequenceId: 0,
+            pendingAnchorSequenceId: 0, pendingEvents: [], pendingTruncated: false)))
+        let persisted = await oldSession.flushSnapshotPersistence()
+        XCTAssertTrue(persisted)
+        let queued = await oldSession.outbox.enqueue(text: "old queued text")
+        XCTAssertNotNil(queued)
+
+        model.applySessionConversationUpdateForTesting(
+            conversation(id: "row-1", aggregateId: "pc-new"),
+            transcriptRowId: "row-1")
+
+        let replacement = try XCTUnwrap(model.existingSession(for: "row-1"))
+        XCTAssertFalse(replacement === oldSession)
+        XCTAssertEqual(replacement.aggregateAuthorityForTesting, "pc-new")
+        XCTAssertFalse(oldSession.isHardDeleted)
+        XCTAssertEqual(oldSession.outbox.entries.map(\.text), ["old queued text"])
+        XCTAssertTrue(probe.chatPostPaths.isEmpty)
+    }
+
     func testArchiveBlocksWhenPredecessorMemberHasVisibleOutbox() async {
         let store = MutableTestConversationPersistenceStore(
             owners: ["row-old", "row-latest"],

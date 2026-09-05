@@ -4,7 +4,8 @@ import Foundation
 /// destination shares this revision fence.
 private actor VersionedDiskSink {
     private let destination: URL
-    private var latestRevision = 0
+    private var latestAttemptedRevision = 0
+    private var latestCommittedRevision = 0
 
     init(destination: URL) {
         self.destination = destination
@@ -13,15 +14,26 @@ private actor VersionedDiskSink {
     func save<T: Encodable & Sendable>(
         _ value: T, version: Int, revision: Int
     ) -> Bool {
-        guard revision >= latestRevision else { return true }
-        latestRevision = revision
-        return DiskStore.writeVersioned(value, to: destination, version: version)
+        guard revision >= latestAttemptedRevision else {
+            return revision <= latestCommittedRevision
+        }
+        latestAttemptedRevision = revision
+        let committed = DiskStore.writeVersioned(value, to: destination, version: version)
+        if committed {
+            latestCommittedRevision = max(latestCommittedRevision, revision)
+        }
+        return committed
     }
 
     func remove(revision: Int) {
-        guard revision >= latestRevision else { return }
-        latestRevision = revision
-        try? FileManager.default.removeItem(at: destination)
+        guard revision >= latestAttemptedRevision else { return }
+        latestAttemptedRevision = revision
+        do {
+            try FileManager.default.removeItem(at: destination)
+        } catch {
+            guard (error as NSError).code == NSFileNoSuchFileError else { return }
+        }
+        latestCommittedRevision = max(latestCommittedRevision, revision)
     }
 }
 
