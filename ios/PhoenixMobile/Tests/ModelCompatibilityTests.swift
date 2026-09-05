@@ -122,10 +122,10 @@ final class ModelCompatibilityTests: XCTestCase {
 
         let conversation = api.productConversationListRowToConversation(row)
 
-        XCTAssertEqual(conversation.id, "latest-map")
+        XCTAssertEqual(conversation.id, "root-map")
         XCTAssertEqual(conversation.product_conversation_id, "pc-map")
         XCTAssertEqual(conversation.aggregateIdentity, "pc-map")
-        XCTAssertEqual(conversation.transcriptRowIdentity, "latest-map")
+        XCTAssertEqual(conversation.transcriptRowIdentity, "root-map")
         XCTAssertEqual(conversation.archived, true)
         XCTAssertEqual(conversation.presentation_mode, "needs_action")
         XCTAssertEqual(conversation.requires_action, true)
