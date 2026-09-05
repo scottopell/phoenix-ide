@@ -42,12 +42,16 @@ final class OutboxTests: XCTestCase {
             attemptCount: 0)
     }
 
+    private let persistenceScope = PersistenceScopeIdentity(
+        serverURL: "https://example.com",
+        credentialGeneration: "credential-a")
+
     @MainActor
     private func makeOutbox(_ conversationId: String) -> Outbox {
         Outbox(
             conversationId: conversationId,
             aggregateAuthority: conversationId,
-            persistenceScope: nil,
+            persistenceScope: persistenceScope,
             persistence: OutboxPersistenceHandle.disk(conversationId: conversationId, aggregateAuthority: conversationId))
     }
 
@@ -59,14 +63,7 @@ final class OutboxTests: XCTestCase {
         switch DiskStore.loadVersionedResult(
             PersistedOutboxEnvelope.self,
             source: source,
-            version: Outbox.schemaVersion,
-            migrate: { storedVersion, fileData in
-                guard let entries = migrateLegacyOutboxEnvelope(
-                    storedVersion: storedVersion,
-                    fileData: fileData)
-                else { return nil }
-                return PersistedOutboxEnvelope(scope: nil, aggregateAuthority: conversationId, entries: entries)
-            })
+            version: Outbox.schemaVersion)
         {
         case .missing:
             return .empty
@@ -78,15 +75,16 @@ final class OutboxTests: XCTestCase {
     }
 
     @MainActor
-    func testSchemaV1EnvelopeMigratesEntries() {
+    func testSchemaV1EnvelopeFailsClosedWithoutProvenance() {
         freshDiskStore()
         let entry = makeEntry(conversationId: "c1")
         XCTAssertTrue(DiskStore.saveVersioned([entry], name: "outbox-c1", version: 1))
 
         let outbox = makeOutbox("c1")
 
-        XCTAssertEqual(outbox.entries, [entry])
-        XCTAssertTrue(outbox.persistenceHealthy)
+        XCTAssertTrue(outbox.entries.isEmpty)
+        XCTAssertFalse(outbox.persistenceHealthy)
+        XCTAssertEqual(storedContents("c1"), .inaccessible)
     }
 
     // MARK: - EnqueueLocalMessage
@@ -325,7 +323,7 @@ final class OutboxTests: XCTestCase {
         let mine = makeEntry(conversationId: "c1")
         DiskStore.saveVersioned(
             PersistedOutboxEnvelope(
-                scope: nil,
+                scope: persistenceScope,
                 aggregateAuthority: "c1",
                 entries: [foreign, mine]),
             name: "outbox-c1",
@@ -354,7 +352,7 @@ final class OutboxTests: XCTestCase {
             createdAt: Date().addingTimeInterval(-300),
             acceptedAt: Date().addingTimeInterval(-120))
         DiskStore.saveVersioned(
-            PersistedOutboxEnvelope(scope: nil, aggregateAuthority: "c1", entries: [stale]),
+            PersistedOutboxEnvelope(scope: persistenceScope, aggregateAuthority: "c1", entries: [stale]),
             name: "outbox-c1",
             version: Outbox.schemaVersion)
         let outbox = makeOutbox("c1")
@@ -373,7 +371,7 @@ final class OutboxTests: XCTestCase {
             createdAt: Date().addingTimeInterval(-3600),
             acceptedAt: Date())
         DiskStore.saveVersioned(
-            PersistedOutboxEnvelope(scope: nil, aggregateAuthority: "c1", entries: [justAccepted]),
+            PersistedOutboxEnvelope(scope: persistenceScope, aggregateAuthority: "c1", entries: [justAccepted]),
             name: "outbox-c1",
             version: Outbox.schemaVersion)
         let outbox = makeOutbox("c1")
@@ -389,7 +387,7 @@ final class OutboxTests: XCTestCase {
             conversationId: "c1", status: .steeringQueued, acceptedByServer: true,
             createdAt: Date().addingTimeInterval(-3600))
         DiskStore.saveVersioned(
-            PersistedOutboxEnvelope(scope: nil, aggregateAuthority: "c1", entries: [steering]),
+            PersistedOutboxEnvelope(scope: persistenceScope, aggregateAuthority: "c1", entries: [steering]),
             name: "outbox-c1",
             version: Outbox.schemaVersion)
         let outbox = makeOutbox("c1")
@@ -406,7 +404,7 @@ final class OutboxTests: XCTestCase {
             conversationId: "c1", status: .pending, acceptedByServer: false,
             createdAt: Date().addingTimeInterval(-3600))
         DiskStore.saveVersioned(
-            PersistedOutboxEnvelope(scope: nil, aggregateAuthority: "c1", entries: [offline]),
+            PersistedOutboxEnvelope(scope: persistenceScope, aggregateAuthority: "c1", entries: [offline]),
             name: "outbox-c1",
             version: Outbox.schemaVersion)
         let outbox = makeOutbox("c1")
@@ -450,7 +448,7 @@ final class OutboxTests: XCTestCase {
             conversationId: "c1", status: .recoverableInconsistency, acceptedByServer: true,
             createdAt: Date().addingTimeInterval(-120))
         DiskStore.saveVersioned(
-            PersistedOutboxEnvelope(scope: nil, aggregateAuthority: "c1", entries: [stale]),
+            PersistedOutboxEnvelope(scope: persistenceScope, aggregateAuthority: "c1", entries: [stale]),
             name: "outbox-c1",
             version: Outbox.schemaVersion)
 

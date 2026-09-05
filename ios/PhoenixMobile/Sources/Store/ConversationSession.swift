@@ -223,31 +223,30 @@ final class ConversationSession {
             PersistedSnapshot.self,
             source: snapshotWriter.destinationURL,
             version: Self.snapshotSchemaVersion)
-        if case .value(let snap) = loadedSnapshot {
-            conversation = snap.conversation
+        if case .value(let snap) = loadedSnapshot,
+           let persistedConversation = snap.conversation,
+           let authority = snap.authoritative,
+           authority.configurationIdentity == api.configurationIdentity,
+           authority.aggregateAuthority == self.aggregateAuthority,
+           let receiptIdentity = Self.receiptIdentity(
+               for: persistedConversation,
+               sessionConversationId: conversationId,
+               expectedAggregateAuthority: self.aggregateAuthority)
+        {
+            conversation = persistedConversation
             messages = snap.messages
             durableMessageSequenceCeiling = snap.messages.map { $0.sequence_id }.max() ?? 0
             lastSequenceId = snap.lastSequenceId
             transcriptGeneration = snap.transcriptGeneration
             snapshotSyncedAt = snap.syncedAt
-            if let persistedConversation = snap.conversation,
-               let authority = snap.authoritative,
-               authority.configurationIdentity == api.configurationIdentity,
-               authority.aggregateAuthority == aggregateAuthority,
-               let receiptIdentity = Self.receiptIdentity(
-                   for: persistedConversation,
-                   sessionConversationId: conversationId,
-                   expectedAggregateAuthority: self.aggregateAuthority)
-            {
-                authoritativeSnapshotReceipt = AuthoritativeSnapshotReceipt(
-                    conversationId: receiptIdentity.conversationId,
-                    aggregateId: receiptIdentity.aggregateId,
-                    configurationIdentity: api.configurationIdentity,
-                    revision: 0,
-                    syncedAt: authority.syncedAt)
-            }
+            authoritativeSnapshotReceipt = AuthoritativeSnapshotReceipt(
+                conversationId: receiptIdentity.conversationId,
+                aggregateId: receiptIdentity.aggregateId,
+                configurationIdentity: api.configurationIdentity,
+                revision: 0,
+                syncedAt: authority.syncedAt)
             replayFromPendingAnchor = true
-            presentationMode = snap.conversation?.presentation_mode
+            presentationMode = persistedConversation.presentation_mode
             // Busy flag follows the cached mode the same way live
             // state_change events derive it — a snapshot taken mid-turn
             // must not open looking idle.

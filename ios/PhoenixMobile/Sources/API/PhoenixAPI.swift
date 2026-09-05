@@ -180,6 +180,12 @@ struct APIConfigurationIdentity: Codable, Equatable, Hashable, Sendable {
         self.credentialGeneration = credentialGeneration
         self.trustSelfSigned = trustSelfSigned
     }
+
+    var persistenceScope: PersistenceScopeIdentity {
+        PersistenceScopeIdentity(
+            serverURL: serverURL,
+            credentialGeneration: credentialGeneration)
+    }
 }
 
 struct PhoenixAPI: Sendable {
