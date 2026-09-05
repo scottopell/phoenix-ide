@@ -97,6 +97,7 @@ final class ConversationSession {
     private let retryTiming: any SessionTiming
     private let staleCheckTiming: any SessionTiming
     private let openEventStream: ConversationEventStreamOpener
+    private let deliveryTriggerAllowed: () -> Bool
     struct HardDeleteContext: Sendable {
         let conversationId: String
         let aggregateAuthority: String
@@ -196,6 +197,7 @@ final class ConversationSession {
         retryTiming: any SessionTiming,
         staleCheckTiming: any SessionTiming,
         openEventStream: @escaping ConversationEventStreamOpener = defaultConversationEventStreamOpener,
+        deliveryTriggerAllowed: @escaping () -> Bool = { true },
         aggregateAuthority: String? = nil,
         onConversationUpdate: ((Conversation) -> Void)? = nil,
         onHardDeleted: @escaping @MainActor (HardDeleteContext) async -> Void = { _ in }
@@ -206,6 +208,7 @@ final class ConversationSession {
         self.retryTiming = retryTiming
         self.staleCheckTiming = staleCheckTiming
         self.openEventStream = openEventStream
+        self.deliveryTriggerAllowed = deliveryTriggerAllowed
         self.aggregateAuthority = Self.aggregateAuthority(
             conversationId: conversationId,
             aggregateAuthority: aggregateAuthority)
@@ -394,13 +397,17 @@ final class ConversationSession {
     /// Called on scenePhase -> .active: the stream task was likely torn down
     /// while backgrounded; restart it and drain anything queued.
     func resyncAfterForeground() {
-        guard !isHardDeleted else { return }
+        guard !isHardDeleted, deliveryTriggerAllowed() else { return }
         resumeLiveTasks()
         drainOutbox()
     }
 
+    func resyncAfterConnectivityRestore() {
+        connectivityRestored()
+    }
+
     private func connectivityRestored() {
-        guard !isHardDeleted else { return }
+        guard !isHardDeleted, deliveryTriggerAllowed() else { return }
         if viewIsActive, !streamBlockedUntilConfigurationChange {
             streamTask?.cancel()
             streamTask = nil
@@ -708,6 +715,12 @@ final class ConversationSession {
         }
         return generation
     }
+
+    #if DEBUG
+    func currentDrainGenerationForTesting() -> Int? {
+        drainTask == nil ? nil : drainGeneration
+    }
+    #endif
 
     func awaitDrainOutbox(generation: Int) async -> Bool {
         if lastCompletedDrainGeneration >= generation {

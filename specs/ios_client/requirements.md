@@ -388,6 +388,16 @@ WHEN a Close conversation request is in flight
 THE SYSTEM SHALL disable new message submission for that conversation
 UNTIL Close conversation fails or completes
 
+WHEN an authoritative ProductConversation snapshot contains exactly one transcript segment
+THE SYSTEM SHALL offer Close through that segment's conversation lifecycle endpoint
+
+WHEN an authoritative ProductConversation snapshot contains multiple transcript segments
+THE SYSTEM SHALL NOT invoke a per-conversation lifecycle endpoint for Close
+AND SHALL omit or disable Close with a concise unavailable explanation
+
+WHEN ProductConversation segment cardinality is not authoritatively known
+THE SYSTEM SHALL NOT offer Close
+
 WHEN the conversation is in a state that rejects ordinary chat
 THE SYSTEM SHALL disable the composer
 AND SHALL continue allowing chat in working states where the server accepts
@@ -396,7 +406,10 @@ the message as steering
 **Rationale:** Queuing an action against live server state fabricates a
 stale intent — a Close conversation or cancel replayed minutes later can destroy
 work the user did in between. Only idempotency-keyed sends are safe to
-defer; the type forces each new action to make that choice explicitly.
+defer; the type forces each new action to make that choice explicitly. A
+per-conversation lifecycle endpoint cannot safely represent aggregate Close
+for a continued ProductConversation; no aggregate Close endpoint contract is
+defined for the iOS client.
 
 ---
 
