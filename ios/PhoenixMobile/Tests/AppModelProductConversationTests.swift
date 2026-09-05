@@ -1906,6 +1906,8 @@ final class AppModelProductConversationTests: XCTestCase {
                 configuration.protocolClasses = [TestURLProtocol.self]
                 return configuration
             }()))!)
+        model.listStore.upsert(self.conversation(id: "row-1", aggregateId: "pc-1"))
+        model.listStore.upsert(self.conversation(id: "row-0", aggregateId: "pc-1"))
         let session = model.session(for: "row-1")
         session?.receive(.initSnapshot(.init(
             conversation: self.conversation(id: "row-1", aggregateId: "pc-1"),
@@ -1952,12 +1954,14 @@ final class AppModelProductConversationTests: XCTestCase {
         detail.applyForTesting(testProductConversationSnapshot())
         XCTAssertFalse(detail.transcriptItems.isEmpty)
         XCTAssertNotNil(detail.actionSession)
+        model.pendingOpenConversationId = "row-0"
 
         await model.forceAggregateNotFoundCleanupForTesting(
             aggregateId: "pc-1",
             transcriptRowId: "row-1",
-            memberIds: ["row-1"])
+            memberIds: ["row-0", "row-1"])
 
+        XCTAssertNil(model.pendingOpenConversationId)
         XCTAssertNil(detail.snapshot)
         XCTAssertTrue(detail.transcriptItems.isEmpty)
         XCTAssertNil(detail.actionSession)
@@ -2283,48 +2287,40 @@ final class AppModelProductConversationTests: XCTestCase {
             aggregateAuthority: "pc-1"))
     }
 
-    func testAggregateRebindReplacesSessionWithoutDeletingOrCrossPostingOldOutbox() async throws {
+
+    @MainActor
+    func testMisroutedInitRetainsSessionAndAggregateListProjection() async throws {
         let store = MutableTestConversationPersistenceStore(
             owners: ["row-1"],
             contentsByConversationId: ["row-1": .entries([])],
-            aggregateMembersById: ["pc-old": ["row-1"], "pc-new": ["row-1"]])
-        let probe = SendProbe()
-        let host = "aggregate-rebind.invalid"
-        let (api, registration) = makeHTTPAPI(
-            probe: probe,
-            host: host,
-            configurationIdentity: .init(
-                serverURL: "https://\(host)",
-                credentialGeneration: "credential",
-                trustSelfSigned: false))
-        defer { TestURLProtocol.uninstall(host: host, owner: registration) }
+            aggregateMembersById: ["pc-old": ["row-1"]])
         let model = AppModel(
             conversationPersistenceStore: store,
             credentialStore: InMemoryCredentialStore())
+        let (api, registration) = makeHTTPAPI(probe: SendProbe())
+        defer { TestURLProtocol.uninstall(host: "phoenix.invalid", owner: registration) }
         model.replaceAPIForTesting(api)
-        model.connectivity.setOnlineForTesting(false)
-        model.listStore.upsert(conversation(id: "row-1", aggregateId: "pc-old"))
-        let oldSession = try XCTUnwrap(model.session(for: "row-1", aggregateAuthority: "pc-old"))
-        oldSession.receive(.initSnapshot(.init(
-            conversation: conversation(id: "row-1", aggregateId: "pc-old"),
+        let oldProjection = conversation(id: "row-1", aggregateId: "pc-old")
+        model.listStore.upsert(oldProjection)
+        let session = try XCTUnwrap(model.session(for: "row-1", aggregateAuthority: "pc-old"))
+        session.receive(.initSnapshot(.init(
+            conversation: oldProjection,
             messages: [], agentWorking: false,
             presentationMode: "idle", lastSequenceId: 0,
             pendingAnchorSequenceId: 0, pendingEvents: [], pendingTruncated: false)))
-        let persisted = await oldSession.flushSnapshotPersistence()
+        let persisted = await session.flushSnapshotPersistence()
         XCTAssertTrue(persisted)
-        let queued = await oldSession.outbox.enqueue(text: "old queued text")
-        XCTAssertNotNil(queued)
+        let listBefore = model.listStore.conversations
 
-        model.applySessionConversationUpdateForTesting(
-            conversation(id: "row-1", aggregateId: "pc-new"),
-            transcriptRowId: "row-1")
+        session.receive(.initSnapshot(.init(
+            conversation: conversation(id: "row-1", aggregateId: "pc-new"),
+            messages: [], agentWorking: false,
+            presentationMode: "idle", lastSequenceId: 0,
+            pendingAnchorSequenceId: 0, pendingEvents: [], pendingTruncated: false)))
 
-        let replacement = try XCTUnwrap(model.existingSession(for: "row-1"))
-        XCTAssertFalse(replacement === oldSession)
-        XCTAssertEqual(replacement.aggregateAuthorityForTesting, "pc-new")
-        XCTAssertFalse(oldSession.isHardDeleted)
-        XCTAssertEqual(oldSession.outbox.entries.map(\.text), ["old queued text"])
-        XCTAssertTrue(probe.chatPostPaths.isEmpty)
+        XCTAssertTrue(model.existingSession(for: "row-1") === session)
+        XCTAssertEqual(model.listStore.conversations, listBefore)
+        XCTAssertEqual(model.listStore.aggregateId(forTranscriptRowId: "row-1"), "pc-old")
     }
 
     func testArchiveBlocksWhenPredecessorMemberHasVisibleOutbox() async {
