@@ -8,7 +8,7 @@ final class ProductConversationDetailModel {
     private(set) var initialTranscriptRowId: String?
 
     private let connectivity: ConnectivityMonitor
-    private let createSession: (String) -> ConversationSession?
+    private let createSession: (String, String) -> ConversationSession?
     private let existingSession: (String) -> ConversationSession?
     private let persistedOutboxContents: (String) -> Outbox.StoredContents
     private let hasCachedSnapshot: (String) -> Bool
@@ -25,6 +25,7 @@ final class ProductConversationDetailModel {
     private(set) var actionTranscriptRowId: String?
     private(set) var lastDelegatedConnection: ConversationSession.ConnectionState = .idle
     private(set) var observedSessionIds: Set<String> = []
+    private(set) var hardDeleted = false
 
     private var retainedOlderPages: [ProductConversationSnapshot] = []
     private var startedTranscriptRowId: String?
@@ -46,7 +47,7 @@ final class ProductConversationDetailModel {
         initialTranscriptRowId: String? = nil,
         api: PhoenixAPI,
         connectivity: ConnectivityMonitor,
-        sessionProvider: @escaping (String) -> ConversationSession?,
+        sessionProvider: @escaping (String, String) -> ConversationSession?,
         existingSession: @escaping (String) -> ConversationSession? = { _ in nil },
         persistedOutboxContents: @escaping (String) -> Outbox.StoredContents = { _ in .empty },
         hasCachedSnapshot: @escaping (String) -> Bool = { _ in false },
@@ -75,7 +76,7 @@ final class ProductConversationDetailModel {
     }
 
     var isHistoryReadOnly: Bool {
-        snapshot?.ordinary_lifecycle == .history
+        hardDeleted || snapshot?.ordinary_lifecycle == .history
     }
 
     var canSendChat: Bool {
@@ -255,6 +256,7 @@ final class ProductConversationDetailModel {
 
     func invalidateHardDeleted() {
         invalidate(clearError: false)
+        hardDeleted = true
     }
 
     private func invalidate(clearError: Bool) {
@@ -492,6 +494,7 @@ final class ProductConversationDetailModel {
     }
 
     private func applySnapshot(_ newSnapshot: ProductConversationSnapshot, resetRetainedPages: Bool) {
+        hardDeleted = false
         if resetRetainedPages { retainedOlderPages.removeAll() }
         snapshot = newSnapshot
         aggregateTranscriptRowIds = Set(newSnapshot.segments.map(\.transcript_row_id))
@@ -790,7 +793,7 @@ final class ProductConversationDetailModel {
             sessionSlots[transcriptRowId] = existing
             return existing
         }
-        guard let created = createSession(transcriptRowId) else { return nil }
+        guard let created = createSession(transcriptRowId, aggregateId) else { return nil }
         sessionSlots[transcriptRowId] = created
         return created
     }

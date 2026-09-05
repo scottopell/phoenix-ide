@@ -119,6 +119,12 @@ protocol ConversationPersistenceStore {
         configurationIdentity: APIConfigurationIdentity,
         aggregateAuthority: String
     ) async -> Bool
+    func removeAuthoritativePersistedConversationState(
+        conversationId: String,
+        configurationIdentity: APIConfigurationIdentity,
+        aggregateAuthority: String,
+        legacyScope: PersistenceScopeIdentity?
+    ) async -> Bool
     func removeAllPersistedConversationState() async
     func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool
     func hardDeleteFences(persistenceScope: PersistenceScopeIdentity) -> HardDeleteFenceLoadResult
@@ -245,7 +251,7 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
         else { return false }
         guard snapshot.conversation?.aggregateIdentity == aggregateAuthority else { return false }
         if let authority = snapshot.authoritative {
-            return authority.configurationIdentity == configurationIdentity
+            return authority.configurationIdentity.persistenceScope == configurationIdentity.persistenceScope
                 && authority.aggregateAuthority == aggregateAuthority
         }
         return legacyScope == configurationIdentity.persistenceScope
@@ -927,7 +933,7 @@ final class AppModel {
         }
     }
 
-    func session(for conversationId: String) -> ConversationSession? {
+    func session(for conversationId: String, aggregateAuthority: String? = nil) -> ConversationSession? {
         guard let api else { return nil }
         guard !hardDeletedConversationIds.contains(conversationId) else { return nil }
         if let existing = sessions[conversationId] { return existing }
@@ -959,7 +965,7 @@ final class AppModel {
                     self?.persistedOutboxHydrated == true
                 },
                 legacySnapshotPersistenceScope: legacySnapshotPersistenceScope,
-                aggregateAuthority: aggregateIdentity(forTranscriptRowId: conversationId),
+                aggregateAuthority: aggregateAuthority ?? aggregateIdentity(forTranscriptRowId: conversationId),
                 onConversationUpdate: onConversationUpdate,
                 onHardDeleted: onHardDeleted)
         }
@@ -1342,8 +1348,8 @@ final class AppModel {
             initialTranscriptRowId: initialTranscriptRowId,
             api: api,
             connectivity: connectivity,
-            sessionProvider: { [weak self] transcriptRowId in
-                self?.session(for: transcriptRowId)
+            sessionProvider: { [weak self] transcriptRowId, aggregateAuthority in
+                self?.session(for: transcriptRowId, aggregateAuthority: aggregateAuthority)
             },
             existingSession: { [weak self] transcriptRowId in
                 self?.existingSession(for: transcriptRowId)
