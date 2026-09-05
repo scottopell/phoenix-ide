@@ -1581,6 +1581,9 @@ final class AppModel {
                     snapshotPersistence: conversationPersistenceStore.snapshotPersistence(conversationId: conversationId),
                     retryTiming: LiveSessionTiming(),
                     staleCheckTiming: LiveSessionTiming(),
+                    deliveryTriggerAllowed: { [weak self] in
+                        self?.persistedOutboxHydrated == true
+                    },
                     aggregateAuthority: aggregateIdentity(forTranscriptRowId: conversationId))
                 drainSessions[conversationId] = drainSession
             }

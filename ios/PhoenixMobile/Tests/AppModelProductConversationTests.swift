@@ -1202,7 +1202,12 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertEqual(store.pendingOutboxDiscoveryCount, 0)
         XCTAssertTrue(probe.chatPostPaths.isEmpty)
 
+        let startupDrainGeneration = model.currentPersistedOutboxDrainGenerationForTesting()
+        if let startupDrainGeneration {
+            _ = await model.awaitPersistedOutboxDrainForTesting(generation: startupDrainGeneration)
+        }
         let session = model.session(for: "row-1")
+        XCTAssertNotNil(session)
 
         store.hardDeleteFenceLoadResult = .accessible([])
         model.connectivity.setOnlineForTesting(true)

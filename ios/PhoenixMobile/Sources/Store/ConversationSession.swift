@@ -1475,9 +1475,15 @@ final class ConversationSession {
                             current: conversation.aggregateIdentity))))
             return
         }
-        guard previousState != currentState,
-              let reason = currentState.productConversationTopologyInvalidationReason
-        else { return }
+        guard previousState != currentState else { return }
+        let reason: ProductConversationTopologyInvalidation.Reason
+        if let topologyReason = currentState.productConversationTopologyInvalidationReason {
+            reason = topologyReason
+        } else if previousState.acceptsChatMessage != currentState.acceptsChatMessage {
+            reason = .chatCapabilityChanged
+        } else {
+            return
+        }
         onSessionEvent?(
             .aggregateTopologyInvalidated(
                 ProductConversationTopologyInvalidation(

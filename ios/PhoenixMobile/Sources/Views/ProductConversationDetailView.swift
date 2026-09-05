@@ -62,11 +62,13 @@ struct ProductConversationDetailView: View {
                     .padding(.top, 4)
                     .accessibilityIdentifier("productConversation.outboxPersistenceWarning")
                 }
-                if let error = detailModel.lastDelegatedError {
+                if let error = detailModel.currentOwnerSession?.lastErrorToast {
                     InlineErrorBanner(message: error) { detailModel.dismissDelegatedError() }
                 }
-                if detailModel.canSendChat, let session = detailModel.actionSession {
+                if let session = detailModel.currentOwnerSession, !detailModel.isHistoryReadOnly {
                     ConnectionStateBar(session: session)
+                }
+                if detailModel.canSendChat, let session = detailModel.actionSession {
                     ComposerView(session: session, draft: $draft)
                         .accessibilityIdentifier("conversation.productComposer")
                 } else if detailModel.isHistoryReadOnly {
