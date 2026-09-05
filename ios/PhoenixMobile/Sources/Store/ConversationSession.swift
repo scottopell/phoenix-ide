@@ -99,12 +99,14 @@ final class ConversationSession {
     private let openEventStream: ConversationEventStreamOpener
     struct HardDeleteContext: Sendable {
         let conversationId: String
-        let aggregateIdentity: String?
+        let aggregateAuthority: String
+        let configurationIdentity: APIConfigurationIdentity
     }
 
     private var onConversationUpdate: ((Conversation) -> Void)?
     private var onSessionEvent: ((ProductConversationSessionEvent) -> Void)?
     private var onHardDeleted: @MainActor (HardDeleteContext) async -> Void
+    private var hardDeleteReportTask: Task<Void, Never>?
     private var viewIsActive = false
     private var replayFromPendingAnchor = false
     private var streamBlockedUntilConfigurationChange = false
@@ -539,6 +541,10 @@ final class ConversationSession {
 
     func currentStreamTaskForTesting() -> Task<Void, Never>? {
         streamTask
+    }
+
+    func awaitHardDeleteReportForTesting() async {
+        await hardDeleteReportTask?.value
     }
 
     func clearCachedSnapshotAndWait() async {
@@ -1216,7 +1222,8 @@ final class ConversationSession {
         }
         let hardDeleteContext = HardDeleteContext(
             conversationId: conversationId,
-            aggregateIdentity: conversation?.aggregateIdentity)
+            aggregateAuthority: conversation?.aggregateIdentity ?? aggregateAuthority,
+            configurationIdentity: api.configurationIdentity)
         inFlight.removeAll()
         isHardDeleted = true
         conversation = nil
@@ -1234,7 +1241,7 @@ final class ConversationSession {
         snapshotNeedsOutboxReconciliation = false
         snapshotNeedsOutboxDrain = false
         authoritativeSnapshotReceipt = nil
-        Task { @MainActor [hardDeleteContext, onHardDeleted] in
+        hardDeleteReportTask = Task { @MainActor [hardDeleteContext, onHardDeleted] in
             await onHardDeleted(hardDeleteContext)
         }
     }

@@ -494,10 +494,13 @@ rule HardDeletionFencePrecedesCleanup {
     ensures: session.interaction_enabled = false
     ensures: session.state = deleted
     @guidance
-        -- Persist the fence before starting asynchronous local deletion.
-        -- Startup recovery consumes matching fences before session
-        -- materialization or persisted queue delivery. Retire a fence only
-        -- after every authoritative local sink confirms absence.
+        -- One authority transaction owns live-event, aggregate-not-found,
+        -- and startup-recovery deletion. It commits the exact configuration,
+        -- aggregate, and member fence; revalidates the configuration epoch;
+        -- terminally revokes member delivery and persistence capabilities;
+        -- awaits exact-scope transcript, queue, and list removal; verifies
+        -- absence; then retires that exact fence. Epoch mismatch leaves the
+        -- fence durable without process-local mutation.
 }
 
 rule HardDeletionEventReceived {

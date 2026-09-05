@@ -65,6 +65,20 @@ struct PersistedHardDeleteFence: Codable, Equatable, Sendable {
     }
 }
 
+enum HardDeleteFenceState: Sendable {
+    case needsCommit
+    case committed(PersistedHardDeleteFence)
+}
+
+struct HardDeleteCleanupContext: Sendable {
+    let configurationEpoch: Int
+    let configurationIdentity: APIConfigurationIdentity
+    let aggregateAuthority: String
+    let triggerConversationId: String?
+    let memberConversationIds: Set<String>
+    let fenceState: HardDeleteFenceState
+}
+
 @MainActor
 protocol ConversationPersistenceStore {
     var listPersistenceContext: VersionedDiskContext? { get }
@@ -614,17 +628,13 @@ final class AppModel {
     }
 
     private func completePersistedHardDeleteFence(_ fence: PersistedHardDeleteFence) async {
-        var removedAll = true
-        for conversationId in fence.memberConversationIds {
-            let removed = await conversationPersistenceStore.removeAuthoritativePersistedConversationState(
-                conversationId: conversationId,
-                configurationIdentity: fence.configurationIdentity,
-                aggregateAuthority: fence.aggregateAuthority)
-            removedAll = removedAll && removed
-        }
-        guard removedAll else { return }
-        guard await listStore.removeAndPersist(aggregateId: fence.aggregateAuthority) else { return }
-        await conversationPersistenceStore.retireHardDeleteFence(fence)
+        await runHardDeleteCleanup(.init(
+            configurationEpoch: apiGeneration,
+            configurationIdentity: fence.configurationIdentity,
+            aggregateAuthority: fence.aggregateAuthority,
+            triggerConversationId: nil,
+            memberConversationIds: Set(fence.memberConversationIds),
+            fenceState: .committed(fence)))
     }
 
     private func schedulePersistedOutboxDrain() {
@@ -880,83 +890,98 @@ final class AppModel {
         segmentTranscriptRowIds: Set<String>
     ) async {
         guard let api else { return }
-        let persistedConversationIds = conversationPersistenceStore.persistedConversationIds(
+        let persistedMembers = conversationPersistenceStore.persistedConversationIds(
             aggregateId: aggregateId,
             scope: api.configurationIdentity.persistenceScope)
-        let aggregateConversationIds = Set(listStore.transcriptToAggregate.compactMap { key, value in
-            value == aggregateId ? key : nil
+        let listMembers = Set(listStore.transcriptToAggregate.compactMap { id, aggregate in
+            aggregate == aggregateId ? id : nil
         })
-        .union(segmentTranscriptRowIds)
-        .union(Set([transcriptRowId].compactMap { $0 }))
-        .union(persistedConversationIds)
-        let fence = PersistedHardDeleteFence(
+        await runHardDeleteCleanup(.init(
+            configurationEpoch: apiGeneration,
             configurationIdentity: api.configurationIdentity,
             aggregateAuthority: aggregateId,
-            memberConversationIds: aggregateConversationIds.sorted())
-        productConversationDetails[aggregateId]?.invalidateHardDeleted()
-        guard await conversationPersistenceStore.persistHardDeleteFence(fence) else { return }
-        guard api.configurationIdentity == fence.configurationIdentity else { return }
-        let cleanupGeneration = beginHardDeleteCleanup(conversationIds: aggregateConversationIds)
-        let ownedSessions = aggregateConversationIds.compactMap { sessions.removeValue(forKey: $0) }
-        let ownedDrainSessions = aggregateConversationIds.compactMap { drainSessions.removeValue(forKey: $0) }
-        for session in ownedSessions { session.stop() }
-        for session in ownedDrainSessions { session.stop() }
-        productConversationDetails.removeValue(forKey: aggregateId)
-        if pendingOpenConversationId == transcriptRowId || pendingOpenConversationId == aggregateId {
+            triggerConversationId: transcriptRowId,
+            memberConversationIds: persistedMembers
+                .union(listMembers)
+                .union(segmentTranscriptRowIds)
+                .union(Set([transcriptRowId].compactMap { $0 })),
+            fenceState: .needsCommit))
+    }
+
+    private func runHardDeleteCleanup(_ context: HardDeleteCleanupContext) async {
+        let fence: PersistedHardDeleteFence
+        switch context.fenceState {
+        case .needsCommit:
+            fence = PersistedHardDeleteFence(
+                configurationIdentity: context.configurationIdentity,
+                aggregateAuthority: context.aggregateAuthority,
+                memberConversationIds: context.memberConversationIds.sorted())
+            guard await conversationPersistenceStore.persistHardDeleteFence(fence) else { return }
+        case .committed(let persisted):
+            fence = persisted
+        }
+
+        guard apiGeneration == context.configurationEpoch,
+              api?.configurationIdentity == context.configurationIdentity
+        else { return }
+
+        let memberIds = Set(fence.memberConversationIds)
+        let cleanupGeneration = beginHardDeleteCleanup(conversationIds: memberIds)
+        productConversationDetails[context.aggregateAuthority]?.invalidateHardDeleted()
+        productConversationDetails.removeValue(forKey: context.aggregateAuthority)
+        for id in memberIds {
+            sessions.removeValue(forKey: id)?.invalidateConfiguration()
+            drainSessions.removeValue(forKey: id)?.invalidateConfiguration()
+        }
+        if pendingOpenConversationId == context.triggerConversationId
+            || pendingOpenConversationId == context.aggregateAuthority
+        {
             pendingOpenConversationId = nil
         }
-        UNUserNotificationCenter.current().removeDeliveredNotifications(
-            withIdentifiers: ["attention-\(aggregateId)"])
-        UNUserNotificationCenter.current().removePendingNotificationRequests(
-            withIdentifiers: ["attention-\(aggregateId)"])
+
         var removedAll = true
-        for conversationId in aggregateConversationIds {
+        for id in memberIds {
             let removed = await conversationPersistenceStore.removeAuthoritativePersistedConversationState(
-                conversationId: conversationId,
-                configurationIdentity: api.configurationIdentity,
-                aggregateAuthority: aggregateId)
+                conversationId: id,
+                configurationIdentity: context.configurationIdentity,
+                aggregateAuthority: context.aggregateAuthority)
             removedAll = removedAll && removed
         }
-        _ = ownedSessions
-        _ = ownedDrainSessions
-        if removedAll,
-           await listStore.removeAndPersist(aggregateId: aggregateId)
-        {
-            await conversationPersistenceStore.retireHardDeleteFence(fence)
+        guard removedAll,
+              await listStore.removeAndPersist(aggregateId: context.aggregateAuthority)
+        else {
+            completeHardDeleteCleanup(generation: cleanupGeneration, conversationIds: memberIds)
+            return
         }
-        completeHardDeleteCleanup(generation: cleanupGeneration, conversationIds: aggregateConversationIds)
+        await conversationPersistenceStore.retireHardDeleteFence(fence)
+        completeHardDeleteCleanup(generation: cleanupGeneration, conversationIds: memberIds)
+        UNUserNotificationCenter.current().removeDeliveredNotifications(
+            withIdentifiers: ["attention-\(context.aggregateAuthority)"])
+        UNUserNotificationCenter.current().removePendingNotificationRequests(
+            withIdentifiers: ["attention-\(context.aggregateAuthority)"])
     }
 
     private func clearPersistedState(for conversationId: String) async {
         await conversationPersistenceStore.removePersistedConversationState(conversationId: conversationId)
     }
 
-    private func handleHardDeleted(_ context: ConversationSession.HardDeleteContext) async {
-        if let aggregateIdentity = context.aggregateIdentity {
-            await handleAggregateHardDeleted(aggregateIdentity: aggregateIdentity, triggerConversationId: context.conversationId)
-            return
-        }
-        let conversationId = context.conversationId
-        let cleanupGeneration = beginHardDeleteCleanup(conversationIds: [conversationId])
-        listStore.removeByTranscriptRowId(conversationId)
-        if pendingOpenConversationId == conversationId {
-            pendingOpenConversationId = nil
-        }
-        sessions.removeValue(forKey: conversationId)?.stop()
-        drainSessions.removeValue(forKey: conversationId)?.stop()
-        await clearPersistedState(for: conversationId)
-        completeHardDeleteCleanup(generation: cleanupGeneration, conversationIds: [conversationId])
-        UNUserNotificationCenter.current().removeDeliveredNotifications(
-            withIdentifiers: ["attention-\(conversationId)"])
-        UNUserNotificationCenter.current().removePendingNotificationRequests(
-            withIdentifiers: ["attention-\(conversationId)"])
-    }
-
-    private func handleAggregateHardDeleted(aggregateIdentity: String, triggerConversationId: String) async {
-        await handleAggregateHardDeleted(
-            aggregateId: aggregateIdentity,
-            transcriptRowId: triggerConversationId,
-            segmentTranscriptRowIds: [])
+    private func handleHardDeleted(_ report: ConversationSession.HardDeleteContext) async {
+        guard let api,
+              api.configurationIdentity == report.configurationIdentity
+        else { return }
+        let persistedMembers = conversationPersistenceStore.persistedConversationIds(
+            aggregateId: report.aggregateAuthority,
+            scope: report.configurationIdentity.persistenceScope)
+        let listMembers = Set(listStore.transcriptToAggregate.compactMap { id, aggregate in
+            aggregate == report.aggregateAuthority ? id : nil
+        })
+        await runHardDeleteCleanup(.init(
+            configurationEpoch: apiGeneration,
+            configurationIdentity: report.configurationIdentity,
+            aggregateAuthority: report.aggregateAuthority,
+            triggerConversationId: report.conversationId,
+            memberConversationIds: persistedMembers.union(listMembers).union([report.conversationId]),
+            fenceState: .needsCommit))
     }
 
     func refreshList() async {
