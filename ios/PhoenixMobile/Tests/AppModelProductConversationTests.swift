@@ -2493,7 +2493,7 @@ final class AppModelProductConversationTests: XCTestCase {
             aggregateId: "pc-1",
             api: PhoenixAPI(baseURL: URL(string: "https://example.com")!, password: nil, allowSelfSigned: true, configurationIdentity: APIConfigurationIdentity(serverURL: "https://example.com", credentialGeneration: "test-detail", trustSelfSigned: true))!,
             connectivity: model.connectivity,
-            sessionProvider: { _ in nil })
+            sessionProvider: { _, _ in nil })
 
         detail.primeInitialTranscriptRowId("row-1")
 
