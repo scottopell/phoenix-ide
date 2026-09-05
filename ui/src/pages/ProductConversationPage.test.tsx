@@ -798,6 +798,27 @@ describe('ProductConversationPage', () => {
     expect(screen.getByTestId('aggregate-message-viewer')).toBeInTheDocument();
   });
 
+  it('does not expose note sending while the latest row shows a question-only response panel', async () => {
+    renderPage('/product-conversations/pc-1?viewer=message&presentation=pane&message=3&message_id=m-3');
+    await waitForPageReady();
+    act(() => emitLatestProjection({
+      convState: {
+        type: 'awaiting_user_response',
+        questions: [{
+          question: 'Choose a direction',
+          header: 'Direction',
+          options: [{ label: 'A', description: 'First' }, { label: 'B', description: 'Second' }],
+          multiSelect: false,
+        }],
+        answers: [],
+      },
+      appendReviewNotesToComposer: undefined,
+    }));
+
+    const viewerProps = viewerSpy.mock.lastCall?.[0] as Record<string, unknown> | undefined;
+    expect(viewerProps?.['onSendNotes']).toBeUndefined();
+  });
+
   it('does not expose note sending when History has no composer capability', async () => {
     const { api } = await import('../api');
     vi.mocked(api.getProductConversationSnapshot).mockResolvedValueOnce(makeSnapshot({

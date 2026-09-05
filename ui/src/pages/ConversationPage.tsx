@@ -1773,6 +1773,7 @@ function ConversationPageContent({
     && convStateForChildren.type !== 'creation_failed'
     && convStateForChildren.type !== 'creation_cancelled'
     && convStateForChildren.type !== 'context_exhausted'
+    && convStateForChildren.type !== 'awaiting_user_response'
     && convStateForChildren.type !== 'awaiting_task_approval'
     && convStateForChildren.type !== 'handed_off'
     && convStateForChildren.type !== 'terminal';
