@@ -1234,12 +1234,6 @@ final class ConversationSession {
         snapshotNeedsOutboxReconciliation = false
         snapshotNeedsOutboxDrain = false
         authoritativeSnapshotReceipt = nil
-        let snapshotRemovalRevision = snapshotWriter.reserveRevision()
-        latestSnapshotRevision = snapshotRemovalRevision
-        Task { [snapshotWriter] in
-            await snapshotWriter.remove(revision: snapshotRemovalRevision)
-        }
-        outbox.clear()
         Task { @MainActor [hardDeleteContext, onHardDeleted] in
             await onHardDeleted(hardDeleteContext)
         }
