@@ -931,6 +931,27 @@ describe('ProductConversationPage', () => {
     expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.['mutationEnabled']).toBe(false);
   });
 
+  it('does not expose aggregate note sending while Close makes the composer read-only', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValueOnce(makeSnapshot({
+      close: {
+        attempt_id: 'close-active',
+        phase: 'settling_active_work',
+        confirmation_snapshot: null,
+        inspections: [],
+        losses: [],
+        residuals: [],
+      },
+    }));
+
+    renderPage('/product-conversations/pc-1?viewer=message&presentation=pane&message=3&message_id=m-3');
+    await waitForPageReady();
+    act(() => emitLatestProjection({ appendReviewNotesToComposer: undefined }));
+
+    const viewerProps = viewerSpy.mock.lastCall?.[0] as Record<string, unknown> | undefined;
+    expect(viewerProps?.['onSendNotes']).toBeUndefined();
+  });
+
   it('background-refreshes active Close phases without replacing the page with a skeleton', async () => {
     const { api } = await import('../api');
     const activeClose = {
