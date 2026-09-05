@@ -1400,22 +1400,23 @@ final class ConversationSessionReducerTests: XCTestCase {
         }
         let opener = ScriptedStreamOpeningFactory(
             steps: [invalidStream, validStream], blockedOrdinals: [])
+        let retryTiming = ControlledTiming()
         let updates = ConversationUpdateGate()
         let session = makeSession(
             onConversationUpdate: { updates.observe($0) },
-            retryTiming: ImmediateCancellationTiming(),
+            retryTiming: retryTiming,
             staleCheckTiming: ImmediateCancellationTiming(),
             openEventStream: opener.openEventStream,
             aggregateAuthority: "pc-1")
 
         session.start()
         await opener.waitForOpen()
+        await retryTiming.waitForSleepEntry()
         XCTAssertNil(session.conversation)
         XCTAssertTrue(session.messages.isEmpty)
         XCTAssertFalse(session.isHardDeleted)
 
-        session.stop()
-        session.start()
+        try await retryTiming.releaseSleep()
         await opener.waitForOpen(count: 2)
         await updates.wait()
         XCTAssertEqual(session.conversation?.id, "c1")
