@@ -78,8 +78,8 @@ final class ConversationListStore {
         }
     }
 
-    func refresh(api: PhoenixAPI) async {
-        guard refreshToken == nil else { return }
+    func refresh(api: PhoenixAPI) async -> [String: String] {
+        guard refreshToken == nil else { return [:] }
         externalMutationGeneration += 1
         let token = UUID()
         refreshToken = token
@@ -92,17 +92,26 @@ final class ConversationListStore {
         }
         let startedGeneration = generation
         do {
-            let fresh = try await api.listConversations()
-            guard generation == startedGeneration else { return }
+            let response = try await api.listProductConversations()
+            guard generation == startedGeneration else { return [:] }
+            let latestByAggregate = Dictionary(uniqueKeysWithValues: response.product_conversations.map {
+                ($0.product_conversation_id, $0.latest_transcript_row_id)
+            })
             externalMutationGeneration += 1
             apply(Self.merging(
-                fresh,
+                response.product_conversations.map(api.productConversationListRowToConversation),
                 preserving: upsertsDuringRefresh,
                 excluding: exclusionsDuringRefresh))
+            for (aggregateId, transcriptRowId) in latestByAggregate where aggregateExists(aggregateId) {
+                transcriptToAggregate[transcriptRowId] = aggregateId
+            }
+            persistCache()
             lastError = nil
+            return latestByAggregate
         } catch {
-            guard generation == startedGeneration else { return }
+            guard generation == startedGeneration else { return [:] }
             lastError = (error as? APIError)?.errorDescription ?? error.localizedDescription
+            return [:]
         }
     }
 
@@ -241,6 +250,18 @@ final class ConversationListStore {
 
     /// Merge a single updated conversation (e.g. after creation or an SSE
     /// update in an open session) without waiting for a full refresh.
+    func registerTranscriptAlias(
+        transcriptRowId: String,
+        aggregateId: String
+    ) {
+        guard aggregateExists(aggregateId) else { return }
+        transcriptToAggregate[transcriptRowId] = aggregateId
+        if hasCachedSnapshot(transcriptRowId) {
+            aggregateToCachedTranscript[aggregateId] = transcriptRowId
+        }
+        persistCache()
+    }
+
     func upsert(_ conversation: Conversation) {
         if lastRefreshed == nil { lastRefreshed = Date() }
         externalMutationGeneration += 1
