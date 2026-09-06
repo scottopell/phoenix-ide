@@ -31,7 +31,8 @@ final class TestURLProtocol: URLProtocol {
     }
 
     override class func canInit(with request: URLRequest) -> Bool {
-        handler(for: request) != nil
+        guard let scheme = request.url?.scheme?.lowercased() else { return false }
+        return scheme == "http" || scheme == "https"
     }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
