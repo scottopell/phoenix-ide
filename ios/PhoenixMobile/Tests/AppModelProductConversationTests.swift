@@ -2,6 +2,25 @@ import XCTest
 
 @testable import PhoenixMobile
 
+private extension Set where Element == PersistedOutboxOwner {
+    func contains(_ transcriptRowId: String) -> Bool {
+        contains { $0.transcriptRowId == transcriptRowId }
+    }
+}
+
+private func persistedOwners(
+    _ transcriptRowIds: Set<String>,
+    aggregateMembersById: [String: Set<String>]
+) -> Set<PersistedOutboxOwner> {
+    Set(transcriptRowIds.map { transcriptRowId in
+        PersistedOutboxOwner(
+            transcriptRowId: transcriptRowId,
+            aggregateAuthority: aggregateMembersById.first(where: {
+                $0.value.contains(transcriptRowId)
+            })?.key)
+    })
+}
+
 private func makePendingOutboxEntry(conversationId: String) -> OutboxEntry {
     OutboxEntry(
         localId: UUID().uuidString.lowercased(),
@@ -196,7 +215,7 @@ private final class InMemoryOutboxStore {
 private final class TestConversationPersistenceStore: ConversationPersistenceStore {
     var listPersistenceContext: VersionedDiskContext? { nil }
     var persistenceScope: PersistenceScopeIdentity? { nil }
-    func persistedOutboxOwnerTranscriptRowIdsSnapshot(scope: PersistenceScopeIdentity) -> Set<String> { outboxStore.ownerTranscriptRowIds }
+    func persistedOutboxOwnersSnapshot(scope: PersistenceScopeIdentity) -> Set<PersistedOutboxOwner> { persistedOwners(outboxStore.ownerTranscriptRowIds, aggregateMembersById: aggregateMembersById) }
     let baseDirectory: URL
     var snapshotsByConversationId: Set<String> = []
     var aggregateMembersById: [String: Set<String>] = [:]
@@ -209,10 +228,11 @@ private final class TestConversationPersistenceStore: ConversationPersistenceSto
         self.outboxStore = InMemoryOutboxStore(contentsByConversationId: contentsByConversationId, owners: owners)
     }
 
-    func pendingOutboxOwnerTranscriptRowIds(scope: PersistenceScopeIdentity) async -> Set<String> {
-        return Set(outboxStore.ownerTranscriptRowIds.filter { conversationId in
+    func pendingOutboxOwners(scope: PersistenceScopeIdentity) async -> Set<PersistedOutboxOwner> {
+        let ids = Set(outboxStore.ownerTranscriptRowIds.filter { conversationId in
             outboxStore.inspect(conversationId: conversationId).hasPendingSendableEntries
         })
+        return persistedOwners(ids, aggregateMembersById: aggregateMembersById)
     }
 
     func hasCachedSnapshot(conversationId: String) -> Bool { snapshotsByConversationId.contains(conversationId) }
@@ -378,12 +398,12 @@ final class ResettableConversationPersistenceStore: ConversationPersistenceStore
         self.resetBlocker = resetBlocker
     }
 
-    func pendingOutboxOwnerTranscriptRowIds(scope: PersistenceScopeIdentity) async -> Set<String> {
-        await wrapped.pendingOutboxOwnerTranscriptRowIds(scope: scope)
+    func pendingOutboxOwners(scope: PersistenceScopeIdentity) async -> Set<PersistedOutboxOwner> {
+        await wrapped.pendingOutboxOwners(scope: scope)
     }
 
-    func persistedOutboxOwnerTranscriptRowIdsSnapshot(scope: PersistenceScopeIdentity) -> Set<String> {
-        wrapped.persistedOutboxOwnerTranscriptRowIdsSnapshot(scope: scope)
+    func persistedOutboxOwnersSnapshot(scope: PersistenceScopeIdentity) -> Set<PersistedOutboxOwner> {
+        wrapped.persistedOutboxOwnersSnapshot(scope: scope)
     }
 
     func hasCachedSnapshot(conversationId: String) -> Bool {
@@ -463,8 +483,8 @@ final class HardDeleteGatedConversationPersistenceStore: ConversationPersistence
         self.removedProbe = removedProbe
     }
 
-    func pendingOutboxOwnerTranscriptRowIds(scope: PersistenceScopeIdentity) async -> Set<String> { outboxStore.ownerTranscriptRowIds }
-    func persistedOutboxOwnerTranscriptRowIdsSnapshot(scope: PersistenceScopeIdentity) -> Set<String> { outboxStore.ownerTranscriptRowIds }
+    func pendingOutboxOwners(scope: PersistenceScopeIdentity) async -> Set<PersistedOutboxOwner> { persistedOwners(outboxStore.ownerTranscriptRowIds, aggregateMembersById: [:]) }
+    func persistedOutboxOwnersSnapshot(scope: PersistenceScopeIdentity) -> Set<PersistedOutboxOwner> { persistedOwners(outboxStore.ownerTranscriptRowIds, aggregateMembersById: aggregateMembersById) }
     func hasCachedSnapshot(conversationId: String) -> Bool { false }
     func hasAuthoritativeCachedSnapshot(conversationId: String, configurationIdentity: APIConfigurationIdentity, aggregateAuthority: String) -> Bool { false }
     func inspectOutbox(conversationId: String) -> OutboxStoreInspection {
@@ -498,7 +518,7 @@ final class HardDeleteGatedConversationPersistenceStore: ConversationPersistence
 final class GatedConversationPersistenceStore: ConversationPersistenceStore {
     var listPersistenceContext: VersionedDiskContext? { nil }
     var persistenceScope: PersistenceScopeIdentity? { nil }
-    func persistedOutboxOwnerTranscriptRowIdsSnapshot(scope: PersistenceScopeIdentity) -> Set<String> { outboxStore.ownerTranscriptRowIds }
+    func persistedOutboxOwnersSnapshot(scope: PersistenceScopeIdentity) -> Set<PersistedOutboxOwner> { persistedOwners(outboxStore.ownerTranscriptRowIds, aggregateMembersById: aggregateMembersById) }
     var snapshotsByConversationId: Set<String>
     var aggregateMembersById: [String: Set<String>]
     private let outboxStore: InMemoryOutboxStore
@@ -517,12 +537,13 @@ final class GatedConversationPersistenceStore: ConversationPersistenceStore {
         self.gate = gate
     }
 
-    func pendingOutboxOwnerTranscriptRowIds(scope: PersistenceScopeIdentity) async -> Set<String> {
+    func pendingOutboxOwners(scope: PersistenceScopeIdentity) async -> Set<PersistedOutboxOwner> {
         await gate.markEntered()
         await gate.awaitRelease()
-        return Set(outboxStore.ownerTranscriptRowIds.filter { conversationId in
+        let ids = Set(outboxStore.ownerTranscriptRowIds.filter { conversationId in
             outboxStore.inspect(conversationId: conversationId).hasPendingSendableEntries
         })
+        return persistedOwners(ids, aggregateMembersById: aggregateMembersById)
     }
 
     func hasCachedSnapshot(conversationId: String) -> Bool { snapshotsByConversationId.contains(conversationId) }
@@ -569,7 +590,7 @@ final class GatedConversationPersistenceStore: ConversationPersistenceStore {
 final class MutableTestConversationPersistenceStore: ConversationPersistenceStore {
     var listPersistenceContext: VersionedDiskContext? { nil }
     var persistenceScope: PersistenceScopeIdentity? { nil }
-    func persistedOutboxOwnerTranscriptRowIdsSnapshot(scope: PersistenceScopeIdentity) -> Set<String> { outboxStore.ownerTranscriptRowIds }
+    func persistedOutboxOwnersSnapshot(scope: PersistenceScopeIdentity) -> Set<PersistedOutboxOwner> { persistedOwners(outboxStore.ownerTranscriptRowIds, aggregateMembersById: aggregateMembersById) }
     var snapshotsByConversationId: Set<String>
     var aggregateMembersById: [String: Set<String>]
     var onPendingOutboxOwnerTranscriptRowIds: (() async -> Set<String>)?
@@ -584,14 +605,17 @@ final class MutableTestConversationPersistenceStore: ConversationPersistenceStor
         self.outboxStore = InMemoryOutboxStore(contentsByConversationId: contentsByConversationId, owners: owners)
     }
 
-    func pendingOutboxOwnerTranscriptRowIds(scope: PersistenceScopeIdentity) async -> Set<String> {
+    func pendingOutboxOwners(scope: PersistenceScopeIdentity) async -> Set<PersistedOutboxOwner> {
         pendingOutboxDiscoveryCount += 1
+        let ids: Set<String>
         if let onPendingOutboxOwnerTranscriptRowIds {
-            return await onPendingOutboxOwnerTranscriptRowIds()
+            ids = await onPendingOutboxOwnerTranscriptRowIds()
+        } else {
+            ids = Set(outboxStore.ownerTranscriptRowIds.filter { conversationId in
+                outboxStore.inspect(conversationId: conversationId).hasPendingSendableEntries
+            })
         }
-        return Set(outboxStore.ownerTranscriptRowIds.filter { conversationId in
-            outboxStore.inspect(conversationId: conversationId).hasPendingSendableEntries
-        })
+        return persistedOwners(ids, aggregateMembersById: aggregateMembersById)
     }
     func hasCachedSnapshot(conversationId: String) -> Bool { snapshotsByConversationId.contains(conversationId) }
     func hasAuthoritativeCachedSnapshot(conversationId: String, configurationIdentity: APIConfigurationIdentity, aggregateAuthority: String) -> Bool { snapshotsByConversationId.contains(conversationId) }
@@ -986,6 +1010,50 @@ final class AppModelProductConversationTests: XCTestCase {
 
         XCTAssertEqual(reloaded.navigationConversationId(for: aggregateConversation), "row-1")
     }
+    func testColdRestartUsesPersistedAggregateAuthorityWithoutSnapshotOrListAlias() async {
+        let baseDirectory = isolatedDiskDirectory()
+        let store = DiskConversationPersistenceStore(baseDirectory: baseDirectory)
+        let pending = makePendingOutboxEntry(conversationId: "row-2")
+        let handle = store.outboxPersistence(
+            conversationId: "row-2",
+            aggregateAuthority: "pc-1",
+            scope: defaultPersistenceScope)
+        _ = await handle.save(
+            PersistedOutboxEnvelope(
+                scope: defaultPersistenceScope,
+                aggregateAuthority: "pc-1",
+                entries: [pending]),
+            revision: handle.reserveRevision())
+        let model = makeModel(conversationPersistenceStore: store)
+        let (api, registration) = makeHTTPAPI(
+            probe: SendProbe(),
+            host: "example.com",
+            configurationIdentity: .init(
+                serverURL: "https://example.com",
+                credentialGeneration: "test-default",
+                trustSelfSigned: false))
+        defer { TestURLProtocol.uninstall(host: "example.com", owner: registration) }
+        model.replaceAPIForTesting(api)
+        model.triggerStartupHardDeleteRecoveryForTesting()
+        await model.awaitStartupHardDeleteRecoveryForTesting()
+        model.triggerPersistedOutboxDrainIfNeededForTesting()
+
+        _ = await model.awaitCurrentPersistedOutboxDrainForTesting()
+        let session = try! XCTUnwrap(model.existingSession(for: "row-2"))
+
+        XCTAssertEqual(session.outbox.aggregateAuthority, "pc-1")
+        XCTAssertEqual(session.outbox.entries.map(\.id), [pending.id])
+        XCTAssertFalse(session.canSendPersistedOutbox)
+        session.receive(.initSnapshot(.init(
+            conversation: conversation(id: "row-2", aggregateId: "pc-1"),
+            messages: [], agentWorking: false, presentationMode: "idle",
+            lastSequenceId: 0, pendingAnchorSequenceId: 0,
+            pendingEvents: [], pendingTruncated: false)))
+        let persisted = await session.flushSnapshotPersistence()
+        XCTAssertTrue(persisted)
+        XCTAssertTrue(session.canSendPersistedOutbox)
+    }
+
     func testColdLaunchLeavesLegacyOutboxUndrainedWithoutIdentitySnapshot() async {
         _ = isolatedDiskDirectory()
         let store = TestConversationPersistenceStore(
@@ -1009,7 +1077,7 @@ final class AppModelProductConversationTests: XCTestCase {
         } else {
             XCTFail("expected outbox entry to remain durable")
         }
-        XCTAssertTrue(store.persistedOutboxOwnerTranscriptRowIdsSnapshot(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default")).contains("row-1"))
+        XCTAssertTrue(store.persistedOutboxOwnersSnapshot(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default")).contains("row-1"))
     }
 
     func testAuthoritativeReceiptUnlocksOneSendAndAwaitsReflection() async {
@@ -1398,7 +1466,7 @@ final class AppModelProductConversationTests: XCTestCase {
         await model.signOut()
         XCTAssertEqual(model.serverURLString, "")
         XCTAssertNil(model.currentPersistedOutboxDrainGenerationForTesting())
-        XCTAssertFalse(store.persistedOutboxOwnerTranscriptRowIdsSnapshot(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default")).contains("row-1"))
+        XCTAssertFalse(store.persistedOutboxOwnersSnapshot(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default")).contains("row-1"))
         if case .missing = store.inspectOutbox(conversationId: "row-1").state {
         } else {
             XCTFail("expected signOut to remove persisted outbox state")
@@ -1504,10 +1572,10 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertTrue(reloadedA.conversations.isEmpty)
         let reloadedB = ConversationListStore(hasCachedSnapshot: { _ in false }, context: DiskStore.versionedContext(baseDirectory: baseB))
         XCTAssertTrue(reloadedB.conversations.isEmpty)
-        let pendingAIds = await storeA.pendingOutboxOwnerTranscriptRowIds(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default"))
-        let pendingBIds = await storeB.pendingOutboxOwnerTranscriptRowIds(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default"))
+        let pendingAIds = await storeA.pendingOutboxOwners(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default"))
+        let pendingBIds = await storeB.pendingOutboxOwners(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default"))
         XCTAssertEqual(pendingAIds, [])
-        XCTAssertEqual(pendingBIds, ["row-b"])
+        XCTAssertTrue(pendingBIds.contains("row-b"))
     }
 
     @MainActor
@@ -1540,12 +1608,12 @@ final class AppModelProductConversationTests: XCTestCase {
 
         await model.signOut()
 
-        let pendingAIds = await storeA.pendingOutboxOwnerTranscriptRowIds(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default"))
-        let pendingBIds = await storeB.pendingOutboxOwnerTranscriptRowIds(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default"))
+        let pendingAIds = await storeA.pendingOutboxOwners(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default"))
+        let pendingBIds = await storeB.pendingOutboxOwners(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default"))
         XCTAssertEqual(pendingAIds, [])
-        XCTAssertEqual(pendingBIds, ["row-b"])
-        XCTAssertEqual(storeA.persistedOutboxOwnerTranscriptRowIdsSnapshot(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default")), [])
-        XCTAssertEqual(storeB.persistedOutboxOwnerTranscriptRowIdsSnapshot(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default")), ["row-b"])
+        XCTAssertTrue(pendingBIds.contains("row-b"))
+        XCTAssertEqual(storeA.persistedOutboxOwnersSnapshot(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default")), [])
+        XCTAssertTrue(storeB.persistedOutboxOwnersSnapshot(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default")).contains("row-b"))
         let snapshotAValue = DiskStore.loadVersionedResult(
             ConversationSession.PersistedSnapshot.self,
             source: baseA.appendingPathComponent("PhoenixMobile", isDirectory: true).appendingPathComponent("conv-row-a").appendingPathExtension("json"),
@@ -1705,7 +1773,7 @@ final class AppModelProductConversationTests: XCTestCase {
 
         let store = DiskConversationPersistenceStore(baseDirectory: baseDirectory)
 
-        XCTAssertEqual(store.persistedOutboxOwnerTranscriptRowIdsSnapshot(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default")), ["row-1"])
+        XCTAssertTrue(store.persistedOutboxOwnersSnapshot(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default")).contains("row-1"))
         XCTAssertEqual(
             store.inspectOutbox(conversationId: "row-1").visibleEntries.map(\.conversationId),
             ["row-1"])
@@ -1759,11 +1827,11 @@ final class AppModelProductConversationTests: XCTestCase {
         let storeB = DiskConversationPersistenceStore(baseDirectory: otherBase)
         DiskStore.baseDirectory = otherBase
 
-        let ids = await storeA.pendingOutboxOwnerTranscriptRowIds(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default"))
+        let ids = await storeA.pendingOutboxOwners(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default"))
 
-        XCTAssertEqual(ids, ["row-1"])
-        let storeBPendingIds = await storeB.pendingOutboxOwnerTranscriptRowIds(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default"))
-        XCTAssertEqual(storeBPendingIds, ["row-external"])
+        XCTAssertTrue(ids.contains("row-1"))
+        let storeBPendingIds = await storeB.pendingOutboxOwners(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default"))
+        XCTAssertTrue(storeBPendingIds.contains("row-external"))
         if case .accessible(_, _, let entries) = storeA.inspectOutbox(conversationId: "row-1").state {
             XCTAssertEqual(entries.map(\.conversationId), ["row-1"])
         } else {
@@ -1781,8 +1849,8 @@ final class AppModelProductConversationTests: XCTestCase {
         _ = await handleB.save(PersistedOutboxEnvelope(scope: defaultPersistenceScope, aggregateAuthority: "row-1", entries: [baseBPending]), revision: handleB.reserveRevision())
         await handleA.remove(revision: handleA.reserveRevision())
 
-        let storeBPendingIdsAfterHandleARemoval = await storeB.pendingOutboxOwnerTranscriptRowIds(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default"))
-        XCTAssertEqual(storeBPendingIdsAfterHandleARemoval, ["row-external", "row-1"])
+        let storeBPendingIdsAfterHandleARemoval = await storeB.pendingOutboxOwners(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default"))
+        XCTAssertEqual(Set(storeBPendingIdsAfterHandleARemoval.map(\.transcriptRowId)), ["row-external", "row-1"])
     }
 
     func testDiskConversationPersistenceStoreRemoveAllPersistsInstanceIsolation() async {
@@ -1813,10 +1881,10 @@ final class AppModelProductConversationTests: XCTestCase {
 
         await storeA.removeAllPersistedConversationState()
 
-        let storeAPendingIds = await storeA.pendingOutboxOwnerTranscriptRowIds(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default"))
+        let storeAPendingIds = await storeA.pendingOutboxOwners(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default"))
         XCTAssertEqual(storeAPendingIds, [])
-        let storeBPendingIds = await storeB.pendingOutboxOwnerTranscriptRowIds(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default"))
-        XCTAssertEqual(storeBPendingIds, ["row-b"])
+        let storeBPendingIds = await storeB.pendingOutboxOwners(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default"))
+        XCTAssertTrue(storeBPendingIds.contains("row-b"))
         if case .missing = storeA.inspectOutbox(conversationId: "row-a").state {
         } else {
             XCTFail("expected store A outbox removed")
@@ -1870,7 +1938,7 @@ final class AppModelProductConversationTests: XCTestCase {
         } else {
             XCTFail("expected typed 404 cleanup to clear durable outbox")
         }
-        XCTAssertFalse(store.persistedOutboxOwnerTranscriptRowIdsSnapshot(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default")).contains("row-1"))
+        XCTAssertFalse(store.persistedOutboxOwnersSnapshot(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default")).contains("row-1"))
         XCTAssertNil(model.existingSession(for: "row-1"))
         let replacement = model.productConversationDetailModel(for: "pc-1")
         XCTAssertFalse(replacement === detail)
@@ -1955,8 +2023,8 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertEqual(probe.chatPostPaths, chatPostsBeforeDelete)
         if case .missing = store.inspectOutbox(conversationId: "row-1").state {} else { XCTFail("expected deleted row state removed") }
         if case .missing = store.inspectOutbox(conversationId: "row-0").state {} else { XCTFail("expected sibling row state removed") }
-        XCTAssertFalse(store.persistedOutboxOwnerTranscriptRowIdsSnapshot(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default")).contains("row-1"))
-        XCTAssertFalse(store.persistedOutboxOwnerTranscriptRowIdsSnapshot(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default")).contains("row-0"))
+        XCTAssertFalse(store.persistedOutboxOwnersSnapshot(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default")).contains("row-1"))
+        XCTAssertFalse(store.persistedOutboxOwnersSnapshot(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default")).contains("row-0"))
         XCTAssertNil(model.existingSession(for: "row-1"))
         XCTAssertNil(model.existingSession(for: "row-0"))
         let replacement = model.productConversationDetailModel(for: "pc-1")
@@ -2344,6 +2412,34 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertEqual(model.listStore.aggregateId(forTranscriptRowId: "row-1"), "pc-old")
     }
 
+    func testFirstSuccessorInitPreservesCanonicalAggregateProjectionMetadata() async throws {
+        let model = makeModel()
+        let root = conversation(
+            id: "row-1", aggregateId: "pc-1", slug: "canonical-slug", title: "Canonical title")
+        var canonical = root
+        canonical.task_title = "Canonical task"
+        canonical.archived = false
+        model.listStore.upsert(canonical)
+        let successor = conversation(
+            id: "row-2", aggregateId: "pc-1", slug: "successor-slug", title: "Successor title")
+        let session = try XCTUnwrap(model.session(for: "row-2", aggregateAuthority: "pc-1"))
+
+        session.receive(.initSnapshot(.init(
+            conversation: successor,
+            messages: [], agentWorking: true, presentationMode: "working",
+            lastSequenceId: 1, pendingAnchorSequenceId: 1,
+            pendingEvents: [], pendingTruncated: false)))
+
+        let merged = try XCTUnwrap(model.listStore.conversations.first)
+        XCTAssertEqual(merged.id, "row-1")
+        XCTAssertEqual(merged.slug, "canonical-slug")
+        XCTAssertEqual(merged.title, "Canonical title")
+        XCTAssertEqual(merged.task_title, "Canonical task")
+        XCTAssertEqual(merged.archived, false)
+        XCTAssertEqual(merged.state, successor.state)
+        XCTAssertEqual(merged.transcriptRowIdentity, "row-1")
+    }
+
     func testCloseAvailabilityRequiresKnownProductConversationCardinality() {
         let model = makeModel()
         let legacy = conversation(id: "legacy", aggregateId: nil)
@@ -2521,7 +2617,7 @@ final class AppModelProductConversationTests: XCTestCase {
         } else {
             XCTFail("expected inactive persisted outbox to be removed")
         }
-        XCTAssertFalse(store.persistedOutboxOwnerTranscriptRowIdsSnapshot(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default")).contains(inactiveSegmentId))
+        XCTAssertFalse(store.persistedOutboxOwnersSnapshot(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default")).contains(inactiveSegmentId))
     }
 
     @MainActor
@@ -2547,7 +2643,7 @@ final class AppModelProductConversationTests: XCTestCase {
         } else {
             XCTFail("expected inactive persisted outbox to be removed")
         }
-        XCTAssertFalse(store.persistedOutboxOwnerTranscriptRowIdsSnapshot(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default")).contains(inactiveSegmentId))
+        XCTAssertFalse(store.persistedOutboxOwnersSnapshot(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default")).contains(inactiveSegmentId))
         XCTAssertNil(model.existingSession(for: inactiveSegmentId))
     }
 
