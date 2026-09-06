@@ -190,15 +190,10 @@ struct ProductConversationTranscriptView: View {
                     break
                 }
             }
-            .onChange(of: transcriptMutation) { oldMutation, newMutation in
-                if oldMutation != .prependedOlder, newMutation == .prependedOlder {
-                    prependAnchor.capture(visibleItemId: visibleItemId)
-                }
-            }
             .onChange(of: items) { _, _ in
-                if transcriptMutation == .prependedOlder,
-                   let anchorId = prependAnchor.consume()
-                {
+                guard transcriptMutation == .prependedOlder else { return }
+                prependAnchor.capture(visibleItemId: visibleItemId)
+                if let anchorId = prependAnchor.consume() {
                     proxy.scrollTo(anchorId, anchor: .top)
                 }
             }
