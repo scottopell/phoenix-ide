@@ -92,7 +92,7 @@ class SystemdManifestValidationTests(unittest.TestCase):
             "source_commit": "b" * 40,
             "release_tag": None,
             "release_commit": None,
-            "expected": {"version": "2.0.0", "git_sha": "b" * 12},
+            "expected": {"version": "2.0.0", "git_sha": "b" * 40},
             "previous": None,
             "expected_health_url": "http://127.0.0.1:49152/api/version",
             "previous_health_url": None,
@@ -179,6 +179,34 @@ class SystemdManifestValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(helper.ValidationError, "must not be root"):
             self.validate()
 
+    def test_rejects_candidate_identity_with_legacy_twelve_char_sha(self):
+        self.raw["expected"]["git_sha"] = "b" * 12
+        self.write_manifest()
+        with self.assertRaisesRegex(helper.ValidationError, "candidate identity must use a full lowercase embedded git SHA"):
+            self.validate()
+
+    def install_previous_rollback_artifacts(self):
+        self.raw["previous"] = {"version": "1.0.0", "git_sha": "a" * 12}
+        self.raw["previous_health_url"] = "http://127.0.0.1:49151/api/version"
+        self.raw["previous_deployed_sha"] = "a" * 40
+        self.raw["rollback"] = {
+            "binary": self.artifact("rollback", "old-binary"),
+            "service": self.artifact("rollback.service", "old-service"),
+            "socket": self.artifact("rollback.socket", "old-socket"),
+            "environment": self.artifact("rollback.env", "OLD=value"),
+        }
+
+    def test_accepts_previous_identity_with_legacy_twelve_char_sha(self):
+        self.install_previous_rollback_artifacts()
+        self.write_manifest()
+        self.validate()
+
+    def test_rejects_candidate_identity_with_malformed_sha_length(self):
+        self.raw["expected"]["git_sha"] = "b" * 13
+        self.write_manifest()
+        with self.assertRaisesRegex(helper.ValidationError, "candidate identity has malformed embedded git SHA"):
+            self.validate()
+
 
 class SystemdHandoffStagingTests(SystemdManifestValidationTests):
     def bundle(self, files):
@@ -239,7 +267,7 @@ class SystemdHandoffStagingTests(SystemdManifestValidationTests):
         Path(policy.targets.socket).write_text("[Socket]\nListenStream=9443\n")
         Path(policy.targets.environment).parent.mkdir(parents=True, exist_ok=True)
         Path(policy.targets.environment).write_text("PHOENIX_PORT=9443\nPHOENIX_TLS=auto\n")
-        identity = helper.Identity(version="1.2.3", git_sha="a" * 12)
+        identity = helper.Identity(version="1.2.3", git_sha="a" * 40)
         original_copy = helper.copy_handoff_file
 
         def copy_file(source, destination, expected_sha, source_uid, mode):
@@ -335,7 +363,7 @@ class SystemdActivationTests(SystemdManifestValidationTests):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content)
         Path(self.targets.deployed_sha).write_text("a" * 40 + "\n")
-        self.raw["previous"] = {"version": "1.0.0", "git_sha": "a" * 12}
+        self.raw["previous"] = {"version": "1.0.0", "git_sha": "a" * 40}
         self.raw["previous_health_url"] = "http://127.0.0.1:49151/api/version"
         self.raw["previous_deployed_sha"] = "a" * 40
         for name, target in (
