@@ -1163,6 +1163,68 @@ final class ConversationSessionReducerTests: XCTestCase {
         XCTAssertEqual(recorder.exactChatPosts(host: host).count, 1)
     }
 
+    func testPersistedSnapshotSegmentOrdinalRoundTripsAndOlderRowsDecodeNil() throws {
+        let conversation = try conversation(id: "c1", aggregateId: "pc-1")
+        let authority = ConversationSession.PersistedSnapshotAuthority(
+            configurationIdentity: APIConfigurationIdentity(
+                serverURL: "https://phoenix.invalid",
+                credentialGeneration: "test-default",
+                trustSelfSigned: false),
+            aggregateAuthority: "pc-1",
+            syncedAt: Date(timeIntervalSince1970: 1))
+        let snapshot = ConversationSession.PersistedSnapshot(
+            conversation: conversation,
+            messages: [], lastSequenceId: 0, transcriptGeneration: 1,
+            syncedAt: Date(timeIntervalSince1970: 1), authoritative: authority,
+            segmentOrdinal: 7)
+
+        let encoded = try JSONEncoder().encode(snapshot)
+        let decoded = try JSONDecoder().decode(
+            ConversationSession.PersistedSnapshot.self, from: encoded)
+        XCTAssertEqual(decoded.segmentOrdinal, 7)
+
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        object.removeValue(forKey: "segmentOrdinal")
+        let olderRow = try JSONSerialization.data(withJSONObject: object)
+        let decodedOlderRow = try JSONDecoder().decode(
+            ConversationSession.PersistedSnapshot.self, from: olderRow)
+        XCTAssertNil(decodedOlderRow.segmentOrdinal)
+        XCTAssertEqual(ConversationSession.snapshotSchemaVersion, 1)
+    }
+
+    @MainActor
+    func testRESTSegmentPersistenceRejectsForeignConversationAndAggregateBinding() {
+        let session = makeSession(aggregateAuthority: "pc-1")
+
+        session.persistAuthoritativeRESTSegment(
+            transcriptRowId: "foreign-row",
+            aggregateId: "pc-1",
+            slug: nil,
+            title: "Foreign row",
+            updatedAt: "2025-01-02T03:04:05Z",
+            archived: false,
+            presentationMode: "idle",
+            requiresAction: false, segmentOrdinal: 0,
+            messages: [])
+        session.persistAuthoritativeRESTSegment(
+            transcriptRowId: "c1",
+            aggregateId: "foreign-aggregate",
+            slug: nil,
+            title: "Foreign aggregate",
+            updatedAt: "2025-01-02T03:04:05Z",
+            archived: false,
+            presentationMode: "idle",
+            requiresAction: false, segmentOrdinal: 0,
+            messages: [])
+
+        let conversation = session.conversation
+        let receipt = session.authoritativeSnapshotReceipt
+        let acceptsActions = session.acceptsConversationActions
+        XCTAssertNil(conversation)
+        XCTAssertNil(receipt)
+        XCTAssertFalse(acceptsActions)
+    }
+
     @MainActor
     func testForeignConversationIdAuthorityDoesNotUnlockPersistedOutbox() async throws {
         let baseDirectory = FileManager.default.temporaryDirectory
