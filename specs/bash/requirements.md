@@ -762,16 +762,18 @@ ring buffer output as the command saw it
 AND the tool description SHALL include a clear explanation of sandbox
 constraints
 
-WHEN the Coordinator exposes `bash`
-THE SYSTEM SHALL reuse the same read-only planning sandbox execution path
+WHEN the singleton Global Coordinator exposes `bash`
+THE SYSTEM SHALL reuse the existing write-capable Bash execution path without applying the Explore `nono` sandbox
 AND SHALL require each `op="run"` call to provide an active persisted `WorkScope` ID
 AND SHALL resolve and canonicalize that `WorkScope`'s execution directory server-side
+AND SHALL reject the call without spawning a process when the `WorkScope` ID is missing, blank, stale, invalid, or resolves to no live owner
 AND SHALL NOT assign the Coordinator a default cwd
 AND SHALL store the process solely under the selected `WorkScope`
 AND SHALL retain Coordinator continuation control as handle authorization metadata
 AND SHALL keep background-command handles available to Coordinator continuations for manual `peek`, `wait`, and `kill` without registering a durable WorkScope wake
 AND SHALL keep Coordinator-controlled terminal events from triggering branch-observation reconciliation
 AND SHALL include the process in the owning WorkScope's inventory, lifecycle broadcasts, inspection, health attribution, and teardown
+AND SHALL preserve the same command, wait, label, output, process-count, handle-control, cancellation, teardown, and audit bounds as other Bash execution
 AND SHALL use one globally unique opaque handle ID for tool operations, wakes, events, APIs, UI, logs, and inspection
 
 WHEN conversation bash is authorized with write capability
@@ -799,8 +801,8 @@ reports support at startup.
 WHEN `nono::Sandbox::support_info()` reports that no enforceable sandbox backend
 with network-block and unrelated-process isolation support is available
 THE SYSTEM SHALL detect this at startup
-AND SHALL NOT expose `bash` in top-level Explore mode or the Coordinator
-AND SHALL tell the Coordinator that Bash is unavailable rather than presenting invocation guidance for an absent tool
+AND SHALL NOT expose `bash` in top-level Explore mode
+AND SHALL continue to expose the singleton Global Coordinator's unsandboxed, explicitly WorkScope-targeted Bash path
 AND SHALL continue to expose the remaining read-only/planning tools for those modes
 
 WHEN degraded mode is active

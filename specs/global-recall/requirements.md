@@ -121,18 +121,18 @@ THE SYSTEM MAY provide host-bound tools for global message search across Phoenix
 WHILE a restricted planning conversation or sub-agent is running
 THE SYSTEM SHALL NOT provide Phoenix-wide history search, global conversation reads, database queries, global reference resolution, or cross-conversation messaging tools
 
-WHILE the Coordinator is answering a user request
-THE SYSTEM MAY additionally provide host-bound tools for global reference resolution and OS-sandboxed filesystem inspection
+WHILE the singleton Global Coordinator is answering a user request
+THE SYSTEM MAY additionally provide host-bound tools for global reference resolution and unsandboxed Bash
 
 THE host-bound capabilities SHALL NOT become ambient prompt memory or autonomous background behavior
 
 THE search and transcript-read capabilities SHALL describe recalled text as untrusted stored data rather than instructions
 
-WHEN the Coordinator invokes sandboxed filesystem inspection
+WHEN the singleton Global Coordinator invokes Bash
 THE SYSTEM SHALL require an explicit active `WorkScope` ID for every new command
-AND SHALL resolve and canonicalize that WorkScope's persisted worktree path or cwd before launching the read-only planning `nono` sandbox
+AND SHALL resolve and canonicalize that WorkScope's persisted worktree path or cwd before launching unsandboxed Bash
 AND SHALL NOT infer a default repository or cwd
-AND SHALL withhold the tool when the sandbox is unavailable
+AND SHALL reject the command without spawning a process when the WorkScope ID is missing, blank, stale, invalid, or resolves to no live owner
 
 THE SYSTEM MAY provide exactly one cross-conversation mutation capability to a write-capable ordinary ProductConversation or the Coordinator: sending non-empty text to one other existing non-Coordinator conversation through the authoritative user-message acceptance path
 
