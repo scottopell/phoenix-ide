@@ -56,9 +56,9 @@ final class RenderingReducerTests: XCTestCase {
         let httpURL = try XCTUnwrap(URL(string: "http://phoenix.local:8031"))
         let httpsURL = try XCTUnwrap(URL(string: "https://phoenix.local:8031"))
 
-        XCTAssertNil(PhoenixAPI(baseURL: httpURL, password: "secret", allowSelfSigned: true))
-        XCTAssertNotNil(PhoenixAPI(baseURL: httpURL, password: nil, allowSelfSigned: true))
-        XCTAssertNotNil(PhoenixAPI(baseURL: httpsURL, password: "secret", allowSelfSigned: true))
+        XCTAssertNil(PhoenixAPI(baseURL: httpURL, password: "secret", allowSelfSigned: true, configurationIdentity: APIConfigurationIdentity(serverURL: httpURL.absoluteString, credentialGeneration: "test-http", trustSelfSigned: true)))
+        XCTAssertNotNil(PhoenixAPI(baseURL: httpURL, password: nil, allowSelfSigned: true, configurationIdentity: APIConfigurationIdentity(serverURL: httpURL.absoluteString, credentialGeneration: "test-http", trustSelfSigned: true)))
+        XCTAssertNotNil(PhoenixAPI(baseURL: httpsURL, password: "secret", allowSelfSigned: true, configurationIdentity: APIConfigurationIdentity(serverURL: httpsURL.absoluteString, credentialGeneration: "test-https", trustSelfSigned: true)))
     }
 
     func testExistingCertificatePinAppliesIndependentlyOfChainTrust() throws {

@@ -1,0 +1,1137 @@
+import Foundation
+import Observation
+
+@Observable
+@MainActor
+final class ProductConversationDetailModel {
+    let aggregateId: String
+    private(set) var initialTranscriptRowId: String?
+
+    private let connectivity: ConnectivityMonitor
+    private let configurationIdentity: APIConfigurationIdentity
+    private let createSession: (String, String) -> ConversationSession?
+    private let existingSession: (String) -> ConversationSession?
+    private let persistedOutboxContents: (String) -> Outbox.StoredContents
+    private let hasCachedSnapshot: (String) -> Bool
+    private let discoverPersistedMembers: () async -> PersistedMemberDiscovery
+    private let handleDefinitiveNotFound: @MainActor (String?, Set<String>) async -> Void
+    private let loadSnapshot: (String, String?) async throws -> ProductConversationSnapshot
+    private let didStartRefresh: @MainActor (ProductConversationRefreshCause) -> Void
+    private let onConfigurationInvalidated: @MainActor (ProductConversationDetailModel) -> Void
+
+    private(set) var snapshot: ProductConversationSnapshot?
+    private(set) var closeCardinalityKnown = true
+    private(set) var loading = false
+    private(set) var loadingOlder = false
+    private(set) var loadError: String?
+    private(set) var selectedTranscriptRowId: String?
+    private(set) var actionTranscriptRowId: String?
+    private(set) var lastDelegatedConnection: ConversationSession.ConnectionState = .idle
+    private(set) var observedSessionIds: Set<String> = []
+    private(set) var hardDeleted = false
+
+    private var retainedOlderPages: [ProductConversationSnapshot] = []
+    private var startedTranscriptRowId: String?
+    private var isActive = false
+    private var loadTask: Task<Void, Never>?
+    private var loadGeneration = 0
+    private var observerGeneration = 0
+    private var sessionSlots: [String: ConversationSession] = [:]
+    private var retainedFallbackSession: ConversationSession?
+    private var retainedFallbackSource: FallbackSessionSource = .none
+    private var persistedOutboxOwnerIndex = PersistedOutboxOwnerIndex()
+    private var outboxOnlyTranscriptRowIds: Set<String> = []
+    private var persistedMemberDiscoveryGeneration = 0
+    private var aggregateTranscriptRowIds: Set<String> = []
+    private var lastTranscriptMutation: TranscriptMutation = .unknown
+    private var pendingLoadPlan = PendingLoadPlan()
+    private var activeRefreshCause: ProductConversationRefreshCause?
+    private var connectivityRestoreObserver: UUID?
+
+    init(
+        aggregateId: String,
+        initialTranscriptRowId: String? = nil,
+        api: PhoenixAPI,
+        connectivity: ConnectivityMonitor,
+        sessionProvider: @escaping (String, String) -> ConversationSession?,
+        existingSession: @escaping (String) -> ConversationSession? = { _ in nil },
+        persistedOutboxContents: @escaping (String) -> Outbox.StoredContents = { _ in .empty },
+        hasCachedSnapshot: @escaping (String) -> Bool = { _ in false },
+        discoverPersistedMembers: @escaping () async -> PersistedMemberDiscovery = { .empty },
+        handleDefinitiveNotFound: @escaping @MainActor (String?, Set<String>) async -> Void = { _, _ in },
+        loadSnapshot: ((String, String?) async throws -> ProductConversationSnapshot)? = nil,
+        didStartRefresh: @escaping @MainActor (ProductConversationRefreshCause) -> Void = { _ in },
+        onConfigurationInvalidated: @escaping @MainActor (ProductConversationDetailModel) -> Void = { _ in }
+    ) {
+        self.aggregateId = aggregateId
+        self.initialTranscriptRowId = initialTranscriptRowId
+        self.connectivity = connectivity
+        configurationIdentity = api.configurationIdentity
+        self.createSession = sessionProvider
+        self.existingSession = existingSession
+        self.persistedOutboxContents = persistedOutboxContents
+        self.hasCachedSnapshot = hasCachedSnapshot
+        self.discoverPersistedMembers = discoverPersistedMembers
+        self.handleDefinitiveNotFound = handleDefinitiveNotFound
+        self.loadSnapshot = loadSnapshot ?? { id, before in
+            try await api.getProductConversation(id: id, before: before)
+        }
+        self.didStartRefresh = didStartRefresh
+        self.onConfigurationInvalidated = onConfigurationInvalidated
+    }
+
+    var lifecycle: ProductConversationOrdinaryLifecycle? {
+        snapshot?.ordinary_lifecycle
+    }
+
+    var isHistoryReadOnly: Bool {
+        hardDeleted || snapshot?.ordinary_lifecycle == .history
+    }
+
+    var canSendChat: Bool {
+        !isHistoryReadOnly && writableTranscriptRowId != nil
+    }
+
+    var canMutateLifecycle: Bool {
+        !isHistoryReadOnly && lifecycleSession?.acceptsConversationActions == true
+    }
+
+    var currentOwnerSession: ConversationSession? {
+        if let actionSession { return actionSession }
+        return lifecycleSession
+    }
+
+    var selectedTranscriptSession: ConversationSession? {
+        guard let transcriptRowId = selectedTranscriptRowId else { return nil }
+        if isHistoryReadOnly {
+            return existingSession(transcriptRowId)
+        }
+        return sessionForSelection(transcriptRowId)
+    }
+
+    var actionSession: ConversationSession? {
+        guard canSendChat, let transcriptRowId = actionTranscriptRowId else { return nil }
+        return sessionSlots[transcriptRowId]
+    }
+
+    var lifecycleSession: ConversationSession? {
+        guard !isHistoryReadOnly, let transcriptRowId = latestTranscriptRowId else { return nil }
+        return sessionSlots[transcriptRowId]
+    }
+
+    var writableTranscriptRowId: String? {
+        snapshot?.writable_transcript_row_id
+    }
+
+    var latestTranscriptRowId: String? {
+        snapshot?.latest_transcript_row_id
+    }
+
+    var hasOlder: Bool { snapshot?.has_older == true }
+    var olderCursor: String? { snapshot?.before }
+
+    var transcriptItems: [ProductConversationTranscriptItem] {
+        if let snapshot {
+            return mergedSegments(from: snapshot).flatMap(\.items)
+        }
+        let cachedSessions = provenCachedMemberSessions()
+        if !cachedSessions.isEmpty {
+            var seenMessageIds: Set<String> = []
+            return cachedSessions.flatMap { session in
+                let messages = session.messages.compactMap { message -> ProductConversationTranscriptItem? in
+                    guard seenMessageIds.insert(message.message_id).inserted else { return nil }
+                    return .message(message)
+                }
+                return messages + (session.productConversationHandoff.map { [.handoff($0)] } ?? [])
+            }
+        }
+        guard let fallbackSession = retainedFallbackSession else { return [] }
+        return fallbackSession.messages.map(ProductConversationTranscriptItem.message)
+    }
+
+    var transcriptMutation: TranscriptMutation { lastTranscriptMutation }
+
+    var aggregateMemberTranscriptRowIds: Set<String> {
+        aggregateTranscriptRowIds
+    }
+
+    var fallbackSession: ConversationSession? {
+        retainedFallbackSession
+    }
+
+    var displayTitle: String {
+        if let snapshot {
+            return snapshot.canonical_root.title ?? snapshot.canonical_root.slug ?? snapshot.product_conversation_id
+        }
+        if let title = retainedFallbackSession?.conversation?.title, !title.isEmpty {
+            return title
+        }
+        if let slug = retainedFallbackSession?.conversation?.slug, !slug.isEmpty {
+            return slug
+        }
+        return aggregateId
+    }
+
+    var stateDetailSession: ConversationSession? {
+        if canSendChat, let actionSession { return actionSession }
+        return lifecycleSession
+    }
+
+    var segments: [ProductConversationSegment] {
+        (snapshot?.segments ?? []).sorted(by: { $0.segment_ordinal < $1.segment_ordinal })
+    }
+
+    var outboxProjections: [ProductConversationOutboxProjection] {
+        var projections: [ProductConversationOutboxProjection] = []
+        var seenEntryKeys: Set<String> = []
+        let sessionIds = visibleOutboxSessionIds.sorted()
+        if sessionIds.isEmpty,
+           let fallbackSession = retainedFallbackSession,
+           !fallbackSession.outbox.visibleEntries.isEmpty
+        {
+            return fallbackSession.outbox.visibleEntries.map {
+                ProductConversationOutboxProjection(
+                    transcriptRowId: fallbackSession.conversationId,
+                    entry: $0,
+                    actionPolicy: .interactive(session: fallbackSession))
+            }
+        }
+        for transcriptRowId in sessionIds {
+            guard let session = existingSession(transcriptRowId) else { continue }
+            let policy: ProductConversationOutboxProjection.ActionPolicy = isHistoryReadOnly
+                ? .readOnly
+                : .interactive(session: session)
+            for entry in session.outbox.visibleEntries {
+                guard entry.conversationId == transcriptRowId else { continue }
+                let entryKey = "\(transcriptRowId)|\(entry.localId)"
+                guard seenEntryKeys.insert(entryKey).inserted else { continue }
+                projections.append(ProductConversationOutboxProjection(
+                    transcriptRowId: transcriptRowId,
+                    entry: entry,
+                    actionPolicy: policy))
+            }
+        }
+        return projections
+    }
+
+    var composedToolUseIndex: [String: ToolUseRef] {
+        var index: [String: ToolUseRef] = [:]
+        for item in transcriptItems {
+            guard case .message(let message) = item else { continue }
+            mergeToolUseIndex(from: message, into: &index)
+        }
+        return index
+    }
+
+    var delegatedConnectivityAllowsActions: Bool {
+        guard connectivity.isOnline else { return false }
+        switch currentOwnerConnection {
+        case .idle, .live:
+            return true
+        case .connecting, .waitingToRetry, .offline:
+            return false
+        }
+    }
+
+    var currentOwnerConnection: ConversationSession.ConnectionState {
+        lastDelegatedConnection
+    }
+
+    func start() async {
+        guard !isActive else { return }
+        isActive = true
+        if connectivityRestoreObserver == nil {
+            connectivityRestoreObserver = connectivity.addRestoreObserver { [weak self] in
+                guard let self, self.isActive else { return }
+                self.loading = true
+                self.loadError = nil
+                self.pendingLoadPlan.enqueueRefresh(.manual, active: self.activeRefreshCause)
+                if self.loadTask == nil {
+                    self.loadGeneration &+= 1
+                    let generation = self.loadGeneration
+                    self.loadTask = Task { [weak self] in
+                        await self?.runLoadLoop(generation: generation)
+                    }
+                }
+            }
+        }
+        persistedMemberDiscoveryGeneration &+= 1
+        let discoveryGeneration = persistedMemberDiscoveryGeneration
+        let discovery = await discoverPersistedMembers()
+        guard isActive, discoveryGeneration == persistedMemberDiscoveryGeneration,
+              !Task.isCancelled else { return }
+        applyPersistedMemberDiscovery(discovery)
+        activateInitialFallbackIfAvailable()
+        ensureProjectedSessionsMaterialized()
+        if snapshot != nil || retainedFallbackSession != nil {
+            syncObserversAndSessions()
+            projectDelegatedStateFromCurrentOwner()
+        }
+        await enqueueLoad(.refresh(.initial))
+    }
+
+    func stop() {
+        isActive = false
+        if let connectivityRestoreObserver {
+            connectivity.removeRestoreObserver(connectivityRestoreObserver)
+            self.connectivityRestoreObserver = nil
+        }
+        observerGeneration &+= 1
+        loadGeneration &+= 1
+        loadTask?.cancel()
+        loadTask = nil
+        pendingLoadPlan = PendingLoadPlan()
+        activeRefreshCause = nil
+        sessionSlots.removeAll()
+        persistedOutboxOwnerIndex = PersistedOutboxOwnerIndex()
+        outboxOnlyTranscriptRowIds.removeAll()
+        persistedMemberDiscoveryGeneration &+= 1
+        retainedFallbackSession = nil
+        retainedFallbackSource = .none
+        clearObservers()
+        if let startedTranscriptRowId {
+            existingSession(startedTranscriptRowId)?.closeView()
+            self.startedTranscriptRowId = nil
+        }
+        lastDelegatedConnection = .idle
+    }
+
+    func markCardinalityStaleAndRefreshIfActive() {
+        closeCardinalityKnown = false
+        if isActive {
+            Task { await enqueueLoad(.refresh(.delegateConversationChanged)) }
+        }
+    }
+
+    func invalidateConfiguration() {
+        invalidate(clearError: true)
+        onConfigurationInvalidated(self)
+    }
+
+    func invalidateHardDeleted() {
+        invalidate(clearError: false)
+        hardDeleted = true
+    }
+
+    private func invalidate(clearError: Bool) {
+        stop()
+        snapshot = nil
+        retainedOlderPages.removeAll()
+        selectedTranscriptRowId = nil
+        actionTranscriptRowId = nil
+        if clearError { loadError = nil }
+        loading = false
+        loadingOlder = false
+    }
+
+    func refresh(cause: ProductConversationRefreshCause = .manual) async {
+        await enqueueLoad(.refresh(cause))
+    }
+
+    func loadOlder() async {
+        await enqueueLoad(.older)
+    }
+
+    func selectTranscriptRow(id: String) {
+        guard segments.contains(where: { $0.transcript_row_id == id }) else { return }
+        selectedTranscriptRowId = id
+        ensureProjectedSessionsMaterialized()
+        syncObserversAndSessions()
+    }
+
+    func dismissDelegatedError() {
+        currentOwnerSession?.clearErrorToast()
+    }
+
+    func primeInitialTranscriptRowId(_ transcriptRowId: String?) {
+        guard let transcriptRowId else { return }
+        if initialTranscriptRowId == nil {
+            initialTranscriptRowId = transcriptRowId
+        }
+    }
+
+    func applyForTesting(_ snapshot: ProductConversationSnapshot) {
+        applySnapshot(snapshot, resetRetainedPages: false)
+    }
+
+    func invalidateAggregateTopologyForTesting(_ invalidation: ProductConversationTopologyInvalidation) {
+        guard isActive else { return }
+        if invalidatesThisAggregate(invalidation) {
+            pendingLoadPlan.enqueueRefresh(.delegateConversationChanged, active: activeRefreshCause)
+            if loadTask == nil {
+                loadGeneration &+= 1
+                let generation = loadGeneration
+                loadTask = Task { [weak self] in
+                    await self?.runLoadLoop(generation: generation)
+                }
+            }
+        }
+    }
+
+    func applyOwnerEventForTesting(_ event: ProductConversationSessionEvent) {
+        switch event {
+        case .connectionChanged(let connection):
+            lastDelegatedConnection = connection
+        case .errorToastChanged:
+            break
+        default:
+            break
+        }
+    }
+
+    func handleSessionEvent(transcriptRowId: String, generation: Int, event: ProductConversationSessionEvent) {
+        guard generation == observerGeneration else { return }
+        guard observedSessionIds.contains(transcriptRowId) else { return }
+        switch event {
+        case .aggregateTopologyInvalidated(let invalidation):
+            if invalidatesThisAggregate(invalidation) {
+                let observerGeneration = self.observerGeneration
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    guard self.observerGeneration == observerGeneration, self.isActive else { return }
+                    await self.enqueueLoad(.refresh(.delegateConversationChanged))
+                }
+            }
+        case .connectionChanged(let connection):
+            if transcriptRowId == ownerTranscriptRowId {
+                lastDelegatedConnection = connection
+            }
+        case .messagesChanged:
+            break
+        case .outboxChanged:
+            refreshPersistedOutboxDiscovery()
+            syncObserversAndSessions()
+            projectDelegatedStateFromCurrentOwner()
+        case .errorToastChanged:
+            break
+        }
+    }
+
+    private func enqueueLoad(_ request: PendingLoad) async {
+        guard isActive else { return }
+        switch request {
+        case .refresh(let cause):
+            loading = true
+            if cause != .initial { loadError = nil }
+            pendingLoadPlan.enqueueRefresh(cause, active: activeRefreshCause)
+        case .older:
+            loadingOlder = true
+            loadError = nil
+            pendingLoadPlan.enqueueOlder()
+        }
+        if loadTask == nil {
+            loadGeneration &+= 1
+            let generation = loadGeneration
+            loadTask = Task { [weak self] in
+                await self?.runLoadLoop(generation: generation)
+            }
+        }
+        await loadTask?.value
+    }
+
+    private func runLoadLoop(generation: Int) async {
+        while !Task.isCancelled, generation == loadGeneration, !pendingLoadPlan.isEmpty {
+            if let cause = pendingLoadPlan.consumeRefresh() {
+                activeRefreshCause = cause
+                await performRefresh(cause: cause, generation: generation)
+                if generation == loadGeneration {
+                    activeRefreshCause = nil
+                }
+                continue
+            }
+            if pendingLoadPlan.consumeOlder() {
+                await performLoadOlder(generation: generation)
+                continue
+            }
+        }
+        guard generation == loadGeneration else { return }
+        loadTask = nil
+        loading = false
+        loadingOlder = false
+    }
+
+    private func performRefresh(cause: ProductConversationRefreshCause, generation: Int) async {
+        guard connectivity.isOnline else {
+            if snapshot == nil {
+                activateInitialFallbackIfAvailable()
+                activateRetainedFallbackFromPersistedOutboxIfNeeded()
+                if retainedFallbackSession == nil {
+                    loadError = APIError.transport(
+                        underlying: URLError(.notConnectedToInternet)).errorDescription
+                }
+            }
+            if generation == loadGeneration { loading = false }
+            return
+        }
+        do {
+            didStartRefresh(cause)
+            let fresh = try await loadSnapshot(aggregateId, nil)
+            guard generation == loadGeneration, !Task.isCancelled else { return }
+            let previousItems = transcriptItems
+            applyRefreshedSnapshot(fresh, cause: cause)
+            updateTranscriptMutation(from: previousItems, to: transcriptItems)
+            loadError = nil
+        } catch {
+            guard generation == loadGeneration, !Task.isCancelled else { return }
+            if let apiError = error as? APIError, apiError.isNotFound {
+                await handleDefinitiveNotFound(selectedTranscriptRowId ?? initialTranscriptRowId, aggregateMemberTranscriptRowIds)
+                invalidateConfiguration()
+                loadError = nil
+                return
+            }
+            if snapshot == nil {
+                activateInitialFallbackIfAvailable()
+                activateRetainedFallbackFromPersistedOutboxIfNeeded()
+                if let session = retainedFallbackSession,
+                   selectedTranscriptRowId == nil
+                {
+                    selectedTranscriptRowId = session.conversationId
+                }
+                if retainedFallbackSource != .persistedOutbox,
+                   let session = retainedFallbackSession
+                {
+                    lastDelegatedConnection = session.connection
+                }
+            }
+            loadError = (error as? APIError)?.errorDescription ?? error.localizedDescription
+        }
+        if generation == loadGeneration { loading = false }
+    }
+
+    private func performLoadOlder(generation: Int) async {
+        guard connectivity.isOnline else {
+            if generation == loadGeneration { loadingOlder = false }
+            return
+        }
+        guard let before = olderCursor else {
+            if generation == loadGeneration { loadingOlder = false }
+            return
+        }
+        do {
+            let older = try await loadSnapshot(aggregateId, before)
+            guard generation == loadGeneration, !Task.isCancelled else { return }
+            guard older.product_conversation_id == aggregateId else {
+                invalidateConfiguration()
+                if generation == loadGeneration { loadingOlder = false }
+                return
+            }
+            retainedOlderPages.append(older)
+            let newestPage = snapshot ?? older
+            var composed = composeSnapshot(currentPage: newestPage, retainedOlderPages: retainedOlderPages)
+            composed.before = older.before
+            composed.has_older = older.has_older
+            let previousItems = transcriptItems
+            applySnapshot(
+                composed,
+                resetRetainedPages: false,
+                persistedPage: older,
+                replacingPersistedMessages: false)
+            updateTranscriptMutation(from: previousItems, to: transcriptItems)
+            loadError = nil
+        } catch {
+            guard generation == loadGeneration, !Task.isCancelled else { return }
+            if let apiError = error as? APIError, apiError.isNotFound {
+                await handleDefinitiveNotFound(
+                    selectedTranscriptRowId ?? initialTranscriptRowId,
+                    aggregateMemberTranscriptRowIds)
+                invalidateHardDeleted()
+                loadError = nil
+                return
+            }
+            loadError = (error as? APIError)?.errorDescription ?? error.localizedDescription
+        }
+        if generation == loadGeneration { loadingOlder = false }
+    }
+
+    private func applyRefreshedSnapshot(_ fresh: ProductConversationSnapshot, cause: ProductConversationRefreshCause) {
+        guard fresh.product_conversation_id == aggregateId else {
+            invalidateConfiguration()
+            return
+        }
+        let resetForTopology = cause == .delegateConversationChanged
+        let retainedPages = resetForTopology ? [] : retainedOlderPages.filter { $0.product_conversation_id == fresh.product_conversation_id }
+        let composed = composeSnapshot(currentPage: fresh, retainedOlderPages: retainedPages)
+        if resetForTopology { retainedOlderPages.removeAll() }
+        applySnapshot(
+            composed,
+            resetRetainedPages: resetForTopology,
+            persistedPage: fresh,
+            replacingPersistedMessages: true)
+        for olderPage in retainedPages {
+            persistSegmentsInMemberCaches(olderPage, replacingMessages: false)
+        }
+    }
+
+    private func applySnapshot(
+        _ newSnapshot: ProductConversationSnapshot,
+        resetRetainedPages: Bool,
+        persistedPage: ProductConversationSnapshot? = nil,
+        replacingPersistedMessages: Bool = true
+    ) {
+        hardDeleted = false
+        if resetRetainedPages { retainedOlderPages.removeAll() }
+        snapshot = newSnapshot
+        closeCardinalityKnown = true
+        aggregateTranscriptRowIds = Set(newSnapshot.segments.map(\.transcript_row_id))
+        updatePersistedOutboxSessions(from: newSnapshot)
+        if retainedFallbackSource == .persistedOutbox,
+           let retainedFallbackSession,
+           !newSnapshot.segments.contains(where: { $0.transcript_row_id == retainedFallbackSession.conversationId })
+        {
+            self.retainedFallbackSession = nil
+            retainedFallbackSource = .none
+        }
+        let available = Set(newSnapshot.segments.map(\.transcript_row_id))
+        let preferredReadable = newSnapshot.latest_transcript_row_id
+        let newActionTranscriptRowId = newSnapshot.writable_transcript_row_id ?? newSnapshot.latest_transcript_row_id
+
+        if selectedTranscriptRowId == nil || !(selectedTranscriptRowId.map(available.contains) ?? false) {
+            selectedTranscriptRowId = preferredReadable
+        }
+        if selectedTranscriptRowId == nil {
+            selectedTranscriptRowId = preferredReadable
+        }
+
+        actionTranscriptRowId = newActionTranscriptRowId
+        ensureProjectedSessionsMaterialized()
+        persistSegmentsInMemberCaches(
+            persistedPage ?? newSnapshot,
+            replacingMessages: replacingPersistedMessages)
+        syncObserversAndSessions()
+        projectDelegatedStateFromCurrentOwner()
+    }
+
+    private func persistSegmentsInMemberCaches(
+        _ sourceSnapshot: ProductConversationSnapshot,
+        replacingMessages: Bool
+    ) {
+        for segment in sourceSnapshot.segments {
+            let session = existingSession(segment.transcript_row_id)
+                ?? createSession(segment.transcript_row_id, aggregateId)
+            guard let session else { continue }
+            let (presentationMode, requiresAction): (String?, Bool?) = switch sourceSnapshot.presentation {
+            case .needsAction:
+                ("needs_action", true)
+            case .state(_, let mode):
+                (mode, false)
+            }
+            session.persistAuthoritativeRESTSegment(
+                transcriptRowId: segment.transcript_row_id,
+                aggregateId: aggregateId,
+                slug: segment.slug,
+                title: segment.title,
+                updatedAt: sourceSnapshot.updated_at,
+                archived: sourceSnapshot.ordinary_lifecycle == .history,
+                presentationMode: presentationMode ?? "idle",
+                requiresAction: requiresAction ?? false,
+                segmentOrdinal: segment.segment_ordinal,
+                handoff: segment.handoff,
+                replacingMessages: replacingMessages,
+                messages: segment.messages)
+        }
+    }
+
+    private func composeSnapshot(
+        currentPage: ProductConversationSnapshot,
+        retainedOlderPages: [ProductConversationSnapshot]
+    ) -> ProductConversationSnapshot {
+        var byOrdinal = Dictionary(
+            currentPage.segments.map { ($0.segment_ordinal, $0) },
+            uniquingKeysWith: { _, newest in newest })
+        for olderPage in retainedOlderPages {
+            for olderSegment in olderPage.segments {
+                if var newestSegment = byOrdinal[olderSegment.segment_ordinal] {
+                    newestSegment.messages = dedupeMessages(
+                        olderSegment.messages + newestSegment.messages)
+                    if newestSegment.handoff == nil {
+                        newestSegment.handoff = olderSegment.handoff
+                    }
+                    byOrdinal[olderSegment.segment_ordinal] = newestSegment
+                } else {
+                    byOrdinal[olderSegment.segment_ordinal] = olderSegment
+                }
+            }
+        }
+        let deepestCursorSource = retainedOlderPages.last ?? currentPage
+        return ProductConversationSnapshot(
+            product_conversation_id: currentPage.product_conversation_id,
+            close: currentPage.close,
+            canonical_route: currentPage.canonical_route,
+            requested_transcript_row_id: currentPage.requested_transcript_row_id,
+            canonical_root: currentPage.canonical_root,
+            ordinary_lifecycle: currentPage.ordinary_lifecycle,
+            latest_transcript_row_id: currentPage.latest_transcript_row_id,
+            writable_transcript_row_id: currentPage.writable_transcript_row_id,
+            updated_at: currentPage.updated_at,
+            presentation: currentPage.presentation,
+            work_identity: currentPage.work_identity,
+            source: currentPage.source,
+            chain_qa_compatibility: currentPage.chain_qa_compatibility,
+            segments: byOrdinal.values.sorted(by: { $0.segment_ordinal < $1.segment_ordinal }),
+            before: deepestCursorSource.before,
+            has_older: deepestCursorSource.has_older)
+    }
+
+    private func mergedSegments(from sourceSnapshot: ProductConversationSnapshot) -> [MergedSegment] {
+        sourceSnapshot.segments.sorted(by: { $0.segment_ordinal < $1.segment_ordinal }).map { segment in
+            let renderedMessages = overlayMessages(for: segment, sourceSnapshot: sourceSnapshot)
+            return MergedSegment(
+                transcriptRowId: segment.transcript_row_id,
+                items: renderedMessages.map(ProductConversationTranscriptItem.message)
+                    + (segment.handoff.map { [.handoff($0)] } ?? []))
+        }
+    }
+
+    private func overlayMessages(for segment: ProductConversationSegment, sourceSnapshot: ProductConversationSnapshot) -> [Message] {
+        guard sourceSnapshot.ordinary_lifecycle != .history,
+              segment.transcript_row_id == sourceSnapshot.writable_transcript_row_id,
+              let liveSession = existingSession(segment.transcript_row_id)
+        else { return segment.messages }
+        let baseIds = Set(segment.messages.map(\.message_id))
+        let liveById = Dictionary(uniqueKeysWithValues: liveSession.messages.map { ($0.message_id, $0) })
+        var rendered = segment.messages.compactMap { liveById[$0.message_id] ?? $0 }
+        let suppressedBoundaryIds = suppressedBoundaryMessageIds(for: segment, sourceSnapshot: sourceSnapshot)
+        for live in liveSession.messages where baseIds.contains(live.message_id) == false {
+            if suppressedBoundaryIds.contains(live.message_id) { continue }
+            rendered.append(live)
+        }
+        return dedupeMessages(rendered)
+    }
+
+    private func suppressedBoundaryMessageIds(
+        for segment: ProductConversationSegment,
+        sourceSnapshot: ProductConversationSnapshot
+    ) -> Set<String> {
+        var ids: Set<String> = []
+        if let handoff = segment.handoff {
+            switch handoff {
+            case .completed(_, _, _, let openingMessageId, _):
+                ids.insert(openingMessageId)
+            case .historical(_, _, let continuationMessageId, _):
+                ids.insert(continuationMessageId)
+            }
+        }
+        if let predecessor = sourceSnapshot.segments.last(where: { $0.segment_ordinal == segment.segment_ordinal - 1 }),
+           let handoff = predecessor.handoff {
+            switch handoff {
+            case .completed(_, _, _, let openingMessageId, _):
+                ids.insert(openingMessageId)
+            case .historical(_, _, let continuationMessageId, _):
+                ids.insert(continuationMessageId)
+            }
+        }
+        return ids
+    }
+
+    private var visibleSessionIdsForProjection: Set<String> {
+        var ids: Set<String> = []
+        if canSendChat, let actionTranscriptRowId { ids.insert(actionTranscriptRowId) }
+        if let selectedTranscriptRowId, !isHistoryReadOnly { ids.insert(selectedTranscriptRowId) }
+        if let latestTranscriptRowId, !isHistoryReadOnly { ids.insert(latestTranscriptRowId) }
+        ids.formUnion(visibleOutboxSessionIds)
+        return ids
+    }
+
+    private var visibleOutboxSessionIds: Set<String> {
+        var ids = persistedOutboxOwnerIndex.transcriptRowIds
+        for segment in segments {
+            let transcriptRowId = segment.transcript_row_id
+            if let session = existingSession(transcriptRowId), !session.outbox.visibleEntries.isEmpty {
+                ids.insert(transcriptRowId)
+            }
+        }
+        return ids
+    }
+
+    private func sessionForSelection(_ transcriptRowId: String) -> ConversationSession? {
+        if transcriptRowId == actionTranscriptRowId {
+            return actionSession
+        }
+        if let session = sessionSlots[transcriptRowId] {
+            return session
+        }
+        if isHistoryReadOnly {
+            return existingSession(transcriptRowId)
+        }
+        return nil
+    }
+
+    private func syncObserversAndSessions() {
+        guard isActive else { return }
+        observerGeneration &+= 1
+        let generation = observerGeneration
+        let desired = visibleSessionIdsForProjection
+        for transcriptRowId in observedSessionIds.subtracting(desired) {
+            existingSession(transcriptRowId)?.setSessionEventObserver(nil)
+        }
+        for transcriptRowId in desired {
+            let session: ConversationSession?
+            if transcriptRowId == actionTranscriptRowId, canSendChat {
+                session = sessionSlots[transcriptRowId]
+            } else if transcriptRowId == latestTranscriptRowId, !isHistoryReadOnly {
+                session = sessionSlots[transcriptRowId]
+            } else if transcriptRowId == selectedTranscriptRowId, !isHistoryReadOnly {
+                session = sessionSlots[transcriptRowId]
+            } else {
+                session = sessionSlots[transcriptRowId] ?? existingSession(transcriptRowId)
+            }
+            session?.setSessionEventObserver { [weak self] event in
+                self?.handleSessionEvent(transcriptRowId: transcriptRowId, generation: generation, event: event)
+            }
+        }
+        observedSessionIds = desired
+        syncStartedActionSession()
+    }
+
+    private func syncStartedActionSession() {
+        let desiredStarted: String?
+        if canSendChat {
+            desiredStarted = actionTranscriptRowId
+        } else if !isHistoryReadOnly {
+            desiredStarted = latestTranscriptRowId
+        } else {
+            desiredStarted = nil
+        }
+        if let startedTranscriptRowId, startedTranscriptRowId != desiredStarted {
+            existingSession(startedTranscriptRowId)?.closeView()
+            self.startedTranscriptRowId = nil
+        }
+        guard let desiredStarted else { return }
+        if startedTranscriptRowId == desiredStarted { return }
+        let session = sessionSlots[desiredStarted]
+        session?.start()
+        startedTranscriptRowId = desiredStarted
+    }
+
+    private func projectDelegatedStateFromCurrentOwner() {
+        let projectedOwner: ConversationSession?
+        if isActive {
+            projectedOwner = currentOwnerSession ?? retainedFallbackSession
+        } else if let ownerTranscriptRowId, let existing = existingSession(ownerTranscriptRowId) {
+            projectedOwner = existing
+        } else if let initialTranscriptRowId, let existing = existingSession(initialTranscriptRowId) {
+            projectedOwner = existing
+        } else {
+            projectedOwner = retainedFallbackSession
+        }
+        if let projectedOwner {
+            if retainedFallbackSource == .persistedOutbox,
+               currentOwnerSession == nil,
+               (isActive || (ownerTranscriptRowId == nil && initialTranscriptRowId == nil))
+            {
+                lastDelegatedConnection = .idle
+                return
+            }
+            lastDelegatedConnection = projectedOwner.connection
+        } else {
+            lastDelegatedConnection = .idle
+        }
+    }
+
+    private var ownerTranscriptRowId: String? {
+        if canSendChat { return actionTranscriptRowId }
+        return latestTranscriptRowId
+    }
+
+
+    private func applyPersistedMemberDiscovery(_ discovery: PersistedMemberDiscovery) {
+        let memberIds = discovery.currentAuthorityMemberIds
+        let discoveredOutboxOwners = discovery.persistedOutboxOwnerIds
+            .union(outboxOnlyTranscriptRowIds)
+        persistedOutboxOwnerIndex = PersistedOutboxOwnerIndex(
+            transcriptRowIds: discoveredOutboxOwners)
+        outboxOnlyTranscriptRowIds = discoveredOutboxOwners.subtracting(memberIds)
+        for transcriptRowId in discoveredOutboxOwners {
+            _ = materializeSession(transcriptRowId)
+        }
+        activatePersistedMemberFallbacks(memberIds: memberIds)
+    }
+
+    private func activatePersistedMemberFallbacks(memberIds: Set<String>) {
+        guard !memberIds.isEmpty else { return }
+        for transcriptRowId in memberIds {
+            _ = materializeSession(transcriptRowId)
+        }
+        aggregateTranscriptRowIds.formUnion(memberIds)
+        let provenIds = Set(provenCachedMemberSessions().map(\.conversationId))
+        aggregateTranscriptRowIds = provenIds
+        if retainedFallbackSession == nil,
+           let initialTranscriptRowId,
+           provenIds.contains(initialTranscriptRowId)
+        {
+            retainedFallbackSession = existingSession(initialTranscriptRowId)
+            retainedFallbackSource = .initialTranscriptRow
+        }
+    }
+
+    private func provenCachedMemberSessions() -> [ConversationSession] {
+        let sessions = aggregateTranscriptRowIds.compactMap(existingSession).filter { session in
+            guard let receipt = session.authoritativeSnapshotReceipt,
+                  receipt.configurationIdentity == configurationIdentity,
+                  receipt.aggregateId == aggregateId,
+                  session.conversation?.id == session.conversationId,
+                  session.conversation?.aggregateIdentity == aggregateId
+            else { return false }
+            return true
+        }
+        guard sessions.count <= 1 || sessions.allSatisfy({
+            $0.authoritativeSnapshotReceipt?.segmentOrdinal != nil
+        }) else { return [] }
+        let ordinals = sessions.compactMap { $0.authoritativeSnapshotReceipt?.segmentOrdinal }
+        guard Set(ordinals).count == ordinals.count else {
+            NSLog("Phoenix cached aggregate ordering rejected: duplicate segment ordinal for %@", aggregateId)
+            return []
+        }
+        return sessions.sorted {
+            ($0.authoritativeSnapshotReceipt?.segmentOrdinal ?? 0)
+                < ($1.authoritativeSnapshotReceipt?.segmentOrdinal ?? 0)
+        }
+    }
+
+    private func activateInitialFallbackIfAvailable() {
+        guard retainedFallbackSession == nil,
+              let initialTranscriptRowId,
+              hasCachedSnapshot(initialTranscriptRowId),
+              let session = materializeSession(initialTranscriptRowId)
+        else { return }
+        retainedFallbackSession = session
+        retainedFallbackSource = .initialTranscriptRow
+        if selectedTranscriptRowId == nil {
+            selectedTranscriptRowId = session.conversationId
+        }
+    }
+
+    private func activateRetainedFallbackFromPersistedOutboxIfNeeded() {
+        guard retainedFallbackSession == nil else { return }
+        guard let transcriptRowId = persistedOutboxOwnerIndex.transcriptRowIds.sorted().first,
+              let session = materializeSession(transcriptRowId)
+        else { return }
+        retainedFallbackSession = session
+        retainedFallbackSource = .persistedOutbox
+        if selectedTranscriptRowId == nil {
+            selectedTranscriptRowId = transcriptRowId
+        }
+    }
+
+    func seedPersistedOutboxFallbackOwnerForTesting(_ transcriptRowId: String) {
+        persistedOutboxOwnerIndex = PersistedOutboxOwnerIndex(transcriptRowIds: [transcriptRowId])
+        outboxOnlyTranscriptRowIds = [transcriptRowId]
+    }
+
+    func awaitCurrentLoadForTesting() async {
+        await loadTask?.value
+    }
+
+    var observerGenerationForTesting: Int { observerGeneration }
+
+    private func updatePersistedOutboxSessions(from sourceSnapshot: ProductConversationSnapshot) {
+        _ = sourceSnapshot
+        refreshPersistedOutboxDiscovery()
+    }
+
+    private func refreshPersistedOutboxDiscovery() {
+        let discovered: Set<String> = Set(segments.compactMap { segment -> String? in
+            let transcriptRowId = segment.transcript_row_id
+            return persistedOutboxContents(transcriptRowId) == .hasVisibleEntries
+                ? transcriptRowId
+                : nil
+        })
+        let retainedOutboxOnly = outboxOnlyTranscriptRowIds.filter {
+            persistedOutboxContents($0) == .hasVisibleEntries
+        }
+        outboxOnlyTranscriptRowIds = Set(retainedOutboxOnly)
+        persistedOutboxOwnerIndex = PersistedOutboxOwnerIndex(
+            transcriptRowIds: discovered.union(outboxOnlyTranscriptRowIds))
+        for transcriptRowId in discovered {
+            _ = materializeSession(transcriptRowId)
+        }
+        if retainedFallbackSource == .persistedOutbox,
+           let retainedFallbackSession,
+           !discovered.contains(retainedFallbackSession.conversationId)
+        {
+            self.retainedFallbackSession = nil
+            retainedFallbackSource = .none
+        }
+        if retainedFallbackSession == nil {
+            activateRetainedFallbackFromPersistedOutboxIfNeeded()
+        }
+        releaseUnneededDiscoveredPersistedOutboxSessions()
+    }
+
+    private func materializeSession(_ transcriptRowId: String) -> ConversationSession? {
+        if let session = sessionSlots[transcriptRowId] {
+            return session
+        }
+        if let existing = existingSession(transcriptRowId) {
+            sessionSlots[transcriptRowId] = existing
+            return existing
+        }
+        guard let created = createSession(transcriptRowId, aggregateId) else { return nil }
+        sessionSlots[transcriptRowId] = created
+        return created
+    }
+
+    private func ensureProjectedSessionsMaterialized() {
+        if canSendChat, let actionTranscriptRowId {
+            _ = materializeSession(actionTranscriptRowId)
+        }
+        if !isHistoryReadOnly, let latestTranscriptRowId {
+            _ = materializeSession(latestTranscriptRowId)
+        }
+        if !isHistoryReadOnly, let selectedTranscriptRowId {
+            _ = materializeSession(selectedTranscriptRowId)
+        }
+    }
+
+    private func releaseUnneededDiscoveredPersistedOutboxSessions() {
+        let protectedIds = visibleSessionIdsForProjection
+            .union(Set([startedTranscriptRowId].compactMap { $0 }))
+            .union(Set([retainedFallbackSession?.conversationId].compactMap { $0 }))
+        for transcriptRowId in sessionSlots.keys {
+            guard persistedOutboxOwnerIndex.transcriptRowIds.contains(transcriptRowId),
+                  !protectedIds.contains(transcriptRowId)
+            else { continue }
+            sessionSlots.removeValue(forKey: transcriptRowId)
+        }
+    }
+
+    private func clearObservers() {
+        for transcriptRowId in observedSessionIds {
+            existingSession(transcriptRowId)?.setSessionEventObserver(nil)
+        }
+        observedSessionIds.removeAll()
+    }
+
+    private func invalidatesThisAggregate(_ invalidation: ProductConversationTopologyInvalidation) -> Bool {
+        invalidation.aggregateIdentity == aggregateId
+    }
+
+    private func dedupeMessages(_ messages: [Message]) -> [Message] {
+        var byId: [String: Message] = [:]
+        for message in messages { byId[message.message_id] = message }
+        return byId.values.sorted(by: { lhs, rhs in
+            if lhs.sequence_id != rhs.sequence_id { return lhs.sequence_id < rhs.sequence_id }
+            return lhs.message_id < rhs.message_id
+        })
+    }
+
+    private func mergeToolUseIndex(from message: Message, into index: inout [String: ToolUseRef]) {
+        guard let blocks = message.content.arrayValue else { return }
+        for block in blocks where block["type"]?.stringValue == "tool_use" {
+            guard let id = block["id"]?.stringValue,
+                  let name = block["name"]?.stringValue
+            else { continue }
+            index[id] = ToolUseRef(name: name, input: block["input"])
+        }
+    }
+
+    private func updateTranscriptMutation(
+        from previousItems: [ProductConversationTranscriptItem],
+        to currentItems: [ProductConversationTranscriptItem]
+    ) {
+        guard previousItems != currentItems else {
+            lastTranscriptMutation = .unchanged
+            return
+        }
+        if currentItems.count > previousItems.count,
+           Array(currentItems.suffix(previousItems.count)) == previousItems {
+            lastTranscriptMutation = .prependedOlder
+            return
+        }
+        lastTranscriptMutation = .appendedLive
+    }
+}
+
+private struct MergedSegment {
+    let transcriptRowId: String
+    let items: [ProductConversationTranscriptItem]
+}
+
+enum ProductConversationRefreshCause: Equatable {
+    case initial
+    case manual
+    case delegateConversationChanged
+}
+
+private struct PersistedOutboxOwnerIndex: Equatable {
+    var transcriptRowIds: Set<String> = []
+}
+
+private enum FallbackSessionSource {
+    case existingOwner
+    case initialTranscriptRow
+    case persistedOutbox
+    case none
+}
+
+enum TranscriptMutation: Equatable {
+    case unknown
+    case prependedOlder
+    case appendedLive
+    case unchanged
+}
+
+private enum PendingLoad: Equatable {
+    case refresh(ProductConversationRefreshCause)
+    case older
+}
+
+private struct PendingLoadPlan: Equatable {
+    var refreshCause: ProductConversationRefreshCause?
+    var wantsOlder = false
+
+    var isEmpty: Bool { refreshCause == nil && !wantsOlder }
+
+    mutating func enqueueRefresh(_ cause: ProductConversationRefreshCause, active: ProductConversationRefreshCause?) {
+        if let active {
+            switch comparePriority(active, cause) {
+            case .orderedDescending:
+                return
+            case .orderedSame, .orderedAscending:
+                break
+            }
+        }
+        refreshCause = refreshCause.map { existing in
+            stronger(existing, cause)
+        } ?? cause
+    }
+
+    private func comparePriority(_ lhs: ProductConversationRefreshCause, _ rhs: ProductConversationRefreshCause) -> ComparisonResult {
+        let left = priority(lhs)
+        let right = priority(rhs)
+        if left < right { return .orderedAscending }
+        if left > right { return .orderedDescending }
+        return .orderedSame
+    }
+
+    private func stronger(_ lhs: ProductConversationRefreshCause, _ rhs: ProductConversationRefreshCause) -> ProductConversationRefreshCause {
+        comparePriority(lhs, rhs) != .orderedAscending ? lhs : rhs
+    }
+
+    private func priority(_ cause: ProductConversationRefreshCause) -> Int {
+        switch cause {
+        case .initial:
+            0
+        case .manual:
+            1
+        case .delegateConversationChanged:
+            2
+        }
+    }
+
+    mutating func enqueueOlder() {
+        wantsOlder = true
+    }
+
+    mutating func consumeRefresh() -> ProductConversationRefreshCause? {
+        let cause = refreshCause
+        refreshCause = nil
+        return cause
+    }
+
+    mutating func consumeOlder() -> Bool {
+        let wantsOlder = wantsOlder
+        self.wantsOlder = false
+        return wantsOlder
+    }
+}

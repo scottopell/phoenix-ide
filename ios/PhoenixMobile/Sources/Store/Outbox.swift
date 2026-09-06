@@ -1,11 +1,160 @@
 import Foundation
 import Observation
 
+enum PersistedOutboxStoreContents: Equatable {
+    case missing
+    case entries([OutboxEntry])
+    case inaccessible
+}
+
+struct OutboxStoreInspection: Equatable {
+    enum FileState: Equatable {
+        case missing
+        case accessible(scope: PersistenceScopeIdentity?, aggregateAuthority: String?, entries: [OutboxEntry])
+        case inaccessible
+        case incompatibleNewerVersion
+    }
+
+    let conversationId: String
+    let state: FileState
+
+    var visibleEntries: [OutboxEntry] {
+        guard case .accessible(_, _, let entries) = state else { return [] }
+        return entries.filter { $0.conversationId == conversationId && $0.isVisible }
+    }
+
+    var hasPendingSendableEntries: Bool {
+        visibleEntries.contains { $0.status == .pending && !$0.acceptedByServer }
+    }
+
+    var aggregateAuthority: String? {
+        guard case .accessible(_, let aggregateAuthority, _) = state else { return nil }
+        return aggregateAuthority
+    }
+
+    var scope: PersistenceScopeIdentity? {
+        guard case .accessible(let scope, _, _) = state else { return nil }
+        return scope
+    }
+}
+
+@MainActor
+final class OutboxPersistenceHandle {
+    private let inspectImpl: (String) -> OutboxStoreInspection
+    private let reserveImpl: () -> Int
+    private let saveImpl: (PersistedOutboxEnvelope, Int) async -> Bool
+    private let removeImpl: (Int) async -> Void
+
+    init(
+        inspect: @escaping (String) -> OutboxStoreInspection,
+        reserveRevision: @escaping () -> Int,
+        save: @escaping (PersistedOutboxEnvelope, Int) async -> Bool,
+        remove: @escaping (Int) async -> Void
+    ) {
+        self.inspectImpl = inspect
+        self.reserveImpl = reserveRevision
+        self.saveImpl = save
+        self.removeImpl = remove
+    }
+
+    func inspect(conversationId: String) -> OutboxStoreInspection {
+        inspectImpl(conversationId)
+    }
+
+    func loadVisibleEntries(
+        conversationId: String,
+        scope: PersistenceScopeIdentity?,
+        aggregateAuthority: String?
+    ) -> PersistedOutboxStoreContents {
+        let inspection = inspect(conversationId: conversationId)
+        switch inspection.state {
+        case .missing:
+            return .missing
+        case .accessible(let persistedScope, let persistedAuthority, _):
+            guard persistedScope == scope,
+                  persistedAuthority == aggregateAuthority
+            else { return .inaccessible }
+            return .entries(inspection.visibleEntries)
+        case .inaccessible, .incompatibleNewerVersion:
+            return .inaccessible
+        }
+    }
+
+    func reserveRevision() -> Int { reserveImpl() }
+    func save(_ envelope: PersistedOutboxEnvelope, revision: Int) async -> Bool { await saveImpl(envelope, revision) }
+    func remove(revision: Int) async { await removeImpl(revision) }
+
+    static func disk(
+        conversationId: String,
+        baseDirectory: URL? = nil,
+        context: VersionedDiskContext? = nil,
+        aggregateAuthority: String? = nil,
+        scope: PersistenceScopeIdentity? = nil
+    ) -> OutboxPersistenceHandle {
+        let resolvedBaseDirectory = baseDirectory ?? DiskStore.baseDirectory
+        let directory = DiskStore.phoenixMobileDirectory(baseDirectory: resolvedBaseDirectory)
+        let source = directory.appendingPathComponent("outbox-\(conversationId)").appendingPathExtension("json")
+        let writer = (context ?? DiskStore.versionedContext(baseDirectory: resolvedBaseDirectory)).writer(
+            destinationURL: source,
+            version: Outbox.schemaVersion)
+        return OutboxPersistenceHandle(
+            inspect: { requestedConversationId in
+                switch DiskStore.loadVersionedResult(
+                    PersistedOutboxEnvelope.self,
+                    source: source,
+                    version: Outbox.schemaVersion)
+                {
+                case .missing:
+                    return OutboxStoreInspection(conversationId: requestedConversationId, state: .missing)
+                case .value(let envelope):
+                    return OutboxStoreInspection(
+                        conversationId: requestedConversationId,
+                        state: .accessible(
+                            scope: envelope.scope,
+                            aggregateAuthority: envelope.aggregateAuthority,
+                            entries: envelope.entries))
+                case .incompatible:
+                    return OutboxStoreInspection(conversationId: requestedConversationId, state: .incompatibleNewerVersion)
+                case .unreadable:
+                    return OutboxStoreInspection(conversationId: requestedConversationId, state: .inaccessible)
+                }
+            },
+            reserveRevision: { writer.reserveRevision() },
+            save: { envelope, revision in await writer.save(envelope, revision: revision) },
+            remove: { revision in await writer.remove(revision: revision) })
+    }
+}
+
+struct PersistedOutboxEnvelope: Codable, Equatable, Sendable {
+    let scope: PersistenceScopeIdentity?
+    let aggregateAuthority: String?
+    let entries: [OutboxEntry]
+}
+
 /// A locally-authored message that has not yet been confirmed by
 /// authoritative server history. Implements the client-side delivery
 /// contract in specs/user_message_queue/user_message_queue.allium:
 /// `localId` doubles as the POST `message_id`, so retries are idempotent
 /// and reconciliation joins that submitted identity to server history.
+struct PersistenceScopeIdentity: Codable, Equatable, Hashable, Sendable {
+    let serverEndpoint: String
+    let credentialGeneration: String
+
+    init(serverURL: String, credentialGeneration: String) {
+        self.serverEndpoint = Self.normalizedServerEndpoint(serverURL)
+        self.credentialGeneration = credentialGeneration
+    }
+
+    private static func normalizedServerEndpoint(_ serverURL: String) -> String {
+        guard let url = URL(string: serverURL), let scheme = url.scheme, let host = url.host else {
+            return serverURL.lowercased()
+        }
+        var normalized = "\(scheme.lowercased())://\(host.lowercased())"
+        if let port = url.port { normalized += ":\(port)" }
+        return normalized
+    }
+}
+
 struct OutboxEntry: Codable, Identifiable, Equatable, Sendable {
     enum Status: String, Codable, Sendable {
         /// Authored; awaiting send or awaiting reflection in server history.
@@ -73,29 +222,38 @@ final class Outbox {
     /// won't survive an app restart. Cleared by the next successful write.
     private(set) var persistenceHealthy = true
     private var storageWritable = true
-    private let writer: VersionedDiskWriter
+    private let persistence: OutboxPersistenceHandle
     private var latestPersistenceRevision = 0
 
-    /// v1 stores visible OutboxEntry values in a versioned envelope.
-    static let schemaVersion = 1
+    /// v1 stored visible OutboxEntry values directly. v2 stores a scoped envelope.
+    static let schemaVersion = 2
 
-    private var storeName: String { "outbox-\(conversationId)" }
+    let aggregateAuthority: String?
+    let persistenceScope: PersistenceScopeIdentity?
 
-    init(conversationId: String) {
+    init(
+        conversationId: String,
+        aggregateAuthority: String?,
+        persistenceScope: PersistenceScopeIdentity?,
+        persistence: OutboxPersistenceHandle
+    ) {
         self.conversationId = conversationId
-        self.writer = DiskStore.versionedWriter(
-            name: "outbox-\(conversationId)", version: Self.schemaVersion)
+        self.aggregateAuthority = aggregateAuthority
+        self.persistenceScope = persistenceScope
+        self.persistence = persistence
         // Rehydrate only entries tagged with this conversation — a foreign
         // entry can never reconcile here and must not render (spec rule
         // RehydrateQueueForConversationOnly).
-        switch DiskStore.loadVersionedResult(
-            [OutboxEntry].self, name: storeName, version: Self.schemaVersion)
+        switch persistence.loadVisibleEntries(
+            conversationId: conversationId,
+            scope: persistenceScope,
+            aggregateAuthority: aggregateAuthority)
         {
         case .missing:
             entries = []
-        case .value(let loaded):
+        case .entries(let loaded):
             entries = loaded.filter { $0.conversationId == conversationId && $0.isVisible }
-        case .incompatible, .unreadable:
+        case .inaccessible:
             entries = []
             persistenceHealthy = false
             storageWritable = false
@@ -110,32 +268,19 @@ final class Outbox {
         entries.contains { $0.status == .pending && !$0.acceptedByServer }
     }
 
-    static func storedContents(conversationId: String) -> StoredContents {
-        let name = "outbox-\(conversationId)"
-        switch DiskStore.loadVersionedResult(
-            [OutboxEntry].self, name: name, version: Self.schemaVersion)
-        {
-        case .missing:
-            return .empty
-        case .value(let entries):
-            return entries.contains {
-                $0.conversationId == conversationId && $0.isVisible
-            } ? .hasVisibleEntries : .empty
-        case .incompatible, .unreadable:
-            return .inaccessible
-        }
-    }
-
     @discardableResult
     private func persist() async -> Bool {
         guard storageWritable else {
             persistenceHealthy = false
             return false
         }
-        let revision = writer.reserveRevision()
+        let revision = persistence.reserveRevision()
         latestPersistenceRevision = revision
-        let snapshot = entries.filter(\.isVisible)
-        let saved = await writer.save(snapshot, revision: revision)
+        let snapshot = PersistedOutboxEnvelope(
+            scope: persistenceScope,
+            aggregateAuthority: aggregateAuthority,
+            entries: entries.filter(\.isVisible))
+        let saved = await persistence.save(snapshot, revision: revision)
         if latestPersistenceRevision == revision {
             persistenceHealthy = saved
         }
@@ -147,11 +292,14 @@ final class Outbox {
             persistenceHealthy = false
             return
         }
-        let revision = writer.reserveRevision()
+        let revision = persistence.reserveRevision()
         latestPersistenceRevision = revision
-        let snapshot = entries.filter(\.isVisible)
+        let snapshot = PersistedOutboxEnvelope(
+            scope: persistenceScope,
+            aggregateAuthority: aggregateAuthority,
+            entries: entries.filter(\.isVisible))
         Task {
-            let saved = await writer.save(snapshot, revision: revision)
+            let saved = await persistence.save(snapshot, revision: revision)
             guard latestPersistenceRevision == revision else { return }
             persistenceHealthy = saved
         }
@@ -173,7 +321,7 @@ final class Outbox {
         suppressedMessageIds.removeAll()
         persistenceHealthy = true
         storageWritable = false
-        let revision = writer.reserveRevision()
+        let revision = persistence.reserveRevision()
         latestPersistenceRevision = revision
         return revision
     }
@@ -181,14 +329,14 @@ final class Outbox {
     /// A hard-deleted conversation owns no remaining local delivery state.
     func clear() {
         let revision = invalidateForRemoval()
-        Task { await writer.remove(revision: revision) }
+        Task { await persistence.remove(revision: revision) }
     }
 
     /// Invalidate every queued write and wait until the revision fence has
     /// removed this store. Later-arriving older writes are rejected.
     func clearAndWait() async {
         let revision = invalidateForRemoval()
-        await writer.remove(revision: revision)
+        await persistence.remove(revision: revision)
     }
 
     private func update(_ localId: String, _ mutate: (inout OutboxEntry) -> Void) {

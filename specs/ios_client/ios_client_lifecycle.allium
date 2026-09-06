@@ -127,6 +127,15 @@ entity ConversationClientStateDeletionOccurrence {
     session: IosConversationSession
 }
 
+entity DurableHardDeleteFence {
+    session: IosConversationSession
+}
+
+entity DeliveryRecoveryGate {
+    session: IosConversationSession
+    fence_classified: Boolean
+}
+
 ------------------------------------------------------------
 -- Rules -- ownership and app lifecycle
 ------------------------------------------------------------
@@ -287,12 +296,32 @@ rule AppForegroundsOffline {
     ensures: QueueDeliveryTriggerOccurrence.created(session: session)
 }
 
+rule AppForegroundClassifiesDeletionFenceBeforeQueueDelivery {
+    -- REQ-IOS-004, REQ-IOS-005
+    when: AppForegrounded(session)
+
+    requires: session.state != deleted
+    requires: exists DeliveryRecoveryGate{
+        session: session,
+        fence_classified: false
+    }
+
+    ensures: DeliveryRecoveryGate{
+        session: session,
+        fence_classified: true
+    }
+}
+
 rule AppForegroundRetainedSessionTriggersQueueDelivery {
     -- REQ-IOS-004: persistence retry is independent of an open live view.
     when: AppForegrounded(session)
 
     requires: session.state != deleted
     requires: not session.view_open or session.state != dormant
+    requires: exists DeliveryRecoveryGate{
+        session: session,
+        fence_classified: true
+    }
 
     ensures: QueueDeliveryTriggerOccurrence.created(session: session)
 }
@@ -322,12 +351,32 @@ rule NetworkPathRestored {
     ensures: QueueDeliveryTriggerOccurrence.created(session: session)
 }
 
+rule NetworkRestoreClassifiesDeletionFenceBeforeQueueDelivery {
+    -- REQ-IOS-004, REQ-IOS-005
+    when: NetworkBecameAvailable(session)
+
+    requires: session.state != deleted
+    requires: exists DeliveryRecoveryGate{
+        session: session,
+        fence_classified: false
+    }
+
+    ensures: DeliveryRecoveryGate{
+        session: session,
+        fence_classified: true
+    }
+}
+
 rule NetworkRestoredOutsideOpenOfflineSessionTriggersQueueDelivery {
     -- REQ-IOS-004: retained sessions and persisted sweeps also retry.
     when: NetworkBecameAvailable(session)
 
     requires: session.state != deleted
     requires: session.state != offline or not session.view_open
+    requires: exists DeliveryRecoveryGate{
+        session: session,
+        fence_classified: true
+    }
 
     ensures: QueueDeliveryTriggerOccurrence.created(session: session)
 }
@@ -479,6 +528,25 @@ rule StaleOrDuplicateEventDiscarded {
 ------------------------------------------------------------
 -- Rules -- terminal deletion
 ------------------------------------------------------------
+
+rule HardDeletionFencePrecedesCleanup {
+    when: ConversationHardDeleted(session)
+
+    requires: session.state = live
+
+    ensures: DurableHardDeleteFence.created(session: session)
+    ensures: session.view_open = false
+    ensures: session.interaction_enabled = false
+    ensures: session.state = deleted
+    @guidance
+        -- One authority transaction owns live-event, aggregate-not-found,
+        -- and startup-recovery deletion. It commits the exact configuration,
+        -- aggregate, and member fence; revalidates the configuration epoch;
+        -- terminally revokes member delivery and persistence capabilities;
+        -- awaits exact-scope transcript, queue, and list removal; verifies
+        -- absence; then retires that exact fence. Epoch mismatch leaves the
+        -- fence durable without process-local mutation.
+}
 
 rule HardDeletionEventReceived {
     -- REQ-IOS-005
