@@ -141,14 +141,14 @@ struct ProductConversationTranscriptView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 10) {
-                    ForEach(Array(items.enumerated()), id: \.offset) { _, item in
+                    ForEach(items) { item in
                         switch item {
                         case .message(let message):
                             MessageView(message: message, toolIndex: toolIndex)
-                                .id(message.message_id)
                         case .handoff(let handoff):
                             ProductConversationHandoffView(handoff: handoff)
                         }
+                        Color.clear.frame(height: 0).id(item.id)
                     }
                     if !streamingText.isEmpty {
                         StreamingBubble(text: streamingText)
@@ -164,9 +164,20 @@ struct ProductConversationTranscriptView: View {
             }
             .defaultScrollAnchor(.bottom)
             .onChange(of: transcriptMutation) {
-                guard transcriptMutation == .appendedLive else { return }
-                withAnimation(.easeOut(duration: 0.2)) {
-                    proxy.scrollTo("bottom", anchor: .bottom)
+                switch transcriptMutation {
+                case .appendedLive:
+                    withAnimation(.easeOut(duration: 0.2)) {
+                        proxy.scrollTo("bottom", anchor: .bottom)
+                    }
+                case .prependedOlder, .unknown, .unchanged:
+                    break
+                }
+            }
+            .onChange(of: items) { oldItems, _ in
+                if transcriptMutation == .prependedOlder,
+                   let anchorId = oldItems.first?.id
+                {
+                    proxy.scrollTo(anchorId, anchor: .top)
                 }
             }
             .onChange(of: streamingText) {
@@ -176,6 +187,7 @@ struct ProductConversationTranscriptView: View {
         .accessibilityIdentifier("conversation.transcript")
     }
 }
+
 
 struct ProductConversationOutboxList: View {
     let projections: [ProductConversationOutboxProjection]
