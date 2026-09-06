@@ -1666,7 +1666,9 @@ final class ConversationSessionReducerTests: XCTestCase {
                 pendingAnchorSequenceId: 1, pendingEvents: [], pendingTruncated: false)))
             continuation.finish()
         }
+        var newStreamContinuation: AsyncThrowingStream<PhoenixEvent, Error>.Continuation?
         let newStream = AsyncThrowingStream<PhoenixEvent, Error> { continuation in
+            newStreamContinuation = continuation
             continuation.yield(.initSnapshot(.init(
                 conversation: try! self.conversation(id: "c1"),
                 messages: [try! self.message(id: "m-new", content: "[{\"type\":\"text\",\"text\":\"fresh\"}]")],
@@ -1676,7 +1678,6 @@ final class ConversationSessionReducerTests: XCTestCase {
                 pendingAnchorSequenceId: 2,
                 pendingEvents: [],
                 pendingTruncated: false)))
-            continuation.finish()
         }
         let openerFactory = ScriptedStreamOpeningFactory(
             steps: [oldStream, newStream],
@@ -1692,6 +1693,7 @@ final class ConversationSessionReducerTests: XCTestCase {
             openEventStream: openerFactory.openEventStream)
 
         defer {
+            newStreamContinuation?.finish()
             openerFactory.releaseAllNonCooperativeWaiters()
             conversationGate.releaseAll()
         }
