@@ -440,20 +440,33 @@ final class ProductConversationDetailModelTests: XCTestCase {
         XCTAssertFalse(model.hasOlder)
     }
 
-    func testHistoryDoesNotCreateSessionsForLatestOrSelectionWithoutExistingSession() {
-        final class Counter { var created: [String] = [] }
-        let counter = Counter()
+    func testHistoryCreatesMemberCachesWithoutStartingAnyRuntimeAuthority() {
+        final class Registry {
+            var sessions: [String: ConversationSession] = [:]
+            var created: [String] = []
+        }
+        let registry = Registry()
         let model = ProductConversationDetailModel(
             aggregateId: "pc-1",
             api: makeAPI(),
             connectivity: ConnectivityMonitor(),
-            sessionProvider: { id, _ in counter.created.append(id); return self.makeSession(id: id) })
+            sessionProvider: { id, _ in
+                registry.created.append(id)
+                let session = self.makeSession(id: id)
+                registry.sessions[id] = session
+                return session
+            },
+            existingSession: { registry.sessions[$0] })
 
         model.applyForTesting(snapshot(lifecycle: .history, writable: nil))
-        _ = model.stateDetailSession
-        _ = model.selectedTranscriptSession
 
-        XCTAssertTrue(counter.created.isEmpty)
+        XCTAssertEqual(Set(registry.created), ["row-1", "row-2"])
+        XCTAssertNil(model.currentOwnerSession)
+        XCTAssertNil(model.actionSession)
+        XCTAssertNil(model.lifecycleSession)
+        XCTAssertTrue(registry.sessions.values.allSatisfy {
+            $0.currentStreamTaskForTesting() == nil && $0.currentDrainTaskForTesting() == nil
+        })
     }
 
     func testOpenWithoutWritableUsesLatestSessionForActionsButNotChat() async {
@@ -584,6 +597,51 @@ final class ProductConversationDetailModelTests: XCTestCase {
         XCTAssertTrue(model.hasOlder)
     }
 
+    func testTwoOlderPagesInRetainedCursorChainAppendWithoutErasingFirstPage() async {
+        var initial = snapshot(before: "cursor-1", hasOlder: true)
+        initial.segments[0].messages = [.init(
+            message_id: "newest", conversation_id: "row-1", sequence_id: 3,
+            message_type: "agent", content: .object(["text": .string("newest")]),
+            display_data: nil, created_at: "2025-01-03T03:04:05Z")]
+        var olderOne = snapshot(before: "cursor-2", hasOlder: true)
+        olderOne.segments[0].messages = [.init(
+            message_id: "middle", conversation_id: "row-1", sequence_id: 2,
+            message_type: "agent", content: .object(["text": .string("middle")]),
+            display_data: nil, created_at: "2025-01-02T03:04:05Z")]
+        var olderTwo = snapshot(before: nil, hasOlder: false)
+        olderTwo.segments[0].messages = [.init(
+            message_id: "oldest", conversation_id: "row-1", sequence_id: 1,
+            message_type: "user", content: .object(["text": .string("oldest")]),
+            display_data: nil, created_at: "2025-01-01T03:04:05Z")]
+        final class Box { var calls: [String?] = []; var index = 0 }
+        let box = Box()
+        let responses = [initial, olderOne, olderTwo]
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-1", api: makeAPI(), connectivity: ConnectivityMonitor(),
+            sessionProvider: { _, _ in nil },
+            loadSnapshot: { _, before in
+                box.calls.append(before)
+                defer { box.index += 1 }
+                return responses[box.index]
+            })
+
+        await model.start()
+        await model.loadOlder()
+        await model.loadOlder()
+
+        let ids = model.transcriptItems.compactMap { item -> String? in
+            guard case .message(let message) = item else { return nil }
+            return message.message_id
+        }
+        XCTAssertEqual(box.calls, [nil, "cursor-1", "cursor-2"])
+        let oldestIndex = try! XCTUnwrap(ids.firstIndex(of: "oldest"))
+        let middleIndex = try! XCTUnwrap(ids.firstIndex(of: "middle"))
+        let newestIndex = try! XCTUnwrap(ids.firstIndex(of: "newest"))
+        XCTAssertLessThan(oldestIndex, middleIndex)
+        XCTAssertLessThan(middleIndex, newestIndex)
+        XCTAssertFalse(model.hasOlder)
+    }
+
     func testColdRestartDiscoversPersistedPredecessorOutboxWithoutPreexistingSession() async throws {
         final class SessionRegistry {
             var sessions: [String: ConversationSession] = [:]
@@ -635,6 +693,110 @@ final class ProductConversationDetailModelTests: XCTestCase {
             _ = model.displayTitle
             XCTAssertEqual(registry.created, ["row-1", "row-2", "row-2", "row-2"])
         }
+    }
+
+    func testNewestRefreshReplacesReturnedMemberCacheAndDropsDeletedAndSupersededMessages() async {
+        let session = makeSession(id: "row-1")
+        var initial = snapshot(before: nil, hasOlder: false)
+        initial.segments = [initial.segments[0]]
+        initial.latest_transcript_row_id = "row-1"
+        initial.writable_transcript_row_id = "row-1"
+        initial.segments[0].messages = [
+            .init(message_id: "deleted", conversation_id: "row-1", sequence_id: 1,
+                  message_type: "agent", content: .string("deleted"), display_data: nil, created_at: nil),
+            .init(message_id: "same", conversation_id: "row-1", sequence_id: 2,
+                  message_type: "agent", content: .string("old"), display_data: nil, created_at: nil),
+        ]
+        var refreshed = initial
+        refreshed.segments[0].messages = [
+            .init(message_id: "same", conversation_id: "row-1", sequence_id: 2,
+                  message_type: "agent", content: .string("new"), display_data: nil, created_at: nil),
+        ]
+        final class Calls { var count = 0 }
+        let calls = Calls()
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-1", api: makeAPI(), connectivity: ConnectivityMonitor(),
+            sessionProvider: { id, _ in id == "row-1" ? session : nil },
+            existingSession: { id in id == "row-1" ? session : nil },
+            loadSnapshot: { _, _ in
+                defer { calls.count += 1 }
+                return calls.count == 0 ? initial : refreshed
+            })
+
+        await model.start()
+        await model.refresh()
+
+        XCTAssertEqual(session.messages.map(\.message_id), ["same"])
+        XCTAssertEqual(session.messages.first?.content.stringValue, "new")
+    }
+
+    func testOutboxOnlyDiscoverySeedsOfflineOptimisticProjection() async {
+        let connectivity = ConnectivityMonitor()
+        connectivity.setOnlineForTesting(false)
+        let baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-outbox-only-tests-\(UUID().uuidString)")
+        let outboxOwner = ConversationSession(
+            conversationId: "row-outbox", api: makeAPI(), connectivity: connectivity,
+            outboxPersistence: OutboxPersistenceHandle.disk(
+                conversationId: "row-outbox", baseDirectory: baseDirectory),
+            snapshotPersistence: DiskStore.versionedContext(baseDirectory: baseDirectory).writer(
+                destinationURL: baseDirectory.appendingPathComponent("PhoenixMobile", isDirectory: true)
+                    .appendingPathComponent("conv-row-outbox").appendingPathExtension("json"),
+                version: ConversationSession.snapshotSchemaVersion),
+            retryTiming: LiveSessionTiming(), staleCheckTiming: LiveSessionTiming(),
+            aggregateAuthority: "pc-1")
+        let pending = await outboxOwner.outbox.enqueue(text: "offline pending")
+        XCTAssertNotNil(pending)
+        let persisted = await outboxOwner.outbox.flushPersistence()
+        XCTAssertTrue(persisted)
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-1", api: makeAPI(), connectivity: connectivity,
+            sessionProvider: { id, _ in id == "row-outbox" ? outboxOwner : nil },
+            existingSession: { id in id == "row-outbox" ? outboxOwner : nil },
+            persistedOutboxContents: { $0 == "row-outbox" ? .hasVisibleEntries : .empty },
+            discoverPersistedMembers: {
+                PersistedMemberDiscovery(
+                    currentAuthorityMemberIds: [],
+                    persistedOutboxOwnerIds: ["row-outbox"])
+            })
+
+        await model.start()
+
+        XCTAssertEqual(model.outboxProjections.map(\.transcriptRowId), ["row-outbox"])
+        XCTAssertEqual(model.fallbackSession?.conversationId, "row-outbox")
+    }
+
+    func testStoppedModelIgnoresLatePersistedMemberDiscovery() async {
+        let connectivity = ConnectivityMonitor()
+        connectivity.setOnlineForTesting(false)
+        let gate = AsyncGate()
+        let session = makeSession(id: "late-row")
+        session.persistAuthoritativeRESTSegment(
+            transcriptRowId: "late-row", aggregateId: "pc-1", slug: nil, title: "Late",
+            updatedAt: "2025-01-02T03:04:05Z", archived: false,
+            presentationMode: "idle", requiresAction: false, segmentOrdinal: 0,
+            handoff: nil, replacingMessages: true, messages: [])
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-1", api: makeAPI(), connectivity: connectivity,
+            sessionProvider: { id, _ in id == "late-row" ? session : nil },
+            existingSession: { id in id == "late-row" ? session : nil },
+            discoverPersistedMembers: {
+                await gate.signalStartedAndWaitForRelease()
+                return PersistedMemberDiscovery(
+                    currentAuthorityMemberIds: ["late-row"],
+                    persistedOutboxOwnerIds: [])
+            })
+        let start = Task { await model.start() }
+        await gate.waitUntilStarted()
+
+        model.stop()
+        await gate.release()
+        await start.value
+
+        XCTAssertTrue(model.transcriptItems.isEmpty)
+        XCTAssertNil(model.fallbackSession)
+        XCTAssertFalse(model.canSendChat)
+        XCTAssertFalse(model.canMutateLifecycle)
     }
 
     func testTopologyGenerationChangeResetsToFreshCursorChain() async {
@@ -799,7 +961,9 @@ final class ProductConversationDetailModelTests: XCTestCase {
         let reloadedRow1 = makeMemberSession("row-1")
         let reloadedRow2 = makeMemberSession("row-2")
         XCTAssertEqual(reloadedRow1.messages.map(\.message_id), ["m-older", "m-newer"])
-        XCTAssertEqual(reloadedRow2.messages.map(\.message_id), ["m-2", "m-newer"])
+        XCTAssertEqual(reloadedRow2.messages.map(\.message_id), ["m-newer", "m-2"])
+        XCTAssertEqual(reloadedRow1.productConversationHandoff, newest.segments[0].handoff)
+        XCTAssertEqual(reloadedRow1.authoritativeSnapshotReceipt?.handoff, newest.segments[0].handoff)
         XCTAssertEqual(
             reloadedRow1.authoritativeSnapshotReceipt?.configurationIdentity,
             api.configurationIdentity)
@@ -844,7 +1008,11 @@ final class ProductConversationDetailModelTests: XCTestCase {
             connectivity: offlineConnectivity,
             sessionProvider: { transcriptRowId, _ in reloadedSessions[transcriptRowId] },
             existingSession: { reloadedSessions[$0] },
-            provenCurrentAuthorityMemberIds: { Set(reloadedSessions.keys) })
+            discoverPersistedMembers: {
+                PersistedMemberDiscovery(
+                    currentAuthorityMemberIds: Set(reloadedSessions.keys),
+                    persistedOutboxOwnerIds: [])
+            })
 
         await recreatedOfflineDetail.start()
 
@@ -879,7 +1047,11 @@ final class ProductConversationDetailModelTests: XCTestCase {
             aggregateId: "pc-1", api: api, connectivity: connectivity,
             sessionProvider: { id, _ in sessions[id] },
             existingSession: { sessions[$0] },
-            provenCurrentAuthorityMemberIds: { Set(sessions.keys) })
+            discoverPersistedMembers: {
+                PersistedMemberDiscovery(
+                    currentAuthorityMemberIds: Set(sessions.keys),
+                    persistedOutboxOwnerIds: [])
+            })
 
         await model.start()
 

@@ -13,7 +13,7 @@ final class ProductConversationDetailModel {
     private let existingSession: (String) -> ConversationSession?
     private let persistedOutboxContents: (String) -> Outbox.StoredContents
     private let hasCachedSnapshot: (String) -> Bool
-    private let provenCurrentAuthorityMemberIds: () -> Set<String>
+    private let discoverPersistedMembers: () async -> PersistedMemberDiscovery
     private let handleDefinitiveNotFound: @MainActor (String?, Set<String>) async -> Void
     private let loadSnapshot: (String, String?) async throws -> ProductConversationSnapshot
     private let didStartRefresh: @MainActor (ProductConversationRefreshCause) -> Void
@@ -40,6 +40,8 @@ final class ProductConversationDetailModel {
     private var retainedFallbackSession: ConversationSession?
     private var retainedFallbackSource: FallbackSessionSource = .none
     private var persistedOutboxOwnerIndex = PersistedOutboxOwnerIndex()
+    private var outboxOnlyTranscriptRowIds: Set<String> = []
+    private var persistedMemberDiscoveryGeneration = 0
     private var aggregateTranscriptRowIds: Set<String> = []
     private var lastTranscriptMutation: TranscriptMutation = .unknown
     private var pendingLoadPlan = PendingLoadPlan()
@@ -55,7 +57,7 @@ final class ProductConversationDetailModel {
         existingSession: @escaping (String) -> ConversationSession? = { _ in nil },
         persistedOutboxContents: @escaping (String) -> Outbox.StoredContents = { _ in .empty },
         hasCachedSnapshot: @escaping (String) -> Bool = { _ in false },
-        provenCurrentAuthorityMemberIds: @escaping () -> Set<String> = { [] },
+        discoverPersistedMembers: @escaping () async -> PersistedMemberDiscovery = { .empty },
         handleDefinitiveNotFound: @escaping @MainActor (String?, Set<String>) async -> Void = { _, _ in },
         loadSnapshot: ((String, String?) async throws -> ProductConversationSnapshot)? = nil,
         didStartRefresh: @escaping @MainActor (ProductConversationRefreshCause) -> Void = { _ in },
@@ -69,7 +71,7 @@ final class ProductConversationDetailModel {
         self.existingSession = existingSession
         self.persistedOutboxContents = persistedOutboxContents
         self.hasCachedSnapshot = hasCachedSnapshot
-        self.provenCurrentAuthorityMemberIds = provenCurrentAuthorityMemberIds
+        self.discoverPersistedMembers = discoverPersistedMembers
         self.handleDefinitiveNotFound = handleDefinitiveNotFound
         self.loadSnapshot = loadSnapshot ?? { id, before in
             try await api.getProductConversation(id: id, before: before)
@@ -113,8 +115,8 @@ final class ProductConversationDetailModel {
     }
 
     var lifecycleSession: ConversationSession? {
-        guard let transcriptRowId = latestTranscriptRowId else { return nil }
-        return sessionSlots[transcriptRowId] ?? (isHistoryReadOnly ? existingSession(transcriptRowId) : nil)
+        guard !isHistoryReadOnly, let transcriptRowId = latestTranscriptRowId else { return nil }
+        return sessionSlots[transcriptRowId]
     }
 
     var writableTranscriptRowId: String? {
@@ -136,10 +138,11 @@ final class ProductConversationDetailModel {
         if !cachedSessions.isEmpty {
             var seenMessageIds: Set<String> = []
             return cachedSessions.flatMap { session in
-                session.messages.compactMap { message in
+                let messages = session.messages.compactMap { message -> ProductConversationTranscriptItem? in
                     guard seenMessageIds.insert(message.message_id).inserted else { return nil }
-                    return ProductConversationTranscriptItem.message(message)
+                    return .message(message)
                 }
+                return messages + (session.productConversationHandoff.map { [.handoff($0)] } ?? [])
             }
         }
         guard let fallbackSession = retainedFallbackSession else { return [] }
@@ -252,7 +255,12 @@ final class ProductConversationDetailModel {
                 }
             }
         }
-        activatePersistedMemberFallbacks()
+        persistedMemberDiscoveryGeneration &+= 1
+        let discoveryGeneration = persistedMemberDiscoveryGeneration
+        let discovery = await discoverPersistedMembers()
+        guard isActive, discoveryGeneration == persistedMemberDiscoveryGeneration,
+              !Task.isCancelled else { return }
+        applyPersistedMemberDiscovery(discovery)
         activateInitialFallbackIfAvailable()
         ensureProjectedSessionsMaterialized()
         if snapshot != nil || retainedFallbackSession != nil {
@@ -276,6 +284,8 @@ final class ProductConversationDetailModel {
         activeRefreshCause = nil
         sessionSlots.removeAll()
         persistedOutboxOwnerIndex = PersistedOutboxOwnerIndex()
+        outboxOnlyTranscriptRowIds.removeAll()
+        persistedMemberDiscoveryGeneration &+= 1
         retainedFallbackSession = nil
         retainedFallbackSource = .none
         clearObservers()
@@ -443,7 +453,6 @@ final class ProductConversationDetailModel {
     private func performRefresh(cause: ProductConversationRefreshCause, generation: Int) async {
         guard connectivity.isOnline else {
             if snapshot == nil {
-                activatePersistedMemberFallbacks()
                 activateInitialFallbackIfAvailable()
                 activateRetainedFallbackFromPersistedOutboxIfNeeded()
                 if retainedFallbackSession == nil {
@@ -471,7 +480,6 @@ final class ProductConversationDetailModel {
                 return
             }
             if snapshot == nil {
-                activatePersistedMemberFallbacks()
                 activateInitialFallbackIfAvailable()
                 activateRetainedFallbackFromPersistedOutboxIfNeeded()
                 if let session = retainedFallbackSession,
@@ -513,7 +521,11 @@ final class ProductConversationDetailModel {
             composed.before = older.before
             composed.has_older = older.has_older
             let previousItems = transcriptItems
-            applySnapshot(composed, resetRetainedPages: false)
+            applySnapshot(
+                composed,
+                resetRetainedPages: false,
+                persistedPage: older,
+                replacingPersistedMessages: false)
             updateTranscriptMutation(from: previousItems, to: transcriptItems)
             loadError = nil
         } catch {
@@ -540,10 +552,22 @@ final class ProductConversationDetailModel {
         let retainedPages = resetForTopology ? [] : retainedOlderPages.filter { $0.product_conversation_id == fresh.product_conversation_id }
         let composed = composeSnapshot(currentPage: fresh, retainedOlderPages: retainedPages)
         if resetForTopology { retainedOlderPages.removeAll() }
-        applySnapshot(composed, resetRetainedPages: resetForTopology)
+        applySnapshot(
+            composed,
+            resetRetainedPages: resetForTopology,
+            persistedPage: fresh,
+            replacingPersistedMessages: true)
+        for olderPage in retainedPages {
+            persistSegmentsInMemberCaches(olderPage, replacingMessages: false)
+        }
     }
 
-    private func applySnapshot(_ newSnapshot: ProductConversationSnapshot, resetRetainedPages: Bool) {
+    private func applySnapshot(
+        _ newSnapshot: ProductConversationSnapshot,
+        resetRetainedPages: Bool,
+        persistedPage: ProductConversationSnapshot? = nil,
+        replacingPersistedMessages: Bool = true
+    ) {
         hardDeleted = false
         if resetRetainedPages { retainedOlderPages.removeAll() }
         snapshot = newSnapshot
@@ -570,17 +594,20 @@ final class ProductConversationDetailModel {
 
         actionTranscriptRowId = newActionTranscriptRowId
         ensureProjectedSessionsMaterialized()
-        persistSegmentsInMemberCaches(newSnapshot)
+        persistSegmentsInMemberCaches(
+            persistedPage ?? newSnapshot,
+            replacingMessages: replacingPersistedMessages)
         syncObserversAndSessions()
         projectDelegatedStateFromCurrentOwner()
     }
 
-    private func persistSegmentsInMemberCaches(_ sourceSnapshot: ProductConversationSnapshot) {
+    private func persistSegmentsInMemberCaches(
+        _ sourceSnapshot: ProductConversationSnapshot,
+        replacingMessages: Bool
+    ) {
         for segment in sourceSnapshot.segments {
             let session = existingSession(segment.transcript_row_id)
-                ?? (sourceSnapshot.ordinary_lifecycle == .history
-                    ? nil
-                    : createSession(segment.transcript_row_id, aggregateId))
+                ?? createSession(segment.transcript_row_id, aggregateId)
             guard let session else { continue }
             let (presentationMode, requiresAction): (String?, Bool?) = switch sourceSnapshot.presentation {
             case .needsAction:
@@ -598,6 +625,8 @@ final class ProductConversationDetailModel {
                 presentationMode: presentationMode ?? "idle",
                 requiresAction: requiresAction ?? false,
                 segmentOrdinal: segment.segment_ordinal,
+                handoff: segment.handoff,
+                replacingMessages: replacingMessages,
                 messages: segment.messages)
         }
     }
@@ -606,15 +635,20 @@ final class ProductConversationDetailModel {
         currentPage: ProductConversationSnapshot,
         retainedOlderPages: [ProductConversationSnapshot]
     ) -> ProductConversationSnapshot {
-        var byOrdinal: [Int64: ProductConversationSegment] = [:]
-        for snapshot in retainedOlderPages + [currentPage] {
-            for segment in snapshot.segments {
-                if var existing = byOrdinal[segment.segment_ordinal] {
-                    existing.messages = dedupeMessages(existing.messages + segment.messages)
-                    if existing.handoff == nil { existing.handoff = segment.handoff }
-                    byOrdinal[segment.segment_ordinal] = existing
+        var byOrdinal = Dictionary(
+            currentPage.segments.map { ($0.segment_ordinal, $0) },
+            uniquingKeysWith: { _, newest in newest })
+        for olderPage in retainedOlderPages {
+            for olderSegment in olderPage.segments {
+                if var newestSegment = byOrdinal[olderSegment.segment_ordinal] {
+                    newestSegment.messages = dedupeMessages(
+                        olderSegment.messages + newestSegment.messages)
+                    if newestSegment.handoff == nil {
+                        newestSegment.handoff = olderSegment.handoff
+                    }
+                    byOrdinal[olderSegment.segment_ordinal] = newestSegment
                 } else {
-                    byOrdinal[segment.segment_ordinal] = segment
+                    byOrdinal[olderSegment.segment_ordinal] = olderSegment
                 }
             }
         }
@@ -800,8 +834,20 @@ final class ProductConversationDetailModel {
     }
 
 
-    private func activatePersistedMemberFallbacks() {
-        let memberIds = provenCurrentAuthorityMemberIds()
+    private func applyPersistedMemberDiscovery(_ discovery: PersistedMemberDiscovery) {
+        let memberIds = discovery.currentAuthorityMemberIds
+        let discoveredOutboxOwners = discovery.persistedOutboxOwnerIds
+            .union(outboxOnlyTranscriptRowIds)
+        persistedOutboxOwnerIndex = PersistedOutboxOwnerIndex(
+            transcriptRowIds: discoveredOutboxOwners)
+        outboxOnlyTranscriptRowIds = discoveredOutboxOwners.subtracting(memberIds)
+        for transcriptRowId in discoveredOutboxOwners {
+            _ = materializeSession(transcriptRowId)
+        }
+        activatePersistedMemberFallbacks(memberIds: memberIds)
+    }
+
+    private func activatePersistedMemberFallbacks(memberIds: Set<String>) {
         guard !memberIds.isEmpty else { return }
         for transcriptRowId in memberIds {
             _ = materializeSession(transcriptRowId)
@@ -869,6 +915,7 @@ final class ProductConversationDetailModel {
 
     func seedPersistedOutboxFallbackOwnerForTesting(_ transcriptRowId: String) {
         persistedOutboxOwnerIndex = PersistedOutboxOwnerIndex(transcriptRowIds: [transcriptRowId])
+        outboxOnlyTranscriptRowIds = [transcriptRowId]
     }
 
     func awaitCurrentLoadForTesting() async {
@@ -889,7 +936,12 @@ final class ProductConversationDetailModel {
                 ? transcriptRowId
                 : nil
         })
-        persistedOutboxOwnerIndex = PersistedOutboxOwnerIndex(transcriptRowIds: discovered)
+        let retainedOutboxOnly = outboxOnlyTranscriptRowIds.filter {
+            persistedOutboxContents($0) == .hasVisibleEntries
+        }
+        outboxOnlyTranscriptRowIds = Set(retainedOutboxOnly)
+        persistedOutboxOwnerIndex = PersistedOutboxOwnerIndex(
+            transcriptRowIds: discovered.union(outboxOnlyTranscriptRowIds))
         for transcriptRowId in discovered {
             _ = materializeSession(transcriptRowId)
         }
