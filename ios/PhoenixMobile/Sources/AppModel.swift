@@ -584,6 +584,7 @@ final class AppModel {
     static let lastCwdKey = "phoenix.lastCwd"
 
     private var configurationMutationDepth = 0
+    private var signOutInProgress = false
 
     var serverURLString: String {
         didSet {
@@ -718,6 +719,15 @@ final class AppModel {
         }
         notificationRouter.model = self
         UNUserNotificationCenter.current().delegate = notificationRouter
+        if let api,
+           self.coordinatorIdentityStore.load(persistenceScope: api.configurationIdentity.persistenceScope) == nil,
+           let legacyId = UserDefaults.standard.string(forKey: "phoenix.coordinatorConversationId")
+        {
+            self.coordinatorIdentityStore.save(.init(
+                persistenceScope: api.configurationIdentity.persistenceScope,
+                conversationId: legacyId))
+            UserDefaults.standard.removeObject(forKey: "phoenix.coordinatorConversationId")
+        }
         coordinatorConversationId = api.flatMap {
             self.coordinatorIdentityStore.load(persistenceScope: $0.configurationIdentity.persistenceScope)?.conversationId
         }
@@ -894,6 +904,7 @@ final class AppModel {
     }
 
     private func rebuildAPI() {
+        guard !signOutInProgress else { return }
 
         cancelPersistedOutboxDrainAuthority()
         startupHardDeleteRecoveryTask?.cancel()
@@ -1190,7 +1201,7 @@ final class AppModel {
     }
 
     func refreshList() async {
-        guard let api else { return }
+        guard !signOutInProgress, let api else { return }
         attentionEvidenceGeneration &+= 1
         let latestByAggregate = await listStore.refresh(api: api)
         if listStore.lastError == nil {
@@ -1806,6 +1817,9 @@ final class AppModel {
     /// working directory, and the pinned certificate are per-server state
     /// and must not leak across a server/account switch.
     func signOut() async {
+        guard !signOutInProgress else { return }
+        signOutInProgress = true
+        defer { signOutInProgress = false }
         cancelPersistedOutboxDrainAuthority()
         apiGeneration += 1
         nudgePreferenceGeneration &+= 1
@@ -1820,6 +1834,7 @@ final class AppModel {
         let configurationIdentity = api?.configurationIdentity
         let ownedSessions = resetLocalStateForSignOut()
         await removeLocalStateForSignOut(ownedSessions: ownedSessions)
+        api = nil
         UserDefaults.standard.removeObject(forKey: Self.lastCwdKey)
         if let configurationIdentity {
             coordinatorIdentityStore.clear(persistenceScope: configurationIdentity.persistenceScope)

@@ -130,12 +130,27 @@ struct ProductConversationStateDetailView: View {
     }
 }
 
+struct PrependScrollAnchor: Equatable {
+    private(set) var itemId: String?
+
+    mutating func capture(visibleItemId: String?) {
+        itemId = visibleItemId
+    }
+
+    mutating func consume() -> String? {
+        defer { itemId = nil }
+        return itemId
+    }
+}
+
 struct ProductConversationTranscriptView: View {
     let items: [ProductConversationTranscriptItem]
     let toolIndex: [String: ToolUseRef]
     let streamingText: String
     let outboxProjections: [ProductConversationOutboxProjection]
     let transcriptMutation: TranscriptMutation
+    @State private var visibleItemId: String?
+    @State private var prependAnchor = PrependScrollAnchor()
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -150,6 +165,7 @@ struct ProductConversationTranscriptView: View {
                         }
                         Color.clear.frame(height: 0).id(item.id)
                     }
+                    .scrollTargetLayout()
                     if !streamingText.isEmpty {
                         StreamingBubble(text: streamingText)
                             .id("streaming")
@@ -163,6 +179,7 @@ struct ProductConversationTranscriptView: View {
                 .padding(.vertical, 8)
             }
             .defaultScrollAnchor(.bottom)
+            .scrollPosition(id: $visibleItemId, anchor: .top)
             .onChange(of: transcriptMutation) {
                 switch transcriptMutation {
                 case .appendedLive:
@@ -173,9 +190,14 @@ struct ProductConversationTranscriptView: View {
                     break
                 }
             }
-            .onChange(of: items) { oldItems, _ in
+            .onChange(of: transcriptMutation) { oldMutation, newMutation in
+                if oldMutation != .prependedOlder, newMutation == .prependedOlder {
+                    prependAnchor.capture(visibleItemId: visibleItemId)
+                }
+            }
+            .onChange(of: items) { _, _ in
                 if transcriptMutation == .prependedOlder,
-                   let anchorId = oldItems.first?.id
+                   let anchorId = prependAnchor.consume()
                 {
                     proxy.scrollTo(anchorId, anchor: .top)
                 }
