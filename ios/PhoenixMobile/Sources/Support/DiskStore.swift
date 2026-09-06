@@ -25,6 +25,12 @@ private actor VersionedDiskSink {
         return committed
     }
 
+    func fence(revision: Int) {
+        guard revision >= latestAttemptedRevision else { return }
+        latestAttemptedRevision = revision
+        latestCommittedRevision = max(latestCommittedRevision, revision)
+    }
+
     func remove(revision: Int) {
         guard revision >= latestAttemptedRevision else { return }
         latestAttemptedRevision = revision
@@ -74,6 +80,10 @@ final class VersionedDiskWriter {
 
     func save<T: Encodable & Sendable>(_ value: T, revision: Int) async -> Bool {
         await destination.sink.save(value, version: version, revision: revision)
+    }
+
+    func fence(revision: Int) async {
+        await destination.sink.fence(revision: revision)
     }
 
     func remove(revision: Int) async {
