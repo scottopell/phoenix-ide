@@ -125,6 +125,19 @@ final class ProductConversationDetailModelTests: XCTestCase {
         XCTAssertEqual(row2.conversationId, "row-2")
     }
 
+    func testTranscriptItemIdentityQualifiesReusedMessageIdsBySegment() throws {
+        let first = ProductConversationTranscriptItem.message(
+            try JSONDecoder().decode(Message.self, from: Data(
+                "{\"message_id\":\"shared\",\"conversation_id\":\"row-1\",\"sequence_id\":2,\"message_type\":\"agent\",\"content\":\"first\"}".utf8)))
+        let second = ProductConversationTranscriptItem.message(
+            try JSONDecoder().decode(Message.self, from: Data(
+                "{\"message_id\":\"shared\",\"conversation_id\":\"row-2\",\"sequence_id\":2,\"message_type\":\"agent\",\"content\":\"second\"}".utf8)))
+
+        XCTAssertNotEqual(first.id, second.id)
+        XCTAssertEqual(first.id, "message:row-1:shared")
+        XCTAssertEqual(second.id, "message:row-2:shared")
+    }
+
     func testHistoryOnlyDisablesGlobalMutationsButOpenWithoutWritableStillAllowsLifecycleActions() async {
         let row2 = makeSession(id: "row-2")
         row2.receive(.initSnapshot(.init(
