@@ -2771,59 +2771,19 @@ struct StreamConversationQuery {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(tag = "outcome", rename_all = "lowercase")]
-enum ConversationOpenPhases {
-    Connected {
-        native_open_ms: Option<f64>,
-        init_received_ms: f64,
-        handler_ms: f64,
-    },
-    Error {
-        native_open_ms: Option<f64>,
-        init_received_ms: Option<f64>,
-        #[expect(
-            dead_code,
-            reason = "presence enforces JSON null during deserialization"
-        )]
-        handler_ms: MustBeNull,
-    },
-    Canceled {
-        native_open_ms: Option<f64>,
-        init_received_ms: Option<f64>,
-        #[expect(
-            dead_code,
-            reason = "presence enforces JSON null during deserialization"
-        )]
-        handler_ms: MustBeNull,
-    },
+#[serde(rename_all = "lowercase")]
+enum ConversationOpenOutcome {
+    Connected,
+    Error,
+    Canceled,
 }
 
-#[derive(Debug, Deserialize)]
-struct MustBeNull;
-
-impl ConversationOpenPhases {
-    fn values(&self) -> (&'static str, Option<f64>, Option<f64>, Option<f64>) {
+impl ConversationOpenOutcome {
+    const fn as_str(&self) -> &'static str {
         match self {
-            Self::Connected {
-                native_open_ms,
-                init_received_ms,
-                handler_ms,
-            } => (
-                "connected",
-                *native_open_ms,
-                Some(*init_received_ms),
-                Some(*handler_ms),
-            ),
-            Self::Error {
-                native_open_ms,
-                init_received_ms,
-                handler_ms: _,
-            } => ("error", *native_open_ms, *init_received_ms, None),
-            Self::Canceled {
-                native_open_ms,
-                init_received_ms,
-                handler_ms: _,
-            } => ("canceled", *native_open_ms, *init_received_ms, None),
+            Self::Connected => "connected",
+            Self::Error => "error",
+            Self::Canceled => "canceled",
         }
     }
 }
@@ -2852,10 +2812,16 @@ impl NetworkEffectiveType {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ConversationOpenTelemetry {
     open_id: uuid::Uuid,
-    #[serde(flatten)]
-    phases: ConversationOpenPhases,
+    outcome: ConversationOpenOutcome,
+    route_resolved_ms: Option<f64>,
+    event_source_created_ms: Option<f64>,
+    native_open_ms: Option<f64>,
+    init_received_ms: Option<f64>,
+    init_handled_ms: Option<f64>,
+    first_paint_ms: Option<f64>,
     total_ms: f64,
     retry_attempt: u32,
     visible: bool,
@@ -2868,32 +2834,46 @@ impl ConversationOpenTelemetry {
         const MAX_RETRY_ATTEMPT: u32 = 10_000;
         let valid_duration =
             |value: f64| value.is_finite() && (0.0..=MAX_DURATION_MS).contains(&value);
-        let (_, native_open_ms, init_received_ms, handler_ms) = self.phases.values();
-        let phase_order_valid = match &self.phases {
-            ConversationOpenPhases::Connected {
-                init_received_ms,
-                handler_ms,
-                ..
-            } => {
-                *init_received_ms <= self.total_ms
-                    && native_open_ms.is_none_or(|value| value <= *init_received_ms)
-                    && (*init_received_ms + *handler_ms - self.total_ms).abs() <= 0.2
+        let milestones = [
+            self.route_resolved_ms,
+            self.event_source_created_ms,
+            self.native_open_ms,
+            self.init_received_ms,
+            self.init_handled_ms,
+            self.first_paint_ms,
+        ];
+        let milestones_valid = milestones
+            .iter()
+            .flatten()
+            .all(|value| valid_duration(*value) && *value <= self.total_ms);
+        let ordered = milestones
+            .iter()
+            .flatten()
+            .copied()
+            .try_fold(0.0, |previous, value| (value >= previous).then_some(value))
+            .is_some();
+        let causal_prefix = (self.native_open_ms.is_none()
+            || self.event_source_created_ms.is_some())
+            && (self.init_received_ms.is_none() || self.event_source_created_ms.is_some())
+            && (self.init_handled_ms.is_none() || self.init_received_ms.is_some())
+            && (self.first_paint_ms.is_none() || self.init_handled_ms.is_some());
+        let connected_complete = match self.outcome {
+            ConversationOpenOutcome::Connected => {
+                self.event_source_created_ms.is_some()
+                    && self.init_received_ms.is_some()
+                    && self.init_handled_ms.is_some()
+                    && self.first_paint_ms == Some(self.total_ms)
             }
-            ConversationOpenPhases::Error {
-                init_received_ms, ..
+            ConversationOpenOutcome::Error | ConversationOpenOutcome::Canceled => {
+                self.first_paint_ms.is_none()
             }
-            | ConversationOpenPhases::Canceled {
-                init_received_ms, ..
-            } => init_received_ms.is_none_or(|init| {
-                init <= self.total_ms && native_open_ms.is_none_or(|native| native <= init)
-            }),
         };
-        native_open_ms.is_none_or(|value| valid_duration(value) && value <= self.total_ms)
-            && init_received_ms.is_none_or(valid_duration)
-            && handler_ms.is_none_or(valid_duration)
+        milestones_valid
+            && ordered
+            && causal_prefix
             && valid_duration(self.total_ms)
             && self.retry_attempt <= MAX_RETRY_ATTEMPT
-            && phase_order_valid
+            && connected_complete
     }
 }
 
@@ -2901,83 +2881,84 @@ impl ConversationOpenTelemetry {
 mod conversation_open_telemetry_tests {
     use super::ConversationOpenTelemetry;
 
-    #[test]
-    fn rejects_unknown_network_effective_types() {
-        let report = r#"{
-            "open_id":"550e8400-e29b-41d4-a716-446655440000",
-            "outcome":"connected",
-            "native_open_ms":1.0,
-            "init_received_ms":2.0,
-            "handler_ms":1.0,
-            "total_ms":3.0,
-            "retry_attempt":0,
-            "visible":true,
-            "effective_type":"content-bearing-value"
-        }"#;
-        assert!(serde_json::from_str::<ConversationOpenTelemetry>(report).is_err());
-    }
-
-    #[test]
-    fn connected_requires_completed_phase_timings() {
-        let report = serde_json::json!({
+    fn valid_report() -> serde_json::Value {
+        serde_json::json!({
             "open_id": "550e8400-e29b-41d4-a716-446655440000",
             "outcome": "connected",
-            "native_open_ms": 1.0,
-            "init_received_ms": null,
-            "handler_ms": null,
-            "total_ms": 3.0,
+            "route_resolved_ms": 1.0,
+            "event_source_created_ms": 2.0,
+            "native_open_ms": 3.0,
+            "init_received_ms": 4.0,
+            "init_handled_ms": 5.0,
+            "first_paint_ms": 6.0,
+            "total_ms": 6.0,
             "retry_attempt": 0,
             "visible": true,
             "effective_type": "4g"
-        });
+        })
+    }
+
+    #[test]
+    fn accepts_an_ordered_content_free_readiness_timeline() {
+        assert!(
+            serde_json::from_value::<ConversationOpenTelemetry>(valid_report())
+                .unwrap()
+                .has_valid_bounds()
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_network_effective_types() {
+        let mut report = valid_report();
+        report["effective_type"] = serde_json::json!("content-bearing-value");
         assert!(serde_json::from_value::<ConversationOpenTelemetry>(report).is_err());
     }
 
     #[test]
-    fn rejects_contradictory_phase_timings() {
-        let base = serde_json::json!({
-            "open_id": "550e8400-e29b-41d4-a716-446655440000",
-            "outcome": "connected",
-            "native_open_ms": 1.0,
-            "init_received_ms": 2.0,
-            "handler_ms": 1.0,
-            "total_ms": 3.0,
-            "retry_attempt": 0,
-            "visible": true,
-            "effective_type": "4g"
-        });
-        let mut impossible_total = base.clone();
-        impossible_total["total_ms"] = serde_json::json!(1.0);
-        assert!(
-            !serde_json::from_value::<ConversationOpenTelemetry>(impossible_total)
-                .unwrap()
-                .has_valid_bounds()
-        );
-
-        let mut error_with_handler = base;
-        error_with_handler["outcome"] = serde_json::json!("error");
-        assert!(serde_json::from_value::<ConversationOpenTelemetry>(error_with_handler).is_err());
+    fn rejects_content_bearing_or_identity_fields() {
+        for field in ["conversation_id", "slug", "title", "message"] {
+            let mut report = valid_report();
+            report[field] = serde_json::json!("must-not-be-accepted");
+            assert!(serde_json::from_value::<ConversationOpenTelemetry>(report).is_err());
+        }
     }
 
     #[test]
-    fn rejects_out_of_bounds_numbers() {
-        let valid = serde_json::json!({
-            "open_id": "550e8400-e29b-41d4-a716-446655440000",
-            "outcome": "connected",
-            "native_open_ms": 1.0,
-            "init_received_ms": 2.0,
-            "handler_ms": 1.0,
-            "total_ms": 3.0,
-            "retry_attempt": 0,
-            "visible": true,
-            "effective_type": "4g"
-        });
+    fn connected_requires_first_paint_at_total() {
+        let mut report = valid_report();
+        report["first_paint_ms"] = serde_json::Value::Null;
+        assert!(!serde_json::from_value::<ConversationOpenTelemetry>(report)
+            .unwrap()
+            .has_valid_bounds());
+    }
+
+    #[test]
+    fn rejects_impossible_unfinished_milestone_prefixes() {
+        for (missing, present) in [
+            ("event_source_created_ms", "native_open_ms"),
+            ("event_source_created_ms", "init_received_ms"),
+            ("init_received_ms", "init_handled_ms"),
+        ] {
+            let mut report = valid_report();
+            report["outcome"] = serde_json::json!("error");
+            report["first_paint_ms"] = serde_json::Value::Null;
+            report[missing] = serde_json::Value::Null;
+            report[present] = serde_json::json!(5.0);
+            assert!(!serde_json::from_value::<ConversationOpenTelemetry>(report)
+                .unwrap()
+                .has_valid_bounds());
+        }
+    }
+
+    #[test]
+    fn rejects_out_of_order_or_out_of_bounds_milestones() {
         for (field, value) in [
+            ("route_resolved_ms", serde_json::json!(4.5)),
             ("total_ms", serde_json::json!(-1)),
             ("total_ms", serde_json::json!(300_001)),
             ("retry_attempt", serde_json::json!(10_001)),
         ] {
-            let mut report = valid.clone();
+            let mut report = valid_report();
             report[field] = value;
             assert!(!serde_json::from_value::<ConversationOpenTelemetry>(report)
                 .unwrap()
@@ -2990,15 +2971,17 @@ async fn report_conversation_open(Json(report): Json<ConversationOpenTelemetry>)
     if !report.has_valid_bounds() {
         return StatusCode::BAD_REQUEST;
     }
-    let (outcome, native_open_ms, init_received_ms, handler_ms) = report.phases.values();
     let span = tracing::info_span!(
         target: "phoenix_ide::otel",
         "browser.conversation_open",
         "open.id" = %report.open_id,
-        "browser.outcome" = outcome,
-        "browser.native_open_ms" = native_open_ms,
-        "browser.init_received_ms" = init_received_ms,
-        "browser.handler_ms" = handler_ms,
+        "browser.outcome" = report.outcome.as_str(),
+        "browser.route_resolved_ms" = report.route_resolved_ms,
+        "browser.event_source_created_ms" = report.event_source_created_ms,
+        "browser.native_open_ms" = report.native_open_ms,
+        "browser.init_received_ms" = report.init_received_ms,
+        "browser.init_handled_ms" = report.init_handled_ms,
+        "browser.first_paint_ms" = report.first_paint_ms,
         "browser.total_ms" = report.total_ms,
         "browser.retry_attempt" = report.retry_attempt,
         "browser.visible" = report.visible,

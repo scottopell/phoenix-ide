@@ -6,22 +6,28 @@ describe('ConversationOpenMeasurement', () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(null, { status: 204 })));
   });
 
-  it('separates native open, init transit, and handler duration exactly', () => {
-    const times = [100, 125, 144.25, 219.25];
+  it('reports cumulative route-to-paint milestones exactly', () => {
+    const times = [100, 110, 120, 125, 144.25, 160, 219.25];
     const measurement = new ConversationOpenMeasurement('open-1', 2, () => times.shift()!);
+    measurement.routeResolved();
+    measurement.eventSourceCreated();
     measurement.nativeOpen();
     measurement.initReceived();
+    measurement.initHandled();
 
-    expect(measurement.connected()).toMatchObject({
+    expect(measurement.firstPaint()).toMatchObject({
       open_id: 'open-1',
       outcome: 'connected',
+      route_resolved_ms: 10,
+      event_source_created_ms: 20,
       native_open_ms: 25,
       init_received_ms: 44.3,
-      handler_ms: 75,
+      init_handled_ms: 60,
+      first_paint_ms: 119.3,
       total_ms: 119.3,
       retry_attempt: 2,
     });
-    expect(measurement.connected()).toBeNull();
+    expect(measurement.firstPaint()).toBeNull();
   });
 
   it('reports an error before native open without fabricating phase durations', () => {
@@ -31,7 +37,8 @@ describe('ConversationOpenMeasurement', () => {
       outcome: 'error',
       native_open_ms: null,
       init_received_ms: null,
-      handler_ms: null,
+      init_handled_ms: null,
+      first_paint_ms: null,
       total_ms: 70,
     });
   });
@@ -53,31 +60,70 @@ describe('ConversationOpenMeasurement', () => {
     expect(measurement.error()).toBeNull();
   });
 
-  it('preserves additive phases when the shared timeline saturates', () => {
-    const times = [0, 299_999, 400_000];
+  it('bounds the cumulative timeline and retry count', () => {
+    const times = [0, 299_999, 299_999, 299_999, 400_000];
     const measurement = new ConversationOpenMeasurement(
       'open-saturated',
       20_000,
       () => times.shift()!,
     );
+    measurement.eventSourceCreated();
     measurement.initReceived();
+    measurement.initHandled();
 
-    expect(measurement.connected()).toMatchObject({
+    expect(measurement.firstPaint()).toMatchObject({
       init_received_ms: 299_999,
-      handler_ms: 1,
+      init_handled_ms: 299_999,
+      first_paint_ms: 300_000,
       total_ms: 300_000,
       retry_attempt: 10_000,
     });
+  });
+
+  it('marks a timeline non-visible after any hidden interval', () => {
+    const visibility = vi.spyOn(document, 'visibilityState', 'get');
+    visibility.mockReturnValue('visible');
+    const times = [0, 1, 2, 3, 4];
+    const measurement = new ConversationOpenMeasurement('open-hidden', 0, () => times.shift()!);
+    measurement.eventSourceCreated();
+    measurement.initReceived();
+    visibility.mockReturnValue('hidden');
+    measurement.documentHidden();
+    visibility.mockReturnValue('visible');
+    measurement.initHandled();
+
+    expect(measurement.firstPaint()).toMatchObject({
+      outcome: 'connected',
+      visible: false,
+    });
+  });
+
+  it('makes invalid connected payloads unrepresentable', () => {
+    // @ts-expect-error connected reports structurally require all completion milestones
+    const invalid: import('./conversationOpenTelemetry').ConversationOpenTelemetryPayload = {
+      open_id: 'invalid',
+      outcome: 'connected',
+      route_resolved_ms: null,
+      native_open_ms: null,
+      total_ms: 1,
+      retry_attempt: 0,
+      visible: true,
+      effective_type: null,
+    };
+    expect(invalid.outcome).toBe('connected');
   });
 
   it('posts a bounded content-free payload with keepalive', () => {
     const payload = {
       open_id: 'open-3',
       outcome: 'connected' as const,
+      route_resolved_ms: 5,
+      event_source_created_ms: 10,
       native_open_ms: 20,
       init_received_ms: 40,
-      handler_ms: 1,
-      total_ms: 41,
+      init_handled_ms: 41,
+      first_paint_ms: 45,
+      total_ms: 45,
       retry_attempt: 0,
       visible: true,
       effective_type: '4g',

@@ -19,6 +19,7 @@ import type { SSEAction } from '../conversation/atom';
 import { ConversationStore } from '../conversation/ConversationStore';
 import { clearCodexQuota, getCodexQuotaSnapshot } from '../codexQuota';
 import type { SseWireEvent } from '../generated/sse';
+import { ConversationOpenMeasurement } from './conversationOpenTelemetry';
 
 const WIRE_EVENT_TYPES: Record<SseWireEvent['type'], true> = {
   init: true,
@@ -225,23 +226,80 @@ describe('useConnection epoch stamping (task 08683)', () => {
     expect(init?.type === 'sse_init' ? init.payload.transcriptCoverage : undefined).toBe('complete');
   });
 
-  it('reports one connected measurement correlated to the stream open ID', () => {
+  it('uses the route-owned open ID and waits for first paint before reporting once', () => {
+    const clock = vi.spyOn(performance, 'now');
+    clock.mockReturnValueOnce(0);
+    clock.mockReturnValue(10);
     const dispatch = vi.fn<(a: SSEAction) => void>();
+    const initialMeasurement = new ConversationOpenMeasurement('route-open-id', 0);
+    initialMeasurement.routeResolved();
+    let reportFirstPaint: (() => void) | undefined;
 
-    renderHook(() => useConnection({ conversationId: 'conv-A', dispatch }));
+    renderHook(() => useConnection({
+      conversationId: 'conv-A',
+      dispatch,
+      initialOpenMeasurement: initialMeasurement,
+      onValidatedInit: (_payload, report) => {
+        clock.mockReturnValue(20);
+        reportFirstPaint = report;
+        clock.mockReturnValue(30);
+      },
+    }));
     const stream = FakeEventSource.instances[0]!;
-    const openId = new URL(stream.url, 'http://localhost').searchParams.get('open_id');
+
+    expect(new URL(stream.url, 'http://localhost').searchParams.get('open_id')).toBe(
+      'route-open-id',
+    );
+    act(() => stream.emit('init', makeInitPayload('conv-A', 'slug-A')));
+    expect(reportFirstPaint).toEqual(expect.any(Function));
+    expect(fetch).not.toHaveBeenCalled();
 
     act(() => {
-      stream.emit('init', makeInitPayload('conv-A', 'slug-A'));
-      stream.emit('init', makeInitPayload('conv-A', 'slug-A'));
+      reportFirstPaint?.();
+      reportFirstPaint?.();
     });
 
     expect(fetch).toHaveBeenCalledTimes(1);
     const body = JSON.parse(
       (vi.mocked(fetch).mock.calls[0]![1] as RequestInit).body as string,
-    ) as { open_id: string; outcome: string };
-    expect(body).toMatchObject({ open_id: openId, outcome: 'connected' });
+    ) as {
+      open_id: string;
+      outcome: string;
+      route_resolved_ms: number | null;
+      init_handled_ms: number;
+    };
+    expect(body).toMatchObject({
+      open_id: 'route-open-id',
+      outcome: 'connected',
+      route_resolved_ms: expect.any(Number),
+      init_handled_ms: 30,
+    });
+  });
+
+  it('reports cancellation rather than connection when teardown wins before first paint', () => {
+    vi.useFakeTimers();
+    const dispatch = vi.fn<(a: SSEAction) => void>();
+    let reportFirstPaint: (() => void) | undefined;
+    const { unmount } = renderHook(() => useConnection({
+      conversationId: 'conv-A',
+      dispatch,
+      onValidatedInit: (_payload, report) => {
+        reportFirstPaint = report;
+      },
+    }));
+
+    act(() => FakeEventSource.instances[0]!.emit('init', makeInitPayload('conv-A', 'slug-A')));
+    unmount();
+    act(() => {
+      vi.advanceTimersByTime(0);
+      reportFirstPaint?.();
+    });
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+    const body = JSON.parse(
+      (vi.mocked(fetch).mock.calls[0]![1] as RequestInit).body as string,
+    ) as { outcome: string; first_paint_ms: number | null };
+    expect(body).toMatchObject({ outcome: 'canceled', first_paint_ms: null });
   });
 
   it('reports an unfinished open as canceled when the conversation changes', () => {
@@ -270,9 +328,12 @@ describe('useConnection epoch stamping (task 08683)', () => {
     expect(reports).toContainEqual({
       open_id: firstOpenId,
       outcome: 'canceled',
+      route_resolved_ms: null,
+      event_source_created_ms: expect.any(Number),
       native_open_ms: null,
       init_received_ms: null,
-      handler_ms: null,
+      init_handled_ms: null,
+      first_paint_ms: null,
       total_ms: expect.any(Number),
       retry_attempt: 0,
       visible: expect.any(Boolean),
