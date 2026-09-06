@@ -175,6 +175,7 @@ final class ConversationSession {
         let configurationIdentity: APIConfigurationIdentity
         let revision: Int
         let syncedAt: Date
+        let segmentOrdinal: Int64?
     }
 
     /// Bump when Snapshot's persisted shape changes incompatibly (DiskStore
@@ -194,11 +195,15 @@ final class ConversationSession {
         /// authority metadata; rendering remains valid, but authoritative
         /// replay stays locked until a current authoritative init rewrites it.
         var authoritative: PersistedSnapshotAuthority?
+        // owned: pre-feature snapshots had no aggregate segment ordinal; nil
+        // means multi-member ordering is unproven and must not be fabricated.
+        var segmentOrdinal: Int64? = nil
     }
 
     private var transcriptGeneration: Int64?
     private(set) var snapshotSyncedAt: Date?
     private var pendingAuthoritativeSnapshot: PersistedSnapshotAuthority?
+    private var segmentOrdinal: Int64?
 
     init(
         conversationId: String,
@@ -257,12 +262,14 @@ final class ConversationSession {
             lastSequenceId = snap.lastSequenceId
             transcriptGeneration = snap.transcriptGeneration
             snapshotSyncedAt = snap.syncedAt
+            segmentOrdinal = snap.segmentOrdinal
             hydrationAuthority = .current(AuthoritativeSnapshotReceipt(
                 conversationId: receiptIdentity.conversationId,
                 aggregateId: receiptIdentity.aggregateId,
                 configurationIdentity: api.configurationIdentity,
                 revision: 0,
-                syncedAt: authority.syncedAt))
+                syncedAt: authority.syncedAt,
+                segmentOrdinal: snap.segmentOrdinal))
             replayFromPendingAnchor = true
             presentationMode = persistedConversation.presentation_mode
             // Busy flag follows the cached mode the same way live
@@ -512,7 +519,8 @@ final class ConversationSession {
             lastSequenceId: lastSequenceId,
             transcriptGeneration: transcriptGeneration,
             syncedAt: syncedAt,
-            authoritative: authority)
+            authoritative: authority,
+            segmentOrdinal: segmentOrdinal)
     }
 
     private func persistSnapshot(
@@ -569,7 +577,8 @@ final class ConversationSession {
                     aggregateId: receiptIdentity.aggregateId,
                     configurationIdentity: authority.configurationIdentity,
                     revision: revision,
-                    syncedAt: authority.syncedAt))
+                    syncedAt: authority.syncedAt,
+                    segmentOrdinal: snapshot.segmentOrdinal))
             }
             if snapshotNeedsOutboxReconciliation {
                 snapshotNeedsOutboxReconciliation = false
@@ -978,6 +987,57 @@ final class ConversationSession {
                 outbox.surfaceStaleAcceptedEntries()
             }
         }
+    }
+
+    func persistAuthoritativeRESTSegment(
+        transcriptRowId: String,
+        aggregateId: String,
+        slug: String?,
+        title: String?,
+        updatedAt: String,
+        archived: Bool,
+        presentationMode: String,
+        requiresAction: Bool,
+        segmentOrdinal: Int64,
+        messages incomingMessages: [Message]
+    ) {
+        let projectedConversation = Conversation(
+            id: transcriptRowId,
+            product_conversation_id: aggregateId,
+            slug: slug,
+            title: title,
+            model: conversation?.model,
+            cwd: conversation?.cwd,
+            created_at: conversation?.created_at,
+            updated_at: updatedAt,
+            message_count: incomingMessages.count,
+            state: conversation?.state,
+            state_updated_at: conversation?.state_updated_at,
+            branch_name: conversation?.branch_name,
+            task_title: conversation?.task_title,
+            archived: archived,
+            project_name: conversation?.project_name,
+            conv_mode_label: conversation?.conv_mode_label,
+            presentation_mode: presentationMode,
+            requires_action: requiresAction,
+            transcript_generation: conversation?.transcript_generation,
+            runtime_role: conversation?.runtime_role)
+        guard matchesSessionBinding(projectedConversation), !isHardDeleted else { return }
+        conversation = projectedConversation
+        self.segmentOrdinal = segmentOrdinal
+        let byId = Dictionary(
+            (messages + incomingMessages).map { ($0.message_id, $0) },
+            uniquingKeysWith: { _, newer in newer })
+        messages = byId.values.sorted {
+            if $0.sequence_id == $1.sequence_id { return $0.message_id < $1.message_id }
+            return $0.sequence_id < $1.sequence_id
+        }
+        durableMessageSequenceCeiling = max(
+            durableMessageSequenceCeiling,
+            incomingMessages.map(\.sequence_id).max() ?? 0)
+        lastSequenceId = max(lastSequenceId, durableMessageSequenceCeiling)
+        onSessionEvent?(.messagesChanged)
+        persistSnapshot(authoritative: true)
     }
 
     // MARK: - Reducer
