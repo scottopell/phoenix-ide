@@ -2413,7 +2413,9 @@ final class AppModelProductConversationTests: XCTestCase {
     }
 
     func testFirstSuccessorInitPreservesCanonicalAggregateProjectionMetadata() async throws {
-        let model = makeModel()
+        let baseDirectory = isolatedDiskDirectory()
+        let store = DiskConversationPersistenceStore(baseDirectory: baseDirectory)
+        let model = makeModel(conversationPersistenceStore: store)
         let root = conversation(
             id: "row-1", aggregateId: "pc-1", slug: "canonical-slug", title: "Canonical title")
         var canonical = root
@@ -2431,6 +2433,8 @@ final class AppModelProductConversationTests: XCTestCase {
             pendingEvents: [], pendingTruncated: false)))
 
         let merged = try XCTUnwrap(model.listStore.conversations.first)
+        let persisted = await session.flushSnapshotPersistence()
+        XCTAssertTrue(persisted)
         XCTAssertEqual(merged.id, "row-1")
         XCTAssertEqual(merged.slug, "canonical-slug")
         XCTAssertEqual(merged.title, "Canonical title")
@@ -2438,6 +2442,64 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertEqual(merged.archived, false)
         XCTAssertEqual(merged.state, successor.state)
         XCTAssertEqual(merged.transcriptRowIdentity, "row-1")
+
+        let restored = ConversationListStore(
+            hasCachedSnapshot: { $0 == "row-2" },
+            context: store.listPersistenceContext!)
+        XCTAssertEqual(
+            restored.cachedNavigationTranscriptRowId(
+                forAggregateId: "pc-1",
+                latestTranscriptRowId: "row-2"),
+            "row-2")
+    }
+
+    func testListSuccessorInvalidatesStoppedSingleSegmentCloseCardinality() async throws {
+        let probe = SendProbe()
+        let host = "list-successor.invalid"
+        let successorList = ProductConversationListResponse(product_conversations: [
+            .init(
+                product_conversation_id: "pc-1",
+                canonical_route: "/product-conversations/pc-1",
+                canonical_root: .init(transcript_row_id: "row-1", slug: "root", title: "Root"),
+                ordinary_lifecycle: .open,
+                latest_transcript_row_id: "row-2",
+                updated_at: "2025-01-02T04:04:05Z",
+                presentation: .state(displayName: "Root", presentationMode: "working"))
+        ])
+        let registration = TestURLProtocol.install(host: host) { request in
+            probe.record(request)
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: nil,
+                headerFields: ["Content-Type": "application/json"])!
+            return (response, try! JSONEncoder().encode(successorList))
+        }
+        defer { TestURLProtocol.uninstall(host: host, owner: registration) }
+        let model = makeModel()
+        model.replaceAPIForTesting(PhoenixAPI(
+            baseURL: URL(string: "https://\(host)")!, password: nil,
+            allowSelfSigned: false,
+            configurationIdentity: .init(
+                serverURL: "https://\(host)", credentialGeneration: host,
+                trustSelfSigned: false),
+            session: URLSession(configuration: {
+                let config = URLSessionConfiguration.ephemeral
+                config.protocolClasses = [TestURLProtocol.self]
+                return config
+            }()))!)
+        let detail = model.productConversationDetailModel(for: "pc-1")
+        detail.applyForTesting(testSingleSegmentProductConversationSnapshot())
+        detail.stop()
+
+        await model.refreshList()
+        XCTAssertNil(model.listStore.lastError)
+        let known = conversation(id: "row-1", aggregateId: "pc-1")
+
+        XCTAssertEqual(
+            model.closeUnavailableExplanation(for: known),
+            "Open the conversation before closing it.")
+        let archived = await model.archive(conversationId: "row-1")
+        XCTAssertFalse(archived)
+        XCTAssertTrue(probe.archivePostPaths.isEmpty)
     }
 
     func testCloseAvailabilityRequiresKnownProductConversationCardinality() {

@@ -71,10 +71,8 @@ final class ConversationSession {
         acceptsConversationActions && typedState.acceptsChatMessage
     }
     var acceptsConversationActions: Bool {
-        guard case .legacyReadOnly = hydrationAuthority else {
-            return !isHardDeleted && !isHardDeletePending && !isArchiving && conversation?.archived != true
-        }
-        return false
+        guard case .current = hydrationAuthority else { return false }
+        return !isHardDeleted && !isHardDeletePending && !isArchiving && conversation?.archived != true
     }
     /// tool_use_id -> the invoking block's tool name + input. Lets a tool
     /// result message (which carries only `tool_use_id`) find its native

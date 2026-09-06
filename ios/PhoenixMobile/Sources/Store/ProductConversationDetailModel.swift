@@ -249,6 +249,10 @@ final class ProductConversationDetailModel {
         lastDelegatedConnection = .idle
     }
 
+    func invalidateCardinalityForListSuccessor() {
+        snapshot = nil
+    }
+
     func invalidateConfiguration() {
         invalidate(clearError: true)
         onConfigurationInvalidated(self)
