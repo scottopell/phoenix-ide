@@ -84,12 +84,17 @@ struct HardDeleteCleanupContext: Sendable {
     let fenceState: HardDeleteFenceState
 }
 
+struct PersistedOutboxOwner: Hashable {
+    let transcriptRowId: String
+    let aggregateAuthority: String?
+}
+
 @MainActor
 protocol ConversationPersistenceStore {
     var listPersistenceContext: VersionedDiskContext? { get }
     var persistenceScope: PersistenceScopeIdentity? { get }
-    func pendingOutboxOwnerTranscriptRowIds(scope: PersistenceScopeIdentity) async -> Set<String>
-    func persistedOutboxOwnerTranscriptRowIdsSnapshot(scope: PersistenceScopeIdentity) -> Set<String>
+    func pendingOutboxOwners(scope: PersistenceScopeIdentity) async -> Set<PersistedOutboxOwner>
+    func persistedOutboxOwnersSnapshot(scope: PersistenceScopeIdentity) -> Set<PersistedOutboxOwner>
     func hasCachedSnapshot(conversationId: String) -> Bool
     func hasAuthoritativeCachedSnapshot(
         conversationId: String,
@@ -171,7 +176,7 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
         self.persistenceScope = nil
     }
 
-    func pendingOutboxOwnerTranscriptRowIds(scope: PersistenceScopeIdentity) async -> Set<String> {
+    func pendingOutboxOwners(scope: PersistenceScopeIdentity) async -> Set<PersistedOutboxOwner> {
         let schemaVersion = Outbox.schemaVersion
         let directory = directory
         return await Task.detached(priority: nil) {
@@ -195,7 +200,11 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
                         $0.status == .pending &&
                         !$0.acceptedByServer
                     }
-                    return hasVisiblePendingEntries ? conversationId : nil
+                    return hasVisiblePendingEntries
+                        ? PersistedOutboxOwner(
+                            transcriptRowId: conversationId,
+                            aggregateAuthority: envelope.aggregateAuthority)
+                        : nil
                 case .incompatible, .unreadable:
                     return nil
                 }
@@ -203,7 +212,7 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
         }.value
     }
 
-    func persistedOutboxOwnerTranscriptRowIdsSnapshot(scope: PersistenceScopeIdentity) -> Set<String> {
+    func persistedOutboxOwnersSnapshot(scope: PersistenceScopeIdentity) -> Set<PersistedOutboxOwner> {
         Set(DiskStore.names(in: directory, withPrefix: "outbox-").compactMap { name in
             guard name.hasPrefix("outbox-") else { return nil }
             let conversationId = String(name.dropFirst("outbox-".count))
@@ -221,7 +230,9 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
                 $0.isVisible &&
                 $0.status == .pending &&
                 !$0.acceptedByServer
-            } ? conversationId : nil
+            } ? PersistedOutboxOwner(
+                transcriptRowId: conversationId,
+                aggregateAuthority: envelope.aggregateAuthority) : nil
         })
     }
 
@@ -1025,9 +1036,10 @@ final class AppModel {
     }
 
     private func handleSessionConversationUpdate(_ conversation: Conversation, transcriptRowId: String) {
-        guard let aggregateIdentity = aggregateIdentity(forTranscriptRowId: transcriptRowId),
-              let existing = listStore.conversations.first(where: { $0.aggregateIdentity == aggregateIdentity })
-        else {
+        let aggregateIdentity = conversation.aggregateIdentity
+        guard let existing = listStore.conversations.first(where: {
+            $0.aggregateIdentity == aggregateIdentity
+        }) else {
             listStore.upsert(conversation)
             return
         }
@@ -1705,12 +1717,13 @@ final class AppModel {
         else { return [] }
         var drainedConversationIds: [String] = []
         let currentAPIIdentity = api.configurationIdentity
-        let candidateConversationIds = await conversationPersistenceStore.pendingOutboxOwnerTranscriptRowIds(
+        let candidateOwners = await conversationPersistenceStore.pendingOutboxOwners(
             scope: api.configurationIdentity.persistenceScope)
         guard persistedOutboxDrainAuthorityGeneration == authorityGeneration,
               currentAPIIdentity == apiIdentity
         else { return drainedConversationIds }
-        for conversationId in candidateConversationIds.sorted() {
+        for owner in candidateOwners.sorted(by: { $0.transcriptRowId < $1.transcriptRowId }) {
+            let conversationId = owner.transcriptRowId
             guard persistedOutboxDrainAuthorityGeneration == authorityGeneration,
                   currentAPIIdentity == apiIdentity
             else { return drainedConversationIds }
@@ -1730,7 +1743,7 @@ final class AppModel {
                     connectivity: connectivity,
                     outboxPersistence: conversationPersistenceStore.outboxPersistence(
                     conversationId: conversationId,
-                    aggregateAuthority: aggregateIdentity(forTranscriptRowId: conversationId),
+                    aggregateAuthority: owner.aggregateAuthority,
                     scope: api.configurationIdentity.persistenceScope),
                     snapshotPersistence: conversationPersistenceStore.snapshotPersistence(conversationId: conversationId),
                     retryTiming: LiveSessionTiming(),
@@ -1739,7 +1752,7 @@ final class AppModel {
                         self?.persistedOutboxHydrated == true
                     },
                     legacySnapshotPersistenceScope: legacySnapshotPersistenceScope,
-                    aggregateAuthority: aggregateIdentity(forTranscriptRowId: conversationId))
+                    aggregateAuthority: owner.aggregateAuthority)
                 drainSessions[conversationId] = drainSession
             }
             drainedConversationIds.append(conversationId)
