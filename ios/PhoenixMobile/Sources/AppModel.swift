@@ -89,6 +89,15 @@ struct PersistedOutboxOwner: Hashable {
     let aggregateAuthority: String?
 }
 
+struct PersistedMemberDiscovery: Equatable, Sendable {
+    var currentAuthorityMemberIds: Set<String>
+    var persistedOutboxOwnerIds: Set<String>
+
+    static let empty = PersistedMemberDiscovery(
+        currentAuthorityMemberIds: [],
+        persistedOutboxOwnerIds: [])
+}
+
 @MainActor
 protocol ConversationPersistenceStore {
     var listPersistenceContext: VersionedDiskContext? { get }
@@ -112,6 +121,10 @@ protocol ConversationPersistenceStore {
         aggregateId: String,
         scope: PersistenceScopeIdentity
     ) -> Set<String>
+    func persistedMemberDiscovery(
+        aggregateId: String,
+        scope: PersistenceScopeIdentity
+    ) async -> PersistedMemberDiscovery
     func persistedConversationIds(
         aggregateId: String,
         scope: PersistenceScopeIdentity,
@@ -137,6 +150,19 @@ protocol ConversationPersistenceStore {
 }
 
 extension ConversationPersistenceStore {
+    func persistedMemberDiscovery(
+        aggregateId: String,
+        scope: PersistenceScopeIdentity
+    ) async -> PersistedMemberDiscovery {
+        let members = persistedConversationIds(aggregateId: aggregateId, scope: scope)
+        let outboxOwners = await pendingOutboxOwners(scope: scope)
+        return PersistedMemberDiscovery(
+            currentAuthorityMemberIds: members,
+            persistedOutboxOwnerIds: Set(outboxOwners.compactMap {
+                $0.aggregateAuthority == aggregateId ? $0.transcriptRowId : nil
+            }))
+    }
+
     func persistedConversationIds(
         aggregateId: String,
         scope: PersistenceScopeIdentity,
@@ -329,6 +355,54 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
     func snapshotPersistence(conversationId: String) -> VersionedDiskWriter {
         let destination = directory.appendingPathComponent("conv-\(conversationId)").appendingPathExtension("json")
         return context.writer(destinationURL: destination, version: ConversationSession.snapshotSchemaVersion)
+    }
+
+    func persistedMemberDiscovery(
+        aggregateId: String,
+        scope: PersistenceScopeIdentity
+    ) async -> PersistedMemberDiscovery {
+        let schemaVersion = ConversationSession.snapshotSchemaVersion
+        let outboxSchemaVersion = Outbox.schemaVersion
+        let directory = directory
+        return await Task.detached(priority: nil) {
+            let snapshotIds = Set(DiskStore.names(in: directory, withPrefix: "conv-").compactMap { name -> String? in
+                guard name.hasPrefix("conv-") else { return nil }
+                let conversationId = String(name.dropFirst("conv-".count))
+                let source = directory.appendingPathComponent(name).appendingPathExtension("json")
+                guard !conversationId.isEmpty,
+                      case .value(let snapshot) = DiskStore.loadVersionedResult(
+                        ConversationSession.PersistedSnapshot.self,
+                        source: source,
+                        version: schemaVersion),
+                      snapshot.conversation?.product_conversation_id == aggregateId,
+                      snapshot.conversation?.id == conversationId,
+                      snapshot.syncedAt != nil,
+                      snapshot.authoritative?.configurationIdentity.persistenceScope == scope,
+                      snapshot.authoritative?.aggregateAuthority == aggregateId
+                else { return nil }
+                return conversationId
+            })
+            let outboxIds = Set(DiskStore.names(in: directory, withPrefix: "outbox-").compactMap { name -> String? in
+                guard name.hasPrefix("outbox-") else { return nil }
+                let conversationId = String(name.dropFirst("outbox-".count))
+                let source = directory.appendingPathComponent(name).appendingPathExtension("json")
+                guard case .value(let envelope) = DiskStore.loadVersionedResult(
+                    PersistedOutboxEnvelope.self,
+                    source: source,
+                    version: outboxSchemaVersion),
+                    envelope.scope == scope,
+                    envelope.aggregateAuthority == aggregateId,
+                    envelope.entries.contains(where: {
+                        $0.conversationId == conversationId && $0.isVisible
+                            && $0.status == .pending && !$0.acceptedByServer
+                    })
+                else { return nil }
+                return conversationId
+            })
+            return PersistedMemberDiscovery(
+                currentAuthorityMemberIds: snapshotIds,
+                persistedOutboxOwnerIds: outboxIds)
+        }.value
     }
 
     func persistedConversationIds(
@@ -1459,11 +1533,18 @@ final class AppModel {
                     aggregateAuthority: aggregateId,
                     legacyScope: self.legacySnapshotPersistenceScope)
             },
-            provenCurrentAuthorityMemberIds: { [weak self] in
-                guard let self, let api = self.api else { return [] }
-                return self.conversationPersistenceStore.persistedConversationIds(
+            discoverPersistedMembers: { [weak self] in
+                guard let self, let api = self.api else { return .empty }
+                let identity = api.configurationIdentity
+                let generation = self.apiGeneration
+                let discovery = await self.conversationPersistenceStore.persistedMemberDiscovery(
                     aggregateId: aggregateId,
-                    scope: api.configurationIdentity.persistenceScope)
+                    scope: identity.persistenceScope)
+                guard !Task.isCancelled,
+                      self.apiGeneration == generation,
+                      self.api?.configurationIdentity == identity
+                else { return .empty }
+                return discovery
             },
             handleDefinitiveNotFound: { [weak self] transcriptRowId, segmentTranscriptRowIds in
                 await self?.handleAggregateHardDeleted(

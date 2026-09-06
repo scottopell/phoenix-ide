@@ -176,6 +176,7 @@ final class ConversationSession {
         let revision: Int
         let syncedAt: Date
         let segmentOrdinal: Int64?
+        let handoff: ProductConversationHandoff?
     }
 
     /// Bump when Snapshot's persisted shape changes incompatibly (DiskStore
@@ -198,12 +199,15 @@ final class ConversationSession {
         // owned: pre-feature snapshots had no aggregate segment ordinal; nil
         // means multi-member ordering is unproven and must not be fabricated.
         var segmentOrdinal: Int64? = nil
+        // owned: pre-feature snapshots had no ProductConversation handoff.
+        var handoff: ProductConversationHandoff? = nil
     }
 
     private var transcriptGeneration: Int64?
     private(set) var snapshotSyncedAt: Date?
     private var pendingAuthoritativeSnapshot: PersistedSnapshotAuthority?
     private var segmentOrdinal: Int64?
+    private(set) var productConversationHandoff: ProductConversationHandoff?
 
     init(
         conversationId: String,
@@ -263,13 +267,15 @@ final class ConversationSession {
             transcriptGeneration = snap.transcriptGeneration
             snapshotSyncedAt = snap.syncedAt
             segmentOrdinal = snap.segmentOrdinal
+            productConversationHandoff = snap.handoff
             hydrationAuthority = .current(AuthoritativeSnapshotReceipt(
                 conversationId: receiptIdentity.conversationId,
                 aggregateId: receiptIdentity.aggregateId,
                 configurationIdentity: api.configurationIdentity,
                 revision: 0,
                 syncedAt: authority.syncedAt,
-                segmentOrdinal: snap.segmentOrdinal))
+                segmentOrdinal: snap.segmentOrdinal,
+                handoff: snap.handoff))
             replayFromPendingAnchor = true
             presentationMode = persistedConversation.presentation_mode
             // Busy flag follows the cached mode the same way live
@@ -298,6 +304,7 @@ final class ConversationSession {
             transcriptGeneration = snap.transcriptGeneration
             snapshotSyncedAt = snap.syncedAt
             presentationMode = persistedConversation.presentation_mode
+            productConversationHandoff = snap.handoff
             agentWorking = presentationMode == "working"
             rebuildToolUseIndex()
             hydrationAuthority = .legacyReadOnly(snap.authoritative)
@@ -520,7 +527,8 @@ final class ConversationSession {
             transcriptGeneration: transcriptGeneration,
             syncedAt: syncedAt,
             authoritative: authority,
-            segmentOrdinal: segmentOrdinal)
+            segmentOrdinal: segmentOrdinal,
+            handoff: productConversationHandoff)
     }
 
     private func persistSnapshot(
@@ -578,7 +586,8 @@ final class ConversationSession {
                     configurationIdentity: authority.configurationIdentity,
                     revision: revision,
                     syncedAt: authority.syncedAt,
-                    segmentOrdinal: snapshot.segmentOrdinal))
+                    segmentOrdinal: snapshot.segmentOrdinal,
+                    handoff: snapshot.handoff))
             }
             if snapshotNeedsOutboxReconciliation {
                 snapshotNeedsOutboxReconciliation = false
@@ -999,13 +1008,15 @@ final class ConversationSession {
         presentationMode: String,
         requiresAction: Bool,
         segmentOrdinal: Int64,
+        handoff: ProductConversationHandoff? = nil,
+        replacingMessages: Bool = false,
         messages incomingMessages: [Message]
     ) {
         let projectedConversation = Conversation(
             id: transcriptRowId,
             product_conversation_id: aggregateId,
-            slug: slug,
-            title: title,
+            slug: slug ?? conversation?.slug,
+            title: title ?? conversation?.title,
             model: conversation?.model,
             cwd: conversation?.cwd,
             created_at: conversation?.created_at,
@@ -1025,17 +1036,17 @@ final class ConversationSession {
         guard matchesSessionBinding(projectedConversation), !isHardDeleted else { return }
         conversation = projectedConversation
         self.segmentOrdinal = segmentOrdinal
+        productConversationHandoff = handoff
+        let cachedMessages = replacingMessages ? [] : messages
         let byId = Dictionary(
-            (messages + incomingMessages).map { ($0.message_id, $0) },
+            (cachedMessages + incomingMessages).map { ($0.message_id, $0) },
             uniquingKeysWith: { _, newer in newer })
         messages = byId.values.sorted {
             if $0.sequence_id == $1.sequence_id { return $0.message_id < $1.message_id }
             return $0.sequence_id < $1.sequence_id
         }
-        durableMessageSequenceCeiling = max(
-            durableMessageSequenceCeiling,
-            incomingMessages.map(\.sequence_id).max() ?? 0)
-        lastSequenceId = max(lastSequenceId, durableMessageSequenceCeiling)
+        durableMessageSequenceCeiling = messages.map(\.sequence_id).max() ?? 0
+        lastSequenceId = durableMessageSequenceCeiling
         onSessionEvent?(.messagesChanged)
         persistSnapshot(authoritative: true)
     }
