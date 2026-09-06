@@ -629,11 +629,11 @@ final class ProductConversationDetailModelTests: XCTestCase {
             model.applyForTesting(self.snapshot())
             XCTAssertEqual(model.outboxProjections.count, 1)
             XCTAssertEqual(model.outboxProjections[0].transcriptRowId, "row-1")
-            XCTAssertEqual(registry.created, ["row-1", "row-2", "row-2"])
+            XCTAssertEqual(registry.created, ["row-1", "row-2", "row-2", "row-2"])
             _ = model.outboxProjections
             _ = model.transcriptItems
             _ = model.displayTitle
-            XCTAssertEqual(registry.created, ["row-1", "row-2", "row-2"])
+            XCTAssertEqual(registry.created, ["row-1", "row-2", "row-2", "row-2"])
         }
     }
 
@@ -725,6 +725,207 @@ final class ProductConversationDetailModelTests: XCTestCase {
         await model.refresh(cause: .manual)
 
         XCTAssertNil(latest.lastErrorToast)
+    }
+
+    func testRESTPagesPersistIntoMemberOwnedSessionCachesWithExactAuthority() async throws {
+        let baseDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("phoenix-detail-rest-cache-tests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: baseDirectory) }
+        let api = makeAPI()
+        let connectivity = ConnectivityMonitor()
+        var sessions: [String: ConversationSession] = [:]
+        func makeMemberSession(_ id: String) -> ConversationSession {
+            ConversationSession(
+                conversationId: id,
+                api: api,
+                connectivity: connectivity,
+                outboxPersistence: OutboxPersistenceHandle.disk(
+                    conversationId: id,
+                    baseDirectory: baseDirectory),
+                snapshotPersistence: DiskStore.versionedContext(baseDirectory: baseDirectory).writer(
+                    destinationURL: baseDirectory
+                        .appendingPathComponent("PhoenixMobile", isDirectory: true)
+                        .appendingPathComponent("conv-\(id)")
+                        .appendingPathExtension("json"),
+                    version: ConversationSession.snapshotSchemaVersion),
+                retryTiming: LiveSessionTiming(),
+                staleCheckTiming: LiveSessionTiming(),
+                aggregateAuthority: "pc-1")
+        }
+        var newest = snapshot(before: "older", hasOlder: true)
+        newest.segments[0].messages = [
+            .init(
+                message_id: "m-newer", conversation_id: "row-1", sequence_id: 4,
+                message_type: "agent", content: .object(["text": .string("newer")]),
+                display_data: nil, created_at: "2025-01-02T03:04:05Z")
+        ]
+        var older = snapshot(before: nil, hasOlder: false)
+        older.segments[0].messages = [
+            .init(
+                message_id: "m-older", conversation_id: "row-1", sequence_id: 1,
+                message_type: "user", content: .object(["text": .string("older")]),
+                display_data: nil, created_at: "2025-01-01T03:04:05Z")
+        ]
+        older.segments[1].messages = [
+            .init(
+                message_id: "m-2", conversation_id: "row-2", sequence_id: 5,
+                message_type: "agent", content: .object(["text": .string("latest")]),
+                display_data: nil, created_at: "2025-01-03T03:04:05Z"),
+            .init(
+                message_id: "m-newer", conversation_id: "row-2", sequence_id: 4,
+                message_type: "agent", content: .object(["text": .string("boundary duplicate")]),
+                display_data: nil, created_at: "2025-01-02T03:04:05Z")
+        ]
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-1",
+            api: api,
+            connectivity: connectivity,
+            sessionProvider: { id, _ in
+                if let session = sessions[id] { return session }
+                let session = makeMemberSession(id)
+                sessions[id] = session
+                return session
+            },
+            existingSession: { sessions[$0] },
+            loadSnapshot: { _, before in before == nil ? newest : older })
+
+        await model.start()
+        await model.loadOlder()
+        for session in sessions.values {
+            let didPersist = await session.flushSnapshotPersistence()
+            XCTAssertTrue(didPersist)
+        }
+
+        let reloadedRow1 = makeMemberSession("row-1")
+        let reloadedRow2 = makeMemberSession("row-2")
+        XCTAssertEqual(reloadedRow1.messages.map(\.message_id), ["m-older", "m-newer"])
+        XCTAssertEqual(reloadedRow2.messages.map(\.message_id), ["m-2", "m-newer"])
+        XCTAssertEqual(
+            reloadedRow1.authoritativeSnapshotReceipt?.configurationIdentity,
+            api.configurationIdentity)
+        XCTAssertEqual(reloadedRow1.authoritativeSnapshotReceipt?.aggregateId, "pc-1")
+        XCTAssertEqual(reloadedRow2.authoritativeSnapshotReceipt?.aggregateId, "pc-1")
+        let offlineConnectivity = ConnectivityMonitor()
+        offlineConnectivity.setOnlineForTesting(false)
+        let foreignAggregateSession = ConversationSession(
+            conversationId: "foreign-row",
+            api: api,
+            connectivity: offlineConnectivity,
+            outboxPersistence: OutboxPersistenceHandle.disk(
+                conversationId: "foreign-row", baseDirectory: baseDirectory),
+            snapshotPersistence: DiskStore.versionedContext(baseDirectory: baseDirectory).writer(
+                destinationURL: baseDirectory
+                    .appendingPathComponent("PhoenixMobile", isDirectory: true)
+                    .appendingPathComponent("conv-foreign-row")
+                    .appendingPathExtension("json"),
+                version: ConversationSession.snapshotSchemaVersion),
+            retryTiming: LiveSessionTiming(),
+            staleCheckTiming: LiveSessionTiming(),
+            aggregateAuthority: "foreign-aggregate")
+        foreignAggregateSession.persistAuthoritativeRESTSegment(
+            transcriptRowId: "foreign-row", aggregateId: "foreign-aggregate",
+            slug: nil, title: "Foreign", updatedAt: "2025-01-04T03:04:05Z",
+            archived: false, presentationMode: "idle", requiresAction: false, segmentOrdinal: 0,
+            messages: [.init(
+                message_id: "foreign", conversation_id: "foreign-row", sequence_id: 3,
+                message_type: "agent", content: .object(["text": .string("foreign")]),
+                display_data: nil, created_at: "2025-01-04T03:04:05Z")])
+        let legacyUnprovenSession = makeMemberSession("legacy-row")
+        let reloadedSessions = [
+            "row-1": reloadedRow1,
+            "row-2": reloadedRow2,
+            "foreign-row": foreignAggregateSession,
+            "legacy-row": legacyUnprovenSession
+        ]
+        let recreatedOfflineDetail = ProductConversationDetailModel(
+            aggregateId: "pc-1",
+            initialTranscriptRowId: "row-2",
+            api: api,
+            connectivity: offlineConnectivity,
+            sessionProvider: { transcriptRowId, _ in reloadedSessions[transcriptRowId] },
+            existingSession: { reloadedSessions[$0] },
+            provenCurrentAuthorityMemberIds: { Set(reloadedSessions.keys) })
+
+        await recreatedOfflineDetail.start()
+
+        let offlineMessageIds = recreatedOfflineDetail.transcriptItems.compactMap { item -> String? in
+            guard case .message(let message) = item else { return nil }
+            return message.message_id
+        }
+        XCTAssertEqual(offlineMessageIds, ["m-older", "m-newer", "m-2"])
+        XCTAssertFalse(offlineMessageIds.contains("foreign"))
+        XCTAssertFalse(recreatedOfflineDetail.canSendChat)
+        XCTAssertFalse(recreatedOfflineDetail.canMutateLifecycle)
+    }
+
+    func testOfflineCachedMembersWithDuplicateOrdinalsFailClosed() async {
+        let api = makeAPI()
+        let connectivity = ConnectivityMonitor()
+        connectivity.setOnlineForTesting(false)
+        func member(_ id: String) -> ConversationSession {
+            let session = makeSession(id: id)
+            session.persistAuthoritativeRESTSegment(
+                transcriptRowId: id, aggregateId: "pc-1", slug: nil, title: id,
+                updatedAt: "2025-01-02T03:04:05Z", archived: false,
+                presentationMode: "idle", requiresAction: false, segmentOrdinal: 0,
+                messages: [.init(
+                    message_id: id, conversation_id: id, sequence_id: 1,
+                    message_type: "agent", content: .object(["text": .string(id)]),
+                    display_data: nil, created_at: "2025-01-02T03:04:05Z")])
+            return session
+        }
+        let sessions = ["row-a": member("row-a"), "row-b": member("row-b")]
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-1", api: api, connectivity: connectivity,
+            sessionProvider: { id, _ in sessions[id] },
+            existingSession: { sessions[$0] },
+            provenCurrentAuthorityMemberIds: { Set(sessions.keys) })
+
+        await model.start()
+
+        XCTAssertTrue(model.transcriptItems.isEmpty)
+        XCTAssertFalse(model.canSendChat)
+        XCTAssertFalse(model.canMutateLifecycle)
+    }
+
+    func testOfflineInitialLoadWithoutEligibleFallbackSurfacesErrorAndRetriesOnRestore() async {
+        actor Calls {
+            var count = 0
+            func record() { count += 1 }
+            func value() -> Int { count }
+        }
+        let calls = Calls()
+        let connectivity = ConnectivityMonitor()
+        connectivity.setOnlineForTesting(false)
+        let model = ProductConversationDetailModel(
+            aggregateId: "pc-1",
+            initialTranscriptRowId: "row-2",
+            api: makeAPI(),
+            connectivity: connectivity,
+            sessionProvider: { _, _ in nil },
+            existingSession: { _ in nil },
+            hasCachedSnapshot: { _ in false },
+            loadSnapshot: { _, _ in
+                await calls.record()
+                return self.snapshot()
+            })
+
+        await model.start()
+
+        XCTAssertNil(model.fallbackSession)
+        XCTAssertEqual(
+            model.loadError,
+            APIError.transport(underlying: URLError(.notConnectedToInternet)).errorDescription)
+        let initialCalls = await calls.value()
+        XCTAssertEqual(initialCalls, 0)
+
+        connectivity.setOnlineForTesting(true)
+        await model.awaitCurrentLoadForTesting()
+
+        let restoredCalls = await calls.value()
+        XCTAssertEqual(restoredCalls, 1)
+        XCTAssertNotNil(model.snapshot)
+        XCTAssertNil(model.loadError)
     }
 
     func testInitialAggregateLoadFailureFallsBackToCachedMemberSession() async throws {
@@ -1333,7 +1534,7 @@ final class ProductConversationDetailModelTests: XCTestCase {
         await model.start()
         model.applyForTesting(snapshot())
         XCTAssertTrue(model.fallbackSession === row1)
-        XCTAssertEqual(box.created, ["row-1", "row-2", "row-2"])
+        XCTAssertEqual(box.created, ["row-1", "row-2", "row-2", "row-2"])
 
         box.persisted = TestPersistedOutboxStore()
         model.handleSessionEvent(transcriptRowId: "row-1", generation: 1, event: .outboxChanged)
