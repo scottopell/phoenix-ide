@@ -606,6 +606,7 @@ final class MutableTestConversationPersistenceStore: ConversationPersistenceStor
     var aggregateMembersById: [String: Set<String>]
     var onPendingOutboxOwnerTranscriptRowIds: (() async -> Set<String>)?
     var hardDeleteFenceLoadResult: HardDeleteFenceLoadResult = .accessible([])
+    var persistHardDeleteFenceResult = true
     private(set) var hardDeleteFenceLoadCount = 0
     private(set) var pendingOutboxDiscoveryCount = 0
     private let outboxStore: InMemoryOutboxStore
@@ -654,7 +655,9 @@ final class MutableTestConversationPersistenceStore: ConversationPersistenceStor
         await removePersistedConversationState(conversationId: conversationId)
         return true
     }
-    func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool { true }
+    func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool {
+        persistHardDeleteFenceResult
+    }
     func hardDeleteFences(persistenceScope: PersistenceScopeIdentity) -> HardDeleteFenceLoadResult {
         hardDeleteFenceLoadCount += 1
         return hardDeleteFenceLoadResult
@@ -2168,6 +2171,29 @@ final class AppModelProductConversationTests: XCTestCase {
     }
 
     @MainActor
+    func testHardDeleteFenceFailureLeavesAuthoritativeStateAndOutboxIntact() async throws {
+        let store = MutableTestConversationPersistenceStore(
+            owners: ["row-1"],
+            contentsByConversationId: ["row-1": .entries([makePendingOutboxEntry(conversationId: "row-1")])],
+            aggregateMembersById: ["pc-1": ["row-1"]])
+        store.persistHardDeleteFenceResult = false
+        let model = makeModel(conversationPersistenceStore: store)
+        model.listStore.upsert(conversation(id: "row-1", aggregateId: "pc-1"))
+        let session = try XCTUnwrap(model.session(for: "row-1", aggregateAuthority: "pc-1"))
+        session.receive(.initSnapshot(.init(
+            conversation: conversation(id: "row-1", aggregateId: "pc-1"),
+            messages: [], agentWorking: false, presentationMode: "idle",
+            lastSequenceId: 0, pendingAnchorSequenceId: 0,
+            pendingEvents: [], pendingTruncated: false)))
+
+        session.receive(.conversationHardDeleted(seq: 1, conversationId: "row-1"))
+        await model.awaitHardDeleteCleanupForTesting(conversationId: "row-1")
+
+        XCTAssertNotNil(model.existingSession(for: "row-1"))
+        XCTAssertFalse(model.listStore.conversations.isEmpty)
+        XCTAssertFalse(store.inspectOutbox(conversationId: "row-1").visibleEntries.isEmpty)
+    }
+
     func testHardDeleteClearsRetainedProductConversationProjection() async {
         let store = MutableTestConversationPersistenceStore(
             contentsByConversationId: ["row-1": .entries([])],

@@ -821,7 +821,8 @@ final class AppModel {
     }
 
     private func triggerPersistedOutboxDrainIfNeeded() {
-        guard persistedOutboxHydrated,
+        guard !signOutInProgress,
+              persistedOutboxHydrated,
               connectivity.isOnline,
               api != nil,
               persistedOutboxDrainTask == nil,
@@ -1112,16 +1113,6 @@ final class AppModel {
                 aggregateAuthority: context.aggregateAuthority,
                 memberConversationIds: context.memberConversationIds.sorted())
             guard await conversationPersistenceStore.persistHardDeleteFence(fence) else {
-                guard contextIsCurrent() else { return }
-                let memberIds = Set(fence.memberConversationIds)
-                _ = beginHardDeleteCleanup(conversationIds: memberIds)
-                productConversationDetails[context.aggregateAuthority]?.invalidateHardDeleted()
-                productConversationDetails.removeValue(forKey: context.aggregateAuthority)
-                for id in memberIds {
-                    sessions.removeValue(forKey: id)?.revokeForHardDelete()
-                    drainSessions.removeValue(forKey: id)?.revokeForHardDelete()
-                }
-                _ = await listStore.removeAndPersist(aggregateId: context.aggregateAuthority)
                 return
             }
             guard contextIsCurrent() else { return }
@@ -1719,6 +1710,7 @@ final class AppModel {
     }
 
     private func scheduleDeliveryTrigger(_ trigger: DeliveryTrigger) {
+        guard !signOutInProgress else { return }
         if persistedOutboxHydrated {
             for session in sessions.values {
                 switch trigger {

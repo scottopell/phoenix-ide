@@ -98,9 +98,13 @@ final class ConversationListStore {
                 ($0.product_conversation_id, $0.latest_transcript_row_id)
             })
             externalMutationGeneration += 1
+            var preserved = upsertsDuringRefresh
+            if let coordinator = conversations.first(where: { $0.isCoordinator }) {
+                preserved[coordinator.aggregateIdentity] = coordinator
+            }
             apply(Self.merging(
                 response.product_conversations.map(api.productConversationListRowToConversation),
-                preserving: upsertsDuringRefresh,
+                preserving: preserved,
                 excluding: exclusionsDuringRefresh))
             for (aggregateId, transcriptRowId) in latestByAggregate where aggregateExists(aggregateId) {
                 transcriptToAggregate[transcriptRowId] = aggregateId
