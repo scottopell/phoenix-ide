@@ -991,6 +991,7 @@ final class AppModel {
                 staleCheckTiming: LiveSessionTiming(),
                 deliveryTriggerAllowed: { [weak self] in
                     self?.persistedOutboxHydrated == true
+                        && self?.signOutInProgress == false
                 },
                 legacySnapshotPersistenceScope: legacySnapshotPersistenceScope,
                 aggregateAuthority: aggregateAuthority ?? aggregateIdentity(forTranscriptRowId: conversationId),
@@ -1113,6 +1114,7 @@ final class AppModel {
                 aggregateAuthority: context.aggregateAuthority,
                 memberConversationIds: context.memberConversationIds.sorted())
             guard await conversationPersistenceStore.persistHardDeleteFence(fence) else {
+                NSLog("Phoenix hard-delete cleanup stopped: failed to persist fence for %@", context.aggregateAuthority)
                 return
             }
             guard contextIsCurrent() else { return }
@@ -1294,6 +1296,10 @@ final class AppModel {
 
     func triggerPersistedOutboxDrainIfNeededForTesting() {
         triggerPersistedOutboxDrainIfNeeded()
+    }
+
+    func enableBackgroundNudgesForTesting() {
+        backgroundNudgesEnabled = true
     }
 
     enum PersistedOutboxDrainAwaitResult: Equatable {
@@ -1502,7 +1508,14 @@ final class AppModel {
               apiGeneration == startedGeneration,
               listStore.canApplyExternal(startedAt: listToken)
         else { return false }
-        guard listStore.applyExternal(fresh, startedAt: listToken) else { return false }
+        let coordinatorProjection = coordinatorConversationId.flatMap { coordinatorId in
+            listStore.conversations.first { $0.transcriptRowIdentity == coordinatorId }
+        }
+        guard listStore.applyExternal(
+            fresh,
+            startedAt: listToken,
+            preserving: coordinatorProjection.map { [$0.aggregateIdentity: $0] } ?? [:])
+        else { return false }
         invalidateSuccessorCardinality(Dictionary(uniqueKeysWithValues: fresh.map {
             ($0.aggregateIdentity, $0.transcriptRowIdentity)
         }))
@@ -1846,7 +1859,10 @@ final class AppModel {
         productConversationDetails.removeAll()
         for detail in cachedDetails { detail.invalidateConfiguration() }
         let ownedSessions = Array(sessions.values) + Array(drainSessions.values)
-        for session in ownedSessions { session.stop() }
+        for session in ownedSessions {
+            session.invalidateConfiguration()
+            session.stop()
+        }
         sessions.removeAll()
         drainSessions.removeAll()
         attention.reset()

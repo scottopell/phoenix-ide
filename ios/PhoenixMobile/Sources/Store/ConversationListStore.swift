@@ -245,9 +245,13 @@ final class ConversationListStore {
     }
 
     @discardableResult
-    func applyExternal(_ fresh: [Conversation], startedAt token: ExternalRefreshToken) -> Bool {
+    func applyExternal(
+        _ fresh: [Conversation],
+        startedAt token: ExternalRefreshToken,
+        preserving: [String: Conversation] = [:]
+    ) -> Bool {
         guard canApplyExternal(startedAt: token) else { return false }
-        apply(Self.merging(fresh, preserving: [:]))
+        apply(Self.merging(fresh, preserving: preserving))
         lastError = nil
         return true
     }

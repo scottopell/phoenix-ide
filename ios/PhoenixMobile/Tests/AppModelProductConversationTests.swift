@@ -607,6 +607,8 @@ final class MutableTestConversationPersistenceStore: ConversationPersistenceStor
     var onPendingOutboxOwnerTranscriptRowIds: (() async -> Set<String>)?
     var hardDeleteFenceLoadResult: HardDeleteFenceLoadResult = .accessible([])
     var persistHardDeleteFenceResult = true
+    private var deliveryPreparationGate: (entered: AsyncCandidateGate, completed: AsyncCandidateGate)?
+    private var removeAllGate: AsyncCandidateGate?
     private(set) var hardDeleteFenceLoadCount = 0
     private(set) var pendingOutboxDiscoveryCount = 0
     private let outboxStore: InMemoryOutboxStore
@@ -629,6 +631,15 @@ final class MutableTestConversationPersistenceStore: ConversationPersistenceStor
         }
         return persistedOwners(ids, aggregateMembersById: aggregateMembersById)
     }
+    fileprivate func suspendNextDeliveryPreparation(
+        using gate: AsyncCandidateGate,
+        completed: AsyncCandidateGate
+    ) {
+        deliveryPreparationGate = (gate, completed)
+    }
+    fileprivate func suspendRemoveAll(using gate: AsyncCandidateGate) {
+        removeAllGate = gate
+    }
     func hasCachedSnapshot(conversationId: String) -> Bool { snapshotsByConversationId.contains(conversationId) }
     func hasAuthoritativeCachedSnapshot(conversationId: String, configurationIdentity: APIConfigurationIdentity, aggregateAuthority: String) -> Bool { snapshotsByConversationId.contains(conversationId) }
     func inspectOutbox(conversationId: String) -> OutboxStoreInspection {
@@ -636,7 +647,25 @@ final class MutableTestConversationPersistenceStore: ConversationPersistenceStor
             conversationId: conversationId,
             aggregateAuthority: aggregateMembersById.first(where: { $0.value.contains(conversationId) })?.key)
     }
-    func outboxPersistence(conversationId: String, aggregateAuthority: String?, scope: PersistenceScopeIdentity) -> OutboxPersistenceHandle { outboxStore.handle(for: conversationId, aggregateAuthority: aggregateAuthority, scope: scope) }
+    func outboxPersistence(conversationId: String, aggregateAuthority: String?, scope: PersistenceScopeIdentity) -> OutboxPersistenceHandle {
+        let underlying = outboxStore.handle(
+            for: conversationId, aggregateAuthority: aggregateAuthority, scope: scope)
+        return OutboxPersistenceHandle(
+            inspect: { underlying.inspect(conversationId: $0) },
+            reserveRevision: { underlying.reserveRevision() },
+            save: { [weak self] envelope, revision in
+                if let suspension = self?.deliveryPreparationGate {
+                    self?.deliveryPreparationGate = nil
+                    await suspension.entered.markEntered()
+                    await suspension.entered.awaitRelease()
+                    let saved = await underlying.save(envelope, revision: revision)
+                    await suspension.completed.markEntered()
+                    return saved
+                }
+                return await underlying.save(envelope, revision: revision)
+            },
+            remove: { revision in await underlying.remove(revision: revision) })
+    }
     func snapshotPersistence(conversationId: String) -> VersionedDiskWriter {
         let destination = FileManager.default.temporaryDirectory
             .appendingPathComponent("PhoenixMobile", isDirectory: true)
@@ -664,6 +693,11 @@ final class MutableTestConversationPersistenceStore: ConversationPersistenceStor
     }
     func retireHardDeleteFence(_ fence: PersistedHardDeleteFence) async {}
     func removeAllPersistedConversationState() async {
+        if let gate = removeAllGate {
+            removeAllGate = nil
+            await gate.markEntered()
+            await gate.awaitRelease()
+        }
         for conversationId in outboxStore.ownerTranscriptRowIds {
             await outboxStore.removePersistedConversationState(conversationId: conversationId)
         }
@@ -718,6 +752,16 @@ final class AppModelProductConversationTests: XCTestCase {
     private let credentialStore = InMemoryCredentialStore()
     private var defaultPersistenceScope: PersistenceScopeIdentity {
         defaultConfigurationIdentity.persistenceScope
+    }
+
+    override class func setUp() {
+        super.setUp()
+        URLProtocol.registerClass(TestURLProtocol.self)
+    }
+
+    override class func tearDown() {
+        URLProtocol.unregisterClass(TestURLProtocol.self)
+        super.tearDown()
     }
 
     private func makeModel(
@@ -824,7 +868,7 @@ final class AppModelProductConversationTests: XCTestCase {
         let registration = TestURLProtocol.install(host: host) { (request: URLRequest) in
             probe.record(request)
             let url = request.url!
-            if request.httpMethod == "GET", url.path.contains("/api/product-conversations/") {
+            if request.httpMethod == "GET", url.path.hasPrefix("/api/product-conversations") {
                 let response = HTTPURLResponse(url: url, statusCode: productConversationStatusCode, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!
                 return (response, productConversationBody)
             }
@@ -844,6 +888,51 @@ final class AppModelProductConversationTests: XCTestCase {
             session: session,
             streamSession: session)!
         return (api, registration)
+    }
+
+    func testBackgroundAttentionPreservesCoordinatorProjectionAliasesAndCache() async throws {
+        let baseDirectory = isolatedDiskDirectory()
+        let store = DiskConversationPersistenceStore(baseDirectory: baseDirectory)
+        let probe = SendProbe()
+        let listBody = try JSONEncoder().encode(ProductConversationListResponse(
+            product_conversations: [
+                .init(
+                    product_conversation_id: "pc-ordinary",
+                    canonical_route: "/product-conversations/pc-ordinary",
+                    canonical_root: .init(
+                        transcript_row_id: "ordinary-row", slug: "ordinary", title: "Ordinary"),
+                    ordinary_lifecycle: .open,
+                    latest_transcript_row_id: "ordinary-row",
+                    updated_at: "2025-01-02T04:04:05Z",
+                    presentation: .state(displayName: "Ordinary", presentationMode: "idle"))
+            ]))
+        let (api, registration) = makeHTTPAPI(
+            probe: probe, productConversationBody: listBody)
+        defer { TestURLProtocol.uninstall(host: "phoenix.invalid", owner: registration) }
+        let coordinatorStore = InMemoryCoordinatorIdentityStore(
+            "coordinator-row", configurationIdentity: api.configurationIdentity)
+        let model = AppModel(
+            conversationPersistenceStore: store,
+            coordinatorIdentityStore: coordinatorStore,
+            credentialStore: InMemoryCredentialStore())
+        model.replaceAPIForTesting(api)
+        let coordinator = conversation(id: "coordinator-row")
+        model.listStore.upsert(coordinator)
+        model.enableBackgroundNudgesForTesting()
+
+        let succeeded = await model.runBackgroundAttentionCheck()
+
+        XCTAssertTrue(succeeded, model.listStore.lastError ?? "background attention failed")
+        XCTAssertTrue(model.listStore.conversations.contains { $0.id == "coordinator-row" })
+        XCTAssertEqual(
+            model.listStore.aggregateId(forTranscriptRowId: "coordinator-row"),
+            coordinator.aggregateIdentity)
+        let restored = ConversationListStore(
+            hasCachedSnapshot: { _ in false }, context: store.listPersistenceContext!)
+        XCTAssertTrue(restored.conversations.contains { $0.id == "coordinator-row" })
+        XCTAssertEqual(
+            restored.aggregateId(forTranscriptRowId: "coordinator-row"),
+            coordinator.aggregateIdentity)
     }
 
     func testBackgroundIntegrationPreservesAuthoritativeAggregateIdentityAfterLegacyCache() {
@@ -1681,6 +1770,56 @@ final class AppModelProductConversationTests: XCTestCase {
         model.configureForTesting(serverURL: "https://example.com", trustSelfSigned: true)
         let replacement = model.productConversationDetailModel(for: "pc-1")
         XCTAssertFalse(replacement === detail)
+        await model.signOut()
+    }
+
+    func testSignOutRevokesDeliverySuspendedBeforePostAndClearsLocalState() async throws {
+        let store = MutableTestConversationPersistenceStore(contentsByConversationId: [:])
+        let probe = SendProbe()
+        let (api, registration) = makeHTTPAPI(probe: probe)
+        defer { TestURLProtocol.uninstall(host: "phoenix.invalid", owner: registration) }
+        let model = makeModel(conversationPersistenceStore: store)
+        model.connectivity.setOnlineForTesting(false)
+        model.replaceAPIForTesting(api)
+        await model.awaitStartupHardDeleteRecoveryForTesting()
+        let session = try XCTUnwrap(model.session(for: "row-1"))
+        session.receive(.initSnapshot(.init(
+            conversation: conversation(id: "row-1"),
+            messages: [], agentWorking: false, presentationMode: "idle",
+            lastSequenceId: 0, pendingAnchorSequenceId: 0,
+            pendingEvents: [], pendingTruncated: false)))
+        let persisted = await session.flushSnapshotPersistence()
+        XCTAssertTrue(persisted)
+        let queued = await session.outbox.enqueue(text: "queued")
+        XCTAssertNotNil(queued)
+        let didPersistQueuedItem = await session.outbox.flushPersistence()
+        XCTAssertTrue(didPersistQueuedItem)
+        let deliveryGate = AsyncCandidateGate()
+        let deliveryCompleted = AsyncCandidateGate()
+        store.suspendNextDeliveryPreparation(
+            using: deliveryGate,
+            completed: deliveryCompleted)
+        let cleanupGate = AsyncCandidateGate()
+        store.suspendRemoveAll(using: cleanupGate)
+
+        model.connectivity.setOnlineForTesting(true)
+        model.foregrounded()
+        await deliveryGate.waitForEntry()
+        let signOut = Task { await model.signOut() }
+        await cleanupGate.waitForEntry()
+        XCTAssertEqual(session.hydrationAuthority, .none)
+
+        await deliveryGate.release()
+        await deliveryCompleted.waitForEntry()
+        XCTAssertTrue(probe.chatPostPaths.isEmpty)
+        await cleanupGate.release()
+        await signOut.value
+
+        XCTAssertTrue(probe.chatPostPaths.isEmpty)
+        XCTAssertTrue(model.listStore.conversations.isEmpty)
+        XCTAssertNil(model.existingSession(for: "row-1"))
+        XCTAssertTrue(store.inspectOutbox(conversationId: "row-1").visibleEntries.isEmpty)
+        XCTAssertFalse(store.hasCachedSnapshot(conversationId: "row-1"))
     }
 
     func testSignOutRejectsRestoreRefreshAndFencesRefreshAdmittedBeforeReset() async throws {
@@ -2178,6 +2317,9 @@ final class AppModelProductConversationTests: XCTestCase {
             aggregateMembersById: ["pc-1": ["row-1"]])
         store.persistHardDeleteFenceResult = false
         let model = makeModel(conversationPersistenceStore: store)
+        let (api, registration) = makeHTTPAPI(probe: SendProbe())
+        defer { TestURLProtocol.uninstall(host: "phoenix.invalid", owner: registration) }
+        model.replaceAPIForTesting(api)
         model.listStore.upsert(conversation(id: "row-1", aggregateId: "pc-1"))
         let session = try XCTUnwrap(model.session(for: "row-1", aggregateAuthority: "pc-1"))
         session.receive(.initSnapshot(.init(
