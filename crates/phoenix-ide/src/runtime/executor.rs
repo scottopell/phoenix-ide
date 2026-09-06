@@ -8304,11 +8304,7 @@ where
         let cwd = self.context.filesystem_root().to_path_buf();
         let repo_root =
             crate::git_ops::repo_root_from_phoenix_worktree(&cwd).unwrap_or_else(|| cwd.clone());
-        let worktree_identity = self
-            .storage
-            .get_product_conversation_id(&self.context.conversation_id)
-            .await
-            .map_err(|error| format!("Failed to load ProductConversation identity: {error}"))?;
+        let conversation_id = self.context.conversation_id.clone();
         let desired_base_branch = self.context.desired_base_branch.clone();
         let tasks_dir_name = self.context.tasks_dir_name.clone();
         let storage = self.storage.clone();
@@ -8326,7 +8322,7 @@ where
                 execute_approve_task_blocking_reviewed(
                     &cwd,
                     &repo_root,
-                    &worktree_identity,
+                    &conversation_id,
                     &tasks_dir_name,
                     &task_file,
                     &title,
@@ -10274,30 +10270,55 @@ fn resolve_approval_base_branch(
         .map_err(|e| e.to_string())
 }
 
-/// Locate the early Explore worktree at `{repo_root}/.phoenix/worktrees/{conv_id}`
-/// and rename its `task-pending-…` temp branch to `task_branch` in place
-/// (REQ-PROJ-028). Returns the worktree path.
+/// Promote the persisted Explore worktree in place (REQ-PROJ-028).
 ///
-/// `propose_task` is Managed-only and a Managed conversation gets this worktree
-/// on its first message, so it always exists by approval time; if it somehow
-/// doesn't, this errors with a clear "reject and re-propose" message rather than
-/// nesting a new worktree.
+/// The caller supplies the worktree path from the conversation's persisted
+/// `WorkScope` environment. Approval validates that checkout against the
+/// repository before mutating its branch; it never reconstructs resource
+/// ownership from a conversation or `ProductConversation` identifier.
 fn open_early_worktree_and_rename_branch(
     repo_root: &std::path::Path,
-    conv_id: &str,
+    worktree_path: &std::path::Path,
     task_branch: &str,
 ) -> Result<(std::path::PathBuf, String), String> {
-    let worktree_path = repo_root.join(".phoenix/worktrees").join(conv_id);
-    let exists = worktree_path.is_dir()
-        && run_git(&worktree_path, &["rev-parse", "--is-inside-work-tree"]).is_ok();
-    if !exists {
+    if !worktree_path.is_dir()
+        || run_git(worktree_path, &["rev-parse", "--is-inside-work-tree"]).is_err()
+    {
         return Err(format!(
             "No Explore worktree found at {} for this conversation. \
              Reject the plan and ask the agent to propose again.",
             worktree_path.display()
         ));
     }
-    let temp_branch = run_git(&worktree_path, &["rev-parse", "--abbrev-ref", "HEAD"])
+    let canonical_worktree = worktree_path
+        .canonicalize()
+        .map_err(|error| format!("Failed to canonicalize Explore worktree: {error}"))?;
+    let checkout_root = run_git(worktree_path, &["rev-parse", "--show-toplevel"])
+        .map(std::path::PathBuf::from)?
+        .canonicalize()
+        .map_err(|error| format!("Failed to canonicalize Explore checkout root: {error}"))?;
+    let repository_common_dir = run_git(
+        repo_root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .map(std::path::PathBuf::from)?
+    .canonicalize()
+    .map_err(|error| format!("Failed to canonicalize repository Git directory: {error}"))?;
+    let worktree_common_dir = run_git(
+        worktree_path,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .map(std::path::PathBuf::from)?
+    .canonicalize()
+    .map_err(|error| format!("Failed to canonicalize worktree Git directory: {error}"))?;
+    if checkout_root != canonical_worktree || worktree_common_dir != repository_common_dir {
+        return Err(format!(
+            "Persisted Explore worktree {} does not belong to repository {}",
+            worktree_path.display(),
+            repo_root.display()
+        ));
+    }
+    let temp_branch = run_git(worktree_path, &["rev-parse", "--abbrev-ref", "HEAD"])
         .map_err(|e| format!("Failed to determine current branch in worktree: {e}"))?
         .trim()
         .to_string();
@@ -10308,10 +10329,10 @@ fn open_early_worktree_and_rename_branch(
             task_branch = %task_branch,
             "Task approval retry found worktree already on approval branch; skipping rename"
         );
-        return Ok((worktree_path, temp_branch));
+        return Ok((worktree_path.to_path_buf(), temp_branch));
     }
     if temp_branch == "HEAD" {
-        return Ok((worktree_path, temp_branch));
+        return Ok((worktree_path.to_path_buf(), temp_branch));
     }
     if !temp_branch.starts_with("task-pending-") {
         return Err(format!(
@@ -10335,11 +10356,11 @@ fn open_early_worktree_and_rename_branch(
         })?;
     }
     run_git(
-        &worktree_path,
+        worktree_path,
         &["branch", "-m", &temp_branch, &target_branch],
     )
     .map_err(|e| format!("Failed to rename branch '{temp_branch}' to '{target_branch}': {e}"))?;
-    Ok((worktree_path, target_branch))
+    Ok((worktree_path.to_path_buf(), target_branch))
 }
 
 fn branch_ref_exists(repo_root: &std::path::Path, git_ref: &str) -> bool {
@@ -10534,8 +10555,9 @@ fn detect_plain_markdown_task_stem(task_file: &str) -> Option<String> {
 /// A plain-markdown task file (a `.md` name that isn't a taskmd filename) is
 /// handled by [`execute_approve_plain_markdown_blocking`] — dispatched below.
 ///
-/// `cwd` is the Explore worktree; `repo_root` is the git repository root, used
-/// for the canonical worktree path `{repo_root}/.phoenix/worktrees/{conv_id}`.
+/// `cwd` is the persisted Explore worktree and `repo_root` is its repository.
+/// Approval validates and promotes `cwd` directly rather than reconstructing a
+/// path from either conversation identity.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn execute_approve_task_blocking_reviewed(
     cwd: &std::path::Path,
@@ -10620,7 +10642,7 @@ fn execute_approve_task_blocking_reviewed(
         resolve_taskmd_approval_filename(&taskmd_filename_input)?;
 
     let (worktree_path, branch_name) =
-        open_early_worktree_and_rename_branch(repo_root, conv_id, &branch_name)?;
+        open_early_worktree_and_rename_branch(repo_root, cwd, &branch_name)?;
     let worktree_path_str = worktree_path.to_string_lossy().to_string();
 
     let final_filename = promote_task_status_to_in_progress(
@@ -10779,7 +10801,7 @@ fn execute_approve_plain_markdown_blocking(
     // the task file already in place. Rename the temp branch, then commit the
     // file at its own path on it.
     let (worktree_path, branch_name) =
-        open_early_worktree_and_rename_branch(repo_root, conv_id, &branch_name)?;
+        open_early_worktree_and_rename_branch(repo_root, cwd, &branch_name)?;
     let worktree_path_str = worktree_path.to_string_lossy().to_string();
     ensure_gitignore_has_phoenix(&worktree_path)?;
     run_git(&worktree_path, &["add", "--", task_file])?;
@@ -14669,14 +14691,14 @@ mod cwd_immutability_tests {
     }
 
     #[test]
-    fn approve_task_returns_same_path_as_explore_worktree() {
+    fn approve_task_promotes_persisted_worktree_when_product_and_transcript_ids_differ() {
         let (_tmp, repo_root) = init_repo();
-        let conv_id = "test-conv-immutable-cwd";
+        let transcript_conversation_id = "transcript-conversation-id";
+        let product_conversation_id = "different-product-conversation-id";
         let base_branch = "main";
-
-        // Simulate REQ-PROJ-028: create the early Explore worktree
-        let explore_wt = add_explore_worktree(&repo_root, conv_id, base_branch);
+        let explore_wt = add_explore_worktree(&repo_root, transcript_conversation_id, base_branch);
         let explore_wt_str = explore_wt.to_string_lossy().to_string();
+        std::fs::write(repo_root.join("dirty-canonical-checkout.txt"), "dirty").unwrap();
 
         // Stage a taskmd-1.0 task file in the worktree (the agent would
         // have created this via the patch tool before calling propose_task).
@@ -14692,7 +14714,7 @@ mod cwd_immutability_tests {
         let result = execute_approve_task_blocking(
             &explore_wt,
             &repo_root,
-            conv_id,
+            product_conversation_id,
             "tasks",
             &format!("tasks/{task_filename}"),
             "Fix the login bug",
@@ -14708,7 +14730,7 @@ mod cwd_immutability_tests {
         );
 
         // The temp branch must be gone, renamed to the task branch.
-        let id_prefix: String = conv_id.chars().take(8).collect();
+        let id_prefix: String = transcript_conversation_id.chars().take(8).collect();
         let temp_branch = format!("task-pending-{id_prefix}");
         assert!(
             !branch_exists(&repo_root, &temp_branch),
@@ -14738,6 +14760,28 @@ mod cwd_immutability_tests {
             ".phoenix must not exist inside the worktree; \
              its presence means a nested worktree was created"
         );
+    }
+    #[test]
+    fn approval_rejects_worktree_owned_by_another_repository() {
+        let (_expected_tmp, expected_repo) = init_repo();
+        let (_other_tmp, other_repo) = init_repo();
+        let other_worktree = add_explore_worktree(&other_repo, "other-conversation", "main");
+        let branch_before = run_git(&other_worktree, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .expect("read branch before rejection");
+
+        let error = open_early_worktree_and_rename_branch(
+            &expected_repo,
+            &other_worktree,
+            "task-12345-must-not-move",
+        )
+        .expect_err("a worktree from another repository must be rejected");
+
+        assert!(error.contains("does not belong to repository"), "{error}");
+        assert_eq!(
+            run_git(&other_worktree, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap(),
+            branch_before
+        );
+        assert!(!branch_exists(&other_repo, "task-12345-must-not-move"));
     }
 }
 
@@ -14798,12 +14842,12 @@ mod approve_task_branch_collision_tests {
     fn local_child_ref_namespace_collision_uses_fallback() {
         let (_tmp, repo_root) = init_repo();
         let conv_id = "namespace-local";
-        add_explore_worktree(&repo_root, conv_id, "main");
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, "main");
         let desired_branch = "task-12345-fix-the-login-bug";
         run_git(&repo_root, &["branch", &format!("{desired_branch}/foo")]).unwrap();
 
         let (_worktree, branch_name) =
-            open_early_worktree_and_rename_branch(&repo_root, conv_id, desired_branch)
+            open_early_worktree_and_rename_branch(&repo_root, &explore_wt, desired_branch)
                 .expect("approval should avoid branch namespace prefix collisions");
 
         assert_ne!(branch_name, desired_branch);
@@ -14835,9 +14879,9 @@ mod approve_task_branch_collision_tests {
         .unwrap();
 
         let conv_id = "namespace-remote";
-        add_explore_worktree(&repo_root, conv_id, "main");
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, "main");
         let (_worktree, branch_name) =
-            open_early_worktree_and_rename_branch(&repo_root, conv_id, desired_branch)
+            open_early_worktree_and_rename_branch(&repo_root, &explore_wt, desired_branch)
                 .expect("approval should avoid remote branch namespace prefix collisions");
 
         assert_ne!(branch_name, desired_branch);
@@ -14855,13 +14899,13 @@ mod approve_task_branch_collision_tests {
         run_git(&repo_root, &["branch", desired_branch]).unwrap();
 
         let (first_worktree, fallback_branch) =
-            open_early_worktree_and_rename_branch(&repo_root, conv_id, desired_branch)
+            open_early_worktree_and_rename_branch(&repo_root, &explore_wt, desired_branch)
                 .expect("first approval should select and record a fallback branch");
         assert_eq!(first_worktree, explore_wt);
         assert_ne!(fallback_branch, desired_branch);
 
         let (retry_worktree, retry_branch) =
-            open_early_worktree_and_rename_branch(&repo_root, conv_id, desired_branch)
+            open_early_worktree_and_rename_branch(&repo_root, &explore_wt, desired_branch)
                 .expect("retry should accept the recorded fallback branch");
 
         assert_eq!(retry_worktree, explore_wt);
@@ -14878,7 +14922,7 @@ mod approve_task_branch_collision_tests {
         let config_lock = repo_root.join(".git/config.lock");
         std::fs::write(&config_lock, "lock").unwrap();
 
-        let error = open_early_worktree_and_rename_branch(&repo_root, conv_id, desired_branch)
+        let error = open_early_worktree_and_rename_branch(&repo_root, &explore_wt, desired_branch)
             .expect_err("config lock should fail before the non-idempotent branch rename");
 
         assert!(
@@ -15131,7 +15175,7 @@ mod approve_task_branch_collision_tests {
 
         let error = open_early_worktree_and_rename_branch(
             &repo_root,
-            conv_id,
+            &explore_wt,
             "task-12345-fix-the-login-bug",
         )
         .expect_err("prefix branch must not be treated as an approval retry");
@@ -15156,7 +15200,7 @@ mod approve_task_branch_collision_tests {
         .unwrap();
 
         let (worktree_path, branch_name) =
-            open_early_worktree_and_rename_branch(&repo_root, conv_id, target_branch)
+            open_early_worktree_and_rename_branch(&repo_root, &explore_wt, target_branch)
                 .expect("retry should continue on the already-renamed branch");
 
         assert_eq!(worktree_path, explore_wt);
