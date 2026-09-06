@@ -1163,7 +1163,38 @@ final class ConversationSessionReducerTests: XCTestCase {
         XCTAssertEqual(recorder.exactChatPosts(host: host).count, 1)
     }
 
+    @MainActor
+    func testRESTSegmentPersistencePreservesMemberMetadataAbsentFromAggregateResponse() throws {
+        let session = makeSession(aggregateAuthority: "pc-1")
+        var initial = try conversation(id: "c1", aggregateId: "pc-1")
+        initial.model = "gpt-test"
+        initial.cwd = "/tmp/project"
+        initial.branch_name = "feature"
+        initial.project_name = "Phoenix"
+        initial.runtime_role = "coordinator"
+        session.receive(.initSnapshot(.init(
+            conversation: initial, messages: [], agentWorking: false,
+            presentationMode: "idle", lastSequenceId: 0,
+            pendingAnchorSequenceId: 0, pendingEvents: [], pendingTruncated: false,
+            transcriptGeneration: 3, transcriptCoverage: .complete)))
+
+        session.persistAuthoritativeRESTSegment(
+            transcriptRowId: "c1", aggregateId: "pc-1", slug: nil, title: nil,
+            updatedAt: "2025-01-02T03:04:05Z", archived: false,
+            presentationMode: "idle", requiresAction: false, segmentOrdinal: 0,
+            handoff: nil, replacingMessages: true, messages: [])
+
+        XCTAssertEqual(session.conversation?.model, "gpt-test")
+        XCTAssertEqual(session.conversation?.cwd, "/tmp/project")
+        XCTAssertEqual(session.conversation?.branch_name, "feature")
+        XCTAssertEqual(session.conversation?.project_name, "Phoenix")
+        XCTAssertEqual(session.conversation?.runtime_role, "coordinator")
+        XCTAssertEqual(session.conversation?.transcript_generation, 3)
+    }
+
     func testPersistedSnapshotSegmentOrdinalRoundTripsAndOlderRowsDecodeNil() throws {
+        // ProductConversation handoffs are additive typed cache data: old rows
+        // decode nil and new rows preserve the exact enum payload.
         let conversation = try conversation(id: "c1", aggregateId: "pc-1")
         let authority = ConversationSession.PersistedSnapshotAuthority(
             configurationIdentity: APIConfigurationIdentity(
@@ -1172,23 +1203,31 @@ final class ConversationSessionReducerTests: XCTestCase {
                 trustSelfSigned: false),
             aggregateAuthority: "pc-1",
             syncedAt: Date(timeIntervalSince1970: 1))
+        let handoff = ProductConversationHandoff.historical(
+            predecessorTranscriptRowId: "c1",
+            successorTranscriptRowId: "c2",
+            continuationMessageId: "m-next",
+            summary: "continued")
         let snapshot = ConversationSession.PersistedSnapshot(
             conversation: conversation,
             messages: [], lastSequenceId: 0, transcriptGeneration: 1,
             syncedAt: Date(timeIntervalSince1970: 1), authoritative: authority,
-            segmentOrdinal: 7)
+            segmentOrdinal: 7, handoff: handoff)
 
         let encoded = try JSONEncoder().encode(snapshot)
         let decoded = try JSONDecoder().decode(
             ConversationSession.PersistedSnapshot.self, from: encoded)
         XCTAssertEqual(decoded.segmentOrdinal, 7)
+        XCTAssertEqual(decoded.handoff, handoff)
 
         var object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
         object.removeValue(forKey: "segmentOrdinal")
+        object.removeValue(forKey: "handoff")
         let olderRow = try JSONSerialization.data(withJSONObject: object)
         let decodedOlderRow = try JSONDecoder().decode(
             ConversationSession.PersistedSnapshot.self, from: olderRow)
         XCTAssertNil(decodedOlderRow.segmentOrdinal)
+        XCTAssertNil(decodedOlderRow.handoff)
         XCTAssertEqual(ConversationSession.snapshotSchemaVersion, 1)
     }
 
