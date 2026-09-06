@@ -8,10 +8,12 @@ final class ProductConversationDetailModel {
     private(set) var initialTranscriptRowId: String?
 
     private let connectivity: ConnectivityMonitor
+    private let configurationIdentity: APIConfigurationIdentity
     private let createSession: (String, String) -> ConversationSession?
     private let existingSession: (String) -> ConversationSession?
     private let persistedOutboxContents: (String) -> Outbox.StoredContents
     private let hasCachedSnapshot: (String) -> Bool
+    private let provenCurrentAuthorityMemberIds: () -> Set<String>
     private let handleDefinitiveNotFound: @MainActor (String?, Set<String>) async -> Void
     private let loadSnapshot: (String, String?) async throws -> ProductConversationSnapshot
     private let didStartRefresh: @MainActor (ProductConversationRefreshCause) -> Void
@@ -42,6 +44,7 @@ final class ProductConversationDetailModel {
     private var lastTranscriptMutation: TranscriptMutation = .unknown
     private var pendingLoadPlan = PendingLoadPlan()
     private var activeRefreshCause: ProductConversationRefreshCause?
+    private var connectivityRestoreObserver: UUID?
 
     init(
         aggregateId: String,
@@ -52,6 +55,7 @@ final class ProductConversationDetailModel {
         existingSession: @escaping (String) -> ConversationSession? = { _ in nil },
         persistedOutboxContents: @escaping (String) -> Outbox.StoredContents = { _ in .empty },
         hasCachedSnapshot: @escaping (String) -> Bool = { _ in false },
+        provenCurrentAuthorityMemberIds: @escaping () -> Set<String> = { [] },
         handleDefinitiveNotFound: @escaping @MainActor (String?, Set<String>) async -> Void = { _, _ in },
         loadSnapshot: ((String, String?) async throws -> ProductConversationSnapshot)? = nil,
         didStartRefresh: @escaping @MainActor (ProductConversationRefreshCause) -> Void = { _ in },
@@ -60,10 +64,12 @@ final class ProductConversationDetailModel {
         self.aggregateId = aggregateId
         self.initialTranscriptRowId = initialTranscriptRowId
         self.connectivity = connectivity
+        configurationIdentity = api.configurationIdentity
         self.createSession = sessionProvider
         self.existingSession = existingSession
         self.persistedOutboxContents = persistedOutboxContents
         self.hasCachedSnapshot = hasCachedSnapshot
+        self.provenCurrentAuthorityMemberIds = provenCurrentAuthorityMemberIds
         self.handleDefinitiveNotFound = handleDefinitiveNotFound
         self.loadSnapshot = loadSnapshot ?? { id, before in
             try await api.getProductConversation(id: id, before: before)
@@ -125,6 +131,16 @@ final class ProductConversationDetailModel {
     var transcriptItems: [ProductConversationTranscriptItem] {
         if let snapshot {
             return mergedSegments(from: snapshot).flatMap(\.items)
+        }
+        let cachedSessions = provenCachedMemberSessions()
+        if !cachedSessions.isEmpty {
+            var seenMessageIds: Set<String> = []
+            return cachedSessions.flatMap { session in
+                session.messages.compactMap { message in
+                    guard seenMessageIds.insert(message.message_id).inserted else { return nil }
+                    return ProductConversationTranscriptItem.message(message)
+                }
+            }
         }
         guard let fallbackSession = retainedFallbackSession else { return [] }
         return fallbackSession.messages.map(ProductConversationTranscriptItem.message)
@@ -221,6 +237,22 @@ final class ProductConversationDetailModel {
     func start() async {
         guard !isActive else { return }
         isActive = true
+        if connectivityRestoreObserver == nil {
+            connectivityRestoreObserver = connectivity.addRestoreObserver { [weak self] in
+                guard let self, self.isActive else { return }
+                self.loading = true
+                self.loadError = nil
+                self.pendingLoadPlan.enqueueRefresh(.manual, active: self.activeRefreshCause)
+                if self.loadTask == nil {
+                    self.loadGeneration &+= 1
+                    let generation = self.loadGeneration
+                    self.loadTask = Task { [weak self] in
+                        await self?.runLoadLoop(generation: generation)
+                    }
+                }
+            }
+        }
+        activatePersistedMemberFallbacks()
         activateInitialFallbackIfAvailable()
         ensureProjectedSessionsMaterialized()
         if snapshot != nil || retainedFallbackSession != nil {
@@ -232,6 +264,10 @@ final class ProductConversationDetailModel {
 
     func stop() {
         isActive = false
+        if let connectivityRestoreObserver {
+            connectivity.removeRestoreObserver(connectivityRestoreObserver)
+            self.connectivityRestoreObserver = nil
+        }
         observerGeneration &+= 1
         loadGeneration &+= 1
         loadTask?.cancel()
@@ -406,6 +442,15 @@ final class ProductConversationDetailModel {
 
     private func performRefresh(cause: ProductConversationRefreshCause, generation: Int) async {
         guard connectivity.isOnline else {
+            if snapshot == nil {
+                activatePersistedMemberFallbacks()
+                activateInitialFallbackIfAvailable()
+                activateRetainedFallbackFromPersistedOutboxIfNeeded()
+                if retainedFallbackSession == nil {
+                    loadError = APIError.transport(
+                        underlying: URLError(.notConnectedToInternet)).errorDescription
+                }
+            }
             if generation == loadGeneration { loading = false }
             return
         }
@@ -426,6 +471,7 @@ final class ProductConversationDetailModel {
                 return
             }
             if snapshot == nil {
+                activatePersistedMemberFallbacks()
                 activateInitialFallbackIfAvailable()
                 activateRetainedFallbackFromPersistedOutboxIfNeeded()
                 if let session = retainedFallbackSession,
@@ -524,8 +570,36 @@ final class ProductConversationDetailModel {
 
         actionTranscriptRowId = newActionTranscriptRowId
         ensureProjectedSessionsMaterialized()
+        persistSegmentsInMemberCaches(newSnapshot)
         syncObserversAndSessions()
         projectDelegatedStateFromCurrentOwner()
+    }
+
+    private func persistSegmentsInMemberCaches(_ sourceSnapshot: ProductConversationSnapshot) {
+        for segment in sourceSnapshot.segments {
+            let session = existingSession(segment.transcript_row_id)
+                ?? (sourceSnapshot.ordinary_lifecycle == .history
+                    ? nil
+                    : createSession(segment.transcript_row_id, aggregateId))
+            guard let session else { continue }
+            let (presentationMode, requiresAction): (String?, Bool?) = switch sourceSnapshot.presentation {
+            case .needsAction:
+                ("needs_action", true)
+            case .state(_, let mode):
+                (mode, false)
+            }
+            session.persistAuthoritativeRESTSegment(
+                transcriptRowId: segment.transcript_row_id,
+                aggregateId: aggregateId,
+                slug: segment.slug,
+                title: segment.title,
+                updatedAt: sourceSnapshot.updated_at,
+                archived: sourceSnapshot.ordinary_lifecycle == .history,
+                presentationMode: presentationMode ?? "idle",
+                requiresAction: requiresAction ?? false,
+                segmentOrdinal: segment.segment_ordinal,
+                messages: segment.messages)
+        }
     }
 
     private func composeSnapshot(
@@ -725,6 +799,48 @@ final class ProductConversationDetailModel {
         return latestTranscriptRowId
     }
 
+
+    private func activatePersistedMemberFallbacks() {
+        let memberIds = provenCurrentAuthorityMemberIds()
+        guard !memberIds.isEmpty else { return }
+        for transcriptRowId in memberIds {
+            _ = materializeSession(transcriptRowId)
+        }
+        aggregateTranscriptRowIds.formUnion(memberIds)
+        let provenIds = Set(provenCachedMemberSessions().map(\.conversationId))
+        aggregateTranscriptRowIds = provenIds
+        if retainedFallbackSession == nil,
+           let initialTranscriptRowId,
+           provenIds.contains(initialTranscriptRowId)
+        {
+            retainedFallbackSession = existingSession(initialTranscriptRowId)
+            retainedFallbackSource = .initialTranscriptRow
+        }
+    }
+
+    private func provenCachedMemberSessions() -> [ConversationSession] {
+        let sessions = aggregateTranscriptRowIds.compactMap(existingSession).filter { session in
+            guard let receipt = session.authoritativeSnapshotReceipt,
+                  receipt.configurationIdentity == configurationIdentity,
+                  receipt.aggregateId == aggregateId,
+                  session.conversation?.id == session.conversationId,
+                  session.conversation?.aggregateIdentity == aggregateId
+            else { return false }
+            return true
+        }
+        guard sessions.count <= 1 || sessions.allSatisfy({
+            $0.authoritativeSnapshotReceipt?.segmentOrdinal != nil
+        }) else { return [] }
+        let ordinals = sessions.compactMap { $0.authoritativeSnapshotReceipt?.segmentOrdinal }
+        guard Set(ordinals).count == ordinals.count else {
+            NSLog("Phoenix cached aggregate ordering rejected: duplicate segment ordinal for %@", aggregateId)
+            return []
+        }
+        return sessions.sorted {
+            ($0.authoritativeSnapshotReceipt?.segmentOrdinal ?? 0)
+                < ($1.authoritativeSnapshotReceipt?.segmentOrdinal ?? 0)
+        }
+    }
 
     private func activateInitialFallbackIfAvailable() {
         guard retainedFallbackSession == nil,

@@ -2500,6 +2500,49 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent(fence.storageName).appendingPathExtension("json").path))
     }
 
+    func testAuthoritativeCleanupFencesReservedUnpublishedSnapshotAndOutboxSaves() async {
+        let baseDirectory = isolatedDiskDirectory()
+        let context = DiskStore.versionedContext(baseDirectory: baseDirectory)
+        let store = DiskConversationPersistenceStore(baseDirectory: baseDirectory, context: context)
+        let snapshotWriter = store.snapshotPersistence(conversationId: "row-1")
+        let outbox = store.outboxPersistence(
+            conversationId: "row-1",
+            aggregateAuthority: "pc-1",
+            scope: defaultPersistenceScope)
+        let staleSnapshotRevision = snapshotWriter.reserveRevision()
+        let staleOutboxRevision = outbox.reserveRevision()
+        let now = Date()
+        let snapshot = ConversationSession.PersistedSnapshot(
+            conversation: conversation(id: "row-1", aggregateId: "pc-1"),
+            messages: [],
+            lastSequenceId: 0,
+            transcriptGeneration: 1,
+            syncedAt: now,
+            authoritative: .init(
+                configurationIdentity: defaultConfigurationIdentity,
+                aggregateAuthority: "pc-1",
+                syncedAt: now))
+        let envelope = PersistedOutboxEnvelope(
+            scope: defaultPersistenceScope,
+            aggregateAuthority: "pc-1",
+            entries: [])
+
+        let removed = await store.removeAuthoritativePersistedConversationState(
+            conversationId: "row-1",
+            configurationIdentity: defaultConfigurationIdentity,
+            aggregateAuthority: "pc-1")
+        let staleSnapshotCompleted = await snapshotWriter.save(
+            snapshot, revision: staleSnapshotRevision)
+        let staleOutboxCompleted = await outbox.save(
+            envelope, revision: staleOutboxRevision)
+
+        XCTAssertTrue(removed)
+        XCTAssertTrue(staleSnapshotCompleted)
+        XCTAssertTrue(staleOutboxCompleted)
+        XCTAssertFalse(store.hasCachedSnapshot(conversationId: "row-1"))
+        XCTAssertEqual(store.inspectOutbox(conversationId: "row-1").state, .missing)
+    }
+
     func testHardDeleteCleanupRemovesProvenLegacySnapshotButPreservesForeignUnscopedSnapshot() async throws {
         let baseDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("phoenix-legacy-cleanup-\(UUID().uuidString)")
