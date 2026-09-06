@@ -1,4 +1,5 @@
 pub mod direct_turn;
+pub mod direct_turn_llm;
 pub mod direct_turn_profile;
 pub mod engine;
 pub mod simulator;
