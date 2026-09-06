@@ -125,6 +125,16 @@ final class ProductConversationDetailModelTests: XCTestCase {
         XCTAssertEqual(row2.conversationId, "row-2")
     }
 
+    func testPrependScrollAnchorRestoresExactVisibleSegmentQualifiedIdOnce() {
+        var anchor = PrependScrollAnchor()
+        let visibleId = "message:row-2:shared"
+
+        anchor.capture(visibleItemId: visibleId)
+
+        XCTAssertEqual(anchor.consume(), visibleId)
+        XCTAssertNil(anchor.consume())
+    }
+
     func testTranscriptItemIdentityQualifiesReusedMessageIdsBySegment() throws {
         let first = ProductConversationTranscriptItem.message(
             try JSONDecoder().decode(Message.self, from: Data(

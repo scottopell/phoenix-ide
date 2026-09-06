@@ -272,6 +272,7 @@ private final class SendProbe {
     private let lock = NSLock()
     private var chatPostPathsStorage: [String] = []
     private var aggregateGetPathsStorage: [String] = []
+    private var listGetPathsStorage: [String] = []
     private var archivePostPathsStorage: [String] = []
 
     func record(_ request: URLRequest) {
@@ -283,6 +284,9 @@ private final class SendProbe {
         }
         if request.httpMethod == "GET", path.contains("/api/product-conversations/") {
             aggregateGetPathsStorage.append(path)
+        }
+        if request.httpMethod == "GET", path == "/api/product-conversations" {
+            listGetPathsStorage.append(path)
         }
         if request.httpMethod == "POST", path.contains("/archive") {
             archivePostPathsStorage.append(path)
@@ -305,6 +309,12 @@ private final class SendProbe {
         lock.lock()
         defer { lock.unlock() }
         return aggregateGetPathsStorage
+    }
+
+    var listGetPaths: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return listGetPathsStorage
     }
 }
 
@@ -1670,6 +1680,40 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertFalse(replacement === detail)
     }
 
+    func testSignOutRejectsRestoreRefreshAndFencesRefreshAdmittedBeforeReset() async throws {
+        let baseDirectory = isolatedDiskDirectory()
+        let context = DiskStore.versionedContext(baseDirectory: baseDirectory)
+        let blocker = DrainBlocker()
+        let store = ResettableConversationPersistenceStore(
+            baseDirectory: baseDirectory, context: context, resetBlocker: blocker)
+        let probe = SendProbe()
+        let listBody = try JSONEncoder().encode(ProductConversationListResponse(
+            product_conversations: []))
+        let (api, registration) = makeHTTPAPI(
+            probe: probe, productConversationBody: listBody)
+        defer { TestURLProtocol.uninstall(host: "phoenix.invalid", owner: registration) }
+        let model = makeModel(conversationPersistenceStore: store)
+        model.replaceAPIForTesting(api)
+        let oldRow = conversation(id: "row-old", aggregateId: "pc-old")
+        model.listStore.upsert(oldRow)
+        let admittedBeforeSignOut = model.listStore.externalRefreshToken()
+
+        let signOut = Task { await model.signOut() }
+        await blocker.waitForEntry()
+        await model.refreshList()
+
+        XCTAssertTrue(probe.listGetPaths.isEmpty)
+        XCTAssertFalse(model.listStore.applyExternal([oldRow], startedAt: admittedBeforeSignOut))
+
+        await blocker.release()
+        await signOut.value
+
+        XCTAssertTrue(model.listStore.conversations.isEmpty)
+        let restored = ConversationListStore(
+            hasCachedSnapshot: { _ in false }, context: context)
+        XCTAssertTrue(restored.conversations.isEmpty)
+    }
+
     func testSignOutWithSuspendedCleanupDoesNotPublishUnconfiguredStateEarly() async {
         let baseDirectory = isolatedDiskDirectory()
         let context = DiskStore.versionedContext(baseDirectory: baseDirectory)
@@ -1719,6 +1763,46 @@ final class AppModelProductConversationTests: XCTestCase {
 
         XCTAssertEqual(model.coordinatorConversationId, "coordinator-row")
         XCTAssertEqual(coordinatorStore.receiptsByPersistenceScope.count, 1)
+    }
+
+    func testLegacyCoordinatorIdentityImportsOnceIntoCurrentPersistenceScope() {
+        let key = "phoenix.coordinatorConversationId"
+        UserDefaults.standard.set("legacy-coordinator", forKey: key)
+        defer { UserDefaults.standard.removeObject(forKey: key) }
+        let serverKey = "phoenix.serverURL"
+        let trustKey = "phoenix.trustSelfSigned"
+        UserDefaults.standard.set("https://example.com", forKey: serverKey)
+        UserDefaults.standard.set(false, forKey: trustKey)
+        defer {
+            UserDefaults.standard.removeObject(forKey: serverKey)
+            UserDefaults.standard.removeObject(forKey: trustKey)
+        }
+        let credentialStore = InMemoryCredentialStore()
+        try! credentialStore.saveRecord(
+            .init(password: "secret", generation: "credential"),
+            account: "server-credentials")
+        let identity = APIConfigurationIdentity(
+            serverURL: "https://example.com",
+            credentialGeneration: "credential",
+            trustSelfSigned: false)
+        let coordinatorStore = InMemoryCoordinatorIdentityStore()
+
+        let model = AppModel(
+            coordinatorIdentityStore: coordinatorStore,
+            credentialStore: credentialStore)
+
+        XCTAssertEqual(model.coordinatorConversationId, "legacy-coordinator")
+        XCTAssertNil(UserDefaults.standard.string(forKey: key))
+        XCTAssertEqual(
+            coordinatorStore.receiptsByPersistenceScope[identity.persistenceScope]?.conversationId,
+            "legacy-coordinator")
+
+        UserDefaults.standard.set("different-legacy", forKey: key)
+        let reloaded = AppModel(
+            coordinatorIdentityStore: coordinatorStore,
+            credentialStore: credentialStore)
+        XCTAssertEqual(reloaded.coordinatorConversationId, "legacy-coordinator")
+        XCTAssertEqual(UserDefaults.standard.string(forKey: key), "different-legacy")
     }
 
     func testSignOutClearsInjectedCoordinatorIdentityStore() async {
