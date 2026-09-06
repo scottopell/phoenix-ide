@@ -1498,7 +1498,11 @@ final class AppModel {
         let startedNudgeGeneration = nudgePreferenceGeneration
         let startedEvidenceGeneration = attentionEvidenceGeneration
         let listToken = listStore.externalRefreshToken()
-        guard let fresh = try? await api.listConversations() else { return false }
+        guard let response = try? await api.listProductConversations() else { return false }
+        let latestByAggregate = Dictionary(uniqueKeysWithValues: response.product_conversations.map {
+            ($0.product_conversation_id, $0.latest_transcript_row_id)
+        })
+        let fresh = response.product_conversations.map(api.productConversationListRowToConversation)
         guard !Task.isCancelled,
               backgroundNudgesEnabled,
               apiGeneration == startedGeneration
@@ -1516,9 +1520,7 @@ final class AppModel {
             startedAt: listToken,
             preserving: coordinatorProjection.map { [$0.aggregateIdentity: $0] } ?? [:])
         else { return false }
-        invalidateSuccessorCardinality(Dictionary(uniqueKeysWithValues: fresh.map {
-            ($0.aggregateIdentity, $0.transcriptRowIdentity)
-        }))
+        invalidateSuccessorCardinality(latestByAggregate)
         let isCurrent: @MainActor () -> Bool = { [weak self] in
             guard let self else { return false }
             return self.backgroundNudgesEnabled
