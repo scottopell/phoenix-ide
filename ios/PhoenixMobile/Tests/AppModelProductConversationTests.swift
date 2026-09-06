@@ -457,6 +457,7 @@ final class ResettableConversationPersistenceStore: ConversationPersistenceStore
     func hardDeleteFences(persistenceScope: PersistenceScopeIdentity) -> HardDeleteFenceLoadResult { .accessible([]) }
     func retireHardDeleteFence(_ fence: PersistedHardDeleteFence) async {}
     func removeAllPersistedConversationState() async {
+        await resetBlocker.block()
         await wrapped.removeAllPersistedConversationState()
     }
 }
@@ -662,34 +663,34 @@ final class MutableTestConversationPersistenceStore: ConversationPersistenceStor
 
 @MainActor
 final class InMemoryCoordinatorIdentityStore: CoordinatorIdentityStore {
-    var receiptsByConfigurationIdentity: [APIConfigurationIdentity: CoordinatorIdentityReceipt]
+    var receiptsByPersistenceScope: [PersistenceScopeIdentity: CoordinatorIdentityReceipt]
 
     init(_ value: String? = nil, configurationIdentity: APIConfigurationIdentity = APIConfigurationIdentity(serverURL: "https://example.com", credentialGeneration: "test-default", trustSelfSigned: true)) {
         if let value {
-            receiptsByConfigurationIdentity = [configurationIdentity: CoordinatorIdentityReceipt(configurationIdentity: configurationIdentity, conversationId: value)]
+            receiptsByPersistenceScope = [configurationIdentity.persistenceScope: CoordinatorIdentityReceipt(persistenceScope: configurationIdentity.persistenceScope, conversationId: value)]
         } else {
-            receiptsByConfigurationIdentity = [:]
+            receiptsByPersistenceScope = [:]
         }
     }
 
     var value: String? {
-        receiptsByConfigurationIdentity.values.first?.conversationId
+        receiptsByPersistenceScope.values.first?.conversationId
     }
 
-    func load(configurationIdentity: APIConfigurationIdentity) -> CoordinatorIdentityReceipt? {
-        receiptsByConfigurationIdentity[configurationIdentity]
+    func load(persistenceScope: PersistenceScopeIdentity) -> CoordinatorIdentityReceipt? {
+        receiptsByPersistenceScope[persistenceScope]
     }
 
     func save(_ receipt: CoordinatorIdentityReceipt) {
-        receiptsByConfigurationIdentity[receipt.configurationIdentity] = receipt
+        receiptsByPersistenceScope[receipt.persistenceScope] = receipt
     }
 
-    func clear(configurationIdentity: APIConfigurationIdentity) {
-        receiptsByConfigurationIdentity.removeValue(forKey: configurationIdentity)
+    func clear(persistenceScope: PersistenceScopeIdentity) {
+        receiptsByPersistenceScope.removeValue(forKey: persistenceScope)
     }
 
     func clearAll() {
-        receiptsByConfigurationIdentity.removeAll()
+        receiptsByPersistenceScope.removeAll()
     }
 
     func resetConversationListCache() async {}
@@ -1669,6 +1670,57 @@ final class AppModelProductConversationTests: XCTestCase {
         XCTAssertFalse(replacement === detail)
     }
 
+    func testSignOutWithSuspendedCleanupDoesNotPublishUnconfiguredStateEarly() async {
+        let baseDirectory = isolatedDiskDirectory()
+        let context = DiskStore.versionedContext(baseDirectory: baseDirectory)
+        let blocker = DrainBlocker()
+        let store = ResettableConversationPersistenceStore(
+            baseDirectory: baseDirectory, context: context, resetBlocker: blocker)
+        let credentials = InMemoryCredentialStore()
+        try! credentials.saveRecord(
+            .init(password: "secret", generation: "old-generation"),
+            account: "server-password-record")
+        let model = AppModel(
+            conversationPersistenceStore: store,
+            credentialStore: credentials)
+        model.configureForTesting(serverURL: "https://old.example", trustSelfSigned: true)
+        model.listStore.upsert(conversation(id: "row-1"))
+        let signOut = Task { await model.signOut() }
+        await blocker.waitForEntry()
+
+        XCTAssertEqual(model.serverURLString, "https://old.example")
+        XCTAssertNotNil(credentials.loadRecord(account: "server-password-record"))
+        XCTAssertTrue(model.listStore.conversations.isEmpty)
+
+        await blocker.release()
+        await signOut.value
+
+        XCTAssertEqual(model.serverURLString, "")
+        XCTAssertNil(credentials.loadRecord(account: "server-password-record"))
+        XCTAssertTrue(model.listStore.conversations.isEmpty)
+    }
+
+    func testCoordinatorReceiptSurvivesTrustOnlyOfflineRebuild() {
+        let identity = APIConfigurationIdentity(
+            serverURL: "https://example.com",
+            credentialGeneration: "credential",
+            trustSelfSigned: false)
+        let coordinatorStore = InMemoryCoordinatorIdentityStore(
+            "coordinator-row", configurationIdentity: identity)
+        let (api, registration) = makeHTTPAPI(
+            probe: SendProbe(), configurationIdentity: identity)
+        defer { TestURLProtocol.uninstall(host: "phoenix.invalid", owner: registration) }
+        let model = AppModel(
+            coordinatorIdentityStore: coordinatorStore,
+            credentialStore: InMemoryCredentialStore())
+        model.replaceAPIForTesting(api)
+
+        model.rebuildTrustForTesting(true)
+
+        XCTAssertEqual(model.coordinatorConversationId, "coordinator-row")
+        XCTAssertEqual(coordinatorStore.receiptsByPersistenceScope.count, 1)
+    }
+
     func testSignOutClearsInjectedCoordinatorIdentityStore() async {
         let (api, registration) = makeHTTPAPI(probe: SendProbe())
         defer { TestURLProtocol.uninstall(host: "phoenix.invalid", owner: registration) }
@@ -1680,7 +1732,7 @@ final class AppModelProductConversationTests: XCTestCase {
 
         await model.signOut()
 
-        XCTAssertNil(identityStore.receiptsByConfigurationIdentity[api.configurationIdentity])
+        XCTAssertNil(identityStore.receiptsByPersistenceScope[api.configurationIdentity.persistenceScope])
         XCTAssertNil(model.coordinatorConversationId)
     }
 
@@ -1743,8 +1795,8 @@ final class AppModelProductConversationTests: XCTestCase {
 
         await first.signOut()
 
-        XCTAssertTrue(firstStore.receiptsByConfigurationIdentity.isEmpty)
-        XCTAssertEqual(secondStore.receiptsByConfigurationIdentity[secondIdentity]?.conversationId, "coordinator-b")
+        XCTAssertTrue(firstStore.receiptsByPersistenceScope.isEmpty)
+        XCTAssertEqual(secondStore.receiptsByPersistenceScope[secondIdentity.persistenceScope]?.conversationId, "coordinator-b")
         XCTAssertEqual(second.coordinatorConversationId, "coordinator-b")
     }
 
@@ -1753,11 +1805,11 @@ final class AppModelProductConversationTests: XCTestCase {
         let model = makeModel(coordinatorIdentityStore: identityStore)
         model.configureForTesting(serverURL: "https://example.com", trustSelfSigned: true)
         let identity = model.configurationIdentity!
-        identityStore.receiptsByConfigurationIdentity[identity] = CoordinatorIdentityReceipt(configurationIdentity: identity, conversationId: "coordinator-row")
+        identityStore.receiptsByPersistenceScope[identity.persistenceScope] = CoordinatorIdentityReceipt(persistenceScope: identity.persistenceScope, conversationId: "coordinator-row")
         model.replaceAPIForTesting(PhoenixAPI(baseURL: URL(string: identity.serverURL)!, password: nil, allowSelfSigned: identity.trustSelfSigned, configurationIdentity: identity)!)
 
         XCTAssertEqual(model.coordinatorConversationId, "coordinator-row")
-        XCTAssertEqual(identityStore.receiptsByConfigurationIdentity[identity]?.conversationId, "coordinator-row")
+        XCTAssertEqual(identityStore.receiptsByPersistenceScope[identity.persistenceScope]?.conversationId, "coordinator-row")
     }
 
     func testDiskConversationPersistenceStoreRejectsForeignAndMalformedEntries() {

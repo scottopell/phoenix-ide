@@ -18,6 +18,7 @@ final class ProductConversationDetailModel {
     private let onConfigurationInvalidated: @MainActor (ProductConversationDetailModel) -> Void
 
     private(set) var snapshot: ProductConversationSnapshot?
+    private(set) var closeCardinalityKnown = true
     private(set) var loading = false
     private(set) var loadingOlder = false
     private(set) var loadError: String?
@@ -249,8 +250,11 @@ final class ProductConversationDetailModel {
         lastDelegatedConnection = .idle
     }
 
-    func invalidateCardinalityForListSuccessor() {
-        snapshot = nil
+    func markCardinalityStaleAndRefreshIfActive() {
+        closeCardinalityKnown = false
+        if isActive {
+            Task { await enqueueLoad(.refresh(.delegateConversationChanged)) }
+        }
     }
 
     func invalidateConfiguration() {
@@ -497,6 +501,7 @@ final class ProductConversationDetailModel {
         hardDeleted = false
         if resetRetainedPages { retainedOlderPages.removeAll() }
         snapshot = newSnapshot
+        closeCardinalityKnown = true
         aggregateTranscriptRowIds = Set(newSnapshot.segments.map(\.transcript_row_id))
         updatePersistedOutboxSessions(from: newSnapshot)
         if retainedFallbackSource == .persistedOutbox,
