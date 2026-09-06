@@ -1048,6 +1048,9 @@ final class AppModel {
                 existing: existing,
                 liveUpdate: conversation,
                 aggregateIdentity: aggregateIdentity))
+        listStore.registerTranscriptAlias(
+            transcriptRowId: transcriptRowId,
+            aggregateId: aggregateIdentity)
     }
 
     private func handleAggregateHardDeleted(
@@ -1179,8 +1182,15 @@ final class AppModel {
     func refreshList() async {
         guard let api else { return }
         attentionEvidenceGeneration &+= 1
-        await listStore.refresh(api: api)
+        let latestByAggregate = await listStore.refresh(api: api)
         if listStore.lastError == nil {
+            for (aggregateId, latestTranscriptRowId) in latestByAggregate {
+                guard let detail = productConversationDetails[aggregateId],
+                      let detailLatest = detail.latestTranscriptRowId,
+                      detailLatest != latestTranscriptRowId
+                else { continue }
+                detail.invalidateCardinalityForListSuccessor()
+            }
             // The user is looking at fresh data — nothing here should nudge
             // them later.
             attention.seed(

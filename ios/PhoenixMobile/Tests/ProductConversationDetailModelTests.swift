@@ -125,12 +125,14 @@ final class ProductConversationDetailModelTests: XCTestCase {
         XCTAssertEqual(row2.conversationId, "row-2")
     }
 
-    func testHistoryOnlyDisablesGlobalMutationsButOpenWithoutWritableStillAllowsLifecycleActions() {
+    func testHistoryOnlyDisablesGlobalMutationsButOpenWithoutWritableStillAllowsLifecycleActions() async {
         let row2 = makeSession(id: "row-2")
         row2.receive(.initSnapshot(.init(
             conversation: try! conversation(id: "row-2", state: "{\"type\":\"needs_input\",\"task_kind\":\"edit\"}"),
             messages: [], agentWorking: false, presentationMode: "needs_action", lastSequenceId: 1,
             pendingAnchorSequenceId: 1, pendingEvents: [], pendingTruncated: false)))
+        let persisted = await row2.flushSnapshotPersistence()
+        XCTAssertTrue(persisted)
         let model = ProductConversationDetailModel(
             aggregateId: "pc-1",
             api: makeAPI(),
@@ -244,6 +246,8 @@ final class ProductConversationDetailModelTests: XCTestCase {
             conversation: try! conversation(id: "row-1"),
             messages: [], agentWorking: false, presentationMode: "idle", lastSequenceId: 1,
             pendingAnchorSequenceId: 1, pendingEvents: [], pendingTruncated: false)))
+        let persisted = await row1.flushSnapshotPersistence()
+        XCTAssertTrue(persisted)
         _ = await row1.send(text: "pending predecessor")
         let model = ProductConversationDetailModel(
             aggregateId: "pc-1",
@@ -429,12 +433,14 @@ final class ProductConversationDetailModelTests: XCTestCase {
         XCTAssertTrue(counter.created.isEmpty)
     }
 
-    func testOpenWithoutWritableUsesLatestSessionForActionsButNotChat() {
+    func testOpenWithoutWritableUsesLatestSessionForActionsButNotChat() async {
         let latest = makeSession(id: "row-2")
         latest.receive(.initSnapshot(.init(
             conversation: try! conversation(id: "row-2", state: "{\"type\":\"needs_input\",\"task_kind\":\"edit\"}"),
             messages: [], agentWorking: false, presentationMode: "needs_action", lastSequenceId: 1,
             pendingAnchorSequenceId: 1, pendingEvents: [], pendingTruncated: false)))
+        let persisted = await latest.flushSnapshotPersistence()
+        XCTAssertTrue(persisted)
         let model = ProductConversationDetailModel(
             aggregateId: "pc-1",
             api: makeAPI(),
@@ -579,6 +585,8 @@ final class ProductConversationDetailModelTests: XCTestCase {
                 conversation: try! self.conversation(id: "row-1"),
                 messages: [], agentWorking: false, presentationMode: "idle", lastSequenceId: 1,
                 pendingAnchorSequenceId: 1, pendingEvents: [], pendingTruncated: false)))
+            let snapshotPersisted = await row1.flushSnapshotPersistence()
+            XCTAssertTrue(snapshotPersisted)
             _ = await row1.send(text: "pending predecessor")
             let persisted = TestPersistedOutboxStore(visibleByTranscriptRowId: ["row-1": true])
             let model = ProductConversationDetailModel(
