@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import './ContextExhaustedHandoff.css';
 
 const AlertTriangle = () => (
@@ -78,6 +78,41 @@ function clearEditDraft(parentId: string): boolean {
   }
 }
 
+interface CompletedContinuationBoundaryProps {
+  summary: string;
+  revealedSummary?: ReactNode;
+  revealSummary?: boolean;
+  onOpenContinuation?: () => void;
+}
+
+export function CompletedContinuationBoundary({
+  summary,
+  revealedSummary,
+  revealSummary = false,
+  onOpenContinuation,
+}: CompletedContinuationBoundaryProps) {
+  return (
+    <section className="context-exhausted-handoff context-exhausted-banner context-exhausted-banner--continued" aria-label="Conversation continuation boundary">
+      <div className="context-exhausted-header context-exhausted-header--static">
+        <span className="context-exhausted-icon" aria-hidden="true"><AlertTriangle /></span>
+        <span className="context-exhausted-title">Context compacted</span>
+        <span className="context-exhausted-subtitle">Conversation continued in the next segment</span>
+      </div>
+      <details className="context-exhausted-summary context-exhausted-summary--historical" open={revealSummary || undefined}>
+        <summary>Review handoff</summary>
+        <pre className="context-exhausted-content" data-fragment-id="message-text">
+          {revealedSummary ?? summary}
+        </pre>
+      </details>
+      {onOpenContinuation ? (
+        <button type="button" className="context-exhausted-continue" onClick={onOpenContinuation}>
+          Open continuation
+        </button>
+      ) : null}
+    </section>
+  );
+}
+
 export function ContextExhaustedHandoff({
   parentId,
   generatedHandoff,
@@ -136,7 +171,7 @@ export function ContextExhaustedHandoff({
 
   if (hasContinuation) {
     return (
-      <section className="context-exhausted-banner" aria-labelledby="context-exhausted-title">
+      <section className="context-exhausted-handoff context-exhausted-banner" aria-labelledby="context-exhausted-title">
         <div className="context-exhausted-header context-exhausted-header--static">
           <span className="context-exhausted-icon"><AlertTriangle /></span>
           <span id="context-exhausted-title" className="context-exhausted-title">Context Window Full</span>
@@ -153,7 +188,7 @@ export function ContextExhaustedHandoff({
   }
 
   return (
-    <section className="context-exhausted-banner context-exhausted-banner--expanded" aria-labelledby="context-exhausted-title">
+    <section className="context-exhausted-handoff context-exhausted-banner context-exhausted-banner--expanded" aria-labelledby="context-exhausted-title">
       <div className="context-exhausted-header context-exhausted-header--static">
         <span className="context-exhausted-icon"><AlertTriangle /></span>
         <span id="context-exhausted-title" className="context-exhausted-title">Context Window Full</span>
