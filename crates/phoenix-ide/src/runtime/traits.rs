@@ -440,9 +440,6 @@ pub trait StateStore: Send + Sync {
     #[allow(dead_code)]
     async fn get_conversation_mode(&self, conv_id: &str) -> Result<ConvMode, String>;
 
-    /// Resolve the stable `ProductConversation` identity owning one transcript runtime.
-    async fn get_product_conversation_id(&self, conv_id: &str) -> Result<String, String>;
-
     /// Update the conversation working directory. Conversation cwd is
     /// immutable post-creation; the only legitimate callers are
     /// recovery/teardown fallbacks (task 13012). The `_recovery_only`
@@ -940,10 +937,6 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
 
     async fn get_conversation_mode(&self, conv_id: &str) -> Result<ConvMode, String> {
         (**self).get_conversation_mode(conv_id).await
-    }
-
-    async fn get_product_conversation_id(&self, conv_id: &str) -> Result<String, String> {
-        (**self).get_product_conversation_id(conv_id).await
     }
 
     async fn update_conversation_cwd_recovery_only(
@@ -1885,14 +1878,6 @@ impl StateStore for DatabaseStorage {
             .await
             .map_err(|e| e.to_string())?;
         Ok(conv.conv_mode)
-    }
-
-    async fn get_product_conversation_id(&self, conv_id: &str) -> Result<String, String> {
-        self.db
-            .get_conversation(conv_id)
-            .await
-            .map(|conv| conv.product_conversation_id.to_string())
-            .map_err(|error| error.to_string())
     }
 
     async fn update_conversation_cwd_recovery_only(
