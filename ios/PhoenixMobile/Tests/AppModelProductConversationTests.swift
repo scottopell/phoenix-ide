@@ -935,6 +935,45 @@ final class AppModelProductConversationTests: XCTestCase {
             coordinator.aggregateIdentity)
     }
 
+    func testBackgroundAttentionLatestSuccessorInvalidatesStoppedSingleSegmentCloseCardinality() async throws {
+        let probe = SendProbe()
+        let listBody = try JSONEncoder().encode(ProductConversationListResponse(
+            product_conversations: [
+                .init(
+                    product_conversation_id: "pc-1",
+                    canonical_route: "/product-conversations/pc-1",
+                    canonical_root: .init(
+                        transcript_row_id: "row-1", slug: "root", title: "Root"),
+                    ordinary_lifecycle: .open,
+                    latest_transcript_row_id: "row-2",
+                    updated_at: "2025-01-02T04:04:05Z",
+                    presentation: .state(displayName: "Root", presentationMode: "working"))
+            ]))
+        let (api, registration) = makeHTTPAPI(
+            probe: probe, productConversationBody: listBody)
+        defer { TestURLProtocol.uninstall(host: "phoenix.invalid", owner: registration) }
+        let model = makeModel()
+        model.replaceAPIForTesting(api)
+        let detail = model.productConversationDetailModel(for: "pc-1")
+        detail.applyForTesting(testSingleSegmentProductConversationSnapshot())
+        detail.stop()
+        model.enableBackgroundNudgesForTesting()
+
+        let succeeded = await model.runBackgroundAttentionCheck()
+
+        XCTAssertTrue(succeeded, model.listStore.lastError ?? "background attention failed")
+        let root = try XCTUnwrap(model.listStore.conversations.first {
+            $0.aggregateIdentity == "pc-1"
+        })
+        XCTAssertEqual(root.id, "row-1")
+        XCTAssertEqual(
+            model.closeUnavailableExplanation(for: root),
+            "Open the conversation before closing it.")
+        let archived = await model.archive(conversationId: "row-1")
+        XCTAssertFalse(archived)
+        XCTAssertTrue(probe.archivePostPaths.isEmpty)
+    }
+
     func testBackgroundIntegrationPreservesAuthoritativeAggregateIdentityAfterLegacyCache() {
         let model = makeModel()
         let aggregateProjection = conversation(
