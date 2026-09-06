@@ -1502,6 +1502,34 @@ final class ConversationSessionReducerTests: XCTestCase {
     }
 
     @MainActor
+    func testConfigurationInvalidationDisablesRetainedLifecycleActionsUntilValidInit() async throws {
+        let session = makeSession(aggregateAuthority: "pc-1")
+        session.receive(.initSnapshot(.init(
+            conversation: try conversation(
+                id: "c1", aggregateId: "pc-1", state: "{\"type\":\"working\"}"),
+            messages: [], agentWorking: true, presentationMode: "working",
+            lastSequenceId: 0, pendingAnchorSequenceId: 0,
+            pendingEvents: [], pendingTruncated: false)))
+        var persisted = await session.flushSnapshotPersistence()
+        XCTAssertTrue(persisted)
+        XCTAssertTrue(session.acceptsConversationActions)
+
+        session.invalidateConfiguration()
+
+        XCTAssertNotNil(session.conversation)
+        XCTAssertFalse(session.acceptsConversationActions)
+        session.receive(.initSnapshot(.init(
+            conversation: try conversation(
+                id: "c1", aggregateId: "pc-1", state: "{\"type\":\"working\"}"),
+            messages: [], agentWorking: true, presentationMode: "working",
+            lastSequenceId: 1, pendingAnchorSequenceId: 1,
+            pendingEvents: [], pendingTruncated: false)))
+        persisted = await session.flushSnapshotPersistence()
+        XCTAssertTrue(persisted)
+        XCTAssertTrue(session.acceptsConversationActions)
+    }
+
+    @MainActor
     func testBlockedDrainSuccessAfterHardDeleteDoesNotMutateOutbox() async throws {
         let gate = SendGate()
         let postCount = RequestCounter()
