@@ -60,6 +60,25 @@ describe('ProductConversationFixture', () => {
     expect(container).not.toHaveTextContent('Aggregate diagnostics');
   });
 
+  it.each([
+    ['mobile-context-exhausted', 'Context Window Full'],
+    ['awaiting-continuation', 'Compacting conversation...'],
+  ] as const)('mounts latest-row continuation presentation for %s', async (scenarioId, expectedText) => {
+    const scenario = getProductConversationScenario(scenarioId);
+    const { container } = render(<ProductConversationFixture scenario={scenario} />);
+
+    await waitFor(() => {
+      expect(container.querySelector(`[data-product-conversation-fixture-ready="${scenario.id}"]`)).not.toBeNull();
+    });
+
+    expect(screen.getByText(expectedText)).toBeInTheDocument();
+    if (scenarioId === 'mobile-context-exhausted') {
+      expect(screen.getByRole('button', { name: 'Continue' })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Edit first' })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Copy handoff' })).toBeInTheDocument();
+    }
+  });
+
   it('restores mutable API hooks after unmount', async () => {
     const scenario = getProductConversationScenario('mobile-open');
     const originalGetSnapshot = api.getProductConversationSnapshot;

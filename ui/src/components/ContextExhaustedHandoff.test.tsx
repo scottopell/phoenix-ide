@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { ContextExhaustedHandoff } from './ContextExhaustedHandoff';
+import { CompletedContinuationBoundary, ContextExhaustedHandoff } from './ContextExhaustedHandoff';
 
 const generated = 'Generated operational handoff';
 
@@ -89,6 +89,19 @@ describe('ContextExhaustedHandoff', () => {
     fireEvent.change(screen.getByRole('textbox', { name: 'Edit handoff' }), { target: { value: 'External refinement' } });
     fireEvent.click(screen.getByRole('button', { name: 'Copy edited handoff' }));
     expect(onCopy).toHaveBeenLastCalledWith('External refinement');
+  });
+
+  it('presents a completed continuation as a reviewable historical boundary', () => {
+    render(<CompletedContinuationBoundary summary={generated} />);
+    const boundary = screen.getByRole('region', { name: 'Conversation continuation boundary' });
+    const review = screen.getByText('Review handoff');
+
+    expect(boundary).toHaveTextContent('Conversation continued in the next segment');
+    expect(review.closest('details')).not.toHaveAttribute('open');
+    fireEvent.click(review);
+    expect(review.closest('details')).toHaveAttribute('open');
+    expect(boundary).toHaveTextContent(generated);
+    expect(screen.queryByRole('button', { name: 'Continue' })).not.toBeInTheDocument();
   });
 
   it('shows only navigation after a successor exists', () => {

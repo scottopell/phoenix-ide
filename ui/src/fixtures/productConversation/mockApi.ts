@@ -14,7 +14,7 @@ function latestConversation(scenario: ProductConversationScenario): Conversation
     updated_at: '2026-07-01T12:00:00Z',
     message_count: snapshot?.segments.at(-1)?.messages.length ?? 0,
     transcript_generation: 1,
-    state: { type: 'idle' },
+    state: scenario.latestConversationState ?? { type: 'idle' },
     archived: snapshot?.ordinary_lifecycle === 'history',
     browser_session_active: false,
     terminal_uses_tmux: false,
@@ -39,6 +39,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   const originalGetWorkScopeInventory = api.getWorkScopeInventory;
   const originalListForkProposals = api.listForkProposals;
   const originalReconcileAcceptedMessages = api.reconcileAcceptedMessages;
+  const originalContinueConversation = api.continueConversation;
   const originalFetch = globalThis.fetch;
   const OriginalWebSocket = globalThis.WebSocket;
   let snapshotRequestCount = 0;
@@ -128,6 +129,11 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
       message_id: messageId,
       status: 'steering_queued' as const,
     })),
+  });
+  api.continueConversation = async () => ({
+    conversation_id: 'fixture-successor',
+    slug: 'fixture-successor',
+    status: 'accepted',
   });
   globalThis.fetch = async (input, init) => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
@@ -268,6 +274,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     api.getWorkScopeInventory = originalGetWorkScopeInventory;
     api.listForkProposals = originalListForkProposals;
     api.reconcileAcceptedMessages = originalReconcileAcceptedMessages;
+    api.continueConversation = originalContinueConversation;
     globalThis.fetch = originalFetch;
     globalThis.WebSocket = OriginalWebSocket;
     for (const key of Object.keys(document.documentElement.dataset)) {

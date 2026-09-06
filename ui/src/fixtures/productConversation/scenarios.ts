@@ -235,6 +235,46 @@ export const productConversationScenarios = [
   {
     ...productConversationScenarioDefinitions[2],
     snapshot: makeSnapshot({
+      presentation: { kind: 'state', display_name: 'Exhausted aggregate', presentation_mode: 'context_exhausted' },
+      latest_transcript_row_id: 'row-exhausted',
+      writable_transcript_row_id: 'row-exhausted',
+      source: null,
+      work_identity: null,
+      chain_qa_compatibility: null,
+      segments: [
+        segment(1, 'row-exhausted', 'Exhausted latest segment', [
+          textMessage('exhausted-1', 1, 'user', 'Finish the implementation before context fills.'),
+          textMessage('exhausted-2', 2, 'agent', 'The implementation is ready for a fresh context.'),
+        ], null),
+      ],
+    }),
+    latestConversationState: {
+      type: 'context_exhausted',
+      summary: 'Preserve ProductConversation continuation controls and verify the mobile journey.',
+    },
+    chain: makeChain(),
+  },
+  {
+    ...productConversationScenarioDefinitions[3],
+    snapshot: makeSnapshot({
+      presentation: { kind: 'state', display_name: 'Compacting aggregate', presentation_mode: 'working' },
+      latest_transcript_row_id: 'row-compacting',
+      writable_transcript_row_id: 'row-compacting',
+      source: null,
+      work_identity: null,
+      chain_qa_compatibility: null,
+      segments: [
+        segment(1, 'row-compacting', 'Compacting latest segment', [
+          textMessage('compacting-1', 1, 'agent', 'Preparing a fresh-context handoff.'),
+        ], null),
+      ],
+    }),
+    latestConversationState: { type: 'awaiting_continuation', attempt: 1 },
+    chain: makeChain(),
+  },
+  {
+    ...productConversationScenarioDefinitions[4],
+    snapshot: makeSnapshot({
       ordinary_lifecycle: 'history',
       writable_transcript_row_id: null,
       presentation: { kind: 'state', display_name: 'Archived product history', presentation_mode: 'done' },
@@ -261,10 +301,10 @@ export const productConversationScenarios = [
     chain: makeChain(),
   },
   {
-    ...productConversationScenarioDefinitions[3],
+    ...productConversationScenarioDefinitions[5],
   },
   {
-    ...productConversationScenarioDefinitions[4],
+    ...productConversationScenarioDefinitions[6],
     initialSnapshotFailures: 1,
     snapshotError: 'Fixture failed to fetch product conversation snapshot',
     snapshot: makeSnapshot({
@@ -273,7 +313,7 @@ export const productConversationScenarios = [
     }),
   },
   {
-    ...productConversationScenarioDefinitions[5],
+    ...productConversationScenarioDefinitions[7],
     snapshot: makeLongSnapshot(),
     olderSnapshot: makeOlderPage(),
   },
