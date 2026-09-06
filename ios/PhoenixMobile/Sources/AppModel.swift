@@ -8,15 +8,15 @@ import UserNotifications
 
 @MainActor
 struct CoordinatorIdentityReceipt: Codable, Equatable, Sendable {
-    let configurationIdentity: APIConfigurationIdentity
+    let persistenceScope: PersistenceScopeIdentity
     let conversationId: String
 }
 
 @MainActor
 protocol CoordinatorIdentityStore {
-    func load(configurationIdentity: APIConfigurationIdentity) -> CoordinatorIdentityReceipt?
+    func load(persistenceScope: PersistenceScopeIdentity) -> CoordinatorIdentityReceipt?
     func save(_ receipt: CoordinatorIdentityReceipt)
-    func clear(configurationIdentity: APIConfigurationIdentity)
+    func clear(persistenceScope: PersistenceScopeIdentity)
     func clearAll()
 }
 
@@ -34,18 +34,18 @@ struct UserDefaultsCoordinatorIdentityStore: CoordinatorIdentityStore {
         UserDefaults.standard.set(data, forKey: defaultsKey)
     }
 
-    func load(configurationIdentity: APIConfigurationIdentity) -> CoordinatorIdentityReceipt? {
-        loadAll().first { $0.configurationIdentity == configurationIdentity }
+    func load(persistenceScope: PersistenceScopeIdentity) -> CoordinatorIdentityReceipt? {
+        loadAll().first { $0.persistenceScope == persistenceScope }
     }
 
     func save(_ receipt: CoordinatorIdentityReceipt) {
-        var receipts = loadAll().filter { $0.configurationIdentity != receipt.configurationIdentity }
+        var receipts = loadAll().filter { $0.persistenceScope != receipt.persistenceScope }
         receipts.append(receipt)
         saveAll(receipts)
     }
 
-    func clear(configurationIdentity: APIConfigurationIdentity) {
-        saveAll(loadAll().filter { $0.configurationIdentity != configurationIdentity })
+    func clear(persistenceScope: PersistenceScopeIdentity) {
+        saveAll(loadAll().filter { $0.persistenceScope != persistenceScope })
     }
 
     func clearAll() {
@@ -719,7 +719,7 @@ final class AppModel {
         notificationRouter.model = self
         UNUserNotificationCenter.current().delegate = notificationRouter
         coordinatorConversationId = api.flatMap {
-            self.coordinatorIdentityStore.load(configurationIdentity: $0.configurationIdentity)?.conversationId
+            self.coordinatorIdentityStore.load(persistenceScope: $0.configurationIdentity.persistenceScope)?.conversationId
         }
         finishStartupHydration()
     }
@@ -924,12 +924,12 @@ final class AppModel {
             detail.invalidateConfiguration()
         }
         if let previousConfigurationIdentity,
-           configuredAPI?.configurationIdentity != previousConfigurationIdentity
+           configuredAPI?.configurationIdentity.persistenceScope != previousConfigurationIdentity.persistenceScope
         {
-            coordinatorIdentityStore.clear(configurationIdentity: previousConfigurationIdentity)
+            coordinatorIdentityStore.clear(persistenceScope: previousConfigurationIdentity.persistenceScope)
         }
         coordinatorConversationId = configuredAPI.flatMap {
-            coordinatorIdentityStore.load(configurationIdentity: $0.configurationIdentity)?.conversationId
+            coordinatorIdentityStore.load(persistenceScope: $0.configurationIdentity.persistenceScope)?.conversationId
         }
         guard let configuredAPI else { return }
         for session in sessions.values { session.replaceAPI(configuredAPI) }
@@ -1051,6 +1051,16 @@ final class AppModel {
         listStore.registerTranscriptAlias(
             transcriptRowId: transcriptRowId,
             aggregateId: aggregateIdentity)
+    }
+
+    private func invalidateSuccessorCardinality(_ latestByAggregate: [String: String]) {
+        for (aggregateId, latestTranscriptRowId) in latestByAggregate {
+            guard let detail = productConversationDetails[aggregateId],
+                  let detailLatest = detail.latestTranscriptRowId,
+                  detailLatest != latestTranscriptRowId
+            else { continue }
+            detail.markCardinalityStaleAndRefreshIfActive()
+        }
     }
 
     private func handleAggregateHardDeleted(
@@ -1184,13 +1194,7 @@ final class AppModel {
         attentionEvidenceGeneration &+= 1
         let latestByAggregate = await listStore.refresh(api: api)
         if listStore.lastError == nil {
-            for (aggregateId, latestTranscriptRowId) in latestByAggregate {
-                guard let detail = productConversationDetails[aggregateId],
-                      let detailLatest = detail.latestTranscriptRowId,
-                      detailLatest != latestTranscriptRowId
-                else { continue }
-                detail.invalidateCardinalityForListSuccessor()
-            }
+            invalidateSuccessorCardinality(latestByAggregate)
             // The user is looking at fresh data — nothing here should nudge
             // them later.
             attention.seed(
@@ -1272,8 +1276,18 @@ final class AppModel {
     func replaceAPIForTesting(_ api: PhoenixAPI) {
         cancelPersistedOutboxDrainAuthority()
         self.api = api
-        coordinatorConversationId = coordinatorIdentityStore.load(configurationIdentity: api.configurationIdentity)?.conversationId
+        coordinatorConversationId = coordinatorIdentityStore.load(persistenceScope: api.configurationIdentity.persistenceScope)?.conversationId
         schedulePersistedOutboxDrain()
+    }
+
+    func rebuildTrustForTesting(_ trustSelfSigned: Bool) {
+        let currentServerURL = api?.configurationIdentity.serverURL ?? serverURLString
+        let currentGeneration = api?.configurationIdentity.credentialGeneration ?? credentialGeneration
+        performAtomicConfigurationMutation {
+            serverURLString = currentServerURL
+            credentialGeneration = currentGeneration
+            self.trustSelfSigned = trustSelfSigned
+        }
     }
 
     func triggerPersistedOutboxDrainIfNeededForTesting() {
@@ -1487,6 +1501,9 @@ final class AppModel {
               listStore.canApplyExternal(startedAt: listToken)
         else { return false }
         guard listStore.applyExternal(fresh, startedAt: listToken) else { return false }
+        invalidateSuccessorCardinality(Dictionary(uniqueKeysWithValues: fresh.map {
+            ($0.aggregateIdentity, $0.transcriptRowIdentity)
+        }))
         let isCurrent: @MainActor () -> Bool = { [weak self] in
             guard let self else { return false }
             return self.backgroundNudgesEnabled
@@ -1529,7 +1546,7 @@ final class AppModel {
                 }
                 coordinatorConversationId = conversation.id
                 coordinatorIdentityStore.save(CoordinatorIdentityReceipt(
-                    configurationIdentity: api.configurationIdentity,
+                    persistenceScope: api.configurationIdentity.persistenceScope,
                     conversationId: conversation.id))
                 listStore.upsert(conversation)
                 return conversation.id
@@ -1578,7 +1595,10 @@ final class AppModel {
         guard conversation.product_conversation_id != nil else {
             return "Close is unavailable until conversation type is confirmed."
         }
-        guard let snapshot = productConversationDetails[conversation.aggregateIdentity]?.snapshot else {
+        guard let detail = productConversationDetails[conversation.aggregateIdentity],
+              detail.closeCardinalityKnown,
+              let snapshot = detail.snapshot
+        else {
             return "Open the conversation before closing it."
         }
         guard snapshot.segments.count == 1 else {
@@ -1607,7 +1627,10 @@ final class AppModel {
                 $0.value.aggregateMemberTranscriptRowIds.contains(conversationId)
             })?.key
         if let aggregateId {
-            guard productConversationDetails[aggregateId]?.snapshot?.segments.count == 1 else {
+            guard let detail = productConversationDetails[aggregateId],
+                  detail.closeCardinalityKnown,
+                  detail.snapshot?.segments.count == 1
+            else {
                 lastActionError = "Close is unavailable for continued conversations."
                 return false
             }
@@ -1794,9 +1817,12 @@ final class AppModel {
         let notificationCenter = UNUserNotificationCenter.current()
         notificationCenter.removeAllDeliveredNotifications()
         notificationCenter.removeAllPendingNotificationRequests()
+        let configurationIdentity = api?.configurationIdentity
+        let ownedSessions = resetLocalStateForSignOut()
+        await removeLocalStateForSignOut(ownedSessions: ownedSessions)
         UserDefaults.standard.removeObject(forKey: Self.lastCwdKey)
-        if let configurationIdentity = api?.configurationIdentity {
-            coordinatorIdentityStore.clear(configurationIdentity: configurationIdentity)
+        if let configurationIdentity {
+            coordinatorIdentityStore.clear(persistenceScope: configurationIdentity.persistenceScope)
         }
         coordinatorConversationId = nil
         CertPinStore.forget()
@@ -1806,8 +1832,6 @@ final class AppModel {
         credentialGeneration = Self.mintedCredentialGeneration()
         serverURLString = ""
         trustSelfSigned = false
-        let ownedSessions = resetLocalStateForSignOut()
-        await removeLocalStateForSignOut(ownedSessions: ownedSessions)
     }
 
     private func resetLocalStateForSignOut() -> [ConversationSession] {
