@@ -372,7 +372,16 @@ function renderHistoricalUnit(
       const text = (unit.message.content as { text?: string })?.text;
       if (!text) return null;
       if (displayData?.productHistoricalHandoff) {
-        return <CompletedContinuationBoundary summary={text} />;
+        const revealedSummary = activeHighlight?.owner === 'message-text'
+          ? renderHighlightedText(text, activeHighlight.start, activeHighlight.end)
+          : undefined;
+        return (
+          <CompletedContinuationBoundary
+            summary={text}
+            revealedSummary={revealedSummary}
+            revealSummary={revealedSummary !== undefined}
+          />
+        );
       }
       return (
         <div className="system-message">

@@ -104,6 +104,21 @@ describe('ContextExhaustedHandoff', () => {
     expect(screen.queryByRole('button', { name: 'Continue' })).not.toBeInTheDocument();
   });
 
+  it('reveals a completed handoff when transcript Find selects its summary', () => {
+    render(
+      <CompletedContinuationBoundary
+        summary={generated}
+        revealedSummary={<mark>operational</mark>}
+        revealSummary
+      />,
+    );
+
+    const review = screen.getByText('Review handoff');
+    expect(review.closest('details')).toHaveAttribute('open');
+    expect(screen.getByText('operational').tagName).toBe('MARK');
+    expect(screen.getByText('operational').closest('[data-fragment-id="message-text"]')).not.toBeNull();
+  });
+
   it('shows only navigation after a successor exists', () => {
     renderHandoff({ continuedInConvId: 'successor-1' });
     expect(screen.getByRole('button', { name: 'Open continuation' })).toBeInTheDocument();

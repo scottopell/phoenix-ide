@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import './ContextExhaustedHandoff.css';
 
 const AlertTriangle = () => (
@@ -80,10 +80,17 @@ function clearEditDraft(parentId: string): boolean {
 
 interface CompletedContinuationBoundaryProps {
   summary: string;
+  revealedSummary?: ReactNode;
+  revealSummary?: boolean;
   onOpenContinuation?: () => void;
 }
 
-export function CompletedContinuationBoundary({ summary, onOpenContinuation }: CompletedContinuationBoundaryProps) {
+export function CompletedContinuationBoundary({
+  summary,
+  revealedSummary,
+  revealSummary = false,
+  onOpenContinuation,
+}: CompletedContinuationBoundaryProps) {
   return (
     <section className="context-exhausted-handoff context-exhausted-banner context-exhausted-banner--continued" aria-label="Conversation continuation boundary">
       <div className="context-exhausted-header context-exhausted-header--static">
@@ -91,9 +98,11 @@ export function CompletedContinuationBoundary({ summary, onOpenContinuation }: C
         <span className="context-exhausted-title">Context compacted</span>
         <span className="context-exhausted-subtitle">Conversation continued in the next segment</span>
       </div>
-      <details className="context-exhausted-summary context-exhausted-summary--historical">
+      <details className="context-exhausted-summary context-exhausted-summary--historical" open={revealSummary || undefined}>
         <summary>Review handoff</summary>
-        <pre className="context-exhausted-content">{summary}</pre>
+        <pre className="context-exhausted-content" data-fragment-id="message-text">
+          {revealedSummary ?? summary}
+        </pre>
       </details>
       {onOpenContinuation ? (
         <button type="button" className="context-exhausted-continue" onClick={onOpenContinuation}>
