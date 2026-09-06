@@ -413,13 +413,17 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
         legacyScope: PersistenceScopeIdentity?
     ) async -> Bool {
         let snapshotSource = directory.appendingPathComponent("conv-\(conversationId)").appendingPathExtension("json")
+        let snapshotWriter = context.writer(
+            destinationURL: snapshotSource,
+            version: ConversationSession.snapshotSchemaVersion)
+        let snapshotRemovalRevision = snapshotWriter.reserveRevision()
         switch DiskStore.loadVersionedResult(
             ConversationSession.PersistedSnapshot.self,
             source: snapshotSource,
             version: ConversationSession.snapshotSchemaVersion)
         {
         case .missing:
-            break
+            await snapshotWriter.remove(revision: snapshotRemovalRevision)
         case .value(let snapshot):
             let currentAuthorityMatches = snapshot.authoritative?.configurationIdentity.persistenceScope == configurationIdentity.persistenceScope
                 && snapshot.authoritative?.aggregateAuthority == aggregateAuthority
@@ -429,29 +433,35 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
             if snapshot.conversation?.id == conversationId,
                currentAuthorityMatches || provenLegacyMatches
             {
-                let writer = context.writer(destinationURL: snapshotSource, version: ConversationSession.snapshotSchemaVersion)
-                await writer.remove(revision: writer.reserveRevision())
+                await snapshotWriter.remove(revision: snapshotRemovalRevision)
+            } else {
+                await snapshotWriter.fence(revision: snapshotRemovalRevision)
             }
         case .incompatible, .unreadable:
+            await snapshotWriter.fence(revision: snapshotRemovalRevision)
             return false
         }
 
         let outboxSource = directory.appendingPathComponent("outbox-\(conversationId)").appendingPathExtension("json")
+        let outboxWriter = context.writer(destinationURL: outboxSource, version: Outbox.schemaVersion)
+        let outboxRemovalRevision = outboxWriter.reserveRevision()
         switch DiskStore.loadVersionedResult(
             PersistedOutboxEnvelope.self,
             source: outboxSource,
             version: Outbox.schemaVersion)
         {
         case .missing:
-            break
+            await outboxWriter.remove(revision: outboxRemovalRevision)
         case .value(let envelope):
             if envelope.scope == configurationIdentity.persistenceScope,
                envelope.aggregateAuthority == aggregateAuthority
             {
-                let writer = context.writer(destinationURL: outboxSource, version: Outbox.schemaVersion)
-                await writer.remove(revision: writer.reserveRevision())
+                await outboxWriter.remove(revision: outboxRemovalRevision)
+            } else {
+                await outboxWriter.fence(revision: outboxRemovalRevision)
             }
         case .incompatible, .unreadable:
+            await outboxWriter.fence(revision: outboxRemovalRevision)
             return false
         }
 
@@ -1448,6 +1458,12 @@ final class AppModel {
                     configurationIdentity: api.configurationIdentity,
                     aggregateAuthority: aggregateId,
                     legacyScope: self.legacySnapshotPersistenceScope)
+            },
+            provenCurrentAuthorityMemberIds: { [weak self] in
+                guard let self, let api = self.api else { return [] }
+                return self.conversationPersistenceStore.persistedConversationIds(
+                    aggregateId: aggregateId,
+                    scope: api.configurationIdentity.persistenceScope)
             },
             handleDefinitiveNotFound: { [weak self] transcriptRowId, segmentTranscriptRowIds in
                 await self?.handleAggregateHardDeleted(
