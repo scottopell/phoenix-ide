@@ -18,6 +18,12 @@ DesktopMultiSegmentQaWork.storyName = 'desktop-multi-segment-qa-work';
 export const MobileOpen = storyFor('mobile-open');
 MobileOpen.storyName = 'mobile-open';
 
+export const MobileContextExhausted = storyFor('mobile-context-exhausted');
+MobileContextExhausted.storyName = 'mobile-context-exhausted';
+
+export const AwaitingContinuation = storyFor('awaiting-continuation');
+AwaitingContinuation.storyName = 'awaiting-continuation';
+
 export const HistoryReadOnly = storyFor('history-read-only');
 HistoryReadOnly.storyName = 'history-read-only';
 

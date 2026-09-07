@@ -56,6 +56,39 @@ async function assertTranscriptGeometry(page, id, viewport, theme) {
   measurements.push({ id, viewport: viewport.name, theme, ...geometry });
 }
 
+async function assertContinuationHandoff(page, viewport) {
+  const handoff = page.locator('.context-exhausted-handoff');
+  await handoff.waitFor({ state: 'visible' });
+  const actions = ['Continue', 'Edit first', 'Copy handoff'];
+  for (const name of actions) {
+    const button = handoff.getByRole('button', { name });
+    await button.scrollIntoViewIfNeeded();
+    const box = await button.boundingBox();
+    if (!box || box.width <= 0 || box.height < 44 || box.x < 0 || box.y < 0
+      || box.x + box.width > viewport.width || box.y + box.height > viewport.height) {
+      throw new Error(`${name} is not visibly reachable at ${viewport.width}x${viewport.height}: ${JSON.stringify(box)}`);
+    }
+  }
+  await handoff.getByRole('button', { name: 'Copy handoff' }).click();
+  await handoff.getByRole('button', { name: 'Edit first' }).click();
+  const editor = handoff.getByRole('textbox', { name: 'Handoff' });
+  await editor.scrollIntoViewIfNeeded();
+  const editorBox = await editor.boundingBox();
+  if (!editorBox || editorBox.y < 0 || editorBox.y + editorBox.height > viewport.height) {
+    throw new Error(`handoff review editor is not reachable: ${JSON.stringify(editorBox)}`);
+  }
+  journeys.push(`continuation ${viewport.name}: Continue, review, and Copy are viewport-reachable at ${viewport.width}x${viewport.height}`);
+}
+
+async function assertHistoricalBoundary(page) {
+  const boundary = page.getByRole('region', { name: 'Conversation continuation boundary' }).first();
+  await boundary.waitFor({ state: 'visible' });
+  await boundary.getByText('Conversation continued in the next segment').waitFor();
+  const composer = page.locator('[data-testid="product-conversation-composer"] #message-input');
+  await composer.waitFor({ state: 'visible' });
+  journeys.push('completed predecessor: typed compacted boundary remains historical while latest successor composer stays active');
+}
+
 async function assertViewer(page, viewport, outDir) {
   const message = page.locator('.virtual-transcript__row .message.user, .virtual-transcript__row .message.agent').filter({ hasText: /./ }).first();
   await message.click({ button: 'right' });
@@ -152,7 +185,10 @@ async function assertLongHistory(page) {
   await page.getByText('Final status summary: deterministic fixture transcript content for chronology validation.').waitFor();
   await transcript.evaluate((element) => element.scrollTo({ top: 0 }));
   await page.getByText('Older deep-link target from the real cursor page.').waitFor();
-  await page.getByText('A historical handoff boundary survives pagination.').waitFor();
+  const boundary = page.getByRole('region', { name: 'Conversation continuation boundary' }).filter({ hasText: 'A historical handoff boundary survives pagination.' });
+  await boundary.waitFor({ state: 'visible' });
+  await boundary.getByText('Review handoff').click();
+  await boundary.getByText('A historical handoff boundary survives pagination.').waitFor({ state: 'visible' });
   journeys.push('long transcript: deep-linked older row, controlled scroll to newest row, and paginated handoff boundary visible');
 }
 
@@ -223,6 +259,19 @@ runSurfaceCapture({
       await assertViewer(page, viewport, outDir);
       await assertReconnect(page);
       await assertComposer(page);
+    }
+    if (id === 'mobile-context-exhausted' && viewport.name === 'mobile-dark') {
+      await assertContinuationHandoff(page, viewport);
+    }
+    if (id === 'awaiting-continuation' && viewport.name === 'mobile-dark') {
+      await page.getByText('Compacting conversation...', { exact: true }).waitFor({ state: 'visible' });
+      if (await page.locator('[data-testid="product-conversation-composer"] #message-input').count()) {
+        throw new Error('awaiting continuation exposed an ordinary composer');
+      }
+      journeys.push('awaiting continuation: compacting progress replaces the aggregate composer');
+    }
+    if (id === 'desktop-multi-segment-qa-work' && viewport.name === 'desktop-dark') {
+      await assertHistoricalBoundary(page);
     }
     if (id === 'desktop-multi-segment-qa-work' && viewport.name === 'desktop-light') {
       await assertViewer(page, viewport, outDir);

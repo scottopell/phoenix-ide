@@ -33,6 +33,7 @@ import {
   type VirtualTranscriptRangeChange,
 } from './VirtualTranscript';
 import type { Message, ConversationState } from '../api';
+import { CompletedContinuationBoundary } from './ContextExhaustedHandoff';
 import type { PendingUserMessage } from '../hooks';
 import {
   UserMessage,
@@ -366,12 +367,22 @@ function renderHistoricalUnit(
         />
       );
     case 'system': {
-      const displayData = unit.message.display_data as
-        | { hidden?: boolean }
-        | null;
+      const displayData = unit.message.display_data as ProductHistoricalHandoffDisplayData | null;
       if (displayData?.hidden) return null;
       const text = (unit.message.content as { text?: string })?.text;
       if (!text) return null;
+      if (displayData?.productHistoricalHandoff) {
+        const revealedSummary = activeHighlight?.owner === 'message-text'
+          ? renderHighlightedText(text, activeHighlight.start, activeHighlight.end)
+          : undefined;
+        return (
+          <CompletedContinuationBoundary
+            summary={text}
+            revealedSummary={revealedSummary}
+            revealSummary={revealedSummary !== undefined}
+          />
+        );
+      }
       return (
         <div className="system-message">
           <span className="system-message-text" data-fragment-id="message-text">
@@ -407,6 +418,16 @@ function renderTailUnit(
         </RenderProfiler>
       );
   }
+}
+
+interface ProductHistoricalHandoffDisplayData {
+  hidden?: boolean;
+  productHistoricalHandoff?: {
+    predecessor_transcript_row_id: string;
+    successor_transcript_row_id: string;
+    continuation_message_id: string;
+    segment_ordinal: number;
+  };
 }
 
 function renderUnit(
