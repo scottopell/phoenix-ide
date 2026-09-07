@@ -6840,7 +6840,7 @@ where
                 phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable
             };
         let mut system_prompt = if is_coordinator {
-            crate::system_prompt::build_coordinator_system_prompt(llm_language, explore_bash)
+            crate::system_prompt::build_coordinator_system_prompt(llm_language)
         } else {
             build_system_prompt(
                 working_dir

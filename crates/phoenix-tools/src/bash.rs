@@ -57,19 +57,14 @@ pub struct ValidatedBashSpawnTarget {
     pub lifecycle_scope: phoenix_core::work_scope::WorkScopeId,
 }
 
-#[derive(Debug, Clone)]
-pub struct SharedSandboxedBashRequest {
-    pub input: Value,
-    pub spawn_target: Option<ValidatedBashSpawnTarget>,
-}
-
-impl SandboxedBashTool {
-    pub async fn run_shared_sandboxed(
+impl BashTool {
+    pub async fn run_explicit_target(
         &self,
-        request: SharedSandboxedBashRequest,
+        input: Value,
+        target: ValidatedBashSpawnTarget,
         ctx: ToolContext,
     ) -> ToolOutput {
-        operations::dispatch_shared_sandboxed(request, ctx).await
+        operations::dispatch_explicit_target(input, target, ctx).await
     }
 }
 
@@ -783,10 +778,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_sandboxed_explicit_target_run_uses_resolved_cwd_and_owner_scope_without_mutating_context(
-    ) {
+    async fn explicit_target_run_uses_resolved_cwd_and_owner_scope_without_mutating_context() {
         let registry = Arc::new(BashHandleRegistry::new());
-        let tool = SandboxedBashTool;
+        let tool = BashTool;
         let original_dir = temp_dir();
         let original = ToolContext::new(
             CancellationToken::new(),
@@ -805,14 +799,29 @@ mod tests {
         let original =
             original.with_resource_authority(phoenix_core::work_scope::ResourceAuthority::Work);
 
+        let marker = explicit_dir.path().join("coordinator-marker");
+        let command = format!("printf trusted > '{}'", marker.display());
+        let completed = tool
+            .run_explicit_target(
+                json!({"op": "run", "cmd": command, "wait_seconds": 5}),
+                ValidatedBashSpawnTarget {
+                    working_dir: explicit_dir.path().to_path_buf(),
+                    lifecycle_scope: explicit_scope.clone(),
+                },
+                original.clone(),
+            )
+            .await;
+        assert!(completed.is_success(), "{}", completed.output());
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "trusted");
+        assert!(!original_dir.join("coordinator-marker").exists());
+        assert_eq!(original.working_dir(), original_dir.as_path());
+
         let running = tool
-            .run_shared_sandboxed(
-                SharedSandboxedBashRequest {
-                    input: json!({"op": "run", "cmd": "sleep 30", "wait_seconds": 0}),
-                    spawn_target: Some(ValidatedBashSpawnTarget {
-                        working_dir: explicit_dir.path().to_path_buf(),
-                        lifecycle_scope: explicit_scope.clone(),
-                    }),
+            .run_explicit_target(
+                json!({"op": "run", "cmd": "sleep 30", "wait_seconds": 0}),
+                ValidatedBashSpawnTarget {
+                    working_dir: explicit_dir.path().to_path_buf(),
+                    lifecycle_scope: explicit_scope.clone(),
                 },
                 original.clone(),
             )
@@ -836,13 +845,7 @@ mod tests {
             phoenix_core::work_scope::ResourceAuthority::Work,
         );
         let owner_attempt = tool
-            .run_shared_sandboxed(
-                SharedSandboxedBashRequest {
-                    input: json!({"op": "peek", "handle": handle.clone()}),
-                    spawn_target: None,
-                },
-                owner_ctx,
-            )
+            .run(json!({"op": "peek", "handle": handle.clone()}), owner_ctx)
             .await;
         assert!(
             !owner_attempt.is_success(),
@@ -856,11 +859,8 @@ mod tests {
             .iter()
             .any(|owned| owned.handle.handle_id.as_str() == handle));
         let _ = tool
-            .run_shared_sandboxed(
-                SharedSandboxedBashRequest {
-                    input: json!({"op": "kill", "handle": handle, "signal": "KILL"}),
-                    spawn_target: None,
-                },
+            .run(
+                json!({"op": "kill", "handle": handle, "signal": "KILL"}),
                 original.clone(),
             )
             .await;

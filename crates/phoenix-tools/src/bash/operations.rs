@@ -32,7 +32,7 @@ use super::registry::{BashHandleError, BashTerminalEffect, LiveHandleSummary};
 use super::ring::{RingLine, WindowView};
 use super::sandbox::ExploreSandboxLauncher;
 use super::types::{BashOp, BashToolInput};
-use super::{SharedSandboxedBashRequest, ValidatedBashSpawnTarget};
+use super::ValidatedBashSpawnTarget;
 use crate::{ResourceScopeKey, ToolContext, ToolOutput};
 use phoenix_core::domain::bash_progress::{BashProgressLine, BashToolProgress};
 use phoenix_core::domain::tool_wire::{
@@ -420,11 +420,11 @@ fn resolve_wait_seconds(raw: Option<i64>) -> Result<u64, BashError> {
 // Top-level dispatch
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum BashSpawnMode {
     Direct,
     ExploreReadOnly,
-    SharedReadOnly,
+    ExplicitTarget(ValidatedBashSpawnTarget),
 }
 
 #[derive(Debug, Clone)]
@@ -435,9 +435,9 @@ struct SpawnContext {
 }
 
 impl BashSpawnMode {
-    fn authority(self) -> phoenix_core::work_scope::ResourceAuthority {
+    fn authority(&self) -> phoenix_core::work_scope::ResourceAuthority {
         match self {
-            Self::Direct | Self::SharedReadOnly => {
+            Self::Direct | Self::ExplicitTarget(_) => {
                 phoenix_core::work_scope::ResourceAuthority::Work
             }
             Self::ExploreReadOnly => phoenix_core::work_scope::ResourceAuthority::Restricted,
@@ -447,31 +447,25 @@ impl BashSpawnMode {
 
 /// Run a bash request end-to-end and produce the `ToolOutput`.
 pub async fn dispatch(input: Value, ctx: ToolContext) -> ToolOutput {
-    dispatch_with_spawn_mode(input, ctx, BashSpawnMode::Direct, None).await
+    dispatch_with_spawn_mode(input, ctx, BashSpawnMode::Direct).await
 }
 
 pub async fn dispatch_sandboxed(input: Value, ctx: ToolContext) -> ToolOutput {
-    dispatch_with_spawn_mode(input, ctx, BashSpawnMode::ExploreReadOnly, None).await
+    dispatch_with_spawn_mode(input, ctx, BashSpawnMode::ExploreReadOnly).await
 }
 
-pub async fn dispatch_shared_sandboxed(
-    request: SharedSandboxedBashRequest,
+pub async fn dispatch_explicit_target(
+    input: Value,
+    target: ValidatedBashSpawnTarget,
     ctx: ToolContext,
 ) -> ToolOutput {
-    dispatch_with_spawn_mode(
-        request.input,
-        ctx,
-        BashSpawnMode::SharedReadOnly,
-        request.spawn_target,
-    )
-    .await
+    dispatch_with_spawn_mode(input, ctx, BashSpawnMode::ExplicitTarget(target)).await
 }
 
 async fn dispatch_with_spawn_mode(
     input: Value,
     ctx: ToolContext,
     spawn_mode: BashSpawnMode,
-    spawn_target: Option<ValidatedBashSpawnTarget>,
 ) -> ToolOutput {
     // Dispatch kind, not caller convention, selects effective Bash authority.
     let ctx = ctx.with_resource_authority(spawn_mode.authority());
@@ -487,23 +481,16 @@ async fn dispatch_with_spawn_mode(
             wait_seconds,
             read_args,
         } => {
-            let spawn_context = match spawn_mode {
+            let spawn_context = match &spawn_mode {
                 BashSpawnMode::Direct | BashSpawnMode::ExploreReadOnly => SpawnContext {
                     working_dir: ctx.working_dir().to_path_buf(),
                     lifecycle_scope: ctx.work_scope.clone(),
                     terminal_effect: BashTerminalEffect::InventoryAndBranchReconcile,
                 },
-                BashSpawnMode::SharedReadOnly => match spawn_target {
-                    Some(target) => SpawnContext {
-                        working_dir: target.working_dir,
-                        lifecycle_scope: ResourceScopeKey::Work(target.lifecycle_scope),
-                        terminal_effect: BashTerminalEffect::InventoryOnly,
-                    },
-                    None => SpawnContext {
-                        working_dir: ctx.working_dir().to_path_buf(),
-                        lifecycle_scope: ctx.work_scope.clone(),
-                        terminal_effect: BashTerminalEffect::InventoryOnly,
-                    },
+                BashSpawnMode::ExplicitTarget(target) => SpawnContext {
+                    working_dir: target.working_dir.clone(),
+                    lifecycle_scope: ResourceScopeKey::Work(target.lifecycle_scope.clone()),
+                    terminal_effect: BashTerminalEffect::InventoryOnly,
                 },
             };
             run_run(
@@ -594,7 +581,7 @@ async fn run_run(
         spawn_context,
         reservation.handle_id().clone(),
         ring_bytes_cap,
-        spawn_mode,
+        &spawn_mode,
     ) {
         Ok((handle, spawned)) => {
             let inserted = match registry
@@ -712,7 +699,7 @@ fn spawn_child(
     spawn_context: &SpawnContext,
     handle_id: HandleId,
     ring_bytes_cap: usize,
-    spawn_mode: BashSpawnMode,
+    spawn_mode: &BashSpawnMode,
 ) -> Result<(Arc<Handle>, SpawnedProcessGroup), String> {
     // Per bash.allium @guidance on HandleSpawned:
     //   "Spawn child via Command::new(\"bash\").args([\"-c\", cmd]) with
@@ -735,7 +722,7 @@ fn spawn_child(
     let mut sandbox_scratch_dir = None;
     let launch_uuid = uuid::Uuid::new_v4().to_string();
     let mut command = match spawn_mode {
-        BashSpawnMode::Direct => {
+        BashSpawnMode::Direct | BashSpawnMode::ExplicitTarget(_) => {
             let mut command = Command::new("bash");
             command
                 .arg("-c")
@@ -743,7 +730,7 @@ fn spawn_child(
                 .current_dir(&spawn_context.working_dir);
             command
         }
-        BashSpawnMode::ExploreReadOnly | BashSpawnMode::SharedReadOnly => {
+        BashSpawnMode::ExploreReadOnly => {
             let sandbox_command = ExploreSandboxLauncher::command(cmd, &spawn_context.working_dir)?;
             sandbox_scratch_dir = Some(sandbox_command.scratch_dir);
             Command::from(sandbox_command.command)
@@ -1984,7 +1971,7 @@ mod tests {
             &spawn_context,
             HandleId::new("b-launch-identity"),
             RING_BUFFER_BYTES,
-            BashSpawnMode::Direct,
+            &BashSpawnMode::Direct,
         )
         .expect("spawn child");
         let (mut child, scratch_dir) = spawned.into_waiter_parts();
@@ -2041,7 +2028,7 @@ mod tests {
             &spawn_context,
             HandleId::new("b-drop-process-group"),
             RING_BUFFER_BYTES,
-            BashSpawnMode::Direct,
+            &BashSpawnMode::Direct,
         )
         .expect("spawn process group");
         let pgid = spawned.pgid();
@@ -2396,9 +2383,14 @@ mod tests {
     }
 
     #[test]
-    fn shared_read_only_handles_are_visible_across_scope_actors() {
+    fn explicit_target_handles_are_visible_across_scope_actors() {
+        let mode = BashSpawnMode::ExplicitTarget(ValidatedBashSpawnTarget {
+            working_dir: std::path::PathBuf::from("/tmp"),
+            lifecycle_scope: phoenix_core::work_scope::WorkScopeId::parse("work-scope")
+                .expect("work scope"),
+        });
         assert_eq!(
-            BashSpawnMode::SharedReadOnly.authority(),
+            mode.authority(),
             phoenix_core::work_scope::ResourceAuthority::Work
         );
         assert_eq!(
@@ -2407,12 +2399,9 @@ mod tests {
         );
         let successor = phoenix_core::work_scope::EffectiveResourceAccess::new(
             "coordinator-successor",
-            BashSpawnMode::SharedReadOnly.authority(),
+            mode.authority(),
         );
-        assert!(successor.can_control(
-            "coordinator-predecessor",
-            BashSpawnMode::SharedReadOnly.authority()
-        ));
+        assert!(successor.can_control("coordinator-predecessor", mode.authority()));
     }
 
     #[tokio::test]

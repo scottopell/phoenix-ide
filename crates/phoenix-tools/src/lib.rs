@@ -27,7 +27,7 @@ pub use bash::{
     BashHandleError, BashHandleRegistry, BashLifecycleEvent, BashLifecyclePhase, BashLifecycleSink,
     BashOp, BashTerminalEffect, BashTool, BashToolInput,
     ResourceScopeKeyHandles as BashResourceScopeKeyHandles, SandboxedBashTool,
-    SharedSandboxedBashRequest, ValidatedBashSpawnTarget,
+    ValidatedBashSpawnTarget,
 };
 pub use browser::{
     BrowserClearConsoleLogsTool, BrowserClickTool, BrowserError, BrowserEvalTool,
