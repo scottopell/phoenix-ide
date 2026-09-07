@@ -138,7 +138,8 @@ THE SYSTEM MAY provide exactly one cross-conversation mutation capability to a w
 
 THE cross-conversation message capability SHALL NOT accept images, files, skills, filesystem references, user-agent metadata, lifecycle commands, or batch targets
 
-THE SYSTEM SHALL NOT provide writable filesystem, browser, MCP, task drafting, task approval, project, workspace, conversation creation, source-scoped retrieval for another conversation's private follow-up surface, or other lifecycle mutation tools to the Coordinator
+THE SYSTEM SHALL NOT provide writable filesystem tools to the Coordinator other than the singleton Coordinator's explicitly WorkScope-targeted Bash capability
+AND SHALL NOT provide browser, MCP, task drafting, task approval, project, workspace, conversation creation, source-scoped retrieval for another conversation's private follow-up surface, or other lifecycle mutation tools to the Coordinator
 
 ---
 

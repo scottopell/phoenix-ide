@@ -329,6 +329,14 @@ mod tests {
         assert!(prompt.contains("bash commands are unsandboxed"));
         assert!(prompt.contains("Every bash run requires an active work_scope_id"));
         assert!(prompt.contains("there is no default repository or cwd"));
+        assert!(prompt.contains(
+            "mutate the selected WorkScope only through unsandboxed Bash with its explicit active work_scope_id"
+        ));
+        assert!(prompt.contains(
+            "no dedicated project, task, workspace, approval, or conversation-lifecycle mutation tools"
+        ));
+        assert!(!prompt.contains("cannot mutate files, repositories"));
+        assert!(!prompt.contains("cannot mutate projects, tasks, workspaces"));
         assert!(!prompt.contains("Bash is unavailable"));
         assert!(!prompt.contains("Explore OS sandbox"));
     }
@@ -339,7 +347,13 @@ mod tests {
         assert!(prompt.contains("You Phoenix Coordinator"));
         assert!(!prompt.contains("You are Phoenix Coordinator"));
         assert!(prompt.contains("send_conversation_message"));
-        assert!(prompt.contains("No change file, repo, project, task"));
+        assert!(prompt.contains(
+            "May change selected WorkScope only with unsandboxed bash and its explicit active work_scope_id"
+        ));
+        assert!(prompt.contains(
+            "No separate project, task, workspace, approval, or talk-lifecycle change tool"
+        ));
+        assert!(!prompt.contains("No change project, task, workspace"));
         assert!(prompt.contains("bash run need active work_scope_id"));
         assert!(prompt.contains("No default repo or cwd"));
         assert!(prompt.contains("Never pretend watch in background"));

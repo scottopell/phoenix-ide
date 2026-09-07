@@ -4,7 +4,7 @@
 
 Phoenix Coordinator is one durable, chat-first Phoenix-wide conversation for surveying unrelated work, inspecting relevant history, and sending useful text guidance to existing conversations. Phoenix supplies a transparent bounded relational snapshot on every Coordinator turn. Both the Coordinator and write-capable ordinary ProductConversations receive bounded natural-language history search, conversation reading, read-only operational SQLite, and singular cross-conversation messaging; stable reference resolution remains Coordinator-only.
 
-The Coordinator has one mutation capability: a singular text-message action targeting an existing non-Coordinator conversation. That action reuses the normal chat acceptance authority, so each target independently reports delivered, queued as steering, or rejected. Acceptance never implies that the receiving agent understood, acknowledged, or completed the instruction.
+The Coordinator has two mutation capabilities: singular text-message delivery to an existing non-Coordinator conversation, and unsandboxed Bash targeted to an explicit active WorkScope. Message delivery reuses the normal chat acceptance authority, so each target independently reports delivered, queued as steering, or rejected. Acceptance never implies that the receiving agent understood, acknowledged, or completed the instruction.
 
 The `/global` surface is the standard transcript and composer without a separate work view. A compact composer action requests a read-only current-activity briefing through the normal message path while preserving the user's draft.
 
@@ -40,7 +40,7 @@ Coverage verifies operator-level application-data reads, read-only SQLite author
 
 ## Scope
 
-The scope is transparent relational orientation, one durable chat-only Coordinator conversation, bounded global reads, WorkScope-targeted read-only local investigation through the existing Explore sandbox, singular text-message delivery to existing non-Coordinator conversations, and a compact read-only briefing action.
+The scope is transparent relational orientation, one durable chat-only Coordinator conversation, bounded global reads, explicitly WorkScope-targeted local operation through unsandboxed Bash, singular text-message delivery to existing non-Coordinator conversations, and a compact read-only briefing action.
 
 The Coordinator runs only on user turns. It does not monitor work in the background, create conversations, manage a global objective, retain attention history, or infer recipient understanding from message acceptance.
 
@@ -50,6 +50,6 @@ The Coordinator runs only on user turns. It does not monitor work in the backgro
 - Phoenix-wide tools for restricted planning conversations or sub-agents.
 - Images, files, skills, user-agent metadata, or lifecycle commands in cross-conversation messages.
 - Batch-action transactions or atomic fan-out.
-- Conversation creation, task lifecycle, approval, repository, filesystem, or workspace mutation from the Coordinator.
+- Dedicated conversation-creation, task-lifecycle, approval, repository, filesystem, or workspace mutation tools for the Coordinator; selected-WorkScope mutation remains available only through explicitly targeted Bash.
 - Background monitoring or proactive intervention without a user turn.
 - A separate transcript/composer runtime for the Coordinator.
