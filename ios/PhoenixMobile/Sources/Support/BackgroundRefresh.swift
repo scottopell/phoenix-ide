@@ -9,7 +9,7 @@ import Foundation
 /// this tier existed.
 enum BackgroundRefresh {
     /// Must match BGTaskSchedulerPermittedIdentifiers in project.yml.
-    static let taskIdentifier = "com.phoenix.mobile.refresh"
+    static let taskIdentifier = "com.scottopell.phoenix-ide.refresh"
 
     /// Call exactly once, before app launch completes (App.init).
     static func register(model: AppModel) {
