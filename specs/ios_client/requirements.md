@@ -53,6 +53,17 @@ AND offer explicit Retry and Discard affordances
 WHEN the app restarts with queued entries on disk
 THE SYSTEM SHALL rehydrate only entries belonging to the viewed conversation
 
+WHEN a released schema-v1 conversation snapshot lacks authority metadata
+AND persisted server and legacy credential provenance establish the current installation persistence scope
+THE SYSTEM SHALL render the cached conversation and messages read-only
+AND SHALL NOT mint an authoritative snapshot receipt
+AND SHALL NOT enable queued-message delivery
+UNTIL a current authoritative initialization rewrites the snapshot with exact authority
+
+WHEN that installation persistence scope cannot be established
+THE SYSTEM SHALL treat the legacy snapshot as ineligible cache
+AND SHALL surface the load failure instead of an empty cached fallback
+
 The queue implements the client-side delivery contract of
 `specs/user_message_queue/user_message_queue.allium` (enqueue-before-POST,
 `message_id = localId`, reconciliation against either an exact authoritative
@@ -148,6 +159,12 @@ WHEN a conversation hard-delete event arrives
 OR a reconnect receives a definitive not-found response for that conversation
 THE SYSTEM SHALL remove its transcript, snapshot, outbox, and list entry
 AND disable further interaction with the deleted conversation
+AND SHALL reserve removal revisions for every destination registered in the shared persistence context before reset completes
+AND SHALL prevent a pending write from publishing protected files after that reset
+
+WHEN durable hard-delete recovery identifies protected conversation data
+THE SYSTEM SHALL use normalized server origin and credential generation as its persistent scope
+AND SHALL exclude transport-only trust settings from that scope
 
 **Rationale:** Mirrors the web client's connection machine against the
 server contract in `specs/sse_wire/sse_wire.allium`; the init-as-resync
@@ -388,6 +405,16 @@ WHEN a Close conversation request is in flight
 THE SYSTEM SHALL disable new message submission for that conversation
 UNTIL Close conversation fails or completes
 
+WHEN an authoritative ProductConversation snapshot contains exactly one transcript segment
+THE SYSTEM SHALL offer Close through that segment's conversation lifecycle endpoint
+
+WHEN an authoritative ProductConversation snapshot contains multiple transcript segments
+THE SYSTEM SHALL NOT invoke a per-conversation lifecycle endpoint for Close
+AND SHALL omit or disable Close with a concise unavailable explanation
+
+WHEN ProductConversation segment cardinality is not authoritatively known
+THE SYSTEM SHALL NOT offer Close
+
 WHEN the conversation is in a state that rejects ordinary chat
 THE SYSTEM SHALL disable the composer
 AND SHALL continue allowing chat in working states where the server accepts
@@ -396,7 +423,10 @@ the message as steering
 **Rationale:** Queuing an action against live server state fabricates a
 stale intent — a Close conversation or cancel replayed minutes later can destroy
 work the user did in between. Only idempotency-keyed sends are safe to
-defer; the type forces each new action to make that choice explicitly.
+defer; the type forces each new action to make that choice explicitly. A
+per-conversation lifecycle endpoint cannot safely represent aggregate Close
+for a continued ProductConversation; no aggregate Close endpoint contract is
+defined for the iOS client.
 
 ---
 
