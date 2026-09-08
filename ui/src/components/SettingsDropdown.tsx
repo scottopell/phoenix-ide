@@ -10,6 +10,7 @@ import {
 } from '../notifications';
 import { useDensity } from '../hooks/useDensity';
 import { useRegisterFocusScope } from '../hooks/useFocusScope';
+import { compactGitIdentity } from '../utils/gitIdentity';
 
 type BrowserPermission = NotificationPermission | 'unsupported';
 
@@ -616,7 +617,7 @@ function VersionFooter() {
   return (
     <div className="settings-version-footer">
       <span>v{info.version}</span>
-      <code title="Git SHA">{info.git_sha}</code>
+      <code title={`Git SHA ${info.git_sha}`}>{compactGitIdentity(info.git_sha)}</code>
     </div>
   );
 }

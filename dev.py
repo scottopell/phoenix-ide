@@ -8245,19 +8245,38 @@ def _start_bare_supervisor(
             except (KeyError, TypeError, json.JSONDecodeError) as exc:
                 raise SystemExit("running bare supervisor did not report its protocol version") from exc
             if running_protocol != protocol:
-                raise SystemExit(
-                    "running bare supervisor uses an incompatible protocol; stop it from an external shell "
-                    "with `python3 ~/.phoenix-ide/bin/phoenix-supervisor.py shutdown-supervisor`, then redeploy"
+                shutdown = subprocess.run(
+                    [
+                        sys.executable,
+                        str(layout["supervisor"]),
+                        "--root",
+                        str(layout["root"]),
+                        "shutdown-supervisor",
+                    ],
+                    capture_output=True,
+                    text=True,
                 )
-            if reuse_compatible:
-                return
-            if layout["supervisor"].is_file() and _file_sha256(layout["supervisor"]) == _file_sha256(selected_source):
-                return
-            raise SystemExit(
-                "running bare supervisor differs from the selected deployment source; production was left running. "
-                "Stop the supervisor from an external shell with "
-                "`python3 ~/.phoenix-ide/bin/phoenix-supervisor.py shutdown-supervisor`, then redeploy"
-            )
+                if shutdown.returncode != 0:
+                    raise SystemExit(
+                        "running bare supervisor uses an incompatible protocol and could not be stopped safely: "
+                        f"{shutdown.stderr.strip() or shutdown.stdout.strip()}"
+                    )
+                for _ in range(100):
+                    if not layout["socket"].exists():
+                        break
+                    time.sleep(0.05)
+                else:
+                    raise SystemExit("incompatible bare supervisor did not release its socket during upgrade")
+            else:
+                if reuse_compatible:
+                    return
+                if layout["supervisor"].is_file() and _file_sha256(layout["supervisor"]) == _file_sha256(selected_source):
+                    return
+                raise SystemExit(
+                    "running bare supervisor differs from the selected deployment source; production was left running. "
+                    "Stop the supervisor from an external shell with "
+                    "`python3 ~/.phoenix-ide/bin/phoenix-supervisor.py shutdown-supervisor`, then redeploy"
+                )
         layout["socket"].unlink(missing_ok=True)
     layout["supervisor"].parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(selected_source, layout["supervisor"])
@@ -8384,7 +8403,9 @@ def _commit_bare_transaction(
     env_snapshot: dict[str, str],
     transaction_id: str,
     previous_running: bool,
-) -> None:
+    *,
+    activate: bool = True,
+) -> str:
     """Stage an immutable transaction for `prepared` and activate it through the
     running supervisor. Shared by deploy (new binary) and restart (installed
     binary, refreshed env); on activation failure it discards the unclaimed
@@ -8411,8 +8432,9 @@ def _commit_bare_transaction(
         rollback_binary.chmod(0o600)
         rollback_env.chmod(0o600)
     manifest = {
-        "manifest_version": 1,
+        "manifest_version": 2,
         "transaction_id": transaction_id,
+        "source_kind": prepared.source_kind.value,
         "expected": prepared.identity.as_dict(),
         "previous": previous_identity.as_dict() if previous_identity else None,
         "expected_health_url": _bare_api_health_url(env_snapshot),
@@ -8433,6 +8455,13 @@ def _commit_bare_transaction(
         artifact.chmod(0o400)
     transaction.chmod(0o500)
 
+    if not activate:
+        return manifest_hash
+    _activate_bare_transaction(layout, transaction_id, manifest_hash)
+    return manifest_hash
+
+
+def _activate_bare_transaction(layout: dict[str, Path], transaction_id: str, manifest_hash: str) -> None:
     result = subprocess.run([
         sys.executable, str(layout["supervisor"]), "--root", str(layout["root"]),
         "activate", "--transaction-id", transaction_id, "--manifest-sha256", manifest_hash,
@@ -8484,9 +8513,13 @@ def prod_daemon_deploy(
             [sys.executable, str(supervisor_source), "--protocol-version"],
             capture_output=True, text=True, check=True,
         ).stdout.strip()
-        if protocol != "1":
+        if protocol != "2":
             raise SystemExit(f"bare supervisor protocol mismatch: {protocol!r}")
 
+        previous_running = _bare_child_running(layout) if layout["socket"].exists() else False
+        manifest_hash = _commit_bare_transaction(
+            layout, prepared, env_snapshot, transaction_id, previous_running, activate=False
+        )
         _start_bare_supervisor(
             layout,
             protocol,
@@ -8494,8 +8527,7 @@ def prod_daemon_deploy(
             reuse_compatible=controller.enabled,
         )
         _configure_bare_reboot_persistence(layout)
-        previous_running = _bare_child_running(layout)
-        _commit_bare_transaction(layout, prepared, env_snapshot, transaction_id, previous_running)
+        _activate_bare_transaction(layout, transaction_id, manifest_hash)
 
     print("\n✓ Deployed through persistent bare Linux supervisor")
     print(f"  Transaction: {transaction_id}")
@@ -8914,6 +8946,23 @@ class ProdSourceKind(enum.Enum):
     INSTALLED_RESTART = "installed_restart"
 
 
+_FULL_GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
+_LEGACY_GIT_SHA_RE = re.compile(r"[0-9a-f]{12}")
+_EMBEDDED_GIT_SHA_RE = re.compile(r"[0-9a-f]{12}|[0-9a-f]{40}")
+
+
+def _is_full_git_sha(value: str) -> bool:
+    return _FULL_GIT_SHA_RE.fullmatch(value) is not None
+
+
+def _is_legacy_git_sha(value: str) -> bool:
+    return _LEGACY_GIT_SHA_RE.fullmatch(value) is not None
+
+
+def _is_embedded_git_sha(value: str) -> bool:
+    return _EMBEDDED_GIT_SHA_RE.fullmatch(value) is not None
+
+
 @dataclasses.dataclass(frozen=True)
 class RuntimeIdentity:
     version: str
@@ -9045,7 +9094,7 @@ def _rollback_identity_matches(
     rollback_identity = RuntimeIdentity.from_value(rollback_identity)
     previous_identity = RuntimeIdentity.from_value(previous_identity)
     rollback_sha = rollback_identity.git_sha
-    if re.fullmatch(r"[0-9a-f]{12}", rollback_sha) is None:
+    if not _is_embedded_git_sha(rollback_sha):
         return False
     if previous_health_json:
         return rollback_identity == previous_identity
@@ -9259,11 +9308,11 @@ def _prepare_release_candidate(
         )
     if identity.git_sha.endswith("-dirty"):
         raise SystemExit(f"release {tag} asset embeds a dirty git identity")
-    if not re.fullmatch(r"[0-9a-f]{12}", identity.git_sha):
+    if not _is_full_git_sha(identity.git_sha):
         raise SystemExit(
-            f"release {tag} asset embeds malformed git identity {identity.git_sha!r}; expected 12 lowercase hex characters"
+            f"release {tag} asset embeds legacy or malformed git identity {identity.git_sha!r}; modern published releases require 40 lowercase hex characters"
         )
-    if not release_commit.startswith(identity.git_sha):
+    if release_commit != identity.git_sha:
         raise SystemExit(
             f"release {tag} resolves to {release_commit}, but the asset embeds {identity.git_sha}"
         )
@@ -9283,9 +9332,14 @@ def _prepare_local_candidate(*, target: str | None) -> PreparedCandidate:
         ["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True
     ).stdout.strip()
     identity = RuntimeIdentity.from_value(_binary_identity(binary))
-    if not source_commit.startswith(identity.git_sha.removesuffix("-dirty")):
+    normalized_identity_sha = identity.git_sha.removesuffix("-dirty")
+    if not _is_full_git_sha(normalized_identity_sha):
         raise SystemExit(
-            f"local candidate identity {identity.git_sha} does not match selected HEAD {source_commit[:12]}"
+            f"local candidate identity {identity.git_sha} is malformed; expected full 40-character commit identity"
+        )
+    if source_commit != normalized_identity_sha:
+        raise SystemExit(
+            f"local candidate identity {identity.git_sha} does not match selected HEAD {source_commit}"
         )
     return PreparedCandidate(
         binary=binary,

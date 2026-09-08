@@ -25,13 +25,16 @@ import urllib.parse
 from pathlib import Path
 from typing import BinaryIO, Optional
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 MAX_REQUEST_BYTES = 16 * 1024
 MAX_DIRECT_DIAGNOSTIC_BYTES = 64 * 1024
 TRANSACTION_RE = re.compile(r"[0-9a-f]{32}")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
-EMBEDDED_SHA_RE = re.compile(r"[0-9a-f]{12}")
+LEGACY_EMBEDDED_SHA_RE = re.compile(r"[0-9a-f]{12}")
+EMBEDDED_SHA_RE = re.compile(r"[0-9a-f]{12}|[0-9a-f]{40}")
+FULL_EMBEDDED_SHA_RE = re.compile(r"[0-9a-f]{40}")
+SOURCE_KINDS = frozenset({"local_head", "published_release", "installed_restart"})
 VERSION_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}")
 
 
@@ -62,6 +65,7 @@ class Artifact:
 class TransactionManifest:
     manifest_version: int
     transaction_id: str
+    source_kind: str
     expected: RuntimeIdentity
     previous: Optional[RuntimeIdentity]
     expected_health_url: str
@@ -80,6 +84,8 @@ class TransactionManifest:
     def load(cls, path: Path) -> "TransactionManifest":
         try:
             raw = json.loads(path.read_text())
+            if "source_kind" not in raw:
+                raise ValueError("protocol-2 transaction manifest requires source_kind")
             raw["expected"] = RuntimeIdentity(**raw["expected"])
             raw["previous"] = RuntimeIdentity(**raw["previous"]) if raw.get("previous") else None
             raw["candidate_binary"] = Artifact(**raw["candidate_binary"])
@@ -462,11 +468,16 @@ class Supervisor:
         return self.child_identity
 
     def dispatch(self, request: dict[str, object]) -> dict[str, object]:
-        if request.get("protocol_version") != PROTOCOL_VERSION:
-            raise SupervisorError("unsupported supervisor protocol")
         action = request.get("action")
+        protocol_version = request.get("protocol_version")
+        if protocol_version != PROTOCOL_VERSION and not (
+            action == "status" and protocol_version == 1
+        ):
+            raise SupervisorError("unsupported supervisor protocol")
         if action == "status":
-            return {"ok": True, **self.status()}
+            response = {"ok": True, **self.status()}
+            response["protocol_version"] = protocol_version
+            return response
         if action == "stop":
             self.stop_child()
             return {"ok": True, **self.status()}
@@ -520,9 +531,19 @@ class Supervisor:
         if metadata.st_uid != self.owner_uid or metadata.st_mode & 0o077 or metadata.st_mode & 0o200:
             raise SupervisorError("transaction directory ownership or mode is unsafe")
         validate_runtime_identity(manifest.expected)
+        if manifest.source_kind not in SOURCE_KINDS:
+            raise SupervisorError(f"unsupported transaction source kind: {manifest.source_kind}")
+        if manifest.source_kind == "installed_restart":
+            if not EMBEDDED_SHA_RE.fullmatch(manifest.expected.git_sha):
+                raise SupervisorError("installed restart identity must use a lowercase embedded git SHA")
+            if not GIT_SHA_RE.fullmatch(manifest.source_commit) or not manifest.source_commit.startswith(manifest.expected.git_sha):
+                raise SupervisorError("installed restart source commit does not match expected identity")
+        else:
+            if not FULL_EMBEDDED_SHA_RE.fullmatch(manifest.expected.git_sha):
+                raise SupervisorError("expected identity must use a full lowercase embedded git SHA")
+            if not GIT_SHA_RE.fullmatch(manifest.source_commit) or manifest.source_commit != manifest.expected.git_sha:
+                raise SupervisorError("source commit does not exactly match expected identity")
         validate_health_url(manifest.expected_health_url)
-        if not GIT_SHA_RE.fullmatch(manifest.source_commit) or not manifest.source_commit.startswith(manifest.expected.git_sha):
-            raise SupervisorError("source commit does not match expected identity")
         if manifest.previous is not None:
             validate_runtime_identity(manifest.previous)
             if manifest.previous_health_url is None:
