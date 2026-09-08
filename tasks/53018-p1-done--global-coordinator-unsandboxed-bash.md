@@ -1,0 +1,1 @@
+Explicitly grant only the singleton Global Coordinator unsandboxed Bash while retaining explicit WorkScope targeting, server-resolved cwd, resource bounds, auditability, and fail-closed invalid/missing scopes. Update normative Bash/global-recall requirements first; preserve every other conversation/subagent policy.

@@ -103,23 +103,14 @@ pub fn snapshot_next_taskmd_id_hint(
     })
 }
 
-pub fn build_coordinator_system_prompt(
-    language: LlmLanguage,
-    bash: ExploreBashCapability,
-) -> String {
+pub fn build_coordinator_system_prompt(language: LlmLanguage) -> String {
     let mut prompt = llm_language::coordinator_prompt(language).to_string();
-    prompt.push_str(match (language, bash) {
-        (LlmLanguage::PhoenixNative, ExploreBashCapability::Sandboxed) => {
-            "\n\nFor read-only local investigation, bash run requires an active work_scope_id from the current snapshot. Phoenix resolves that WorkScope's cwd server-side and runs under the Explore OS sandbox; there is no default repository or cwd."
+    prompt.push_str(match language {
+        LlmLanguage::PhoenixNative => {
+            "\n\nTrusted Global Coordinator capability: bash commands are unsandboxed. Every bash run requires an active work_scope_id from the current snapshot. Phoenix resolves that WorkScope's cwd server-side; there is no default repository or cwd. Commands retain the normal Bash bounds and audit trail."
         }
-        (LlmLanguage::PhoenixNative, ExploreBashCapability::Unavailable) => {
-            "\n\nBash is unavailable because this host cannot enforce the required OS sandbox. Do not claim local repository inspection."
-        }
-        (LlmLanguage::Caveman, ExploreBashCapability::Sandboxed) => {
-            "\n\nFor read-only local look, bash run need active work_scope_id from current snapshot. Phoenix find that WorkScope cwd and use Explore OS sandbox. No default repo or cwd."
-        }
-        (LlmLanguage::Caveman, ExploreBashCapability::Unavailable) => {
-            "\n\nNo bash here. Host cannot make safe sandbox. Do not claim local repo look."
+        LlmLanguage::Caveman => {
+            "\n\nTrusted Global Coordinator bash is not sandboxed. Every bash run need active work_scope_id from current snapshot. Phoenix find that WorkScope cwd. No default repo or cwd. Normal bash limits and audit stay."
         }
     });
     prompt.push_str("\n\n");
@@ -317,10 +308,7 @@ mod tests {
 
     #[test]
     fn coordinator_prompt_excludes_project_and_explore_guidance() {
-        let prompt = build_coordinator_system_prompt(
-            LlmLanguage::default(),
-            ExploreBashCapability::Sandboxed,
-        );
+        let prompt = build_coordinator_system_prompt(LlmLanguage::default());
         assert!(prompt.contains("You are Phoenix Coordinator"));
         assert!(!prompt.contains("taskmd"));
         assert!(!prompt.contains("available_skills"));
@@ -335,29 +323,37 @@ mod tests {
     }
 
     #[test]
-    fn coordinator_prompt_matches_bash_availability() {
-        let available = build_coordinator_system_prompt(
-            LlmLanguage::default(),
-            ExploreBashCapability::Sandboxed,
-        );
-        assert!(available.contains("bash run requires an active work_scope_id"));
-        let unavailable = build_coordinator_system_prompt(
-            LlmLanguage::default(),
-            ExploreBashCapability::Unavailable,
-        );
-        assert!(unavailable.contains("Bash is unavailable"));
-        assert!(unavailable.contains("Do not claim local repository inspection"));
-        assert!(!unavailable.contains("bash run requires an active work_scope_id"));
+    fn coordinator_prompt_describes_unconditional_targeted_bash() {
+        let prompt = build_coordinator_system_prompt(LlmLanguage::default());
+        assert!(prompt.contains("Trusted Global Coordinator capability"));
+        assert!(prompt.contains("bash commands are unsandboxed"));
+        assert!(prompt.contains("Every bash run requires an active work_scope_id"));
+        assert!(prompt.contains("there is no default repository or cwd"));
+        assert!(prompt.contains(
+            "mutate the selected WorkScope only through unsandboxed Bash with its explicit active work_scope_id"
+        ));
+        assert!(prompt.contains(
+            "no dedicated project, task, workspace, approval, or conversation-lifecycle mutation tools"
+        ));
+        assert!(!prompt.contains("cannot mutate files, repositories"));
+        assert!(!prompt.contains("cannot mutate projects, tasks, workspaces"));
+        assert!(!prompt.contains("Bash is unavailable"));
+        assert!(!prompt.contains("Explore OS sandbox"));
     }
 
     #[test]
     fn coordinator_prompt_uses_conversation_llm_language() {
-        let prompt =
-            build_coordinator_system_prompt(LlmLanguage::Caveman, ExploreBashCapability::Sandboxed);
+        let prompt = build_coordinator_system_prompt(LlmLanguage::Caveman);
         assert!(prompt.contains("You Phoenix Coordinator"));
         assert!(!prompt.contains("You are Phoenix Coordinator"));
         assert!(prompt.contains("send_conversation_message"));
-        assert!(prompt.contains("No change file, repo, project, task"));
+        assert!(prompt.contains(
+            "May change selected WorkScope only with unsandboxed bash and its explicit active work_scope_id"
+        ));
+        assert!(prompt.contains(
+            "No separate project, task, workspace, approval, or talk-lifecycle change tool"
+        ));
+        assert!(!prompt.contains("No change project, task, workspace"));
         assert!(prompt.contains("bash run need active work_scope_id"));
         assert!(prompt.contains("No default repo or cwd"));
         assert!(prompt.contains("Never pretend watch in background"));

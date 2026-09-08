@@ -58,6 +58,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [044](044_creation-publication-uses-request-bound-identity-and-immutable-pins.md) | Creation publication uses request-bound identity and immutable starting pins | Accepted | REQ-CCR-001/002/003/005/005A/006A, REQ-DWF-CREATE-001/002/003/004, REQ-PROJ-017/022, REQ-GITREP-003 |
 | [045](045_provider-prompts-use-persisted-generation-fenced-projections.md) | Provider prompts use persisted generation-fenced projections | Accepted | REQ-BED-018A, REQ-BED-020, REQ-BED-030A |
 | [046](046_productconversation-owns-aggregate-presentation.md) | ProductConversation owns aggregate presentation without duplicating transcript authority | Accepted | REQ-BED-030A; `ProductConversation`, transcript members |
+| [047](047_global-coordinator-unsandboxed-bash.md) | Global Coordinator uses explicitly targeted unsandboxed Bash | Accepted | REQ-BASH-012/013, REQ-GR-007; singleton Coordinator, explicit active WorkScope target |
 
 ## For agents: which decisions bind your task
 
@@ -69,6 +70,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Deciding whether to create a new `design.md` | 000 |
 | Migrating legacy `specs/*/design.md` content | 000, 001, 002, 003, 004, 005, 006 |
 | Specifying bash command execution / wait-window semantics | 001 |
+| Specifying Global Coordinator Bash authorization or sandbox policy | 047, then 027 and 001 |
 | Specifying bash handle state observation or response shaping | 002 |
 | Specifying bash process cleanup, shutdown cleanup, or kill escalation policy | 003 |
 | Specifying inline-terminal history commit, per-command rounds, or user-origin attribution | 004 |

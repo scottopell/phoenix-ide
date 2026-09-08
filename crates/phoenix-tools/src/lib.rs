@@ -27,7 +27,7 @@ pub use bash::{
     BashHandleError, BashHandleRegistry, BashLifecycleEvent, BashLifecyclePhase, BashLifecycleSink,
     BashOp, BashTerminalEffect, BashTool, BashToolInput,
     ResourceScopeKeyHandles as BashResourceScopeKeyHandles, SandboxedBashTool,
-    SharedSandboxedBashRequest, ValidatedBashSpawnTarget,
+    ValidatedBashSpawnTarget,
 };
 pub use browser::{
     BrowserClearConsoleLogsTool, BrowserClickTool, BrowserError, BrowserEvalTool,
@@ -1002,9 +1002,10 @@ impl ToolRegistry {
     }
 
     /// Bounded registry for the global Coordinator. The host supplies global
-    /// read tools, optional cwd-resolved sandboxed bash, and the singular
-    /// cross-conversation text-message action. Browser, MCP, task, project,
-    /// creation, approval, workspace, and other lifecycle tools are absent.
+    /// read tools, explicitly WorkScope-targeted unsandboxed Bash, and the
+    /// singular cross-conversation text-message action. Browser, MCP, dedicated
+    /// task/project/workspace mutation, creation, approval, and other lifecycle
+    /// tools are absent.
     #[must_use]
     pub fn coordinator(mut global_read_tools: Vec<Arc<dyn Tool>>) -> Self {
         let mut tools: Vec<Arc<dyn Tool>> = vec![Arc::new(ThinkTool)];
