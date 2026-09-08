@@ -13,6 +13,7 @@ import { api, ExpansionError, type Conversation, type Message } from '../api';
 import { ConversationReadinessProvider } from '../contexts/ConversationReadinessContext';
 import { FocusScopeProvider, useFocusScopeCommands } from '../hooks/useFocusScope';
 import { cacheDB } from '../cache';
+import type { ConversationOpenMeasurement } from '../hooks/conversationOpenTelemetry';
 
 const viewportFlags = vi.hoisted(() => ({ isDesktop: true, isWideDesktop: true }));
 
@@ -59,7 +60,8 @@ vi.mock('../cache', () => ({
 type ConnectionOptions = {
   conversationId?: string;
   dispatch: (action: SSEAction) => void;
-  onValidatedInit?: (payload: InitPayload) => void;
+  initialOpenMeasurement?: ConversationOpenMeasurement;
+  onValidatedInit?: (payload: InitPayload, reportFirstPaint?: () => void) => void;
   onValidatedSteeringQueued?: (messageId: string) => void;
 };
 
@@ -90,7 +92,7 @@ function useConnectedConnection(options: ConnectionOptions) {
     if (!connectedConversationId) return;
     const conversation = authoritativeConversations.get(connectedConversationId)
       ?? makeConversation({ id: connectedConversationId });
-    validatedInitRef.current?.(makeConnectionInit(conversation));
+    validatedInitRef.current?.(makeConnectionInit(conversation), () => undefined);
   }, [connectedConversationId]);
   return { state: 'connected' as const, attempt: 0, nextRetryIn: null, retryNow: vi.fn() };
 }
@@ -317,6 +319,7 @@ afterEach(() => {
   authoritativeConversations.clear();
   vi.clearAllMocks();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
   hooksMockState.useConnection.mockImplementation(useConnectedConnection);
   localStorage.clear();
 });
@@ -324,6 +327,35 @@ afterEach(() => {
 hooksMockState.useConnection.mockImplementation(useConnectedConnection);
 
 describe('ConversationPage message viewer layout', () => {
+  it('reports first transcript paint only after two animation frames', async () => {
+    const animationFrames: FrameRequestCallback[] = [];
+    vi.stubGlobal('requestAnimationFrame', vi.fn((callback: FrameRequestCallback) => {
+      animationFrames.push(callback);
+      return animationFrames.length;
+    }));
+    const reportFirstPaint = vi.fn();
+    hooksMockState.useConnection.mockImplementation((options: ConnectionOptions) => {
+      const validatedInitRef = useRef(options.onValidatedInit);
+      validatedInitRef.current = options.onValidatedInit;
+      useEffect(() => {
+        if (!options.conversationId) return;
+        const conversation = authoritativeConversations.get(options.conversationId)
+          ?? makeConversation({ id: options.conversationId });
+        validatedInitRef.current?.(makeConnectionInit(conversation), reportFirstPaint);
+      }, [options.conversationId]);
+      return { state: 'connected' as const, attempt: 0, nextRetryIn: null, retryNow: vi.fn() };
+    });
+
+    renderPage(makeConversation());
+    await waitFor(() => expect(animationFrames).toHaveLength(1));
+
+    act(() => animationFrames.shift()!(0));
+    expect(reportFirstPaint).not.toHaveBeenCalled();
+    expect(animationFrames).toHaveLength(1);
+
+    act(() => animationFrames.shift()!(16));
+    expect(reportFirstPaint).toHaveBeenCalledTimes(1);
+  });
   it('keeps a direct fullscreen message open out of split-pane layout', async () => {
     const { container } = renderPage(
       makeConversation(),
@@ -1307,12 +1339,18 @@ describe('ConversationPage archived read-only rendering', () => {
     const conversation = makeConversation({ id: uuidRoute, slug: 'canonical-route' });
 
     renderPage(conversation, uuidRoute, '?keep=route-state#message-missing-target');
+    await waitFor(() => expect(hooksMockState.useConnection).toHaveBeenCalled());
+    const initialMeasurement = (hooksMockState.useConnection.mock.calls[0]![0] as ConnectionOptions)
+      .initialOpenMeasurement;
 
     await waitFor(() => expect(api.getConversationRoute).toHaveBeenCalledWith(uuidRoute));
     expect(await screen.findByText('keep this history visible')).toBeInTheDocument();
     await waitFor(() => expect(screen.getByTestId('route-location')).toHaveTextContent(
       '/c/canonical-route?keep=route-state#message-missing-target',
     ));
+    const canonicalMeasurement = (hooksMockState.useConnection.mock.calls.at(-1)![0] as ConnectionOptions)
+      .initialOpenMeasurement;
+    expect(canonicalMeasurement).toBe(initialMeasurement);
   });
 
   it('uses the authoritative route owner when the cached slug owner changed', async () => {
@@ -1443,6 +1481,11 @@ describe('ConversationPage archived read-only rendering', () => {
   });
 
   it('resolves an offline route when connectivity returns', async () => {
+    const openMeasurements: ConversationOpenMeasurement[] = [];
+    hooksMockState.useConnection.mockImplementation((options: ConnectionOptions) => {
+      if (options.initialOpenMeasurement) openMeasurements.push(options.initialOpenMeasurement);
+      return useConnectedConnection(options);
+    });
     const online = vi.spyOn(window.navigator, 'onLine', 'get').mockReturnValue(false);
     const conversation = makeConversation();
 
@@ -1460,6 +1503,81 @@ describe('ConversationPage archived read-only rendering', () => {
       const options = hooksMockState.useConnection.mock.calls.at(-1)?.[0] as ConnectionOptions;
       expect(options.conversationId).toBe(conversation.id);
     });
+    expect(openMeasurements.at(-1)).toBe(openMeasurements[0]);
+  });
+
+  it('does not overlap an in-flight initial route request on online events', async () => {
+    let resolveRoute: ((value: { id: string; slug: string }) => void) | undefined;
+    vi.mocked(api.getConversationRouteBySlug).mockReturnValueOnce(new Promise((resolve) => {
+      resolveRoute = resolve;
+    }));
+    const conversation = makeConversation();
+
+    renderPage(conversation);
+    await waitFor(() => expect(api.getConversationRouteBySlug).toHaveBeenCalledTimes(1));
+    act(() => {
+      window.dispatchEvent(new Event('online'));
+      window.dispatchEvent(new Event('online'));
+    });
+    expect(api.getConversationRouteBySlug).toHaveBeenCalledTimes(1);
+    resolveRoute?.({ id: conversation.id, slug: conversation.slug });
+  });
+
+  it('rotates a completed route measurement when an online retry succeeds', async () => {
+    const firstRouteRequest = Promise.reject(new Error('temporary route failure'));
+    vi.mocked(api.getConversationRouteBySlug)
+      .mockReturnValueOnce(firstRouteRequest)
+      .mockResolvedValueOnce({ id: 'conv-recovered', slug });
+    const openMeasurements: ConversationOpenMeasurement[] = [];
+    hooksMockState.useConnection.mockImplementation((options: ConnectionOptions) => {
+      if (options.initialOpenMeasurement) openMeasurements.push(options.initialOpenMeasurement);
+      return useConnectedConnection(options);
+    });
+
+    renderPage(makeConversation({ id: 'conv-recovered' }));
+    await waitFor(() => expect(api.getConversationRouteBySlug).toHaveBeenCalledTimes(1));
+    act(() => window.dispatchEvent(new Event('online')));
+    await waitFor(() => expect(api.getConversationRouteBySlug).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(openMeasurements.at(-1)).not.toBe(openMeasurements[0]));
+  });
+
+  it('keeps ordinary online stream reconnects route-free', async () => {
+    const conversation = makeConversation();
+    const openMeasurements: ConversationOpenMeasurement[] = [];
+    hooksMockState.useConnection.mockImplementation((options: ConnectionOptions) => {
+      if (options.initialOpenMeasurement) openMeasurements.push(options.initialOpenMeasurement);
+      return useConnectedConnection(options);
+    });
+
+    renderPage(conversation);
+    await waitFor(() => expect(api.getConversationRouteBySlug).toHaveBeenCalledTimes(1));
+    const initialMeasurement = openMeasurements.at(-1);
+    act(() => window.dispatchEvent(new Event('online')));
+    await waitFor(() => expect(api.getConversationRouteBySlug).toHaveBeenCalledTimes(2));
+    expect(openMeasurements.at(-1)).toBe(initialMeasurement);
+  });
+
+  it('flushes a route-owned measurement synchronously on pagehide', async () => {
+    const conversation = makeConversation();
+    let resolveRoute: ((value: { id: string; slug: string }) => void) | undefined;
+    vi.mocked(api.getConversationRouteBySlug).mockReturnValueOnce(new Promise((resolve) => {
+      resolveRoute = resolve;
+    }));
+    const reports: Array<{ outcome: string; event_source_created_ms: number | null }> = [];
+    vi.stubGlobal('fetch', vi.fn((_url: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.body) reports.push(JSON.parse(init.body as string));
+      return Promise.resolve(new Response(null, { status: 204 }));
+    }));
+
+    renderPage(conversation);
+    await waitFor(() => expect(api.getConversationRouteBySlug).toHaveBeenCalled());
+    act(() => window.dispatchEvent(new PageTransitionEvent('pagehide')));
+
+    expect(reports).toContainEqual(expect.objectContaining({
+      outcome: 'canceled',
+      event_source_created_ms: null,
+    }));
+    resolveRoute?.({ id: conversation.id, slug: conversation.slug });
   });
 
   it('keeps cached history provisional until authoritative SSE init replaces it', async () => {
