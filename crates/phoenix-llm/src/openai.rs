@@ -3975,6 +3975,101 @@ mod tests {
         assert_eq!(state.http_requests.load(Ordering::SeqCst), 1);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn per_frame_timeout_does_not_bound_a_72_minute_logical_attempt() {
+        let logical_dispatch = tokio::time::Instant::now();
+        let request = request_with(&[("incident", MessageRole::User)]);
+        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel(1);
+        let mut websocket = ResponsesStreamAccumulator::new(Instant::now(), &request);
+        let reasoning = serde_json::json!({
+            "type":"response.reasoning_summary_text.delta",
+            "delta":"internal reasoning"
+        })
+        .to_string();
+
+        // 285 frames arrive every 15 seconds. The exact production loop wraps
+        // each `socket.next()` independently, so every frame satisfies the
+        // 30-second guard while the logical attempt reaches 71.25 minutes.
+        for _ in 0..285 {
+            let guarded_frame = tokio::spawn(async {
+                tokio::time::timeout(CODEX_WS_FRAME_TIMEOUT, async {
+                    tokio::time::sleep(Duration::from_secs(15)).await;
+                })
+                .await
+            });
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_secs(15)).await;
+            guarded_frame
+                .await
+                .unwrap()
+                .expect("each frame arrives within the per-frame timeout");
+            websocket
+                .process_event(
+                    "response.reasoning_summary_text.delta",
+                    &reasoning,
+                    &chunk_tx,
+                )
+                .await
+                .unwrap();
+            assert!(!websocket.done);
+        }
+        tokio::time::advance(Duration::from_secs(8)).await;
+        assert_eq!(logical_dispatch.elapsed(), Duration::from_secs(4_283));
+        assert_eq!(
+            websocket.telemetry.snapshot(false).generation_event_count,
+            285
+        );
+        assert!(
+            chunk_rx.try_recv().is_err(),
+            "reasoning produces no visible text"
+        );
+
+        // A transport failure can then replace the stream accumulator during
+        // HTTP/SSE fallback. The logical request clock continues, but the final
+        // stream snapshot describes only this fallback segment.
+        let mut http = ResponsesStreamAccumulator::new(Instant::now(), &request);
+        for _ in 0..282 {
+            tokio::time::advance(Duration::from_millis(150)).await;
+            http.process_event(
+                "response.reasoning_summary_text.delta",
+                &reasoning,
+                &chunk_tx,
+            )
+            .await
+            .unwrap();
+        }
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_millis(150)).await;
+            http.process_event(
+                "response.created",
+                &serde_json::json!({"type":"response.created"}).to_string(),
+                &chunk_tx,
+            )
+            .await
+            .unwrap();
+        }
+        tokio::time::advance(Duration::from_millis(3_550)).await;
+        let terminal = serde_json::json!({
+            "type":"response.completed",
+            "response":{
+                "id":"response-after-fallback",
+                "usage":{"input_tokens":10,"output_tokens":1},
+                "output":[{"type":"reasoning","id":"reasoning-1","summary":[]}]
+            }
+        })
+        .to_string();
+        http.process_event("response.completed", &terminal, &chunk_tx)
+            .await
+            .unwrap();
+
+        let final_stream = http.telemetry.snapshot(true);
+        assert_eq!(logical_dispatch.elapsed(), Duration::from_millis(4_329_600));
+        assert_eq!(final_stream.provider_event_count, 288);
+        assert_eq!(final_stream.generation_event_count, 282);
+        assert_eq!(final_stream.visible_text_event_count, 0);
+        assert!(final_stream.completed);
+    }
+
     #[tokio::test]
     async fn websocket_frame_timeout_falls_back_and_header_identity_reconnects() {
         let (url, state) = mock_server().await;
