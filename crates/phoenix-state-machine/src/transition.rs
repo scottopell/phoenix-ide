@@ -238,21 +238,20 @@ fn stamp_retry_count(display_data: &mut Option<serde_json::Value>, final_attempt
     }
 }
 
-/// Project a runtime `ErrorKind` onto the three retryable
+/// Project a runtime `ErrorKind` onto the retryable
 /// `LlmAttemptReason` variants. `is_auto_retryable()` is the gate for
 /// `Effect::ScheduleRetry`; this helper is the wire-side projection of
-/// the same predicate. `TimedOut` collapses to `Network` because the
-/// upstream `LlmErrorKind` never distinguishes them (timeouts arrive
-/// as `LlmErrorKind::Network`); the runtime keeps the kinds separate
-/// for non-LLM paths but the `LlmAttempt` reader doesn't care.
+/// the same predicate. Timeout remains distinct from a network failure so
+/// retry visibility preserves the terminal attempt reason.
 fn error_kind_to_attempt_reason(kind: &ErrorKind) -> LlmAttemptReason {
     match kind {
         ErrorKind::RateLimit => LlmAttemptReason::RateLimit,
         // A malformed response is retryable; its transient retry banner reuses
         // the `server_error` reason rather than widening the spec'd
-        // `{rate_limit, server_error, network}` wire set.
+        // `server_error` wire reason rather than adding another class.
         ErrorKind::ServerError | ErrorKind::InvalidResponse => LlmAttemptReason::ServerError,
-        ErrorKind::Network | ErrorKind::TimedOut => LlmAttemptReason::Network,
+        ErrorKind::Network => LlmAttemptReason::Network,
+        ErrorKind::TimedOut => LlmAttemptReason::TimedOut,
         // Non-retryable kinds. `db::ErrorKind::is_auto_retryable` admits
         // exactly the four kinds matched above, and every caller guards on it
         // before reaching here, so a non-retryable kind landing in this arm is
@@ -3339,6 +3338,16 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 resets_at: None,
             }
         }
+        LlmOutcome::TimedOut { message } => {
+            let attempt = current_attempt(state);
+            Event::LlmError {
+                message,
+                error_kind: ErrorKind::TimedOut,
+                attempt,
+                recovery_in_progress: false,
+                resets_at: None,
+            }
+        }
         LlmOutcome::TokenBudgetExceeded => {
             let attempt = current_attempt(state);
             Event::LlmError {
@@ -3587,6 +3596,7 @@ pub fn llm_error_to_db_error(
             ErrorKind::UsageLimitReached
         }
         phoenix_core::domain::llm_error_kind::LlmErrorKind::Network => ErrorKind::Network,
+        phoenix_core::domain::llm_error_kind::LlmErrorKind::TimedOut => ErrorKind::TimedOut,
         phoenix_core::domain::llm_error_kind::LlmErrorKind::InvalidRequest => {
             ErrorKind::InvalidRequest
         }
@@ -5592,6 +5602,70 @@ mod tests {
                 .any(|e| matches!(e, Effect::ExecuteTool { .. })),
             "must not dispatch the propose_task tool to the executor"
         );
+    }
+
+    #[test]
+    fn timed_out_attempt_retries_without_accepting_another_turn() {
+        let result = transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &test_context(),
+            Event::LlmError {
+                message: "attempt deadline elapsed".to_string(),
+                error_kind: ErrorKind::TimedOut,
+                attempt: 1,
+                recovery_in_progress: false,
+                resets_at: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.new_state, ConvState::LlmRequesting { attempt: 2 });
+        assert!(result.effects.iter().any(|effect| matches!(
+            effect,
+            Effect::ScheduleRetry {
+                attempt: 2,
+                reason: LlmAttemptReason::TimedOut,
+                ..
+            }
+        )));
+        assert!(!result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::PersistMessage { .. })));
+    }
+
+    #[test]
+    fn exhausted_timed_out_attempt_reaches_terminal_parent_error() {
+        let result = transition(
+            &ConvState::LlmRequesting {
+                attempt: MAX_RETRY_ATTEMPTS,
+            },
+            &test_context(),
+            Event::LlmError {
+                message: "attempt deadline elapsed".to_string(),
+                error_kind: ErrorKind::TimedOut,
+                attempt: MAX_RETRY_ATTEMPTS,
+                recovery_in_progress: false,
+                resets_at: None,
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            result.new_state,
+            ConvState::Error {
+                error_kind: ErrorKind::TimedOut,
+                ..
+            }
+        ));
+        assert!(result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::PersistState)));
+        assert!(!result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::ScheduleRetry { .. })));
     }
 
     #[test]

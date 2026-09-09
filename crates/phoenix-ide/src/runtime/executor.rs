@@ -10911,6 +10911,7 @@ fn llm_error_to_db_error(kind: phoenix_llm::LlmErrorKind) -> crate::db::ErrorKin
         phoenix_llm::LlmErrorKind::RateLimit => crate::db::ErrorKind::RateLimit,
         phoenix_llm::LlmErrorKind::UsageLimitReached => crate::db::ErrorKind::UsageLimitReached,
         phoenix_llm::LlmErrorKind::Network => crate::db::ErrorKind::Network,
+        phoenix_llm::LlmErrorKind::TimedOut => crate::db::ErrorKind::TimedOut,
         phoenix_llm::LlmErrorKind::InvalidRequest => crate::db::ErrorKind::InvalidRequest,
         phoenix_llm::LlmErrorKind::PromptRejected => crate::db::ErrorKind::PromptRejected,
         phoenix_llm::LlmErrorKind::InvalidResponse => crate::db::ErrorKind::InvalidResponse,
@@ -10970,6 +10971,9 @@ fn llm_error_to_outcome(error: phoenix_llm::LlmError) -> LlmOutcome {
             message: error.message,
         },
         LlmErrorKind::Network => LlmOutcome::NetworkError {
+            message: error.message,
+        },
+        LlmErrorKind::TimedOut => LlmOutcome::TimedOut {
             message: error.message,
         },
         LlmErrorKind::ContextWindowExceeded => LlmOutcome::TokenBudgetExceeded,
@@ -13351,6 +13355,45 @@ mod authoritative_user_message_effect_tests {
         assert!(storage
             .recorded_settle_active_direct_turn_calls()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn exhausted_timeout_atomically_releases_direct_turn_ownership() {
+        let (mut rt, storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let turn = crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(30),
+            generation: 0,
+        };
+        storage.set_active_direct_turn(Some(turn.clone()));
+        rt.active_direct_turn = Some(Box::new(turn));
+        rt.state = ConvState::LlmRequesting {
+            attempt: crate::state_machine::transition::MAX_RETRY_ATTEMPTS,
+        };
+
+        rt.process_generation_tagged_llm_outcome(
+            0,
+            LlmOutcome::TimedOut {
+                message: "provider attempt deadline elapsed".to_string(),
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            rt.state,
+            ConvState::Error {
+                error_kind: crate::db::ErrorKind::TimedOut,
+                ..
+            }
+        ));
+        assert!(rt.active_direct_turn.is_none());
+        assert_eq!(storage.recorded_settle_active_direct_turn_calls().len(), 1);
+        assert!(matches!(
+            storage.recorded_settle_active_direct_turn_calls()[0].terminal,
+            crate::runtime::traits::ActiveDirectTurnTerminal::Failed { .. }
+        ));
     }
 
     #[tokio::test(start_paused = true)]
@@ -17207,6 +17250,35 @@ mod steer_drain_detector_tests {
     }
 
     #[tokio::test]
+    async fn crash_before_llm_commit_recovers_the_existing_direct_turn() {
+        let conversation_id = "conv-timeout-crash-recovery";
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            conversation_id,
+            ConvState::LlmRequesting { attempt: 2 },
+            Vec::new(),
+        );
+        let turn = crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(404),
+            generation: 3,
+        };
+        storage.set_active_direct_turn(Some(turn.clone()));
+        rt.active_direct_turn = Some(Box::new(turn));
+
+        assert!(!rt
+            .resume_interrupted_llm_request()
+            .await
+            .expect("existing accepted turn is redispatched"));
+        assert!(matches!(rt.state, ConvState::LlmRequesting { attempt: 2 }));
+        assert_eq!(
+            rt.active_direct_turn.as_deref().map(|turn| turn.turn_id),
+            Some(phoenix_workflow::TurnAuthorityId(404))
+        );
+        assert_eq!(storage.get_all_messages(conversation_id).len(), 0);
+        assert!(rt.llm_task_handle.is_some());
+        rt.llm_task_handle.take().unwrap().abort();
+    }
+
+    #[tokio::test]
     async fn committed_steering_recovery_dispatch_failure_persists_error() {
         let conversation_id = "conv-steering-recovery-dispatch-failure";
         let (mut rt, storage) = build_runtime_with_state_and_queue(
@@ -19792,6 +19864,25 @@ mod llm_generation_guard_tests {
             state_before,
             "a stale aborted outcome must not move state — no spurious retry/error"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_timed_out_generation_cannot_persist_response_or_execute_tools() {
+        let mut rt = runtime_requesting();
+        rt.llm_request_generation = 2;
+        let state_before = rt.state.clone();
+        let stale_timeout = LlmOutcome::TimedOut {
+            message: "attempt deadline elapsed".to_string(),
+        };
+
+        if !rt.llm_outcome_is_stale(1) {
+            rt.process_outcome(EffectOutcome::Llm(stale_timeout))
+                .await
+                .expect("would process if current");
+        }
+
+        assert_eq!(rt.state, state_before);
+        assert!(rt.llm_outcome_is_stale(1));
     }
 
     #[tokio::test]

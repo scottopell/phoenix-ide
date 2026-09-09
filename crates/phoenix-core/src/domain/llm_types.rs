@@ -409,6 +409,7 @@ pub enum LlmAttemptOutcome {
     InvalidResponse,
     ServerOverloaded,
     NetworkError,
+    TimedOut,
     TokenBudgetExceeded,
     AuthError,
     RequestRejected,
@@ -504,6 +505,32 @@ impl LlmAttemptCapture {
     }
 
     #[must_use]
+    pub fn finalize_timed_out(&self, elapsed: std::time::Duration) -> Option<LlmAttemptMetrics> {
+        let mut state = self.0.lock().ok()?;
+        if let Some(metrics) = state.finalized.clone() {
+            return Some(metrics);
+        }
+        let identity = state.identity.clone()?;
+        let metrics = LlmAttemptMetrics {
+            conversation_id: identity.conversation_id,
+            root_conversation_id: identity.root_conversation_id,
+            request_id: identity.request_id,
+            retry_attempt: identity.retry_attempt,
+            provider: identity.provider,
+            model: identity.model,
+            transport: state.transport.unwrap_or(identity.fallback_transport),
+            total_duration_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            stream: state
+                .progress
+                .clone()
+                .unwrap_or_else(ProviderStreamTelemetry::non_streaming),
+            outcome: LlmAttemptOutcome::TimedOut,
+        };
+        state.finalized = Some(metrics.clone());
+        Some(metrics)
+    }
+
+    #[must_use]
     pub fn finalize_cancelled(&self) -> Option<LlmAttemptMetrics> {
         let mut state = self.0.lock().ok()?;
         if let Some(metrics) = state.finalized.clone() {
@@ -543,6 +570,9 @@ impl LlmAttemptCapture {
     #[must_use]
     pub fn finalize(&self, finalization: LlmAttemptFinalization) -> Option<LlmAttemptMetrics> {
         let mut state = self.0.lock().ok()?;
+        if let Some(metrics) = state.finalized.clone() {
+            return Some(metrics);
+        }
         let identity = state.identity.clone()?;
         let metrics = LlmAttemptMetrics {
             conversation_id: identity.conversation_id,
@@ -1029,6 +1059,48 @@ mod attempt_capture_tests {
             None
         );
         assert_eq!(capture.finalized(), None);
+    }
+
+    #[test]
+    fn timeout_and_cancellation_race_has_one_terminal_winner() {
+        let capture = LlmAttemptCapture::new();
+        let telemetry = LlmRequestTelemetry {
+            conversation_id: "conv".to_string(),
+            root_conversation_id: "root".to_string(),
+            request_id: "request".to_string(),
+            retry_attempt: 1,
+            attempt_capture: capture.clone(),
+        };
+        capture.begin(&telemetry, "openai", "gpt-test", LlmTransport::Websocket);
+        capture.publish_progress(ProviderStreamTelemetry {
+            dispatch_to_first_provider_event_ms: Some(5),
+            dispatch_to_first_generation_event_ms: Some(5),
+            dispatch_to_first_visible_text_ms: None,
+            provider_event_count: 4,
+            generation_event_count: 4,
+            visible_text_event_count: 0,
+            max_provider_gap_ms: Some(5),
+            max_generation_gap_ms: Some(5),
+            output_kind: StreamTelemetryOutputKind::Reasoning,
+            completed: false,
+        });
+
+        let timed_out = capture
+            .finalize_timed_out(std::time::Duration::from_secs(10))
+            .expect("started attempt");
+        let cancelled = capture.finalize_cancelled().expect("same terminal result");
+        let late_success = capture
+            .finalize(LlmAttemptFinalization {
+                stream: Some(ProviderStreamTelemetry::non_streaming()),
+                outcome: LlmAttemptOutcome::Success,
+            })
+            .expect("same terminal result");
+
+        assert_eq!(timed_out, cancelled);
+        assert_eq!(timed_out, late_success);
+        assert_eq!(timed_out.outcome, LlmAttemptOutcome::TimedOut);
+        assert_eq!(timed_out.stream.generation_event_count, 4);
+        assert!(!timed_out.stream.completed);
     }
 
     #[test]

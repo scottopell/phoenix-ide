@@ -1761,6 +1761,28 @@ describe('conversationReducer', () => {
     });
   });
 
+  describe('sse_llm_attempt', () => {
+    it('renders timed_out distinctly from a network retry', () => {
+      const initial = createInitialAtom(testConversation, [], []);
+      const next = conversationReducer(initial, {
+        type: 'sse_llm_attempt',
+        sequenceId: 1,
+        attempt: 2,
+        maxAttempts: 3,
+        reason: 'timed_out',
+        backingOffMs: 2_000,
+        resetsAt: null,
+      });
+
+      expect(next.turnRetryContext).toMatchObject({
+        attempt: 2,
+        maxAttempts: 3,
+        reason: 'timed_out',
+        reasonText: 'request timeout',
+      });
+    });
+  });
+
   describe('sse_token', () => {
     // Tokens are only accepted while phase === 'llm_requesting' (task 24683).
     // All tests in this block set that phase first to mirror how the real

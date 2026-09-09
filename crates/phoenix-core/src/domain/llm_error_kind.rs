@@ -15,8 +15,10 @@ use crate::domain::retry_policy::{AutoRetryPolicy, UserResumePolicy};
 /// compiler forces it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LlmErrorKind {
-    /// Network issues, timeouts - retryable
+    /// Network issues - retryable.
     Network,
+    /// Phoenix's absolute provider-attempt deadline elapsed - retryable.
+    TimedOut,
     /// Transient rate-limit throttle (per-minute, per-second windows) - retryable with backoff
     RateLimit,
     /// Quota window exhausted (plan-level cap hit, credits depleted, etc.) - NOT retryable
@@ -56,7 +58,7 @@ pub enum LlmErrorKind {
 ///
 /// Specs: `specs/llm-retry-visibility/`. The wire-level `snake_case` is
 /// emitted by `serde` via the `rename_all` attribute so the JSON values
-/// match the spec's `{rate_limit, server_error, network}` set.
+/// match the retry-visibility spec's closed reason set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
 #[serde(rename_all = "snake_case")]
@@ -66,8 +68,10 @@ pub enum LlmAttemptReason {
     RateLimit,
     /// Server returned 5xx. Retryable; same backoff as `RateLimit`.
     ServerError,
-    /// Network / timeout. Retryable.
+    /// Network failure. Retryable.
     Network,
+    /// Phoenix's absolute provider-attempt deadline elapsed. Retryable.
+    TimedOut,
 }
 
 impl LlmAttemptReason {
@@ -89,11 +93,12 @@ impl LlmAttemptReason {
     pub fn from_kind(kind: LlmErrorKind) -> Option<Self> {
         match kind {
             LlmErrorKind::Network => Some(Self::Network),
+            LlmErrorKind::TimedOut => Some(Self::TimedOut),
             LlmErrorKind::RateLimit => Some(Self::RateLimit),
             // A malformed response is retryable; on the wire its transient
             // retry banner reuses the `server_error` reason (it is a
             // server/transport fault from the client's view) rather than
-            // widening the spec'd `{rate_limit, server_error, network}` set.
+            // adding another retry-visibility reason.
             LlmErrorKind::ServerError | LlmErrorKind::InvalidResponse => Some(Self::ServerError),
             // Non-retryable kinds never reach Effect::ScheduleRetry.
             LlmErrorKind::UsageLimitReached
@@ -111,9 +116,11 @@ impl LlmErrorKind {
     #[must_use]
     pub fn auto_retry_policy(self) -> AutoRetryPolicy {
         match self {
-            Self::Network | Self::RateLimit | Self::ServerError | Self::InvalidResponse => {
-                AutoRetryPolicy::AutoRetryable
-            }
+            Self::Network
+            | Self::TimedOut
+            | Self::RateLimit
+            | Self::ServerError
+            | Self::InvalidResponse => AutoRetryPolicy::AutoRetryable,
             Self::UsageLimitReached
             | Self::ServerOverloaded
             | Self::Auth
@@ -138,6 +145,7 @@ impl LlmErrorKind {
             // *auto*-retried (no point hammering a reset-on-clock quota).
             Self::Auth
             | Self::Network
+            | Self::TimedOut
             | Self::RateLimit
             | Self::ServerError
             | Self::InvalidResponse

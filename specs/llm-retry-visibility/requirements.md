@@ -26,10 +26,10 @@ when the delay elapses.
 
 The state's `attempt` field is already surfaced on the wire as part of
 the `StateChange.state` payload (clients can read `state.attempt`).
-What's currently *lost* between the executor and the client:
+The retry-attempt projection carries the following context between the executor and the client:
 
-- **The reason** (`RateLimit | ServerError | Network`), classified by
-  `llm_error_to_outcome` (`executor.rs:3570`) into an `LlmOutcome`
+- **The reason** (`RateLimit | ServerError | Network | TimedOut`), classified by
+  `llm_error_to_outcome` into an `LlmOutcome`
   variant that has no on-the-wire representation during the retry
   window.
 - **The backoff delay** (`delay: Duration` in `Effect::ScheduleRetry`),
@@ -64,7 +64,7 @@ LlmAttempt {
     sequence_id: i64,
     attempt: u32,           // 1-indexed, matches state.attempt
     max_attempts: u32,      // MAX_RETRY_ATTEMPTS = 3
-    reason: LlmAttemptReason,   // RateLimit | ServerError | Network
+    reason: LlmAttemptReason,   // RateLimit | ServerError | Network | TimedOut
     backing_off_ms: u64,    // the delay value in Effect::ScheduleRetry
     resets_at: Option<DateTime<Utc>>,  // RFC3339 string, when known
 }

@@ -387,6 +387,7 @@ fn parse_retry(request: &LlmRequest) -> Option<(crate::LlmErrorKind, u32)> {
         "rate_limit" => crate::LlmErrorKind::RateLimit,
         "server_error" => crate::LlmErrorKind::ServerError,
         "network" => crate::LlmErrorKind::Network,
+        "timed_out" => crate::LlmErrorKind::TimedOut,
         _ => return None,
     };
     let n = n_str.trim().parse::<u32>().ok()?.min(MAX_RETRY_N);
@@ -807,7 +808,8 @@ impl LlmService for MockLlmService {
                     crate::LlmErrorKind::RateLimit => LlmError::rate_limit(message),
                     crate::LlmErrorKind::ServerError => LlmError::server_error(message),
                     crate::LlmErrorKind::Network => LlmError::network(message),
-                    // parse_retry only emits the three retryable variants;
+                    crate::LlmErrorKind::TimedOut => LlmError::timed_out(message),
+                    // parse_retry only emits retryable variants;
                     // any other kind escaped its validation and is a bug.
                     _ => unreachable!("parse_retry only emits retryable kinds"),
                 });
@@ -1009,6 +1011,10 @@ mod tests {
         assert_eq!(
             parse_retry(&user_req("[[retry:network,1]]")),
             Some((LlmErrorKind::Network, 1))
+        );
+        assert_eq!(
+            parse_retry(&user_req("[[retry:timed_out,1]]")),
+            Some((LlmErrorKind::TimedOut, 1))
         );
         // KINDs outside the retryable subset are rejected — auth, usage_limit,
         // etc. don't reach the retry loop in the real runtime either, so the

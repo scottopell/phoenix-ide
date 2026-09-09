@@ -37,6 +37,10 @@ impl LlmError {
         Self::new(LlmErrorKind::Network, message)
     }
 
+    pub fn timed_out(message: impl Into<String>) -> Self {
+        Self::new(LlmErrorKind::TimedOut, message)
+    }
+
     pub fn rate_limit(message: impl Into<String>) -> Self {
         Self::new(LlmErrorKind::RateLimit, message)
     }

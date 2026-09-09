@@ -86,6 +86,7 @@ enum LlmAttemptReason {
     rate_limit
     | server_error
     | network
+    | timed_out
 }
 
 ------------------------------------------------------------
@@ -194,6 +195,7 @@ entity PersistedAssistantMessage {
 --   classify_retry_reason(error_kind: LlmErrorKind) -> LlmAttemptReason
 --       Maps the retryable subset of LlmErrorKind to LlmAttemptReason:
 --           Network     -> network
+--           TimedOut    -> timed_out
 --           RateLimit   -> rate_limit
 --           ServerError -> server_error
 --       Undefined on non-retryable variants (which never reach
@@ -204,6 +206,7 @@ entity PersistedAssistantMessage {
 --           rate_limit   -> "rate limit"
 --           server_error -> "server error"
 --           network      -> "network error"
+--           timed_out    -> "request timeout"
 --       The strings are not normative wire syntax; they are the
 --       implementation's single source of truth and are referenced by
 --       working-phase-visibility's render_retry_modifier_for helper
@@ -238,7 +241,7 @@ entity PersistedAssistantMessage {
 -- RetryTimeout outcome lands) before the LlmAttempt event has been
 -- queued for broadcast.
 --
--- The `reason` argument is one of the three LlmAttemptReason enum
+-- The `reason` argument is one of the four LlmAttemptReason enum
 -- variants. The runtime maps the inbound LlmErrorKind to this enum
 -- via classify_retry_reason() (declared in the Helpers block), which
 -- mirrors the retryable subset of LlmErrorKind (`llm/error.rs:111` —
@@ -253,7 +256,7 @@ rule RuntimeEmitsLlmAttemptOnScheduleRetry {
 
     requires: attempt >= 1
     requires: attempt <= max_retry_attempts()
-    requires: reason in { rate_limit, server_error, network }
+    requires: reason in { rate_limit, server_error, network, timed_out }
     requires: delay_ms >= 0
 
     -- The LlmAttempt event is constructed here. The actual SSE
@@ -443,12 +446,12 @@ invariant TurnRetryContextPresentBetweenAttemptAndTurnBoundary {
 -- REQ-LRV-002: the wire emission only carries reason values from the
 -- retryable subset. Structurally enforced by the
 -- RuntimeEmitsLlmAttemptOnScheduleRetry rule's `reason` precondition
--- (`reason in { rate_limit, server_error, network }`) and the
+-- (`reason in { rate_limit, server_error, network, timed_out }`) and the
 -- LlmAttemptReason enum's closed set of variants.
 invariant LlmAttemptReasonInRetryableSet {
     for conv_id in LlmAttemptBroadcast:
         LlmAttemptBroadcast{conversation_id: conv_id}.payload.reason
-            in { rate_limit, server_error, network }
+            in { rate_limit, server_error, network, timed_out }
 }
 
 -- REQ-LRV-004: LlmAttempt is emitted on the conversation whose
@@ -516,7 +519,7 @@ surface RetryContextProducer {
         -- has finished or aborted.
 
     @guarantee RetryablesOnly
-        -- The reason field is always one of the three retryable
+        -- The reason field is always one of the four retryable
         -- classifications (Network, RateLimit, ServerError). Non-
         -- retryable LlmErrorKind variants never produce an
         -- LlmAttempt because the state machine terminates the turn

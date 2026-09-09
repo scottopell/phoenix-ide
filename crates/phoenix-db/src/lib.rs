@@ -802,6 +802,7 @@ fn llm_attempt_outcome_db(value: &LlmAttemptOutcome) -> &'static str {
         LlmAttemptOutcome::InvalidResponse => "invalid_response",
         LlmAttemptOutcome::ServerOverloaded => "server_overloaded",
         LlmAttemptOutcome::NetworkError => "network_error",
+        LlmAttemptOutcome::TimedOut => "timed_out",
         LlmAttemptOutcome::TokenBudgetExceeded => "token_budget_exceeded",
         LlmAttemptOutcome::AuthError => "auth_error",
         LlmAttemptOutcome::RequestRejected => "request_rejected",
@@ -818,6 +819,7 @@ fn llm_attempt_outcome_from_db(value: &str) -> DbResult<LlmAttemptOutcome> {
         "invalid_response" => Ok(LlmAttemptOutcome::InvalidResponse),
         "server_overloaded" => Ok(LlmAttemptOutcome::ServerOverloaded),
         "network_error" => Ok(LlmAttemptOutcome::NetworkError),
+        "timed_out" => Ok(LlmAttemptOutcome::TimedOut),
         "token_budget_exceeded" => Ok(LlmAttemptOutcome::TokenBudgetExceeded),
         "auth_error" => Ok(LlmAttemptOutcome::AuthError),
         "request_rejected" => Ok(LlmAttemptOutcome::RequestRejected),
@@ -23790,6 +23792,50 @@ mod tests {
             Some("fp-tr"),
             "ack must carry the fork_proposal_id handle"
         );
+    }
+
+    #[tokio::test]
+    async fn timed_out_llm_metric_round_trips_and_upserts_idempotently() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-timeout", "slug-timeout", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let metric = LlmAttemptMetrics {
+            conversation_id: "conv-timeout".to_string(),
+            root_conversation_id: "conv-timeout".to_string(),
+            request_id: "req-timeout".to_string(),
+            retry_attempt: 1,
+            provider: "openai".to_string(),
+            model: "gpt-test".to_string(),
+            transport: LlmTransport::Websocket,
+            total_duration_ms: 600_000,
+            stream: ProviderStreamTelemetry {
+                dispatch_to_first_provider_event_ms: Some(10),
+                dispatch_to_first_generation_event_ms: Some(20),
+                dispatch_to_first_visible_text_ms: None,
+                provider_event_count: 8,
+                generation_event_count: 7,
+                visible_text_event_count: 0,
+                max_provider_gap_ms: Some(15),
+                max_generation_gap_ms: Some(15),
+                output_kind: StreamTelemetryOutputKind::Reasoning,
+                completed: false,
+            },
+            outcome: LlmAttemptOutcome::TimedOut,
+        };
+
+        db.upsert_llm_request_metrics(&metric).await.unwrap();
+        db.upsert_llm_request_metrics(&metric).await.unwrap();
+
+        let rows = db
+            .llm_request_metrics_for_request("req-timeout")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].metrics.outcome, LlmAttemptOutcome::TimedOut);
+        assert_eq!(rows[0].metrics.stream.provider_event_count, 8);
+        assert_eq!(rows[0].metrics.stream.visible_text_event_count, 0);
+        assert!(!rows[0].metrics.stream.completed);
     }
 
     #[allow(clippy::too_many_lines)]

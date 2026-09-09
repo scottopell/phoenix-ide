@@ -3993,6 +3993,7 @@ mod tests {
         for _ in 0..285 {
             let guarded_frame = tokio::spawn(async {
                 tokio::time::timeout(CODEX_WS_FRAME_TIMEOUT, async {
+                    // test-timing-allow: paused Tokio time reproduces recurring frames inside the idle guard
                     tokio::time::sleep(Duration::from_secs(15)).await;
                 })
                 .await

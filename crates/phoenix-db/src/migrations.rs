@@ -495,6 +495,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "reconcile_product_lifecycle_cutover",
         sql: MIGRATION_095,
     },
+    Migration {
+        version: 96,
+        name: "add_llm_request_timed_out_outcome",
+        sql: MIGRATION_096,
+    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -7813,6 +7818,69 @@ END;
 ";
 
 #[cfg(test)]
+mod migration_096_tests {
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    #[tokio::test]
+    async fn preserves_existing_metrics_and_allows_only_declared_outcomes() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE llm_request_metrics (
+                conversation_id TEXT NOT NULL, root_conversation_id TEXT NOT NULL,
+                request_id TEXT NOT NULL, retry_attempt INTEGER NOT NULL CHECK (retry_attempt >= 0),
+                provider TEXT NOT NULL, model TEXT NOT NULL,
+                transport TEXT NOT NULL CHECK (transport IN ('http_json', 'http_sse', 'websocket')),
+                total_duration_ms INTEGER NOT NULL CHECK (total_duration_ms >= 0),
+                dispatch_to_first_provider_event_ms INTEGER,
+                dispatch_to_first_generation_event_ms INTEGER,
+                dispatch_to_first_visible_text_ms INTEGER,
+                provider_event_count INTEGER NOT NULL CHECK (provider_event_count >= 0),
+                generation_event_count INTEGER NOT NULL CHECK (generation_event_count >= 0),
+                visible_text_event_count INTEGER NOT NULL CHECK (visible_text_event_count >= 0),
+                max_provider_gap_ms INTEGER, max_generation_gap_ms INTEGER,
+                output_kind TEXT NOT NULL CHECK (output_kind IN ('none', 'text', 'reasoning', 'tool', 'structured', 'mixed')),
+                stream_completed INTEGER NOT NULL CHECK (stream_completed IN (0, 1)),
+                outcome TEXT NOT NULL CHECK (outcome IN ('success', 'network_error', 'cancelled')),
+                created_at TEXT NOT NULL, PRIMARY KEY (request_id, retry_attempt)
+            );
+            CREATE INDEX idx_llm_request_metrics_created_at ON llm_request_metrics(created_at);
+            CREATE INDEX idx_llm_request_metrics_provider_model_transport ON llm_request_metrics(provider, model, transport, created_at);
+            CREATE INDEX idx_llm_request_metrics_root ON llm_request_metrics(root_conversation_id, created_at);
+            INSERT INTO llm_request_metrics VALUES
+              ('c','c','existing',1,'openai','gpt','http_sse',12,NULL,NULL,NULL,0,0,0,NULL,NULL,'none',0,'network_error','2026-01-01');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(super::MIGRATION_096)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let existing: String = sqlx::query_scalar(
+            "SELECT outcome FROM llm_request_metrics WHERE request_id = 'existing'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(existing, "network_error");
+        sqlx::query("INSERT INTO llm_request_metrics VALUES ('c','c','timeout',1,'openai','gpt','websocket',600000,NULL,NULL,NULL,0,0,0,NULL,NULL,'none',0,'timed_out','2026-01-02')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(sqlx::query("INSERT INTO llm_request_metrics VALUES ('c','c','bad',1,'openai','gpt','websocket',1,NULL,NULL,NULL,0,0,0,NULL,NULL,'none',0,'unknown','2026-01-03')")
+            .execute(&pool)
+            .await
+            .is_err());
+    }
+}
+
+#[cfg(test)]
 mod migration_094_tests {
     use sqlx::sqlite::SqlitePoolOptions;
 
@@ -9826,6 +9894,41 @@ CHECK (ownership_token IS NULL OR (
     AND trim(ownership_token) <> ''
     AND instr(ownership_token, char(0)) = 0
 ));";
+
+const MIGRATION_096: &str = r"
+CREATE TABLE llm_request_metrics_new (
+    conversation_id TEXT NOT NULL,
+    root_conversation_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    retry_attempt INTEGER NOT NULL CHECK (retry_attempt >= 0),
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    transport TEXT NOT NULL CHECK (transport IN ('http_json', 'http_sse', 'websocket')),
+    total_duration_ms INTEGER NOT NULL CHECK (total_duration_ms >= 0),
+    dispatch_to_first_provider_event_ms INTEGER CHECK (dispatch_to_first_provider_event_ms IS NULL OR dispatch_to_first_provider_event_ms >= 0),
+    dispatch_to_first_generation_event_ms INTEGER CHECK (dispatch_to_first_generation_event_ms IS NULL OR dispatch_to_first_generation_event_ms >= 0),
+    dispatch_to_first_visible_text_ms INTEGER CHECK (dispatch_to_first_visible_text_ms IS NULL OR dispatch_to_first_visible_text_ms >= 0),
+    provider_event_count INTEGER NOT NULL CHECK (provider_event_count >= 0),
+    generation_event_count INTEGER NOT NULL CHECK (generation_event_count >= 0),
+    visible_text_event_count INTEGER NOT NULL CHECK (visible_text_event_count >= 0),
+    max_provider_gap_ms INTEGER CHECK (max_provider_gap_ms IS NULL OR max_provider_gap_ms >= 0),
+    max_generation_gap_ms INTEGER CHECK (max_generation_gap_ms IS NULL OR max_generation_gap_ms >= 0),
+    output_kind TEXT NOT NULL CHECK (output_kind IN ('none', 'text', 'reasoning', 'tool', 'structured', 'mixed')),
+    stream_completed INTEGER NOT NULL CHECK (stream_completed IN (0, 1)),
+    outcome TEXT NOT NULL CHECK (outcome IN ('success', 'rate_limited', 'usage_limit_reached', 'server_error', 'invalid_response', 'server_overloaded', 'network_error', 'timed_out', 'token_budget_exceeded', 'auth_error', 'request_rejected', 'cancelled')),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (request_id, retry_attempt)
+);
+INSERT INTO llm_request_metrics_new SELECT * FROM llm_request_metrics;
+PRAGMA writable_schema = ON;
+DROP TABLE llm_request_metrics;
+ALTER TABLE llm_request_metrics_new RENAME TO llm_request_metrics;
+PRAGMA writable_schema = OFF;
+CREATE INDEX idx_llm_request_metrics_created_at ON llm_request_metrics(created_at);
+CREATE INDEX idx_llm_request_metrics_provider_model_transport
+    ON llm_request_metrics(provider, model, transport, created_at);
+CREATE INDEX idx_llm_request_metrics_root ON llm_request_metrics(root_conversation_id, created_at);
+";
 
 #[cfg(test)]
 mod tests {

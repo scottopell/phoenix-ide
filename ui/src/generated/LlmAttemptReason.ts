@@ -9,6 +9,6 @@
  *
  * Specs: `specs/llm-retry-visibility/`. The wire-level `snake_case` is
  * emitted by `serde` via the `rename_all` attribute so the JSON values
- * match the spec's `{rate_limit, server_error, network}` set.
+ * match the retry-visibility spec's closed reason set.
  */
-export type LlmAttemptReason = "rate_limit" | "server_error" | "network";
+export type LlmAttemptReason = "rate_limit" | "server_error" | "network" | "timed_out";
