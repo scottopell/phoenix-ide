@@ -44,6 +44,12 @@ export const productConversationScenarioDefinitions = [
     state: 'error',
   },
   {
+    id: 'latest-row-aligned-prefix-tail',
+    title: 'Latest-row aligned prefix / completed steering / terminal tail',
+    viewport: 'mobile',
+    state: 'ready',
+  },
+  {
     id: 'long-history-110-messages',
     title: 'Long transcript / 110+ messages across multiple segments',
     viewport: 'desktop',
@@ -64,6 +70,8 @@ export interface ProductConversationScenario {
   viewport: 'desktop' | 'mobile';
   state: 'ready' | 'loading' | 'error';
   snapshot?: ProductConversationSnapshotView;
+  /** Complete aligned latest-row projection emitted by the embedded ordinary SSE init. */
+  alignedLatestMessages?: import('../../api').Message[];
   latestConversationState?: import('../../api').ConversationState;
   /** A real cursor page returned only when the page requests snapshot.before. */
   olderSnapshot?: ProductConversationSnapshotView;

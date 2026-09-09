@@ -150,32 +150,42 @@ function flattenHistoricalMessages(snapshot: ProductConversationSnapshotView): M
     });
 }
 
-function mergeMessagesById(snapshotMessages: Message[], liveMessages: Message[], transcriptRowId: string): Message[] {
-  const liveById = new Map(liveMessages.map((message) => [message.message_id, message]));
-  const merged = snapshotMessages.map((message) => {
-    const live = liveById.get(message.message_id);
-    if (!live) return message;
-    return {
-      ...live,
-      display_data: {
-        ...(live.display_data ?? {}),
-        ...((message.display_data as { productOccurrenceToken?: string } | null | undefined)?.productOccurrenceToken
-          ? { productOccurrenceToken: (message.display_data as { productOccurrenceToken: string }).productOccurrenceToken }
-          : {}),
-      },
-    };
-  });
-  const snapshotIds = new Set(snapshotMessages.map((message) => message.message_id));
-  const appended = liveMessages
-    .filter((message) => !snapshotIds.has(message.message_id))
-    .map((message) => ({
+function compareTranscriptRowMessages(left: Message, right: Message): number {
+  return left.sequence_id - right.sequence_id
+    || left.message_id.localeCompare(right.message_id);
+}
+
+function reconcileLatestTranscriptRowMessages(
+  snapshotMessages: Message[],
+  liveMessages: Message[],
+  transcriptRowId: string,
+): Message[] {
+  const messagesById = new Map<string, Message>();
+  const messageIdBySequence = new Map<number, string>();
+  const insert = (message: Message, preferOccurrenceFrom?: Message) => {
+    const priorAtSequence = messageIdBySequence.get(message.sequence_id);
+    if (priorAtSequence && priorAtSequence !== message.message_id) {
+      messagesById.delete(priorAtSequence);
+    }
+    const priorById = messagesById.get(message.message_id);
+    if (priorById && priorById.sequence_id !== message.sequence_id) {
+      messageIdBySequence.delete(priorById.sequence_id);
+    }
+    messagesById.set(message.message_id, {
       ...message,
       display_data: {
         ...(message.display_data ?? {}),
-        productOccurrenceToken: productOccurrenceToken(transcriptRowId, message.message_id),
+        productOccurrenceToken: preferOccurrenceFrom
+          ? (preferOccurrenceFrom.display_data as { productOccurrenceToken?: string } | null | undefined)?.productOccurrenceToken
+            ?? productOccurrenceToken(transcriptRowId, message.message_id)
+          : productOccurrenceToken(transcriptRowId, message.message_id),
       },
-    }));
-  return [...merged, ...appended];
+    });
+    messageIdBySequence.set(message.sequence_id, message.message_id);
+  };
+  for (const snapshotMessage of snapshotMessages) insert(snapshotMessage, snapshotMessage);
+  for (const liveMessage of liveMessages) insert(liveMessage, messagesById.get(liveMessage.message_id));
+  return [...messagesById.values()].sort(compareTranscriptRowMessages);
 }
 
 function makeAggregateMessages(
@@ -200,7 +210,13 @@ function makeAggregateMessages(
   const latestSnapshotMessages = latestSegment?.messages.map((message) => toMessage(message, productOccurrenceToken(latestSegment.transcript_row_id, message.message_id))) ?? [];
   return [
     ...historical,
-    ...mergeMessagesById(latestSnapshotMessages, latestProjection.messages, snapshot.latest_transcript_row_id),
+    ...reconcileLatestTranscriptRowMessages(
+      latestSnapshotMessages,
+      latestProjection.conversationId === snapshot.latest_transcript_row_id
+        ? latestProjection.messages
+        : [],
+      snapshot.latest_transcript_row_id,
+    ),
     ...(latestHandoff ? [latestHandoff] : []),
   ];
 }
@@ -714,20 +730,24 @@ function ProductConversationPageInner() {
   const routeGenerationRef = useRef(0);
   const paginationRequestRef = useRef(0);
   const observedMemberProjectionRef = useRef<typeof latestProjection>(null);
+  const currentLatestProjection = snapshot
+    && latestProjection?.conversationId === snapshot.latest_transcript_row_id
+    ? latestProjection
+    : null;
   const aggregateMessages = useMemo(
-    () => snapshot ? makeAggregateMessages(snapshot, latestProjection) : [],
-    [latestProjection, snapshot],
+    () => snapshot ? makeAggregateMessages(snapshot, currentLatestProjection) : [],
+    [currentLatestProjection, snapshot],
   );
   const aggregateMessageSlot = viewerSlot.slot.kind === 'message' ? viewerSlot.slot : null;
   const isWideDesktop = useIsWideDesktop();
   const showSplitPaneViewer = isWideDesktop && aggregateMessageSlot?.presentation === 'pane';
   const closeAggregateMessageViewer = viewerSlot.close;
   const appendAggregateReviewNotes = useCallback((formattedNotes: string) => {
-    latestProjection?.appendReviewNotesToComposer?.(formattedNotes);
+    currentLatestProjection?.appendReviewNotesToComposer?.(formattedNotes);
     if (!(isWideDesktop && aggregateMessageSlot?.presentation === 'fullscreen')) {
       closeAggregateMessageViewer();
     }
-  }, [aggregateMessageSlot?.presentation, closeAggregateMessageViewer, isWideDesktop, latestProjection]);
+  }, [aggregateMessageSlot?.presentation, closeAggregateMessageViewer, currentLatestProjection, isWideDesktop]);
   ownedSnapshotRef.current = ownedSnapshot;
 
   useEffect(() => {
@@ -787,19 +807,19 @@ function ProductConversationPageInner() {
   }, [productConversationId, snapshot]);
 
   useEffect(() => {
-    if (!latestProjection?.conversationId || !snapshot) return;
+    if (!currentLatestProjection?.conversationId || !snapshot) return;
     const previous = observedMemberProjectionRef.current;
-    observedMemberProjectionRef.current = latestProjection;
-    const lifecycleMismatch = latestProjection.serverArchived
+    observedMemberProjectionRef.current = currentLatestProjection;
+    const lifecycleMismatch = currentLatestProjection.serverArchived
       !== (snapshot.ordinary_lifecycle === 'history');
-    const projectionChanged = previous !== latestProjection;
+    const projectionChanged = previous !== currentLatestProjection;
     if (lifecycleMismatch && projectionChanged) {
       setSnapshotRetry((retry) => retry + 1);
     }
-  }, [latestProjection, snapshot]);
+  }, [currentLatestProjection, snapshot]);
 
   useEffect(() => {
-    const projection = latestProjection;
+    const projection = currentLatestProjection;
     if (!projection?.conversationId || snapshot?.ordinary_lifecycle === 'history') {
       setTaskApprovalOverlay(null);
       setApprovalContextWindowUsed(null);
@@ -829,7 +849,7 @@ function ProductConversationPageInner() {
     return () => {
       cancelled = true;
     };
-  }, [latestProjection, snapshot?.ordinary_lifecycle]);
+  }, [currentLatestProjection, snapshot?.ordinary_lifecycle]);
 
   useEffect(() => {
     const handler = (event: Event) => {
@@ -848,7 +868,7 @@ function ProductConversationPageInner() {
     const routeGeneration = routeGenerationRef.current;
     const requestGeneration = ++paginationRequestRef.current;
     const requestView = {
-      conversationId: latestProjection?.conversationId ?? snapshot.product_conversation_id,
+      conversationId: currentLatestProjection?.conversationId ?? snapshot.product_conversation_id,
       generation: historyGeneration,
       transcriptGeneration: historyGeneration,
     };
@@ -892,20 +912,20 @@ function ProductConversationPageInner() {
         setLoadingOlder(false);
       }
     }
-  }, [historyGeneration, latestProjection?.conversationId, loadingOlder, productConversationId, snapshot]);
+  }, [currentLatestProjection?.conversationId, historyGeneration, loadingOlder, productConversationId, snapshot]);
 
   const messages = aggregateMessages;
   const closeInProgress = snapshot?.close != null && snapshot.close.phase !== 'completed';
   const convState = useMemo(
     () => snapshot?.ordinary_lifecycle === 'history' || closeInProgress
       ? ({ type: 'idle' } satisfies ConversationState)
-      : latestProjection?.convState ?? (snapshot ? aggregateConversationState(snapshot, loadingOlder, olderError) : { type: 'idle' } satisfies ConversationState),
-    [closeInProgress, latestProjection, loadingOlder, olderError, snapshot],
+      : currentLatestProjection?.convState ?? (snapshot ? aggregateConversationState(snapshot, loadingOlder, olderError) : { type: 'idle' } satisfies ConversationState),
+    [closeInProgress, currentLatestProjection, loadingOlder, olderError, snapshot],
   );
-  const latestSlug = latestProjection?.slug ?? snapshot?.latest_transcript_row_id ?? null;
-  const latestConversationId = latestProjection?.conversationId ?? snapshot?.latest_transcript_row_id ?? undefined;
+  const latestSlug = currentLatestProjection?.slug ?? snapshot?.latest_transcript_row_id ?? null;
+  const latestConversationId = currentLatestProjection?.conversationId ?? snapshot?.latest_transcript_row_id ?? undefined;
   const latestWorkScopeKey = snapshot?.ordinary_lifecycle === 'open'
-    ? latestProjection?.conversation?.work_scope_key
+    ? currentLatestProjection?.conversation?.work_scope_key
     : undefined;
   const transcriptView = {
     conversationId: latestConversationId ?? snapshot?.product_conversation_id ?? '',
@@ -982,13 +1002,13 @@ function ProductConversationPageInner() {
       <section className="view active product-conversation-page__transcript" data-testid="product-conversation-transcript">
         <ConversationNavStack
           messages={messages}
-          pendingMessages={latestProjection?.pendingMessages ?? []}
+          pendingMessages={currentLatestProjection?.pendingMessages ?? []}
           convState={convState}
-          onRetry={latestProjection?.onRetryPending ?? (() => {})}
-          onCancelSteering={latestProjection?.onCancelSteering}
-          onOpenFile={latestProjection?.onOpenFile}
-          filePathRootDir={latestProjection?.filePathRootDir}
-          systemPrompt={latestProjection?.systemPrompt}
+          onRetry={currentLatestProjection?.onRetryPending ?? (() => {})}
+          onCancelSteering={currentLatestProjection?.onCancelSteering}
+          onOpenFile={currentLatestProjection?.onOpenFile}
+          filePathRootDir={currentLatestProjection?.filePathRootDir}
+          systemPrompt={currentLatestProjection?.systemPrompt}
           enableMessageSidepanel
           enableMessageFullscreen
           conversationId={latestConversationId ?? snapshot.product_conversation_id}
@@ -1035,7 +1055,7 @@ function ProductConversationPageInner() {
                 occurrenceToken={aggregateMessageSlot.occurrenceToken}
                 messages={aggregateMessages}
                 onClose={closeAggregateMessageViewer}
-                onSendNotes={liveControlsEnabled && latestProjection?.appendReviewNotesToComposer
+                onSendNotes={liveControlsEnabled && currentLatestProjection?.appendReviewNotesToComposer
                   ? appendAggregateReviewNotes
                   : undefined}
                 presentation={aggregateMessageSlot.presentation}
@@ -1048,14 +1068,14 @@ function ProductConversationPageInner() {
         </ReviewNotesProvider>
       )}
 
-        {taskApprovalOverlay && latestProjection?.conversationId === taskApprovalOverlay.conversationId && (
+        {taskApprovalOverlay && currentLatestProjection?.conversationId === taskApprovalOverlay.conversationId && (
           <Suspense fallback={null}>
             <TaskApprovalReader
               title={taskApprovalOverlay.title}
               priority={taskApprovalOverlay.priority}
               plan={taskApprovalOverlay.plan}
               contextWindowUsed={approvalContextWindowUsed ?? undefined}
-              modelContextWindow={latestProjection.modelContextWindow}
+              modelContextWindow={currentLatestProjection.modelContextWindow}
               mutationEnabled={liveControlsEnabled}
               {...(liveControlsEnabled ? {
                 onApprove: (handoff) => api.approveTask(taskApprovalOverlay.conversationId, handoff)

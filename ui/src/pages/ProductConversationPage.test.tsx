@@ -3,11 +3,18 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { useEffect } from 'react';
 import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom';
 import { ProductConversationPage } from './ProductConversationPage';
+import { buildHistoricalUnits } from '../conversation/renderUnits';
+import {
+  ALIGNED_PREFIX_BOUNDARY_TOOL_ID,
+  ALIGNED_PREFIX_STEERING_TOOL_ID,
+  ALIGNED_PREFIX_TERMINAL_MARKER,
+  getProductConversationScenario,
+} from '../fixtures/productConversation/scenarios';
 import { ConversationReadinessProvider } from '../contexts/ConversationReadinessContext';
 import { FileExplorerProvider } from '../components/FileExplorer';
 import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
 import { ChainProvider } from '../chain';
-import { ApiResponseError, type ChainView, type ProductConversationSnapshotView } from '../api';
+import { ApiResponseError, type ChainView, type Message, type ProductConversationSnapshotView } from '../api';
 import type { ProductConversationCloseView } from '../generated/ProductConversationCloseView';
 import { notifyCloseSnapshotChanged } from '../notifications';
 
@@ -314,9 +321,9 @@ function emitLatestProjection(overrides: Partial<Record<string, unknown>> = {}) 
   if (!onProjectionChange) throw new Error('missing onProjectionChange');
   onProjectionChange({
     slug: 'row-2',
-    conversationId: 'conv-latest',
+    conversationId: 'row-2',
     conversation: { work_scope_key: 'ws-live' },
-    messages: [makeMessage('live-sent', 5, 'conv-latest'), makeMessage('live-streamed', 6, 'conv-latest')],
+    messages: [makeMessage('live-sent', 5, 'row-2'), makeMessage('live-streamed', 6, 'row-2')],
     pendingMessages: [{
       localId: 'pending-local',
       text: 'pending-local',
@@ -371,6 +378,117 @@ describe('ProductConversationPage', () => {
       refresh: { state: 'fresh', stale: false, last_attempted_at: '2026-01-01T00:00:00Z' },
       work_change: { kind: 'clean' },
     });
+  });
+
+  it('reconciles an aligned SSE prefix into monotonic latest-row chronology', async () => {
+    const { api } = await import('../api');
+    const scenario = getProductConversationScenario('latest-row-aligned-prefix-tail');
+    if (!scenario.snapshot || !scenario.alignedLatestMessages) throw new Error('fixture scenario incomplete');
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(scenario.snapshot);
+    renderPage('/product-conversations/pc-aligned-prefix-tail');
+    await waitForPageReady();
+    act(() => emitLatestProjection({
+      conversationId: 'row-aligned-prefix-tail',
+      slug: 'aligned-prefix-tail',
+      messages: scenario.alignedLatestMessages,
+      pendingMessages: [],
+      convState: { type: 'idle' },
+    }));
+
+    const props = conversationNavStackSpy.mock.calls.at(-1)?.[0];
+    const messages = props.messages as Message[];
+    const sequenceKeys = messages.map((message) => [message.sequence_id, message.message_id] as const);
+    expect(sequenceKeys).toEqual([...sequenceKeys].sort(([leftSequence, leftId], [rightSequence, rightId]) => (
+      leftSequence - rightSequence || leftId.localeCompare(rightId)
+    )));
+    expect(messages).toHaveLength(101);
+    expect(messages.at(-1)?.message_id).toBe('aligned-prefix-terminal-assistant');
+    expect(JSON.stringify(messages.at(-1)?.content)).toContain(ALIGNED_PREFIX_TERMINAL_MARKER);
+
+    const { historicalUnits } = buildHistoricalUnits({ messages, pendingMessages: [] });
+    expect(historicalUnits.at(-1)?.key).toBe('aligned-prefix-terminal-assistant');
+    const completedToolIds = historicalUnits.flatMap((unit) => {
+      if (unit.kind === 'agent_turn') return [...unit.toolResultsByUseId.keys()];
+      if (unit.kind === 'tool_only_agent_turn_group') {
+        return unit.members.flatMap((member) => [...member.toolResultsByUseId.keys()]);
+      }
+      return [];
+    });
+    expect(completedToolIds).toContain(ALIGNED_PREFIX_BOUNDARY_TOOL_ID);
+    expect(completedToolIds).toContain(ALIGNED_PREFIX_STEERING_TOOL_ID);
+  });
+
+  it('lets a same-sequence live row replace the stale snapshot identity', async () => {
+    const { api } = await import('../api');
+    const scenario = getProductConversationScenario('latest-row-aligned-prefix-tail');
+    if (!scenario.snapshot || !scenario.alignedLatestMessages) throw new Error('fixture scenario incomplete');
+    const snapshot = structuredClone(scenario.snapshot);
+    const latest = snapshot.segments[0];
+    if (!latest) throw new Error('fixture snapshot missing latest segment');
+    latest.messages = latest.messages.map((message) => message.sequence_id === 101
+      ? { ...message, message_id: 'stale-terminal-identity' }
+      : message);
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(snapshot);
+
+    renderPage('/product-conversations/pc-aligned-prefix-tail');
+    await waitForPageReady();
+    act(() => emitLatestProjection({
+      conversationId: 'row-aligned-prefix-tail',
+      slug: 'aligned-prefix-tail',
+      messages: scenario.alignedLatestMessages,
+      pendingMessages: [],
+      convState: { type: 'idle' },
+    }));
+
+    const messages = conversationNavStackSpy.mock.calls.at(-1)?.[0].messages as Message[];
+    expect(messages.filter((message) => message.sequence_id === 101)).toEqual([
+      expect.objectContaining({ message_id: 'aligned-prefix-terminal-assistant' }),
+    ]);
+    expect(messages.some((message) => message.message_id === 'stale-terminal-identity')).toBe(false);
+  });
+
+  it('ignores a stale live projection from the prior latest transcript row', async () => {
+    const { api } = await import('../api');
+    const scenario = getProductConversationScenario('latest-row-aligned-prefix-tail');
+    if (!scenario.snapshot) throw new Error('fixture scenario incomplete');
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(scenario.snapshot);
+
+    renderPage('/product-conversations/pc-aligned-prefix-tail');
+    await waitForPageReady();
+    act(() => emitLatestProjection({
+      conversationId: 'prior-latest-row',
+      slug: 'prior-latest-row',
+      messages: [{
+        message_id: 'foreign-row-message',
+        conversation_id: 'prior-latest-row',
+        sequence_id: 999,
+        message_type: 'agent',
+        content: [{ type: 'text', text: 'must not cross the row boundary' }],
+        display_data: {},
+        usage_data: null,
+        created_at: '2026-07-01T12:00:00Z',
+      }],
+      pendingMessages: [{
+        localId: 'foreign-pending',
+        text: 'must not appear after the current terminal tail',
+        queuedAt: Date.now(),
+        queuePosition: 1,
+      }],
+      convState: {
+        type: 'tool_executing',
+        toolName: 'foreign-tool',
+        toolInput: '{}',
+        remainingTools: 0,
+      },
+    }));
+
+    const props = conversationNavStackSpy.mock.calls.at(-1)?.[0];
+    const messages = props.messages as Message[];
+    expect(messages.some((message) => message.message_id === 'foreign-row-message')).toBe(false);
+    expect(messages.at(-1)?.message_id).toBe('aligned-prefix-terminal-assistant');
+    expect(props.pendingMessages).toEqual([]);
+    expect(props.convState).toEqual({ type: 'idle' });
+    expect(props.conversationId).toBe('row-aligned-prefix-tail');
   });
 
   it('refetches the authoritative aggregate when SSE changes member archive state', async () => {
@@ -625,7 +743,7 @@ describe('ProductConversationPage', () => {
   it('assigns occurrence identity to newly streamed latest messages', async () => {
     renderPage();
     await waitForPageReady();
-    emitLatestProjection({ messages: [makeMessage('new-live', 7, 'conv-latest')] });
+    emitLatestProjection({ messages: [makeMessage('new-live', 7, 'row-2')] });
 
     await waitFor(() => {
       const props = conversationNavStackSpy.mock.lastCall?.[0] as { messages: Array<{ message_id: string; display_data?: { productOccurrenceToken?: string } }> };
@@ -938,12 +1056,12 @@ describe('ProductConversationPage', () => {
     renderPage();
     await waitForPageReady();
 
-    emitLatestProjection({ slug: 'row-live-2', conversationId: 'conv-live-2', conversation: { work_scope_key: 'ws-latest' } });
+    emitLatestProjection({ slug: 'row-live-2', conversationId: 'row-2', conversation: { work_scope_key: 'ws-latest' } });
 
     await waitFor(() => {
       const props = conversationNavStackSpy.mock.lastCall?.[0] as Record<string, unknown>;
       expect(props['slug']).toBe('row-live-2');
-      expect(props['conversationId']).toBe('conv-live-2');
+      expect(props['conversationId']).toBe('row-2');
       expect(props['workScopeKey']).toBe('ws-latest');
     });
   });

@@ -1,9 +1,14 @@
-import type { ChainView, ConversationState, ProductConversationSnapshotView } from '../../api';
+import type { ChainView, ConversationState, Message, ProductConversationSnapshotView } from '../../api';
+import type { EnrichedMessage } from '../../generated/EnrichedMessage';
 import { productConversationScenarioDefinitions } from './types';
 import type { ProductConversationScenario, ProductConversationScenarioId } from './types';
 
 const now = Date.parse('2026-07-01T12:00:00Z');
 const isoAgo = (minutes: number) => new Date(now - minutes * 60_000).toISOString();
+
+type FixtureMessage = EnrichedMessage & Message;
+
+const ALIGNED_PREFIX_TRANSCRIPT_ROW_ID = 'row-aligned-prefix-tail';
 
 function state(type: ConversationState['type']): ConversationState {
   switch (type) {
@@ -18,10 +23,10 @@ function state(type: ConversationState['type']): ConversationState {
   }
 }
 
-function textMessage(id: string, sequenceId: number, messageType: 'user' | 'agent' | 'system', text: string, conversationState?: ConversationState) {
+function textMessage(id: string, sequenceId: number, messageType: 'user' | 'agent' | 'system', text: string, conversationState?: ConversationState): FixtureMessage {
   return {
     message_id: id,
-    conversation_id: `conv-${id}`,
+    conversation_id: ALIGNED_PREFIX_TRANSCRIPT_ROW_ID,
     sequence_id: sequenceId,
     message_type: messageType,
     content: messageType === 'agent' ? [{ type: 'text' as const, text }] : { text },
@@ -35,7 +40,7 @@ function segment(
   segmentOrdinal: number,
   transcriptRowId: string,
   title: string,
-  messages: ReturnType<typeof textMessage>[],
+  messages: EnrichedMessage[],
   handoffSummary: string | null,
 ) {
   return {
@@ -101,6 +106,92 @@ function makeSnapshot(overrides: Partial<ProductConversationSnapshotView> = {}):
     ...overrides,
   };
 }
+
+export const ALIGNED_PREFIX_BOUNDARY_TOOL_ID = 'aligned-prefix-boundary-tool';
+export const ALIGNED_PREFIX_STEERING_TOOL_ID = 'aligned-prefix-steering-tool';
+export const ALIGNED_PREFIX_TERMINAL_MARKER = 'TRANSCRIPT_TAIL_TERMINAL_ASSISTANT_VISIBLE';
+
+function toolUseMessage(id: string, sequenceId: number, toolUseId: string, name: string, input: Record<string, unknown>): FixtureMessage {
+  return {
+    ...textMessage(id, sequenceId, 'agent', ''),
+    content: [{ type: 'tool_use' as const, id: toolUseId, name, input }],
+    display_data: {},
+  };
+}
+
+function toolResultMessage(id: string, sequenceId: number, toolUseId: string, content: string): FixtureMessage {
+  return {
+    ...textMessage(id, sequenceId, 'system', ''),
+    message_type: 'tool' as const,
+    content: { tool_use_id: toolUseId, content, is_error: false },
+    display_data: {},
+  };
+}
+
+function makeAlignedPrefixScenario() {
+  const prefixOwner = toolUseMessage('aligned-prefix-owner', 1, ALIGNED_PREFIX_BOUNDARY_TOOL_ID, 'read_file', { path: 'ui/src/incident-boundary.ts' });
+  const snapshotMessages = [
+    toolResultMessage('aligned-prefix-result', 2, ALIGNED_PREFIX_BOUNDARY_TOOL_ID, 'boundary owner completed'),
+    ...Array.from({ length: 70 }, (_, index) => toolResultMessage(
+      `aligned-prefix-window-row-${index + 3}`,
+      index + 3,
+      `aligned-prefix-window-tool-${index + 3}`,
+      `Persisted boundary-window row ${index + 3}`,
+    )),
+    ...Array.from({ length: 24 }, (_, index) => textMessage(
+      `aligned-prefix-history-${index + 73}`,
+      index + 73,
+      index % 2 === 0 ? 'user' : 'agent',
+      `${'Variable-height aggregate transcript evidence. '.repeat((index % 4) + 1)} Sequence ${index + 73}.`,
+    )),
+    toolUseMessage('aligned-prefix-steering-use', 97, ALIGNED_PREFIX_STEERING_TOOL_ID, 'send_conversation_message', {
+      target: '@conv:fixture-target',
+      message: 'Continue from the durable checkpoint.',
+      message_id: 'fixture-steering-message-id',
+    }),
+    toolResultMessage(
+      'aligned-prefix-steering-result',
+      98,
+      ALIGNED_PREFIX_STEERING_TOOL_ID,
+      JSON.stringify({ outcome: 'queued_as_steering', target: '@conv:fixture-target', message_id: 'fixture-steering-message-id' }),
+    ),
+    toolUseMessage('aligned-prefix-followup-use', 99, 'aligned-prefix-followup-tool', 'read_file', { path: 'ui/src/final-check.ts' }),
+    toolResultMessage('aligned-prefix-followup-result', 100, 'aligned-prefix-followup-tool', 'final check completed'),
+    textMessage(
+      'aligned-prefix-terminal-assistant',
+      101,
+      'agent',
+      `${ALIGNED_PREFIX_TERMINAL_MARKER}: the durable terminal assistant response is visible.`,
+      state('idle'),
+    ),
+  ];
+  const snapshot = makeSnapshot({
+    product_conversation_id: 'pc-aligned-prefix-tail',
+    canonical_route: '/product-conversations/pc-aligned-prefix-tail',
+    requested_transcript_row_id: 'row-aligned-prefix-tail',
+    latest_transcript_row_id: 'row-aligned-prefix-tail',
+    writable_transcript_row_id: 'row-aligned-prefix-tail',
+    canonical_root: { transcript_row_id: 'row-aligned-prefix-tail', slug: 'aligned-prefix-tail', title: 'Aligned prefix tail' },
+    presentation: { kind: 'state', display_name: 'Aligned prefix tail', presentation_mode: 'idle' },
+    work_identity: null,
+    source: null,
+    chain_qa_compatibility: null,
+    segments: [segment(1, 'row-aligned-prefix-tail', 'Incident-shaped latest row', snapshotMessages, null)],
+    before: 'aligned-prefix-older-cursor',
+    has_older: true,
+  });
+  const olderSnapshot = makeSnapshot({
+    ...snapshot,
+    segments: [segment(1, 'row-aligned-prefix-tail', 'Incident-shaped latest row', [
+      textMessage('aligned-prefix-older-reader-anchor', 0, 'user', 'OLDER_READER_ANCHOR_PRESERVED'),
+    ], null)],
+    before: null,
+    has_older: false,
+  });
+  return { snapshot, olderSnapshot, alignedLatestMessages: [prefixOwner, ...snapshotMessages] };
+}
+
+const alignedPrefixScenario = makeAlignedPrefixScenario();
 
 function makeLongSnapshot(): ProductConversationSnapshotView {
   let sequenceId = 1;
@@ -314,6 +405,13 @@ export const productConversationScenarios = [
   },
   {
     ...productConversationScenarioDefinitions[7],
+    snapshot: alignedPrefixScenario.snapshot,
+    olderSnapshot: alignedPrefixScenario.olderSnapshot,
+    alignedLatestMessages: alignedPrefixScenario.alignedLatestMessages,
+    chain: makeChain(),
+  },
+  {
+    ...productConversationScenarioDefinitions[8],
     snapshot: makeLongSnapshot(),
     olderSnapshot: makeOlderPage(),
   },

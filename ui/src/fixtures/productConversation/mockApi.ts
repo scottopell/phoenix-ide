@@ -48,6 +48,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   let eventSourceOpenCount = 0;
   let eventSourceInitCount = 0;
   let latestEventSource: FixtureEventSource | null = null;
+  let releaseOlderSnapshot: (() => void) | null = null;
 
   const record = (name: string, value: number | string) => {
     document.documentElement.dataset[`productConversationFixture${name}`] = String(value);
@@ -71,6 +72,13 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
         throw new Error(`Scenario ${scenario.id} received an unexpected older-history cursor`);
       }
       record('OlderSnapshotRequests', Number(document.documentElement.dataset['productConversationFixtureOlderSnapshotRequests'] ?? '0') + 1);
+      if (scenario.id === 'latest-row-aligned-prefix-tail') {
+        record('OlderSnapshotPending', 'true');
+        await new Promise<void>((resolve) => {
+          releaseOlderSnapshot = resolve;
+        });
+        record('OlderSnapshotPending', 'false');
+      }
       return scenario.olderSnapshot;
     }
     return scenario.snapshot;
@@ -94,7 +102,8 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
 
   const conversation = latestConversation(scenario);
   const route = { id: conversation.id, slug: conversation.slug };
-  const messages = (scenario.snapshot?.segments.at(-1)?.messages ?? []) as Message[];
+  const messages = scenario.alignedLatestMessages
+    ?? (scenario.snapshot?.segments.at(-1)?.messages ?? []) as Message[];
 
   api.getConversationRoute = async () => route;
   api.getConversationRouteBySlug = async () => route;
@@ -135,6 +144,12 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     slug: 'fixture-successor',
     status: 'accepted',
   });
+  const releaseOlderSnapshotResponse = () => {
+    releaseOlderSnapshot?.();
+    releaseOlderSnapshot = null;
+  };
+  window.addEventListener('product-conversation-fixture-release-older', releaseOlderSnapshotResponse);
+
   globalThis.fetch = async (input, init) => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
     if (url.endsWith('/api/telemetry/conversation-open')) {
@@ -275,6 +290,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     api.listForkProposals = originalListForkProposals;
     api.reconcileAcceptedMessages = originalReconcileAcceptedMessages;
     api.continueConversation = originalContinueConversation;
+    window.removeEventListener('product-conversation-fixture-release-older', releaseOlderSnapshotResponse);
     globalThis.fetch = originalFetch;
     globalThis.WebSocket = OriginalWebSocket;
     for (const key of Object.keys(document.documentElement.dataset)) {
