@@ -188,6 +188,12 @@ entity CodexResponsesLiteRequest {
     compatibility_header: Boolean
 }
 
+entity CodexModelRegistration {
+    model: String
+    account: String?
+    route: String
+}
+
 -- A continuation snapshot is isolated by PromptCacheKey in the shared model
 -- service. `prefix` contains every prior client input item followed by the
 -- exact output items returned by the server. The continuation fingerprint is
@@ -234,7 +240,7 @@ rule ResponsesEndpointResolved {
 rule CodexWebSocketContinuationSelected {
     when: SendCodexResponses(model, cache_key, request)
 
-    requires: starts_with(model, "gpt-5.6")
+    requires: starts_with(model, "gpt-5.6") or model = "gpt-6-astra"
 
     ensures:
         if CodexWebSocketSession.exists(
@@ -320,7 +326,7 @@ rule CodexWebSocketPoolBoundedAndCancellationSafe {
 rule CodexResponsesLitePrefixTranslated {
     when: TranslateCodexResponsesRequest(model, request)
 
-    requires: starts_with(model, "gpt-5.6")
+    requires: starts_with(model, "gpt-5.6") or model = "gpt-6-astra"
 
     ensures:
         CodexResponsesLiteRequest.created(
@@ -348,6 +354,36 @@ rule CodexResponsesLitePrefixTranslated {
         -- Every WebSocket response.create also carries the Responses Lite
         -- selector in client_metadata; the upgrade header alone is insufficient
         -- because one connection carries multiple independent creates.
+}
+
+rule CodexAstraAvailabilityScopedToAccountCatalog {
+    when: DiscoverCodexModels(account, models, credential_still_matches)
+
+    ensures:
+        if credential_still_matches and models.any(model => model = "gpt-6-astra"):
+            CodexModelRegistration.created(
+                model: "gpt-6-astra",
+                account: account,
+                route: "codex"
+            )
+        else:
+            not CodexModelRegistration.exists(
+                model: "gpt-6-astra",
+                account: account,
+                route: "codex"
+            )
+}
+
+rule DirectAstraAvailabilityIndependentOfCodexCatalog {
+    when: RegisterDirectOpenAIModels(api_models)
+
+    ensures:
+        if api_models.any(model => model = "gpt-6-astra"):
+            CodexModelRegistration.created(
+                model: "gpt-6-astra",
+                account: null,
+                route: "direct_openai"
+            )
 }
 
 -- A message carrying at least one image is translated to a Responses API

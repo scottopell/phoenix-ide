@@ -163,6 +163,13 @@ const EFFORT_LEVELS_GPT_54: &[ModelEffort] = &[
     ModelEffort::High,
     ModelEffort::Xhigh,
 ];
+const EFFORT_LEVELS_GPT_6_ASTRA: &[ModelEffort] = &[
+    ModelEffort::Low,
+    ModelEffort::Medium,
+    ModelEffort::High,
+    ModelEffort::Xhigh,
+    ModelEffort::Max,
+];
 fn effort_anthropic_base() -> EffortCapabilities {
     EffortCapabilities::supported_known(EFFORT_LEVELS_ANTHROPIC_BASE, ModelEffort::High)
 }
@@ -177,6 +184,10 @@ fn effort_gpt_55_plus() -> EffortCapabilities {
 
 fn effort_gpt_54() -> EffortCapabilities {
     EffortCapabilities::supported_known(EFFORT_LEVELS_GPT_54, ModelEffort::None)
+}
+
+fn effort_gpt_6_astra() -> EffortCapabilities {
+    EffortCapabilities::supported_known(EFFORT_LEVELS_GPT_6_ASTRA, ModelEffort::Low)
 }
 
 /// Per-model metadata surfaced to API consumers (the `/api/models` response and
@@ -684,6 +695,20 @@ pub fn all_models() -> Vec<ModelSpec> {
         // bridge path is selected, so this spec's value reaches the runtime
         // only for direct/provider-compatible routes.
         ModelSpec {
+            id: "gpt-6-astra".into(),
+            api_name: "gpt-6-astra".into(),
+            backend: ModelBackend::OpenAIResponses,
+            family: "OpenAI".into(),
+            description: "GPT-6 Astra (most capable, 1.05M context)".into(),
+            context_window: 1_050_000,
+            max_output_tokens: Some(128_000),
+            recommended: true,
+            supports_tool_search: false,
+            source: ModelSource::BuiltIn,
+            effort_capabilities: effort_gpt_6_astra(),
+            service_tier_capabilities: ServiceTierCapabilities::Supported,
+        },
+        ModelSpec {
             id: "gpt-5.6-sol".into(),
             api_name: "gpt-5.6-sol".into(),
             backend: ModelBackend::OpenAIResponses,
@@ -839,6 +864,18 @@ mod tests {
             by_id("claude-haiku-4-5").effort_capabilities,
             EffortCapabilities::Unsupported
         );
+        assert_eq!(
+            by_id("gpt-6-astra").effort_capabilities,
+            effort_gpt_6_astra()
+        );
+        assert_eq!(by_id("gpt-6-astra").context_window, 1_050_000);
+        assert_eq!(by_id("gpt-6-astra").output_token_limit(), Some(128_000));
+        assert!(by_id("gpt-6-astra")
+            .effort_capabilities
+            .supports(ModelEffort::Max));
+        assert!(!by_id("gpt-6-astra")
+            .effort_capabilities
+            .supports(ModelEffort::None));
         assert_eq!(
             by_id("gpt-5.6-sol").effort_capabilities,
             effort_gpt_55_plus()

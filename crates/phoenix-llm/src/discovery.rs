@@ -37,6 +37,16 @@ struct ModelData {
     id: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct CodexModelsResponse {
+    models: Vec<CodexModelData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexModelData {
+    slug: String,
+}
+
 #[derive(Debug, Default)]
 pub struct DiscoveredModels {
     pub anthropic_listed: bool,
@@ -158,6 +168,47 @@ pub async fn discover_models(config: &DiscoveryConfig) -> DiscoveredModels {
     models
 }
 
+/// Discover the model catalog available to one ChatGPT/Codex account.
+///
+/// The Codex backend uses `{ "models": [{ "slug": ... }] }`, which is
+/// intentionally distinct from the public `OpenAI` `{ "data": [{ "id": ... }] }`
+/// response. `client_version` declares the minimum Codex catalog contract that
+/// Phoenix implements; it is not Phoenix's application version.
+///
+/// # Errors
+///
+/// Returns an error when the request fails, the account is rejected, or the
+/// response does not satisfy the Codex model-catalog schema.
+pub async fn discover_codex_models(
+    access_token: &str,
+    account_id: Option<&str>,
+) -> Result<HashSet<String>, Box<dyn std::error::Error>> {
+    const CODEX_CATALOG_CONTRACT_VERSION: &str = "0.153.0";
+    let url = format!(
+        "https://chatgpt.com/backend-api/codex/models?client_version={CODEX_CATALOG_CONTRACT_VERSION}"
+    );
+    let client = reqwest::Client::new();
+    let mut request = client
+        .get(url)
+        .bearer_auth(access_token)
+        .timeout(std::time::Duration::from_secs(5));
+    if let Some(account_id) = account_id {
+        request = request.header("chatgpt-account-id", account_id);
+    }
+
+    let response = request.send().await?;
+    if !response.status().is_success() {
+        return Err(format!("Codex models endpoint returned {}", response.status()).into());
+    }
+
+    let models: CodexModelsResponse = response.json().await?;
+    Ok(codex_model_slugs(models))
+}
+
+fn codex_model_slugs(models: CodexModelsResponse) -> HashSet<String> {
+    models.models.into_iter().map(|model| model.slug).collect()
+}
+
 /// Discover model IDs from a single provider endpoint.
 async fn discover_provider(
     url: &str,
@@ -197,4 +248,25 @@ async fn discover_provider(
 
     tracing::info!("Discovered {} {} models", ids.len(), provider_name);
     Ok(ids)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_catalog_uses_model_slugs() {
+        let response: CodexModelsResponse = serde_json::from_value(serde_json::json!({
+            "models": [
+                { "slug": "gpt-6-astra", "display_name": "GPT-6 Astra" },
+                { "slug": "gpt-5.6-sol", "display_name": "GPT-5.6 Sol" }
+            ]
+        }))
+        .expect("Codex catalog fixture");
+
+        assert_eq!(
+            codex_model_slugs(response),
+            HashSet::from(["gpt-6-astra".to_string(), "gpt-5.6-sol".to_string()])
+        );
+    }
 }

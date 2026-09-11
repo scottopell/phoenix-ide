@@ -196,6 +196,24 @@ THE successor SHALL preserve the parent's service-tier selection
 
 ---
 
+### REQ-LLM-004h: Account-Scoped Codex Model Availability
+
+WHEN a built-in model requires account-scoped Codex availability
+THE SYSTEM SHALL advertise and route that model through ChatGPT/Codex authentication only when the active account's model catalog lists its exact wire identifier
+
+WHEN Codex model discovery fails or the account catalog omits that model
+THE SYSTEM SHALL withhold that account-scoped model without suppressing established Codex models whose availability does not depend on that discovery
+
+WHEN direct OpenAI API authentication is configured
+THE SYSTEM SHALL determine direct model availability independently of the ChatGPT account catalog
+
+WHEN the active Codex credential changes while model discovery is in flight
+THE SYSTEM SHALL NOT publish the discovered catalog with a different account's credential
+
+**Rationale:** A global built-in catalog describes what Phoenix can speak, not what a particular ChatGPT account may use. Binding discovered availability to the credential identity prevents false picker choices and cross-account stale results while preserving direct API routing as a separate billing and authentication path.
+
+---
+
 ### REQ-LLM-004e: Provider Translation of Reasoning Effort
 
 WHEN request translation targets a provider with known native reasoning-effort support
