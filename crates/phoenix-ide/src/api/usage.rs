@@ -1027,6 +1027,13 @@ mod tests {
     }
 
     #[test]
+    fn gpt_6_astra_pricing_is_unknown_without_route_tier_and_long_context_data() {
+        let cost = calculate_turn_cost("gpt-6-astra", 1_000_000, 1_000_000, 100_000, 100_000);
+        assert!(!cost.pricing_known);
+        assert_eq!(cost.total_usd, None);
+    }
+
+    #[test]
     fn unknown_model_pricing_is_not_zero_cost() {
         let cost = calculate_turn_cost("future-model", 1_000_000, 1_000_000, 0, 0);
         assert!(!cost.pricing_known);
