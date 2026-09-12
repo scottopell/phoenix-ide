@@ -2,9 +2,13 @@
 
 ## Product intent
 
-Turbocharge addresses uneven result quality. Its promise is: **use more agent capacity to produce the strongest result Phoenix can**. Phoenix should automatically assign complementary investigation, implementation, and review roles so the user receives one stronger, confidence-inspiring outcome without having to orchestrate those roles manually.
+Turbocharge addresses incomplete execution of complex tasks. Its promise is: **use more agent capacity when useful to produce the strongest complete result Phoenix can**. A Turbocharged result must identify the full task scope, break it into coherent obligations, orchestrate those obligations through implementation, validation, and handoff, and synthesize one complete outcome without requiring the user to manage the decomposition.
+
+Delegation is a means, not the product promise. Phoenix may assign complementary investigation, implementation, or review roles when they improve completeness, but a Turbocharged task may proceed with the owning agent alone when delegation adds no material value.
 
 Turbocharge is not a bespoke multi-agent UI. It should use Phoenix's existing subagent interfaces and tools as they exist today. New interfaces or tools are justified only when a concrete Turbocharge behavior cannot be expressed correctly through the current system.
+
+Turbocharge begins through an explicit user action on a message containing a sufficiently complex task. Once enabled, its quality policy persists for subsequent turns in that conversation until the user disables it. It is not activated implicitly by Phoenix.
 
 OpenAI Codex commit `654b0a77d0d2f81aa21f61caf7af4be88fe550bb` supplies useful implementation evidence: its `ultra` choice couples proactive multi-agent orchestration to a real provider effort. Phoenix should evaluate that mechanism under the **Turbocharge** brand without adopting Ultra as a misleading provider effort.
 
@@ -34,28 +38,39 @@ Treat Turbocharge as a quality-seeking orchestration intent separate from provid
 
 ```mermaid
 flowchart LR
-    G["User goal"] --> T["Turbocharge quality policy"]
-    T --> I["Independent investigation"]
-    T --> W["Focused implementation"]
-    T --> R["Adversarial review"]
-    I --> S["Owning agent synthesizes evidence"]
-    W --> S
-    R --> S
-    S --> O["One strongest-result outcome"]
-    T --> E["Resolve a supported provider effort"]
+    M["User explicitly Turbocharges a complex-task message"] --> T["Persistent conversation quality policy"]
+    T --> D["Discover and decompose full task scope"]
+    D --> O["Orchestrate scoped obligations"]
+    O --> I["Implementation"]
+    O --> V["Validation and review"]
+    O --> H["Integration and handoff"]
+    I --> S["Owning agent synthesizes one complete result"]
+    V --> S
+    H --> S
+    T --> E["Delegate only when it improves completeness"]
+    T --> P["Resolve a supported provider effort"]
 ```
 
-Role selection should be adaptive rather than a fixed three-agent ritual: Phoenix should spend additional agent capacity only on complementary work that can materially improve the result. The owning agent remains responsible for synthesis and final coherence.
+Scope decomposition and orchestration are mandatory; role count and parallelism are adaptive. Phoenix should spend additional agent capacity only on complementary work that can materially improve completeness. The owning agent remains responsible for tracking every scoped obligation, resolving gaps and disagreements, and producing the final coherent result. If no complementary delegation would help, Turbocharge remains active and the owning agent proceeds solo.
 
 A typed design should prevent `Turbocharge` from being serialized as `reasoning.effort: "ultra"`. The initial design should reuse current subagent visibility and controls, then identify concrete missing primitives rather than introducing a parallel UI.
 
+## Product decisions
+
+- **Quality target:** prevent incomplete work by discovering the full task scope, decomposing it, and closing implementation, validation, integration, and handoff obligations.
+- **Activation:** explicit user action on the message that introduces the complex task; Phoenix does not activate Turbocharge implicitly.
+- **Persistence:** once selected, Turbocharge remains active for subsequent turns in that conversation until explicitly disabled.
+- **Delegation:** optional and adaptive. Turbocharge may proceed solo when additional agents would not materially improve completeness.
+- **Presentation:** reuse current subagent interfaces rather than creating bespoke team-management UI.
+
 ## Product questions to resolve
 
-- What observable qualities distinguish a successful Turbocharged result: broader option search, independent falsification, stronger evidence, implementation completeness, or another standard?
-- Which work should Turbocharge decline because extra agents would add ceremony rather than improve the result?
-- Is Turbocharge explicitly selected, recommended by Phoenix, automatically activated by policy, or some combination?
-- Is the choice scoped to one turn, a conversation, a task/workstream, or another user concept?
-- How should Phoenix explain what additional quality work occurred without creating bespoke team-management UI?
+- What establishes the authoritative scope: the triggering message alone, an owning-agent decomposition presented to the user, an approved task artifact, or a combination?
+- May the owning agent expand scope when investigation discovers adjacent obligations, and when must it ask before doing so?
+- What visible evidence demonstrates that every scoped obligation is completed or deliberately excluded?
+- How should scope changes from later user messages update the active Turbocharged task?
+- Does disabling Turbocharge stop only proactive orchestration, or also retire its outstanding scope obligations?
+- How should Phoenix explain useful additional quality work without introducing bespoke team-management UI?
 - When complementary agents disagree, what evidence and synthesis obligations determine the owning agent's final answer?
 
 ## Engineering questions after product intent is settled
@@ -68,8 +83,10 @@ A typed design should prevent `Turbocharge` from being serialized as `reasoning.
 
 ## Acceptance criteria
 
-- [ ] Complete product discovery for Turbocharge's activation, scope, quality standard, and refusal criteria.
+- [ ] Complete product discovery for Turbocharge's authoritative scope, scope-change policy, completion evidence, and disable semantics.
 - [ ] Write normative requirements centered on the strongest-result user promise and an ADR for the orchestration-versus-provider-effort distinction.
+- [ ] Persist explicit Turbocharge activation as conversation state from the triggering message onward until user disablement.
+- [ ] Require scope decomposition and obligation tracking while allowing zero delegated agents when delegation adds no material value.
 - [ ] Inventory current subagent capabilities against the required complementary roles; add no bespoke UI or tool without a demonstrated gap.
 - [ ] Add or extend Allium for the resulting orchestration lifecycle, including role selection, synthesis, cancellation, retry, recovery, and bounded delegation.
 - [ ] Represent Turbocharge separately from `ModelEffort`; impossible provider effort values cannot be serialized.
@@ -83,4 +100,5 @@ A typed design should prevent `Turbocharge` from being serialized as `reasoning.
 - Do not send `reasoning.effort: "ultra"` unless a future provider contract explicitly documents that wire value.
 - Do not rename Phoenix's existing explicit subagent tools to Turbocharge.
 - Do not build a bespoke subagent dashboard or duplicate interfaces that already express the needed work.
+- Do not define Turbocharge by a minimum agent count, mandatory parallelism, or automatic activation.
 - Do not copy Codex prompts or limits without reviewing licensing, product fit, and Phoenix's own state-machine/recovery invariants.
