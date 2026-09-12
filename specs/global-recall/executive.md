@@ -16,6 +16,11 @@ The host-bound `query_database` tool provides operator-level forensic reads of P
 
 Natural-language message search, bounded transcript reads, and the shared cross-conversation message service are available to write-capable ordinary ProductConversations and the Coordinator. Durable reference resolution remains Coordinator-only. Restricted planning conversations and sub-agents receive none of these global tools. Coordinator also receives unsandboxed Bash with an explicit active WorkScope ID whose canonical cwd Phoenix resolves server-side. The Coordinator registry remains builtin-only and excludes ambient/default filesystem access, browser, MCP, task, repository, workspace, conversation creation, approval, and lifecycle mutation tools.
 
+The separately specified ordinary-parent predecessor capability (REQ-RET-009,
+ADR-048) does not grant global authority to restricted planning parents. It is
+not implemented; its status and delivery task live in the conversation-retrieval
+executive summary.
+
 ## Status Summary
 
 | Requirement | Status | Notes |

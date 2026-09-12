@@ -121,6 +121,11 @@ THE SYSTEM MAY provide host-bound tools for global message search across Phoenix
 WHILE a restricted planning conversation or sub-agent is running
 THE SYSTEM SHALL NOT provide Phoenix-wide history search, global conversation reads, database queries, global reference resolution, or cross-conversation messaging tools
 
+THE ordinary-parent predecessor capability defined by
+`../conversation-retrieval/requirements.md` REQ-RET-009 SHALL remain separate
+from Phoenix-wide capabilities: restricted planning parents may inspect their
+own predecessors through that bound capability without receiving global tools
+
 WHILE the singleton Global Coordinator is answering a user request
 THE SYSTEM MAY additionally provide host-bound tools for global reference resolution and unsandboxed Bash
 
