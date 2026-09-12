@@ -16,12 +16,11 @@ The official GPT-6 Astra API model contract supports provider efforts `low`, `me
 
 ## Verified upstream behavior
 
-- The Codex model catalog includes `ultra` in Astra's displayed `supported_reasoning_levels` and declares `multi_agent_reasoning_effort: "xhigh"`.
+- The Codex model catalog includes `ultra` in Astra's displayed `supported_reasoning_levels` and declares `multi_agent_reasoning_effort: "xhigh"`. The per-model mapping is useful beyond Astra: Phoenix supports models with uneven orchestration ability, so Turbocharge needs catalog metadata that can select an appropriate provider effort without trusting every model to coordinate many agents equally well.
 - `ModelInfo::resolve_reasoning_effort` intercepts selected `Ultra` before ordinary inference. For Astra it serializes provider-facing `reasoning.effort: "xhigh"`, not `"ultra"`.
 - If the model override is missing or invalid, Codex falls back to `max`, then the highest non-Ultra supported effort, then `medium`.
 - `effective_multi_agent_mode` independently interprets selected Ultra as `MultiAgentMode::Proactive`; other efforts use explicit-request-only multi-agent behavior.
 - The catalog can supply proactive/explicit mode prompts. Codex also changes multi-agent concurrency affordances and suppresses proactive inheritance for internal and spawned-agent session classes.
-- App-server protocol comments describe older collaboration-mode switches as deprecated and direct clients to select Ultra for proactive multi-agent behavior.
 - The Codex TUI warns that Ultra may proactively use multiple agents and treats Max/Ultra as expensive choices requiring explicit selection.
 
 Primary upstream anchors:
@@ -58,20 +57,22 @@ A typed design should prevent `Turbocharge` from being serialized as `reasoning.
 ## Product decisions
 
 - **Quality target:** prevent incomplete work by discovering the full task scope, decomposing it, and closing implementation, validation, integration, and handoff obligations.
-- **Activation:** explicit user action on the message that introduces the complex task; Phoenix does not activate Turbocharge implicitly.
-- **Persistence:** once selected, Turbocharge remains active for subsequent turns in that conversation until explicitly disabled.
+- **Activation:** an explicit, easy inline affordance on the message that introduces the complex task, analogous to an `ultrathink` marker. The final interaction may be a keyword, compose-message chrome, or another message-bound control; Phoenix does not activate Turbocharge implicitly.
+- **Persistence:** activation applies as conversation policy after the triggering message. Whether the user can later turn it off, and whether compaction preserves or terminates it, remains a product decision.
+- **Scope authority:** the user's triggering message supplies the goal; Phoenix infers, owns, and continuously refines the decomposition without requiring plan approval.
+- **Scope growth:** Phoenix completes on-path and adjacent obligations a reasonable user would expect. It asks before broadening the user's product goal.
+- **Completion:** the owning agent exercises higher-effort judgment using normal Phoenix validation and reports the completed result. Turbocharge does not require a new scope ledger, approval gate, or mandatory independent-review verdict.
 - **Delegation:** optional and adaptive. Turbocharge may proceed solo when additional agents would not materially improve completeness.
 - **Presentation:** reuse current subagent interfaces rather than creating bespoke team-management UI.
 
 ## Product questions to resolve
 
-- What establishes the authoritative scope: the triggering message alone, an owning-agent decomposition presented to the user, an approved task artifact, or a combination?
-- May the owning agent expand scope when investigation discovers adjacent obligations, and when must it ask before doing so?
-- What visible evidence demonstrates that every scoped obligation is completed or deliberately excluded?
+- Can Turbocharge be toggled off later in the conversation, or is activation an irreversible escalation for that conversation?
+- Does compaction preserve Turbocharge as durable conversation policy, deliberately terminate it, or ask the user to reaffirm it?
+- If deactivation is allowed, does it affect in-flight orchestration or only later messages?
 - How should scope changes from later user messages update the active Turbocharged task?
-- Does disabling Turbocharge stop only proactive orchestration, or also retire its outstanding scope obligations?
-- How should Phoenix explain useful additional quality work without introducing bespoke team-management UI?
-- When complementary agents disagree, what evidence and synthesis obligations determine the owning agent's final answer?
+- How should Phoenix explain useful additional quality work without introducing bespoke team-management UI or a formal scope ledger?
+- When complementary agents disagree, what judgment and synthesis obligations determine the owning agent's final answer?
 
 ## Engineering questions after product intent is settled
 
@@ -79,18 +80,18 @@ A typed design should prevent `Turbocharge` from being serialized as `reasoning.
 - What missing tool or lifecycle primitive, if any, prevents those roles from being orchestrated correctly?
 - How do cancellation, retry, crash recovery, and partially completed roles converge without duplicate work?
 - How does Turbocharge avoid recursive proactive fan-out while still allowing useful delegated work?
-- How is Turbocharge mapped to real provider effort independently for each model?
+- How does the model catalog represent a Turbocharge orchestration-effort mapping so weaker models receive enough inference effort without being expected to orchestrate agents themselves?
 
 ## Acceptance criteria
 
-- [ ] Complete product discovery for Turbocharge's authoritative scope, scope-change policy, completion evidence, and disable semantics.
+- [ ] Complete product discovery for later-message scope changes, disable semantics, and concise result reporting.
 - [ ] Write normative requirements centered on the strongest-result user promise and an ADR for the orchestration-versus-provider-effort distinction.
-- [ ] Persist explicit Turbocharge activation as conversation state from the triggering message onward until user disablement.
-- [ ] Require scope decomposition and obligation tracking while allowing zero delegated agents when delegation adds no material value.
+- [ ] Define and persist the message-bound activation and its conversation lifecycle, including the decided deactivation and compaction semantics.
+- [ ] Require an owning-agent decomposition without introducing a user approval gate or formal scope ledger, while allowing zero delegated agents when delegation adds no material value.
 - [ ] Inventory current subagent capabilities against the required complementary roles; add no bespoke UI or tool without a demonstrated gap.
 - [ ] Add or extend Allium for the resulting orchestration lifecycle, including role selection, synthesis, cancellation, retry, recovery, and bounded delegation.
 - [ ] Represent Turbocharge separately from `ModelEffort`; impossible provider effort values cannot be serialized.
-- [ ] Define an evidence-backed mapping from Turbocharge to each supported model's real provider effort, including fallback behavior.
+- [ ] Add an evidence-backed per-model Turbocharge orchestration-effort capability, including behavior for models that should not be trusted to coordinate many agents and fallback when metadata is absent.
 - [ ] Define how the owning agent resolves disagreement and demonstrates that independent work improved the final result.
 - [ ] Add deterministic tests for role selection, synthesis, cancellation, retry/recovery, recursion bounds, and unsupported-model fallback.
 - [ ] Compare against a newly pinned upstream Codex revision before implementation because the Ultra contract may change during rollout.
@@ -101,4 +102,5 @@ A typed design should prevent `Turbocharge` from being serialized as `reasoning.
 - Do not rename Phoenix's existing explicit subagent tools to Turbocharge.
 - Do not build a bespoke subagent dashboard or duplicate interfaces that already express the needed work.
 - Do not define Turbocharge by a minimum agent count, mandatory parallelism, or automatic activation.
+- Do not require task-plan approval, a new completion artifact, or an independent-review verdict for every Turbocharged request.
 - Do not copy Codex prompts or limits without reviewing licensing, product fit, and Phoenix's own state-machine/recovery invariants.
