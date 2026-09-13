@@ -500,6 +500,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_llm_request_timed_out_outcome",
         sql: MIGRATION_096,
     },
+    Migration {
+        version: 97,
+        name: "persist_close_ambient_writer_evidence",
+        sql: MIGRATION_097,
+    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -8555,6 +8560,43 @@ mod migration_094_tests {
         assert_eq!(row_count, 8);
     }
 }
+
+const MIGRATION_097: &str = r"
+CREATE TABLE close_ambient_writer_evidence (
+    attempt_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    inspection_generation TEXT NOT NULL,
+    inspection_fingerprint TEXT NOT NULL,
+    resource_kind TEXT NOT NULL CHECK (resource_kind = 'worktree'),
+    identity_kind TEXT NOT NULL,
+    identity_codec TEXT NOT NULL,
+    identity_value TEXT NOT NULL,
+    detector TEXT NOT NULL CHECK (detector IN ('macos_proc_pidinfo', 'linux_procfs')),
+    process_id INTEGER NOT NULL CHECK (typeof(process_id) = 'integer' AND process_id > 0),
+    process_incarnation TEXT NOT NULL CHECK (length(process_incarnation) > 0),
+    executable_codec TEXT NOT NULL,
+    executable_value TEXT NOT NULL,
+    matched_path_codec TEXT NOT NULL,
+    matched_path_value TEXT NOT NULL,
+    match_kind TEXT NOT NULL CHECK (match_kind IN ('descriptor', 'mapping')),
+    access_mode TEXT NOT NULL CHECK (access_mode IN ('write_only', 'read_write', 'writable_shared_mapping')),
+    observed_at_unix_micros INTEGER NOT NULL
+        CHECK (typeof(observed_at_unix_micros) = 'integer' AND observed_at_unix_micros >= 0),
+    PRIMARY KEY (
+        attempt_id, scope, inspection_generation, inspection_fingerprint,
+        resource_kind, identity_kind, identity_codec, identity_value,
+        detector, process_id, process_incarnation,
+        matched_path_codec, matched_path_value, match_kind, access_mode
+    ),
+    FOREIGN KEY (
+        attempt_id, scope, inspection_generation, inspection_fingerprint,
+        resource_kind, identity_kind, identity_value
+    ) REFERENCES close_expected_retirement_resources (
+        attempt_id, scope, inspection_generation, inspection_fingerprint,
+        resource_kind, identity_kind, identity_value
+    ) ON DELETE RESTRICT
+);
+";
 
 const MIGRATION_095: &str = r"
 CREATE UNIQUE INDEX close_obligations_attempt_product_identity

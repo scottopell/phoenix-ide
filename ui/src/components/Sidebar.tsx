@@ -13,6 +13,7 @@ import { subscribeModels } from '../modelsPoller';
 import { ConversationContext } from '../conversation/ConversationContext';
 import {
   getProductConversationListRevision,
+  closeRecoveryGuidance,
   notifyArchiveCloseConflict,
   subscribeProductConversationListRevision,
 } from '../notifications';
@@ -235,10 +236,12 @@ export function Sidebar({
       await api.archiveConversation(conv.id);
       onConversationCreated();
     } catch (err) {
+      const recovery = closeRecoveryGuidance(err);
       notifyArchiveCloseConflict(conv.id, err);
-      console.error('Failed to close conversation:', err);
+      if (recovery) navigate(`/c/${recovery.activeTranscriptId}`);
+      console.error('Close needs attention:', err);
     }
-  }, [onConversationCreated]);
+  }, [navigate, onConversationCreated]);
 
   const handleDelete = useCallback(async () => {
     if (!deleteTarget) return;
