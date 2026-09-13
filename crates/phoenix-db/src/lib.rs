@@ -9421,6 +9421,14 @@ impl Database {
         else {
             return Ok(false);
         };
+        Self::delete_subordinates_if_last_parent(
+            connection,
+            &product_conversation_id,
+            conversation_id,
+            observer,
+        )
+        .await?;
+
         sqlx::query(
             "INSERT INTO close_hard_delete_claims (product_conversation_id)
              SELECT ?1
@@ -9514,13 +9522,6 @@ impl Database {
         )
         .bind(&product_conversation_id)
         .execute(&mut *connection)
-        .await?;
-        Self::delete_subordinates_if_last_parent(
-            connection,
-            &product_conversation_id,
-            conversation_id,
-            observer,
-        )
         .await?;
         Self::delete_product_conversation_if_empty(connection, &product_conversation_id).await?;
         Ok(true)
