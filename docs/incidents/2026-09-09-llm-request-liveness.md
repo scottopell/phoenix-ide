@@ -147,15 +147,15 @@ flowchart TD
 
 ## Five whys
 
-1. **Why did the conversation remain `llm_requesting` for 72.2 minutes?**  
+1. **Why did the conversation remain `llm_requesting` for 72.2 minutes?**
    Because the in-flight LLM future did not produce a terminal outcome for 72.2 minutes.
-2. **Why did the LLM future remain pending?**  
+2. **Why did the LLM future remain pending?**
    Because WebSocket activity kept individual frame reads alive, and later recovery/fallback continued the same logical attempt.
-3. **Why did the frame timeout not stop it?**  
+3. **Why did the frame timeout not stop it?**
    Because it was an idle/per-read timeout inside the loop, reset by every frame, not an absolute deadline.
-4. **Why did reconnect/fallback not consume the original budget?**  
+4. **Why did reconnect/fallback not consume the original budget?**
    Because no typed budget/deadline was captured at service dispatch and passed across transports; each operation owned only its local timeout.
-5. **Why did durable workflow recovery/retry not repair liveness?**  
+5. **Why did durable workflow recovery/retry not repair liveness?**
    Because retry and terminal settlement begin only after a typed error arrives. The owning provider boundary never synthesized a timeout error, so generation fencing and durable settlement had nothing to arbitrate.
 
 ## UI and state analysis
