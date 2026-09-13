@@ -178,6 +178,69 @@ async function assertReconnect(page) {
   journeys.push('ordinary latest-row SSE recovery: native failure caused production backoff, replacement EventSource, replay init, and no duplicate rows');
 }
 
+async function assertAlignedPrefixTail(page) {
+  const transcript = page.locator('.virtual-transcript');
+  const terminal = page.getByText(/TRANSCRIPT_TAIL_TERMINAL_ASSISTANT_VISIBLE/);
+  await terminal.waitFor({ state: 'visible' });
+  const tailEvidence = await page.evaluate(() => {
+    const scroller = document.querySelector('.virtual-transcript');
+    const rows = [...document.querySelectorAll('[data-render-unit-key]')];
+    const terminalRow = rows.find((row) => row.textContent?.includes('TRANSCRIPT_TAIL_TERMINAL_ASSISTANT_VISIBLE'));
+    if (!(scroller instanceof HTMLElement) || !(terminalRow instanceof HTMLElement)) return null;
+    const viewport = scroller.getBoundingClientRect();
+    const marker = terminalRow.getBoundingClientRect();
+    return {
+      lastMountedKey: rows.at(-1)?.getAttribute('data-render-unit-key'),
+      terminalKey: terminalRow.getAttribute('data-render-unit-key'),
+      terminalVisible: marker.bottom > viewport.top && marker.top < viewport.bottom,
+      distanceFromTail: scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight,
+    };
+  });
+  if (!tailEvidence
+    || tailEvidence.terminalKey !== 'aligned-prefix-terminal-assistant'
+    || tailEvidence.lastMountedKey !== tailEvidence.terminalKey
+    || !tailEvidence.terminalVisible
+    || Math.abs(tailEvidence.distanceFromTail) > 1) {
+    throw new Error(`terminal assistant is not the mounted physical tail: ${JSON.stringify(tailEvidence)}`);
+  }
+
+  const assertCompleted = async (name, tool) => {
+    const text = await tool.textContent() ?? '';
+    const completed = await tool.locator('.tool-block-status.success').count()
+      || await tool.locator('.compact-tool-card-status').filter({ hasText: /done|success/i }).count();
+    if (!completed || /waiting for tool result|result not received|running/i.test(text)) {
+      throw new Error(`${name} source tool is not completed: ${text}`);
+    }
+  };
+  const steering = page.locator('[data-tool-id="aligned-prefix-steering-tool"]');
+  await steering.waitFor();
+  await assertCompleted('steering', steering);
+
+  await transcript.evaluate((element) => element.scrollTo({ top: 0 }));
+  const boundary = page.locator('[data-tool-id="aligned-prefix-boundary-tool"]');
+  await boundary.waitFor();
+  await page.waitForFunction(() => (
+    Number(document.documentElement.dataset.productConversationFixtureOlderSnapshotRequests ?? '0') === 1
+      && document.documentElement.dataset.productConversationFixtureOlderSnapshotPending === 'true'
+  ));
+  const anchorBefore = await boundary.boundingBox();
+  if (!anchorBefore) throw new Error('boundary reader anchor has no visible geometry');
+  if (await page.locator('.virtual-transcript').getByText('OLDER_READER_ANCHOR_PRESERVED').count()) {
+    throw new Error('older prefix rendered before the pre-restoration anchor measurement');
+  }
+  await page.evaluate(() => window.dispatchEvent(new Event('product-conversation-fixture-release-older')));
+  await page.locator('.virtual-transcript').getByText('OLDER_READER_ANCHOR_PRESERVED').waitFor({ state: 'attached' });
+  const anchorAfter = await boundary.boundingBox();
+  if (!anchorAfter || Math.abs(anchorAfter.y - anchorBefore.y) > 1) {
+    throw new Error(`reader prefix restoration moved the boundary anchor: ${JSON.stringify({ anchorBefore, anchorAfter })}`);
+  }
+  await assertCompleted('boundary', boundary);
+
+  await transcript.evaluate((element) => element.scrollTo({ top: element.scrollHeight }));
+  await terminal.waitFor({ state: 'visible' });
+  journeys.push('aligned latest row: prefix owner and queued steering completed; terminal assistant is physical tail; reader prefix anchor preserved');
+}
+
 async function assertLongHistory(page) {
   const transcript = page.locator('.virtual-transcript');
   await page.getByText('Older deep-link target from the real cursor page.').waitFor();
@@ -281,6 +344,9 @@ runSurfaceCapture({
       await assertRecallAndWork(page, viewport, outDir);
     }
     if (id === 'error' && viewport.name === 'mobile-dark') await assertRetry(page, viewport, theme);
+    if (id === 'latest-row-aligned-prefix-tail' && viewport.name === 'mobile-dark') {
+      await assertAlignedPrefixTail(page);
+    }
     if (id === 'long-history-110-messages') {
       if (viewport.name === 'mobile-dark') await assertLongHistory(page);
       if (viewport.name === 'desktop-dark') await assertDeepLink(page);

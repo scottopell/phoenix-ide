@@ -33,5 +33,8 @@ Loading.storyName = 'loading';
 export const Error = storyFor('error');
 Error.storyName = 'error';
 
+export const LatestRowAlignedPrefixTail = storyFor('latest-row-aligned-prefix-tail');
+LatestRowAlignedPrefixTail.storyName = 'latest-row-aligned-prefix-tail';
+
 export const LongHistory110Messages = storyFor('long-history-110-messages');
 LongHistory110Messages.storyName = 'long-history-110-messages';
