@@ -198,6 +198,7 @@ pub struct MockToolExecutor {
         crate::runtime::traits::ToolCapabilityGeneration,
     )>,
     model_ids: Arc<[String]>,
+    fail_capability_upgrade: bool,
     /// Record of tool executions
     pub executions: Mutex<Vec<(String, Value)>>,
 }
@@ -214,6 +215,7 @@ impl MockToolExecutor {
                 crate::runtime::traits::ToolCapabilityGeneration::INITIAL,
             )),
             model_ids: Arc::from(Vec::new()),
+            fail_capability_upgrade: false,
             executions: Mutex::new(Vec::new()),
         }
     }
@@ -242,6 +244,11 @@ impl MockToolExecutor {
         authority: phoenix_core::work_scope::ResourceAuthority,
     ) -> Self {
         self.capability.get_mut().unwrap().0 = authority;
+        self
+    }
+
+    pub fn with_failed_capability_upgrade(mut self) -> Self {
+        self.fail_capability_upgrade = true;
         self
     }
 
@@ -294,6 +301,9 @@ impl ToolExecutor for MockToolExecutor {
     fn upgrade_to_work_mode(
         &self,
     ) -> Result<crate::runtime::traits::ToolCapabilitySnapshot, String> {
+        if self.fail_capability_upgrade {
+            return Err("injected capability publication failure".to_string());
+        }
         let mut capability = self.capability.lock().unwrap();
         capability.0 = phoenix_core::work_scope::ResourceAuthority::Work;
         capability.1 = capability.1.next();
@@ -722,6 +732,13 @@ impl InMemoryStorage {
             fail_watermark_read: Mutex::new(false),
             fail_watermark_write: Mutex::new(false),
         }
+    }
+
+    pub fn approved_task_authority_persisted(&self, conv_id: &str) -> bool {
+        self.approved_task_authorities
+            .lock()
+            .unwrap()
+            .contains_key(conv_id)
     }
 
     pub fn set_fail_continuation_commit(&self, fail: bool) {
