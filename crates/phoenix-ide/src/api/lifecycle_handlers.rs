@@ -16,7 +16,7 @@ use crate::runtime::close_retirement::CloseRetirementError;
 use crate::runtime::fork_resolve::ForkResolveError;
 use crate::state_machine::state::TaskApprovalOutcome;
 use crate::state_machine::{ConvState, Event};
-use phoenix_core::domain::close::TranscriptConversationId;
+use phoenix_core::domain::close::{ClosePhase, TranscriptConversationId};
 
 use axum::{
     extract::{Path, State},
@@ -625,10 +625,25 @@ pub(crate) async fn cancel_close_before_retirement(
     Ok(Json(SuccessResponse { success: true }))
 }
 
-fn close_retirement_conflict(
+async fn close_retirement_conflict(
+    db: &phoenix_db::Database,
     error: CloseRetirementError,
     attempt_id: &str,
     active_transcript_id: &str,
+) -> ConflictErrorResponse {
+    let phase = db
+        .get_close_obligation(attempt_id)
+        .await
+        .ok()
+        .map(|obligation| obligation.phase());
+    close_retirement_conflict_for_phase(error, attempt_id, active_transcript_id, phase)
+}
+
+fn close_retirement_conflict_for_phase(
+    error: CloseRetirementError,
+    attempt_id: &str,
+    active_transcript_id: &str,
+    phase: Option<ClosePhase>,
 ) -> ConflictErrorResponse {
     let (message, invariant, relation) = match error {
         CloseRetirementError::EvidenceInvariant {
@@ -641,8 +656,10 @@ fn close_retirement_conflict(
         ),
         CloseRetirementError::Message(message) => (message, None, None),
     };
-    let mut response = ConflictErrorResponse::new(message, "close_retirement_needs_repair")
-        .with_close_recovery(attempt_id, active_transcript_id);
+    let mut response = ConflictErrorResponse::new(message, "close_retirement_needs_repair");
+    if phase == Some(ClosePhase::NeedsRepair) {
+        response = response.with_close_recovery(attempt_id, active_transcript_id);
+    }
     response.failed_invariant = invariant;
     response.failed_relation = relation;
     response
@@ -748,11 +765,9 @@ pub(crate) async fn retry_close_retirement(
                 .await
                 .expect_err("repair routing returns the persisted repair detail");
         }
-        return Err(AppError::Conflict(Box::new(close_retirement_conflict(
-            error,
-            retried.attempt_id().as_str(),
-            &id,
-        ))));
+        return Err(AppError::Conflict(Box::new(
+            close_retirement_conflict(&state.db, error, retried.attempt_id().as_str(), &id).await,
+        )));
     }
     let authoritative = state
         .db
@@ -963,17 +978,21 @@ async fn run_legacy_close_compat(state: &AppState, id: &str, action: &str) -> Re
                 ))));
             }
             ClosePhase::RetirementRequested => {
-                state
+                if let Err(error) = state
                     .runtime
                     .retire_close_runtime_resources(obligation.attempt_id().clone())
                     .await
-                    .map_err(|error| {
-                        AppError::Conflict(Box::new(close_retirement_conflict(
+                {
+                    return Err(AppError::Conflict(Box::new(
+                        close_retirement_conflict(
+                            &state.db,
                             error,
                             obligation.attempt_id().as_str(),
                             expected_latest_transcript.as_str(),
-                        )))
-                    })?;
+                        )
+                        .await,
+                    )));
+                }
                 return Ok(());
             }
             ClosePhase::NeedsRepair => {
@@ -1073,14 +1092,16 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     #[test]
-    fn evidence_invariant_conflict_is_structured_and_hides_storage_detail() {
-        let response = close_retirement_conflict(
-            CloseRetirementError::EvidenceInvariant {
-                invariant: "target_dispatch_must_match_sealed_inventory",
-                relation: "close_retirement_resource_dispatches",
-            },
+    fn evidence_invariant_conflict_advertises_retry_only_from_needs_repair() {
+        let error = || CloseRetirementError::EvidenceInvariant {
+            invariant: "target_dispatch_must_match_sealed_inventory",
+            relation: "close_retirement_resource_dispatches",
+        };
+        let response = close_retirement_conflict_for_phase(
+            error(),
             "attempt-1",
             "active-1",
+            Some(ClosePhase::NeedsRepair),
         );
         let json = serde_json::to_value(response).unwrap();
         assert_eq!(json["error_type"], "close_retirement_needs_repair");
@@ -1101,6 +1122,22 @@ mod tests {
         );
         assert!(!json.to_string().contains("787"));
         assert!(!json.to_string().contains("FOREIGN KEY"));
+
+        for phase in [
+            Some(ClosePhase::RetirementRequested),
+            Some(ClosePhase::Completed),
+            None,
+        ] {
+            let json = serde_json::to_value(close_retirement_conflict_for_phase(
+                error(),
+                "attempt-1",
+                "active-1",
+                phase,
+            ))
+            .unwrap();
+            assert!(json.get("recovery_action").is_none());
+            assert!(json.get("attempt_id").is_none());
+        }
     }
 
     fn fixture(id: &str, continued_in_conv_id: Option<String>) -> Conversation {

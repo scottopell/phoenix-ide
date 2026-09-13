@@ -3662,6 +3662,10 @@ impl Database {
                     plan.final_tombstone_root_inode, plan.final_tombstone_object_device,
                     plan.final_tombstone_object_inode
              FROM close_worktree_cleanup_plans plan
+             JOIN close_retirement_inventories inventory
+               ON inventory.attempt_id = plan.attempt_id AND inventory.scope = plan.scope
+              AND inventory.inspection_generation = plan.inspection_generation
+              AND inventory.inspection_fingerprint = plan.inspection_fingerprint
              JOIN close_retirement_resource_dispatches dispatch
                ON dispatch.attempt_id = plan.attempt_id AND dispatch.scope = plan.scope
               AND dispatch.inspection_generation = plan.inspection_generation
@@ -3684,7 +3688,9 @@ impl Database {
                      AND adoption.identity_kind=plan.identity_kind
                      AND adoption.identity_codec=plan.identity_codec
                      AND adoption.identity_value=plan.identity_value
-               )",
+               )
+             ORDER BY inventory.captured_at DESC, plan.rowid DESC
+             LIMIT 1",
         )
         .bind(request.attempt_id.as_str())
         .bind(request.scope.as_str())
@@ -3696,11 +3702,11 @@ impl Database {
         .bind(request.target_snapshot.fingerprint())
         .fetch_all(&mut *tx)
         .await?;
-        let [source] = sources.as_slice() else {
+        let Some(source) = sources.first() else {
             return Err(DbError::CloseEvidenceInvariant {
-                invariant: "unique_compatible_prior_dispatch_and_cleanup_plan",
-                relation: "close_retirement_resource_dispatches+close_worktree_cleanup_plans",
-                detail: format!("found {} compatible source plans", sources.len()),
+                invariant: "newest_compatible_prior_dispatch_and_cleanup_plan",
+                relation: "close_retirement_inventories+close_retirement_resource_dispatches+close_worktree_cleanup_plans",
+                detail: "found no compatible source plans".to_string(),
             });
         };
         let dispatched_at_us = Utc::now().timestamp_micros();
@@ -9998,9 +10004,64 @@ mod tests {
             (snapshot, plan)
         }
 
+        db.route_close_attempt_to_repair(RouteCloseAttemptToRepairRequest {
+            attempt_id: attempt_id.clone(),
+            scope: scope.clone(),
+            residual: resource.clone(),
+            reason: RetirementFailureReason::IdentityNotProven,
+            detail: "retain before newest unadopted generation".to_string(),
+        })
+        .await
+        .unwrap();
+        db.retry_close_retirement(&attempt_id).await.unwrap();
+        db.replace_close_inspection(ReplaceCloseInspectionRequest {
+            attempt_id: attempt_id.clone(),
+            scopes: vec![ReplaceCloseInspectionScopeRequest {
+                scope: scope.clone(),
+                snapshot: CloseRetirementSnapshot::parse(
+                    "generation-unadopted-newest",
+                    "generation-unadopted-newest-fingerprint",
+                )
+                .unwrap(),
+                losses: Vec::new(),
+            }],
+        })
+        .await
+        .unwrap();
+        let newest_unadopted_snapshot = current_test_snapshot(&db, attempt_id.as_str()).await;
+        capture_test_inventory(
+            &db,
+            attempt_id.as_str(),
+            &scope,
+            &newest_unadopted_snapshot,
+            vec![resource.clone()],
+        )
+        .await;
+        db.record_close_retirement_dispatch(RecordCloseRetirementDispatchRequest {
+            attempt_id: attempt_id.clone(),
+            scope: scope.clone(),
+            snapshot: newest_unadopted_snapshot.clone(),
+            resource: resource.clone(),
+        })
+        .await
+        .unwrap();
+        db.record_close_worktree_cleanup_plan(RecordCloseWorktreeCleanupPlanRequest {
+            attempt_id: attempt_id.clone(),
+            scope: scope.clone(),
+            snapshot: newest_unadopted_snapshot.clone(),
+            resource: resource.clone(),
+            administrative_dir: std::path::PathBuf::from("/tmp/git/worktrees/newest"),
+            administrative_dir_incarnation: "admin-chain-v2".to_string(),
+        })
+        .await
+        .unwrap();
         let (snapshot_b, plan_b) =
             rotate_and_adopt(&db, &attempt_id, &scope, &resource, "generation-b").await;
         assert_eq!(plan_b.final_tombstone, None);
+        assert_eq!(
+            plan_b.administrative_dir,
+            std::path::PathBuf::from("/tmp/git/worktrees/newest")
+        );
         let tombstone = CloseWorktreeFinalTombstone {
             root: std::path::PathBuf::from("/tmp/.phoenix-close-newest"),
             device: 41,
@@ -10050,7 +10111,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(lineage.len(), 2);
-        assert_eq!(lineage[0].0, source_snapshot.generation());
+        assert_eq!(lineage[0].0, newest_unadopted_snapshot.generation());
         assert_eq!(lineage[0].1, snapshot_b.generation());
         assert_eq!(lineage[1].0, snapshot_b.generation());
         assert_eq!(lineage[1].1, snapshot_c.generation());
@@ -10071,7 +10132,7 @@ mod tests {
         .fetch_all(db.pool())
         .await
         .unwrap();
-        assert_eq!(evidence_shape.len(), 3);
+        assert_eq!(evidence_shape.len(), 4);
         assert!(evidence_shape
             .iter()
             .all(|(_, dispatch, plan)| *dispatch == 1 && *plan == 1));
@@ -10123,8 +10184,8 @@ mod tests {
         assert!(matches!(
             error,
             DbError::CloseEvidenceInvariant {
-                invariant: "unique_compatible_prior_dispatch_and_cleanup_plan",
-                relation: "close_retirement_resource_dispatches+close_worktree_cleanup_plans",
+                invariant: "newest_compatible_prior_dispatch_and_cleanup_plan",
+                relation: "close_retirement_inventories+close_retirement_resource_dispatches+close_worktree_cleanup_plans",
                 ..
             }
         ));
