@@ -714,7 +714,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             api_name: "gpt-6-astra".into(),
             backend: ModelBackend::OpenAIResponses,
             family: "OpenAI".into(),
-            description: "GPT-6 Astra (most capable, 1.05M context)".into(),
+            description: "GPT-6 Astra (most capable)".into(),
             context_window: 1_050_000,
             max_output_tokens: Some(128_000),
             recommended: true,

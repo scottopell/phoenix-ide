@@ -1643,7 +1643,8 @@ fn translate_to_responses_request(
         )
     };
 
-    let explicit_cache_supported = !use_codex_backend && supports_explicit_prompt_cache(api_name);
+    let explicit_cache_supported =
+        !use_codex_backend && official_openai_route && supports_explicit_prompt_cache(api_name);
     if explicit_cache_supported {
         place_explicit_cache_breakpoints(&mut input_items);
     }
@@ -4503,6 +4504,21 @@ mod tests {
 
         assert_eq!(direct["service_tier"], "priority");
         assert_eq!(codex["service_tier"], "priority");
+    }
+
+    #[test]
+    fn astra_explicit_cache_controls_are_omitted_on_custom_routes() {
+        let request = empty_request();
+
+        let custom = serde_json::to_value(translate_to_responses_request(
+            "gpt-6-astra",
+            &request,
+            false,
+            false,
+        ))
+        .unwrap();
+
+        assert!(custom.get("prompt_cache_options").is_none());
     }
 
     #[test]
