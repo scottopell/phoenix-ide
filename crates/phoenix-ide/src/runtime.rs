@@ -7626,6 +7626,7 @@ mod scope_liveness_tests {
         attempt_id
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn exact_attempt_retry_adopts_retained_cleanup_and_finalizes_history() {
         use phoenix_core::domain::close::ClosePhase;
@@ -7655,6 +7656,7 @@ mod scope_liveness_tests {
             if marker.exists() {
                 break;
             }
+            // test-timing-allow: polling backoff; the helper's marker is the completion signal
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(marker.exists(), "external writer became ready");
