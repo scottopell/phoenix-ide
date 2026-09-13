@@ -3788,12 +3788,13 @@ fn quarantine_has_writable_mappings_in(
             Err(_) if !process.path().exists() => continue,
             Err(error) => return Err(error),
         };
-        let Ok(before_executable) = std::fs::read_link(process.path().join("exe")) else {
-            continue;
+        let before_executable = match std::fs::read_link(process.path().join("exe")) {
+            Ok(executable) => executable,
+            Err(_) if !process.path().exists() => continue,
+            Err(error) => return Err(format!("cannot inspect process executable: {error}")),
         };
         let mappings = match std::fs::read_to_string(process.path().join("maps")) {
             Ok(mappings) => mappings,
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => continue,
             Err(_) if !process.path().exists() => continue,
             Err(error) => return Err(format!("cannot inspect process mappings: {error}")),
         };
@@ -4007,10 +4008,11 @@ fn quarantine_has_process_cwd_in(
         if !linux_process_is_relevant(&process, effective_uid, "cwd")? {
             continue;
         }
-        if std::fs::read_link(process.path().join("cwd"))
-            .is_ok_and(|cwd| path_is_within(&cwd, &canonical))
-        {
-            return Ok(true);
+        match std::fs::read_link(process.path().join("cwd")) {
+            Ok(cwd) if path_is_within(&cwd, &canonical) => return Ok(true),
+            Ok(_) => {}
+            Err(_) if !process.path().exists() => continue,
+            Err(error) => return Err(format!("cannot inspect process cwd: {error}")),
         }
     }
     Ok(false)
@@ -4265,12 +4267,13 @@ fn quarantine_has_open_descriptors_in(
             Err(_) if !process.path().exists() => continue,
             Err(error) => return Err(error),
         };
-        let Ok(before_executable) = std::fs::read_link(process.path().join("exe")) else {
-            continue;
+        let before_executable = match std::fs::read_link(process.path().join("exe")) {
+            Ok(executable) => executable,
+            Err(_) if !process.path().exists() => continue,
+            Err(error) => return Err(format!("cannot inspect process executable: {error}")),
         };
         let descriptors = match std::fs::read_dir(process.path().join("fd")) {
             Ok(descriptors) => descriptors,
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => continue,
             Err(_) if !process.path().exists() => continue,
             Err(error) => return Err(format!("cannot inspect process descriptors: {error}")),
         };
@@ -4311,8 +4314,10 @@ fn quarantine_has_open_descriptors_in(
                 Err(_) if !process.path().exists() => continue,
                 Err(error) => return Err(error),
             };
-            let Ok(after_executable) = std::fs::read_link(process.path().join("exe")) else {
-                continue;
+            let after_executable = match std::fs::read_link(process.path().join("exe")) {
+                Ok(executable) => executable,
+                Err(_) if !process.path().exists() => continue,
+                Err(error) => return Err(format!("cannot inspect process executable: {error}")),
             };
             if after_incarnation != before_incarnation || after_executable != before_executable {
                 continue;
@@ -7283,7 +7288,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn cwd_scan_treats_same_user_nondumpable_process_as_observational() {
+    fn same_user_nondumpable_process_is_indeterminate() {
         let temp = tempfile::tempdir().unwrap();
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
@@ -7329,14 +7334,16 @@ mod tests {
             super::LinuxProcessOwner::Relevant,
             "same-user nondumpable process must be attributed from kernel credentials"
         );
-        let scan = super::quarantine_has_process_cwd_in(temp.path(), &proc_root, effective_uid);
+        let cwd_scan = super::quarantine_has_process_cwd_in(temp.path(), &proc_root, effective_uid);
+        let mapping_scan =
+            super::quarantine_has_writable_mappings_in(temp.path(), &proc_root, effective_uid);
+        let descriptor_scan = super::quarantine_has_open_descriptors_in(temp.path(), &proc_root);
 
         drop(child.stdin.take());
         child.wait().unwrap();
-        assert!(
-            scan.is_ok(),
-            "same-user nondumpable process unreadability must remain observational: {scan:?}"
-        );
+        assert!(cwd_scan.is_err());
+        assert!(mapping_scan.is_err());
+        assert!(descriptor_scan.is_err());
     }
 
     #[cfg(target_os = "linux")]

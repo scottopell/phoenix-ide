@@ -3218,6 +3218,12 @@ impl RuntimeManager {
 
     /// Replays exact runtime-resource permits for sealed Close retirements. It
     /// never finalizes product lifecycle or unblocks History.
+    fn close_retirement_is_startup_admitted(
+        phase: phoenix_core::domain::close::ClosePhase,
+    ) -> bool {
+        phase == phoenix_core::domain::close::ClosePhase::RetirementRequested
+    }
+
     pub async fn resume_pending_close_runtime_retirements(
         self: &Arc<Self>,
     ) -> Result<usize, String> {
@@ -3230,41 +3236,11 @@ impl RuntimeManager {
         self.run_authority_units(obligations, move |obligation| {
             let manager = Arc::clone(&manager);
             async move {
-                if !matches!(
-                    obligation.phase(),
-                    phoenix_core::domain::close::ClosePhase::RetirementRequested
-                        | phoenix_core::domain::close::ClosePhase::NeedsRepair
-                ) {
+                if !Self::close_retirement_is_startup_admitted(obligation.phase()) {
                     return Ok(false);
                 }
-                let retried = if obligation.phase()
-                    == phoenix_core::domain::close::ClosePhase::NeedsRepair
-                {
-                    manager
-                        .db
-                        .retry_close_retirement(obligation.attempt_id())
-                        .await
-                        .map_err(|error| error.to_string())?
-                } else {
-                    obligation.clone()
-                };
-                if retried.phase()
-                    == phoenix_core::domain::close::ClosePhase::AwaitingRetirementInspection
-                {
-                    return match manager
-                        .inspect_close_retirement(retried.attempt_id().clone())
-                        .await
-                    {
-                        Ok(_) => Ok(true),
-                        Err(error) => {
-                            tracing::warn!(attempt_id = %retried.attempt_id(), %error,
-                                "Close retirement inspection could not be rebuilt during repair recovery");
-                            Ok(false)
-                        }
-                    };
-                }
                 match manager
-                    .retire_close_runtime_resources(retried.attempt_id().clone())
+                    .retire_close_runtime_resources(obligation.attempt_id().clone())
                     .await
                 {
                     Ok(()) => Ok(true),
@@ -7425,10 +7401,12 @@ mod scope_liveness_tests {
         );
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn prepare_clean_close_with_tmux(
         manager: &RuntimeManager,
         owner: &phoenix_tools::tmux::test_server::TestTmuxServerOwner,
         conversation_id: &str,
+        subordinate_id: Option<&str>,
         attempt: &str,
     ) -> (
         tempfile::TempDir,
@@ -7436,6 +7414,7 @@ mod scope_liveness_tests {
         WorkScopeId,
         std::path::PathBuf,
         String,
+        Option<crate::db::Conversation>,
     ) {
         let repository = tempfile::tempdir().unwrap();
         let output = phoenix_core::git::command()
@@ -7491,6 +7470,34 @@ mod scope_liveness_tests {
             .get_conversation(conversation_id)
             .await
             .unwrap();
+        let subordinate = if let Some(subordinate_id) = subordinate_id {
+            Some(
+                manager
+                    .db()
+                    .create_conversation_with_project(
+                        subordinate_id,
+                        subordinate_id,
+                        repository.path().to_str().unwrap(),
+                        false,
+                        Some(conversation_id),
+                        None,
+                        None,
+                        &ConvMode::Explore {
+                            worktree_path: None,
+                            next_taskmd_id_hint: None,
+                        },
+                        None,
+                        None,
+                        None,
+                        phoenix_core::llm_language::LlmLanguage::default(),
+                    )
+                    .await
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+
         sqlx::query("UPDATE conversations SET user_initiated = 1 WHERE id = ?1")
             .bind(conversation_id)
             .execute(manager.db().pool())
@@ -7529,7 +7536,7 @@ mod scope_liveness_tests {
             .capture_close_retirement_inventory(attempt_id.clone(), snapshot)
             .await
             .unwrap();
-        (repository, attempt_id, scope, socket, token)
+        (repository, attempt_id, scope, socket, token, subordinate)
     }
 
     async fn prepare_close_attempt_ready_for_completion(
@@ -7587,6 +7594,16 @@ mod scope_liveness_tests {
         attempt_id
     }
 
+    #[test]
+    fn startup_requires_explicit_operator_admission_for_needs_repair() {
+        assert!(!RuntimeManager::close_retirement_is_startup_admitted(
+            phoenix_core::domain::close::ClosePhase::NeedsRepair,
+        ));
+        assert!(RuntimeManager::close_retirement_is_startup_admitted(
+            phoenix_core::domain::close::ClosePhase::RetirementRequested,
+        ));
+    }
+
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn exact_attempt_retry_adopts_retained_cleanup_and_finalizes_history() {
@@ -7595,15 +7612,18 @@ mod scope_liveness_tests {
 
         let owner = phoenix_tools::tmux::test_server::TestTmuxServerOwner::new();
         let manager = test_manager().await;
-        let (repository, attempt_id, scope, _, _) = prepare_clean_close_with_tmux(
+        let (repository, attempt_id, scope, _, _, subordinate) = prepare_clean_close_with_tmux(
             &manager,
             &owner,
             "retained-retry",
+            Some("retained-retry-subordinate"),
             "retained-retry-attempt",
         )
         .await;
         let worktree = repository.path().join("worktree");
         let marker = repository.path().join("writer-ready");
+        let subordinate = subordinate.unwrap();
+
         let mut writer = std::process::Command::new("sh")
             .args([
                 "-c",
@@ -7826,6 +7846,12 @@ mod scope_liveness_tests {
             .get_conversation("retained-retry")
             .await
             .is_err());
+        assert!(manager
+            .db()
+            .get_conversation(&subordinate.id)
+            .await
+            .is_err());
+
         let retained_evidence_rows: i64 = sqlx::query_scalar(
             "SELECT
                  (SELECT COUNT(*) FROM close_ambient_writer_evidence WHERE attempt_id=?1)
@@ -8102,9 +8128,15 @@ mod scope_liveness_tests {
         let owner = phoenix_tools::tmux::test_server::TestTmuxServerOwner::new();
         let mut manager = test_manager().await;
         manager.tmux_registry = Arc::new(owner.registry());
-        let (_repository, attempt_id, scope, socket, stale_token) =
-            prepare_clean_close_with_tmux(&manager, &owner, "live-tmux-close", "live-tmux-attempt")
-                .await;
+        let (_repository, attempt_id, scope, socket, stale_token, _) =
+            prepare_clean_close_with_tmux(
+                &manager,
+                &owner,
+                "live-tmux-close",
+                None,
+                "live-tmux-attempt",
+            )
+            .await;
         let replacement_token =
             replace_tmux_server(&manager, &owner, &scope, &socket, &stale_token).await;
 
@@ -8136,13 +8168,15 @@ mod scope_liveness_tests {
         let owner = phoenix_tools::tmux::test_server::TestTmuxServerOwner::new();
         let mut manager = test_manager().await;
         manager.tmux_registry = Arc::new(owner.registry());
-        let (_repository, attempt_id, scope, socket, stale_token) = prepare_clean_close_with_tmux(
-            &manager,
-            &owner,
-            "restart-tmux-close",
-            "restart-tmux-attempt",
-        )
-        .await;
+        let (_repository, attempt_id, scope, socket, stale_token, _) =
+            prepare_clean_close_with_tmux(
+                &manager,
+                &owner,
+                "restart-tmux-close",
+                None,
+                "restart-tmux-attempt",
+            )
+            .await;
         replace_tmux_server(&manager, &owner, &scope, &socket, &stale_token).await;
         manager
             .close_retirement_leases
