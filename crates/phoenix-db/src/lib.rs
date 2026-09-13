@@ -7253,6 +7253,8 @@ impl Database {
         &self,
         conversation_id: &str,
         approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
+        approved_state: &ConvState,
+        state_updated_at: DateTime<Utc>,
     ) -> DbResult<()> {
         let snapshot = phoenix_core::task_handoff::ApprovedTaskSnapshot::from(approval);
         let priority = serde_json::to_string(&snapshot.priority)
@@ -7316,6 +7318,23 @@ impl Database {
         .bind(work_scope_id)
         .execute(&mut *tx)
         .await?;
+        let state_json = serde_json::to_string(approved_state)
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let state_result = sqlx::query(
+            "UPDATE conversations
+             SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4
+             WHERE id = ?5",
+        )
+        .bind(state_json)
+        .bind(conv_state_kind(approved_state))
+        .bind(state_updated_at.to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        if state_result.rows_affected() == 0 {
+            return Err(DbError::ConversationNotFound(conversation_id.to_string()));
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -25690,6 +25709,49 @@ mod tests {
                 Some("/tmp/promoted-worktree".to_string())
             )
         );
+    }
+
+    #[tokio::test]
+    async fn approved_authority_and_post_approval_state_commit_together() {
+        let db = Database::open_in_memory().await.unwrap();
+        let conv_id = "atomic-approval-state";
+        db.create_conversation(
+            conv_id,
+            "atomic-approval-state",
+            "/tmp/atomic-approval-state",
+            true,
+            None,
+            Some("model"),
+        )
+        .await
+        .unwrap();
+        let approval = phoenix_core::task_handoff::TaskApprovalHandoffData {
+            task_id: "12345".to_string(),
+            task_title: "atomic-capability".to_string(),
+            title: "Atomic capability".to_string(),
+            priority: phoenix_core::task_source::Priority::P0,
+            plan: "Plan".to_string(),
+            task_file: "tasks/12345-p0-in-progress--atomic-capability.md".to_string(),
+            artifact_body: "Plan".to_string(),
+        };
+        let approved_state = ConvState::LlmRequesting { attempt: 1 };
+
+        db.persist_approved_task_authority(conv_id, &approval, &approved_state, Utc::now())
+            .await
+            .unwrap();
+
+        let conversation = db.get_conversation(conv_id).await.unwrap();
+        assert_eq!(conversation.state, approved_state);
+        let (authority, _, _) = db
+            .get_conversation_work_scope_context(conv_id)
+            .await
+            .unwrap();
+        assert_eq!(authority, phoenix_core::work_scope::AuthorityKind::Work);
+        assert!(db
+            .get_approved_task_objective(conv_id)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     /// Task 02667: a fresh DB's `conversations` table must not carry the
