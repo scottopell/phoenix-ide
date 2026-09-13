@@ -6984,15 +6984,7 @@ impl Database {
             tx.rollback().await?;
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
-        let authority = match mode {
-            ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. } => {
-                AuthorityKind::RestrictedExplore
-            }
-            ConvMode::Direct
-            | ConvMode::Work { .. }
-            | ConvMode::Branch { .. }
-            | ConvMode::DetachedApprovedTask { .. } => AuthorityKind::Work,
-        };
+        let authority = Self::authority_for_mode(&cm);
         sqlx::query("UPDATE work_scopes SET authority_kind = ?1, updated_at = ?2 WHERE id = ?3")
             .bind(authority.as_str())
             .bind(&now)
@@ -7320,23 +7312,7 @@ impl Database {
         .bind(work_scope_id)
         .execute(&mut *tx)
         .await?;
-        let message_type = approval_message.message_type.to_string();
-        let message_content = serde_json::to_string(&approval_message.content)
-            .map_err(|error| DbError::Serialization(error.to_string()))?;
-        sqlx::query(
-            "INSERT INTO messages
-             (message_id, conversation_id, sequence_id, message_type, content,
-              display_data, usage_data, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6)",
-        )
-        .bind(&approval_message.message_id)
-        .bind(conversation_id)
-        .bind(approval_message.sequence_id)
-        .bind(message_type)
-        .bind(message_content)
-        .bind(approval_message.created_at.to_rfc3339())
-        .execute(&mut *tx)
-        .await?;
+        insert_message_tx(&mut tx, approval_message).await?;
         let state_json = serde_json::to_string(approved_state)
             .map_err(|error| DbError::Serialization(error.to_string()))?;
         let state_result = sqlx::query(
@@ -9111,15 +9087,7 @@ impl Database {
                         .await?;
                     }
 
-                    let authority = match mode {
-                        ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. } => {
-                            AuthorityKind::RestrictedExplore
-                        }
-                        ConvMode::Direct
-                        | ConvMode::Work { .. }
-                        | ConvMode::Branch { .. }
-                        | ConvMode::DetachedApprovedTask { .. } => AuthorityKind::Work,
-                    };
+                    let authority = Self::authority_for_mode(&cm);
                     sqlx::query(
                         "UPDATE work_scopes
                          SET authority_kind = ?1, updated_at = ?2
@@ -14840,6 +14808,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_creation_metadata_preserves_direct_authority() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_test_creation_job(&db, "job-direct-authority", "conv-direct-authority").await;
+        let claimed = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-direct".into()),
+                &CreationClaimToken("token-direct".into()),
+                Utc::now(),
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(job) = claimed else {
+            panic!("expected claim");
+        };
+        let CreationStatus::Claimed(claim) = job.protocol.status else {
+            panic!("expected claim authority");
+        };
+
+        let outcome = db
+            .update_conversation_creation_metadata_and_mode(
+                "job-direct-authority",
+                &claim,
+                "conv-direct-authority",
+                &ConversationCreationMetadataUpdate {
+                    slug: None,
+                    title: None,
+                    cwd: Some("/tmp/direct-authority".into()),
+                    project_id: None,
+                    desired_base_branch: None,
+                },
+                &ConvMode::Direct,
+                "test-model",
+                CreationStage::ValidateIntent,
+                CreationStage::ResolveRepository,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, CreationCasOutcome::Applied);
+
+        let (authority, _, _) = db
+            .get_conversation_work_scope_context("conv-direct-authority")
+            .await
+            .unwrap();
+        assert_eq!(authority, AuthorityKind::Direct);
+    }
+
+    #[tokio::test]
     async fn stale_claim_cannot_commit_creation_metadata() {
         let db = Database::open_in_memory().await.unwrap();
         insert_test_creation_job(&db, "job-stale-metadata", "conv-stale-metadata").await;
@@ -17228,6 +17244,35 @@ mod tests {
     fn direct_mode_receives_direct_authority() {
         let cm = conv_mode_columns(&ConvMode::Direct);
         assert_eq!(Database::authority_for_mode(&cm), AuthorityKind::Direct);
+    }
+
+    #[tokio::test]
+    async fn all_direct_mode_writers_preserve_direct_authority() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation(
+            "direct-authority-writers",
+            "direct-authority-writers",
+            "/tmp/direct-authority-writers",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        db.update_conversation_mode_and_cwd(
+            "direct-authority-writers",
+            &ConvMode::Direct,
+            "/tmp/direct-authority-writers",
+        )
+        .await
+        .unwrap();
+
+        let (authority, _, _) = db
+            .get_conversation_work_scope_context("direct-authority-writers")
+            .await
+            .unwrap();
+        assert_eq!(authority, AuthorityKind::Direct);
     }
 
     #[tokio::test]
@@ -25729,6 +25774,8 @@ mod tests {
 
     #[tokio::test]
     async fn approved_authority_and_post_approval_state_commit_together() {
+        use crate::retrieval::MessageRetriever;
+
         let db = Database::open_in_memory().await.unwrap();
         let conv_id = "atomic-approval-state";
         db.create_conversation(
@@ -25778,6 +25825,17 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].message_id, approval_message.message_id);
         assert_eq!(messages[0].sequence_id, approval_message.sequence_id);
+        let retrieved = db
+            .fts_retriever()
+            .retrieve(crate::retrieval::RetrievalRequest::natural_language(
+                "approved plan",
+                crate::retrieval::RetrievalScope::Conversations(vec![conv_id.to_string()]),
+                10,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(retrieved.len(), 1);
+        assert_eq!(retrieved[0].message_id, approval_message.message_id);
         let (authority, _, _) = db
             .get_conversation_work_scope_context(conv_id)
             .await
