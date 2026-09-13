@@ -657,7 +657,7 @@ fn close_retirement_conflict_for_phase(
         CloseRetirementError::Message(message) => (message, None, None),
     };
     let mut response = ConflictErrorResponse::new(message, "close_retirement_needs_repair");
-    if phase == Some(ClosePhase::NeedsRepair) {
+    if close_phase_allows_retry_guidance(phase) {
         response = response.with_close_recovery(attempt_id, active_transcript_id);
     }
     response.failed_invariant = invariant;
@@ -783,6 +783,28 @@ pub(crate) async fn retry_close_retirement(
     Ok(Json(SuccessResponse { success: true }))
 }
 
+fn close_phase_allows_retry_guidance(phase: Option<ClosePhase>) -> bool {
+    phase == Some(ClosePhase::NeedsRepair)
+}
+
+fn inactive_close_transcript_conflict(
+    active_transcript: &str,
+    obligation: Option<&phoenix_core::domain::close::CloseObligation>,
+) -> ConflictErrorResponse {
+    let mut conflict = ConflictErrorResponse::new(
+        "Close is accepted only from the active aggregate transcript",
+        "inactive_close_transcript",
+    );
+    if let Some(obligation) = obligation {
+        if close_phase_allows_retry_guidance(Some(obligation.phase())) {
+            return conflict
+                .with_close_recovery(obligation.attempt_id().as_str(), active_transcript);
+        }
+    }
+    conflict.active_transcript_id = Some(active_transcript.to_string());
+    conflict
+}
+
 #[allow(clippy::too_many_lines, clippy::single_match_else)]
 async fn run_legacy_close_compat(state: &AppState, id: &str, action: &str) -> Result<(), AppError> {
     use phoenix_core::domain::close::{CloseAttemptId, CloseCompletionOutcome, ClosePhase};
@@ -813,22 +835,14 @@ async fn run_legacy_close_compat(state: &AppState, id: &str, action: &str) -> Re
         let active_transcript = active_transcript.ok_or_else(|| {
             AppError::Internal("ProductConversation has no active transcript".to_string())
         })?;
-        let mut conflict = ConflictErrorResponse::new(
-            "Close is accepted only from the active aggregate transcript",
-            "inactive_close_transcript",
-        );
-        if let Some(obligation) = state
+        let obligation = state
             .db
             .get_active_close_obligation_for_product(&transcript.product_conversation_id)
             .await
-            .map_err(|error| AppError::Internal(error.to_string()))?
-        {
-            conflict =
-                conflict.with_close_recovery(obligation.attempt_id().as_str(), active_transcript);
-        } else {
-            conflict.active_transcript_id = Some(active_transcript.to_string());
-        }
-        return Err(AppError::Conflict(Box::new(conflict)));
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+        return Err(AppError::Conflict(Box::new(
+            inactive_close_transcript_conflict(active_transcript, obligation.as_ref()),
+        )));
     }
     let expected_latest_transcript = TranscriptConversationId::parse(id.to_string())
         .map_err(|error| AppError::Internal(error.to_string()))?;
@@ -1138,6 +1152,26 @@ mod tests {
             assert!(json.get("recovery_action").is_none());
             assert!(json.get("attempt_id").is_none());
         }
+    }
+
+    #[test]
+    fn inactive_transcript_retry_guidance_requires_needs_repair() {
+        assert!(close_phase_allows_retry_guidance(Some(
+            ClosePhase::NeedsRepair
+        )));
+        for phase in [
+            Some(ClosePhase::RetirementRequested),
+            Some(ClosePhase::Completed),
+            None,
+        ] {
+            assert!(!close_phase_allows_retry_guidance(phase));
+        }
+        let without_obligation = inactive_close_transcript_conflict("active", None);
+        assert!(without_obligation.recovery_action.is_none());
+        assert_eq!(
+            without_obligation.active_transcript_id.as_deref(),
+            Some("active")
+        );
     }
 
     fn fixture(id: &str, continued_in_conv_id: Option<String>) -> Conversation {
