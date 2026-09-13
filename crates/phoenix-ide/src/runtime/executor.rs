@@ -23,7 +23,7 @@ use super::{
     TaskApprovalHandoffRequest,
 };
 
-use crate::db::{MessageContent, ToolOutcome, ToolResult};
+use crate::db::{Message, MessageContent, MessageType, ToolOutcome, ToolResult};
 use crate::state_machine::outcome::{EffectOutcome, LlmOutcome, ToolExecOutcome};
 use crate::state_machine::state::{
     SubAgentMode, SubAgentOutcome, SubAgentResult, ToolCall, ToolInput,
@@ -8489,8 +8489,9 @@ where
 
         // Run blocking git/fs operations on a blocking thread.
         let blocking_admission = admitted.reborrow();
-        let result =
-            crate::runtime::creation_worker::run_admitted_blocking(blocking_admission, move || {
+        let result = match crate::runtime::creation_worker::run_admitted_blocking(
+            blocking_admission,
+            move || {
                 execute_approve_task_blocking_reviewed(
                     &cwd,
                     &repo_root,
@@ -8502,13 +8503,41 @@ where
                     &plan,
                     desired_base_branch.as_deref(),
                 )
-            })
-            .await
-            .map_err(|e| format!("Task approval join error: {e}"))?;
+            },
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                self.recovery_disposition = RuntimeRecoveryDisposition::RecreateFromDatabase;
+                return Err(format!("Task approval join error: {error}"));
+            }
+        };
 
         match result {
             Ok(approval_result) => {
-                storage
+                let branch_msg = format!(
+                    "Task approved. You are on branch {} in {}.\n\n\
+                     ## Approved plan: {}\n\n\
+                     Priority: {}\n\n\
+                     {}",
+                    approval_result.branch_name,
+                    approval_result.worktree_path,
+                    title_backup,
+                    priority_backup,
+                    plan_backup,
+                );
+                let approval_message = Message {
+                    message_id: uuid::Uuid::new_v4().to_string(),
+                    conversation_id: self.context.conversation_id.clone(),
+                    sequence_id: self.broadcast_tx.next_seq(),
+                    message_type: MessageType::User,
+                    content: MessageContent::User(crate::db::UserContent::meta(&branch_msg)),
+                    display_data: None,
+                    usage_data: None,
+                    created_at: chrono::Utc::now(),
+                };
+                let persist_result = storage
                     .persist_approved_task_authority(
                         &self.context.conversation_id,
                         &TaskApprovalHandoffData {
@@ -8520,10 +8549,15 @@ where
                             task_file: task_file_backup.clone(),
                             artifact_body: approval_result.artifact_body.clone(),
                         },
+                        &approval_message,
                         &self.state,
                         self.state_updated_at,
                     )
-                    .await?;
+                    .await;
+                if let Err(error) = persist_result {
+                    self.recovery_disposition = RuntimeRecoveryDisposition::RecreateFromDatabase;
+                    return Err(error);
+                }
                 // Build the fallible Work tool surface before publishing Work to
                 // the actor context. A failed rebuild leaves every live consumer
                 // Restricted and stops the post-approval turn.
@@ -8556,35 +8590,10 @@ where
                 // Work registry), so this message carries the plan forward. Must be the
                 // last message before the next LLM call to avoid ending on an assistant
                 // message (Anthropic rejects trailing assistant as "prefill").
-                let branch_msg = format!(
-                    "Task approved. You are on branch {} in {}.\n\n\
-                     ## Approved plan: {}\n\n\
-                     Priority: {}\n\n\
-                     {}",
-                    approval_result.branch_name,
-                    approval_result.worktree_path,
-                    title_backup,
-                    priority_backup,
-                    plan_backup,
-                );
-                let msg_id = uuid::Uuid::new_v4().to_string();
-                let content = MessageContent::User(crate::db::UserContent::meta(&branch_msg));
-                let seq = self.broadcast_tx.next_seq();
-                let msg = self
-                    .storage
-                    .add_message_with_seq(
-                        &msg_id,
-                        &self.context.conversation_id,
-                        seq,
-                        &content,
-                        None,
-                        None,
-                    )
-                    .await?;
                 let _ = self
                     .broadcast_tx
                     .admitted_publication(admitted)
-                    .persisted_message(msg);
+                    .persisted_message(approval_message);
 
                 // Approval changes write authority, not the conversation mode.
                 let (branch_name, conv_mode_label) = match self.context.mode_context.as_ref() {
@@ -16279,7 +16288,18 @@ mod approve_task_failure_effect_tests {
         });
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx_dup = mpsc::channel::<Event>(1).0;
-        let tool_executor = Arc::new(MockToolExecutor::new());
+        let tool_executor = Arc::new(crate::runtime::traits::ToolRegistryExecutor::builtin_only(
+            crate::work_scope::ResourceAuthority::Restricted,
+            crate::tools::ToolRegistry::explore(
+                "tasks",
+                Vec::new(),
+                Vec::new(),
+                crate::tools::ExploreToolPolicy::from_platform(
+                    &crate::platform::PlatformCapability::detect(),
+                ),
+            ),
+            Arc::from(Vec::new()),
+        ));
         let mut rt = ConversationRuntime::new(
             context,
             ConvState::AwaitingTaskApproval {
@@ -16310,12 +16330,19 @@ mod approve_task_failure_effect_tests {
         .await
         .unwrap();
 
+        let published = tool_executor.capability_snapshot();
         assert_eq!(
-            rt.tool_executor.capability_snapshot().authority,
+            published.authority,
             crate::work_scope::ResourceAuthority::Work
         );
-        assert_eq!(rt.tool_executor.capability_snapshot().generation.value(), 1);
-        assert_eq!(tool_executor.capability_snapshot().generation.value(), 1);
+        assert_eq!(published.generation.value(), 1);
+        let definitions = tool_executor.definitions().await;
+        assert!(definitions
+            .iter()
+            .any(|definition| definition.name == "bash"));
+        assert!(definitions
+            .iter()
+            .any(|definition| definition.name == "spawn_agents"));
         assert!(matches!(
             rt.context.mode_context,
             Some(ModeContext::Explore { .. })

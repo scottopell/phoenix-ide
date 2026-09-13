@@ -2083,6 +2083,7 @@ impl StateStore for InMemoryStorage {
         &self,
         conv_id: &str,
         approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
+        approval_message: &Message,
         approved_state: &ConvState,
         _state_updated_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), String> {
@@ -2091,6 +2092,12 @@ impl StateStore for InMemoryStorage {
             .lock()
             .unwrap()
             .insert(conv_id.to_string(), approved_state.clone());
+        self.messages
+            .lock()
+            .unwrap()
+            .entry(conv_id.to_string())
+            .or_default()
+            .push(approval_message.clone());
         let mut authorities = self.approved_task_authorities.lock().unwrap();
         match authorities.get(conv_id) {
             Some(existing) if existing != &snapshot => {

@@ -289,6 +289,7 @@ mod tests {
             .persist_approved_task_authority(
                 id,
                 &crate::resource_authority::tests::approval(),
+                &crate::resource_authority::tests::approval_message(id),
                 &phoenix_core::domain::sm_state::ConvState::Idle,
                 chrono::Utc::now(),
             )

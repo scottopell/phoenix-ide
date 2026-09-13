@@ -7253,6 +7253,7 @@ impl Database {
         &self,
         conversation_id: &str,
         approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
+        approval_message: &Message,
         approved_state: &ConvState,
         state_updated_at: DateTime<Utc>,
     ) -> DbResult<()> {
@@ -7316,6 +7317,23 @@ impl Database {
         )
         .bind(Utc::now().to_rfc3339())
         .bind(work_scope_id)
+        .execute(&mut *tx)
+        .await?;
+        let message_type = approval_message.message_type.to_string();
+        let message_content = serde_json::to_string(&approval_message.content)
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        sqlx::query(
+            "INSERT INTO messages
+             (message_id, conversation_id, sequence_id, message_type, content,
+              display_data, usage_data, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6)",
+        )
+        .bind(&approval_message.message_id)
+        .bind(conversation_id)
+        .bind(approval_message.sequence_id)
+        .bind(message_type)
+        .bind(message_content)
+        .bind(approval_message.created_at.to_rfc3339())
         .execute(&mut *tx)
         .await?;
         let state_json = serde_json::to_string(approved_state)
@@ -25735,13 +25753,33 @@ mod tests {
             artifact_body: "Plan".to_string(),
         };
         let approved_state = ConvState::LlmRequesting { attempt: 1 };
+        let approval_message = Message {
+            message_id: "atomic-approval-message".to_string(),
+            conversation_id: conv_id.to_string(),
+            sequence_id: 1,
+            message_type: MessageType::User,
+            content: MessageContent::User(UserContent::meta("approved plan")),
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
 
-        db.persist_approved_task_authority(conv_id, &approval, &approved_state, Utc::now())
-            .await
-            .unwrap();
+        db.persist_approved_task_authority(
+            conv_id,
+            &approval,
+            &approval_message,
+            &approved_state,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
 
         let conversation = db.get_conversation(conv_id).await.unwrap();
         assert_eq!(conversation.state, approved_state);
+        let messages = db.get_messages(conv_id).await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_id, approval_message.message_id);
+        assert_eq!(messages[0].sequence_id, approval_message.sequence_id);
         let (authority, _, _) = db
             .get_conversation_work_scope_context(conv_id)
             .await
