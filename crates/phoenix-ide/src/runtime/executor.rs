@@ -19016,6 +19016,14 @@ mod work_subagent_cwd_guard_tests {
             "test-model",
             200_000,
         );
+        context.work_scope_worktree = match &mode_context {
+            ModeContext::Work { worktree_path, .. }
+            | ModeContext::DetachedApprovedTask { worktree_path, .. }
+            | ModeContext::Branch { worktree_path, .. } => {
+                Some(std::path::PathBuf::from(worktree_path))
+            }
+            ModeContext::Explore { .. } | ModeContext::Direct => None,
+        };
         context.mode_context = Some(mode_context);
         context.mode = crate::state_machine::state::ModeKind::Managed;
         let authority = match context.mode_context.as_ref() {
