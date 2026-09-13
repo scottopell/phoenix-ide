@@ -3718,6 +3718,14 @@ fn macos_descriptor_inspection_is_transient_disappearance(errno: Option<i32>) ->
     matches!(errno, Some(libc::ESRCH | libc::ENOENT | libc::EBADF))
 }
 
+#[cfg(any(test, target_os = "macos"))]
+fn macos_descriptor_inventory_count(bytes: usize, record_size: usize) -> Result<usize, String> {
+    if record_size == 0 || !bytes.is_multiple_of(record_size) {
+        return Err("process descriptor inventory contains a partial record".to_string());
+    }
+    Ok(bytes / record_size)
+}
+
 #[cfg(target_os = "linux")]
 fn quarantine_has_writable_mappings(path: &Path) -> Result<ExternalWriterEvidence, String> {
     // SAFETY: `geteuid` has no preconditions.
@@ -4428,7 +4436,10 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence
             let descriptor_bytes =
                 usize::try_from(descriptor_bytes).expect("positive descriptor byte count");
             if !descriptor_inventory_may_be_truncated(descriptor_bytes, capacity_bytes) {
-                descriptors.truncate(descriptor_bytes / size_of::<libc::proc_fdinfo>());
+                descriptors.truncate(macos_descriptor_inventory_count(
+                    descriptor_bytes,
+                    size_of::<libc::proc_fdinfo>(),
+                )?);
                 break descriptors;
             }
             descriptor_capacity = descriptor_capacity
@@ -7017,6 +7028,15 @@ mod tests {
         }
         assert!(!super::macos_descriptor_inspection_is_transient_disappearance(Some(libc::EACCES)));
         assert!(!super::macos_descriptor_inspection_is_transient_disappearance(None));
+    }
+
+    #[test]
+    fn partial_descriptor_inventory_is_indeterminate() {
+        assert_eq!(super::macos_descriptor_inventory_count(16, 8).unwrap(), 2);
+        assert!(super::macos_descriptor_inventory_count(15, 8)
+            .unwrap_err()
+            .contains("partial record"));
+        assert!(super::macos_descriptor_inventory_count(0, 0).is_err());
     }
 
     #[test]
