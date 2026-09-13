@@ -842,6 +842,10 @@ impl ModelRegistry {
         credential: &Arc<CodexCredential>,
     ) -> Option<(Option<HashSet<String>>, (String, Option<String>))> {
         let mut identity = credential.get_with_account_id().await?;
+        if identity.1.is_none() {
+            tracing::warn!("Codex account ID is unavailable; withholding account-scoped models");
+            return Some((None, identity));
+        }
         match crate::discover_codex_models(&identity.0, identity.1.as_deref()).await {
             Ok(models) => Some((Some(models), identity)),
             Err(error) if error.status() == Some(reqwest::StatusCode::UNAUTHORIZED) => {
@@ -850,6 +854,10 @@ impl ModelRegistry {
                     return Some((None, identity));
                 }
                 identity = credential.get_with_account_id().await?;
+                if identity.1.is_none() {
+                    tracing::warn!("Refreshed Codex credential has no account ID; withholding account-scoped models");
+                    return Some((None, identity));
+                }
                 match crate::discover_codex_models(&identity.0, identity.1.as_deref()).await {
                     Ok(models) => Some((Some(models), identity)),
                     Err(error) => {
