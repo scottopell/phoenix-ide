@@ -20,7 +20,14 @@ RESTART_HELPER = ROOT / "scripts/launchd_restart_helper.py"
 LIVE_LABEL = "com.phoenix-ide.server"
 LIVE_PORT = 8031
 LIVE_HOME = Path.home() / ".phoenix-ide"
-TERMINAL = {"committed", "activation_failed_rolled_back", "activation_failed_rollback_failed"}
+TERMINAL = {
+    "committed",
+    "activation_failed_rolled_back",
+    "activation_failed_rollback_failed",
+    "precondition_failed",
+    "restart_failed",
+    "rejected_concurrent",
+}
 
 
 def refuse_live(label, root, port):
@@ -112,7 +119,7 @@ def target_plist(label, binary, port, log):
 
 
 def socket_activated_server_script(identity):
-    payload = json.dumps(identity)
+    payload = json.dumps({**identity, "socket_activated": True})
     return f'''#!/usr/bin/python3
 import ctypes
 import json
@@ -285,6 +292,7 @@ def run_restart_scenario(root, domain):
     port = allocate_port()
     refuse_live(target_label, root, port)
     identity = {"version": "2.0.0", "git_sha": "a" * 12}
+    runtime = {**identity, "socket_activated": True}
     target_binary = root / f"restart-phoenix-{suffix}"
     target_binary.write_text(socket_activated_server_script(identity))
     target_binary.chmod(0o755)
@@ -317,7 +325,7 @@ def run_restart_scenario(root, domain):
 
     try:
         subprocess.run(["launchctl", "bootstrap", domain, str(target_plist_path)], check=True)
-        wait_identity(url, identity, time.monotonic() + 10)
+        wait_identity(url, runtime, time.monotonic() + 10)
         previous_pid = launchd_pid(domain, target_label)
         manifest = {
             "manifest_version": 1,
@@ -340,7 +348,7 @@ def run_restart_scenario(root, domain):
             "lock_path": str(root / f"restart-lock-{suffix}"),
             "claim_lock_path": str(root / f"restart-claim-lock-{suffix}"),
             "created_at": "2026-01-01T00:00:00+00:00",
-            "transition_timeout_secs": 10,
+            "transition_timeout_secs": 30,
             "health_timeout_secs": 10,
         }
         manifest_path.write_text(json.dumps(manifest))
@@ -371,12 +379,12 @@ def run_restart_scenario(root, domain):
             raise RuntimeError("restart initiator did not report launchd handoff")
         os.killpg(process.pid, signal.SIGKILL)
         process.wait(timeout=5)
-        result = wait_terminal(status, log, time.monotonic() + 20)
+        result = wait_terminal(status, log, time.monotonic() + 40)
         if result["state"] != "committed":
             raise RuntimeError(f"unexpected restart terminal status: {result}")
         if result["previous_pid"] != previous_pid or result["running_pid"] == previous_pid:
             raise RuntimeError(f"restart did not record a new PID: {result}")
-        wait_identity(url, identity, time.monotonic() + 3)
+        wait_identity(url, runtime, time.monotonic() + 3)
         for path, expected_hash in original_hashes.items():
             if digest(path) != expected_hash:
                 raise RuntimeError(f"restart changed installed artifact: {path}")

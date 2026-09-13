@@ -9123,7 +9123,11 @@ def _legacy_prod_identity(env: dict[str, str]) -> tuple[RuntimeIdentity, str, bo
         return None
 
 
-def _current_prod_identity(env: dict[str, str]) -> RuntimeIdentity | None:
+def _current_prod_identity(
+    env: dict[str, str],
+    *,
+    require_socket_activated: bool = False,
+) -> RuntimeIdentity | None:
     import ssl
     import urllib.request
     try:
@@ -9131,6 +9135,8 @@ def _current_prod_identity(env: dict[str, str]) -> RuntimeIdentity | None:
         context = ssl._create_unverified_context() if insecure_tls else None
         with urllib.request.urlopen(url, timeout=2, context=context) as response:
             value = json.load(response)
+        if require_socket_activated and value.get("socket_activated") is not True:
+            return None
         identity = RuntimeIdentity(version=str(value["version"]), git_sha=str(value["git_sha"]))
         return identity if identity.is_exact() else None
     except Exception:
@@ -9227,10 +9233,10 @@ def _installed_launchd_runtime_for_restart() -> InstalledLaunchdRuntime:
         for key, value in plist.get("EnvironmentVariables", {}).items()
     }
     env["PHOENIX_PORT"] = socket_port
-    identity = _current_prod_identity(env)
+    identity = _current_prod_identity(env, require_socket_activated=True)
     if identity is None:
         raise SystemExit(
-            "installed launchd runtime has no exact /api/version identity; "
+            "installed launchd runtime has no exact socket-activated /api/version identity; "
             "refusing an unverifiable restart"
         )
     binary_identity = RuntimeIdentity.from_value(_binary_identity(binary))

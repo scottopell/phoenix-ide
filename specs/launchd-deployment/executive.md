@@ -26,7 +26,7 @@ Live production deployment remains an explicitly gated operator action; automate
 | REQ-LDD-012 | `main` prod parser; positional rejection test |
 | REQ-LDD-013 | `tests/integration/launchd_deploy_harness.py`; macOS-gated harness |
 | REQ-LDD-014 | `launchd_prod_restart`, `launchd_restart_helper.restart`; unit tests and disposable launchd restart journey |
-| REQ-LDD-015 | `_claim_launchd_restart`, restart helper LaunchAgent handoff; mutual-exclusion and secret-redaction tests |
+| REQ-LDD-015 | `_claim_launchd_restart`, `/api/version` socket-activation report, restart helper LaunchAgent handoff; runtime-activation, mutual-exclusion, and secret-redaction tests |
 | REQ-LDD-016 | `launchd_restart_helper.wait_for_identity`, restart status; exact-identity and failure-state tests |
 
 ## Operator surfaces

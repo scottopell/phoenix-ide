@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 import os
 import plistlib
@@ -111,6 +112,16 @@ class RestartHelperTests(unittest.TestCase):
                 "domain temporarily unavailable",
             ):
                 helper.Launchctl(manifest, run=run).inspect()
+
+    def test_identity_probe_requires_runtime_socket_activation(self):
+        response = io.BytesIO(json.dumps({
+            "version": "2.0.0",
+            "git_sha": "aaaaaaaaaaaa",
+            "socket_activated": False,
+        }).encode())
+        with mock.patch.object(helper.urllib.request, "urlopen", return_value=response):
+            with self.assertRaisesRegex(helper.RestartError, "socket activation"):
+                helper.fetch_identity("http://127.0.0.1/version", 1.0, False)
 
     def test_restart_preserves_installed_artifacts_and_commits_exact_identity(self):
         with tempfile.TemporaryDirectory() as td:
@@ -333,6 +344,24 @@ class RestartCommandTests(unittest.TestCase):
         self.assertIsInstance(inspection, self.dev.LaunchdJobInspectionFailed)
         self.assertEqual(64, inspection.exit_code)
         self.assertIn("temporarily unavailable", inspection.detail)
+
+    def test_restart_identity_probe_rejects_non_socket_runtime(self):
+        response = io.BytesIO(json.dumps({
+            "version": "2.0.0",
+            "git_sha": "aaaaaaaaaaaa",
+            "socket_activated": False,
+        }).encode())
+        with mock.patch.object(
+            self.dev,
+            "_launchd_health_probe",
+            return_value=("http://127.0.0.1/version", False),
+        ), mock.patch("urllib.request.urlopen", return_value=response):
+            identity = self.dev._current_prod_identity(
+                {},
+                require_socket_activated=True,
+            )
+
+        self.assertIsNone(identity)
 
     def test_prod_status_surfaces_launchctl_failure_without_deploy_guidance(self):
         inspection = self.dev.LaunchdJobInspectionFailed(64, "permission denied")

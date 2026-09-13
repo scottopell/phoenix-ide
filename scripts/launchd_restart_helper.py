@@ -254,6 +254,8 @@ def fetch_identity(url: str, timeout: float, insecure_tls: bool) -> Identity:
     context = ssl._create_unverified_context() if insecure_tls else None
     with urllib.request.urlopen(url, timeout=timeout, context=context) as response:
         value = json.load(response)
+    if value.get("socket_activated") is not True:
+        raise RestartError("runtime does not report launchd socket activation")
     try:
         identity = Identity(version=str(value["version"]), git_sha=str(value["git_sha"]))
     except (KeyError, TypeError) as exc:

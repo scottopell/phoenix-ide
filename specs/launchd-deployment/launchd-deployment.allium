@@ -40,8 +40,8 @@ entity DeployTransaction {
 
 entity RestartTransaction {
     id: String
-    expected: RuntimeIdentity
-    previous_pid: Integer
+    expected: RuntimeIdentity?
+    previous_pid: Integer?
     running_pid: Integer?
     state: RestartState
     created_at: Timestamp
@@ -53,6 +53,7 @@ entity RestartTransaction {
         preparing -> precondition_failed
         preparing -> rejected_concurrent
         prepared -> restarting
+        prepared -> precondition_failed
         restarting -> committed
         restarting -> restart_failed
         terminal: committed, precondition_failed, restart_failed,
@@ -74,7 +75,7 @@ external entity TargetService {
 --   embedded identity are valid and host-resident; persisted metadata contains
 --   no plist environment values.
 -- activation_claim_available() -> Boolean
---   No active or unresolved deployment owns the host-level claim.
+--   No active or unresolved deployment or restart owns the host-level claim.
 -- helper_is_launchd_owned(transaction) -> Boolean
 --   A distinct one-shot LaunchAgent owns activation independently of Phoenix.
 -- atomic_candidate_install(transaction) -> Boolean
@@ -88,15 +89,16 @@ external entity TargetService {
 --   and commit with matching host asset, checksum and embedded git SHA.
 -- restart_preparation_complete(restart) -> Boolean
 --   The target job is loaded with KeepAlive and the launchd-owned listener,
---   its running and installed binary identities match the deployed source
---   identity, and the secret-free handoff contains hashes of the installed
---   binary, plist, and deployed SHA without environment values.
+--   the running process reports that it adopted the listener, its running and
+--   installed binary identities match the deployed source identity, and the
+--   secret-free handoff contains hashes of the installed binary, plist, and
+--   deployed SHA without environment values.
 -- restart_helper_is_launchd_owned(restart) -> Boolean
 --   A distinct one-shot LaunchAgent owns signaling and verification
 --   independently of Phoenix and the initiating shell.
 -- exact_restarted_identity_running(restart, service) -> Boolean
 --   The target job has a PID distinct from restart.previous_pid and
---   /api/version equals restart.expected.
+--   /api/version equals restart.expected and reports socket activation.
 -- installed_state_unchanged(restart) -> Boolean
 --   Binary, plist, environment, listener definition, and deployed SHA match
 --   their preparation hashes and no installation path was replaced.
@@ -248,4 +250,12 @@ invariant RestartPreservesInstalledState {
 invariant ProductionOperationsAreMutuallyExclusive {
     for restart in RestartTransactions:
         RestartOwnsActivationClaim(restart) implies not DeploymentOwnsActivationClaim()
+}
+
+invariant RestartClaimsAreMutuallyExclusive {
+    for a in RestartTransactions:
+        for b in RestartTransactions:
+            a != b implies not (
+                RestartOwnsActivationClaim(a) and RestartOwnsActivationClaim(b)
+            )
 }

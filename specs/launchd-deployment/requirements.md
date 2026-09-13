@@ -64,7 +64,7 @@ When the operator requests a production restart, the system shall restart the lo
 
 ### REQ-LDD-015 — Independent restart ownership and fencing
 
-Before signaling Phoenix, the system shall validate the installed runtime and transfer restart ownership to a distinct one-shot LaunchAgent whose immutable, secret-free handoff records the expected runtime identity, previous PID, installed artifact hashes, endpoint, and target job identity. Restart and deployment shall share one mutually exclusive host-operation fence.
+Before signaling Phoenix, the system shall validate that the running process reports adoption of the launchd-owned socket and transfer restart ownership to a distinct one-shot LaunchAgent whose immutable, secret-free handoff records the expected runtime identity, previous PID, installed artifact hashes, endpoint, and target job identity. Restart and deployment shall share one mutually exclusive host-operation fence.
 
 ### REQ-LDD-016 — Exact, truthful restart result
 
