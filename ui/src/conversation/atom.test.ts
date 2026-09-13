@@ -1763,7 +1763,11 @@ describe('conversationReducer', () => {
 
   describe('sse_llm_attempt', () => {
     it('renders timed_out distinctly from a network retry', () => {
-      const initial = createInitialAtom(testConversation, [], []);
+      const initial: ConversationAtom = {
+        ...createInitialAtom(),
+        conversationId: testConversation.id,
+        conversation: testConversation,
+      };
       const next = conversationReducer(initial, {
         type: 'sse_llm_attempt',
         sequenceId: 1,

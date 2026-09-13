@@ -17,7 +17,7 @@
 --   crates/phoenix-ide/src/runtime.rs — SseEvent::LlmAttempt
 --       and From<SseEvent> conversion
 --   crates/phoenix-ide/src/runtime/executor.rs — Effect::ScheduleRetry
---       handler (`executor.rs:1408-1418`); emission site
+--       handler (`ConversationRuntime::execute_effect`); emission site
 --   crates/phoenix-ide/src/state_machine/transition.rs — retry
 --       transitions (handle_core_error_retry, handle_core_continuation);
 --       MAX_RETRY_ATTEMPTS constant
@@ -234,7 +234,7 @@ entity PersistedAssistantMessage {
 ------------------------------------------------------------
 
 -- REQ-LRV-001 / REQ-LRV-002: the SSE wire emission. Fires from the
--- executor's Effect::ScheduleRetry handler (`executor.rs:1408-1418`),
+-- executor's Effect::ScheduleRetry handler (`ConversationRuntime::execute_effect`),
 -- immediately before the spawned tokio sleep that drives the backoff.
 -- The emission and the sleep happen in the same effect arm, so there
 -- is no ordering window in which the sleep completes (and a
@@ -245,7 +245,7 @@ entity PersistedAssistantMessage {
 -- variants. The runtime maps the inbound LlmErrorKind to this enum
 -- via classify_retry_reason() (declared in the Helpers block), which
 -- mirrors the retryable subset of LlmErrorKind (`llm/error.rs:111` —
--- is_retryable() returns true for exactly Network/RateLimit/ServerError).
+-- is_retryable() returns true for exactly Network/TimedOut/RateLimit/ServerError).
 -- Non-retryable LlmErrorKind variants terminate the turn without
 -- scheduling a retry, so they never reach this rule.
 --
@@ -520,7 +520,7 @@ surface RetryContextProducer {
 
     @guarantee RetryablesOnly
         -- The reason field is always one of the four retryable
-        -- classifications (Network, RateLimit, ServerError). Non-
+        -- classifications (Network, TimedOut, RateLimit, ServerError). Non-
         -- retryable LlmErrorKind variants never produce an
         -- LlmAttempt because the state machine terminates the turn
         -- without scheduling a retry.

@@ -595,7 +595,7 @@ const CODEX_WS_FRAME_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 #[cfg(test)]
 const CODEX_WS_FRAME_TIMEOUT: Duration = Duration::from_millis(100);
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct CodexWsSessions {
     /// The outer mutex protects entry creation and bounded eviction. Each cache
     /// cohort has its own mutex, so unrelated conversations remain concurrent.
@@ -603,6 +603,17 @@ pub(crate) struct CodexWsSessions {
     /// Transport health belongs to the shared Codex endpoint pool, not to a
     /// prompt-cache cohort. A failed endpoint must be avoided by new conversations too.
     cooldown: std::sync::Mutex<CodexWsCooldown>,
+    frame_timeout: Duration,
+}
+
+impl Default for CodexWsSessions {
+    fn default() -> Self {
+        Self {
+            by_cache_key: HashMap::new(),
+            cooldown: std::sync::Mutex::new(CodexWsCooldown::default()),
+            frame_timeout: CODEX_WS_FRAME_TIMEOUT,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -940,7 +951,7 @@ async fn complete_codex_websocket(
     let (compatibility, full_input) =
         continuation_parts(full_request).map_err(CodexWsError::backend)?;
     let identity = connection_identity(api_key, custom_headers);
-    let entry = {
+    let (entry, frame_timeout) = {
         let mut guard = sessions.lock().await;
         evict_ws_sessions(&mut guard, Instant::now());
         if !guard.by_cache_key.contains_key(cache_key)
@@ -950,11 +961,12 @@ async fn complete_codex_websocket(
                 "Codex WebSocket session capacity reached",
             )));
         }
-        guard
+        let entry = guard
             .by_cache_key
             .entry(cache_key.to_string())
             .or_insert_with(|| Arc::new(CodexWsSessionEntry::default()))
-            .clone()
+            .clone();
+        (entry, guard.frame_timeout)
     };
     let mut session = entry.session.lock().await;
     *entry.last_used.lock().expect("last_used mutex poisoned") = Instant::now();
@@ -1076,7 +1088,7 @@ async fn complete_codex_websocket(
         let socket = session.socket.as_mut().expect("socket initialized");
         let dispatch_at = Instant::now();
         tokio::time::timeout(
-            CODEX_WS_FRAME_TIMEOUT,
+            frame_timeout,
             socket.send(tungstenite::Message::Text(envelope.to_string().into())),
         )
         .await
@@ -1086,7 +1098,7 @@ async fn complete_codex_websocket(
         let mut response_id = None;
         let mut server_output = Vec::new();
         loop {
-            let message = tokio::time::timeout(CODEX_WS_FRAME_TIMEOUT, socket.next())
+            let message = tokio::time::timeout(frame_timeout, socket.next())
                 .await
                 .map_err(|_| CodexWsError::fallback(LlmError::network("WebSocket frame timeout")))?
                 .ok_or_else(|| {
@@ -3358,6 +3370,7 @@ mod tests {
     use axum::http::HeaderMap as AxumHeaderMap;
     use axum::response::{IntoResponse, Response};
     use axum::routing::get;
+    use axum::Json;
     use axum::Router;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -3367,6 +3380,8 @@ mod tests {
         http_requests: Arc<AtomicUsize>,
         ws_requests: Arc<Mutex<Vec<(usize, serde_json::Value)>>>,
         ws_headers: Arc<Mutex<Vec<AxumHeaderMap>>>,
+        shared_delay_started: Arc<std::sync::atomic::AtomicBool>,
+        shared_delay_release: Arc<tokio::sync::Notify>,
     }
 
     #[allow(clippy::too_many_lines)]
@@ -3378,7 +3393,13 @@ mod tests {
         state.ws_headers.lock().await.push(headers);
         let connection = state.connections.fetch_add(1, Ordering::SeqCst);
         ws.on_upgrade(move |mut socket| async move {
-            while let Some(Ok(AxumWsMessage::Text(text))) = socket.recv().await {
+            while let Some(Ok(AxumWsMessage::Text(text))) = tokio::time::timeout(
+                Duration::from_secs(5),
+                socket.recv(),
+            )
+            .await
+            .expect("mock WebSocket request arrives before the fixture deadline")
+            {
                 let request: serde_json::Value = serde_json::from_str(&text).unwrap();
                 state.ws_requests.lock().await.push((connection, request.clone()));
                 assert_eq!(request["type"], "response.create");
@@ -3392,6 +3413,17 @@ mod tests {
                 );
                 let marker = request["input"].to_string();
                 if marker.contains("connection-limit") && connection == 0 {
+                    if marker.contains("shared-deadline-fallback") {
+                        state
+                            .shared_delay_started
+                            .store(true, Ordering::SeqCst);
+                        tokio::time::timeout(
+                            Duration::from_secs(5),
+                            state.shared_delay_release.notified(),
+                        )
+                        .await
+                        .expect("shared deadline test releases delayed 429");
+                    }
                     socket.send(AxumWsMessage::Text(serde_json::json!({
                         "type": "error",
                         "status": 429,
@@ -3402,6 +3434,9 @@ mod tests {
                         }
                     }).to_string())).await.unwrap();
                     continue;
+                }
+                if marker.contains("shared-deadline-fallback") && connection > 0 {
+                    return;
                 }
                 if marker.contains("ws-fail") {
                     socket
@@ -3494,8 +3529,18 @@ mod tests {
         })
     }
 
-    async fn mock_http(State(state): State<MockResponsesState>) -> impl IntoResponse {
+    async fn mock_http(
+        State(state): State<MockResponsesState>,
+        Json(request): Json<serde_json::Value>,
+    ) -> impl IntoResponse {
         state.http_requests.fetch_add(1, Ordering::SeqCst);
+        if request["input"]
+            .to_string()
+            .contains("shared-deadline-fallback")
+        {
+            // test-timing-allow: paused time proves HTTP fallback gets only remaining budget
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
         (
             [("content-type", "text/event-stream")],
             "event: response.created\ndata: {\"type\":\"response.created\"}\n\n\
@@ -3837,7 +3882,10 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let receiver = tokio::spawn(async move {
             let mut text = String::new();
-            while let Some(chunk) = rx.recv().await {
+            while let Some(chunk) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("public replay channel closes before the fixture deadline")
+            {
                 if let super::super::TokenChunk::Text(delta) = chunk {
                     text.push_str(&delta);
                     tokio::task::yield_now().await;
@@ -4069,6 +4117,118 @@ mod tests {
         assert_eq!(final_stream.generation_event_count, 282);
         assert_eq!(final_stream.visible_text_event_count, 0);
         assert!(final_stream.completed);
+    }
+
+    async fn wait_for_mock_phase<F, Fut>(phase: &str, mut ready: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if ready().await {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for mock phase: {phase}"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn real_websocket_reconnect_and_http_fallback_share_the_original_deadline() {
+        let (url, state) = mock_server().await;
+        let sessions = Arc::new(Mutex::new(CodexWsSessions {
+            frame_timeout: Duration::from_secs(30),
+            ..CodexWsSessions::default()
+        }));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut request = request_with(&[(
+            "connection-limit shared-deadline-fallback",
+            MessageRole::User,
+        )]);
+        let capture = crate::LlmAttemptCapture::new();
+        request.telemetry = Some(crate::LlmRequestTelemetry {
+            conversation_id: "deadline".to_string(),
+            root_conversation_id: "deadline".to_string(),
+            request_id: "deadline".to_string(),
+            retry_attempt: 1,
+            attempt_capture: capture.clone(),
+        });
+        capture.begin(
+            request.telemetry.as_ref().unwrap(),
+            "openai",
+            "gpt-test",
+            crate::LlmTransport::Websocket,
+        );
+        let task = tokio::spawn(async move {
+            Box::pin(crate::service::enforce_attempt_deadline(
+                crate::service::LlmAttemptDeadline::new(Duration::from_secs(10)),
+                &request,
+                complete_streaming(
+                    &codex_spec(),
+                    "secret",
+                    Some(&url),
+                    &[],
+                    &BTreeMap::new(),
+                    &request,
+                    &tx,
+                    true,
+                    Some(&sessions),
+                ),
+            ))
+            .await
+        });
+
+        wait_for_mock_phase("first WebSocket request", || async {
+            state.ws_requests.lock().await.len() == 1
+                && state.shared_delay_started.load(Ordering::SeqCst)
+        })
+        .await;
+        assert_eq!(state.connections.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(Duration::from_secs(8)).await;
+        state.shared_delay_release.notify_one();
+        wait_for_mock_phase("fresh WebSocket request", || async {
+            state.connections.load(Ordering::SeqCst) == 2
+                && state.ws_requests.lock().await.len() == 2
+        })
+        .await;
+        wait_for_mock_phase("HTTP/SSE fallback request", || async {
+            state.http_requests.load(Ordering::SeqCst) == 1
+        })
+        .await;
+
+        assert_eq!(state.connections.load(Ordering::SeqCst), 2);
+        assert_eq!(state.ws_requests.lock().await.len(), 2);
+        assert_eq!(state.http_requests.load(Ordering::SeqCst), 1);
+        assert!(
+            rx.try_recv().is_err(),
+            "fresh WebSocket must close before public output"
+        );
+        assert!(!task.is_finished());
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let error = task
+            .await
+            .unwrap()
+            .expect_err("original deadline wins during HTTP/SSE fallback");
+        assert_eq!(error.kind, crate::LlmErrorKind::TimedOut);
+        assert_eq!(state.connections.load(Ordering::SeqCst), 2);
+        assert_eq!(state.ws_requests.lock().await.len(), 2);
+        assert_eq!(state.http_requests.load(Ordering::SeqCst), 1);
+
+        let metrics = capture.finalized().expect("timeout metric");
+        assert_eq!(metrics.outcome, crate::LlmAttemptOutcome::TimedOut);
+        assert!(!metrics.stream.completed);
+        assert_eq!(metrics.total_duration_ms, 10_000);
+        assert_eq!(
+            capture.finalize_cancelled(),
+            Some(metrics),
+            "timeout is the single immutable terminal metric"
+        );
     }
 
     #[tokio::test]

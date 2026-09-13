@@ -20,7 +20,7 @@ ServerError`), the executor maps it to an `LlmOutcome` and feeds an
 for the post-tool-round path) bumps the `attempt` counter, schedules a
 backoff via `Effect::ScheduleRetry { delay, attempt }`, and emits an
 `Effect::NotifyStateChange`. The executor's `Effect::ScheduleRetry`
-handler (`executor.rs:1408-1418`) spawns a sleep task that emits
+handler (`ConversationRuntime::execute_effect`) spawns a sleep task that emits
 `EffectOutcome::RetryTimeout` to drive `RetryTimeout -> RequestLlm`
 when the delay elapses.
 

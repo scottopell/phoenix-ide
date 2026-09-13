@@ -2342,7 +2342,7 @@ where
                     }
                 }, if self.fatal_local_authority_rx.is_some() => {
                     tracing::error!(?boundary, "fatal local SQLite authority loss; aborting external runtime effects");
-                    self.abort_external_effects();
+                    self.abort_external_effects().await;
                     return RuntimeExitDisposition::FatalLocalAuthorityLoss;
                 }
                 Some(AcknowledgedEventRequest { event, acknowledgement, retirement }) = self.acknowledged_event_rx.recv() => {
@@ -2369,7 +2369,7 @@ where
                             conv_id = %self.context.conversation_id,
                             "Runtime shutdown signal received; aborting external effects and exiting executor loop"
                         );
-                        self.abort_external_effects();
+                        self.abort_external_effects().await;
                         return RuntimeExitDisposition::CoordinatedShutdown;
                     }
                     if let Err(e) = self.process_event(event).await {
@@ -2537,7 +2537,7 @@ where
             }
         }
 
-        self.abort_external_effects();
+        self.abort_external_effects().await;
         tracing::info!(conv_id = %self.context.conversation_id, "Conversation runtime stopped");
         if self.recovery_disposition == RuntimeRecoveryDisposition::RecreateFromDatabase {
             RuntimeExitDisposition::RecreateFromDatabase
@@ -5100,10 +5100,17 @@ where
         }
     }
 
-    fn abort_external_effects(&mut self) {
+    async fn abort_external_effects(&mut self) {
         self.llm_request_generation = self.llm_request_generation.wrapping_add(1);
         if let Some(handle) = self.llm_task_handle.take() {
             handle.abort();
+        }
+        if let Some(attempt_capture) = self.active_llm_attempt.take() {
+            if let Some(metrics) = attempt_capture.finalize_cancelled() {
+                if let Err(error) = self.storage.upsert_llm_request_metrics(&metrics).await {
+                    tracing::warn!(%error, "failed to persist cancelled LLM attempt metrics during runtime teardown");
+                }
+            }
         }
         self.tool_request_generation = self.tool_request_generation.wrapping_add(1);
         if let Some(token) = self.tool_cancel_token.take() {
@@ -14214,8 +14221,50 @@ mod authoritative_user_message_effect_tests {
         let (mut rt, result) = dispatch.await.expect("dispatch joins");
         result.expect("admitted external effect dispatches");
         assert!(rt.llm_task_handle.is_some());
-        rt.abort_external_effects();
+        rt.abort_external_effects().await;
         assert!(rt.llm_task_handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_teardown_finalizes_begun_llm_attempt_as_cancelled() {
+        let (mut rt, storage, _broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let capture = phoenix_llm::LlmAttemptCapture::new();
+        let telemetry = phoenix_llm::LlmRequestTelemetry {
+            conversation_id: rt.context.conversation_id.clone(),
+            root_conversation_id: rt.context.root_conversation_id.clone(),
+            request_id: "teardown-attempt".to_string(),
+            retry_attempt: 1,
+            attempt_capture: capture.clone(),
+        };
+        capture.begin(
+            &telemetry,
+            "openai",
+            "gpt-test",
+            phoenix_llm::LlmTransport::Websocket,
+        );
+        rt.active_llm_attempt = Some(capture.clone());
+        rt.llm_task_handle = Some(tokio::spawn(std::future::pending()));
+        let (persisted, release) = storage.gate_metrics_write();
+
+        let teardown = tokio::spawn(async move {
+            rt.abort_external_effects().await;
+            rt
+        });
+        persisted
+            .await
+            .expect("cancelled metric persistence begins");
+        release.send(()).expect("release metric persistence");
+        let rt = teardown.await.unwrap();
+
+        assert!(rt.llm_task_handle.is_none());
+        assert!(rt.active_llm_attempt.is_none());
+        assert_eq!(
+            capture.finalized().expect("terminal capture").outcome,
+            phoenix_llm::LlmAttemptOutcome::Cancelled
+        );
     }
 
     #[tokio::test]
@@ -19871,18 +19920,35 @@ mod llm_generation_guard_tests {
         let mut rt = runtime_requesting();
         rt.llm_request_generation = 2;
         let state_before = rt.state.clone();
-        let stale_timeout = LlmOutcome::TimedOut {
-            message: "attempt deadline elapsed".to_string(),
+        let storage = rt.storage.clone();
+        let tools = rt.tool_executor.clone();
+        let late_response = LlmOutcome::Response {
+            content: vec![ContentBlock::Text {
+                text: "late response".to_string(),
+            }],
+            tool_calls: vec![ToolCall {
+                id: "late-tool".to_string(),
+                input: phoenix_core::domain::sm_state::ToolInput::Bash(
+                    phoenix_core::domain::bash_types::BashInvocation::from_context(
+                        phoenix_core::domain::bash_types::BashToolInput::run("echo stale"),
+                    )
+                    .expect("valid bash input"),
+                ),
+            }],
+            end_turn: false,
+            usage: phoenix_llm::Usage::default(),
+            request_id: "late-response".to_string(),
         };
 
-        if !rt.llm_outcome_is_stale(1) {
-            rt.process_outcome(EffectOutcome::Llm(stale_timeout))
-                .await
-                .expect("would process if current");
-        }
+        rt.process_generation_tagged_llm_outcome(1, late_response)
+            .await;
+        tokio::task::yield_now().await;
 
         assert_eq!(rt.state, state_before);
         assert!(rt.llm_outcome_is_stale(1));
+        assert!(storage.recorded_messages().is_empty());
+        assert!(tools.recorded_executions().is_empty());
+        assert!(rt.tool_task_handle.is_none());
     }
 
     #[tokio::test]

@@ -32,7 +32,7 @@ Deadline expiration produces exhaustive typed values:
 - `LlmOutcome::TimedOut` at the reducer boundary;
 - the existing `ErrorKind::TimedOut` in durable conversation state.
 
-The attempt capture is first-terminal-wins. Timeout, cancellation, and ordinary finalization return the already-finalized metric if another terminal path won. The metrics table is migrated forward to admit `timed_out` while copying existing rows unchanged and retaining a closed outcome constraint.
+The attempt capture is first-terminal-wins. Timeout, cancellation, and ordinary finalization return the already-finalized metric if another terminal path won. The metrics table is migrated forward to admit `timed_out` by changing only the stored table-definition constraint. Migration-52 rows, root page, indexes, foreign keys, and all other physical table semantics remain unchanged. The connection-scoped `writable_schema` capability is restored before the pooled connection is returned; restoration failure poisons and closes that connection.
 
 Timeout is auto-retryable through the existing finite retry policy. Retry remains within the same accepted durable turn and canonical user-message identity while each provider attempt receives its own request identity. The runtime's existing request generation rejects late results before response persistence or tool execution. Retry exhaustion uses the existing atomic direct-turn failed settlement to persist terminal state and release conversation ownership.
 
@@ -43,7 +43,7 @@ Dropping a timed-out provider future is the cancellation mechanism. The OpenAI W
 - An active provider stream cannot retain a conversation indefinitely.
 - Three attempts can consume approximately thirty minutes plus bounded backoff before durable terminal failure; this ADR bounds each provider attempt, not the entire accepted turn.
 - A provider may continue remote computation after client disconnect. Phoenix guarantees at-most-once durable commitment through generation and turn authority, not provider-side exactly-once execution.
-- Existing rows keep their outcome values. Downgrade after migration is not guaranteed.
+- Existing rows and migration-52 physical table identity remain unchanged. Downgrade after migration is not guaranteed.
 - Tests inject short policies and use Tokio virtual time; production callers cannot construct a service without a deadline policy.
 - Transport-local telemetry remains content-free. Cross-transport telemetry history is a separate observability concern and is not duplicated into parallel representations by this change.
 

@@ -11579,7 +11579,8 @@ impl Database {
         Ok(transcript_generation)
     }
 
-    /// Inserts or replaces one finalized provider-attempt metrics row, keyed by request and retry.
+    /// Inserts one finalized provider-attempt metrics row. The first terminal
+    /// row for a request and retry identity remains authoritative.
     ///
     /// # Errors
     ///
@@ -11593,25 +11594,7 @@ impl Database {
              provider_event_count, generation_event_count, visible_text_event_count, max_provider_gap_ms, max_generation_gap_ms, \
              output_kind, stream_completed, outcome, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20) \
-             ON CONFLICT(request_id, retry_attempt) DO UPDATE SET \
-             conversation_id = excluded.conversation_id, \
-             root_conversation_id = excluded.root_conversation_id, \
-             provider = excluded.provider, \
-             model = excluded.model, \
-             transport = excluded.transport, \
-             total_duration_ms = excluded.total_duration_ms, \
-             dispatch_to_first_provider_event_ms = excluded.dispatch_to_first_provider_event_ms, \
-             dispatch_to_first_generation_event_ms = excluded.dispatch_to_first_generation_event_ms, \
-             dispatch_to_first_visible_text_ms = excluded.dispatch_to_first_visible_text_ms, \
-             provider_event_count = excluded.provider_event_count, \
-             generation_event_count = excluded.generation_event_count, \
-             visible_text_event_count = excluded.visible_text_event_count, \
-             max_provider_gap_ms = excluded.max_provider_gap_ms, \
-             max_generation_gap_ms = excluded.max_generation_gap_ms, \
-             output_kind = excluded.output_kind, \
-             stream_completed = excluded.stream_completed, \
-             outcome = excluded.outcome, \
-             created_at = excluded.created_at"
+             ON CONFLICT(request_id, retry_attempt) DO NOTHING"
         )
         .bind(&metrics.request_id)
         .bind(i64::from(metrics.retry_attempt))
@@ -23838,6 +23821,38 @@ mod tests {
         assert!(!rows[0].metrics.stream.completed);
     }
 
+    #[tokio::test]
+    async fn conflicting_terminal_metric_cannot_overwrite_first_winner() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-first-wins", "first-wins", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let mut first = LlmAttemptMetrics {
+            conversation_id: "conv-first-wins".to_string(),
+            root_conversation_id: "conv-first-wins".to_string(),
+            request_id: "req-first-wins".to_string(),
+            retry_attempt: 1,
+            provider: "openai".to_string(),
+            model: "gpt".to_string(),
+            transport: LlmTransport::Websocket,
+            total_duration_ms: 600_000,
+            stream: ProviderStreamTelemetry::non_streaming(),
+            outcome: LlmAttemptOutcome::TimedOut,
+        };
+        db.upsert_llm_request_metrics(&first).await.unwrap();
+        first.outcome = LlmAttemptOutcome::Success;
+        first.total_duration_ms = 1;
+        db.upsert_llm_request_metrics(&first).await.unwrap();
+
+        let rows = db
+            .llm_request_metrics_for_request("req-first-wins")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].metrics.outcome, LlmAttemptOutcome::TimedOut);
+        assert_eq!(rows[0].metrics.total_duration_ms, 600_000);
+    }
+
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn usage_recent_llm_metrics_returns_all_window_rows() {
@@ -23933,12 +23948,12 @@ mod tests {
         let updated = rows
             .iter()
             .find(|row| row.request_id == "req-1")
-            .expect("updated request row");
+            .expect("first terminal request row");
         assert_eq!(updated.retry_attempt, 1);
         assert_eq!(updated.provider, "anthropic");
         assert_eq!(updated.model, "claude-sonnet-5");
         assert_eq!(updated.transport, LlmTransport::HttpSse);
-        assert_eq!(updated.dispatch_to_first_generation_event_ms, Some(910));
+        assert_eq!(updated.dispatch_to_first_generation_event_ms, Some(900));
         assert_eq!(updated.outcome, LlmAttemptOutcome::Success);
 
         let all_rows = db
