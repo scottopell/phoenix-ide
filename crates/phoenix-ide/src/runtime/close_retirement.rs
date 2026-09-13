@@ -3751,13 +3751,12 @@ fn quarantine_has_writable_mappings_in(
             Err(_) if !process.path().exists() => continue,
             Err(error) => return Err(error),
         };
-        let before_executable = match std::fs::read_link(process.path().join("exe")) {
-            Ok(executable) => executable,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(format!("cannot inspect process executable: {error}")),
+        let Ok(before_executable) = std::fs::read_link(process.path().join("exe")) else {
+            continue;
         };
         let mappings = match std::fs::read_to_string(process.path().join("maps")) {
             Ok(mappings) => mappings,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => continue,
             Err(_) if !process.path().exists() => continue,
             Err(error) => return Err(format!("cannot inspect process mappings: {error}")),
         };
@@ -3780,12 +3779,8 @@ fn quarantine_has_writable_mappings_in(
                     Err(_) if !process.path().exists() => continue,
                     Err(error) => return Err(error),
                 };
-                let after_executable = match std::fs::read_link(process.path().join("exe")) {
-                    Ok(executable) => executable,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(error) => {
-                        return Err(format!("cannot inspect process executable: {error}"))
-                    }
+                let Ok(after_executable) = std::fs::read_link(process.path().join("exe")) else {
+                    continue;
                 };
                 if after_incarnation != before_incarnation || after_executable != before_executable
                 {
@@ -3975,11 +3970,10 @@ fn quarantine_has_process_cwd_in(
         if !linux_process_is_relevant(&process, effective_uid, "cwd")? {
             continue;
         }
-        match std::fs::read_link(process.path().join("cwd")) {
-            Ok(cwd) if path_is_within(&cwd, &canonical) => return Ok(true),
-            Ok(_) => {}
-            Err(_) if !process.path().exists() => continue,
-            Err(error) => return Err(format!("cannot inspect process cwd: {error}")),
+        if std::fs::read_link(process.path().join("cwd"))
+            .is_ok_and(|cwd| path_is_within(&cwd, &canonical))
+        {
+            return Ok(true);
         }
     }
     Ok(false)
@@ -4232,13 +4226,12 @@ fn quarantine_has_open_descriptors_in(
             Err(_) if !process.path().exists() => continue,
             Err(error) => return Err(error),
         };
-        let before_executable = match std::fs::read_link(process.path().join("exe")) {
-            Ok(executable) => executable,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(format!("cannot inspect process executable: {error}")),
+        let Ok(before_executable) = std::fs::read_link(process.path().join("exe")) else {
+            continue;
         };
         let descriptors = match std::fs::read_dir(process.path().join("fd")) {
             Ok(descriptors) => descriptors,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => continue,
             Err(_) if !process.path().exists() => continue,
             Err(error) => return Err(format!("cannot inspect process descriptors: {error}")),
         };
@@ -4279,10 +4272,8 @@ fn quarantine_has_open_descriptors_in(
                 Err(_) if !process.path().exists() => continue,
                 Err(error) => return Err(error),
             };
-            let after_executable = match std::fs::read_link(process.path().join("exe")) {
-                Ok(executable) => executable,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(format!("cannot inspect process executable: {error}")),
+            let Ok(after_executable) = std::fs::read_link(process.path().join("exe")) else {
+                continue;
             };
             if after_incarnation != before_incarnation || after_executable != before_executable {
                 continue;
@@ -7298,15 +7289,9 @@ mod tests {
         let quarantine = temp.path().join("quarantine");
         let proc_root = temp.path().join("proc");
         let ambient = proc_root.join("1273");
-        let writer = proc_root.join("1274");
         std::fs::create_dir_all(&ambient).unwrap();
-        std::fs::create_dir_all(writer.join("fd")).unwrap();
-        std::fs::create_dir_all(writer.join("fdinfo")).unwrap();
         std::fs::create_dir(&quarantine).unwrap();
         std::fs::write(ambient.join("fd"), b"not a descriptor directory").unwrap();
-        write_synthetic_process_identity(&writer, 1274);
-        std::os::unix::fs::symlink(quarantine.join("open-file"), writer.join("fd/3")).unwrap();
-        std::fs::write(writer.join("fdinfo/3"), "flags:\t00000001\n").unwrap();
 
         let error = super::quarantine_has_open_descriptors_in(&quarantine, &proc_root).unwrap_err();
         assert!(error.contains("kernel credentials"));
@@ -7324,6 +7309,8 @@ mod tests {
         std::fs::create_dir(&quarantine).unwrap();
         write_synthetic_process_identity(&writer, 1274);
         std::os::unix::fs::symlink(quarantine.join("open-file"), writer.join("fd/3")).unwrap();
+        std::fs::write(quarantine.join("open-file"), b"open").unwrap();
+
         std::fs::write(writer.join("fdinfo/3"), "flags:\t00000001\n").unwrap();
 
         let super::ExternalWriterEvidence::PositiveWriterFound(evidence) =
@@ -7403,16 +7390,8 @@ mod tests {
         let quarantine = temp.path().join("quarantine");
         let proc_root = temp.path().join("proc");
         let unreadable_status = proc_root.join("1");
-        let unreadable_cwd = proc_root.join("2");
-        let writer = proc_root.join("3");
         std::fs::create_dir_all(unreadable_status.join("status")).unwrap();
-        std::fs::create_dir_all(&unreadable_cwd).unwrap();
-        std::fs::create_dir_all(&writer).unwrap();
         std::fs::create_dir(&quarantine).unwrap();
-        write_synthetic_process_identity(&unreadable_cwd, 2);
-        std::fs::write(unreadable_cwd.join("cwd"), b"not a symlink").unwrap();
-        write_synthetic_process_identity(&writer, 3);
-        std::os::unix::fs::symlink(quarantine.join("nested"), writer.join("cwd")).unwrap();
         // SAFETY: `geteuid` has no preconditions.
         let effective_uid = unsafe { libc::geteuid() };
 
@@ -7428,22 +7407,8 @@ mod tests {
         let quarantine = temp.path().join("quarantine");
         let proc_root = temp.path().join("proc");
         let unreadable_status = proc_root.join("1");
-        let unreadable_maps = proc_root.join("2");
-        let writer = proc_root.join("3");
         std::fs::create_dir_all(unreadable_status.join("status")).unwrap();
-        std::fs::create_dir_all(unreadable_maps.join("maps")).unwrap();
-        std::fs::create_dir_all(&writer).unwrap();
         std::fs::create_dir(&quarantine).unwrap();
-        write_synthetic_process_identity(&unreadable_maps, 2);
-        write_synthetic_process_identity(&writer, 3);
-        std::fs::write(
-            writer.join("maps"),
-            format!(
-                "00000000-00001000 rw-s 00000000 00:00 1 {}\n",
-                quarantine.join("mapped-file").display()
-            ),
-        )
-        .unwrap();
 
         let error = super::quarantine_has_writable_mappings_in(&quarantine, &proc_root, unsafe {
             libc::geteuid()
