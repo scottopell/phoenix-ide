@@ -3739,6 +3739,8 @@ fn quarantine_has_writable_mappings_in(
     proc_root: &Path,
     effective_uid: libc::uid_t,
 ) -> Result<ExternalWriterEvidence, String> {
+    use std::os::unix::ffi::OsStrExt as _;
+
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         format!("cannot canonicalize quarantine before mapping inspection: {error}")
     })?;
@@ -3796,7 +3798,6 @@ fn quarantine_has_writable_mappings_in(
                     .to_string_lossy()
                     .parse::<i64>()
                     .map_err(|error| format!("process id is malformed: {error}"))?;
-                use std::os::unix::ffi::OsStrExt as _;
                 return Ok(ExternalWriterEvidence::PositiveWriterFound(
                     AmbientWriterEvidence {
                         detector: AmbientWriterDetector::LinuxProcfs,
@@ -4213,6 +4214,8 @@ fn quarantine_has_open_descriptors_in(
     path: &Path,
     proc_root: &Path,
 ) -> Result<ExternalWriterEvidence, String> {
+    use std::os::unix::ffi::OsStrExt as _;
+
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         format!("cannot canonicalize quarantined worktree before descriptor inspection: {error}")
     })?;
@@ -4289,7 +4292,6 @@ fn quarantine_has_open_descriptors_in(
                 .to_string_lossy()
                 .parse::<i64>()
                 .map_err(|error| format!("process id is malformed: {error}"))?;
-            use std::os::unix::ffi::OsStrExt as _;
             return Ok(ExternalWriterEvidence::PositiveWriterFound(
                 AmbientWriterEvidence {
                     detector: AmbientWriterDetector::LinuxProcfs,
@@ -7272,7 +7274,7 @@ mod tests {
         let effective_uid = unsafe { libc::geteuid() };
         std::fs::write(
             process.join("status"),
-            format!("Name:\twriter\nUid:\t{0}\t{0}\t{0}\t{0}\n", effective_uid),
+            format!("Name:\twriter\nUid:\t{effective_uid}\t{effective_uid}\t{effective_uid}\t{effective_uid}\n"),
         )
         .unwrap();
         let fields = std::iter::repeat_n("0", 18).collect::<Vec<_>>().join(" ");
