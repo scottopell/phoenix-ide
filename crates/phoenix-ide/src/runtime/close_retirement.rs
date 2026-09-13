@@ -2717,6 +2717,7 @@ where
         final_tombstone,
         bind_tombstone,
         |_| {},
+        quarantine_has_external_writer,
     )
 }
 
@@ -2746,11 +2747,12 @@ where
         None,
         |_, _, _| Ok(()),
         after_quarantine,
+        |_| Ok(None),
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn inspect_and_remove_exact_worktree_with_hook_and_plan<F, B>(
+fn inspect_and_remove_exact_worktree_with_hook_and_plan<F, B, W>(
     runtime: &tokio::runtime::Handle,
     identity: &WorktreeIdentity,
     confirmed_snapshot: &CloseRetirementSnapshot,
@@ -2759,10 +2761,12 @@ fn inspect_and_remove_exact_worktree_with_hook_and_plan<F, B>(
     final_tombstone: Option<&CloseWorktreeFinalTombstone>,
     bind_tombstone: B,
     after_quarantine: F,
+    inspect_external_writer: W,
 ) -> Result<ExactWorktreeRemoval, String>
 where
     F: FnOnce(&Path) + Send + 'static,
     B: FnMut(&Path, (u64, u64), Option<(u64, u64)>) -> Result<(), String> + Send + 'static,
+    W: Fn(&Path) -> Result<Option<AmbientWriterEvidence>, String> + Send + 'static,
 {
     let path = worktree_path(identity);
     let quarantine = worktree_quarantine_path(identity)?;
@@ -2792,13 +2796,14 @@ where
                 .to_string(),
         });
     }
-    runtime.block_on(quarantine_and_remove_exact_worktree(
+    runtime.block_on(quarantine_and_remove_exact_worktree_with_writer_inspection(
         identity,
         administrative_dir.to_path_buf(),
         administrative_dir_incarnation.to_string(),
         final_tombstone.cloned(),
         bind_tombstone,
         after_quarantine,
+        inspect_external_writer,
     ))
 }
 
@@ -3695,6 +3700,27 @@ fn macos_descriptor_access_mode(open_flags: u32) -> Option<AmbientWriterAccessMo
     }
 }
 
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+fn classify_descriptor_access_mode(
+    access_mode: Option<AmbientWriterAccessMode>,
+    target_is_directory: bool,
+) -> Result<Option<AmbientWriterAccessMode>, String> {
+    match (access_mode, target_is_directory) {
+        (None, true) => {
+            Err("read-only directory descriptor retains namespace capability".to_string())
+        }
+        (access_mode, _) => Ok(access_mode),
+    }
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn macos_descriptor_inspection_is_transient_disappearance(errno: Option<i32>) -> bool {
+    matches!(
+        errno,
+        Some(libc::ESRCH) | Some(libc::ENOENT) | Some(libc::EBADF)
+    )
+}
+
 #[cfg(target_os = "linux")]
 fn quarantine_has_writable_mappings(path: &Path) -> Result<ExternalWriterEvidence, String> {
     // SAFETY: `geteuid` has no preconditions.
@@ -3711,15 +3737,29 @@ fn quarantine_has_writable_mappings_in(
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         format!("cannot canonicalize quarantine before mapping inspection: {error}")
     })?;
-    let Ok(processes) = std::fs::read_dir(proc_root) else {
-        return Ok(ExternalWriterEvidence::NoPositiveEvidence);
-    };
-    for process in processes.flatten() {
-        if !linux_process_is_relevant(&process, effective_uid, "mapping") {
+    let processes = std::fs::read_dir(proc_root)
+        .map_err(|error| format!("cannot enumerate processes for mapping inspection: {error}"))?;
+    for process in processes {
+        let process = process.map_err(|error| {
+            format!("cannot enumerate a process for mapping inspection: {error}")
+        })?;
+        if !linux_process_is_relevant(&process, effective_uid, "mapping")? {
             continue;
         }
-        let Ok(mappings) = std::fs::read_to_string(process.path().join("maps")) else {
-            continue;
+        let before_incarnation = match linux_process_incarnation(&process.path()) {
+            Ok(incarnation) => incarnation,
+            Err(_) if !process.path().exists() => continue,
+            Err(error) => return Err(error),
+        };
+        let before_executable = match std::fs::read_link(process.path().join("exe")) {
+            Ok(executable) => executable,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("cannot inspect process executable: {error}")),
+        };
+        let mappings = match std::fs::read_to_string(process.path().join("maps")) {
+            Ok(mappings) => mappings,
+            Err(_) if !process.path().exists() => continue,
+            Err(error) => return Err(format!("cannot inspect process mappings: {error}")),
         };
         for mapping in mappings.lines() {
             let mut fields = mapping
@@ -3735,9 +3775,22 @@ fn quarantine_has_writable_mappings_in(
                 && permissions.as_bytes().get(3) == Some(&b's')
                 && path_is_within(Path::new(mapped_path), &canonical)
             {
-                let process_incarnation = linux_process_incarnation(&process.path())?;
-                let executable = std::fs::read_link(process.path().join("exe"))
-                    .map_err(|error| format!("cannot inspect process executable: {error}"))?;
+                let after_incarnation = match linux_process_incarnation(&process.path()) {
+                    Ok(incarnation) => incarnation,
+                    Err(_) if !process.path().exists() => continue,
+                    Err(error) => return Err(error),
+                };
+                let after_executable = match std::fs::read_link(process.path().join("exe")) {
+                    Ok(executable) => executable,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        return Err(format!("cannot inspect process executable: {error}"))
+                    }
+                };
+                if after_incarnation != before_incarnation || after_executable != before_executable
+                {
+                    continue;
+                }
                 let process_id = process
                     .file_name()
                     .to_string_lossy()
@@ -3748,9 +3801,9 @@ fn quarantine_has_writable_mappings_in(
                     AmbientWriterEvidence {
                         detector: AmbientWriterDetector::LinuxProcfs,
                         process_id,
-                        process_incarnation,
+                        process_incarnation: before_incarnation.clone(),
                         executable: GitPathIdentity::from_bytes(
-                            executable.as_os_str().as_bytes().to_vec(),
+                            before_executable.as_os_str().as_bytes().to_vec(),
                         ),
                         matched_path: GitPathIdentity::from_bytes(mapped_path.as_bytes().to_vec()),
                         match_kind: AmbientWriterMatchKind::Mapping,
@@ -3807,9 +3860,8 @@ fn quarantine_has_writable_mappings(path: &Path) -> Result<ExternalWriterEvidenc
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         format!("cannot canonicalize quarantine before mapping inspection: {error}")
     })?;
-    let Some(pids) = macos_all_pids() else {
-        return Ok(ExternalWriterEvidence::NoPositiveEvidence);
-    };
+    let pids = macos_all_pids()
+        .map_err(|error| format!("cannot enumerate processes for mapping inspection: {error}"))?;
     for pid in pids.into_iter().filter(|pid| *pid > 0) {
         let mut address = 0_u64;
         loop {
@@ -3855,15 +3907,34 @@ fn quarantine_has_writable_mappings(path: &Path) -> Result<ExternalWriterEvidenc
                     &canonical,
                 )
             {
-                let Some((process_incarnation, executable)) = macos_process_identity(pid)? else {
+                let Some((uid, before_incarnation)) = macos_process_owner_incarnation(pid)? else {
                     continue;
                 };
+                if uid != unsafe { libc::geteuid() } {
+                    continue;
+                }
+                let Some(before_executable) = macos_process_executable(pid)? else {
+                    continue;
+                };
+                let Some((after_uid, after_incarnation)) = macos_process_owner_incarnation(pid)?
+                else {
+                    continue;
+                };
+                let Some(after_executable) = macos_process_executable(pid)? else {
+                    continue;
+                };
+                if after_uid != uid
+                    || after_incarnation != before_incarnation
+                    || after_executable != before_executable
+                {
+                    continue;
+                }
                 return Ok(ExternalWriterEvidence::PositiveWriterFound(
                     AmbientWriterEvidence {
                         detector: AmbientWriterDetector::MacosProcPidinfo,
                         process_id: i64::from(pid),
-                        process_incarnation,
-                        executable,
+                        process_incarnation: before_incarnation,
+                        executable: before_executable,
                         matched_path: GitPathIdentity::from_bytes(mapped_path.to_bytes().to_vec()),
                         match_kind: AmbientWriterMatchKind::Mapping,
                         access_mode: AmbientWriterAccessMode::WritableSharedMapping,
@@ -3896,52 +3967,62 @@ fn quarantine_has_process_cwd_in(
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         format!("cannot canonicalize quarantine before cwd inspection: {error}")
     })?;
-    let Ok(processes) = std::fs::read_dir(proc_root) else {
-        return Ok(false);
-    };
-    for process in processes.flatten() {
-        if !linux_process_is_relevant(&process, effective_uid, "cwd") {
+    let processes = std::fs::read_dir(proc_root)
+        .map_err(|error| format!("cannot enumerate processes for cwd inspection: {error}"))?;
+    for process in processes {
+        let process = process
+            .map_err(|error| format!("cannot enumerate a process for cwd inspection: {error}"))?;
+        if !linux_process_is_relevant(&process, effective_uid, "cwd")? {
             continue;
         }
-        if std::fs::read_link(process.path().join("cwd"))
-            .is_ok_and(|cwd| path_is_within(&cwd, &canonical))
-        {
-            return Ok(true);
+        match std::fs::read_link(process.path().join("cwd")) {
+            Ok(cwd) if path_is_within(&cwd, &canonical) => return Ok(true),
+            Ok(_) => {}
+            Err(_) if !process.path().exists() => continue,
+            Err(error) => return Err(format!("cannot inspect process cwd: {error}")),
         }
     }
     Ok(false)
 }
 
 #[cfg(target_os = "macos")]
-fn macos_all_pids() -> Option<Vec<i32>> {
+fn macos_all_pids() -> Result<Vec<i32>, String> {
     macos_all_pids_with(|buffer, buffer_bytes| unsafe {
         libc::proc_listpids(1, 0, buffer, buffer_bytes)
     })
 }
 
 #[cfg(target_os = "macos")]
-fn macos_all_pids_with(mut list: impl FnMut(*mut libc::c_void, i32) -> i32) -> Option<Vec<i32>> {
+fn macos_all_pids_with(
+    mut list: impl FnMut(*mut libc::c_void, i32) -> i32,
+) -> Result<Vec<i32>, String> {
     use std::mem::size_of;
 
     let mut capacity = 4096_usize;
     loop {
         let mut pids = vec![0_i32; capacity];
-        let capacity_bytes = pids.len().checked_mul(size_of::<i32>())?;
-        let capacity_bytes_i32 = i32::try_from(capacity_bytes).ok()?;
+        let capacity_bytes = pids
+            .len()
+            .checked_mul(size_of::<i32>())
+            .ok_or_else(|| "process inventory capacity overflow".to_string())?;
+        let capacity_bytes_i32 = i32::try_from(capacity_bytes)
+            .map_err(|_| "process inventory exceeds platform limits".to_string())?;
         let pid_bytes = list(pids.as_mut_ptr().cast(), capacity_bytes_i32);
         if pid_bytes < 0 {
-            return None;
+            return Err("cannot enumerate process inventory".to_string());
         }
-        let pid_bytes = usize::try_from(pid_bytes).ok()?;
+        let pid_bytes = usize::try_from(pid_bytes)
+            .map_err(|_| "process inventory byte count is invalid".to_string())?;
         if pid_bytes < capacity_bytes {
-            // A non-integral short result is not a trustworthy PID inventory.
             if !pid_bytes.is_multiple_of(size_of::<i32>()) {
-                return None;
+                return Err("process inventory contains a partial PID".to_string());
             }
             pids.truncate(pid_bytes / size_of::<i32>());
-            return Some(pids);
+            return Ok(pids);
         }
-        capacity = capacity.checked_mul(2)?;
+        capacity = capacity
+            .checked_mul(2)
+            .ok_or_else(|| "process inventory capacity overflow".to_string())?;
     }
 }
 
@@ -3954,9 +4035,8 @@ fn quarantine_has_process_cwd(path: &Path) -> Result<bool, String> {
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         format!("cannot canonicalize quarantine before cwd inspection: {error}")
     })?;
-    let Some(pids) = macos_all_pids() else {
-        return Ok(false);
-    };
+    let pids = macos_all_pids()
+        .map_err(|error| format!("cannot enumerate processes for cwd inspection: {error}"))?;
     for pid in pids.into_iter().filter(|pid| *pid > 0) {
         let mut info = MaybeUninit::<libc::proc_vnodepathinfo>::uninit();
         let bytes = unsafe {
@@ -4037,7 +4117,7 @@ fn linux_process_owner(
 ) -> Result<LinuxProcessOwner, String> {
     let status = match std::fs::read_to_string(process.path().join("status")) {
         Ok(status) => status,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !process.path().exists() => {
             return Ok(LinuxProcessOwner::Vanished);
         }
         Err(error) => {
@@ -4073,16 +4153,17 @@ fn linux_process_is_relevant(
     process: &std::fs::DirEntry,
     effective_uid: libc::uid_t,
     inventory: &str,
-) -> bool {
-    process
+) -> Result<bool, String> {
+    if !process
         .file_name()
         .as_encoded_bytes()
         .iter()
         .all(u8::is_ascii_digit)
-        && matches!(
-            linux_process_owner(process, effective_uid, inventory),
-            Ok(LinuxProcessOwner::Relevant)
-        )
+    {
+        return Ok(false);
+    }
+    linux_process_owner(process, effective_uid, inventory)
+        .map(|owner| owner == LinuxProcessOwner::Relevant)
 }
 
 #[cfg(target_os = "linux")]
@@ -4135,20 +4216,35 @@ fn quarantine_has_open_descriptors_in(
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         format!("cannot canonicalize quarantined worktree before descriptor inspection: {error}")
     })?;
-    let Ok(processes) = std::fs::read_dir(proc_root) else {
-        return Ok(ExternalWriterEvidence::NoPositiveEvidence);
-    };
-    for process in processes.flatten().filter(|process| {
-        process
-            .file_name()
-            .as_encoded_bytes()
-            .iter()
-            .all(u8::is_ascii_digit)
-    }) {
-        let Ok(descriptors) = std::fs::read_dir(process.path().join("fd")) else {
+    let effective_uid = unsafe { libc::geteuid() };
+    let processes = std::fs::read_dir(proc_root).map_err(|error| {
+        format!("cannot enumerate processes for descriptor inspection: {error}")
+    })?;
+    for process in processes {
+        let process = process.map_err(|error| {
+            format!("cannot enumerate a process for descriptor inspection: {error}")
+        })?;
+        if !linux_process_is_relevant(&process, effective_uid, "descriptor")? {
             continue;
+        }
+        let before_incarnation = match linux_process_incarnation(&process.path()) {
+            Ok(incarnation) => incarnation,
+            Err(_) if !process.path().exists() => continue,
+            Err(error) => return Err(error),
         };
-        for descriptor in descriptors.flatten() {
+        let before_executable = match std::fs::read_link(process.path().join("exe")) {
+            Ok(executable) => executable,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("cannot inspect process executable: {error}")),
+        };
+        let descriptors = match std::fs::read_dir(process.path().join("fd")) {
+            Ok(descriptors) => descriptors,
+            Err(_) if !process.path().exists() => continue,
+            Err(error) => return Err(format!("cannot inspect process descriptors: {error}")),
+        };
+        for descriptor in descriptors {
+            let descriptor = descriptor
+                .map_err(|error| format!("cannot enumerate a process descriptor: {error}"))?;
             let target = match std::fs::read_link(descriptor.path()) {
                 Ok(target) => target,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -4157,24 +4253,40 @@ fn quarantine_has_open_descriptors_in(
             if !linux_descriptor_target_is_within(Ok(target.clone()), &canonical) {
                 continue;
             }
+            let target_metadata = match std::fs::metadata(descriptor.path()) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(format!("cannot inspect descriptor object type: {error}"))
+                }
+            };
             let access_mode = match linux_descriptor_access_mode(
                 &process.path().join("fdinfo").join(descriptor.file_name()),
             ) {
-                Ok(Some(access_mode)) => access_mode,
-                Ok(None) => continue,
+                Ok(access_mode) => {
+                    let Some(access_mode) =
+                        classify_descriptor_access_mode(access_mode, target_metadata.is_dir())?
+                    else {
+                        continue;
+                    };
+                    access_mode
+                }
                 Err(_) if !process.path().exists() => continue,
                 Err(error) => return Err(error),
             };
-            let process_incarnation = match linux_process_incarnation(&process.path()) {
-                Ok(process_incarnation) => process_incarnation,
+            let after_incarnation = match linux_process_incarnation(&process.path()) {
+                Ok(incarnation) => incarnation,
                 Err(_) if !process.path().exists() => continue,
                 Err(error) => return Err(error),
             };
-            let executable = match std::fs::read_link(process.path().join("exe")) {
+            let after_executable = match std::fs::read_link(process.path().join("exe")) {
                 Ok(executable) => executable,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(format!("cannot inspect process executable: {error}")),
             };
+            if after_incarnation != before_incarnation || after_executable != before_executable {
+                continue;
+            }
             let process_id = process
                 .file_name()
                 .to_string_lossy()
@@ -4185,9 +4297,9 @@ fn quarantine_has_open_descriptors_in(
                 AmbientWriterEvidence {
                     detector: AmbientWriterDetector::LinuxProcfs,
                     process_id,
-                    process_incarnation,
+                    process_incarnation: before_incarnation.clone(),
                     executable: GitPathIdentity::from_bytes(
-                        executable.as_os_str().as_bytes().to_vec(),
+                        before_executable.as_os_str().as_bytes().to_vec(),
                     ),
                     matched_path: GitPathIdentity::from_bytes(
                         target.as_os_str().as_bytes().to_vec(),
@@ -4207,7 +4319,7 @@ fn descriptor_inventory_may_be_truncated(returned_bytes: usize, capacity_bytes: 
 }
 
 #[cfg(target_os = "macos")]
-fn macos_process_identity(pid: i32) -> Result<Option<(String, GitPathIdentity)>, String> {
+fn macos_process_owner_incarnation(pid: i32) -> Result<Option<(libc::uid_t, String)>, String> {
     use std::mem::{size_of, MaybeUninit};
 
     let mut info = MaybeUninit::<libc::proc_bsdinfo>::uninit();
@@ -4222,12 +4334,23 @@ fn macos_process_identity(pid: i32) -> Result<Option<(String, GitPathIdentity)>,
     };
     if bytes != i32::try_from(size_of::<libc::proc_bsdinfo>()).expect("bsd info size fits i32") {
         let error = std::io::Error::last_os_error();
-        if matches!(error.raw_os_error(), Some(libc::ESRCH) | Some(libc::ENOENT)) {
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::ESRCH) | Some(libc::ENOENT) | Some(libc::EPERM)
+        ) {
             return Ok(None);
         }
         return Err(format!("cannot inspect process {pid} incarnation: {error}"));
     }
     let info = unsafe { info.assume_init() };
+    Ok(Some((
+        info.pbi_uid,
+        format!("{}:{}", info.pbi_start_tvsec, info.pbi_start_tvusec),
+    )))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_executable(pid: i32) -> Result<Option<GitPathIdentity>, String> {
     let mut executable = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     let executable_bytes = unsafe {
         libc::proc_pidpath(
@@ -4238,16 +4361,16 @@ fn macos_process_identity(pid: i32) -> Result<Option<(String, GitPathIdentity)>,
     };
     if executable_bytes <= 0 {
         let error = std::io::Error::last_os_error();
-        if matches!(error.raw_os_error(), Some(libc::ESRCH) | Some(libc::ENOENT)) {
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::ESRCH) | Some(libc::ENOENT) | Some(libc::EPERM)
+        ) {
             return Ok(None);
         }
         return Err(format!("cannot inspect process {pid} executable: {error}"));
     }
     executable.truncate(usize::try_from(executable_bytes).expect("positive process path size"));
-    Ok(Some((
-        format!("{}:{}", info.pbi_start_tvsec, info.pbi_start_tvusec),
-        GitPathIdentity::from_bytes(executable),
-    )))
+    Ok(Some(GitPathIdentity::from_bytes(executable)))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4275,10 +4398,19 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         format!("cannot canonicalize quarantined worktree before descriptor inspection: {error}")
     })?;
-    let Some(pids) = macos_all_pids() else {
-        return Ok(ExternalWriterEvidence::NoPositiveEvidence);
-    };
+    let pids = macos_all_pids().map_err(|error| {
+        format!("cannot enumerate processes for descriptor inspection: {error}")
+    })?;
     for pid in pids.into_iter().filter(|pid| *pid > 0) {
+        let Some((uid, before_incarnation)) = macos_process_owner_incarnation(pid)? else {
+            continue;
+        };
+        if uid != unsafe { libc::geteuid() } {
+            continue;
+        }
+        let Some(before_executable) = macos_process_executable(pid)? else {
+            continue;
+        };
         let mut descriptor_capacity = 256_usize;
         let descriptors = loop {
             let mut descriptors = vec![
@@ -4289,9 +4421,8 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence
                 descriptor_capacity
             ];
             let capacity_bytes = descriptors.len() * size_of::<libc::proc_fdinfo>();
-            let Ok(capacity_bytes_i32) = i32::try_from(capacity_bytes) else {
-                break Vec::new();
-            };
+            let capacity_bytes_i32 = i32::try_from(capacity_bytes)
+                .map_err(|_| "descriptor inventory exceeds platform limits".to_string())?;
             // SAFETY: the vector provides writable storage for exactly the byte count passed.
             let descriptor_bytes = unsafe {
                 libc::proc_pidinfo(
@@ -4311,10 +4442,9 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence
                 descriptors.truncate(descriptor_bytes / size_of::<libc::proc_fdinfo>());
                 break descriptors;
             }
-            let Some(next_capacity) = descriptor_capacity.checked_mul(2) else {
-                break Vec::new();
-            };
-            descriptor_capacity = next_capacity;
+            descriptor_capacity = descriptor_capacity
+                .checked_mul(2)
+                .ok_or_else(|| "descriptor inventory capacity overflow".to_string())?;
         };
         for descriptor in descriptors
             .into_iter()
@@ -4335,29 +4465,51 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence
                 != i32::try_from(size_of::<VnodeFdInfoWithPath>())
                     .expect("vnode info size fits i32")
             {
-                continue;
+                let error = std::io::Error::last_os_error();
+                if macos_descriptor_inspection_is_transient_disappearance(error.raw_os_error()) {
+                    continue;
+                }
+                return Err(format!(
+                    "cannot inspect process {pid} vnode descriptor {}: {error}",
+                    descriptor.proc_fd
+                ));
             }
             // SAFETY: the exact structure size was reported as initialized above.
             let info = unsafe { info.assume_init() };
             let path_bytes = info.vnode.vip_path.as_flattened();
             // SAFETY: the kernel returns a NUL-terminated MAXPATHLEN path buffer.
             let candidate = unsafe { CStr::from_ptr(path_bytes.as_ptr()) };
-            let Some(access_mode) = macos_descriptor_access_mode(info.file.open_flags) else {
+            let candidate_path = Path::new(std::ffi::OsStr::from_bytes(candidate.to_bytes()));
+            let candidate_is_within = path_is_within(candidate_path, &canonical);
+            let target_is_directory =
+                info.vnode.vip_vi.vi_stat.vst_mode & libc::S_IFMT as u16 == libc::S_IFDIR as u16;
+            let Some(access_mode) = classify_descriptor_access_mode(
+                macos_descriptor_access_mode(info.file.open_flags),
+                candidate_is_within && target_is_directory,
+            )?
+            else {
                 continue;
             };
-            if path_is_within(
-                Path::new(std::ffi::OsStr::from_bytes(candidate.to_bytes())),
-                &canonical,
-            ) {
-                let Some((process_incarnation, executable)) = macos_process_identity(pid)? else {
+            if candidate_is_within {
+                let Some((after_uid, after_incarnation)) = macos_process_owner_incarnation(pid)?
+                else {
                     continue;
                 };
+                let Some(after_executable) = macos_process_executable(pid)? else {
+                    continue;
+                };
+                if after_uid != uid
+                    || after_incarnation != before_incarnation
+                    || after_executable != before_executable
+                {
+                    continue;
+                }
                 return Ok(ExternalWriterEvidence::PositiveWriterFound(
                     AmbientWriterEvidence {
                         detector: AmbientWriterDetector::MacosProcPidinfo,
                         process_id: i64::from(pid),
-                        process_incarnation,
-                        executable,
+                        process_incarnation: before_incarnation,
+                        executable: before_executable,
                         matched_path: GitPathIdentity::from_bytes(candidate.to_bytes().to_vec()),
                         match_kind: AmbientWriterMatchKind::Descriptor,
                         access_mode,
@@ -4487,17 +4639,19 @@ fn decode_hex_bytes(encoded: &str) -> Option<Vec<u8>> {
 }
 
 #[allow(clippy::too_many_lines)]
-async fn quarantine_and_remove_exact_worktree<F, B>(
+async fn quarantine_and_remove_exact_worktree_with_writer_inspection<F, B, W>(
     identity: &WorktreeIdentity,
     planned_administrative_dir: PathBuf,
     planned_administrative_dir_incarnation: String,
     final_tombstone: Option<CloseWorktreeFinalTombstone>,
     bind_tombstone: B,
     after_quarantine: F,
+    inspect_external_writer: W,
 ) -> Result<ExactWorktreeRemoval, String>
 where
     F: FnOnce(&Path) + Send + 'static,
     B: FnMut(&Path, (u64, u64), Option<(u64, u64)>) -> Result<(), String> + Send + 'static,
+    W: Fn(&Path) -> Result<Option<AmbientWriterEvidence>, String> + Send + 'static,
 {
     let path = worktree_path(identity);
     let quarantine = worktree_quarantine_path(identity)?;
@@ -4584,7 +4738,7 @@ where
                 ),
             });
         }
-        if let Some(evidence) = quarantine_has_external_writer(&quarantine)? {
+        if let Some(evidence) = inspect_external_writer(&quarantine)? {
             return Ok(ExactWorktreeRemoval::AmbientWriterResidual(
                 AmbientWriterResidual {
                     detail: format!(
@@ -5272,9 +5426,11 @@ mod tests {
         complete_persisted_worktree_administrative_cleanup, exact_worktree_administrative_dir,
         git_path_from_observation, inspect_and_remove_exact_worktree_with_hook, inspect_worktree,
         observe_administrative_dir_incarnation, observe_worktree_fingerprint, parse_status_losses,
-        planned_administrative_dir_is_absent, quarantine_and_remove_exact_worktree,
-        remove_directory_contents_at_with_hook, remove_exact_worktree_administrative_dir_with_hook,
-        remove_identity_bound_directory, remove_quarantine_then_administrative_dir,
+        planned_administrative_dir_is_absent,
+        quarantine_and_remove_exact_worktree_with_writer_inspection,
+        quarantine_has_external_writer, remove_directory_contents_at_with_hook,
+        remove_exact_worktree_administrative_dir_with_hook, remove_identity_bound_directory,
+        remove_quarantine_then_administrative_dir,
         remove_quarantine_then_administrative_dir_with_hooks, resume_final_worktree_tombstone,
         rotate_inspection_generation, run_bounded_git_status_until, snapshot_for,
         staged_index_entries_by_path, staged_index_entries_for_paths, worktree_quarantine_path,
@@ -5298,9 +5454,13 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_process_inventory_failures_are_absent_evidence() {
-        assert_eq!(super::macos_all_pids_with(|_, _| -1), None);
-        assert_eq!(super::macos_all_pids_with(|_, _| 3), None);
+    fn macos_process_inventory_failures_are_indeterminate() {
+        assert!(super::macos_all_pids_with(|_, _| -1)
+            .unwrap_err()
+            .contains("cannot enumerate process inventory"));
+        assert!(super::macos_all_pids_with(|_, _| 3)
+            .unwrap_err()
+            .contains("partial PID"));
     }
 
     #[cfg(target_os = "macos")]
@@ -5320,7 +5480,7 @@ mod tests {
             i32::try_from(values.len() * size_of::<i32>()).unwrap()
         });
 
-        assert_eq!(pids, Some(vec![17, 23]));
+        assert_eq!(pids, Ok(vec![17, 23]));
         assert_eq!(calls, 2);
     }
 
@@ -5443,13 +5603,14 @@ mod tests {
         std::fs::remove_dir_all(&unrelated).unwrap();
         let administrative_dir = exact_worktree_administrative_dir(&linked, &bare).unwrap();
 
-        let outcome = quarantine_and_remove_exact_worktree(
+        let outcome = super::quarantine_and_remove_exact_worktree_with_writer_inspection(
             &identity,
             administrative_dir.clone(),
             observe_administrative_dir_incarnation(&administrative_dir).unwrap(),
             None,
             |_, _, _| Ok(()),
             |_| {},
+            |_| Ok(None),
         )
         .await
         .unwrap();
@@ -6206,6 +6367,7 @@ mod tests {
                 None,
                 |_, _, _| Ok(()),
                 |_| {},
+                |_| Ok(None),
             )
         })
         .await
@@ -6788,13 +6950,14 @@ mod tests {
             .any(|loss| matches!(loss, CloseLossItem::DetachedUnreachableCommit(_))));
         let common = super::exact_worktree_common_git_dir(&closing).unwrap();
         let administrative_dir = exact_worktree_administrative_dir(&closing, &common).unwrap();
-        let outcome = quarantine_and_remove_exact_worktree(
+        let outcome = super::quarantine_and_remove_exact_worktree_with_writer_inspection(
             &identity,
             administrative_dir.clone(),
             observe_administrative_dir_incarnation(&administrative_dir).unwrap(),
             None,
             |_, _, _| Ok(()),
             |_| {},
+            |_| Ok(None),
         )
         .await
         .unwrap();
@@ -6844,6 +7007,25 @@ mod tests {
             super::macos_descriptor_access_mode(0x3),
             Some(super::AmbientWriterAccessMode::ReadWrite)
         );
+    }
+
+    #[test]
+    fn read_only_directory_namespace_capability_is_indeterminate() {
+        let error = super::classify_descriptor_access_mode(None, true).unwrap_err();
+        assert!(error.contains("namespace capability"));
+        assert_eq!(
+            super::classify_descriptor_access_mode(None, false).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn transient_descriptor_errno_is_disappearance_not_indeterminacy() {
+        for errno in [libc::ESRCH, libc::ENOENT, libc::EBADF] {
+            assert!(super::macos_descriptor_inspection_is_transient_disappearance(Some(errno)));
+        }
+        assert!(!super::macos_descriptor_inspection_is_transient_disappearance(Some(libc::EACCES)));
+        assert!(!super::macos_descriptor_inspection_is_transient_disappearance(None));
     }
 
     #[test]
@@ -6905,10 +7087,11 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_read_only_descriptor_under_quarantine_is_not_a_writer() {
+    fn macos_read_only_file_descriptor_under_quarantine_is_not_a_writer() {
         let temp = tempfile::tempdir().unwrap();
+        let readiness = tempfile::tempdir().unwrap();
         let path = temp.path().join("read-only");
-        let marker = temp.path().join("reader-ready");
+        let marker = readiness.path().join("reader-ready");
         std::fs::write(&path, b"evidence").unwrap();
         let mut reader = std::process::Command::new("sh")
             .args(["-c", "exec 3<\"$TARGET\"; touch \"$MARKER\"; exec sleep 30"])
@@ -6923,9 +7106,47 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(marker.exists(), "external reader became ready");
+        #[repr(C)]
+        struct ProcFileInfo {
+            open_flags: u32,
+            status: u32,
+            offset: i64,
+            file_type: i32,
+            guard_flags: u32,
+        }
+        #[repr(C)]
+        struct VnodeFdInfoWithPath {
+            file: ProcFileInfo,
+            vnode: libc::vnode_info_path,
+        }
+        let mut info = std::mem::MaybeUninit::<VnodeFdInfoWithPath>::zeroed();
+        let bytes = unsafe {
+            libc::proc_pidfdinfo(
+                i32::try_from(reader.id()).unwrap(),
+                3,
+                2,
+                info.as_mut_ptr().cast(),
+                i32::try_from(std::mem::size_of::<VnodeFdInfoWithPath>()).unwrap(),
+            )
+        };
         assert_eq!(
-            super::quarantine_has_open_descriptors(temp.path()).unwrap(),
-            super::ExternalWriterEvidence::NoPositiveEvidence
+            bytes,
+            i32::try_from(std::mem::size_of::<VnodeFdInfoWithPath>()).unwrap()
+        );
+        let info = unsafe { info.assume_init() };
+        assert_eq!(
+            super::macos_descriptor_access_mode(info.file.open_flags),
+            None
+        );
+        let path_bytes = info.vnode.vip_path.as_flattened();
+        let candidate = unsafe { std::ffi::CStr::from_ptr(path_bytes.as_ptr()) };
+        use std::os::unix::ffi::OsStrExt as _;
+        assert_eq!(
+            std::fs::canonicalize(Path::new(
+                std::ffi::OsStr::from_bytes(candidate.to_bytes(),)
+            ))
+            .unwrap(),
+            std::fs::canonicalize(&path).unwrap()
         );
         reader.kill().unwrap();
         reader.wait().unwrap();
@@ -7034,7 +7255,13 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn write_synthetic_process_identity(process: &Path, pid: i64) {
-        std::fs::write(process.join("status"), "Name:\twriter\nUid:\t1\t1\t1\t1\n").unwrap();
+        // SAFETY: `geteuid` has no preconditions.
+        let effective_uid = unsafe { libc::geteuid() };
+        std::fs::write(
+            process.join("status"),
+            format!("Name:\twriter\nUid:\t{0}\t{0}\t{0}\t{0}\n", effective_uid),
+        )
+        .unwrap();
         let fields = std::iter::repeat_n("0", 18).collect::<Vec<_>>().join(" ");
         std::fs::write(
             process.join("stat"),
@@ -7066,7 +7293,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn descriptor_scan_ignores_ambient_failures_and_finds_readable_writer() {
+    fn descriptor_scan_reports_unreadable_live_inventory_as_indeterminate() {
         let temp = tempfile::tempdir().unwrap();
         let quarantine = temp.path().join("quarantine");
         let proc_root = temp.path().join("proc");
@@ -7077,6 +7304,24 @@ mod tests {
         std::fs::create_dir_all(writer.join("fdinfo")).unwrap();
         std::fs::create_dir(&quarantine).unwrap();
         std::fs::write(ambient.join("fd"), b"not a descriptor directory").unwrap();
+        write_synthetic_process_identity(&writer, 1274);
+        std::os::unix::fs::symlink(quarantine.join("open-file"), writer.join("fd/3")).unwrap();
+        std::fs::write(writer.join("fdinfo/3"), "flags:\t00000001\n").unwrap();
+
+        let error = super::quarantine_has_open_descriptors_in(&quarantine, &proc_root).unwrap_err();
+        assert!(error.contains("kernel credentials"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_scan_finds_writable_writer_with_actual_euid() {
+        let temp = tempfile::tempdir().unwrap();
+        let quarantine = temp.path().join("quarantine");
+        let proc_root = temp.path().join("proc");
+        let writer = proc_root.join("1274");
+        std::fs::create_dir_all(writer.join("fd")).unwrap();
+        std::fs::create_dir_all(writer.join("fdinfo")).unwrap();
+        std::fs::create_dir(&quarantine).unwrap();
         write_synthetic_process_identity(&writer, 1274);
         std::os::unix::fs::symlink(quarantine.join("open-file"), writer.join("fd/3")).unwrap();
         std::fs::write(writer.join("fdinfo/3"), "flags:\t00000001\n").unwrap();
@@ -7105,6 +7350,7 @@ mod tests {
         let quarantine = temp.path().join("quarantine");
         let proc_root = temp.path().join("proc");
         std::fs::create_dir(&quarantine).unwrap();
+        std::fs::create_dir(&proc_root).unwrap();
 
         assert_eq!(
             super::quarantine_has_open_descriptors_in(&quarantine, &proc_root).unwrap(),
@@ -7131,7 +7377,28 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn cwd_scan_ignores_ambient_unreadability_and_finds_readable_writer() {
+    fn read_only_directory_descriptor_is_indeterminate_in_synthetic_procfs() {
+        let temp = tempfile::tempdir().unwrap();
+        let quarantine = temp.path().join("quarantine");
+        let process = temp.path().join("proc/1275");
+        std::fs::create_dir_all(process.join("fd")).unwrap();
+        std::fs::create_dir_all(process.join("fdinfo")).unwrap();
+        std::fs::create_dir(&quarantine).unwrap();
+        write_synthetic_process_identity(&process, 1275);
+        std::os::unix::fs::symlink(&quarantine, process.join("fd/3")).unwrap();
+        std::fs::write(process.join("fdinfo/3"), "flags:\t00000000\n").unwrap();
+
+        let error = super::quarantine_has_open_descriptors_in(
+            &quarantine,
+            temp.path().join("proc").as_path(),
+        )
+        .unwrap_err();
+        assert!(error.contains("namespace capability"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cwd_scan_reports_ambient_unreadability_as_indeterminate() {
         let temp = tempfile::tempdir().unwrap();
         let quarantine = temp.path().join("quarantine");
         let proc_root = temp.path().join("proc");
@@ -7142,21 +7409,21 @@ mod tests {
         std::fs::create_dir_all(&unreadable_cwd).unwrap();
         std::fs::create_dir_all(&writer).unwrap();
         std::fs::create_dir(&quarantine).unwrap();
-        std::fs::write(
-            unreadable_cwd.join("status"),
-            "Name:\ttest\nUid:\t1\t1\t1\t1\n",
-        )
-        .unwrap();
+        write_synthetic_process_identity(&unreadable_cwd, 2);
         std::fs::write(unreadable_cwd.join("cwd"), b"not a symlink").unwrap();
-        std::fs::write(writer.join("status"), "Name:\twriter\nUid:\t1\t1\t1\t1\n").unwrap();
+        write_synthetic_process_identity(&writer, 3);
         std::os::unix::fs::symlink(quarantine.join("nested"), writer.join("cwd")).unwrap();
+        // SAFETY: `geteuid` has no preconditions.
+        let effective_uid = unsafe { libc::geteuid() };
 
-        assert!(super::quarantine_has_process_cwd_in(&quarantine, &proc_root, 1).unwrap());
+        let error = super::quarantine_has_process_cwd_in(&quarantine, &proc_root, effective_uid)
+            .unwrap_err();
+        assert!(error.contains("kernel credentials"));
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn mapping_scan_ignores_ambient_unreadability_and_finds_readable_writer() {
+    fn mapping_scan_reports_ambient_unreadability_as_indeterminate() {
         let temp = tempfile::tempdir().unwrap();
         let quarantine = temp.path().join("quarantine");
         let proc_root = temp.path().join("proc");
@@ -7167,11 +7434,7 @@ mod tests {
         std::fs::create_dir_all(unreadable_maps.join("maps")).unwrap();
         std::fs::create_dir_all(&writer).unwrap();
         std::fs::create_dir(&quarantine).unwrap();
-        std::fs::write(
-            unreadable_maps.join("status"),
-            "Name:\ttest\nUid:\t1\t1\t1\t1\n",
-        )
-        .unwrap();
+        write_synthetic_process_identity(&unreadable_maps, 2);
         write_synthetic_process_identity(&writer, 3);
         std::fs::write(
             writer.join("maps"),
@@ -7182,34 +7445,32 @@ mod tests {
         )
         .unwrap();
 
-        let super::ExternalWriterEvidence::PositiveWriterFound(evidence) =
-            super::quarantine_has_writable_mappings_in(&quarantine, &proc_root, 1).unwrap()
-        else {
-            panic!("writable shared mapping must produce complete evidence");
-        };
-        assert_eq!(evidence.process_id, 3);
-        assert_eq!(evidence.process_incarnation, "4242");
-        assert_eq!(evidence.match_kind, super::AmbientWriterMatchKind::Mapping);
-        assert_eq!(
-            evidence.access_mode,
-            super::AmbientWriterAccessMode::WritableSharedMapping
-        );
+        let error = super::quarantine_has_writable_mappings_in(&quarantine, &proc_root, unsafe {
+            libc::geteuid()
+        })
+        .unwrap_err();
+        assert!(error.contains("kernel credentials"));
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn cwd_and_mapping_scans_treat_unavailable_proc_inventory_as_no_evidence() {
+    fn unavailable_proc_inventory_is_indeterminate() {
         let temp = tempfile::tempdir().unwrap();
         let quarantine = temp.path().join("quarantine");
         let proc_root = temp.path().join("proc");
         std::fs::create_dir(&quarantine).unwrap();
         std::fs::write(&proc_root, b"not a proc directory").unwrap();
 
-        assert!(!super::quarantine_has_process_cwd_in(&quarantine, &proc_root, 1).unwrap());
-        assert_eq!(
-            super::quarantine_has_writable_mappings_in(&quarantine, &proc_root, 1).unwrap(),
-            super::ExternalWriterEvidence::NoPositiveEvidence
+        // SAFETY: `geteuid` has no preconditions.
+        let effective_uid = unsafe { libc::geteuid() };
+        assert!(
+            super::quarantine_has_process_cwd_in(&quarantine, &proc_root, effective_uid).is_err()
         );
+        assert!(
+            super::quarantine_has_writable_mappings_in(&quarantine, &proc_root, effective_uid,)
+                .is_err()
+        );
+        assert!(super::quarantine_has_open_descriptors_in(&quarantine, &proc_root).is_err());
     }
 
     #[cfg(target_os = "linux")]
@@ -7219,10 +7480,20 @@ mod tests {
         let missing_quarantine = temp.path().join("missing-quarantine");
         let proc_root = temp.path().join("proc");
 
-        assert!(super::quarantine_has_process_cwd_in(&missing_quarantine, &proc_root, 1).is_err());
-        assert!(
-            super::quarantine_has_writable_mappings_in(&missing_quarantine, &proc_root, 1).is_err()
-        );
+        // SAFETY: `geteuid` has no preconditions.
+        let effective_uid = unsafe { libc::geteuid() };
+        assert!(super::quarantine_has_process_cwd_in(
+            &missing_quarantine,
+            &proc_root,
+            effective_uid,
+        )
+        .is_err());
+        assert!(super::quarantine_has_writable_mappings_in(
+            &missing_quarantine,
+            &proc_root,
+            effective_uid,
+        )
+        .is_err());
     }
 
     #[cfg(target_os = "linux")]
@@ -7305,7 +7576,7 @@ mod tests {
         let callback_quarantine = quarantine.clone();
 
         let administrative_dir = closing.join(".git");
-        let outcome = quarantine_and_remove_exact_worktree(
+        let outcome = quarantine_and_remove_exact_worktree_with_writer_inspection(
             &identity,
             administrative_dir.clone(),
             observe_administrative_dir_incarnation(&administrative_dir).unwrap(),
@@ -7330,6 +7601,7 @@ mod tests {
                 }
                 panic!("external writer did not become ready");
             },
+            quarantine_has_external_writer,
         )
         .await
         .unwrap();

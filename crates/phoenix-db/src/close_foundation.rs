@@ -3400,6 +3400,19 @@ type WorktreeCleanupPlanColumns = (
     Option<String>,
     Option<String>,
 );
+type AdoptableWorktreeCleanupPlanColumns = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 impl Database {
     /// Durably records intent to remove one exact sealed resource before external
@@ -3568,8 +3581,81 @@ impl Database {
             });
         }
         let identity = request.resource.identity();
-        let sources: Vec<WorktreeCleanupPlanColumns> = sqlx::query_as(
-            "SELECT DISTINCT plan.administrative_dir_codec, plan.administrative_dir_value,
+        let existing_lineage: Option<(String, String)> = sqlx::query_as(
+            "SELECT source_inspection_generation, source_inspection_fingerprint
+             FROM close_worktree_cleanup_adoptions
+             WHERE attempt_id=?1 AND scope=?2
+               AND target_inspection_generation=?3 AND target_inspection_fingerprint=?4
+               AND resource_kind=?5 AND identity_kind=?6
+               AND identity_codec=?7 AND identity_value=?8",
+        )
+        .bind(request.attempt_id.as_str())
+        .bind(request.scope.as_str())
+        .bind(request.target_snapshot.generation())
+        .bind(request.target_snapshot.fingerprint())
+        .bind(request.resource.kind().as_str())
+        .bind(identity.identity_kind())
+        .bind(identity.codec())
+        .bind(identity.value())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((source_generation, source_fingerprint)) = existing_lineage {
+            let lineage_is_exact: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                     SELECT 1
+                     FROM close_worktree_cleanup_plans source
+                     JOIN close_worktree_cleanup_plans target
+                       ON target.attempt_id=source.attempt_id
+                      AND target.scope=source.scope
+                      AND target.resource_kind=source.resource_kind
+                      AND target.identity_kind=source.identity_kind
+                      AND target.identity_codec=source.identity_codec
+                      AND target.identity_value=source.identity_value
+                     WHERE source.attempt_id=?1 AND source.scope=?2
+                       AND source.inspection_generation=?3 AND source.inspection_fingerprint=?4
+                       AND target.inspection_generation=?5 AND target.inspection_fingerprint=?6
+                       AND source.resource_kind=?7 AND source.identity_kind=?8
+                       AND source.identity_codec=?9 AND source.identity_value=?10
+                 )",
+            )
+            .bind(request.attempt_id.as_str())
+            .bind(request.scope.as_str())
+            .bind(&source_generation)
+            .bind(&source_fingerprint)
+            .bind(request.target_snapshot.generation())
+            .bind(request.target_snapshot.fingerprint())
+            .bind(request.resource.kind().as_str())
+            .bind(identity.identity_kind())
+            .bind(identity.codec())
+            .bind(identity.value())
+            .fetch_one(&mut *tx)
+            .await?;
+            if !lineage_is_exact {
+                return Err(DbError::CloseEvidenceInvariant {
+                    invariant: "adoption_lineage_requires_exact_source_and_target_plans",
+                    relation: "close_worktree_cleanup_adoptions+close_worktree_cleanup_plans",
+                    detail: "existing adoption lineage does not bind its exact source and target plan rows"
+                        .to_string(),
+                });
+            }
+            tx.commit().await?;
+            return self
+                .close_worktree_cleanup_plan(
+                    &request.attempt_id,
+                    &request.scope,
+                    &request.target_snapshot,
+                    &request.resource,
+                )
+                .await?
+                .ok_or_else(|| DbError::CloseEvidenceInvariant {
+                    invariant: "adoption_lineage_requires_target_cleanup_plan",
+                    relation: "close_worktree_cleanup_adoptions+close_worktree_cleanup_plans",
+                    detail: "adoption lineage exists without its target cleanup plan".to_string(),
+                });
+        }
+        let sources: Vec<AdoptableWorktreeCleanupPlanColumns> = sqlx::query_as(
+            "SELECT plan.inspection_generation, plan.inspection_fingerprint,
+                    plan.administrative_dir_codec, plan.administrative_dir_value,
                     plan.administrative_dir_incarnation, plan.final_tombstone_root_codec,
                     plan.final_tombstone_root_value, plan.final_tombstone_root_device,
                     plan.final_tombstone_root_inode, plan.final_tombstone_object_device,
@@ -3586,7 +3672,18 @@ impl Database {
              WHERE plan.attempt_id = ?1 AND plan.scope = ?2
                AND plan.resource_kind = ?3 AND plan.identity_kind = ?4
                AND plan.identity_codec = ?5 AND plan.identity_value = ?6
-               AND (plan.inspection_generation <> ?7 OR plan.inspection_fingerprint <> ?8)",
+               AND (plan.inspection_generation <> ?7 OR plan.inspection_fingerprint <> ?8)
+               AND NOT EXISTS (
+                   SELECT 1 FROM close_worktree_cleanup_adoptions adoption
+                   WHERE adoption.attempt_id=plan.attempt_id
+                     AND adoption.scope=plan.scope
+                     AND adoption.source_inspection_generation=plan.inspection_generation
+                     AND adoption.source_inspection_fingerprint=plan.inspection_fingerprint
+                     AND adoption.resource_kind=plan.resource_kind
+                     AND adoption.identity_kind=plan.identity_kind
+                     AND adoption.identity_codec=plan.identity_codec
+                     AND adoption.identity_value=plan.identity_value
+               )",
         )
         .bind(request.attempt_id.as_str())
         .bind(request.scope.as_str())
@@ -3674,16 +3771,16 @@ impl Database {
         .bind(identity.identity_kind())
         .bind(identity.codec())
         .bind(identity.value())
-        .bind(&source.0)
-        .bind(&source.1)
         .bind(&source.2)
-        .bind(dispatched_at_us)
         .bind(&source.3)
         .bind(&source.4)
+        .bind(dispatched_at_us)
         .bind(&source.5)
         .bind(&source.6)
         .bind(&source.7)
         .bind(&source.8)
+        .bind(&source.9)
+        .bind(&source.10)
         .execute(&mut *tx)
         .await
         .map_err(|error| DbError::CloseEvidenceInvariant {
@@ -3713,11 +3810,77 @@ impl Database {
             .bind(identity.value())
             .fetch_one(&mut *tx)
             .await?;
-            if target != *source {
+            let source_plan: WorktreeCleanupPlanColumns = (
+                source.2.clone(),
+                source.3.clone(),
+                source.4.clone(),
+                source.5.clone(),
+                source.6.clone(),
+                source.7.clone(),
+                source.8.clone(),
+                source.9.clone(),
+                source.10.clone(),
+            );
+            if target != source_plan {
                 return Err(DbError::CloseEvidenceInvariant {
                     invariant: "idempotent_target_cleanup_plan_matches_source",
                     relation: "close_worktree_cleanup_plans",
                     detail: "target retry generation already has conflicting cleanup authority"
+                        .to_string(),
+                });
+            }
+        }
+        let lineage_insert = sqlx::query(
+            "INSERT INTO close_worktree_cleanup_adoptions (
+                 attempt_id, scope, source_inspection_generation, source_inspection_fingerprint,
+                 target_inspection_generation, target_inspection_fingerprint,
+                 resource_kind, identity_kind, identity_codec, identity_value,
+                 adopted_at_unix_micros
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(request.attempt_id.as_str())
+        .bind(request.scope.as_str())
+        .bind(&source.0)
+        .bind(&source.1)
+        .bind(request.target_snapshot.generation())
+        .bind(request.target_snapshot.fingerprint())
+        .bind(request.resource.kind().as_str())
+        .bind(identity.identity_kind())
+        .bind(identity.codec())
+        .bind(identity.value())
+        .bind(dispatched_at_us)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| DbError::CloseEvidenceInvariant {
+            invariant: "cleanup_adoption_records_source_and_target_generation",
+            relation: "close_worktree_cleanup_adoptions",
+            detail: error.to_string(),
+        })?;
+        if lineage_insert.rows_affected() == 0 {
+            let existing_source: Option<(String, String)> = sqlx::query_as(
+                "SELECT source_inspection_generation, source_inspection_fingerprint
+                 FROM close_worktree_cleanup_adoptions
+                 WHERE attempt_id=?1 AND scope=?2
+                   AND target_inspection_generation=?3 AND target_inspection_fingerprint=?4
+                   AND resource_kind=?5 AND identity_kind=?6
+                   AND identity_codec=?7 AND identity_value=?8",
+            )
+            .bind(request.attempt_id.as_str())
+            .bind(request.scope.as_str())
+            .bind(request.target_snapshot.generation())
+            .bind(request.target_snapshot.fingerprint())
+            .bind(request.resource.kind().as_str())
+            .bind(identity.identity_kind())
+            .bind(identity.codec())
+            .bind(identity.value())
+            .fetch_optional(&mut *tx)
+            .await?;
+            if existing_source.as_ref() != Some(&(source.0.clone(), source.1.clone())) {
+                return Err(DbError::CloseEvidenceInvariant {
+                    invariant: "idempotent_cleanup_adoption_lineage_matches_exact_row",
+                    relation: "close_worktree_cleanup_adoptions",
+                    detail: "conflicting adoption lineage prevented the exact source-to-target row"
                         .to_string(),
                 });
             }
@@ -9718,6 +9881,195 @@ mod tests {
         .unwrap();
         assert_eq!(generations.len(), 2);
         assert!(generations
+            .iter()
+            .all(|(_, dispatch, plan)| *dispatch == 1 && *plan == 1));
+        let violations: Vec<(String, i64, String, i64)> =
+            sqlx::query_as("PRAGMA foreign_key_check")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert!(violations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn repeated_retry_adopts_newest_cleanup_plan_lineage_idempotently() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let scope = allocate_scope_worktree(&db, "root").await;
+        let attempt_id = CloseAttemptId::parse("attempt-adopt-plan-chain").unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            attempt_id.as_str(),
+        )
+        .await
+        .unwrap();
+        set_close_phase(&db, attempt_id.as_str(), ClosePhase::RetirementRequested).await;
+        let source_snapshot = current_test_snapshot(&db, attempt_id.as_str()).await;
+        let resource = RetiredResourceIdentity::parse(
+            RetiredResourceKind::Worktree,
+            LossItemIdentity::Worktree(current_test_worktree(&db, &scope).await),
+        )
+        .unwrap();
+        capture_test_inventory(
+            &db,
+            attempt_id.as_str(),
+            &scope,
+            &source_snapshot,
+            vec![resource.clone()],
+        )
+        .await;
+        db.record_close_retirement_dispatch(RecordCloseRetirementDispatchRequest {
+            attempt_id: attempt_id.clone(),
+            scope: scope.clone(),
+            snapshot: source_snapshot.clone(),
+            resource: resource.clone(),
+        })
+        .await
+        .unwrap();
+        db.record_close_worktree_cleanup_plan(RecordCloseWorktreeCleanupPlanRequest {
+            attempt_id: attempt_id.clone(),
+            scope: scope.clone(),
+            snapshot: source_snapshot.clone(),
+            resource: resource.clone(),
+            administrative_dir: std::path::PathBuf::from("/tmp/git/worktrees/chained"),
+            administrative_dir_incarnation: "admin-chain-v1".to_string(),
+        })
+        .await
+        .unwrap();
+
+        async fn rotate_and_adopt(
+            db: &Database,
+            attempt_id: &CloseAttemptId,
+            scope: &WorkScopeId,
+            resource: &RetiredResourceIdentity,
+            generation: &str,
+        ) -> (CloseRetirementSnapshot, CloseWorktreeCleanupPlan) {
+            db.route_close_attempt_to_repair(RouteCloseAttemptToRepairRequest {
+                attempt_id: attempt_id.clone(),
+                scope: scope.clone(),
+                residual: resource.clone(),
+                reason: RetirementFailureReason::IdentityNotProven,
+                detail: format!("retain before {generation}"),
+            })
+            .await
+            .unwrap();
+            db.retry_close_retirement(attempt_id).await.unwrap();
+            db.replace_close_inspection(ReplaceCloseInspectionRequest {
+                attempt_id: attempt_id.clone(),
+                scopes: vec![ReplaceCloseInspectionScopeRequest {
+                    scope: scope.clone(),
+                    snapshot: CloseRetirementSnapshot::parse(
+                        generation,
+                        format!("{generation}-fingerprint"),
+                    )
+                    .unwrap(),
+                    losses: Vec::new(),
+                }],
+            })
+            .await
+            .unwrap();
+            let snapshot = current_test_snapshot(db, attempt_id.as_str()).await;
+            capture_test_inventory(
+                db,
+                attempt_id.as_str(),
+                scope,
+                &snapshot,
+                vec![resource.clone()],
+            )
+            .await;
+            let request = AdoptCloseWorktreeCleanupPlanRequest {
+                attempt_id: attempt_id.clone(),
+                scope: scope.clone(),
+                target_snapshot: snapshot.clone(),
+                resource: resource.clone(),
+            };
+            let plan = db
+                .adopt_close_worktree_cleanup_plan(request.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                db.adopt_close_worktree_cleanup_plan(request).await.unwrap(),
+                plan
+            );
+            (snapshot, plan)
+        }
+
+        let (snapshot_b, plan_b) =
+            rotate_and_adopt(&db, &attempt_id, &scope, &resource, "generation-b").await;
+        assert_eq!(plan_b.final_tombstone, None);
+        let tombstone = CloseWorktreeFinalTombstone {
+            root: std::path::PathBuf::from("/tmp/.phoenix-close-newest"),
+            device: 41,
+            inode: 42,
+            object_device: None,
+            object_inode: None,
+        };
+        db.bind_close_worktree_final_tombstone(BindCloseWorktreeFinalTombstoneRequest {
+            attempt_id: attempt_id.clone(),
+            scope: scope.clone(),
+            snapshot: snapshot_b.clone(),
+            resource: resource.clone(),
+            tombstone: tombstone.clone(),
+        })
+        .await
+        .unwrap();
+        db.bind_close_worktree_final_tombstone_object(
+            BindCloseWorktreeFinalTombstoneObjectRequest {
+                attempt_id: attempt_id.clone(),
+                scope: scope.clone(),
+                snapshot: snapshot_b.clone(),
+                resource: resource.clone(),
+                object_device: 43,
+                object_inode: 44,
+            },
+        )
+        .await
+        .unwrap();
+
+        let (snapshot_c, plan_c) =
+            rotate_and_adopt(&db, &attempt_id, &scope, &resource, "generation-c").await;
+        assert_eq!(
+            plan_c.final_tombstone,
+            Some(CloseWorktreeFinalTombstone {
+                object_device: Some(43),
+                object_inode: Some(44),
+                ..tombstone
+            })
+        );
+        let lineage: Vec<(String, String)> = sqlx::query_as(
+            "SELECT source_inspection_generation, target_inspection_generation
+             FROM close_worktree_cleanup_adoptions
+             WHERE attempt_id=?1 ORDER BY adopted_at_unix_micros, target_inspection_generation",
+        )
+        .bind(attempt_id.as_str())
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(lineage.len(), 2);
+        assert_eq!(lineage[0].0, source_snapshot.generation());
+        assert_eq!(lineage[0].1, snapshot_b.generation());
+        assert_eq!(lineage[1].0, snapshot_b.generation());
+        assert_eq!(lineage[1].1, snapshot_c.generation());
+        let evidence_shape: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT inventory.inspection_generation,
+                    EXISTS(SELECT 1 FROM close_retirement_resource_dispatches dispatch
+                           WHERE dispatch.attempt_id=inventory.attempt_id
+                             AND dispatch.scope=inventory.scope
+                             AND dispatch.inspection_generation=inventory.inspection_generation),
+                    EXISTS(SELECT 1 FROM close_worktree_cleanup_plans plan
+                           WHERE plan.attempt_id=inventory.attempt_id
+                             AND plan.scope=inventory.scope
+                             AND plan.inspection_generation=inventory.inspection_generation)
+             FROM close_retirement_inventories inventory
+             WHERE inventory.attempt_id=?1 ORDER BY inventory.captured_at",
+        )
+        .bind(attempt_id.as_str())
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(evidence_shape.len(), 3);
+        assert!(evidence_shape
             .iter()
             .all(|(_, dispatch, plan)| *dispatch == 1 && *plan == 1));
         let violations: Vec<(String, i64, String, i64)> =
