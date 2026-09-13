@@ -269,7 +269,7 @@ invariant AutoRetryablePartition {
 
 invariant UserResumablePartition {
     for e in LlmErrors:
-        e.user_resumable = (e.kind = auth or e.kind = network or e.kind = rate_limit or e.kind = server_error or e.kind = invalid_response or e.kind = server_overloaded or e.kind = usage_limit_reached or e.kind = prompt_rejected)
+        e.user_resumable = (e.kind = auth or e.kind = network or e.kind = timed_out or e.kind = rate_limit or e.kind = server_error or e.kind = invalid_response or e.kind = server_overloaded or e.kind = usage_limit_reached or e.kind = prompt_rejected)
 }
 
 -- Token accounting is non-negative. Each count is an unsigned quantity

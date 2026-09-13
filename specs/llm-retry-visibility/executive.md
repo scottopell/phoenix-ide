@@ -20,7 +20,7 @@ This spec adds:
   reconnecting mid-backoff sees the same retry context as a
   continuously-connected client.
 - **A typed `LlmAttemptReason` enum** (`RateLimit | ServerError |
-  Network`) that mirrors the retryable subset of `LlmErrorKind`,
+  Network | TimedOut`) that mirrors the retryable subset of `LlmErrorKind`,
   classified by the same `is_retryable()` predicate.
 - **A `display_data.retry_count: u32` field** on the persisted
   assistant message so the post-hoc "(retried Nx)" badge survives
@@ -40,7 +40,7 @@ Wire format changes are additive:
 - New `SseWireEvent::LlmAttempt { attempt: u32, max_attempts: u32,
   reason: LlmAttemptReason, backing_off_ms: u64, resets_at:
   Option<DateTime<Utc>> }`. Snake-case event tag `"llm_attempt"`.
-- New enum `LlmAttemptReason { RateLimit, ServerError, Network }`,
+- New enum `LlmAttemptReason { RateLimit, ServerError, Network, TimedOut }`,
   shared between the runtime and the wire.
 - `display_data.retry_count: u32` field on assistant-message
   `MessageDisplayData` (typed; ts-rs-exported). `#[serde(default)]`
@@ -80,7 +80,7 @@ is one more typed key).
 | Requirement | Status | Notes |
 |-------------|--------|-------|
 | **REQ-LRV-001:** Retry context wire event | ✅ Complete | `SseWireEvent::LlmAttempt` / `SseEvent::LlmAttempt` exist, are emitted from `Effect::ScheduleRetry`, replay via the ephemeral ring, and have generated TS + parity coverage. |
-| **REQ-LRV-002:** Retry reason classification | ✅ Complete | `LlmAttemptReason` is a closed enum for rate-limit/server-error/network and is threaded from retryable error classification into `Effect::ScheduleRetry`. |
+| **REQ-LRV-002:** Retry reason classification | ✅ Complete | `LlmAttemptReason` is a closed enum for rate-limit/server-error/network/timeout and is threaded from retryable error classification into `Effect::ScheduleRetry`. |
 | **REQ-LRV-003:** Cross-spec contract with working-phase-visibility | ✅ Complete | `working-phase-visibility.allium` imports this spec; `RetryContext` / `TurnRetryContext` are canonical here and consumed by the StateBar retry modifier. |
 | **REQ-LRV-004:** Sub-agent retries stay local | ✅ Complete | `LlmAttempt` is emitted on the conversation runtime handling the retry; no cross-conversation retry rollup is produced. |
 | **REQ-LRV-005:** Cancellation routes through `Cancelling` | ✅ Complete | Cancellation continues through the state-machine cancellation path; stale retry timeouts are ignored after the state has moved on. |

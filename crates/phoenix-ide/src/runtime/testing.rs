@@ -75,6 +75,26 @@ impl LlmClient for MockLlmClient {
             .unwrap()
             .pop_front()
             .unwrap_or_else(|| Err(LlmError::network("No mock response queued")));
+        if result.as_ref().is_ok_and(|response| {
+            response.content.iter().all(|block| {
+                !matches!(block, phoenix_llm::ContentBlock::Text { text } if !text.trim().is_empty())
+            })
+        }) {
+            if let Some(telemetry) = request.telemetry.as_ref() {
+                telemetry.attempt_capture.begin(
+                    telemetry,
+                    "mock",
+                    &self.model_id,
+                    phoenix_llm::LlmTransport::InProcess,
+                );
+                let _ = telemetry.attempt_capture.finalize(
+                    phoenix_llm::LlmAttemptFinalization {
+                        stream: None,
+                        outcome: phoenix_llm::LlmAttemptOutcome::Success,
+                    },
+                );
+            }
+        }
         if matches!(
             result.as_ref().err().map(|error| error.kind),
             Some(phoenix_llm::LlmErrorKind::TimedOut)
@@ -596,6 +616,8 @@ pub struct InMemoryStorage {
     message_add_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     metrics_write_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     metrics_write_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    llm_request_metrics: Mutex<Vec<phoenix_llm::LlmAttemptMetrics>>,
+    metrics_written: tokio::sync::Notify,
     steering_drain_failures: Mutex<usize>,
     continuation_start_recovery_outcome: Mutex<Option<crate::db::ContinuationCommitOutcome>>,
     continuation_start_recovery_error: Mutex<bool>,
@@ -656,6 +678,8 @@ impl InMemoryStorage {
             message_add_release: Mutex::new(None),
             metrics_write_started: Mutex::new(None),
             metrics_write_release: Mutex::new(None),
+            llm_request_metrics: Mutex::new(Vec::new()),
+            metrics_written: tokio::sync::Notify::new(),
             steering_drain_failures: Mutex::new(0),
             continuation_start_recovery_outcome: Mutex::new(None),
             continuation_start_recovery_error: Mutex::new(false),
@@ -742,6 +766,19 @@ impl InMemoryStorage {
         *self.metrics_write_started.lock().unwrap() = Some(started_tx);
         *self.metrics_write_release.lock().unwrap() = Some(release_rx);
         (started_rx, release_tx)
+    }
+
+    pub fn recorded_llm_request_metrics(&self) -> Vec<phoenix_llm::LlmAttemptMetrics> {
+        self.llm_request_metrics.lock().unwrap().clone()
+    }
+
+    pub async fn wait_for_metrics_write(&self) {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.metrics_written.notified(),
+        )
+        .await
+        .expect("metrics write completes before the liveness guard");
     }
 
     pub fn set_steering_drain_failures(&self, failures: usize) {
@@ -2045,7 +2082,7 @@ impl StateStore for InMemoryStorage {
 
     async fn upsert_llm_request_metrics(
         &self,
-        _metrics: &phoenix_llm::LlmAttemptMetrics,
+        metrics: &phoenix_llm::LlmAttemptMetrics,
     ) -> Result<(), String> {
         if let Some(started) = self.metrics_write_started.lock().unwrap().take() {
             let _ = started.send(());
@@ -2054,6 +2091,11 @@ impl StateStore for InMemoryStorage {
         if let Some(release) = release {
             let _ = release.await;
         }
+        self.llm_request_metrics
+            .lock()
+            .unwrap()
+            .push(metrics.clone());
+        self.metrics_written.notify_one();
         Ok(())
     }
 
