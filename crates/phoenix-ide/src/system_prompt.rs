@@ -18,6 +18,7 @@ const GUIDANCE_FILE_NAMES: &[&str] = &["AGENTS.md", "AGENT.md"];
 // `ModeContext` is a domain-vocabulary type embedded in `ConvState`; it now
 // lives in phoenix-core. Re-export at the historical path.
 pub use phoenix_core::domain::mode_context::ModeContext;
+#[cfg(test)]
 use phoenix_core::domain::sm_state::ExploreBashCapability;
 
 // Skill discovery + metadata now live in the `phoenix-skills` crate. Re-export
@@ -126,7 +127,7 @@ pub fn build_system_prompt(
     mode: Option<&ModeContext>,
     language: LlmLanguage,
     persona: Option<&str>,
-    explore_bash: ExploreBashCapability,
+    explore_bash: impl Into<phoenix_core::llm_language::ExploreBashPromptCapability>,
 ) -> String {
     let builtin_dir = crate::skills::builtin::default_extract_dir();
     build_system_prompt_with_options(
@@ -138,7 +139,7 @@ pub fn build_system_prompt(
         builtin_dir.as_deref(),
         language,
         persona,
-        explore_bash,
+        explore_bash.into(),
     )
 }
 
@@ -156,8 +157,10 @@ pub fn build_system_prompt_with_options(
     builtin_dir: Option<&Path>,
     language: LlmLanguage,
     persona: Option<&str>,
-    explore_bash: ExploreBashCapability,
+    explore_bash: impl Into<phoenix_core::llm_language::ExploreBashPromptCapability>,
 ) -> String {
+    let explore_bash = explore_bash.into();
+
     // REQ-AG-006: a named agent's persona replaces the generic assistant
     // preamble at the head of the prompt. Everything below (guidance, skills,
     // mode context, sub-agent suffix) is appended regardless of persona.
@@ -836,6 +839,29 @@ mod tests {
         // The Work block no longer hands out a taskmd ID prefix — task files
         // need not be taskmd files at all (task 13009).
         assert!(!prompt.contains("task ID prefix"));
+    }
+
+    #[test]
+    fn approved_explore_prompt_describes_unsandboxed_bash() {
+        let temp = TempDir::new().unwrap();
+        let prompt = build_system_prompt_with_options(
+            temp.path(),
+            "tasks",
+            false,
+            Some(&ModeContext::Explore {
+                next_taskmd_id_hint: None,
+            }),
+            Some(temp.path()),
+            None,
+            crate::llm_language::LlmLanguage::default(),
+            None,
+            phoenix_core::llm_language::ExploreBashPromptCapability::Unsandboxed,
+        );
+
+        assert!(prompt
+            .contains("`bash` is available with the approved WorkScope's full write authority"));
+        assert!(prompt.contains("not restricted by the Explore sandbox"));
+        assert!(!prompt.contains("`bash` is unavailable"));
     }
 
     #[test]

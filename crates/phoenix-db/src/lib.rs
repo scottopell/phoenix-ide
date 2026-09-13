@@ -1878,7 +1878,7 @@ impl Database {
     fn authority_for_mode(cm: &ConvModeCols<'_>) -> AuthorityKind {
         match cm.kind {
             "direct" => AuthorityKind::Direct,
-            "work" | "branch" => AuthorityKind::Work,
+            "work" | "branch" | "detached_approved_task" => AuthorityKind::Work,
             _ => AuthorityKind::RestrictedExplore,
         }
     }
@@ -14808,6 +14808,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn detached_approved_task_creation_metadata_preserves_work_authority() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_test_creation_job(&db, "job-approved-authority", "conv-approved-authority").await;
+        let claimed = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-approved".into()),
+                &CreationClaimToken("token-approved".into()),
+                Utc::now(),
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(job) = claimed else {
+            panic!("expected claim");
+        };
+        let CreationStatus::Claimed(claim) = job.protocol.status else {
+            panic!("expected claim authority");
+        };
+
+        let mode = ConvMode::DetachedApprovedTask {
+            worktree_path: NonEmptyString::new("/tmp/approved-task").unwrap(),
+            base_branch: NonEmptyString::new("main").unwrap(),
+            task_id: NonEmptyString::new("66005").unwrap(),
+            task_title: NonEmptyString::new("Approved task").unwrap(),
+        };
+        let outcome = db
+            .update_conversation_creation_metadata_and_mode(
+                "job-approved-authority",
+                &claim,
+                "conv-approved-authority",
+                &ConversationCreationMetadataUpdate {
+                    slug: None,
+                    title: None,
+                    cwd: Some("/tmp/approved-task".into()),
+                    project_id: None,
+                    desired_base_branch: None,
+                },
+                &mode,
+                "test-model",
+                CreationStage::ValidateIntent,
+                CreationStage::ResolveRepository,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, CreationCasOutcome::Applied);
+
+        let (authority, _, _) = db
+            .get_conversation_work_scope_context("conv-approved-authority")
+            .await
+            .unwrap();
+        assert_eq!(authority, AuthorityKind::Work);
+    }
+
+    #[tokio::test]
     async fn direct_creation_metadata_preserves_direct_authority() {
         let db = Database::open_in_memory().await.unwrap();
         insert_test_creation_job(&db, "job-direct-authority", "conv-direct-authority").await;
@@ -17244,6 +17298,18 @@ mod tests {
     fn direct_mode_receives_direct_authority() {
         let cm = conv_mode_columns(&ConvMode::Direct);
         assert_eq!(Database::authority_for_mode(&cm), AuthorityKind::Direct);
+    }
+
+    #[test]
+    fn detached_approved_task_receives_work_authority() {
+        let mode = ConvMode::DetachedApprovedTask {
+            worktree_path: NonEmptyString::new("/tmp/approved-task").unwrap(),
+            base_branch: NonEmptyString::new("main").unwrap(),
+            task_id: NonEmptyString::new("66005").unwrap(),
+            task_title: NonEmptyString::new("Approved task").unwrap(),
+        };
+        let cm = conv_mode_columns(&mode);
+        assert_eq!(Database::authority_for_mode(&cm), AuthorityKind::Work);
     }
 
     #[tokio::test]
