@@ -276,14 +276,18 @@ impl Default for MockToolExecutor {
 
 #[async_trait]
 impl ToolExecutor for MockToolExecutor {
-    async fn execute(
+    async fn execute_at_generation(
         &self,
+        expected: crate::runtime::traits::ToolCapabilityGeneration,
         call: crate::runtime::deny_gate::CheckedToolCall,
         _ctx: ToolContext,
-    ) -> Option<ToolOutput> {
+    ) -> Result<Option<ToolOutput>, String> {
+        if self.capability_snapshot().generation != expected {
+            return Err("stale tool capability generation".to_string());
+        }
         let (name, input) = call.into_parts();
         self.executions.lock().unwrap().push((name.clone(), input));
-        self.outputs.get(&name).cloned()
+        Ok(self.outputs.get(&name).cloned())
     }
 
     async fn definitions(&self) -> Vec<ToolDefinition> {
@@ -395,11 +399,15 @@ impl DelayedMockToolExecutor {
 
 #[async_trait]
 impl ToolExecutor for DelayedMockToolExecutor {
-    async fn execute(
+    async fn execute_at_generation(
         &self,
+        expected: crate::runtime::traits::ToolCapabilityGeneration,
         call: crate::runtime::deny_gate::CheckedToolCall,
         ctx: ToolContext,
-    ) -> Option<ToolOutput> {
+    ) -> Result<Option<ToolOutput>, String> {
+        if self.capability_snapshot().generation != expected {
+            return Err("stale tool capability generation".to_string());
+        }
         let (name, input) = call.into_parts();
         self.inner
             .executions
@@ -409,14 +417,14 @@ impl ToolExecutor for DelayedMockToolExecutor {
         self.execution_started.notify_waiters();
 
         // Race between delay and cancellation
-        tokio::select! {
+        Ok(tokio::select! {
             () = tokio::time::sleep(self.delay) => {
                 self.inner.outputs.get(&name).cloned()
             }
             () = ctx.cancel.cancelled() => {
                 Some(ToolOutput::error("[command cancelled]"))
             }
-        }
+        })
     }
 
     async fn definitions(&self) -> Vec<ToolDefinition> {
@@ -472,11 +480,15 @@ impl Default for UncooperativeMockToolExecutor {
 
 #[async_trait]
 impl ToolExecutor for UncooperativeMockToolExecutor {
-    async fn execute(
+    async fn execute_at_generation(
         &self,
+        expected: crate::runtime::traits::ToolCapabilityGeneration,
         call: crate::runtime::deny_gate::CheckedToolCall,
         ctx: ToolContext,
-    ) -> Option<ToolOutput> {
+    ) -> Result<Option<ToolOutput>, String> {
+        if self.capability_snapshot().generation != expected {
+            return Err("stale tool capability generation".to_string());
+        }
         let (name, input) = call.into_parts();
         self.inner
             .executions
@@ -493,7 +505,7 @@ impl ToolExecutor for UncooperativeMockToolExecutor {
         // Block until explicitly released, with a long backstop so a forgotten
         // release can't hang the suite indefinitely.
         let _ = tokio::time::timeout(Duration::from_secs(3600), self.release.notified()).await;
-        self.inner.outputs.get(&name).cloned()
+        Ok(self.inner.outputs.get(&name).cloned())
     }
 
     async fn definitions(&self) -> Vec<ToolDefinition> {
@@ -547,12 +559,17 @@ impl Default for FirstCallUncooperativeToolExecutor {
 
 #[async_trait]
 impl ToolExecutor for FirstCallUncooperativeToolExecutor {
-    async fn execute(
+    async fn execute_at_generation(
         &self,
+        expected: crate::runtime::traits::ToolCapabilityGeneration,
         call: crate::runtime::deny_gate::CheckedToolCall,
         ctx: ToolContext,
-    ) -> Option<ToolOutput> {
+    ) -> Result<Option<ToolOutput>, String> {
         use std::sync::atomic::Ordering;
+
+        if self.capability_snapshot().generation != expected {
+            return Err("stale tool capability generation".to_string());
+        }
         let (name, input) = call.into_parts();
         self.inner
             .executions
@@ -568,12 +585,12 @@ impl ToolExecutor for FirstCallUncooperativeToolExecutor {
             let _ignored_cancel = &ctx.cancel;
             // test-timing-allow: first-call latency models a wedged tool task that must be aborted
             tokio::time::sleep(Duration::from_secs(3600)).await;
-            self.inner.outputs.get(&name).cloned()
+            Ok(self.inner.outputs.get(&name).cloned())
         } else {
             // Subsequent calls: cooperative and immediate.
             let out = self.inner.outputs.get(&name).cloned();
             self.cooperative_completed.notify_waiters();
-            out
+            Ok(out)
         }
     }
 
@@ -2525,21 +2542,26 @@ mod tests {
         use crate::runtime::deny_gate::CheckedToolCall;
         let executor = MockToolExecutor::new().with_tool("bash", ToolOutput::success("output"));
 
+        let generation = executor.capability_snapshot().generation;
         let result = executor
-            .execute(
+            .execute_at_generation(
+                generation,
                 CheckedToolCall::cleared_for_test("bash", serde_json::json!({ "cmd": "ls" })),
                 test_context(),
             )
-            .await;
+            .await
+            .unwrap();
         assert!(result.is_some());
         assert!(result.unwrap().is_success());
 
         let result = executor
-            .execute(
+            .execute_at_generation(
+                generation,
                 CheckedToolCall::cleared_for_test("unknown", serde_json::json!({})),
                 test_context(),
             )
-            .await;
+            .await
+            .unwrap();
         assert!(result.is_none());
     }
 
