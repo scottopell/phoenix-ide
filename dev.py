@@ -894,7 +894,7 @@ LAUNCHD_DEPLOY_CLAIM_LOCK_PATH = LAUNCHD_DEPLOY_DIR / "claim.lock"
 LAUNCHD_DEPLOY_ACTIVE_PATH = LAUNCHD_DEPLOY_DIR / "active"
 LAUNCHD_DEPLOY_HELPER_PREFIX = "com.phoenix-ide.deploy"
 LAUNCHD_RESTART_DIR = Path.home() / ".phoenix-ide" / "restart"
-LAUNCHD_RESTART_STATUS_PATH = LAUNCHD_RESTART_DIR / "status.json"
+LAUNCHD_RESTART_TRANSACTIONS_DIR = LAUNCHD_RESTART_DIR / "transactions"
 LAUNCHD_RESTART_ACTIVE_PATH = LAUNCHD_RESTART_DIR / "active"
 LAUNCHD_RESTART_HELPER_PREFIX = "com.phoenix-ide.restart"
 LAUNCHD_RESTART_HELPER_SOURCE = ROOT / "scripts" / "launchd_restart_helper.py"
@@ -8955,6 +8955,30 @@ class InstalledLaunchdRuntime:
 
 
 @dataclasses.dataclass(frozen=True)
+class LoadedLaunchdJob:
+    state: str
+    pid: int | None
+
+
+@dataclasses.dataclass(frozen=True)
+class LaunchdJobNotLoaded:
+    pass
+
+
+@dataclasses.dataclass(frozen=True)
+class LaunchdJobInspectionFailed:
+    exit_code: int
+    detail: str
+
+
+LaunchdJobInspection = LoadedLaunchdJob | LaunchdJobNotLoaded | LaunchdJobInspectionFailed
+
+
+class ConcurrentLaunchdOperation(SystemExit):
+    pass
+
+
+@dataclasses.dataclass(frozen=True)
 class PreparedCandidate:
     binary: Path
     source_kind: ProdSourceKind
@@ -9113,7 +9137,7 @@ def _current_prod_identity(env: dict[str, str]) -> RuntimeIdentity | None:
         return None
 
 
-def _inspect_launchd_job() -> tuple[str, int | None]:
+def _inspect_launchd_job() -> LaunchdJobInspection:
     target = f"gui/{os.getuid()}/{LAUNCHD_LABEL}"
     result = subprocess.run(
         ["launchctl", "print", target],
@@ -9121,8 +9145,14 @@ def _inspect_launchd_job() -> tuple[str, int | None]:
         text=True,
     )
     output = result.stdout + "\n" + result.stderr
-    if result.returncode != 0 or "Could not find service" in output:
-        return "not_loaded", None
+    if "Could not find service" in output:
+        return LaunchdJobNotLoaded()
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        return LaunchdJobInspectionFailed(
+            exit_code=result.returncode,
+            detail=detail or "launchctl returned no diagnostic output",
+        )
     state = "unknown"
     pid = None
     for raw in result.stdout.splitlines():
@@ -9134,7 +9164,7 @@ def _inspect_launchd_job() -> tuple[str, int | None]:
                 pid = int(line.split(" = ", 1)[1])
             except ValueError:
                 pass
-    return state, pid
+    return LoadedLaunchdJob(state=state, pid=pid)
 
 
 def _installed_launchd_runtime_for_restart() -> InstalledLaunchdRuntime:
@@ -9175,10 +9205,20 @@ def _installed_launchd_runtime_for_restart() -> InstalledLaunchdRuntime:
             "run './dev.py prod deploy' first"
         )
 
-    state, pid = _inspect_launchd_job()
-    if state not in {"running", "active"} or pid is None:
+    inspection = _inspect_launchd_job()
+    if isinstance(inspection, LaunchdJobInspectionFailed):
         raise SystemExit(
-            f"launchd production is not running (state={state}, pid={pid}); "
+            f"could not inspect launchd production (exit {inspection.exit_code}): "
+            f"{inspection.detail}"
+        )
+    if isinstance(inspection, LaunchdJobNotLoaded):
+        raise SystemExit(
+            "launchd production is not loaded; run './dev.py prod deploy' first"
+        )
+    if inspection.state not in {"running", "active"} or inspection.pid is None:
+        raise SystemExit(
+            f"launchd production is not running (state={inspection.state}, "
+            f"pid={inspection.pid}); "
             "run './dev.py prod deploy' first"
         )
 
@@ -9221,7 +9261,7 @@ def _installed_launchd_runtime_for_restart() -> InstalledLaunchdRuntime:
         plist=LAUNCHD_PLIST_PATH,
         deployed_sha=PROD_SHA_PATH,
         identity=identity,
-        pid=pid,
+        pid=inspection.pid,
         health_url=health_url,
         health_insecure_tls=health_insecure_tls,
     )
@@ -9459,6 +9499,10 @@ def _restart_claim_owner() -> str | None:
         return None
 
 
+def _restart_transaction_status_path(transaction_id: str) -> Path:
+    return LAUNCHD_RESTART_TRANSACTIONS_DIR / transaction_id / "status.json"
+
+
 def _status_is_terminal_for_owner(
     status_path: Path,
     owner: str,
@@ -9514,17 +9558,19 @@ def _claim_launchd_deploy(transaction_id: str) -> None:
                 owner = None
         restart_owner = _restart_claim_owner()
         if restart_owner and _status_is_terminal_for_owner(
-            LAUNCHD_RESTART_STATUS_PATH, restart_owner, _RESTART_TERMINAL_STATES
+            _restart_transaction_status_path(restart_owner),
+            restart_owner,
+            _RESTART_TERMINAL_STATES,
         ):
             _release_launchd_restart_claim_unlocked(restart_owner)
             restart_owner = None
         if restart_owner is not None or LAUNCHD_RESTART_ACTIVE_PATH.exists():
-            raise SystemExit(
+            raise ConcurrentLaunchdOperation(
                 f"another launchd restart ({restart_owner or 'unknown'}) is active or needs recovery. "
                 "Run './dev.py prod status'; remove the restart marker only after confirming no helper is running."
             )
         if owner is not None or LAUNCHD_DEPLOY_ACTIVE_PATH.exists():
-            raise SystemExit(
+            raise ConcurrentLaunchdOperation(
                 f"another launchd deployment ({owner or 'unknown'}) is active or needs recovery. "
                 "Run './dev.py prod status'; remove the active marker only after confirming no helper is running."
             )
@@ -9546,19 +9592,19 @@ def _claim_launchd_restart(transaction_id: str) -> None:
             _release_launchd_deploy_claim_unlocked(deploy_owner)
             deploy_owner = None
         if deploy_owner is not None or LAUNCHD_DEPLOY_ACTIVE_PATH.exists():
-            raise SystemExit(
+            raise ConcurrentLaunchdOperation(
                 f"another launchd deployment ({deploy_owner or 'unknown'}) is active or needs recovery. "
                 "Run './dev.py prod status'; remove the deploy marker only after confirming no helper is running."
             )
 
         owner = _restart_claim_owner()
         if owner and _status_is_terminal_for_owner(
-            LAUNCHD_RESTART_STATUS_PATH, owner, _RESTART_TERMINAL_STATES
+            _restart_transaction_status_path(owner), owner, _RESTART_TERMINAL_STATES
         ):
             _release_launchd_restart_claim_unlocked(owner)
             owner = None
         if owner is not None or LAUNCHD_RESTART_ACTIVE_PATH.exists():
-            raise SystemExit(
+            raise ConcurrentLaunchdOperation(
                 f"another launchd restart ({owner or 'unknown'}) is active or needs recovery. "
                 "Run './dev.py prod status'; remove the restart marker only after confirming no helper is running."
             )
@@ -9920,36 +9966,51 @@ def launchd_prod_restart() -> None:
         f"{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-"
         f"{uuid.uuid4().hex[:8]}"
     )
-    _claim_launchd_restart(transaction_id)
     created_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    installed: InstalledLaunchdRuntime | None = None
-    staging = LAUNCHD_RESTART_DIR / "transactions" / transaction_id
+    staging = LAUNCHD_RESTART_TRANSACTIONS_DIR / transaction_id
+    status_path = _restart_transaction_status_path(transaction_id)
+    staging.mkdir(parents=True)
+    staging.chmod(0o700)
+    _write_json_atomic(status_path, {
+        "transaction_id": transaction_id,
+        "state": "preparing",
+        "source_kind": ProdSourceKind.INSTALLED_RESTART.value,
+        "expected_version": None,
+        "expected_git_sha": None,
+        "previous_pid": None,
+        "running_pid": None,
+        "created_at": created_at,
+        "updated_at": created_at,
+        "failure": None,
+    })
     try:
-        _write_json_atomic(LAUNCHD_RESTART_STATUS_PATH, {
+        _claim_launchd_restart(transaction_id)
+    except ConcurrentLaunchdOperation as exc:
+        _write_json_atomic(status_path, {
             "transaction_id": transaction_id,
-            "state": "preparing",
+            "state": "rejected_concurrent",
             "source_kind": ProdSourceKind.INSTALLED_RESTART.value,
             "expected_version": None,
             "expected_git_sha": None,
             "previous_pid": None,
             "running_pid": None,
             "created_at": created_at,
-            "updated_at": created_at,
-            "failure": None,
+            "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "failure": str(exc),
         })
+        raise
+
+    installed: InstalledLaunchdRuntime | None = None
+    try:
         installed = _installed_launchd_runtime_for_restart()
 
-        transactions_dir = LAUNCHD_RESTART_DIR / "transactions"
-        transactions_dir.mkdir(parents=True, exist_ok=True)
         old_transactions = sorted(
-            (path for path in transactions_dir.iterdir() if path.is_dir()),
+            (path for path in LAUNCHD_RESTART_TRANSACTIONS_DIR.iterdir() if path.is_dir()),
             key=lambda path: path.stat().st_mtime,
             reverse=True,
         )
         for old in old_transactions[5:]:
             shutil.rmtree(old, ignore_errors=True)
-        staging.mkdir(parents=True)
-        staging.chmod(0o700)
 
         helper = staging / "restart.py"
         shutil.copy2(LAUNCHD_RESTART_HELPER_SOURCE, helper)
@@ -10017,7 +10078,7 @@ def launchd_prod_restart() -> None:
             "health_url": installed.health_url,
             "health_insecure_tls": installed.health_insecure_tls,
             "active_path": str(LAUNCHD_RESTART_ACTIVE_PATH),
-            "status_path": str(LAUNCHD_RESTART_STATUS_PATH),
+            "status_path": str(status_path),
             "lock_path": str(LAUNCHD_DEPLOY_LOCK_PATH),
             "claim_lock_path": str(LAUNCHD_DEPLOY_CLAIM_LOCK_PATH),
             "transition_timeout_secs": LAUNCHD_TRANSITION_TIMEOUT_SECS,
@@ -10027,7 +10088,7 @@ def launchd_prod_restart() -> None:
         _write_json_atomic(staging / "manifest.json", manifest)
         (staging / "manifest.json").chmod(0o400)
         helper.chmod(0o400)
-        _write_json_atomic(LAUNCHD_RESTART_STATUS_PATH, {
+        _write_json_atomic(status_path, {
             "transaction_id": transaction_id,
             "state": "prepared",
             "source_kind": ProdSourceKind.INSTALLED_RESTART.value,
@@ -10051,7 +10112,7 @@ def launchd_prod_restart() -> None:
     except BaseException as exc:
         failed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
         try:
-            _write_json_atomic(LAUNCHD_RESTART_STATUS_PATH, {
+            _write_json_atomic(status_path, {
                 "transaction_id": transaction_id,
                 "state": "precondition_failed",
                 "source_kind": ProdSourceKind.INSTALLED_RESTART.value,
@@ -10070,42 +10131,73 @@ def launchd_prod_restart() -> None:
     _report_launchd_restart_handoff(transaction_id, installed.identity)
 
 
-def _print_launchd_restart_status() -> None:
-    if not LAUNCHD_RESTART_STATUS_PATH.exists():
-        return
+def _read_launchd_restart_statuses() -> list[dict]:
     try:
-        restart = json.loads(LAUNCHD_RESTART_STATUS_PATH.read_text())
-        print(
-            f"  Last restart: {restart.get('state', 'unknown')} "
-            f"({restart.get('transaction_id', 'unknown')})"
+        paths = list(LAUNCHD_RESTART_TRANSACTIONS_DIR.glob("*/status.json"))
+    except OSError:
+        return []
+    statuses = []
+    for path in paths:
+        try:
+            status = json.loads(path.read_text())
+            if isinstance(status, dict):
+                statuses.append(status)
+        except (OSError, json.JSONDecodeError):
+            continue
+    return statuses
+
+
+def _print_launchd_restart_entry(label: str, restart: dict) -> None:
+    print(
+        f"  {label}: {restart.get('state', 'unknown')} "
+        f"({restart.get('transaction_id', 'unknown')})"
+    )
+    print(
+        f"    Expected: {restart.get('expected_version', 'unknown')} "
+        f"({restart.get('expected_git_sha', 'unknown')})"
+    )
+    previous_pid = restart.get("previous_pid")
+    running_pid = restart.get("running_pid")
+    if previous_pid is not None or running_pid is not None:
+        print(f"    PID: {previous_pid or 'unknown'} → {running_pid or 'pending'}")
+    print(f"    Updated: {restart.get('updated_at', 'unknown')}")
+    if restart.get("failure"):
+        print(f"    Failure: {restart['failure']}")
+    if restart.get("state") in {"preparing", "prepared", "restarting"}:
+        age = datetime.datetime.now(datetime.timezone.utc) - datetime.datetime.fromisoformat(
+            restart["updated_at"]
         )
-        print(
-            f"    Expected: {restart.get('expected_version', 'unknown')} "
-            f"({restart.get('expected_git_sha', 'unknown')})"
+        stale_after = (
+            LAUNCHD_TRANSITION_TIMEOUT_SECS
+            + LAUNCHD_HEALTH_TIMEOUT_SECS
+            + LAUNCHD_STALE_HANDOFF_ALLOWANCE_SECS
         )
-        previous_pid = restart.get("previous_pid")
-        running_pid = restart.get("running_pid")
-        if previous_pid is not None or running_pid is not None:
-            print(f"    PID: {previous_pid or 'unknown'} → {running_pid or 'pending'}")
-        print(f"    Updated: {restart.get('updated_at', 'unknown')}")
-        if restart.get("failure"):
-            print(f"    Failure: {restart['failure']}")
-        if restart.get("state") in {"preparing", "prepared", "restarting"}:
-            age = datetime.datetime.now(datetime.timezone.utc) - datetime.datetime.fromisoformat(
-                restart["updated_at"]
+        if age.total_seconds() > stale_after:
+            print(
+                "    STALE: inspect ~/.phoenix-ide/restart/restart.log and confirm no helper "
+                "is running before clearing the restart marker"
             )
-            stale_after = (
-                LAUNCHD_TRANSITION_TIMEOUT_SECS
-                + LAUNCHD_HEALTH_TIMEOUT_SECS
-                + LAUNCHD_STALE_HANDOFF_ALLOWANCE_SECS
-            )
-            if age.total_seconds() > stale_after:
-                print(
-                    "    STALE: inspect ~/.phoenix-ide/restart/restart.log and confirm no helper "
-                    "is running before clearing the restart marker"
-                )
-    except Exception as exc:
-        print(f"  Last restart: unreadable status ({type(exc).__name__})")
+
+
+def _print_launchd_restart_status() -> None:
+    statuses = _read_launchd_restart_statuses()
+    if not statuses:
+        return
+    latest = max(
+        statuses,
+        key=lambda status: (
+            str(status.get("created_at", "")),
+            str(status.get("transaction_id", "")),
+        ),
+    )
+    owner = _restart_claim_owner()
+    active = next(
+        (status for status in statuses if status.get("transaction_id") == owner),
+        None,
+    )
+    if active is not None and active is not latest:
+        _print_launchd_restart_entry("Active restart", active)
+    _print_launchd_restart_entry("Last restart", latest)
 
 
 
@@ -10142,15 +10234,27 @@ def _print_launchd_deploy_status() -> None:
 
 def launchd_prod_status():
     """Show launchd service status."""
-    state, pid = _inspect_launchd_job()
-    if state == "not_loaded":
+    inspection = _inspect_launchd_job()
+    if isinstance(inspection, LaunchdJobNotLoaded):
         print("Production: not loaded")
         print(f"  Run './dev.py prod deploy' to start")
         _print_launchd_deploy_status()
         _print_launchd_restart_status()
         return
+    if isinstance(inspection, LaunchdJobInspectionFailed):
+        print("Production: status unavailable")
+        print(
+            f"  launchctl print failed (exit {inspection.exit_code}): "
+            f"{inspection.detail}"
+        )
+        _print_launchd_deploy_status()
+        _print_launchd_restart_status()
+        return
 
-    print(f"Production: {state}" + (f" (PID {pid})" if pid else ""))
+    print(
+        f"Production: {inspection.state}"
+        + (f" (PID {inspection.pid})" if inspection.pid else "")
+    )
 
     try:
         status_env = _launchd_env_from_plist(LAUNCHD_PLIST_PATH)

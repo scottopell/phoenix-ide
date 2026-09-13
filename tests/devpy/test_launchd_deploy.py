@@ -515,8 +515,7 @@ class PreparationTests(unittest.TestCase):
              mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", Path(td) / "active"), \
              mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", Path(td) / "status.json"), \
              mock.patch.object(self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", Path(td) / "claim.lock"), \
-             mock.patch.object(self.dev, "LAUNCHD_RESTART_ACTIVE_PATH", Path(td) / "restart-active"), \
-             mock.patch.object(self.dev, "LAUNCHD_RESTART_STATUS_PATH", Path(td) / "restart-status.json"):
+             mock.patch.object(self.dev, "LAUNCHD_RESTART_ACTIVE_PATH", Path(td) / "restart-active"):
             self.dev._claim_launchd_deploy("first")
             self.assertFalse(self.dev._release_launchd_deploy_claim("second"))
             self.assertEqual("first", self.dev._deploy_claim_owner())
@@ -818,7 +817,6 @@ class PreparationTests(unittest.TestCase):
              mock.patch.object(self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", Path(td) / "claim.lock"), \
              mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", Path(td) / "status.json"), \
              mock.patch.object(self.dev, "LAUNCHD_RESTART_ACTIVE_PATH", Path(td) / "restart-active"), \
-             mock.patch.object(self.dev, "LAUNCHD_RESTART_STATUS_PATH", Path(td) / "restart-status.json"), \
              mock.patch.object(self.dev, "_launchd_candidate_env", return_value=({}, None)), \
              mock.patch.object(self.dev, "_preflight_prod_bind_auth"), \
              mock.patch.object(self.dev, "_write_json_atomic", side_effect=OSError("disk full")):
@@ -852,7 +850,6 @@ class PreparationTests(unittest.TestCase):
                  mock.patch.object(self.dev, "LAUNCHD_DEPLOY_LOCK_PATH", root / "deploy" / "activate.lock"), \
                  mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status_path), \
                  mock.patch.object(self.dev, "LAUNCHD_RESTART_ACTIVE_PATH", root / "restart" / "active"), \
-                 mock.patch.object(self.dev, "LAUNCHD_RESTART_STATUS_PATH", root / "restart" / "status.json"), \
                  mock.patch.object(self.dev, "LAUNCHD_INSTALL_DIR", root / "install"), \
                  mock.patch.object(self.dev, "LAUNCHD_PLIST_PATH", root / "service.plist"), \
                  mock.patch.object(self.dev, "PROD_SHA_PATH", root / "deployed.sha"), \
@@ -895,7 +892,6 @@ class PreparationTests(unittest.TestCase):
                  mock.patch.object(self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "deploy" / "claim.lock"), \
                  mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status_path), \
                  mock.patch.object(self.dev, "LAUNCHD_RESTART_ACTIVE_PATH", root / "restart" / "active"), \
-                 mock.patch.object(self.dev, "LAUNCHD_RESTART_STATUS_PATH", root / "restart" / "status.json"), \
                  mock.patch.object(self.dev, "_launchd_candidate_env", return_value=({}, None)), \
                  mock.patch.object(self.dev, "_preflight_prod_bind_auth"), \
                  mock.patch.object(self.dev, "_prepare_local_candidate", return_value=prepared), \

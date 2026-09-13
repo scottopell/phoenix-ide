@@ -167,6 +167,24 @@ class RestartCommandTests(unittest.TestCase):
     def setUpClass(cls):
         cls.dev = load(ROOT / "dev.py", "phoenix_dev_launchd_restart_test")
 
+    def _isolated_operation_paths(self, root: Path):
+        restart = root / "restart"
+        deploy = root / "deploy"
+        return mock.patch.multiple(
+            self.dev,
+            LAUNCHD_INSTALL_DIR=root / "install",
+            LAUNCHD_PLIST_PATH=root / "service.plist",
+            PROD_SHA_PATH=root / "deployed.sha",
+            LAUNCHD_RESTART_DIR=restart,
+            LAUNCHD_RESTART_TRANSACTIONS_DIR=restart / "transactions",
+            LAUNCHD_RESTART_ACTIVE_PATH=restart / "active",
+            LAUNCHD_DEPLOY_DIR=deploy,
+            LAUNCHD_DEPLOY_STATUS_PATH=deploy / "status.json",
+            LAUNCHD_DEPLOY_ACTIVE_PATH=deploy / "active",
+            LAUNCHD_DEPLOY_CLAIM_LOCK_PATH=deploy / "claim.lock",
+            LAUNCHD_DEPLOY_LOCK_PATH=deploy / "activate.lock",
+        )
+
     def _installed_plist(self, binary: Path) -> bytes:
         return plistlib.dumps({
             "Label": self.dev.LAUNCHD_LABEL,
@@ -209,17 +227,7 @@ class RestartCommandTests(unittest.TestCase):
                     return subprocess.CompletedProcess(command, 0, "1\n", "")
                 return subprocess.CompletedProcess(command, 0, "", "")
 
-            with mock.patch.object(self.dev, "LAUNCHD_INSTALL_DIR", install), \
-                 mock.patch.object(self.dev, "LAUNCHD_PLIST_PATH", plist), \
-                 mock.patch.object(self.dev, "PROD_SHA_PATH", deployed_sha), \
-                 mock.patch.object(self.dev, "LAUNCHD_RESTART_DIR", restart_dir), \
-                 mock.patch.object(self.dev, "LAUNCHD_RESTART_STATUS_PATH", restart_dir / "status.json"), \
-                 mock.patch.object(self.dev, "LAUNCHD_RESTART_ACTIVE_PATH", restart_dir / "active"), \
-                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", deploy_dir), \
-                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", deploy_status), \
-                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", deploy_dir / "active"), \
-                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", deploy_dir / "claim.lock"), \
-                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_LOCK_PATH", deploy_dir / "activate.lock"), \
+            with self._isolated_operation_paths(root), \
                  mock.patch.object(self.dev, "LAUNCHD_RESTART_HELPER_SOURCE", ROOT / "scripts" / "launchd_restart_helper.py"), \
                  mock.patch.object(self.dev, "_binary_identity", return_value=identity), \
                  mock.patch.object(self.dev, "_current_prod_identity", return_value=identity), \
@@ -230,7 +238,9 @@ class RestartCommandTests(unittest.TestCase):
 
             load_env.assert_not_called()
             build.assert_not_called()
-            status = json.loads((restart_dir / "status.json").read_text())
+            statuses = list((restart_dir / "transactions").glob("*/status.json"))
+            self.assertEqual(1, len(statuses))
+            status = json.loads(statuses[0].read_text())
             self.assertEqual("prepared", status["state"])
             self.assertEqual("installed_restart", status["source_kind"])
             transactions = list((restart_dir / "transactions").iterdir())
@@ -259,27 +269,14 @@ class RestartCommandTests(unittest.TestCase):
             value.pop("Sockets")
             plist.write_bytes(plistlib.dumps(value))
 
-            with mock.patch.object(self.dev, "LAUNCHD_INSTALL_DIR", root), \
-                 mock.patch.object(self.dev, "LAUNCHD_PLIST_PATH", plist), \
-                 mock.patch.object(self.dev, "LAUNCHD_RESTART_DIR", root / "restart"), \
-                 mock.patch.object(self.dev, "LAUNCHD_RESTART_STATUS_PATH", root / "restart" / "status.json"), \
-                 mock.patch.object(self.dev, "LAUNCHD_RESTART_ACTIVE_PATH", root / "restart" / "active"), \
-                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root / "deploy"), \
-                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", root / "deploy" / "active"), \
-                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", root / "deploy" / "status.json"), \
-                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "deploy" / "claim.lock"):
+            with self._isolated_operation_paths(root), \
+                 mock.patch.object(self.dev, "LAUNCHD_INSTALL_DIR", root):
                 with self.assertRaisesRegex(SystemExit, "socket-activated"):
                     self.dev.launchd_prod_restart()
 
     def test_deploy_and_restart_claims_are_mutually_exclusive(self):
         with tempfile.TemporaryDirectory() as td, \
-             mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", Path(td) / "deploy"), \
-             mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", Path(td) / "deploy" / "active"), \
-             mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", Path(td) / "deploy" / "status.json"), \
-             mock.patch.object(self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", Path(td) / "deploy" / "claim.lock"), \
-             mock.patch.object(self.dev, "LAUNCHD_RESTART_DIR", Path(td) / "restart"), \
-             mock.patch.object(self.dev, "LAUNCHD_RESTART_ACTIVE_PATH", Path(td) / "restart" / "active"), \
-             mock.patch.object(self.dev, "LAUNCHD_RESTART_STATUS_PATH", Path(td) / "restart" / "status.json"):
+             self._isolated_operation_paths(Path(td)):
             self.dev._claim_launchd_restart("restart-one")
             with self.assertRaisesRegex(SystemExit, "restart-one"):
                 self.dev._claim_launchd_deploy("deploy-two")
@@ -287,6 +284,52 @@ class RestartCommandTests(unittest.TestCase):
             self.dev._claim_launchd_deploy("deploy-two")
             with self.assertRaisesRegex(SystemExit, "deploy-two"):
                 self.dev._claim_launchd_restart("restart-three")
+
+    def test_concurrent_restart_rejection_is_durable_without_overwriting_owner(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            deploy = root / "deploy"
+            deploy.mkdir()
+            (deploy / "active").write_text("deploy-owner\n")
+
+            with self._isolated_operation_paths(root):
+                with self.assertRaisesRegex(SystemExit, "deploy-owner"):
+                    self.dev.launchd_prod_restart()
+
+            statuses = list((root / "restart" / "transactions").glob("*/status.json"))
+            self.assertEqual(1, len(statuses))
+            rejection = json.loads(statuses[0].read_text())
+            self.assertEqual("rejected_concurrent", rejection["state"])
+            self.assertIn("deploy-owner", rejection["failure"])
+            self.assertEqual("deploy-owner\n", (deploy / "active").read_text())
+            self.assertFalse((root / "restart" / "active").exists())
+
+    def test_launchctl_failure_is_not_reported_as_not_loaded(self):
+        failure = subprocess.CompletedProcess(
+            [],
+            64,
+            "",
+            "launchctl domain temporarily unavailable",
+        )
+        with mock.patch.object(self.dev.subprocess, "run", return_value=failure):
+            inspection = self.dev._inspect_launchd_job()
+
+        self.assertIsInstance(inspection, self.dev.LaunchdJobInspectionFailed)
+        self.assertEqual(64, inspection.exit_code)
+        self.assertIn("temporarily unavailable", inspection.detail)
+
+    def test_prod_status_surfaces_launchctl_failure_without_deploy_guidance(self):
+        inspection = self.dev.LaunchdJobInspectionFailed(64, "permission denied")
+        with mock.patch.object(self.dev, "_inspect_launchd_job", return_value=inspection), \
+             mock.patch.object(self.dev, "_print_launchd_deploy_status"), \
+             mock.patch.object(self.dev, "_print_launchd_restart_status"), \
+             mock.patch("builtins.print") as output:
+            self.dev.launchd_prod_status()
+
+        rendered = " ".join(str(call) for call in output.call_args_list)
+        self.assertIn("status unavailable", rendered)
+        self.assertIn("permission denied", rendered)
+        self.assertNotIn("prod deploy", rendered)
 
     def test_command_routes_launchd_without_touching_systemd_or_bare_linux(self):
         with mock.patch.object(self.dev, "detect_prod_env", return_value="launchd"), \
