@@ -9835,6 +9835,7 @@ impl Database {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn hard_delete_conversation_tx(
         connection: &mut sqlx::SqliteConnection,
         conversation_id: &str,
