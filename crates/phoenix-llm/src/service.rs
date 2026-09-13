@@ -269,13 +269,9 @@ impl LlmServiceImpl {
             }
         }
         if let Some(ref cred) = self.codex_credential {
+            headers.retain(|(name, _)| !name.eq_ignore_ascii_case("chatgpt-account-id"));
             if let Some(account_id) = cred.account_id() {
-                if !headers
-                    .iter()
-                    .any(|(k, _)| k.eq_ignore_ascii_case("chatgpt-account-id"))
-                {
-                    headers.push(("chatgpt-account-id".to_string(), account_id));
-                }
+                headers.push(("chatgpt-account-id".to_string(), account_id));
             }
             // OpenAI-Beta is required by the ChatGPT-backend Responses
             // endpoint for the experimental Responses surface; Codex CLI
@@ -437,7 +433,9 @@ impl LlmServiceImpl {
 mod tests {
     use super::*;
     use crate::all_models;
-    use crate::registry::{AuthStyle, StaticCredential};
+    use crate::registry::{AuthStyle, CredentialSource, StaticCredential};
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
 
     #[derive(Debug)]
     struct MissingCredential;
@@ -776,6 +774,44 @@ mod tests {
                 .outcome,
             crate::LlmAttemptOutcome::AuthError
         );
+    }
+
+    #[test]
+    fn codex_bound_account_header_replaces_custom_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(br#"{"exp":4102444800}"#);
+        let jwt = format!("{header}.{payload}.");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"auth_mode":"chatgpt","tokens":{{"access_token":"{jwt}","refresh_token":"r","account_id":"catalog-account"}}}}"#
+            ),
+        )
+        .unwrap();
+        let (credential, account_id) = crate::CodexCredential::load(path).unwrap();
+        let bound = Arc::new(AccountBoundCodexCredential::new(credential, account_id));
+        let mut spec = all_models()
+            .into_iter()
+            .find(|spec| spec.id == "gpt-6-astra")
+            .unwrap();
+        spec.api_name = "gpt-6-astra".to_string();
+        let auth = LlmAuth::new(
+            Arc::clone(&bound) as Arc<dyn CredentialSource>,
+            AuthStyle::PlainBearer,
+        );
+        let mut service = LlmServiceImpl::new_with_codex_backend(spec, auth, Vec::new(), bound);
+        service.custom_headers = vec![(
+            "ChatGPT-Account-ID".to_string(),
+            "custom-account".to_string(),
+        )];
+
+        let headers = service.headers_for_provider();
+        assert!(!headers.iter().any(|(_, value)| value == "custom-account"));
+        assert!(headers.iter().any(|(name, value)| name
+            .eq_ignore_ascii_case("chatgpt-account-id")
+            && value == "catalog-account"));
     }
 
     #[test]

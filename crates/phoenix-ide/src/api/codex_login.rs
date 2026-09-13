@@ -128,9 +128,12 @@ struct PkceSession {
     cancel: CancellationToken,
     settled: tokio::sync::Notify,
     is_settled: std::sync::atomic::AtomicBool,
+    credential_committed: std::sync::atomic::AtomicBool,
 }
 
 struct DeviceSession {
+    credential_committed: std::sync::atomic::AtomicBool,
+
     /// User-visible code retained for log lines on settle.
     user_code: String,
     status: Mutex<LoginStatus>,
@@ -141,6 +144,18 @@ struct DeviceSession {
     cancel: CancellationToken,
     settled: tokio::sync::Notify,
     is_settled: std::sync::atomic::AtomicBool,
+}
+
+fn cancel_before_credential_commit(
+    cancel: &CancellationToken,
+    credential_committed: &std::sync::atomic::AtomicBool,
+) -> bool {
+    if credential_committed.load(std::sync::atomic::Ordering::Acquire) {
+        false
+    } else {
+        cancel.cancel();
+        true
+    }
 }
 
 #[derive(Default)]
@@ -317,6 +332,7 @@ pub async fn pkce_start(
         cancel: cancel.clone(),
         settled: tokio::sync::Notify::new(),
         is_settled: std::sync::atomic::AtomicBool::new(false),
+        credential_committed: std::sync::atomic::AtomicBool::new(false),
     });
 
     // Cancel any prior in-flight PKCE session before binding. Without this,
@@ -360,6 +376,11 @@ pub async fn pkce_start(
                 login_target,
             )
             .await;
+            if outcome.is_ok() {
+                session_for_task
+                    .credential_committed
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
             settle_pkce(
                 &mgr_for_task,
                 &registry_for_task,
@@ -682,10 +703,10 @@ pub async fn pkce_cancel(
         let sessions = mgr.pkce.lock().await;
         sessions.get(&session_id).cloned()
     };
-    if let Some(session) = session {
-        session.cancel.cancel();
-    }
-    Json(serde_json::json!({ "ok": true }))
+    let cancelled = session.is_some_and(|session| {
+        cancel_before_credential_commit(&session.cancel, &session.credential_committed)
+    });
+    Json(serde_json::json!({ "ok": true, "cancelled": cancelled }))
 }
 
 // ---------------------------------------------------------------------------
@@ -740,6 +761,7 @@ pub async fn device_start(
                 cancel: cancel.clone(),
                 settled: tokio::sync::Notify::new(),
                 is_settled: std::sync::atomic::AtomicBool::new(false),
+                credential_committed: std::sync::atomic::AtomicBool::new(false),
             }),
         );
     }
@@ -758,6 +780,11 @@ pub async fn device_start(
         };
         tokio::spawn(async move {
             let outcome = drive_device_code(cancel, device, login_target).await;
+            if outcome.is_ok() {
+                session_for_task
+                    .credential_committed
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
             settle_device(
                 &mgr_for_task,
                 &registry_for_task,
@@ -867,10 +894,10 @@ pub async fn device_cancel(
         let sessions = mgr.device.lock().await;
         sessions.get(&session_id).cloned()
     };
-    if let Some(session) = session {
-        session.cancel.cancel();
-    }
-    Json(serde_json::json!({ "ok": true }))
+    let cancelled = session.is_some_and(|session| {
+        cancel_before_credential_commit(&session.cancel, &session.credential_committed)
+    });
+    Json(serde_json::json!({ "ok": true, "cancelled": cancelled }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1121,6 +1148,24 @@ mod tests {
     /// login-target path). Asserting on the error type is what tells us
     /// the fix is in place — a regression that drops the cancel branch would
     /// surface as `LoginError::Network` or a hang on the unreachable issuer.
+    #[test]
+    fn cancel_is_rejected_after_credential_commit() {
+        let cancel = CancellationToken::new();
+        let committed = std::sync::atomic::AtomicBool::new(true);
+
+        assert!(!cancel_before_credential_commit(&cancel, &committed));
+        assert!(!cancel.is_cancelled());
+    }
+
+    #[test]
+    fn cancel_is_accepted_before_credential_commit() {
+        let cancel = CancellationToken::new();
+        let committed = std::sync::atomic::AtomicBool::new(false);
+
+        assert!(cancel_before_credential_commit(&cancel, &committed));
+        assert!(cancel.is_cancelled());
+    }
+
     #[tokio::test]
     async fn drive_device_code_cancelled_before_poll_short_circuits() {
         let cancel = CancellationToken::new();
