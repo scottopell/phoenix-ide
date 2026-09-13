@@ -486,7 +486,10 @@ impl LlmAttemptCapture {
 
     pub fn set_transport(&self, transport: LlmTransport) {
         if let Ok(mut state) = self.0.lock() {
-            state.transport = Some(transport);
+            if state.transport != Some(transport) {
+                state.transport = Some(transport);
+                state.progress = None;
+            }
         }
     }
 
@@ -1125,6 +1128,32 @@ mod attempt_capture_tests {
         assert_eq!(timed_out.outcome, LlmAttemptOutcome::TimedOut);
         assert_eq!(timed_out.stream.generation_event_count, 4);
         assert!(!timed_out.stream.completed);
+    }
+
+    #[test]
+    fn transport_change_clears_progress_from_the_previous_transport() {
+        let capture = LlmAttemptCapture::new();
+        let telemetry = LlmRequestTelemetry {
+            conversation_id: "conv".to_string(),
+            root_conversation_id: "root".to_string(),
+            request_id: "request".to_string(),
+            retry_attempt: 1,
+            attempt_capture: capture.clone(),
+        };
+        capture.begin(&telemetry, "openai", "gpt-test", LlmTransport::Websocket);
+        capture.publish_progress(ProviderStreamTelemetry {
+            provider_event_count: 3,
+            generation_event_count: 2,
+            ..ProviderStreamTelemetry::non_streaming()
+        });
+
+        capture.set_transport(LlmTransport::HttpSse);
+        let metrics = capture
+            .finalize_timed_out(std::time::Duration::from_secs(10))
+            .expect("started attempt");
+
+        assert_eq!(metrics.transport, LlmTransport::HttpSse);
+        assert_eq!(metrics.stream, ProviderStreamTelemetry::non_streaming());
     }
 
     #[test]

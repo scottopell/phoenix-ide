@@ -8137,11 +8137,7 @@ where
         let continuation_task = async move {
             let _continuation_admission = continuation_admission;
             let result = llm_client.complete(&request).await;
-            if let Some(metrics) = attempt_capture.finalized() {
-                if let Err(error) = storage.upsert_llm_request_metrics(&metrics).await {
-                    tracing::warn!(%error, "continuation: failed to write llm_request_metrics row");
-                }
-            }
+            let finalized_metrics = attempt_capture.finalized();
 
             match result {
                 Ok(response) => {
@@ -8202,6 +8198,11 @@ where
                         }
                     };
                     let _ = event_tx.send(event).await;
+                }
+            }
+            if let Some(metrics) = finalized_metrics {
+                if let Err(error) = storage.upsert_llm_request_metrics(&metrics).await {
+                    tracing::warn!(%error, "continuation: failed to write llm_request_metrics row");
                 }
             }
         };
@@ -12465,6 +12466,73 @@ mod authoritative_user_message_effect_tests {
                 ..
             }] if operation_id == &request.operation_id
         ));
+    }
+
+    #[tokio::test]
+    async fn continuation_timeout_event_precedes_metrics_persistence() {
+        let (mut rt, storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let (event_tx, event_rx) = mpsc::channel(8);
+        rt.event_tx = event_tx;
+        rt.event_rx = event_rx;
+        let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+            operation_id: "timeout-before-metrics".to_string(),
+            rejected_tool_calls: Vec::new(),
+            attempt: 1,
+        };
+        rt.state = ConvState::AwaitingContinuation {
+            request: request.clone(),
+        };
+        rt.llm_client
+            .queue_error(phoenix_llm::LlmError::timed_out("continuation deadline"));
+        let (metrics_started, metrics_release) = storage.gate_metrics_write();
+
+        rt.execute_effect(Effect::RequestContinuation {
+            request: request.clone(),
+        })
+        .await
+        .expect("continuation dispatches");
+        metrics_started
+            .await
+            .expect("metrics persistence begins after event publication");
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), rt.event_rx.recv())
+            .await
+            .expect("continuation timeout event arrives before the liveness guard")
+            .expect("typed continuation timeout was published");
+        assert!(matches!(
+            &event,
+            Event::ContinuationError {
+                operation_id,
+                error_kind: crate::db::ErrorKind::TimedOut,
+                ..
+            } if operation_id == &request.operation_id
+        ));
+        rt.process_event(event)
+            .await
+            .expect("typed timeout reaches durable continuation retry state");
+        assert!(matches!(
+            storage.get_current_state(&rt.context.conversation_id),
+            Some(ConvState::AwaitingContinuation { request: persisted })
+                if persisted.operation_id == request.operation_id && persisted.attempt == 2
+        ));
+        assert!(
+            !rt.llm_task_handle
+                .as_ref()
+                .expect("continuation task remains blocked only on telemetry")
+                .is_finished(),
+            "durable timeout adoption must precede telemetry completion"
+        );
+        metrics_release
+            .send(())
+            .expect("release metrics persistence");
+        rt.llm_task_handle
+            .take()
+            .expect("continuation task registered")
+            .await
+            .expect("continuation task joins");
     }
 
     #[tokio::test]

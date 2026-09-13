@@ -97,6 +97,7 @@ enum ContentKind {
 -- them either wastes retries or misclassifies recovery.
 enum LlmErrorKind {
     network
+    | timed_out
     | rate_limit
     | usage_limit_reached
     | server_error
@@ -230,13 +231,13 @@ entity LlmError {
     -- Automatic runtime retry decision. A malformed response is a
     -- server/transport fault, so it joins the transient-failure kinds; every
     -- other kind requires stopping the in-flight turn.
-    auto_retryable: kind = network or kind = rate_limit or kind = server_error or kind = invalid_response
+    auto_retryable: kind = network or kind = timed_out or kind = rate_limit or kind = server_error or kind = invalid_response
 
     -- User-triggered resume from a persisted conversation error. Auth is not
     -- auto-retryable, but is resumable after credentials are fixed.
     -- usage_limit_reached is never auto-retried, but its quota window resets
     -- on a clock boundary, so the user can resume once the window clears.
-    user_resumable: kind = auth or kind = network or kind = rate_limit or kind = server_error or kind = invalid_response or kind = server_overloaded or kind = usage_limit_reached or kind = prompt_rejected
+    user_resumable: kind = auth or kind = network or kind = timed_out or kind = rate_limit or kind = server_error or kind = invalid_response or kind = server_overloaded or kind = usage_limit_reached or kind = prompt_rejected
 }
 
 ------------------------------------------------------------
@@ -255,15 +256,15 @@ invariant QuotaBoundToUsageLimit {
         (e.kind = usage_limit_reached) implies e.has_quota
 }
 
--- The auto-retryable set is exactly {network, rate_limit, server_error,
--- invalid_response}.
+-- The auto-retryable set is exactly {network, timed_out, rate_limit,
+-- server_error, invalid_response}.
 -- Because `auto_retryable` is a derived field this holds by construction; the
 -- invariant is the place a future taxonomy change is forced to restate
 -- the partition deliberately rather than let a new kind default into
 -- either bucket.
 invariant AutoRetryablePartition {
     for e in LlmErrors:
-        e.auto_retryable = (e.kind = network or e.kind = rate_limit or e.kind = server_error or e.kind = invalid_response)
+        e.auto_retryable = (e.kind = network or e.kind = timed_out or e.kind = rate_limit or e.kind = server_error or e.kind = invalid_response)
 }
 
 invariant UserResumablePartition {

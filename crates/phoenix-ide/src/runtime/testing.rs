@@ -69,11 +69,29 @@ impl LlmClient for MockLlmClient {
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         self.requests.lock().unwrap().push(request.clone());
         self.request_count_tx.send_modify(|count| *count += 1);
-        self.responses
+        let result = self
+            .responses
             .lock()
             .unwrap()
             .pop_front()
-            .unwrap_or_else(|| Err(LlmError::network("No mock response queued")))
+            .unwrap_or_else(|| Err(LlmError::network("No mock response queued")));
+        if matches!(
+            result.as_ref().err().map(|error| error.kind),
+            Some(phoenix_llm::LlmErrorKind::TimedOut)
+        ) {
+            if let Some(telemetry) = request.telemetry.as_ref() {
+                telemetry.attempt_capture.begin(
+                    telemetry,
+                    "mock",
+                    &self.model_id,
+                    phoenix_llm::LlmTransport::InProcess,
+                );
+                let _ = telemetry
+                    .attempt_capture
+                    .finalize_timed_out(std::time::Duration::from_secs(600));
+            }
+        }
+        result
     }
 
     fn model_id(&self) -> &str {

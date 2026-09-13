@@ -3436,6 +3436,16 @@ mod tests {
                     continue;
                 }
                 if marker.contains("shared-deadline-fallback") && connection > 0 {
+                    socket
+                        .send(AxumWsMessage::Text(
+                            serde_json::json!({
+                                "type": "response.reasoning_summary_text.delta",
+                                "delta": "ws-reasoning"
+                            })
+                            .to_string(),
+                        ))
+                        .await
+                        .unwrap();
                     return;
                 }
                 if marker.contains("ws-fail") {
@@ -4222,6 +4232,9 @@ mod tests {
 
         let metrics = capture.finalized().expect("timeout metric");
         assert_eq!(metrics.outcome, crate::LlmAttemptOutcome::TimedOut);
+        assert_eq!(metrics.transport, crate::LlmTransport::HttpSse);
+        assert_eq!(metrics.stream.provider_event_count, 0);
+        assert_eq!(metrics.stream.generation_event_count, 0);
         assert!(!metrics.stream.completed);
         assert_eq!(metrics.total_duration_ms, 10_000);
         assert_eq!(
