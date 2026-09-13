@@ -67,8 +67,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [053](053_invalid-continuation-intents-retire-without-fabricated-identity.md) | Invalid continuation intents retire without fabricated identity | Accepted | REQ-BED-021, REQ-COMP-001, REQ-COMP-002 |
 | [054](054_automatic-continuation-admission-binds-consent-and-context-authority.md) | Automatic continuation admission binds consent and context authority | Accepted | REQ-BED-021, REQ-API-029, REQ-CONV-024 |
 | [055](055_invalid-request-errors-allow-manual-recovery.md) | Invalid-request errors allow manual recovery | Accepted | REQ-LLM-006; provider and persisted-error recovery |
-| [056](056_inline-reactions-append-without-taking-selection-focus.md) | Inline reactions append without taking selection focus | Accepted | REQ-PF-018–021, REQ-KB-001, REQ-KB-004 |
-| [057](057_single-line-reaction-pill-with-explicit-keyboard-entry.md) | Single-line reaction pill with explicit keyboard entry | Accepted | REQ-PF-018–020, REQ-KB-004 |
+| [056](056_close-retirement-persists-writer-authority-and-atomically-adopts-retry-evidence.md) | Close retirement persists writer authority and atomically adopts retry evidence | Accepted | REQ-WL-002b/002c, REQ-BED-029, REQ-API-006; `AmbientWriterEvidenceRow`, `RetainedCleanupEvidenceAdoption` |
 
 ## For agents: which decisions bind your task
 
@@ -95,6 +94,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying wake-plane registration receipts, durable wake observations, or wake resume outbox | 006, 011, 012 |
 | Specifying the shared durable workflow engine, profiles, migration, or drain | 013, 014, 015, 016, 019, 020, 024 |
 | Specifying product conversation lifecycle versus WorkScope resource ownership, continuation topology, or worktree lifecycle across continuations | 026 |
+| Specifying Close ambient-writer evidence, post-retirement quiescence, exact-attempt retained cleanup adoption, or needs-repair recovery guidance | 056, then 048, 042, 041, 040, 039, 034, 031, and 026 |
 | Specifying ProductConversation persistence identity, aggregate presentation, transcript-member authority, Close-attempt ownership, or staged lifecycle/attachment authority cutover | 031 and 026, refined by 046 |
 | Specifying hidden GitRepository identity, mutable repository locator/default-branch observations, database replacement/rollback, retained restart-repair evidence, repository authority activation, or repository survival beyond one deleted conversation | 035 for activation, then 033, 032, 031, and 026 |
 | Specifying workflow CAS, effect claims, leases, ambiguity, or compensation | 014, 019 |
@@ -109,7 +109,6 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying projects task-file shapes, proposal classification, or managed approval behavior across taskmd and plain markdown briefs | 023 |
 | Specifying continuation summary retry, restart recovery, or exactly-once commit | 025 |
 | Specifying provider prompt persistence authority, bounded transcript projection, or continuation prompt freezing | 045, then 025 and 031 |
-| Specifying opt-in automatic continuation consent, admission, or generated-context authority | 054, then 025, 031, 045, and 046 |
 | Specifying iOS grounding, server-backed file browsing, prose reading, or anchored comments | 030, then 029, 028, and 026 for draft authority, reader sessions, the companion boundary, ProductConversation, and WorkScope ownership |
 | Specifying ordinary-parent predecessor recall, planning-parent recall eligibility, or continuation recall orientation | 051, then 027, 031, and 045 |
 
@@ -149,7 +148,6 @@ ADR-000 (adopt spEARS v2 for new work)
               └── ADR-024 (Direct-turn authority is partitioned by semantic fact)
       ├── ADR-025 (Continuation compaction is an idempotent durable operation)
       │   └── ADR-045 (Provider prompts use persisted generation-fenced projections)
-      │       └── ADR-054 (Automatic continuation admission binds consent and context authority)
       ├── ADR-021 (The Coordinator surface is chat-only)
       │   └── ADR-022 (The Coordinator uses bounded relational evidence)
       │       └── ADR-027 (Write-capable ProductConversations use bounded global evidence)
@@ -162,6 +160,7 @@ ADR-000 (adopt spEARS v2 for new work)
           │       └── ADR-030 (iOS prose-review authority survives the composer handoff)
           └── ADR-031 (ProductConversation persistence uses staged single authority)
               ├── ADR-046 (ProductConversation owns aggregate presentation without duplicating transcript authority)
+              ├── ADR-056 (Close retirement persists writer authority and atomically adopts retry evidence)
               ├── ADR-043 (Creation staging uses a private locked namespace)
               ├── ADR-044 (Creation publication uses request-bound identity and immutable starting pins)
               └── ADR-032 (GitRepository is hidden infrastructure; Project is retired)
