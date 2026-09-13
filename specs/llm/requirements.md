@@ -416,3 +416,48 @@ WHEN the user signs out of Codex in Phoenix
 THE SYSTEM SHALL invalidate the same credential that owns Codex model access and quota status
 
 **Rationale:** A single credential owner keeps model availability, quota identity, account switching, and sign-out behavior consistent.
+
+---
+
+### REQ-LLM-011: Provider Attempts Have an Absolute Total Deadline
+
+WHEN Phoenix dispatches an LLM provider attempt
+THE SYSTEM SHALL capture one absolute total deadline that bounds credential resolution, connection establishment, transport sends and reads, provider activity, transport recovery, fallback, body consumption, and response normalization for that attempt
+AND SHALL NOT renew the deadline because of provider events, non-visible generation, keepalives, reconnects, authentication retry, or fallback
+
+WHEN a local connect, frame, or request timeout applies
+THE SYSTEM MAY fail that operation earlier
+BUT SHALL NOT treat a sequence of local timeouts as a substitute for the total deadline
+
+WHEN the total deadline elapses before a complete response wins
+THE SYSTEM SHALL cancel the process-local provider work
+AND SHALL classify the attempt as `timed_out` distinctly from network failure and user cancellation
+AND SHALL preserve content-free partial stream telemetry with `completed = false`
+AND SHALL route the typed outcome through the current-generation retry or durable terminal-settlement path
+
+WHEN a timed-out attempt is retried
+THE SYSTEM SHALL retain the accepted durable turn and canonical user-message identity
+AND SHALL allocate a distinct provider request identity
+AND SHALL prevent a late result from an expired generation from persisting response content, executing tools, or altering terminal state
+
+WHEN the finite retry budget is exhausted
+THE SYSTEM SHALL durably persist the timeout failure and release conversation ownership through the direct-turn atomic terminal-settlement boundary
+
+### REQ-LLM-012: LLM Attempt Outcomes Are Total and Idempotent
+
+WHEN an LLM attempt reaches Phoenix's typed result boundary
+THE SYSTEM SHALL finalize exactly one request-metric outcome as success, a provider failure class, `timed_out`, or `cancelled`
+
+WHEN timeout, cancellation, success, or a late result races with another terminal classification
+THE SYSTEM SHALL preserve the first terminal classification
+AND SHALL make repeated persistence of the same request-and-retry identity idempotent
+
+### REQ-LLM-013: Timeout Outcome Schema Migration Preserves Existing Metrics
+
+WHEN a database without the `timed_out` LLM request outcome is upgraded
+THE SYSTEM SHALL migrate the outcome constraint transactionally
+AND SHALL preserve every existing metric row and outcome value unchanged
+AND SHALL admit `timed_out`
+AND SHALL continue rejecting undeclared outcome values
+
+The migration is forward-only internal persistence under the project compatibility policy. It does not establish downgrade compatibility or a stable cross-version SQLite schema contract.

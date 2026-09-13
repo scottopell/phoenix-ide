@@ -64,6 +64,8 @@ pub enum LlmOutcome {
     ServerOverloaded { message: String },
     /// Network/connection error — retryable
     NetworkError { message: String },
+    /// Phoenix's absolute provider-attempt deadline elapsed — retryable.
+    TimedOut { message: String },
     /// Token budget exceeded
     TokenBudgetExceeded,
     /// Authentication error (401/403) — non-retryable.

@@ -1527,6 +1527,27 @@ impl Drop for AuthorityBoundaryConsumerGuard {
     }
 }
 
+fn persist_llm_metrics_independently<S>(
+    storage: S,
+    metrics: phoenix_llm::LlmAttemptMetrics,
+    fatal_cancellation: Option<CancellationToken>,
+) -> tokio::task::JoinHandle<()>
+where
+    S: StateStore + Clone + Send + Sync + 'static,
+{
+    tokio::spawn(async move {
+        tokio::select! {
+            biased;
+            () = wait_for_optional_cancellation(fatal_cancellation) => {}
+            result = storage.upsert_llm_request_metrics(&metrics) => {
+                if let Err(error) = result {
+                    tracing::warn!(%error, "failed to write llm_request_metrics row");
+                }
+            }
+        }
+    })
+}
+
 #[derive(Debug)]
 struct ActivePromptProjection {
     fenced_position: crate::db::GenerationFencedPromptPosition,
@@ -2323,7 +2344,7 @@ where
                 return disposition;
             }
             if self.local_terminal_authority == LocalTerminalAuthority::Fatal {
-                return RuntimeExitDisposition::FatalLocalAuthorityLoss;
+                return self.fatal_local_authority_exit();
             }
             let terminal_retry_at = self
                 .terminal_transition_retry
@@ -2342,8 +2363,7 @@ where
                     }
                 }, if self.fatal_local_authority_rx.is_some() => {
                     tracing::error!(?boundary, "fatal local SQLite authority loss; aborting external runtime effects");
-                    self.abort_external_effects();
-                    return RuntimeExitDisposition::FatalLocalAuthorityLoss;
+                    return self.fatal_local_authority_exit();
                 }
                 Some(AcknowledgedEventRequest { event, acknowledgement, retirement }) = self.acknowledged_event_rx.recv() => {
                     let result = self.process_acknowledged_event(event).await;
@@ -2369,13 +2389,13 @@ where
                             conv_id = %self.context.conversation_id,
                             "Runtime shutdown signal received; aborting external effects and exiting executor loop"
                         );
-                        self.abort_external_effects();
+                        self.abort_external_effects().await;
                         return RuntimeExitDisposition::CoordinatedShutdown;
                     }
                     if let Err(e) = self.process_event(event).await {
                         if e.starts_with("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:") {
                             tracing::error!(error = %e, "fatal local SQLite authority loss");
-                            return RuntimeExitDisposition::FatalLocalAuthorityLoss;
+                            return self.fatal_local_authority_exit();
                         }
                         // process_event already broadcast a typed
                         // SseEvent::Error at the source if appropriate
@@ -2383,7 +2403,7 @@ where
                         tracing::error!(error = %e, "Error handling event");
                     }
                     if self.local_terminal_authority == LocalTerminalAuthority::Fatal {
-                        return RuntimeExitDisposition::FatalLocalAuthorityLoss;
+                        return self.fatal_local_authority_exit();
                     }
                     if self.creation_settlement_disposition == CreationSettlementDisposition::StaleAuthority {
                         return RuntimeExitDisposition::Interrupted;
@@ -2537,7 +2557,7 @@ where
             }
         }
 
-        self.abort_external_effects();
+        self.abort_external_effects().await;
         tracing::info!(conv_id = %self.context.conversation_id, "Conversation runtime stopped");
         if self.recovery_disposition == RuntimeRecoveryDisposition::RecreateFromDatabase {
             RuntimeExitDisposition::RecreateFromDatabase
@@ -2864,6 +2884,39 @@ where
                 "absorbing user cancellation while an earlier direct-turn terminal settlement is owed"
             );
             return Ok(());
+        }
+        if matches!(event, Event::UserCancel { .. }) {
+            if let Some(capture) = self.active_llm_attempt.as_ref() {
+                match capture.claim_cancelled() {
+                    phoenix_llm::LlmAttemptCancellationClaim::Lost(metrics) => {
+                        tracing::debug!(
+                            conv_id = %self.context.conversation_id,
+                            ?metrics.outcome,
+                            "absorbing user cancellation after another LLM terminal classification won"
+                        );
+                        if metrics.outcome == phoenix_llm::LlmAttemptOutcome::TimedOut {
+                            self.abort_active_llm_task();
+                            self.active_llm_attempt = None;
+                            drop(persist_llm_metrics_independently(
+                                self.storage.clone(),
+                                metrics,
+                                self.fatal_external_effect_cancellation.clone(),
+                            ));
+                            return Box::pin(self.process_outcome(EffectOutcome::Llm(
+                                LlmOutcome::TimedOut {
+                                    message: "LLM provider attempt timed out".to_string(),
+                                },
+                            )))
+                            .await;
+                        }
+                        return Ok(());
+                    }
+                    phoenix_llm::LlmAttemptCancellationClaim::Won(_)
+                    | phoenix_llm::LlmAttemptCancellationClaim::NotStarted => {
+                        self.abort_active_llm_task();
+                    }
+                }
+            }
         }
         if matches!(event, Event::UserCancel { .. } | Event::Shutdown) {
             self.terminal_transition_retry = None;
@@ -5100,10 +5153,40 @@ where
         }
     }
 
-    fn abort_external_effects(&mut self) {
+    fn fatal_local_authority_exit(&mut self) -> RuntimeExitDisposition {
+        self.abort_external_effects_in_memory();
+        RuntimeExitDisposition::FatalLocalAuthorityLoss
+    }
+
+    fn abort_active_llm_task(&mut self) {
         self.llm_request_generation = self.llm_request_generation.wrapping_add(1);
         if let Some(handle) = self.llm_task_handle.take() {
             handle.abort();
+        }
+    }
+
+    fn abort_external_effects_in_memory(&mut self) {
+        self.abort_active_llm_task();
+        if let Some(attempt_capture) = self.active_llm_attempt.take() {
+            let _ = attempt_capture.finalize_cancelled();
+        }
+        self.tool_request_generation = self.tool_request_generation.wrapping_add(1);
+        if let Some(token) = self.tool_cancel_token.take() {
+            token.cancel();
+        }
+        if let Some(handle) = self.tool_task_handle.take() {
+            handle.abort();
+        }
+    }
+
+    async fn abort_external_effects(&mut self) {
+        self.abort_active_llm_task();
+        if let Some(attempt_capture) = self.active_llm_attempt.take() {
+            if let Some(metrics) = attempt_capture.finalize_cancelled() {
+                if let Err(error) = self.storage.upsert_llm_request_metrics(&metrics).await {
+                    tracing::warn!(%error, "failed to persist cancelled LLM attempt metrics during runtime teardown");
+                }
+            }
         }
         self.tool_request_generation = self.tool_request_generation.wrapping_add(1);
         if let Some(token) = self.tool_cancel_token.take() {
@@ -7009,17 +7092,7 @@ where
                 Err(e) => llm_error_to_outcome(e),
             };
 
-            if let Some(metrics) = attempt_capture.finalized() {
-                if let Err(error) = storage.upsert_llm_request_metrics(&metrics).await {
-                    tracing::warn!(%error, "failed to write llm_request_metrics row");
-                }
-            } else {
-                tracing::warn!(
-                    request_id,
-                    retry_attempt,
-                    "LLM attempt completed without finalized metrics"
-                );
-            }
+            let finalized_metrics = attempt_capture.finalized();
 
             // Task 67004: a terminal UsageLimitReached carries the
             // structured QuotaDetails parsed from the 429 response
@@ -7085,6 +7158,18 @@ where
 
             drop(request_admission);
             let _ = llm_tx.send(llm_outcome);
+
+            if let Some(metrics) = finalized_metrics {
+                if let Err(error) = storage.upsert_llm_request_metrics(&metrics).await {
+                    tracing::warn!(%error, "failed to write llm_request_metrics row");
+                }
+            } else {
+                tracing::warn!(
+                    request_id,
+                    retry_attempt,
+                    "LLM attempt completed without finalized metrics"
+                );
+            }
         }
         .instrument(turn_span);
         let handle = tokio::spawn(async move {
@@ -8080,11 +8165,7 @@ where
         let continuation_task = async move {
             let _continuation_admission = continuation_admission;
             let result = llm_client.complete(&request).await;
-            if let Some(metrics) = attempt_capture.finalized() {
-                if let Err(error) = storage.upsert_llm_request_metrics(&metrics).await {
-                    tracing::warn!(%error, "continuation: failed to write llm_request_metrics row");
-                }
-            }
+            let finalized_metrics = attempt_capture.finalized();
 
             match result {
                 Ok(response) => {
@@ -8116,6 +8197,11 @@ where
                                 error_kind: crate::db::ErrorKind::ContextExhausted,
                             })
                             .await;
+                        if let Some(metrics) = finalized_metrics {
+                            if let Err(error) = storage.upsert_llm_request_metrics(&metrics).await {
+                                tracing::warn!(%error, "continuation: failed to write llm_request_metrics row");
+                            }
+                        }
                         return;
                     }
 
@@ -8145,6 +8231,11 @@ where
                         }
                     };
                     let _ = event_tx.send(event).await;
+                }
+            }
+            if let Some(metrics) = finalized_metrics {
+                if let Err(error) = storage.upsert_llm_request_metrics(&metrics).await {
+                    tracing::warn!(%error, "continuation: failed to write llm_request_metrics row");
                 }
             }
         };
@@ -10911,6 +11002,7 @@ fn llm_error_to_db_error(kind: phoenix_llm::LlmErrorKind) -> crate::db::ErrorKin
         phoenix_llm::LlmErrorKind::RateLimit => crate::db::ErrorKind::RateLimit,
         phoenix_llm::LlmErrorKind::UsageLimitReached => crate::db::ErrorKind::UsageLimitReached,
         phoenix_llm::LlmErrorKind::Network => crate::db::ErrorKind::Network,
+        phoenix_llm::LlmErrorKind::TimedOut => crate::db::ErrorKind::TimedOut,
         phoenix_llm::LlmErrorKind::InvalidRequest => crate::db::ErrorKind::InvalidRequest,
         phoenix_llm::LlmErrorKind::PromptRejected => crate::db::ErrorKind::PromptRejected,
         phoenix_llm::LlmErrorKind::InvalidResponse => crate::db::ErrorKind::InvalidResponse,
@@ -10970,6 +11062,9 @@ fn llm_error_to_outcome(error: phoenix_llm::LlmError) -> LlmOutcome {
             message: error.message,
         },
         LlmErrorKind::Network => LlmOutcome::NetworkError {
+            message: error.message,
+        },
+        LlmErrorKind::TimedOut => LlmOutcome::TimedOut {
             message: error.message,
         },
         LlmErrorKind::ContextWindowExceeded => LlmOutcome::TokenBudgetExceeded,
@@ -12407,6 +12502,117 @@ mod authoritative_user_message_effect_tests {
     }
 
     #[tokio::test]
+    async fn continuation_empty_summary_persists_finalized_metrics() {
+        let (mut rt, storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let (event_tx, event_rx) = mpsc::channel(8);
+        rt.event_tx = event_tx;
+        rt.event_rx = event_rx;
+        let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+            operation_id: "empty-summary-metrics".to_string(),
+            rejected_tool_calls: Vec::new(),
+            attempt: 1,
+        };
+        rt.state = ConvState::AwaitingContinuation {
+            request: request.clone(),
+        };
+        rt.llm_client.queue_response(phoenix_llm::LlmResponse {
+            content: vec![ContentBlock::Text {
+                text: "   ".to_string(),
+            }],
+            end_turn: true,
+            usage: phoenix_llm::Usage::default(),
+            stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+        });
+
+        rt.execute_effect(Effect::RequestContinuation {
+            request: request.clone(),
+        })
+        .await
+        .expect("continuation dispatches");
+        storage.wait_for_metrics_write().await;
+        let metrics = storage.recorded_llm_request_metrics();
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].outcome, phoenix_llm::LlmAttemptOutcome::Success);
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), rt.event_rx.recv())
+            .await
+            .expect("empty-summary event arrives before the liveness guard")
+            .expect("empty-summary failure published");
+        assert!(
+            matches!(event, Event::ContinuationFailed { operation_id, .. } if operation_id == request.operation_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn continuation_timeout_event_precedes_metrics_persistence() {
+        let (mut rt, storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let (event_tx, event_rx) = mpsc::channel(8);
+        rt.event_tx = event_tx;
+        rt.event_rx = event_rx;
+        let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+            operation_id: "timeout-before-metrics".to_string(),
+            rejected_tool_calls: Vec::new(),
+            attempt: 1,
+        };
+        rt.state = ConvState::AwaitingContinuation {
+            request: request.clone(),
+        };
+        rt.llm_client
+            .queue_error(phoenix_llm::LlmError::timed_out("continuation deadline"));
+        let (metrics_started, metrics_release) = storage.gate_metrics_write();
+
+        rt.execute_effect(Effect::RequestContinuation {
+            request: request.clone(),
+        })
+        .await
+        .expect("continuation dispatches");
+        metrics_started
+            .await
+            .expect("metrics persistence begins after event publication");
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), rt.event_rx.recv())
+            .await
+            .expect("continuation timeout event arrives before the liveness guard")
+            .expect("typed continuation timeout was published");
+        assert!(matches!(
+            &event,
+            Event::ContinuationError {
+                operation_id,
+                error_kind: crate::db::ErrorKind::TimedOut,
+                ..
+            } if operation_id == &request.operation_id
+        ));
+        rt.process_event(event)
+            .await
+            .expect("typed timeout reaches durable continuation retry state");
+        assert!(matches!(
+            storage.get_current_state(&rt.context.conversation_id),
+            Some(ConvState::AwaitingContinuation { request: persisted })
+                if persisted.operation_id == request.operation_id && persisted.attempt == 2
+        ));
+        assert!(
+            !rt.llm_task_handle
+                .as_ref()
+                .expect("continuation task remains blocked only on telemetry")
+                .is_finished(),
+            "durable timeout adoption must precede telemetry completion"
+        );
+        metrics_release
+            .send(())
+            .expect("release metrics persistence");
+        rt.llm_task_handle
+            .take()
+            .expect("continuation task registered")
+            .await
+            .expect("continuation task joins");
+    }
+
+    #[tokio::test]
     async fn continuation_freezes_projection_before_provider_spawn() {
         let (mut rt, storage, _rx) = runtime(
             DirectTurnMaterializationEligibility::StaleAuthority,
@@ -13353,6 +13559,45 @@ mod authoritative_user_message_effect_tests {
             .is_empty());
     }
 
+    #[tokio::test]
+    async fn exhausted_timeout_atomically_releases_direct_turn_ownership() {
+        let (mut rt, storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let turn = crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(30),
+            generation: 0,
+        };
+        storage.set_active_direct_turn(Some(turn.clone()));
+        rt.active_direct_turn = Some(Box::new(turn));
+        rt.state = ConvState::LlmRequesting {
+            attempt: crate::state_machine::transition::MAX_RETRY_ATTEMPTS,
+        };
+
+        rt.process_generation_tagged_llm_outcome(
+            0,
+            LlmOutcome::TimedOut {
+                message: "provider attempt deadline elapsed".to_string(),
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            rt.state,
+            ConvState::Error {
+                error_kind: crate::db::ErrorKind::TimedOut,
+                ..
+            }
+        ));
+        assert!(rt.active_direct_turn.is_none());
+        assert_eq!(storage.recorded_settle_active_direct_turn_calls().len(), 1);
+        assert!(matches!(
+            storage.recorded_settle_active_direct_turn_calls()[0].terminal,
+            crate::runtime::traits::ActiveDirectTurnTerminal::Failed { .. }
+        ));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn parent_direct_turn_retries_failed_terminal_settlement_without_duplicate_message() {
         let (mut rt, storage, _rx) = runtime(
@@ -14171,8 +14416,377 @@ mod authoritative_user_message_effect_tests {
         let (mut rt, result) = dispatch.await.expect("dispatch joins");
         result.expect("admitted external effect dispatches");
         assert!(rt.llm_task_handle.is_some());
-        rt.abort_external_effects();
+        rt.abort_external_effects().await;
         assert!(rt.llm_task_handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_teardown_finalizes_begun_llm_attempt_as_cancelled() {
+        let (mut rt, storage, _broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let capture = phoenix_llm::LlmAttemptCapture::new();
+        let telemetry = phoenix_llm::LlmRequestTelemetry {
+            conversation_id: rt.context.conversation_id.clone(),
+            root_conversation_id: rt.context.root_conversation_id.clone(),
+            request_id: "teardown-attempt".to_string(),
+            retry_attempt: 1,
+            attempt_capture: capture.clone(),
+        };
+        capture.begin(
+            &telemetry,
+            "openai",
+            "gpt-test",
+            phoenix_llm::LlmTransport::Websocket,
+        );
+        rt.active_llm_attempt = Some(capture.clone());
+        rt.llm_task_handle = Some(tokio::spawn(std::future::pending()));
+        let (persisted, release) = storage.gate_metrics_write();
+
+        let teardown = tokio::spawn(async move {
+            rt.abort_external_effects().await;
+            rt
+        });
+        persisted
+            .await
+            .expect("cancelled metric persistence begins");
+        release.send(()).expect("release metric persistence");
+        let rt = teardown.await.unwrap();
+
+        assert!(rt.llm_task_handle.is_none());
+        assert!(rt.active_llm_attempt.is_none());
+        assert_eq!(
+            capture.finalized().expect("terminal capture").outcome,
+            phoenix_llm::LlmAttemptOutcome::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn fatal_fence_cancels_independent_timeout_metrics_sink() {
+        let (rt, storage, _broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let (started, release) = storage.gate_metrics_write();
+        let fence = Arc::new(crate::runtime::FatalLocalAuthorityFence::new());
+        let cancellation = fence.external_effect_cancellation();
+        let capture = phoenix_llm::LlmAttemptCapture::new();
+        let telemetry = phoenix_llm::LlmRequestTelemetry {
+            conversation_id: rt.context.conversation_id.clone(),
+            root_conversation_id: rt.context.root_conversation_id.clone(),
+            request_id: "fenced-timeout-metrics".to_string(),
+            retry_attempt: 1,
+            attempt_capture: capture.clone(),
+        };
+        capture.begin(
+            &telemetry,
+            "openai",
+            "gpt-test",
+            phoenix_llm::LlmTransport::Websocket,
+        );
+        let metrics = capture
+            .finalize_timed_out(std::time::Duration::from_secs(600))
+            .expect("timeout metric");
+        let task =
+            persist_llm_metrics_independently(storage.clone(), metrics.clone(), Some(cancellation));
+        started
+            .await
+            .expect("metrics write entered before fatal close");
+
+        fence.close("test");
+        task.await.expect("fenced metrics sink exits");
+        assert!(storage.recorded_llm_request_metrics().is_empty());
+        drop(release);
+        assert!(storage.recorded_llm_request_metrics().is_empty());
+
+        let (mut never_started, _never_release) = storage.gate_metrics_write();
+        let task = persist_llm_metrics_independently(
+            storage.clone(),
+            metrics,
+            Some(fence.external_effect_cancellation()),
+        );
+        task.await.expect("pre-fenced metrics sink exits");
+        assert!(
+            never_started.try_recv().is_err(),
+            "pre-fenced metrics persistence must not start"
+        );
+        assert!(storage.recorded_llm_request_metrics().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fatal_in_memory_abort_never_enters_metrics_persistence() {
+        let (mut rt, storage, _broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let capture = phoenix_llm::LlmAttemptCapture::new();
+        let telemetry = phoenix_llm::LlmRequestTelemetry {
+            conversation_id: rt.context.conversation_id.clone(),
+            root_conversation_id: rt.context.root_conversation_id.clone(),
+            request_id: "fatal-attempt".to_string(),
+            retry_attempt: 1,
+            attempt_capture: capture.clone(),
+        };
+        capture.begin(
+            &telemetry,
+            "openai",
+            "gpt-test",
+            phoenix_llm::LlmTransport::Websocket,
+        );
+        rt.active_llm_attempt = Some(capture.clone());
+        rt.llm_task_handle = Some(tokio::spawn(std::future::pending()));
+        let (mut persisted, _release) = storage.gate_metrics_write();
+
+        rt.abort_external_effects_in_memory();
+
+        assert!(rt.llm_task_handle.is_none());
+        assert!(rt.active_llm_attempt.is_none());
+        assert_eq!(
+            capture.finalized().expect("terminal capture").outcome,
+            phoenix_llm::LlmAttemptOutcome::Cancelled
+        );
+        assert!(
+            persisted.try_recv().is_err(),
+            "fatal in-memory abort must not enter the suspect SQLite path"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_before_capture_start_aborts_provider_before_persistence() {
+        let (mut rt, storage, _broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        rt.state = ConvState::LlmRequesting { attempt: 1 };
+        let capture = phoenix_llm::LlmAttemptCapture::new();
+        rt.active_llm_attempt = Some(capture.clone());
+        let (started_tx, started_rx) = oneshot::channel();
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        rt.llm_task_handle = Some(tokio::spawn(async move {
+            struct NotifyDrop(Option<oneshot::Sender<()>>);
+            impl Drop for NotifyDrop {
+                fn drop(&mut self) {
+                    if let Some(tx) = self.0.take() {
+                        let _ = tx.send(());
+                    }
+                }
+            }
+            let _notify_drop = NotifyDrop(Some(dropped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        }));
+        started_rx.await.expect("provider task registered");
+        storage.set_fail_state_update(true);
+
+        let result = rt
+            .process_event(Event::UserCancel {
+                reason: None,
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            })
+            .await;
+
+        assert!(result.is_err(), "terminal persistence failure is surfaced");
+        dropped_rx
+            .await
+            .expect("unstarted provider task aborted first");
+        assert!(rt.llm_task_handle.is_none());
+        assert!(
+            capture.finalized().is_none(),
+            "no provider attempt was fabricated"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_winner_aborts_provider_before_terminal_persistence() {
+        let (mut rt, storage, _broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        rt.state = ConvState::LlmRequesting { attempt: 1 };
+        let capture = phoenix_llm::LlmAttemptCapture::new();
+        let telemetry = phoenix_llm::LlmRequestTelemetry {
+            conversation_id: rt.context.conversation_id.clone(),
+            root_conversation_id: rt.context.root_conversation_id.clone(),
+            request_id: "cancel-before-persist".to_string(),
+            retry_attempt: 1,
+            attempt_capture: capture.clone(),
+        };
+        capture.begin(
+            &telemetry,
+            "openai",
+            "gpt-test",
+            phoenix_llm::LlmTransport::Websocket,
+        );
+        rt.active_llm_attempt = Some(capture.clone());
+        let (started_tx, started_rx) = oneshot::channel();
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        rt.llm_task_handle = Some(tokio::spawn(async move {
+            struct NotifyDrop(Option<oneshot::Sender<()>>);
+            impl Drop for NotifyDrop {
+                fn drop(&mut self) {
+                    if let Some(tx) = self.0.take() {
+                        let _ = tx.send(());
+                    }
+                }
+            }
+            let _notify_drop = NotifyDrop(Some(dropped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        }));
+        started_rx.await.expect("provider task started");
+        storage.set_fail_state_update(true);
+
+        let result = rt
+            .process_event(Event::UserCancel {
+                reason: None,
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            })
+            .await;
+
+        assert!(result.is_err(), "terminal persistence failure is surfaced");
+        dropped_rx
+            .await
+            .expect("provider aborted before persistence");
+        assert!(rt.llm_task_handle.is_none());
+        assert_eq!(
+            capture.finalized().expect("terminal capture").outcome,
+            phoenix_llm::LlmAttemptOutcome::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn user_cancel_after_timeout_classification_preserves_timeout_outcome_path() {
+        let (mut rt, storage, _broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let turn = crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(31),
+            generation: 0,
+        };
+        storage.set_active_direct_turn(Some(turn.clone()));
+        rt.active_direct_turn = Some(Box::new(turn));
+        rt.state = ConvState::LlmRequesting {
+            attempt: crate::state_machine::transition::MAX_RETRY_ATTEMPTS,
+        };
+        let capture = phoenix_llm::LlmAttemptCapture::new();
+        let telemetry = phoenix_llm::LlmRequestTelemetry {
+            conversation_id: rt.context.conversation_id.clone(),
+            root_conversation_id: rt.context.root_conversation_id.clone(),
+            request_id: "timeout-cancel-race".to_string(),
+            retry_attempt: crate::state_machine::transition::MAX_RETRY_ATTEMPTS,
+            attempt_capture: capture.clone(),
+        };
+        capture.begin(
+            &telemetry,
+            "openai",
+            "gpt-test",
+            phoenix_llm::LlmTransport::Websocket,
+        );
+        let finalized = capture
+            .finalize_timed_out(std::time::Duration::from_secs(600))
+            .expect("timeout classification wins");
+        assert_eq!(finalized.outcome, phoenix_llm::LlmAttemptOutcome::TimedOut);
+        rt.active_llm_attempt = Some(capture.clone());
+        let (started_tx, started_rx) = oneshot::channel();
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        rt.llm_task_handle = Some(tokio::spawn(async move {
+            struct NotifyDrop(Option<oneshot::Sender<()>>);
+            impl Drop for NotifyDrop {
+                fn drop(&mut self) {
+                    if let Some(tx) = self.0.take() {
+                        let _ = tx.send(());
+                    }
+                }
+            }
+            let _notify_drop = NotifyDrop(Some(dropped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        }));
+        started_rx.await.expect("post-provider task started");
+
+        rt.process_event(Event::UserCancel {
+            reason: None,
+            cause: crate::state_machine::event::CancelCause::UserRequested,
+        })
+        .await
+        .expect("timeout winner is adopted");
+
+        dropped_rx
+            .await
+            .expect("post-provider task aborted before timeout adoption");
+        assert!(rt.llm_task_handle.is_none());
+        assert_eq!(
+            capture.finalized().expect("terminal capture").outcome,
+            phoenix_llm::LlmAttemptOutcome::TimedOut
+        );
+        assert!(matches!(
+            rt.state,
+            ConvState::Error {
+                error_kind: crate::db::ErrorKind::TimedOut,
+                ..
+            }
+        ));
+        assert_eq!(storage.recorded_settle_active_direct_turn_calls().len(), 1);
+        assert!(matches!(
+            storage.recorded_settle_active_direct_turn_calls()[0].terminal,
+            crate::runtime::traits::ActiveDirectTurnTerminal::Failed { .. }
+        ));
+        storage.wait_for_metrics_write().await;
+        let metrics = storage.recorded_llm_request_metrics();
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].outcome, phoenix_llm::LlmAttemptOutcome::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn ordinary_fatal_authority_flag_aborts_registered_external_tasks() {
+        let (mut rt, _storage, _broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        rt.local_terminal_authority = LocalTerminalAuthority::Fatal;
+        let (llm_started_tx, llm_started_rx) = oneshot::channel();
+        let (llm_dropped_tx, llm_dropped_rx) = oneshot::channel();
+        let (tool_started_tx, tool_started_rx) = oneshot::channel();
+        let (tool_dropped_tx, tool_dropped_rx) = oneshot::channel();
+        let tool_cancel_token = CancellationToken::new();
+        rt.tool_cancel_token = Some(tool_cancel_token.clone());
+        rt.llm_task_handle = Some(tokio::spawn(async move {
+            struct NotifyDrop(Option<oneshot::Sender<()>>);
+            impl Drop for NotifyDrop {
+                fn drop(&mut self) {
+                    if let Some(tx) = self.0.take() {
+                        let _ = tx.send(());
+                    }
+                }
+            }
+            let _notify_drop = NotifyDrop(Some(llm_dropped_tx));
+            let _ = llm_started_tx.send(());
+            std::future::pending::<()>().await;
+        }));
+        rt.tool_task_handle = Some(tokio::spawn(async move {
+            struct NotifyDrop(Option<oneshot::Sender<()>>);
+            impl Drop for NotifyDrop {
+                fn drop(&mut self) {
+                    if let Some(tx) = self.0.take() {
+                        let _ = tx.send(());
+                    }
+                }
+            }
+            let _notify_drop = NotifyDrop(Some(tool_dropped_tx));
+            let _ = tool_started_tx.send(());
+            std::future::pending::<()>().await;
+        }));
+        llm_started_rx.await.expect("provider task started");
+        tool_started_rx.await.expect("tool task started");
+        assert_eq!(
+            rt.run_inner().await,
+            RuntimeExitDisposition::FatalLocalAuthorityLoss
+        );
+        llm_dropped_rx.await.expect("provider task aborted");
+        tool_dropped_rx.await.expect("tool task aborted");
+        assert!(tool_cancel_token.is_cancelled());
     }
 
     #[tokio::test]
@@ -17207,6 +17821,35 @@ mod steer_drain_detector_tests {
     }
 
     #[tokio::test]
+    async fn crash_before_llm_commit_recovers_the_existing_direct_turn() {
+        let conversation_id = "conv-timeout-crash-recovery";
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            conversation_id,
+            ConvState::LlmRequesting { attempt: 2 },
+            Vec::new(),
+        );
+        let turn = crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(404),
+            generation: 3,
+        };
+        storage.set_active_direct_turn(Some(turn.clone()));
+        rt.active_direct_turn = Some(Box::new(turn));
+
+        assert!(!rt
+            .resume_interrupted_llm_request()
+            .await
+            .expect("existing accepted turn is redispatched"));
+        assert!(matches!(rt.state, ConvState::LlmRequesting { attempt: 2 }));
+        assert_eq!(
+            rt.active_direct_turn.as_deref().map(|turn| turn.turn_id),
+            Some(phoenix_workflow::TurnAuthorityId(404))
+        );
+        assert_eq!(storage.get_all_messages(conversation_id).len(), 0);
+        assert!(rt.llm_task_handle.is_some());
+        rt.llm_task_handle.take().unwrap().abort();
+    }
+
+    #[tokio::test]
     async fn committed_steering_recovery_dispatch_failure_persists_error() {
         let conversation_id = "conv-steering-recovery-dispatch-failure";
         let (mut rt, storage) = build_runtime_with_state_and_queue(
@@ -19792,6 +20435,42 @@ mod llm_generation_guard_tests {
             state_before,
             "a stale aborted outcome must not move state — no spurious retry/error"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_timed_out_generation_cannot_persist_response_or_execute_tools() {
+        let mut rt = runtime_requesting();
+        rt.llm_request_generation = 2;
+        let state_before = rt.state.clone();
+        let storage = rt.storage.clone();
+        let tools = rt.tool_executor.clone();
+        let late_response = LlmOutcome::Response {
+            content: vec![ContentBlock::Text {
+                text: "late response".to_string(),
+            }],
+            tool_calls: vec![ToolCall {
+                id: "late-tool".to_string(),
+                input: phoenix_core::domain::sm_state::ToolInput::Bash(
+                    phoenix_core::domain::bash_types::BashInvocation::from_context(
+                        phoenix_core::domain::bash_types::BashToolInput::run("echo stale"),
+                    )
+                    .expect("valid bash input"),
+                ),
+            }],
+            end_turn: false,
+            usage: phoenix_llm::Usage::default(),
+            request_id: "late-response".to_string(),
+        };
+
+        rt.process_generation_tagged_llm_outcome(1, late_response)
+            .await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(rt.state, state_before);
+        assert!(rt.llm_outcome_is_stale(1));
+        assert!(storage.recorded_messages().is_empty());
+        assert!(tools.recorded_executions().is_empty());
+        assert!(rt.tool_task_handle.is_none());
     }
 
     #[tokio::test]

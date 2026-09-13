@@ -209,7 +209,7 @@ CREATE TABLE IF NOT EXISTS llm_request_metrics (
     max_generation_gap_ms INTEGER CHECK (max_generation_gap_ms IS NULL OR max_generation_gap_ms >= 0),
     output_kind TEXT NOT NULL CHECK (output_kind IN ('none', 'text', 'reasoning', 'tool', 'structured', 'mixed')),
     stream_completed INTEGER NOT NULL CHECK (stream_completed IN (0, 1)),
-    outcome TEXT NOT NULL CHECK (outcome IN ('success', 'rate_limited', 'usage_limit_reached', 'server_error', 'invalid_response', 'server_overloaded', 'network_error', 'token_budget_exceeded', 'auth_error', 'request_rejected', 'cancelled')),
+    outcome TEXT NOT NULL CHECK (outcome IN ('success', 'rate_limited', 'usage_limit_reached', 'server_error', 'invalid_response', 'server_overloaded', 'network_error', 'timed_out', 'token_budget_exceeded', 'auth_error', 'request_rejected', 'cancelled')),
     created_at TEXT NOT NULL,
     PRIMARY KEY (request_id, retry_attempt)
 );

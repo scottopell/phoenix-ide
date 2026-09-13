@@ -141,7 +141,7 @@ export interface ConversationAtom {
   turnRetryContext: {
     attempt: number;
     maxAttempts: number;
-    reason: 'rate_limit' | 'server_error' | 'network';
+    reason: 'rate_limit' | 'server_error' | 'network' | 'timed_out';
     /** Human-rendered reason ("rate limit", "server error",
      *  "network error"). Source of truth lives on the client because
      *  the wire transport is the snake_case enum. */
@@ -283,7 +283,7 @@ export type SSEAction =
       sequenceId: number;
       attempt: number;
       maxAttempts: number;
-      reason: 'rate_limit' | 'server_error' | 'network';
+      reason: 'rate_limit' | 'server_error' | 'network' | 'timed_out';
       backingOffMs: number;
       /** unix ms; null when the wire omitted the field. */
       resetsAt: number | null;
@@ -438,7 +438,7 @@ export function createInitialAtom(): ConversationAtom {
  *  the user-facing strings the StateBar appends in `(retry K/N <reason>)`.
  *  Specs: `specs/llm-retry-visibility/` REQ-LRV-002 + the consumer's
  *  `render_retry_modifier_for` helper. */
-function reasonText(reason: 'rate_limit' | 'server_error' | 'network'): string {
+function reasonText(reason: 'rate_limit' | 'server_error' | 'network' | 'timed_out'): string {
   switch (reason) {
     case 'rate_limit':
       return 'rate limit';
@@ -446,6 +446,8 @@ function reasonText(reason: 'rate_limit' | 'server_error' | 'network'): string {
       return 'server error';
     case 'network':
       return 'network error';
+    case 'timed_out':
+      return 'request timeout';
   }
 }
 

@@ -75,7 +75,7 @@ pub use rate_limit::{CreditsSnapshot, QuotaDetails, RateLimitWindow};
 #[allow(unused_imports)]
 // CredentialSource + ResolvedAuth + AuthStyle: public API for downstream consumers
 pub use registry::{AuthStyle, CredentialSource, LlmAuth, LlmConfig, ModelRegistry, ResolvedAuth};
-pub use service::LlmServiceImpl;
+pub use service::{LlmAttemptDeadline, LlmServiceImpl};
 // `types` (ContentBlock, Usage, ImageSource, …) live in phoenix-core. Alias
 // the module back as `types` and glob-re-export so both `phoenix_llm::types::X`
 // and `phoenix_llm::X` paths resolve for downstream consumers.
@@ -345,6 +345,7 @@ impl LoggingService {
                 LlmErrorKind::InvalidResponse => LlmAttemptOutcome::InvalidResponse,
                 LlmErrorKind::ServerOverloaded => LlmAttemptOutcome::ServerOverloaded,
                 LlmErrorKind::Network => LlmAttemptOutcome::NetworkError,
+                LlmErrorKind::TimedOut => LlmAttemptOutcome::TimedOut,
                 LlmErrorKind::ContextWindowExceeded => LlmAttemptOutcome::TokenBudgetExceeded,
                 LlmErrorKind::Auth => LlmAttemptOutcome::AuthError,
                 LlmErrorKind::InvalidRequest

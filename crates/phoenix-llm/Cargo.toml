@@ -49,6 +49,7 @@ sha2 = "0.11"
 rand = "0.10"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 # test-support exposes phoenix-core's #[cfg(test)] constructors
 # (PhoenixRuntimeEnvironment::with_root, ContentBlock::tool_use, …) across the
 # crate boundary. Dev-only: production builds never enable the feature.

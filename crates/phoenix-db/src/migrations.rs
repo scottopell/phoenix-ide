@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 
-use sqlx::{Row, Sqlite, SqlitePool, Transaction};
+use sqlx::{Connection, Row, Sqlite, SqlitePool, Transaction};
 
 use phoenix_core::work_scope::WorkScopeId;
 
@@ -494,6 +494,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 95,
         name: "reconcile_product_lifecycle_cutover",
         sql: MIGRATION_095,
+    },
+    Migration {
+        version: 96,
+        name: "add_llm_request_timed_out_outcome",
+        sql: MIGRATION_096,
     },
 ];
 
@@ -7813,6 +7818,164 @@ END;
 ";
 
 #[cfg(test)]
+mod migration_096_tests {
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    type SchemaRow = (String, i64, Option<String>);
+
+    async fn metrics_schema(pool: &sqlx::SqlitePool) -> ((i64, String), Vec<SchemaRow>) {
+        let table = sqlx::query_as(
+            "SELECT rootpage, sql FROM sqlite_schema
+             WHERE type = 'table' AND name = 'llm_request_metrics'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let indexes = sqlx::query_as(
+            "SELECT name, rootpage, sql FROM sqlite_schema
+             WHERE type = 'index' AND tbl_name = 'llm_request_metrics' ORDER BY name",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        (table, indexes)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn preserves_historical_rows_and_constraints_while_adding_timed_out() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE conversations (id TEXT PRIMARY KEY);
+             INSERT INTO conversations VALUES ('c'), ('root');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(super::MIGRATION_052)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (original_table, original_indexes) = metrics_schema(&pool).await;
+        let outcomes = [
+            "success",
+            "rate_limited",
+            "usage_limit_reached",
+            "server_error",
+            "invalid_response",
+            "server_overloaded",
+            "network_error",
+            "token_budget_exceeded",
+            "auth_error",
+            "request_rejected",
+            "cancelled",
+        ];
+        for (index, outcome) in outcomes.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO llm_request_metrics (
+                    request_id, retry_attempt, conversation_id, root_conversation_id,
+                    provider, model, transport, total_duration_ms,
+                    dispatch_to_first_provider_event_ms, dispatch_to_first_generation_event_ms,
+                    dispatch_to_first_visible_text_ms, provider_event_count,
+                    generation_event_count, visible_text_event_count,
+                    max_provider_gap_ms, max_generation_gap_ms, output_kind,
+                    stream_completed, outcome, created_at
+                 ) VALUES (?1, ?2, 'c', 'root', 'openai', 'gpt', ?3, ?4,
+                           1, 2, 3, 4, 5, 6, 7, 8, 'mixed', 1, ?5, ?6)",
+            )
+            .bind(format!("request-{index}"))
+            .bind(i64::try_from(index + 1).unwrap())
+            .bind(if index == 0 { "in_process" } else { "http_sse" })
+            .bind(i64::try_from(100 + index).unwrap())
+            .bind(outcome)
+            .bind(format!("2026-01-{:02}", index + 1))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        sqlx::raw_sql(
+            "CREATE TABLE _migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        super::run_migration_096(&pool, &super::MIGRATIONS[95])
+            .await
+            .unwrap();
+
+        let (migrated_table, migrated_indexes) = metrics_schema(&pool).await;
+        assert_eq!(migrated_table.0, original_table.0);
+        assert_eq!(migrated_indexes, original_indexes);
+        assert_eq!(
+            migrated_table.1,
+            original_table.1.replace(
+                "'network_error', 'token_budget_exceeded'",
+                "'network_error', 'timed_out', 'token_budget_exceeded'"
+            )
+        );
+        let writable_schema: i64 = sqlx::query_scalar("PRAGMA writable_schema")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(writable_schema, 0);
+
+        let rows: Vec<(String, i64, String, String, String, i64)> = sqlx::query_as(
+            "SELECT request_id, retry_attempt, conversation_id, root_conversation_id,
+                    outcome, total_duration_ms
+             FROM llm_request_metrics ORDER BY retry_attempt",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), outcomes.len());
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(row.0, format!("request-{index}"));
+            assert_eq!(row.1, i64::try_from(index + 1).unwrap());
+            assert_eq!(row.2, "c");
+            assert_eq!(row.3, "root");
+            assert_eq!(row.4, outcomes[index]);
+            assert_eq!(row.5, i64::try_from(100 + index).unwrap());
+        }
+        let foreign_keys: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pragma_foreign_key_list('llm_request_metrics')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(foreign_keys, 2);
+        sqlx::query("INSERT INTO llm_request_metrics VALUES ('timeout',12,'c','root','openai','gpt','websocket',600000,NULL,NULL,NULL,0,0,0,NULL,NULL,'none',0,'timed_out','2026-02-01')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(sqlx::query("INSERT INTO llm_request_metrics VALUES ('bad',1,'c','root','openai','gpt','websocket',1,NULL,NULL,NULL,0,0,0,NULL,NULL,'none',0,'unknown','2026-02-02')")
+            .execute(&pool)
+            .await
+            .is_err());
+        assert!(sqlx::query("INSERT INTO llm_request_metrics VALUES ('zero',0,'c','root','openai','gpt','websocket',1,NULL,NULL,NULL,0,0,0,NULL,NULL,'none',0,'timed_out','2026-02-03')")
+            .execute(&pool)
+            .await
+            .is_err());
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("PRAGMA integrity_check")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            "ok"
+        );
+    }
+}
+
+#[cfg(test)]
 mod migration_094_tests {
     use sqlx::sqlite::SqlitePoolOptions;
 
@@ -9051,6 +9214,103 @@ async fn migration_080_prepare(tx: &mut Transaction<'_, Sqlite>) -> DbResult<boo
     Ok(true)
 }
 
+struct WritableSchemaGuard {
+    connection: Option<sqlx::pool::PoolConnection<Sqlite>>,
+    armed: bool,
+}
+
+impl WritableSchemaGuard {
+    async fn enable(pool: &SqlitePool) -> DbResult<Self> {
+        let connection = pool.acquire().await?;
+        let mut guard = Self {
+            connection: Some(connection),
+            armed: true,
+        };
+        sqlx::query("PRAGMA writable_schema = ON")
+            .execute(guard.connection())
+            .await?;
+        Ok(guard)
+    }
+
+    fn connection(&mut self) -> &mut sqlx::SqliteConnection {
+        self.connection
+            .as_deref_mut()
+            .expect("guard owns connection")
+    }
+
+    async fn disable(mut self) -> DbResult<()> {
+        if let Err(error) = sqlx::query("PRAGMA writable_schema = OFF")
+            .execute(self.connection())
+            .await
+        {
+            if let Some(connection) = self.connection.as_mut() {
+                connection.close_on_drop();
+            }
+            return Err(error.into());
+        }
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for WritableSchemaGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Some(connection) = self.connection.as_mut() {
+                connection.close_on_drop();
+            }
+        }
+    }
+}
+
+async fn run_migration_096(pool: &SqlitePool, migration: &Migration) -> DbResult<()> {
+    let mut guard = WritableSchemaGuard::enable(pool).await?;
+    let result = async {
+        let mut tx = guard.connection().begin().await?;
+        let table_sql: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_schema
+             WHERE type = 'table' AND name = 'llm_request_metrics'",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let source = "'network_error', 'token_budget_exceeded'";
+        let target = "'network_error', 'timed_out', 'token_budget_exceeded'";
+        if table_sql.contains(source) && !table_sql.contains("'timed_out'") {
+            let schema_version: i64 = sqlx::query_scalar("PRAGMA schema_version")
+                .fetch_one(&mut *tx)
+                .await?;
+            let changed = sqlx::query(migration.sql).execute(&mut *tx).await?;
+            if changed.rows_affected() != 1 {
+                return Err(DbError::Serialization(format!(
+                    "migration 96 expected one migration-52 metrics schema row, changed {}",
+                    changed.rows_affected()
+                )));
+            }
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "PRAGMA schema_version = {}",
+                schema_version + 1
+            )))
+            .execute(&mut *tx)
+            .await?;
+        } else if !table_sql.contains(target) {
+            return Err(DbError::Serialization(
+                "migration 96 found an unrecognized llm_request_metrics schema".to_string(),
+            ));
+        }
+        sqlx::query("INSERT INTO _migrations (version, name) VALUES (?, ?)")
+            .bind(migration.version)
+            .bind(migration.name)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+    .await;
+    let restore = guard.disable().await;
+    result?;
+    restore
+}
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -9104,6 +9364,12 @@ pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
         if migration.version == 69 {
             retire_commission_review::backfill_settlements(pool, migration.version, migration.name)
                 .await?;
+            applied += 1;
+            continue;
+        }
+
+        if migration.version == 96 {
+            run_migration_096(pool, migration).await?;
             applied += 1;
             continue;
         }
@@ -9826,6 +10092,19 @@ CHECK (ownership_token IS NULL OR (
     AND trim(ownership_token) <> ''
     AND instr(ownership_token, char(0)) = 0
 ));";
+
+const MIGRATION_096: &str = r"
+UPDATE sqlite_schema
+SET sql = replace(
+    sql,
+    '''network_error'', ''token_budget_exceeded''',
+    '''network_error'', ''timed_out'', ''token_budget_exceeded'''
+)
+WHERE type = 'table'
+  AND name = 'llm_request_metrics'
+  AND instr(sql, '''network_error'', ''token_budget_exceeded''') > 0
+  AND instr(sql, '''timed_out''') = 0
+";
 
 #[cfg(test)]
 mod tests {

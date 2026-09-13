@@ -11,6 +11,53 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
+const DEFAULT_LLM_ATTEMPT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Total lifetime allowed for one provider attempt. The service captures one
+/// absolute instant at dispatch; transport retries and fallback cannot renew it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LlmAttemptDeadline(std::time::Duration);
+
+impl LlmAttemptDeadline {
+    #[must_use]
+    pub const fn new(duration: std::time::Duration) -> Self {
+        Self(duration)
+    }
+
+    #[must_use]
+    pub const fn duration(self) -> std::time::Duration {
+        self.0
+    }
+}
+
+impl Default for LlmAttemptDeadline {
+    fn default() -> Self {
+        Self(DEFAULT_LLM_ATTEMPT_DEADLINE)
+    }
+}
+
+pub(crate) async fn enforce_attempt_deadline<T>(
+    policy: LlmAttemptDeadline,
+    request: &LlmRequest,
+    operation: impl std::future::Future<Output = Result<T, LlmError>>,
+) -> Result<T, LlmError> {
+    let started_at = tokio::time::Instant::now();
+    let deadline_at = started_at + policy.duration();
+    if let Ok(result) = tokio::time::timeout_at(deadline_at, operation).await {
+        result
+    } else {
+        if let Some(telemetry) = &request.telemetry {
+            let _ = telemetry
+                .attempt_capture
+                .finalize_timed_out(started_at.elapsed());
+        }
+        Err(LlmError::timed_out(format!(
+            "LLM provider attempt exceeded its {}s total deadline",
+            policy.duration().as_secs()
+        )))
+    }
+}
+
 /// Empty placeholder used when no tags should be forwarded — keeps the
 /// provider-call signatures uniform without allocating per request.
 fn empty_tags() -> &'static BTreeMap<String, String> {
@@ -47,6 +94,7 @@ pub struct LlmServiceImpl {
     pub codex_credential: Option<Arc<CodexCredential>>,
     /// WebSocket continuation is shared by all calls through this service and
     /// isolated by the caller's prompt-cache cohort.
+    attempt_deadline: LlmAttemptDeadline,
     pub(crate) codex_ws_sessions: Arc<Mutex<openai::CodexWsSessions>>,
 }
 
@@ -73,6 +121,7 @@ impl LlmServiceImpl {
             use_codex_backend: false,
             codex_credential: None,
             codex_ws_sessions: Arc::new(Mutex::new(openai::CodexWsSessions::default())),
+            attempt_deadline: LlmAttemptDeadline::default(),
         }
     }
 
@@ -99,7 +148,14 @@ impl LlmServiceImpl {
             use_codex_backend: true,
             codex_credential: Some(codex_credential),
             codex_ws_sessions: Arc::new(Mutex::new(openai::CodexWsSessions::default())),
+            attempt_deadline: LlmAttemptDeadline::default(),
         }
+    }
+
+    #[must_use]
+    pub fn with_attempt_deadline(mut self, deadline: LlmAttemptDeadline) -> Self {
+        self.attempt_deadline = deadline;
+        self
     }
 
     /// Returns the tags map to attach on the wire for this request. Empty
@@ -121,22 +177,30 @@ impl LlmServiceImpl {
 #[async_trait]
 impl LlmService for LlmServiceImpl {
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
-        let result = self.complete_inner(request).await;
+        self.begin_provider_attempt(request, self.attempt_transport(false));
+        Box::pin(enforce_attempt_deadline(
+            self.attempt_deadline,
+            request,
+            async {
+                let result = self.complete_inner(request).await;
 
-        // On auth failure: invalidate credential cache and retry once (only if
-        // the credential source actually had something cached to invalidate —
-        // static keys can't be refreshed, so retrying would be pointless).
-        if let Err(ref e) = result {
-            if e.kind == super::LlmErrorKind::Auth && self.auth.invalidate().await {
-                tracing::warn!(
-                    model = %self.spec.id,
-                    "Auth failure; credential cache invalidated, retrying"
-                );
-                return self.complete_inner(request).await;
-            }
-        }
+                // On auth failure: invalidate credential cache and retry once (only if
+                // the credential source actually had something cached to invalidate —
+                // static keys can't be refreshed, so retrying would be pointless).
+                if let Err(ref e) = result {
+                    if e.kind == super::LlmErrorKind::Auth && self.auth.invalidate().await {
+                        tracing::warn!(
+                            model = %self.spec.id,
+                            "Auth failure; credential cache invalidated, retrying"
+                        );
+                        return self.complete_inner(request).await;
+                    }
+                }
 
-        result
+                result
+            },
+        ))
+        .await
     }
 
     async fn complete_streaming(
@@ -144,21 +208,25 @@ impl LlmService for LlmServiceImpl {
         request: &LlmRequest,
         chunk_tx: &mpsc::Sender<TokenChunk>,
     ) -> Result<LlmResponse, LlmError> {
-        let result = self.complete_streaming_inner(request, chunk_tx).await;
+        self.begin_provider_attempt(request, self.attempt_transport(true));
+        Box::pin(enforce_attempt_deadline(self.attempt_deadline, request, async {
+            let result = self.complete_streaming_inner(request, chunk_tx).await;
 
-        // On auth failure: invalidate cached credential so the next request uses
-        // fresh ones, but don't retry. Retrying a stream risks sending duplicate
-        // tokens through chunk_tx if any were emitted before the error.
-        if let Err(ref e) = result {
-            if e.kind == super::LlmErrorKind::Auth && self.auth.invalidate().await {
-                tracing::warn!(
-                    model = %self.spec.id,
-                    "Auth failure (streaming); credential cache invalidated (next request will use fresh credentials)"
-                );
+            // On auth failure: invalidate cached credential so the next request uses
+            // fresh ones, but don't retry. Retrying a stream risks sending duplicate
+            // tokens through chunk_tx if any were emitted before the error.
+            if let Err(ref e) = result {
+                if e.kind == super::LlmErrorKind::Auth && self.auth.invalidate().await {
+                    tracing::warn!(
+                        model = %self.spec.id,
+                        "Auth failure (streaming); credential cache invalidated (next request will use fresh credentials)"
+                    );
+                }
             }
-        }
 
-        result
+            result
+        }))
+        .await
     }
 
     fn model_id(&self) -> &str {
@@ -236,6 +304,20 @@ impl LlmServiceImpl {
         headers
     }
 
+    fn attempt_transport(&self, streaming: bool) -> super::LlmTransport {
+        if !streaming {
+            return super::LlmTransport::HttpJson;
+        }
+        if self.spec.backend.api_format() == ApiFormat::OpenAIResponses
+            && self.use_codex_backend
+            && crate::openai::supports_responses_lite(&self.spec.api_name)
+        {
+            super::LlmTransport::Websocket
+        } else {
+            super::LlmTransport::HttpSse
+        }
+    }
+
     fn begin_provider_attempt(&self, request: &LlmRequest, transport: super::LlmTransport) {
         if let Some(telemetry) = &request.telemetry {
             telemetry.attempt_capture.begin(
@@ -251,7 +333,6 @@ impl LlmServiceImpl {
         match self.spec.backend.api_format() {
             ApiFormat::Anthropic => {
                 let resolved = self.resolve_auth().await?;
-                self.begin_provider_attempt(request, super::LlmTransport::HttpJson);
                 // Build headers AFTER resolve so any per-request state the
                 // credential refresh updates (notably the codex account_id
                 // pulled from auth.json) is reflected in this request's
@@ -269,7 +350,6 @@ impl LlmServiceImpl {
             }
             ApiFormat::OpenAIResponses => {
                 let key = self.auth.resolve().await?.credential;
-                self.begin_provider_attempt(request, super::LlmTransport::HttpJson);
                 let headers = self.headers_for_provider();
                 openai::complete(
                     &self.spec,
@@ -284,7 +364,6 @@ impl LlmServiceImpl {
             }
             ApiFormat::OpenAIChatCompletions => {
                 let key = self.auth.resolve().await?.credential;
-                self.begin_provider_attempt(request, super::LlmTransport::HttpJson);
                 let headers = self.headers_for_provider();
                 openai::complete_chat(
                     &self.spec,
@@ -307,7 +386,6 @@ impl LlmServiceImpl {
         match self.spec.backend.api_format() {
             ApiFormat::Anthropic => {
                 let resolved = self.resolve_auth().await?;
-                self.begin_provider_attempt(request, super::LlmTransport::HttpSse);
                 let headers = self.headers_for_provider();
                 anthropic::complete_streaming(
                     &self.spec,
@@ -322,12 +400,6 @@ impl LlmServiceImpl {
             }
             ApiFormat::OpenAIResponses => {
                 let key = self.auth.resolve().await?.credential;
-                let transport = if self.use_codex_backend {
-                    super::LlmTransport::Websocket
-                } else {
-                    super::LlmTransport::HttpSse
-                };
-                self.begin_provider_attempt(request, transport);
                 let headers = self.headers_for_provider();
                 openai::complete_streaming(
                     &self.spec,
@@ -344,7 +416,6 @@ impl LlmServiceImpl {
             }
             ApiFormat::OpenAIChatCompletions => {
                 let key = self.auth.resolve().await?.credential;
-                self.begin_provider_attempt(request, super::LlmTransport::HttpSse);
                 let headers = self.headers_for_provider();
                 openai::complete_streaming_chat(
                     &self.spec,
@@ -379,6 +450,20 @@ mod tests {
     impl crate::registry::CredentialSource for MissingCredential {
         async fn get(&self) -> Option<String> {
             None
+        }
+
+        async fn invalidate(&self) -> bool {
+            false
+        }
+    }
+
+    #[derive(Debug)]
+    struct DelayedCredential;
+
+    #[async_trait::async_trait]
+    impl crate::registry::CredentialSource for DelayedCredential {
+        async fn get(&self) -> Option<String> {
+            std::future::pending().await
         }
 
         async fn invalidate(&self) -> bool {
@@ -434,8 +519,236 @@ mod tests {
         t
     }
 
+    fn begin_test_attempt(capture: &crate::LlmAttemptCapture, request: &LlmRequest) {
+        capture.begin(
+            request.telemetry.as_ref().expect("test telemetry"),
+            "openai",
+            "gpt-test",
+            crate::LlmTransport::Websocket,
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_non_visible_progress_cannot_extend_absolute_deadline() {
+        let (request, capture) = request_with_capture();
+        begin_test_attempt(&capture, &request);
+        let progress_capture = capture.clone();
+        let operation = async move {
+            loop {
+                // test-timing-allow: paused Tokio time is the deadline behavior under test
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                progress_capture.publish_progress(crate::ProviderStreamTelemetry {
+                    dispatch_to_first_provider_event_ms: Some(1_000),
+                    dispatch_to_first_generation_event_ms: Some(1_000),
+                    dispatch_to_first_visible_text_ms: None,
+                    provider_event_count: 1,
+                    generation_event_count: 1,
+                    visible_text_event_count: 0,
+                    max_provider_gap_ms: Some(1_000),
+                    max_generation_gap_ms: Some(1_000),
+                    output_kind: crate::StreamTelemetryOutputKind::Reasoning,
+                    completed: false,
+                });
+            }
+            #[allow(unreachable_code)]
+            Ok::<(), LlmError>(())
+        };
+        let task = tokio::spawn({
+            let request = request.clone();
+            async move {
+                enforce_attempt_deadline(
+                    LlmAttemptDeadline::new(std::time::Duration::from_secs(10)),
+                    &request,
+                    operation,
+                )
+                .await
+            }
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(9)).await;
+        assert!(!task.is_finished());
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        let error = task.await.unwrap().expect_err("deadline must win");
+        assert_eq!(error.kind, crate::LlmErrorKind::TimedOut);
+        let metrics = capture.finalized().expect("timeout metric");
+        assert_eq!(metrics.outcome, crate::LlmAttemptOutcome::TimedOut);
+        assert_eq!(metrics.total_duration_ms, 10_000);
+        assert_eq!(metrics.stream.visible_text_event_count, 0);
+        assert!(!metrics.stream.completed);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fallback_phase_receives_only_remaining_absolute_budget() {
+        let (request, capture) = request_with_capture();
+        begin_test_attempt(&capture, &request);
+        let reached_fallback = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fallback_flag = reached_fallback.clone();
+        let operation = async move {
+            // test-timing-allow: paused Tokio time models the pre-fallback phase
+            tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+            fallback_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            // test-timing-allow: paused Tokio time proves fallback cannot renew the deadline
+            tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+            Ok::<(), LlmError>(())
+        };
+        let task = tokio::spawn({
+            let request = request.clone();
+            async move {
+                enforce_attempt_deadline(
+                    LlmAttemptDeadline::new(std::time::Duration::from_secs(10)),
+                    &request,
+                    operation,
+                )
+                .await
+            }
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(8)).await;
+        tokio::task::yield_now().await;
+        assert!(reached_fallback.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!task.is_finished());
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            task.await.unwrap().expect_err("shared deadline").kind,
+            crate::LlmErrorKind::TimedOut
+        );
+        assert_eq!(
+            capture
+                .finalized()
+                .expect("timeout metric")
+                .total_duration_ms,
+            10_000
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn success_before_deadline_remains_the_single_terminal_metric() {
+        let (request, capture) = request_with_capture();
+        begin_test_attempt(&capture, &request);
+        let result = enforce_attempt_deadline(
+            LlmAttemptDeadline::new(std::time::Duration::from_secs(10)),
+            &request,
+            async {
+                // test-timing-allow: paused Tokio time places success before the deadline
+                tokio::time::sleep(std::time::Duration::from_secs(9)).await;
+                Ok::<_, LlmError>(())
+            },
+        )
+        .await;
+        assert!(result.is_ok());
+        let success = capture
+            .finalize(crate::LlmAttemptFinalization {
+                stream: Some(crate::ProviderStreamTelemetry::non_streaming()),
+                outcome: crate::LlmAttemptOutcome::Success,
+            })
+            .expect("started attempt");
+        assert_eq!(success.outcome, crate::LlmAttemptOutcome::Success);
+        assert_eq!(capture.finalize_cancelled(), Some(success));
+    }
+
+    #[test]
+    fn unsupported_codex_model_attempt_transport_is_http_sse() {
+        let mut spec = all_models()
+            .into_iter()
+            .find(|model| model.id == "gpt-5.5")
+            .expect("gpt-5.5 must be in the model registry");
+        spec.backend = crate::ModelBackend::OpenAIResponses;
+        spec.api_name = "gpt-5.5".to_string();
+        let mut service = LlmServiceImpl::new(
+            spec,
+            LlmAuth::new(Arc::new(MissingCredential), AuthStyle::PlainBearer),
+            None,
+            None,
+            None,
+            vec![],
+            BTreeMap::new(),
+        );
+        service.use_codex_backend = true;
+
+        assert_eq!(
+            service.attempt_transport(true),
+            crate::LlmTransport::HttpSse
+        );
+    }
+
     #[tokio::test]
-    async fn local_auth_failure_does_not_finalize_provider_attempt() {
+    async fn unsupported_codex_auth_failure_records_http_sse_transport() {
+        let mut spec = all_models()
+            .into_iter()
+            .find(|model| model.id == "gpt-5.5")
+            .expect("gpt-5.5 must be in the model registry");
+        spec.backend = crate::ModelBackend::OpenAIResponses;
+        spec.api_name = "gpt-5.5".to_string();
+        let mut service = LlmServiceImpl::new(
+            spec,
+            LlmAuth::new(Arc::new(MissingCredential), AuthStyle::PlainBearer),
+            None,
+            None,
+            None,
+            vec![],
+            BTreeMap::new(),
+        );
+        service.use_codex_backend = true;
+        let service: Arc<dyn LlmService> = Arc::new(service);
+        let service = crate::LoggingService::new(service, "openai", crate::LlmTransport::HttpSse);
+        let (request, capture) = request_with_capture();
+        let (chunk_tx, _chunk_rx) = mpsc::channel(1);
+
+        let error = service
+            .complete_streaming(&request, &chunk_tx)
+            .await
+            .expect_err("missing credential should fail before adapter dispatch");
+
+        assert_eq!(error.kind, crate::LlmErrorKind::Auth);
+        assert_eq!(
+            capture.finalized().expect("attempt finalized").transport,
+            crate::LlmTransport::HttpSse
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unsupported_codex_deadline_before_adapter_records_http_sse_transport() {
+        let mut spec = all_models()
+            .into_iter()
+            .find(|model| model.id == "gpt-5.5")
+            .expect("gpt-5.5 must be in the model registry");
+        spec.backend = crate::ModelBackend::OpenAIResponses;
+        spec.api_name = "gpt-5.5".to_string();
+        let mut service = LlmServiceImpl::new(
+            spec,
+            LlmAuth::new(Arc::new(DelayedCredential), AuthStyle::PlainBearer),
+            None,
+            None,
+            None,
+            vec![],
+            BTreeMap::new(),
+        )
+        .with_attempt_deadline(LlmAttemptDeadline::new(std::time::Duration::from_millis(
+            100,
+        )));
+        service.use_codex_backend = true;
+        let service: Arc<dyn LlmService> = Arc::new(service);
+        let service = crate::LoggingService::new(service, "openai", crate::LlmTransport::HttpSse);
+        let (request, capture) = request_with_capture();
+        let (chunk_tx, _chunk_rx) = mpsc::channel(1);
+
+        let error = service
+            .complete_streaming(&request, &chunk_tx)
+            .await
+            .expect_err("deadline wins before credential or adapter work");
+
+        assert_eq!(error.kind, crate::LlmErrorKind::TimedOut);
+        assert_eq!(
+            capture.finalized().expect("attempt finalized").transport,
+            crate::LlmTransport::HttpSse
+        );
+    }
+
+    #[tokio::test]
+    async fn local_auth_failure_finalizes_the_service_dispatched_attempt() {
         let spec = all_models()
             .into_iter()
             .find(|model| model.id == "claude-sonnet-5")
@@ -460,7 +773,13 @@ mod tests {
             .expect_err("missing local credential should fail");
 
         assert_eq!(error.kind, crate::LlmErrorKind::Auth);
-        assert_eq!(capture.finalized(), None);
+        assert_eq!(
+            capture
+                .finalized()
+                .expect("service attempt is terminal")
+                .outcome,
+            crate::LlmAttemptOutcome::AuthError
+        );
     }
 
     fn chat_gateway_service_with_api_name(api_name: &str) -> LlmServiceImpl {

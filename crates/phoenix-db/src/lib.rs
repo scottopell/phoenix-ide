@@ -802,6 +802,7 @@ fn llm_attempt_outcome_db(value: &LlmAttemptOutcome) -> &'static str {
         LlmAttemptOutcome::InvalidResponse => "invalid_response",
         LlmAttemptOutcome::ServerOverloaded => "server_overloaded",
         LlmAttemptOutcome::NetworkError => "network_error",
+        LlmAttemptOutcome::TimedOut => "timed_out",
         LlmAttemptOutcome::TokenBudgetExceeded => "token_budget_exceeded",
         LlmAttemptOutcome::AuthError => "auth_error",
         LlmAttemptOutcome::RequestRejected => "request_rejected",
@@ -818,6 +819,7 @@ fn llm_attempt_outcome_from_db(value: &str) -> DbResult<LlmAttemptOutcome> {
         "invalid_response" => Ok(LlmAttemptOutcome::InvalidResponse),
         "server_overloaded" => Ok(LlmAttemptOutcome::ServerOverloaded),
         "network_error" => Ok(LlmAttemptOutcome::NetworkError),
+        "timed_out" => Ok(LlmAttemptOutcome::TimedOut),
         "token_budget_exceeded" => Ok(LlmAttemptOutcome::TokenBudgetExceeded),
         "auth_error" => Ok(LlmAttemptOutcome::AuthError),
         "request_rejected" => Ok(LlmAttemptOutcome::RequestRejected),
@@ -11577,7 +11579,8 @@ impl Database {
         Ok(transcript_generation)
     }
 
-    /// Inserts or replaces one finalized provider-attempt metrics row, keyed by request and retry.
+    /// Inserts one finalized provider-attempt metrics row. The first terminal
+    /// row for a request and retry identity remains authoritative.
     ///
     /// # Errors
     ///
@@ -11591,25 +11594,7 @@ impl Database {
              provider_event_count, generation_event_count, visible_text_event_count, max_provider_gap_ms, max_generation_gap_ms, \
              output_kind, stream_completed, outcome, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20) \
-             ON CONFLICT(request_id, retry_attempt) DO UPDATE SET \
-             conversation_id = excluded.conversation_id, \
-             root_conversation_id = excluded.root_conversation_id, \
-             provider = excluded.provider, \
-             model = excluded.model, \
-             transport = excluded.transport, \
-             total_duration_ms = excluded.total_duration_ms, \
-             dispatch_to_first_provider_event_ms = excluded.dispatch_to_first_provider_event_ms, \
-             dispatch_to_first_generation_event_ms = excluded.dispatch_to_first_generation_event_ms, \
-             dispatch_to_first_visible_text_ms = excluded.dispatch_to_first_visible_text_ms, \
-             provider_event_count = excluded.provider_event_count, \
-             generation_event_count = excluded.generation_event_count, \
-             visible_text_event_count = excluded.visible_text_event_count, \
-             max_provider_gap_ms = excluded.max_provider_gap_ms, \
-             max_generation_gap_ms = excluded.max_generation_gap_ms, \
-             output_kind = excluded.output_kind, \
-             stream_completed = excluded.stream_completed, \
-             outcome = excluded.outcome, \
-             created_at = excluded.created_at"
+             ON CONFLICT(request_id, retry_attempt) DO NOTHING"
         )
         .bind(&metrics.request_id)
         .bind(i64::from(metrics.retry_attempt))
@@ -23792,6 +23777,82 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn timed_out_llm_metric_round_trips_and_upserts_idempotently() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-timeout", "slug-timeout", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let metric = LlmAttemptMetrics {
+            conversation_id: "conv-timeout".to_string(),
+            root_conversation_id: "conv-timeout".to_string(),
+            request_id: "req-timeout".to_string(),
+            retry_attempt: 1,
+            provider: "openai".to_string(),
+            model: "gpt-test".to_string(),
+            transport: LlmTransport::Websocket,
+            total_duration_ms: 600_000,
+            stream: ProviderStreamTelemetry {
+                dispatch_to_first_provider_event_ms: Some(10),
+                dispatch_to_first_generation_event_ms: Some(20),
+                dispatch_to_first_visible_text_ms: None,
+                provider_event_count: 8,
+                generation_event_count: 7,
+                visible_text_event_count: 0,
+                max_provider_gap_ms: Some(15),
+                max_generation_gap_ms: Some(15),
+                output_kind: StreamTelemetryOutputKind::Reasoning,
+                completed: false,
+            },
+            outcome: LlmAttemptOutcome::TimedOut,
+        };
+
+        db.upsert_llm_request_metrics(&metric).await.unwrap();
+        db.upsert_llm_request_metrics(&metric).await.unwrap();
+
+        let rows = db
+            .llm_request_metrics_for_request("req-timeout")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].metrics.outcome, LlmAttemptOutcome::TimedOut);
+        assert_eq!(rows[0].metrics.stream.provider_event_count, 8);
+        assert_eq!(rows[0].metrics.stream.visible_text_event_count, 0);
+        assert!(!rows[0].metrics.stream.completed);
+    }
+
+    #[tokio::test]
+    async fn conflicting_terminal_metric_cannot_overwrite_first_winner() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-first-wins", "first-wins", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let mut first = LlmAttemptMetrics {
+            conversation_id: "conv-first-wins".to_string(),
+            root_conversation_id: "conv-first-wins".to_string(),
+            request_id: "req-first-wins".to_string(),
+            retry_attempt: 1,
+            provider: "openai".to_string(),
+            model: "gpt".to_string(),
+            transport: LlmTransport::Websocket,
+            total_duration_ms: 600_000,
+            stream: ProviderStreamTelemetry::non_streaming(),
+            outcome: LlmAttemptOutcome::TimedOut,
+        };
+        db.upsert_llm_request_metrics(&first).await.unwrap();
+        first.outcome = LlmAttemptOutcome::Success;
+        first.total_duration_ms = 1;
+        db.upsert_llm_request_metrics(&first).await.unwrap();
+
+        let rows = db
+            .llm_request_metrics_for_request("req-first-wins")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].metrics.outcome, LlmAttemptOutcome::TimedOut);
+        assert_eq!(rows[0].metrics.total_duration_ms, 600_000);
+    }
+
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn usage_recent_llm_metrics_returns_all_window_rows() {
@@ -23887,12 +23948,12 @@ mod tests {
         let updated = rows
             .iter()
             .find(|row| row.request_id == "req-1")
-            .expect("updated request row");
+            .expect("first terminal request row");
         assert_eq!(updated.retry_attempt, 1);
         assert_eq!(updated.provider, "anthropic");
         assert_eq!(updated.model, "claude-sonnet-5");
         assert_eq!(updated.transport, LlmTransport::HttpSse);
-        assert_eq!(updated.dispatch_to_first_generation_event_ms, Some(910));
+        assert_eq!(updated.dispatch_to_first_generation_event_ms, Some(900));
         assert_eq!(updated.outcome, LlmAttemptOutcome::Success);
 
         let all_rows = db

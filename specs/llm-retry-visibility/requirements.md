@@ -13,33 +13,25 @@ backoffs and I have no way to tell.
 ## Background
 
 When the LLM client returns a retryable `LlmError`
-(`crates/phoenix-ide/src/llm/error.rs:111` — `Network | RateLimit |
-ServerError`), the executor maps it to an `LlmOutcome` and feeds an
+(`Network | RateLimit | ServerError | TimedOut`), the executor maps it to an `LlmOutcome` and feeds an
 `Event::LlmError` to the state machine. The state machine
 (`handle_core_error_retry` in `transition.rs`, and `handle_core_continuation`
 for the post-tool-round path) bumps the `attempt` counter, schedules a
 backoff via `Effect::ScheduleRetry { delay, attempt }`, and emits an
 `Effect::NotifyStateChange`. The executor's `Effect::ScheduleRetry`
-handler (`executor.rs:1408-1418`) spawns a sleep task that emits
+handler (`ConversationRuntime::execute_effect`) spawns a sleep task that emits
 `EffectOutcome::RetryTimeout` to drive `RetryTimeout -> RequestLlm`
 when the delay elapses.
 
 The state's `attempt` field is already surfaced on the wire as part of
 the `StateChange.state` payload (clients can read `state.attempt`).
-What's currently *lost* between the executor and the client:
+The retry-attempt projection carries the following context between the executor and the client:
 
-- **The reason** (`RateLimit | ServerError | Network`), classified by
-  `llm_error_to_outcome` (`executor.rs:3570`) into an `LlmOutcome`
-  variant that has no on-the-wire representation during the retry
-  window.
-- **The backoff delay** (`delay: Duration` in `Effect::ScheduleRetry`),
-  known only to the spawned sleep task.
-- **The quota reset timestamp** (`resets_at`) — present on
-  `QuotaDetails` and rendered into the user-facing message string when
-  the turn *terminates* via `UserFacingError`, but never surfaced
-  during the retry loop itself.
-- **The maximum attempts** — `MAX_RETRY_ATTEMPTS = 3` in
-  `transition.rs:183` — implicit and not on the wire.
+- **The reason** (`RateLimit | ServerError | Network | TimedOut`), classified by
+  `llm_error_to_outcome` and surfaced as `LlmAttempt.reason`.
+- **The backoff delay**, surfaced as `LlmAttempt.backing_off_ms`.
+- **The quota reset timestamp**, surfaced as `LlmAttempt.resets_at` when known.
+- **The maximum attempts**, surfaced as `LlmAttempt.max_attempts`.
 
 This spec adds the wire/runtime contract for surfacing those values
 during the backoff window. The display side that consumes them is
@@ -64,7 +56,7 @@ LlmAttempt {
     sequence_id: i64,
     attempt: u32,           // 1-indexed, matches state.attempt
     max_attempts: u32,      // MAX_RETRY_ATTEMPTS = 3
-    reason: LlmAttemptReason,   // RateLimit | ServerError | Network
+    reason: LlmAttemptReason,   // RateLimit | ServerError | Network | TimedOut
     backing_off_ms: u64,    // the delay value in Effect::ScheduleRetry
     resets_at: Option<DateTime<Utc>>,  // RFC3339 string, when known
 }
@@ -81,12 +73,13 @@ data, not by string parsing.
 ### REQ-LRV-002: Retry Reason Classification
 
 WHEN classifying an `LlmError` into an `LlmAttemptReason`
-THE SYSTEM SHALL map exactly the three retryable `LlmErrorKind`
+THE SYSTEM SHALL map exactly the four retryable `LlmErrorKind`
 variants:
 
 - `LlmErrorKind::RateLimit` -> `LlmAttemptReason::RateLimit`
 - `LlmErrorKind::ServerError` -> `LlmAttemptReason::ServerError`
 - `LlmErrorKind::Network` -> `LlmAttemptReason::Network`
+- `LlmErrorKind::TimedOut` -> `LlmAttemptReason::TimedOut`
 
 WHEN an `LlmError` with a non-retryable kind arrives
 THE SYSTEM SHALL NOT emit `LlmAttempt` (the state machine terminates
