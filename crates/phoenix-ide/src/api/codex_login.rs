@@ -483,10 +483,7 @@ async fn settle_pkce(
     // an OpenAI request — that request must hit the new credential, not the
     // pre-login state.
     if outcome.is_ok() {
-        let registry = llm_registry.clone();
-        tokio::task::spawn_blocking(move || registry.reload_codex_credential())
-            .await
-            .ok();
+        llm_registry.reload_codex_credential().await;
     }
     {
         let mut inner = session.inner.lock().await;
@@ -819,10 +816,7 @@ async fn settle_device(
     }
     // Reload before publishing status — see settle_pkce for the rationale.
     if outcome.is_ok() {
-        let registry = llm_registry.clone();
-        tokio::task::spawn_blocking(move || registry.reload_codex_credential())
-            .await
-            .ok();
+        llm_registry.reload_codex_credential().await;
     }
     {
         let mut status = session.status.lock().await;
@@ -1021,10 +1015,7 @@ pub async fn signout(State(state): State<AppState>) -> Json<serde_json::Value> {
         Ok(()) => true,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
         Err(e) => {
-            let registry = state.llm_registry.clone();
-            let restored = tokio::task::spawn_blocking(move || registry.reload_codex_credential())
-                .await
-                .ok();
+            let restored = Some(state.llm_registry.reload_codex_credential().await);
             tracing::warn!(error = %e, path = %auth_path.display(),
                 credential_restored = restored.as_ref().is_some_and(|o| o.credential_loaded),
                 "codex_login: signout failed to remove auth file");
@@ -1034,10 +1025,7 @@ pub async fn signout(State(state): State<AppState>) -> Json<serde_json::Value> {
             }));
         }
     };
-    let registry = state.llm_registry.clone();
-    let outcome = tokio::task::spawn_blocking(move || registry.reload_codex_credential())
-        .await
-        .ok();
+    let outcome = Some(state.llm_registry.reload_codex_credential().await);
     tracing::info!(
         removed,
         drained_pkce_sessions = drained,

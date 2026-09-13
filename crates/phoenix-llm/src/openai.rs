@@ -1713,12 +1713,16 @@ fn translate_to_backend_request(
     }
 }
 
+fn is_gpt_56_or_astra(api_name: &str) -> bool {
+    api_name == "gpt-5.6" || api_name.starts_with("gpt-5.6-") || api_name == "gpt-6-astra"
+}
+
 fn supports_responses_lite(api_name: &str) -> bool {
-    api_name == "gpt-5.6" || api_name.starts_with("gpt-5.6-")
+    is_gpt_56_or_astra(api_name)
 }
 
 fn supports_explicit_prompt_cache(api_name: &str) -> bool {
-    api_name == "gpt-5.6" || api_name.starts_with("gpt-5.6-")
+    is_gpt_56_or_astra(api_name)
 }
 
 /// Preserve `OpenAI`'s historical read boundaries while leaving the latest
@@ -4187,6 +4191,17 @@ mod tests {
         .unwrap();
         assert_eq!(explicit["reasoning"]["effort"], "max");
         assert_eq!(explicit["max_output_tokens"], 16_384);
+    }
+
+    #[test]
+    fn astra_uses_responses_lite_only_on_the_codex_route() {
+        let request = empty_request();
+
+        let codex = translate_to_backend_request("gpt-6-astra", &request, true);
+        let platform = translate_to_backend_request("gpt-6-astra", &request, false);
+
+        assert!(matches!(codex, ResponsesBackendRequest::CodexLite(_)));
+        assert!(matches!(platform, ResponsesBackendRequest::Platform(_)));
     }
 
     #[test]

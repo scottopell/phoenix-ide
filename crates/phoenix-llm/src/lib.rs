@@ -57,7 +57,7 @@ pub use codex_credential::{
     CodexCredential, CODEX_BACKEND_URL, CODEX_BRIDGE_CONTEXT_WINDOW, CODEX_USAGE_URL,
 };
 pub use credential_helper::{CredentialHelper, CredentialStatus};
-pub use discovery::{discover_models, DiscoveredModels, DiscoveryConfig};
+pub use discovery::{discover_codex_models, discover_models, DiscoveredModels, DiscoveryConfig};
 pub use error::{LlmAttemptReason, LlmError, LlmErrorKind};
 // AutoRetryPolicy / UserResumePolicy live in phoenix-core
 // (phoenix_core::domain::retry_policy) and are not re-exported here: nothing
