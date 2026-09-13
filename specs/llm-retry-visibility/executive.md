@@ -3,15 +3,12 @@
 ## Requirements Summary
 
 Phoenix already retries retryable `LlmError`s
-(`Network | RateLimit | ServerError`) in the state machine via
+(`Network | RateLimit | ServerError | TimedOut`) in the state machine via
 `Effect::ScheduleRetry`, with exponential backoff (1s, 2s, 4s) and
-a global cap of `MAX_RETRY_ATTEMPTS = 3`. The retry count is
-already on the wire via `StateChange.state.attempt`. What's missing
-is *why* a retry is happening and how long until the next one — both
-known to the executor at retry-schedule time but never surfaced to
-the client.
+a global cap of `MAX_RETRY_ATTEMPTS = 3`. Retry count, reason, backoff duration, reset time, and maximum attempts are
+surfaced through the typed `LlmAttempt` event.
 
-This spec adds:
+The implemented contract includes:
 
 - **A new SSE event `LlmAttempt`** carrying `(attempt, max_attempts,
   reason, backing_off_ms, resets_at?)`, emitted from the executor's

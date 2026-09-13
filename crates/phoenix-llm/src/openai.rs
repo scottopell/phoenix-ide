@@ -1725,7 +1725,7 @@ fn translate_to_backend_request(
     }
 }
 
-fn supports_responses_lite(api_name: &str) -> bool {
+pub(crate) fn supports_responses_lite(api_name: &str) -> bool {
     api_name == "gpt-5.6" || api_name.starts_with("gpt-5.6-")
 }
 

@@ -308,7 +308,10 @@ impl LlmServiceImpl {
         if !streaming {
             return super::LlmTransport::HttpJson;
         }
-        if self.spec.backend.api_format() == ApiFormat::OpenAIResponses && self.use_codex_backend {
+        if self.spec.backend.api_format() == ApiFormat::OpenAIResponses
+            && self.use_codex_backend
+            && crate::openai::supports_responses_lite(&self.spec.api_name)
+        {
             super::LlmTransport::Websocket
         } else {
             super::LlmTransport::HttpSse
@@ -447,6 +450,20 @@ mod tests {
     impl crate::registry::CredentialSource for MissingCredential {
         async fn get(&self) -> Option<String> {
             None
+        }
+
+        async fn invalidate(&self) -> bool {
+            false
+        }
+    }
+
+    #[derive(Debug)]
+    struct DelayedCredential;
+
+    #[async_trait::async_trait]
+    impl crate::registry::CredentialSource for DelayedCredential {
+        async fn get(&self) -> Option<String> {
+            std::future::pending().await
         }
 
         async fn invalidate(&self) -> bool {
@@ -630,6 +647,104 @@ mod tests {
             .expect("started attempt");
         assert_eq!(success.outcome, crate::LlmAttemptOutcome::Success);
         assert_eq!(capture.finalize_cancelled(), Some(success));
+    }
+
+    #[test]
+    fn unsupported_codex_model_attempt_transport_is_http_sse() {
+        let mut spec = all_models()
+            .into_iter()
+            .find(|model| model.id == "gpt-5.5")
+            .expect("gpt-5.5 must be in the model registry");
+        spec.backend = crate::ModelBackend::OpenAIResponses;
+        spec.api_name = "gpt-5.5".to_string();
+        let mut service = LlmServiceImpl::new(
+            spec,
+            LlmAuth::new(Arc::new(MissingCredential), AuthStyle::PlainBearer),
+            None,
+            None,
+            None,
+            vec![],
+            BTreeMap::new(),
+        );
+        service.use_codex_backend = true;
+
+        assert_eq!(
+            service.attempt_transport(true),
+            crate::LlmTransport::HttpSse
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_codex_auth_failure_records_http_sse_transport() {
+        let mut spec = all_models()
+            .into_iter()
+            .find(|model| model.id == "gpt-5.5")
+            .expect("gpt-5.5 must be in the model registry");
+        spec.backend = crate::ModelBackend::OpenAIResponses;
+        spec.api_name = "gpt-5.5".to_string();
+        let mut service = LlmServiceImpl::new(
+            spec,
+            LlmAuth::new(Arc::new(MissingCredential), AuthStyle::PlainBearer),
+            None,
+            None,
+            None,
+            vec![],
+            BTreeMap::new(),
+        );
+        service.use_codex_backend = true;
+        let service: Arc<dyn LlmService> = Arc::new(service);
+        let service = crate::LoggingService::new(service, "openai", crate::LlmTransport::HttpSse);
+        let (request, capture) = request_with_capture();
+        let (chunk_tx, _chunk_rx) = mpsc::channel(1);
+
+        let error = service
+            .complete_streaming(&request, &chunk_tx)
+            .await
+            .expect_err("missing credential should fail before adapter dispatch");
+
+        assert_eq!(error.kind, crate::LlmErrorKind::Auth);
+        assert_eq!(
+            capture.finalized().expect("attempt finalized").transport,
+            crate::LlmTransport::HttpSse
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unsupported_codex_deadline_before_adapter_records_http_sse_transport() {
+        let mut spec = all_models()
+            .into_iter()
+            .find(|model| model.id == "gpt-5.5")
+            .expect("gpt-5.5 must be in the model registry");
+        spec.backend = crate::ModelBackend::OpenAIResponses;
+        spec.api_name = "gpt-5.5".to_string();
+        let mut service = LlmServiceImpl::new(
+            spec,
+            LlmAuth::new(Arc::new(DelayedCredential), AuthStyle::PlainBearer),
+            None,
+            None,
+            None,
+            vec![],
+            BTreeMap::new(),
+        )
+        .with_attempt_deadline(LlmAttemptDeadline::new(std::time::Duration::from_millis(
+            100,
+        )));
+        service.use_codex_backend = true;
+        let service: Arc<dyn LlmService> = Arc::new(service);
+        let service = crate::LoggingService::new(service, "openai", crate::LlmTransport::HttpSse);
+        let (request, capture) = request_with_capture();
+        let (chunk_tx, _chunk_rx) = mpsc::channel(1);
+
+        let error = service
+            .complete_streaming(&request, &chunk_tx)
+            .await
+            .expect_err("deadline wins before credential or adapter work");
+
+        assert_eq!(error.kind, crate::LlmErrorKind::TimedOut);
+        assert_eq!(
+            capture.finalized().expect("attempt finalized").transport,
+            crate::LlmTransport::HttpSse
+        );
     }
 
     #[tokio::test]

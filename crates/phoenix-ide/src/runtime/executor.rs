@@ -1527,15 +1527,25 @@ impl Drop for AuthorityBoundaryConsumerGuard {
     }
 }
 
-fn persist_llm_metrics_independently<S>(storage: S, metrics: phoenix_llm::LlmAttemptMetrics)
+fn persist_llm_metrics_independently<S>(
+    storage: S,
+    metrics: phoenix_llm::LlmAttemptMetrics,
+    fatal_cancellation: Option<CancellationToken>,
+) -> tokio::task::JoinHandle<()>
 where
     S: StateStore + Clone + Send + Sync + 'static,
 {
     tokio::spawn(async move {
-        if let Err(error) = storage.upsert_llm_request_metrics(&metrics).await {
-            tracing::warn!(%error, "failed to write llm_request_metrics row");
+        tokio::select! {
+            biased;
+            () = wait_for_optional_cancellation(fatal_cancellation) => {}
+            result = storage.upsert_llm_request_metrics(&metrics) => {
+                if let Err(error) = result {
+                    tracing::warn!(%error, "failed to write llm_request_metrics row");
+                }
+            }
         }
-    });
+    })
 }
 
 #[derive(Debug)]
@@ -2887,7 +2897,11 @@ where
                         if metrics.outcome == phoenix_llm::LlmAttemptOutcome::TimedOut {
                             self.abort_active_llm_task();
                             self.active_llm_attempt = None;
-                            persist_llm_metrics_independently(self.storage.clone(), metrics);
+                            drop(persist_llm_metrics_independently(
+                                self.storage.clone(),
+                                metrics,
+                                self.fatal_external_effect_cancellation.clone(),
+                            ));
                             return Box::pin(self.process_outcome(EffectOutcome::Llm(
                                 LlmOutcome::TimedOut {
                                     message: "LLM provider attempt timed out".to_string(),
@@ -14446,6 +14460,58 @@ mod authoritative_user_message_effect_tests {
             capture.finalized().expect("terminal capture").outcome,
             phoenix_llm::LlmAttemptOutcome::Cancelled
         );
+    }
+
+    #[tokio::test]
+    async fn fatal_fence_cancels_independent_timeout_metrics_sink() {
+        let (rt, storage, _broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let (started, release) = storage.gate_metrics_write();
+        let fence = Arc::new(crate::runtime::FatalLocalAuthorityFence::new());
+        let cancellation = fence.external_effect_cancellation();
+        let capture = phoenix_llm::LlmAttemptCapture::new();
+        let telemetry = phoenix_llm::LlmRequestTelemetry {
+            conversation_id: rt.context.conversation_id.clone(),
+            root_conversation_id: rt.context.root_conversation_id.clone(),
+            request_id: "fenced-timeout-metrics".to_string(),
+            retry_attempt: 1,
+            attempt_capture: capture.clone(),
+        };
+        capture.begin(
+            &telemetry,
+            "openai",
+            "gpt-test",
+            phoenix_llm::LlmTransport::Websocket,
+        );
+        let metrics = capture
+            .finalize_timed_out(std::time::Duration::from_secs(600))
+            .expect("timeout metric");
+        let task =
+            persist_llm_metrics_independently(storage.clone(), metrics.clone(), Some(cancellation));
+        started
+            .await
+            .expect("metrics write entered before fatal close");
+
+        fence.close("test");
+        task.await.expect("fenced metrics sink exits");
+        assert!(storage.recorded_llm_request_metrics().is_empty());
+        drop(release);
+        assert!(storage.recorded_llm_request_metrics().is_empty());
+
+        let (mut never_started, _never_release) = storage.gate_metrics_write();
+        let task = persist_llm_metrics_independently(
+            storage.clone(),
+            metrics,
+            Some(fence.external_effect_cancellation()),
+        );
+        task.await.expect("pre-fenced metrics sink exits");
+        assert!(
+            never_started.try_recv().is_err(),
+            "pre-fenced metrics persistence must not start"
+        );
+        assert!(storage.recorded_llm_request_metrics().is_empty());
     }
 
     #[tokio::test]
