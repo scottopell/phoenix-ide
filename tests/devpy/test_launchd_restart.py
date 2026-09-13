@@ -71,6 +71,7 @@ class FakeLaunchctl:
 
     def signal_hup(self):
         self.signals.append("HUP")
+        return 100
 
     def wait_for_new_pid(self, previous_pid):
         if previous_pid != 100:
@@ -82,20 +83,31 @@ class RestartHelperTests(unittest.TestCase):
     def test_signal_uses_launchctl_hup_without_unloading_target(self):
         with tempfile.TemporaryDirectory() as td:
             manifest = make_manifest(Path(td))
-            run = mock.Mock(return_value=subprocess.CompletedProcess([], 0, "", ""))
+            run = mock.Mock(side_effect=[
+                subprocess.CompletedProcess([], 0, "state = running\npid = 100\n", ""),
+                subprocess.CompletedProcess([], 0, "", ""),
+            ])
 
-            helper.Launchctl(manifest, run=run).signal_hup()
+            signal_pid = helper.Launchctl(manifest, run=run).signal_hup()
 
-            run.assert_called_once_with(
-                [
-                    "launchctl",
-                    "kill",
-                    "HUP",
-                    f"gui/{manifest.uid}/{manifest.label}",
-                ],
-                capture_output=True,
-                text=True,
-            )
+            self.assertEqual(100, signal_pid)
+            self.assertEqual(run.call_args_list, [
+                mock.call(
+                    ["launchctl", "print", f"gui/{manifest.uid}/{manifest.label}"],
+                    capture_output=True,
+                    text=True,
+                ),
+                mock.call(
+                    [
+                        "launchctl",
+                        "kill",
+                        "HUP",
+                        f"gui/{manifest.uid}/{manifest.label}",
+                    ],
+                    capture_output=True,
+                    text=True,
+                ),
+            ])
 
     def test_inspection_failure_preserves_launchctl_diagnostic(self):
         with tempfile.TemporaryDirectory() as td:
@@ -146,6 +158,31 @@ class RestartHelperTests(unittest.TestCase):
             self.assertEqual("committed", status["state"])
             self.assertEqual(100, status["previous_pid"])
             self.assertEqual(101, status["running_pid"])
+
+    def test_restart_waits_for_replacement_of_pid_signaled_after_rebind(self):
+        class ReboundLaunchctl(FakeLaunchctl):
+            def signal_hup(self):
+                self.signals.append("HUP")
+                return 101
+
+            def wait_for_new_pid(self, previous_pid):
+                if previous_pid != 101:
+                    raise AssertionError("restart used the stale preparation PID")
+                return 102
+
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            launchctl = ReboundLaunchctl(manifest)
+
+            with mock.patch.object(helper, "Launchctl", return_value=launchctl), \
+                 mock.patch.object(helper, "fetch_identity", return_value=manifest.expected), \
+                 mock.patch.object(helper, "wait_for_identity"):
+                state = helper.restart(manifest)
+
+            self.assertEqual("committed", state)
+            status = json.loads(Path(manifest.status_path).read_text())
+            self.assertEqual(101, status["previous_pid"])
+            self.assertEqual(102, status["running_pid"])
 
     def test_artifact_change_is_rejected_before_signal(self):
         with tempfile.TemporaryDirectory() as td:
@@ -330,6 +367,57 @@ class RestartCommandTests(unittest.TestCase):
             self.assertIn("deploy-owner", rejection["failure"])
             self.assertEqual("deploy-owner\n", (deploy / "active").read_text())
             self.assertFalse((root / "restart" / "active").exists())
+
+    def test_restart_retention_preserves_current_and_active_transactions(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            transactions = root / "restart" / "transactions"
+            transactions.mkdir(parents=True)
+            active = transactions / "active-owner"
+            active.mkdir()
+            current = transactions / "current-request"
+            current.mkdir()
+            for index in range(7):
+                candidate = transactions / f"rejected-{index}"
+                candidate.mkdir()
+                os.utime(candidate, (index + 1, index + 1))
+            (root / "restart" / "active").write_text("active-owner\n")
+
+            with self._isolated_operation_paths(root):
+                self.dev._prune_launchd_restart_transactions("current-request")
+
+            self.assertTrue(active.is_dir())
+            self.assertTrue(current.is_dir())
+            retained_rejections = list(transactions.glob("rejected-*"))
+            self.assertEqual(5, len(retained_rejections))
+
+    def test_restart_status_uses_completion_chronology(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            transactions = root / "restart" / "transactions"
+            owner = transactions / "owner"
+            rejected = transactions / "rejected"
+            owner.mkdir(parents=True)
+            rejected.mkdir()
+            (owner / "status.json").write_text(json.dumps({
+                "transaction_id": "owner",
+                "state": "committed",
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "updated_at": "2026-01-01T00:00:03+00:00",
+            }))
+            (rejected / "status.json").write_text(json.dumps({
+                "transaction_id": "rejected",
+                "state": "rejected_concurrent",
+                "created_at": "2026-01-01T00:00:01+00:00",
+                "updated_at": "2026-01-01T00:00:02+00:00",
+            }))
+
+            with self._isolated_operation_paths(root), \
+                 mock.patch("builtins.print") as output:
+                self.dev._print_launchd_restart_status()
+
+            rendered = " ".join(str(call) for call in output.call_args_list)
+            self.assertIn("Last restart: committed (owner)", rendered)
 
     def test_launchctl_failure_is_not_reported_as_not_loaded(self):
         failure = subprocess.CompletedProcess(

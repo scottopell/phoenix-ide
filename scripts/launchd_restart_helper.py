@@ -134,6 +134,7 @@ def write_status(
     state: str,
     *,
     failure: Optional[str] = None,
+    previous_pid: Optional[int] = None,
     running_pid: Optional[int] = None,
 ) -> None:
     status = {
@@ -142,7 +143,7 @@ def write_status(
         "source_kind": "installed_restart",
         "expected_version": manifest.expected.version,
         "expected_git_sha": manifest.expected.git_sha,
-        "previous_pid": manifest.previous_pid,
+        "previous_pid": manifest.previous_pid if previous_pid is None else previous_pid,
         "running_pid": running_pid,
         "created_at": manifest.created_at,
         "updated_at": utc_now(),
@@ -225,7 +226,13 @@ class Launchctl:
                     pass
         return state, pid
 
-    def signal_hup(self) -> None:
+    def signal_hup(self) -> int:
+        state, pid = self.inspect()
+        if state not in {"running", "active"} or pid is None:
+            raise RestartError(
+                "installed service changed immediately before restart; "
+                f"observed state={state} pid={pid}"
+            )
         result = self.run(
             ["launchctl", "kill", "HUP", self.target],
             capture_output=True,
@@ -235,6 +242,7 @@ class Launchctl:
             detail = (result.stderr or result.stdout).strip()
             suffix = f": {detail}" if detail else ""
             raise RestartError(f"launchctl could not signal the installed service{suffix}")
+        return pid
 
     def wait_for_new_pid(self, previous_pid: int) -> int:
         deadline = self.monotonic() + self.manifest.transition_timeout_secs
@@ -295,6 +303,7 @@ def restart(manifest: Manifest) -> str:
 
         launchctl = Launchctl(manifest)
         disrupted = False
+        signal_pid = manifest.previous_pid
         try:
             verify_claim(manifest)
             verify_installed_artifacts(manifest)
@@ -314,17 +323,27 @@ def restart(manifest: Manifest) -> str:
                     f"installed runtime identity changed before restart: {observed}"
                 )
 
-            write_status(manifest, "restarting")
-            launchctl.signal_hup()
+            signal_pid = launchctl.signal_hup()
             disrupted = True
-            running_pid = launchctl.wait_for_new_pid(manifest.previous_pid)
+            write_status(manifest, "restarting", previous_pid=signal_pid)
+            running_pid = launchctl.wait_for_new_pid(signal_pid)
             wait_for_identity(manifest, manifest.expected)
             verify_installed_artifacts(manifest)
-            write_status(manifest, "committed", running_pid=running_pid)
+            write_status(
+                manifest,
+                "committed",
+                previous_pid=signal_pid,
+                running_pid=running_pid,
+            )
             return "committed"
         except Exception as exc:
             state = "restart_failed" if disrupted else "precondition_failed"
-            write_status(manifest, state, failure=str(exc))
+            write_status(
+                manifest,
+                state,
+                failure=str(exc),
+                previous_pid=signal_pid,
+            )
             if disrupted:
                 return state
             raise

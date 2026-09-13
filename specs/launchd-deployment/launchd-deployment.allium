@@ -241,10 +241,9 @@ invariant DisruptionRequiresPreparedHandoff {
             preparation_complete(transaction) and helper_is_launchd_owned(transaction)
 }
 
-invariant RestartPreservesInstalledState {
+invariant CommittedRestartPreservesInstalledState {
     for restart in RestartTransactions:
-        restart.state in { restarting, committed, restart_failed }
-        implies installed_state_unchanged(restart)
+        restart.state = committed implies installed_state_unchanged(restart)
 }
 
 invariant ProductionOperationsAreMutuallyExclusive {

@@ -9964,6 +9964,24 @@ def _report_launchd_restart_handoff(
         pass
 
 
+def _prune_launchd_restart_transactions(current_transaction_id: str) -> None:
+    preserved = {current_transaction_id}
+    owner = _restart_claim_owner()
+    if owner is not None:
+        preserved.add(owner)
+    old_transactions = sorted(
+        (
+            path
+            for path in LAUNCHD_RESTART_TRANSACTIONS_DIR.iterdir()
+            if path.is_dir() and path.name not in preserved
+        ),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for old in old_transactions[5:]:
+        shutil.rmtree(old, ignore_errors=True)
+
+
 def launchd_prod_restart() -> None:
     """Restart the installed LaunchAgent without replacing installed state."""
     import uuid
@@ -10010,13 +10028,7 @@ def launchd_prod_restart() -> None:
     try:
         installed = _installed_launchd_runtime_for_restart()
 
-        old_transactions = sorted(
-            (path for path in LAUNCHD_RESTART_TRANSACTIONS_DIR.iterdir() if path.is_dir()),
-            key=lambda path: path.stat().st_mtime,
-            reverse=True,
-        )
-        for old in old_transactions[5:]:
-            shutil.rmtree(old, ignore_errors=True)
+        _prune_launchd_restart_transactions(transaction_id)
 
         helper = staging / "restart.py"
         shutil.copy2(LAUNCHD_RESTART_HELPER_SOURCE, helper)
@@ -10192,6 +10204,7 @@ def _print_launchd_restart_status() -> None:
     latest = max(
         statuses,
         key=lambda status: (
+            str(status.get("updated_at") or status.get("created_at", "")),
             str(status.get("created_at", "")),
             str(status.get("transaction_id", "")),
         ),
