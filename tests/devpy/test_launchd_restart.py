@@ -1,0 +1,301 @@
+import importlib.util
+import json
+import os
+import plistlib
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def load(path, name):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+helper = load(ROOT / "scripts" / "launchd_restart_helper.py", "launchd_restart_helper_test")
+
+
+def make_manifest(root: Path) -> helper.Manifest:
+    binary = root / "phoenix-ide"
+    binary.write_bytes(b"installed binary")
+    plist = root / "service.plist"
+    plist.write_bytes(plistlib.dumps({"Label": "test.phoenix.server"}))
+    deployed_sha = root / "deployed.sha"
+    deployed_sha.write_text("a" * 40 + "\n")
+    active = root / "restart-active"
+    active.write_text("restart-tx\n")
+    return helper.Manifest(
+        manifest_version=helper.HANDOFF_PROTOCOL_VERSION,
+        transaction_id="restart-tx",
+        expected=helper.Identity("2.0.0", "aaaaaaaaaaaa"),
+        previous_pid=100,
+        binary_path=str(binary),
+        binary_sha256=helper.sha256(binary),
+        plist_path=str(plist),
+        plist_sha256=helper.sha256(plist),
+        deployed_sha_path=str(deployed_sha),
+        deployed_sha256=helper.sha256(deployed_sha),
+        label="test.phoenix.server",
+        helper_label="test.phoenix.restart",
+        uid=os.getuid(),
+        health_url="http://127.0.0.1:1/api/version",
+        health_insecure_tls=False,
+        active_path=str(active),
+        status_path=str(root / "restart-status.json"),
+        lock_path=str(root / "activation.lock"),
+        claim_lock_path=str(root / "claim.lock"),
+        created_at="2026-01-01T00:00:00+00:00",
+        transition_timeout_secs=0.1,
+        health_timeout_secs=0.1,
+    )
+
+
+class FakeLaunchctl:
+    def __init__(self, manifest):
+        self.manifest = manifest
+        self.signals = []
+
+    def inspect(self):
+        return ("running", 100) if not self.signals else ("running", 101)
+
+    def signal_hup(self):
+        self.signals.append("HUP")
+
+    def wait_for_new_pid(self, previous_pid):
+        if previous_pid != 100:
+            raise AssertionError("wrong previous PID")
+        return 101
+
+
+class RestartHelperTests(unittest.TestCase):
+    def test_signal_uses_launchctl_hup_without_unloading_target(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            run = mock.Mock(return_value=subprocess.CompletedProcess([], 0, "", ""))
+
+            helper.Launchctl(manifest, run=run).signal_hup()
+
+            run.assert_called_once_with(
+                [
+                    "launchctl",
+                    "kill",
+                    "HUP",
+                    f"gui/{manifest.uid}/{manifest.label}",
+                ],
+                capture_output=True,
+                text=True,
+            )
+
+    def test_restart_preserves_installed_artifacts_and_commits_exact_identity(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            binary_before = Path(manifest.binary_path).read_bytes()
+            plist_before = Path(manifest.plist_path).read_bytes()
+            sha_before = Path(manifest.deployed_sha_path).read_bytes()
+            launchctl = FakeLaunchctl(manifest)
+
+            with mock.patch.object(helper, "Launchctl", return_value=launchctl), \
+                 mock.patch.object(helper, "fetch_identity", return_value=manifest.expected), \
+                 mock.patch.object(helper, "wait_for_identity") as wait:
+                state = helper.restart(manifest)
+
+            self.assertEqual("committed", state)
+            self.assertEqual(["HUP"], launchctl.signals)
+            wait.assert_called_once_with(manifest, manifest.expected)
+            self.assertEqual(binary_before, Path(manifest.binary_path).read_bytes())
+            self.assertEqual(plist_before, Path(manifest.plist_path).read_bytes())
+            self.assertEqual(sha_before, Path(manifest.deployed_sha_path).read_bytes())
+            status = json.loads(Path(manifest.status_path).read_text())
+            self.assertEqual("committed", status["state"])
+            self.assertEqual(100, status["previous_pid"])
+            self.assertEqual(101, status["running_pid"])
+
+    def test_artifact_change_is_rejected_before_signal(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            Path(manifest.plist_path).write_bytes(b"changed")
+            launchctl = FakeLaunchctl(manifest)
+
+            with mock.patch.object(helper, "Launchctl", return_value=launchctl):
+                with self.assertRaisesRegex(helper.RestartError, "plist checksum mismatch"):
+                    helper.restart(manifest)
+
+            self.assertEqual([], launchctl.signals)
+            status = json.loads(Path(manifest.status_path).read_text())
+            self.assertEqual("precondition_failed", status["state"])
+
+    def test_failed_recovery_is_truthful_and_does_not_claim_rollback(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            launchctl = FakeLaunchctl(manifest)
+
+            with mock.patch.object(helper, "Launchctl", return_value=launchctl), \
+                 mock.patch.object(helper, "fetch_identity", return_value=manifest.expected), \
+                 mock.patch.object(helper, "wait_for_identity", side_effect=helper.RestartError("wrong identity")):
+                state = helper.restart(manifest)
+
+            self.assertEqual("restart_failed", state)
+            status = json.loads(Path(manifest.status_path).read_text())
+            self.assertEqual("restart_failed", status["state"])
+            self.assertIn("wrong identity", status["failure"])
+            self.assertNotIn("rollback", status)
+
+    def test_helper_releases_only_its_own_claim_after_terminal_status(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            active = Path(manifest.active_path)
+            helper.write_status(manifest, "committed", running_pid=101)
+
+            self.assertFalse(helper.release_claim(helper.dataclasses.replace(manifest, transaction_id="other")))
+            self.assertEqual("restart-tx", active.read_text().strip())
+            self.assertTrue(helper.release_claim(manifest))
+            self.assertFalse(active.exists())
+
+
+class RestartCommandTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.dev = load(ROOT / "dev.py", "phoenix_dev_launchd_restart_test")
+
+    def _installed_plist(self, binary: Path) -> bytes:
+        return plistlib.dumps({
+            "Label": self.dev.LAUNCHD_LABEL,
+            "ProgramArguments": [str(binary)],
+            "EnvironmentVariables": {"PHOENIX_PASSWORD": "installed-secret"},
+            "Sockets": {"Listeners": {
+                "SockFamily": "IPv4v6",
+                "SockProtocol": "TCP",
+                "SockServiceName": "9555",
+                "SockType": "stream",
+            }},
+            "KeepAlive": True,
+            "RunAtLoad": True,
+        })
+
+    def test_launchd_restart_hands_off_installed_state_without_build_or_env_reload(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            install = root / "install"
+            install.mkdir()
+            binary = install / "phoenix-ide"
+            binary.write_bytes(b"installed")
+            plist = root / "service.plist"
+            plist.write_bytes(self._installed_plist(binary))
+            deployed_sha = root / "deployed.sha"
+            deployed_sha.write_text("a" * 40 + "\n")
+            restart_dir = root / "restart"
+            deploy_dir = root / "deploy"
+            deploy_dir.mkdir()
+            deploy_status = deploy_dir / "status.json"
+            deploy_status.write_text('{"state":"committed","source_kind":"published_release"}\n')
+            identity = self.dev.RuntimeIdentity("2.0.0", "aaaaaaaaaaaa")
+            commands = []
+
+            def run(command, **_kwargs):
+                commands.append([str(part) for part in command])
+                if command[:2] == ["launchctl", "print"]:
+                    return subprocess.CompletedProcess(command, 0, "state = running\npid = 100\n", "")
+                if "--protocol-version" in command:
+                    return subprocess.CompletedProcess(command, 0, "1\n", "")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with mock.patch.object(self.dev, "LAUNCHD_INSTALL_DIR", install), \
+                 mock.patch.object(self.dev, "LAUNCHD_PLIST_PATH", plist), \
+                 mock.patch.object(self.dev, "PROD_SHA_PATH", deployed_sha), \
+                 mock.patch.object(self.dev, "LAUNCHD_RESTART_DIR", restart_dir), \
+                 mock.patch.object(self.dev, "LAUNCHD_RESTART_STATUS_PATH", restart_dir / "status.json"), \
+                 mock.patch.object(self.dev, "LAUNCHD_RESTART_ACTIVE_PATH", restart_dir / "active"), \
+                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", deploy_dir), \
+                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", deploy_status), \
+                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", deploy_dir / "active"), \
+                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", deploy_dir / "claim.lock"), \
+                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_LOCK_PATH", deploy_dir / "activate.lock"), \
+                 mock.patch.object(self.dev, "LAUNCHD_RESTART_HELPER_SOURCE", ROOT / "scripts" / "launchd_restart_helper.py"), \
+                 mock.patch.object(self.dev, "_binary_identity", return_value=identity), \
+                 mock.patch.object(self.dev, "_current_prod_identity", return_value=identity), \
+                 mock.patch.object(self.dev, "_load_env_file") as load_env, \
+                 mock.patch.object(self.dev, "prod_build") as build, \
+                 mock.patch.object(self.dev.subprocess, "run", side_effect=run):
+                self.dev.launchd_prod_restart()
+
+            load_env.assert_not_called()
+            build.assert_not_called()
+            status = json.loads((restart_dir / "status.json").read_text())
+            self.assertEqual("prepared", status["state"])
+            self.assertEqual("installed_restart", status["source_kind"])
+            transactions = list((restart_dir / "transactions").iterdir())
+            self.assertEqual(1, len(transactions))
+            manifest = json.loads((transactions[0] / "manifest.json").read_text())
+            self.assertEqual(str(binary), manifest["binary_path"])
+            self.assertEqual(str(plist), manifest["plist_path"])
+            self.assertEqual("http://localhost:9555/api/version", manifest["health_url"])
+            self.assertNotIn("installed-secret", json.dumps(manifest))
+            self.assertEqual(
+                '{"state":"committed","source_kind":"published_release"}\n',
+                deploy_status.read_text(),
+            )
+            flattened = [part for command in commands for part in command]
+            self.assertNotIn("codesign", flattened)
+            self.assertNotIn("bootout", flattened)
+            self.assertNotIn("kill", flattened)
+
+    def test_restart_rejects_non_socket_activated_installation(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            binary = root / "phoenix-ide"
+            binary.write_bytes(b"installed")
+            plist = root / "service.plist"
+            value = plistlib.loads(self._installed_plist(binary))
+            value.pop("Sockets")
+            plist.write_bytes(plistlib.dumps(value))
+
+            with mock.patch.object(self.dev, "LAUNCHD_INSTALL_DIR", root), \
+                 mock.patch.object(self.dev, "LAUNCHD_PLIST_PATH", plist), \
+                 mock.patch.object(self.dev, "LAUNCHD_RESTART_DIR", root / "restart"), \
+                 mock.patch.object(self.dev, "LAUNCHD_RESTART_STATUS_PATH", root / "restart" / "status.json"), \
+                 mock.patch.object(self.dev, "LAUNCHD_RESTART_ACTIVE_PATH", root / "restart" / "active"), \
+                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root / "deploy"), \
+                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", root / "deploy" / "active"), \
+                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", root / "deploy" / "status.json"), \
+                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "deploy" / "claim.lock"):
+                with self.assertRaisesRegex(SystemExit, "socket-activated"):
+                    self.dev.launchd_prod_restart()
+
+    def test_deploy_and_restart_claims_are_mutually_exclusive(self):
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", Path(td) / "deploy"), \
+             mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", Path(td) / "deploy" / "active"), \
+             mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", Path(td) / "deploy" / "status.json"), \
+             mock.patch.object(self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", Path(td) / "deploy" / "claim.lock"), \
+             mock.patch.object(self.dev, "LAUNCHD_RESTART_DIR", Path(td) / "restart"), \
+             mock.patch.object(self.dev, "LAUNCHD_RESTART_ACTIVE_PATH", Path(td) / "restart" / "active"), \
+             mock.patch.object(self.dev, "LAUNCHD_RESTART_STATUS_PATH", Path(td) / "restart" / "status.json"):
+            self.dev._claim_launchd_restart("restart-one")
+            with self.assertRaisesRegex(SystemExit, "restart-one"):
+                self.dev._claim_launchd_deploy("deploy-two")
+            self.dev._release_launchd_restart_claim("restart-one")
+            self.dev._claim_launchd_deploy("deploy-two")
+            with self.assertRaisesRegex(SystemExit, "deploy-two"):
+                self.dev._claim_launchd_restart("restart-three")
+
+    def test_command_routes_launchd_without_touching_systemd_or_bare_linux(self):
+        with mock.patch.object(self.dev, "detect_prod_env", return_value="launchd"), \
+             mock.patch.object(self.dev, "launchd_prod_restart") as launchd, \
+             mock.patch.object(self.dev, "prod_daemon_restart") as bare:
+            self.dev.cmd_prod_restart()
+        launchd.assert_called_once_with()
+        bare.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

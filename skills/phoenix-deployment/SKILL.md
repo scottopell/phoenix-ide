@@ -1,6 +1,6 @@
 ---
 name: phoenix-deployment
-description: Production deployment for Phoenix IDE. Use when running ./dev.py prod deploy, checking production status, diagnosing a failed deploy, or stopping the production service.
+description: Production deployment for Phoenix IDE. Use when deploying, restarting, checking status, diagnosing a failed production operation, or stopping the production service.
 ---
 
 # Phoenix IDE Deployment
@@ -25,6 +25,7 @@ Linux
 ./dev.py prod deploy --release v1.2.3   # Deploy an exact checksummed release
 ./dev.py prod deploy --release latest   # Deploy latest stable release
 ./dev.py prod status                    # Check runtime and durable transaction
+./dev.py prod restart                   # Restart the installed runtime (backend-specific config semantics)
 ./dev.py prod stop                      # Stop the backend-owned runtime
 ```
 

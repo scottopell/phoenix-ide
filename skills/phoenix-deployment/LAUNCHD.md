@@ -2,6 +2,10 @@
 
 Applies when: macOS. This is the only macOS production mode. `./dev.py prod deploy` checks and builds local `HEAD`; `./dev.py prod deploy --release vX.Y.Z` or `--release latest` installs a checksummed host-architecture GitHub release without local compilation.
 
+```bash
+./dev.py prod restart  # Restart the installed process; preserve installed config
+```
+
 ## Runtime details
 
 | Property | Value |
@@ -40,6 +44,13 @@ The launchd plist owns Phoenix's production listener through a socket named
 startup; if launchd supplies that socket, Phoenix adopts it instead of binding a
 new port. SIGHUP exits immediately in this mode so launchd can restart the
 process while keeping the listener open.
+
+`./dev.py prod restart` uses that path through an independent one-shot
+LaunchAgent. It verifies a new PID with the same exact runtime identity and
+preserves the installed binary, plist, environment, listener, and deployed SHA.
+It does not read `.phoenix-ide.env`; run `./dev.py prod deploy` when configuration
+must change. Restart status is durable under `~/.phoenix-ide/restart/` and is
+shown by `./dev.py prod status`.
 
 `./dev.py prod deploy` writes this socket dictionary into
 `~/Library/LaunchAgents/com.phoenix-ide.server.plist`:

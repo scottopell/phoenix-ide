@@ -61,6 +61,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [047](047_global-coordinator-unsandboxed-bash.md) | Global Coordinator uses explicitly targeted unsandboxed Bash | Accepted | REQ-BASH-012/013, REQ-GR-007; singleton Coordinator, explicit active WorkScope target |
 | [048](048_absolute-llm-provider-attempt-deadline.md) | LLM provider attempts use one absolute service deadline | Accepted | REQ-LLM-011–013; request liveness, timeout metrics, durable retry/terminalization |
 | [049](049_compaction-protects-accepted-handoffs-and-coordinator-context.md) | Compaction protects accepted handoffs and Coordinator context | Accepted | REQ-BED-020, REQ-GR-011, REQ-GR-013 |
+| [050](050_launchd-restart-preserves-installed-state.md) | launchd restart preserves installed state through an independent helper | Accepted | REQ-LDD-014 through REQ-LDD-016; `RestartTransaction` |
 
 ## For agents: which decisions bind your task
 
@@ -82,7 +83,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying request-bound creation identity, immutable creation pins, atomic creation publication, or staging cleanup ownership | 043 for the private staging boundary, then 044, 007, and 031 |
 | Specifying multi-PR branch observation, active PR targeting, or bash terminal-edge reconciliation | 008 |
 | Specifying native process resource sampling, Work Scope health, or resource-observation freshness | 009 |
-| Specifying native macOS self-deployment, activation, or rollback | 010 |
+| Specifying native macOS self-deployment, activation, rollback, or installed-state-preserving restart | 050, then 010 |
 | Specifying wake-plane registration receipts, durable wake observations, or wake resume outbox | 006, 011, 012 |
 | Specifying the shared durable workflow engine, profiles, migration, or drain | 013, 014, 015, 016, 019, 020, 024 |
 | Specifying product conversation lifecycle versus WorkScope resource ownership, continuation topology, or worktree lifecycle across continuations | 026 |
@@ -122,8 +123,9 @@ ADR-000 (adopt spEARS v2 for new work)
       ├── ADR-037 (Legacy direct-turn terminal ambiguity is retired as failure)
       │   └── applies ADR-024 and ADR-034 to pre-obligation materialized direct turns
       ├── ADR-010 (launchd deployment uses an independent transaction helper)
-      │   └── ADR-017 (production deployment shares preparation but keeps backend-owned activation)
-      │       └── ADR-018 (release updates use published release previews and approval-bound installations)
+      │   ├── ADR-017 (production deployment shares preparation but keeps backend-owned activation)
+      │   │   └── ADR-018 (release updates use published release previews and approval-bound installations)
+      │   └── ADR-050 (launchd restart preserves installed state through an independent helper)
       ├── ADR-011 (Wake-plane core uses registration receipts and durable runtime observations)
       │   └── ADR-012 (Wake-resume scheduling uses a durable acceptance outbox)
       └── ADR-013 (Durable workflows use normalized core and typed profiles)
