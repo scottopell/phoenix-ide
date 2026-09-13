@@ -3629,22 +3629,51 @@ enum ExternalWriterEvidence {
     NoPositiveEvidence,
 }
 
-const AMBIENT_WRITER_MAX_OBSERVATIONS: usize = 3;
-const AMBIENT_WRITER_REQUIRED_CLEAN: usize = 2;
-const AMBIENT_WRITER_OBSERVATION_SPACING: std::time::Duration =
-    std::time::Duration::from_millis(100);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AmbientWriterObservationPolicy {
+    max_observations: std::num::NonZeroUsize,
+    required_clean: std::num::NonZeroUsize,
+    spacing: std::time::Duration,
+}
+
+impl AmbientWriterObservationPolicy {
+    fn new(
+        max_observations: usize,
+        required_clean: usize,
+        spacing: std::time::Duration,
+    ) -> Result<Self, String> {
+        let max_observations = std::num::NonZeroUsize::new(max_observations)
+            .ok_or_else(|| "ambient writer observation budget must be positive".to_string())?;
+        let required_clean = std::num::NonZeroUsize::new(required_clean)
+            .ok_or_else(|| "required clean observations must be positive".to_string())?;
+        if required_clean > max_observations {
+            return Err("required clean observations exceed the observation budget".to_string());
+        }
+        Ok(Self {
+            max_observations,
+            required_clean,
+            spacing,
+        })
+    }
+
+    fn production() -> Self {
+        Self::new(3, 2, std::time::Duration::from_millis(100))
+            .expect("production ambient-writer observation policy is valid")
+    }
+}
 
 fn inspect_ambient_writer_until_quiescent(
+    policy: AmbientWriterObservationPolicy,
     mut observe: impl FnMut() -> Result<ExternalWriterEvidence, String>,
     mut wait: impl FnMut(std::time::Duration),
 ) -> Result<Option<AmbientWriterEvidence>, String> {
     let mut consecutive_clean = 0;
     let mut last_writer = None;
-    for observation in 0..AMBIENT_WRITER_MAX_OBSERVATIONS {
+    for observation in 0..policy.max_observations.get() {
         match observe()? {
             ExternalWriterEvidence::NoPositiveEvidence => {
                 consecutive_clean += 1;
-                if consecutive_clean == AMBIENT_WRITER_REQUIRED_CLEAN {
+                if consecutive_clean == policy.required_clean.get() {
                     return Ok(None);
                 }
             }
@@ -3653,8 +3682,8 @@ fn inspect_ambient_writer_until_quiescent(
                 last_writer = Some(evidence);
             }
         }
-        if observation + 1 < AMBIENT_WRITER_MAX_OBSERVATIONS {
-            wait(AMBIENT_WRITER_OBSERVATION_SPACING);
+        if observation + 1 < policy.max_observations.get() {
+            wait(policy.spacing);
         }
     }
     last_writer.map_or_else(
@@ -3670,6 +3699,7 @@ fn inspect_ambient_writer_until_quiescent(
 
 fn quarantine_has_external_writer(path: &Path) -> Result<Option<AmbientWriterEvidence>, String> {
     inspect_ambient_writer_until_quiescent(
+        AmbientWriterObservationPolicy::production(),
         || match quarantine_has_open_descriptors(path)? {
             positive @ ExternalWriterEvidence::PositiveWriterFound(_) => Ok(positive),
             ExternalWriterEvidence::NoPositiveEvidence => quarantine_has_writable_mappings(path),
@@ -3703,19 +3733,19 @@ fn macos_descriptor_access_mode(open_flags: u32) -> Option<AmbientWriterAccessMo
 #[cfg(any(test, target_os = "linux", target_os = "macos"))]
 fn classify_descriptor_access_mode(
     access_mode: Option<AmbientWriterAccessMode>,
-    target_is_directory: bool,
-) -> Result<Option<AmbientWriterAccessMode>, String> {
-    match (access_mode, target_is_directory) {
-        (None, true) => {
-            Err("read-only directory descriptor retains namespace capability".to_string())
-        }
-        (access_mode, _) => Ok(access_mode),
-    }
+    _target_is_directory: bool,
+) -> Option<AmbientWriterAccessMode> {
+    access_mode
 }
 
 #[cfg(any(test, target_os = "macos"))]
 fn macos_descriptor_inspection_is_transient_disappearance(errno: Option<i32>) -> bool {
     matches!(errno, Some(libc::ESRCH | libc::ENOENT | libc::EBADF))
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn macos_process_identity_failure_is_disappearance(errno: Option<i32>) -> bool {
+    matches!(errno, Some(libc::ESRCH | libc::ENOENT))
 }
 
 #[cfg(any(test, target_os = "macos"))]
@@ -4267,7 +4297,7 @@ fn quarantine_has_open_descriptors_in(
             ) {
                 Ok(access_mode) => {
                     let Some(access_mode) =
-                        classify_descriptor_access_mode(access_mode, target_metadata.is_dir())?
+                        classify_descriptor_access_mode(access_mode, target_metadata.is_dir())
                     else {
                         continue;
                     };
@@ -4333,10 +4363,7 @@ fn macos_process_owner_incarnation(pid: i32) -> Result<Option<(libc::uid_t, Stri
     };
     if bytes != i32::try_from(size_of::<libc::proc_bsdinfo>()).expect("bsd info size fits i32") {
         let error = std::io::Error::last_os_error();
-        if matches!(
-            error.raw_os_error(),
-            Some(libc::ESRCH | libc::ENOENT | libc::EPERM)
-        ) {
+        if macos_process_identity_failure_is_disappearance(error.raw_os_error()) {
             return Ok(None);
         }
         return Err(format!("cannot inspect process {pid} incarnation: {error}"));
@@ -4360,10 +4387,7 @@ fn macos_process_executable(pid: i32) -> Result<Option<GitPathIdentity>, String>
     };
     if executable_bytes <= 0 {
         let error = std::io::Error::last_os_error();
-        if matches!(
-            error.raw_os_error(),
-            Some(libc::ESRCH | libc::ENOENT | libc::EPERM)
-        ) {
+        if macos_process_identity_failure_is_disappearance(error.raw_os_error()) {
             return Ok(None);
         }
         return Err(format!("cannot inspect process {pid} executable: {error}"));
@@ -4401,15 +4425,6 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence
         format!("cannot enumerate processes for descriptor inspection: {error}")
     })?;
     for pid in pids.into_iter().filter(|pid| *pid > 0) {
-        let Some((uid, before_incarnation)) = macos_process_owner_incarnation(pid)? else {
-            continue;
-        };
-        if uid != unsafe { libc::geteuid() } {
-            continue;
-        }
-        let Some(before_executable) = macos_process_executable(pid)? else {
-            continue;
-        };
         let mut descriptor_capacity = 256_usize;
         let descriptors = loop {
             let mut descriptors = vec![
@@ -4490,11 +4505,19 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence
             let Some(access_mode) = classify_descriptor_access_mode(
                 macos_descriptor_access_mode(info.file.open_flags),
                 candidate_is_within && target_is_directory,
-            )?
-            else {
+            ) else {
                 continue;
             };
             if candidate_is_within {
+                let Some((uid, before_incarnation)) = macos_process_owner_incarnation(pid)? else {
+                    continue;
+                };
+                if uid != unsafe { libc::geteuid() } {
+                    continue;
+                }
+                let Some(before_executable) = macos_process_executable(pid)? else {
+                    continue;
+                };
                 let Some((after_uid, after_incarnation)) = macos_process_owner_incarnation(pid)?
                 else {
                     continue;
@@ -7014,13 +7037,9 @@ mod tests {
     }
 
     #[test]
-    fn read_only_directory_namespace_capability_is_indeterminate() {
-        let error = super::classify_descriptor_access_mode(None, true).unwrap_err();
-        assert!(error.contains("namespace capability"));
-        assert_eq!(
-            super::classify_descriptor_access_mode(None, false).unwrap(),
-            None
-        );
+    fn read_only_directory_descriptor_has_no_write_authority() {
+        assert_eq!(super::classify_descriptor_access_mode(None, true), None);
+        assert_eq!(super::classify_descriptor_access_mode(None, false), None);
     }
 
     #[test]
@@ -7033,12 +7052,38 @@ mod tests {
     }
 
     #[test]
+    fn macos_writable_mapping_identity_eperm_is_indeterminate() {
+        assert!(!super::macos_process_identity_failure_is_disappearance(
+            Some(libc::EPERM)
+        ));
+        assert!(super::macos_process_identity_failure_is_disappearance(
+            Some(libc::ESRCH)
+        ));
+        assert!(super::macos_process_identity_failure_is_disappearance(
+            Some(libc::ENOENT)
+        ));
+    }
+
+    #[test]
     fn partial_descriptor_inventory_is_indeterminate() {
         assert_eq!(super::macos_descriptor_inventory_count(16, 8).unwrap(), 2);
         assert!(super::macos_descriptor_inventory_count(15, 8)
             .unwrap_err()
             .contains("partial record"));
         assert!(super::macos_descriptor_inventory_count(0, 0).is_err());
+    }
+
+    fn observation_policy(
+        max: usize,
+        clean: usize,
+        spacing_ms: u64,
+    ) -> super::AmbientWriterObservationPolicy {
+        super::AmbientWriterObservationPolicy::new(
+            max,
+            clean,
+            std::time::Duration::from_millis(spacing_ms),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -7050,6 +7095,7 @@ mod tests {
         ];
         let mut waits = Vec::new();
         let result = super::inspect_ambient_writer_until_quiescent(
+            observation_policy(3, 2, 7),
             || Ok(observations.pop().unwrap()),
             |duration| waits.push(duration),
         )
@@ -7062,6 +7108,7 @@ mod tests {
     fn stable_writer_is_retained_with_complete_evidence_without_sleeping() {
         let evidence = writer_evidence("start-stable");
         let result = super::inspect_ambient_writer_until_quiescent(
+            observation_policy(3, 2, 7),
             || {
                 Ok(super::ExternalWriterEvidence::PositiveWriterFound(
                     evidence.clone(),
@@ -7074,6 +7121,28 @@ mod tests {
     }
 
     #[test]
+    fn injected_observation_policy_controls_budget_clean_threshold_and_spacing() {
+        let mut observations = 0;
+        let mut waits = Vec::new();
+        let result = super::inspect_ambient_writer_until_quiescent(
+            observation_policy(2, 2, 37),
+            || {
+                observations += 1;
+                Ok(super::ExternalWriterEvidence::NoPositiveEvidence)
+            },
+            |duration| waits.push(duration),
+        )
+        .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(observations, 2);
+        assert_eq!(waits, vec![std::time::Duration::from_millis(37)]);
+
+        assert!(
+            super::AmbientWriterObservationPolicy::new(1, 2, std::time::Duration::ZERO,).is_err()
+        );
+    }
+
+    #[test]
     fn pid_reuse_keeps_the_new_process_incarnation_distinct() {
         let mut observations = vec![
             super::ExternalWriterEvidence::PositiveWriterFound(writer_evidence("start-new")),
@@ -7081,6 +7150,7 @@ mod tests {
             super::ExternalWriterEvidence::PositiveWriterFound(writer_evidence("start-old")),
         ];
         let result = super::inspect_ambient_writer_until_quiescent(
+            observation_policy(3, 2, 7),
             || Ok(observations.pop().unwrap()),
             |_| {},
         )
@@ -7091,6 +7161,7 @@ mod tests {
     #[test]
     fn detector_indeterminacy_fails_closed() {
         let error = super::inspect_ambient_writer_until_quiescent(
+            observation_policy(3, 2, 7),
             || Err("detector cannot establish process incarnation".to_string()),
             |_| {},
         )
@@ -7399,12 +7470,14 @@ mod tests {
         std::os::unix::fs::symlink(&quarantine, process.join("fd/3")).unwrap();
         std::fs::write(process.join("fdinfo/3"), "flags:\t00000000\n").unwrap();
 
-        let error = super::quarantine_has_open_descriptors_in(
-            &quarantine,
-            temp.path().join("proc").as_path(),
-        )
-        .unwrap_err();
-        assert!(error.contains("namespace capability"));
+        assert_eq!(
+            super::quarantine_has_open_descriptors_in(
+                &quarantine,
+                temp.path().join("proc").as_path(),
+            )
+            .unwrap(),
+            super::ExternalWriterEvidence::NoPositiveEvidence,
+        );
     }
 
     #[cfg(target_os = "linux")]
