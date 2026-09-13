@@ -1663,9 +1663,9 @@ fn translate_to_responses_request(
             .map(platform_reasoning),
         service_tier: ProviderRequestTier::from_effective_service_tier(
             request.service_tier,
-            use_codex_backend,
+            use_codex_backend || api_name == "gpt-6-astra",
         )
-        .codex_request_value()
+        .responses_request_value()
         .map(str::to_string),
         // Match the explicit defaults Codex CLI and Pi send. `tool_choice`
         // mirrors the server-side default but stabilises the wire shape so
@@ -4460,6 +4460,28 @@ mod tests {
         .unwrap();
         assert_eq!(explicit["reasoning"]["effort"], "max");
         assert_eq!(explicit["max_output_tokens"], 16_384);
+    }
+
+    #[test]
+    fn astra_fast_tier_serializes_on_direct_and_codex_routes() {
+        let mut request = empty_request();
+        request.service_tier = phoenix_core::domain::llm_types::EffectiveServiceTier::Fast;
+
+        let direct = serde_json::to_value(translate_to_responses_request(
+            "gpt-6-astra",
+            &request,
+            false,
+        ))
+        .unwrap();
+        let codex = serde_json::to_value(translate_to_responses_request(
+            "gpt-6-astra",
+            &request,
+            true,
+        ))
+        .unwrap();
+
+        assert_eq!(direct["service_tier"], "priority");
+        assert_eq!(codex["service_tier"], "priority");
     }
 
     #[test]

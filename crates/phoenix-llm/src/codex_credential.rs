@@ -764,6 +764,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn account_bound_credential_without_account_id_supports_legacy_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let jwt = fake_jwt(now_unix() + 3600);
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"auth_mode":"chatgpt","tokens":{{"access_token":"{jwt}","refresh_token":"r"}}}}"#
+            ),
+        )
+        .unwrap();
+        let (credential, account_id) = CodexCredential::load(path).unwrap();
+        let bound = AccountBoundCodexCredential::new(credential, account_id);
+
+        assert_eq!(bound.get().await.as_deref(), Some(jwt.as_str()));
+        assert!(bound.invalidate().await);
+    }
+
+    #[tokio::test]
     async fn invalidate_clears_cache() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");

@@ -356,8 +356,7 @@ pub struct ModelSpec {
     /// external model, Phoenix represents that absence honestly instead of
     /// fabricating unsupported/optional/native.
     pub effort_capabilities: EffortCapabilities,
-    /// Route-aware Codex fast-mode capability. Only built-in `OpenAI` Responses
-    /// models routed through the Codex bridge advertise support.
+    /// Route-aware Responses API fast-mode capability.
     pub service_tier_capabilities: ServiceTierCapabilities,
 }
 
@@ -400,7 +399,7 @@ impl ModelSpec {
         &self,
         service: &dyn crate::LlmService,
     ) -> ServiceTierCapabilities {
-        if service.uses_codex_bridge() {
+        if service.uses_codex_bridge() || self.api_name == "gpt-6-astra" {
             self.service_tier_capabilities
         } else {
             ServiceTierCapabilities::Unsupported
