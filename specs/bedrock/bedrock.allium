@@ -1143,6 +1143,8 @@ rule UserApprovesTaskCurrentConversation {
         objective: conversation.approved_task_objective
     }
     ensures: WriteAuthorityPersistedBeforeResume(conversation)
+    ensures: RuntimeCapabilitiesMatchPersistedAuthority(conversation)
+    ensures: NoPostApprovalExecutionUsesRestrictedAuthority(conversation)
     ensures: conversation.core_status = llm_requesting
     ensures: conversation.retry_attempt = 1
     ensures: LlmRequestDispatched(conversation)
@@ -2105,6 +2107,20 @@ rule ModeChangeNotification {
 --
 -- Allium has no formal helper-function declaration; rules call these
 -- predicates by bare identifier. This block defines their complete semantics.
+--
+--   RuntimeCapabilitiesMatchPersistedAuthority(
+--       conversation: Parent
+--   ) -> Boolean
+--       True exactly when tool definitions, tool dispatch, Bash isolation,
+--       tool context, and Work-child admission all derive from the authority
+--       persisted on conversation's attached WorkScope.
+--
+--   NoPostApprovalExecutionUsesRestrictedAuthority(
+--       conversation: Parent
+--   ) -> Boolean
+--       True exactly when no provider request or tool execution admitted after
+--       Work authority persistence uses a pre-approval Restricted capability
+--       projection. False while any capability consumer remains stale.
 --
 --   retirement_inventory_is_complete_and_sealed(
 --       product_conversation: ProductConversation,

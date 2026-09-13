@@ -927,6 +927,21 @@ AND SHALL NOT change `continued_in_conv_id`, `work_scope_id`, lifecycle, mode, r
   approved task commit, `WorkScope` attachment, source/provenance records beyond the approval itself,
   or branch/worktree provenance
 
+### REQ-BED-046: Publish Approved Capabilities as One Authority Projection
+
+WHEN task approval grants Work authority to a conversation's `WorkScope`
+THE SYSTEM SHALL derive the conversation runtime's tool surface, tool execution policy, Bash isolation policy, tool context, and sub-agent admission policy from that same `WorkScope` authority before accepting post-approval work
+AND SHALL NOT use conversation mode provenance as capability authority
+
+IF the system cannot project the granted authority to every runtime capability consumer
+THEN THE SYSTEM SHALL NOT resume the conversation with a partially updated capability surface
+
+WHEN a runtime is reconstructed after interruption
+THE SYSTEM SHALL derive every capability consumer from persisted `WorkScope` authority rather than from conversation mode provenance
+
+WHILE an Explore-origin conversation has not received approved `WorkScope` authority
+THE SYSTEM SHALL retain its Restricted tool surface, sandboxed Bash policy, and prohibition on Work sub-agents
+
 WHEN the user approves the task while in AwaitingTaskApproval with the
 Start in new conversation policy
 THE SYSTEM SHALL perform the same task-approval artifact persistence
