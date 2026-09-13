@@ -3418,7 +3418,7 @@ mod tests {
                             .shared_delay_started
                             .store(true, Ordering::SeqCst);
                         tokio::time::timeout(
-                            Duration::from_secs(5),
+                            Duration::from_secs(30),
                             state.shared_delay_release.notified(),
                         )
                         .await

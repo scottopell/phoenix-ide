@@ -9221,14 +9221,15 @@ struct WritableSchemaGuard {
 
 impl WritableSchemaGuard {
     async fn enable(pool: &SqlitePool) -> DbResult<Self> {
-        let mut connection = pool.acquire().await?;
-        sqlx::query("PRAGMA writable_schema = ON")
-            .execute(&mut *connection)
-            .await?;
-        Ok(Self {
+        let connection = pool.acquire().await?;
+        let mut guard = Self {
             connection: Some(connection),
             armed: true,
-        })
+        };
+        sqlx::query("PRAGMA writable_schema = ON")
+            .execute(guard.connection())
+            .await?;
+        Ok(guard)
     }
 
     fn connection(&mut self) -> &mut sqlx::SqliteConnection {

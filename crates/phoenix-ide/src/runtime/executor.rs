@@ -2865,6 +2865,19 @@ where
             );
             return Ok(());
         }
+        if matches!(event, Event::UserCancel { .. })
+            && self
+                .active_llm_attempt
+                .as_ref()
+                .and_then(phoenix_llm::LlmAttemptCapture::finalized)
+                .is_some_and(|metrics| metrics.outcome != phoenix_llm::LlmAttemptOutcome::Cancelled)
+        {
+            tracing::debug!(
+                conv_id = %self.context.conversation_id,
+                "absorbing user cancellation after the active LLM attempt reached a terminal classification"
+            );
+            return Ok(());
+        }
         if matches!(event, Event::UserCancel { .. } | Event::Shutdown) {
             self.terminal_transition_retry = None;
         }
@@ -14265,6 +14278,81 @@ mod authoritative_user_message_effect_tests {
             capture.finalized().expect("terminal capture").outcome,
             phoenix_llm::LlmAttemptOutcome::Cancelled
         );
+    }
+
+    #[tokio::test]
+    async fn user_cancel_after_timeout_classification_preserves_timeout_outcome_path() {
+        let (mut rt, storage, _broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let turn = crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(31),
+            generation: 0,
+        };
+        storage.set_active_direct_turn(Some(turn.clone()));
+        rt.active_direct_turn = Some(Box::new(turn));
+        rt.state = ConvState::LlmRequesting {
+            attempt: crate::state_machine::transition::MAX_RETRY_ATTEMPTS,
+        };
+        let capture = phoenix_llm::LlmAttemptCapture::new();
+        let telemetry = phoenix_llm::LlmRequestTelemetry {
+            conversation_id: rt.context.conversation_id.clone(),
+            root_conversation_id: rt.context.root_conversation_id.clone(),
+            request_id: "timeout-cancel-race".to_string(),
+            retry_attempt: crate::state_machine::transition::MAX_RETRY_ATTEMPTS,
+            attempt_capture: capture.clone(),
+        };
+        capture.begin(
+            &telemetry,
+            "openai",
+            "gpt-test",
+            phoenix_llm::LlmTransport::Websocket,
+        );
+        let finalized = capture
+            .finalize_timed_out(std::time::Duration::from_secs(600))
+            .expect("timeout classification wins");
+        assert_eq!(finalized.outcome, phoenix_llm::LlmAttemptOutcome::TimedOut);
+        rt.active_llm_attempt = Some(capture.clone());
+        rt.llm_task_handle = Some(tokio::spawn(std::future::pending()));
+
+        rt.process_event(Event::UserCancel {
+            reason: None,
+            cause: crate::state_machine::event::CancelCause::UserRequested,
+        })
+        .await
+        .expect("later cancellation is absorbed");
+
+        assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
+        assert!(rt.llm_task_handle.is_some());
+        assert_eq!(
+            capture.finalized().expect("terminal capture").outcome,
+            phoenix_llm::LlmAttemptOutcome::TimedOut
+        );
+        assert!(storage
+            .recorded_settle_active_direct_turn_calls()
+            .is_empty());
+
+        rt.process_generation_tagged_llm_outcome(
+            0,
+            LlmOutcome::TimedOut {
+                message: "provider attempt deadline elapsed".to_string(),
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            rt.state,
+            ConvState::Error {
+                error_kind: crate::db::ErrorKind::TimedOut,
+                ..
+            }
+        ));
+        assert_eq!(storage.recorded_settle_active_direct_turn_calls().len(), 1);
+        assert!(matches!(
+            storage.recorded_settle_active_direct_turn_calls()[0].terminal,
+            crate::runtime::traits::ActiveDirectTurnTerminal::Failed { .. }
+        ));
     }
 
     #[tokio::test]

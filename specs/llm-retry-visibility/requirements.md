@@ -81,12 +81,13 @@ data, not by string parsing.
 ### REQ-LRV-002: Retry Reason Classification
 
 WHEN classifying an `LlmError` into an `LlmAttemptReason`
-THE SYSTEM SHALL map exactly the three retryable `LlmErrorKind`
+THE SYSTEM SHALL map exactly the four retryable `LlmErrorKind`
 variants:
 
 - `LlmErrorKind::RateLimit` -> `LlmAttemptReason::RateLimit`
 - `LlmErrorKind::ServerError` -> `LlmAttemptReason::ServerError`
 - `LlmErrorKind::Network` -> `LlmAttemptReason::Network`
+- `LlmErrorKind::TimedOut` -> `LlmAttemptReason::TimedOut`
 
 WHEN an `LlmError` with a non-retryable kind arrives
 THE SYSTEM SHALL NOT emit `LlmAttempt` (the state machine terminates

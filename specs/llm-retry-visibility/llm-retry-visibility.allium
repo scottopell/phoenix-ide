@@ -59,7 +59,7 @@
 --
 -- Requirement traceability: REQ-LRV-001 through REQ-LRV-007 are modelled
 -- here. REQ-LRV-002 (reason classification) is structurally enforced by
--- the LlmAttemptReason enum (a closed three-variant set) and the
+-- the LlmAttemptReason enum (a closed four-variant set) and the
 -- classify_retry_reason() helper that maps LlmErrorKind's retryable
 -- subset into it; consumed by RuntimeEmitsLlmAttemptOnScheduleRetry's
 -- `reason in { ... }` precondition and the
@@ -80,7 +80,7 @@
 
 -- Why a retry attempt is being scheduled. Mirrors the retryable subset
 -- of LlmErrorKind exactly (`llm/error.rs:111` — Network, RateLimit,
--- ServerError). Non-retryable LlmErrorKind variants terminate the turn
+-- ServerError, TimedOut). Non-retryable LlmErrorKind variants terminate the turn
 -- without scheduling a retry, so they never reach this enum.
 enum LlmAttemptReason {
     rate_limit
