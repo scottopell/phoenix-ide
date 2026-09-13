@@ -6,6 +6,7 @@ import {
   AGENT_FINISHED_THRESHOLD_MS,
   DEFAULT_NOTIFICATION_SETTINGS,
   closeNotificationsForConversation,
+  closeRecoveryGuidance,
   getProductConversationListRevision,
   notifyCatchUp,
   notifyConversationStateChange,
@@ -110,6 +111,25 @@ describe('product conversation list revision notifications', () => {
 });
 
 describe('archive close conflict notifications', () => {
+  it('extracts typed exact-attempt recovery without parsing prose', () => {
+    const error = new ConflictError({
+      error: 'Close needs attention',
+      error_type: 'close_retirement_needs_repair',
+      attempt_id: 'attempt-1',
+      active_transcript_id: 'active-1',
+      recovery_action: {
+        method: 'POST',
+        path: '/api/conversations/active-1/close/retry-retirement',
+      },
+    });
+    expect(closeRecoveryGuidance(error)).toEqual({
+      attemptId: 'attempt-1',
+      activeTranscriptId: 'active-1',
+      retryPath: '/api/conversations/active-1/close/retry-retirement',
+    });
+    expect(closeRecoveryGuidance(new Error('Close needs attention'))).toBeNull();
+  });
+
   it('notifies for every durable Close conflict', () => {
     const closeListener = vi.fn();
     const listListener = vi.fn();

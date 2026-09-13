@@ -22,7 +22,7 @@ Recovery is user-facing. A raw storage-engine code cannot tell the client which 
 
 Choose option 3.
 
-An ambient positive writer is a complete typed observation: detector, process ID plus start/incarnation, executable, exact matched path, match kind, and writable descriptor access mode. Read-only descriptors and non-descriptor path relationships never confer write authority. Missing mandatory positive identity is detector-indeterminate and fails closed.
+An ambient positive writer is a complete typed observation: detector, process ID plus start/incarnation, executable, exact matched path, match kind, and writable access mode. Writable descriptors and explicitly writable shared mappings qualify. Read-only descriptors, read-only/private mappings, and non-authorizing path relationships never confer write authority. Missing mandatory positive identity is detector-indeterminate and fails closed.
 
 After owned resources retire, Phoenix performs no more than three ambient observations separated by 100 milliseconds on a monotonic clock. Final removal requires two consecutive authoritative no-writer observations. A transient writable incarnation may disappear, but that disappearance is accepted only after the two clean observations. A stable writer, a writer in the final observation, exhausted budget without two clean observations, or detector indeterminacy preserves quarantine and produces typed repair. Observation count, spacing, and clock are injectable for deterministic tests.
 

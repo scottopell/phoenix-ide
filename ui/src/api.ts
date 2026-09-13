@@ -938,6 +938,14 @@ export class ExpansionError extends Error {
  *  when `error_type === 'continuation_exists'` (REQ-BED-031) so the UI can
  *  route to the continuation without parsing the error message. */
 export interface ConflictErrorDetail {
+  attempt_id?: string;
+  active_transcript_id?: string;
+  recovery_action?: {
+    method: 'POST';
+    path: string;
+  };
+  failed_invariant?: string;
+  failed_relation?: string;
   error: string;
   error_type: string;
   conflict_slug?: string;

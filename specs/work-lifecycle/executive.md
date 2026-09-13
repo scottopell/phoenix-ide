@@ -6,7 +6,7 @@ The work lifecycle spec now describes the intended user-facing **Close conversat
 
 ## Current Reality
 
-Durable Close retirement and ProductConversation History finalization are shipped, while the dedicated Close-start replacement and legacy-edge removal remain incomplete. A successful exact attempt retires the attached WorkScope resources, records one durable outcome message, transitions the ordinary aggregate to History in the completion transaction, and publishes compatibility updates only after commit. Primary ProductConversation surfaces expose Close and read-only History rather than Archive, but `POST /api/conversations/:id/archive`, `/abandon-task`, `/mark-merged`, and `continued_in_conv_id` compatibility checks remain live internally or on legacy surfaces. Existing row-level WorkScope fields remain attachment authority, with no parallel writable normalized attachment relation. Phoenix continues using the current Project-backed repository model; replacement is deferred until a named feature requires it. Exact-attempt adoption of immutable restart-repair evidence remains incomplete.
+Durable Close retirement and ProductConversation History finalization are shipped, while the dedicated Close-start replacement and legacy-edge removal remain incomplete. A successful exact attempt retires the attached WorkScope resources, records one durable outcome message, transitions the ordinary aggregate to History in the completion transaction, and publishes compatibility updates only after commit. Primary ProductConversation surfaces expose Close and read-only History rather than Archive, but `POST /api/conversations/:id/archive`, `/abandon-task`, `/mark-merged`, and `continued_in_conv_id` compatibility checks remain live internally or on legacy surfaces. Existing row-level WorkScope fields remain attachment authority, with no parallel writable normalized attachment relation. Phoenix continues using the current Project-backed repository model; replacement is deferred until a named feature requires it. Exact-attempt retry atomically adopts compatible prior worktree dispatch and cleanup-plan evidence into a fresh inspection generation. Ambient writer retirement on macOS and Linux distinguishes writable descriptors/shared mappings from read-only or non-authorizing path references, persists complete blocking-writer identity, and requires bounded consecutive clean reinspection before final removal.
 
 ## Requirements Summary
 
@@ -30,7 +30,7 @@ Current normative authority is `requirements.md`, `work-lifecycle.allium`, `spec
 | REQ-WL-001 | Partially implemented | Primary ProductConversation surfaces expose Close, but legacy abandon / mark-merged endpoints and dedicated Close-start replacement remain incomplete |
 | REQ-WL-002 | Partially implemented | Legacy flows already inspect/capture worktree state for cleanup paths, but the exact Close loss-inventory contract is not the shipped user flow |
 | REQ-WL-002a | Not implemented | No shipped fingerprint-bound discard confirmation for the unified Close obligation |
-| REQ-WL-002b | Partially implemented | Durable Close retirement idempotently retires attached WorkScope resources and completes with one outcome plus aggregate History; legacy entry and cleanup edges remain |
+| REQ-WL-002b | Partially implemented | Durable Close retirement idempotently retires attached WorkScope resources and completes with one outcome plus aggregate History; ambient writer evidence is normalized and exact-attempt retained cleanup adoption is transactional, while legacy entry and cleanup edges remain |
 | REQ-PROJ-028a | Not implemented | Missing/inaccessible registered worktrees are not yet preserved as immutable restart-repair evidence that later Close attempts can adopt fail-closed by exact identity |
 | REQ-WL-003 | Partially implemented | Observed PR state already guides current cleanup affordances, but it still participates in legacy mark-merged UX rather than purely advisory Close guidance |
 
@@ -50,6 +50,9 @@ Current-reality verification for this reconciliation used:
 - `crates/phoenix-ide/src/api/lifecycle_handlers.rs`
 - `crates/phoenix-ide/src/api/handlers.rs`
 - `crates/phoenix-db/src/lib.rs` (`archive_conversation`, `archived` listings, continuation/ownership queries)
+- `crates/phoenix-db/src/close_foundation.rs` (`adopt_close_worktree_cleanup_plan`, `record_close_ambient_writer_evidence`)
+- `crates/phoenix-ide/src/runtime/close_retirement.rs` (platform writer classification and bounded quiescence)
+- `exact_attempt_retry_adopts_retained_cleanup_and_finalizes_history` (retained quarantine through WorkScope retirement and aggregate History)
 
 ## Provenance
 

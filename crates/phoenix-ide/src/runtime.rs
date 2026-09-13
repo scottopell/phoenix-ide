@@ -7587,6 +7587,139 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
+    async fn exact_attempt_retry_adopts_retained_cleanup_and_finalizes_history() {
+        use phoenix_core::domain::close::ClosePhase;
+        use phoenix_core::domain::product_conversation::OrdinaryProductConversationLifecycle;
+
+        let owner = phoenix_tools::tmux::test_server::TestTmuxServerOwner::new();
+        let manager = test_manager().await;
+        let (repository, attempt_id, scope, _, _) = prepare_clean_close_with_tmux(
+            &manager,
+            &owner,
+            "retained-retry",
+            "retained-retry-attempt",
+        )
+        .await;
+        let worktree = repository.path().join("worktree");
+        let marker = repository.path().join("writer-ready");
+        let mut writer = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "exec 3>>\"$TARGET\"; touch \"$MARKER\"; exec sleep 30",
+            ])
+            .env("TARGET", worktree.join("tracked"))
+            .env("MARKER", &marker)
+            .spawn()
+            .unwrap();
+        for _ in 0..100 {
+            if marker.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(marker.exists(), "external writer became ready");
+
+        let error = manager
+            .retire_close_runtime_resources(attempt_id.clone())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("stable ambient writer"));
+        let obligation = manager
+            .db()
+            .get_close_obligation(attempt_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(obligation.phase(), ClosePhase::NeedsRepair);
+        let original_snapshot = obligation.snapshot().cloned().unwrap();
+        writer.kill().unwrap();
+        writer.wait().unwrap();
+
+        let retried = manager
+            .db()
+            .retry_close_retirement(&attempt_id)
+            .await
+            .unwrap();
+        assert_eq!(retried.phase(), ClosePhase::AwaitingRetirementInspection);
+        manager
+            .inspect_close_retirement(attempt_id.clone())
+            .await
+            .unwrap();
+
+        let completed = manager
+            .db()
+            .get_close_obligation(attempt_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(completed.phase(), ClosePhase::Completed);
+        let retry_snapshot = completed.snapshot().cloned().unwrap();
+        assert_ne!(retry_snapshot.generation(), original_snapshot.generation());
+        let evidence_shape: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT inventory.inspection_generation,
+                    EXISTS(SELECT 1 FROM close_retirement_resource_dispatches dispatch
+                           WHERE dispatch.attempt_id=inventory.attempt_id
+                             AND dispatch.scope=inventory.scope
+                             AND dispatch.inspection_generation=inventory.inspection_generation
+                             AND dispatch.resource_kind='worktree'),
+                    EXISTS(SELECT 1 FROM close_worktree_cleanup_plans plan
+                           WHERE plan.attempt_id=inventory.attempt_id
+                             AND plan.scope=inventory.scope
+                             AND plan.inspection_generation=inventory.inspection_generation)
+             FROM close_retirement_inventories inventory
+             WHERE inventory.attempt_id=?1 AND inventory.scope=?2
+             ORDER BY inventory.captured_at",
+        )
+        .bind(attempt_id.as_str())
+        .bind(scope.as_str())
+        .fetch_all(manager.db().pool())
+        .await
+        .unwrap();
+        assert_eq!(evidence_shape.len(), 2);
+        assert!(evidence_shape
+            .iter()
+            .all(|(_, dispatch, plan)| *dispatch == 1 && *plan == 1));
+        let work_scope_retired: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM close_retirement_resources
+                 WHERE attempt_id=?1 AND scope=?2
+                   AND inspection_generation=?3 AND inspection_fingerprint=?4
+                   AND resource_kind='work_scope' AND proof_kind='retired'
+             )",
+        )
+        .bind(attempt_id.as_str())
+        .bind(scope.as_str())
+        .bind(retry_snapshot.generation())
+        .bind(retry_snapshot.fingerprint())
+        .fetch_one(manager.db().pool())
+        .await
+        .unwrap();
+        assert!(work_scope_retired);
+        let conversation = manager
+            .db()
+            .get_conversation("retained-retry")
+            .await
+            .unwrap();
+        assert!(conversation.archived);
+        let aggregate = manager
+            .db()
+            .get_ordinary_product_conversation(&conversation.product_conversation_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            aggregate.product_conversation.ordinary_lifecycle(),
+            Some(OrdinaryProductConversationLifecycle::History)
+        );
+        assert!(!worktree.exists());
+        let ambient_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_ambient_writer_evidence WHERE attempt_id=?1",
+        )
+        .bind(attempt_id.as_str())
+        .fetch_one(manager.db().pool())
+        .await
+        .unwrap();
+        assert!(ambient_rows >= 1);
+    }
+
+    #[tokio::test]
     async fn complete_close_retirement_and_publish_persists_archive_before_emitting_update() {
         use phoenix_core::domain::product_conversation::OrdinaryProductConversationLifecycle;
 
@@ -8008,7 +8141,9 @@ mod scope_liveness_tests {
             .retire_close_runtime_resources(attempt_id.clone())
             .await
             .unwrap_err();
-        assert!(error.contains("worktree cannot be reinspected before live resource retirement"));
+        assert!(error
+            .to_string()
+            .contains("worktree cannot be reinspected before live resource retirement"));
 
         let obligation = manager
             .db()

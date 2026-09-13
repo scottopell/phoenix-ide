@@ -139,10 +139,10 @@ AND SHALL report typed repair information rather than silently succeeding
 
 WHEN Phoenix inspects processes outside the sealed gate for authority to write a quarantined worktree
 THE SYSTEM SHALL distinguish a filesystem path reference from write authority
-AND SHALL treat only a writable open descriptor whose access mode is `write_only` or `read_write` as positive writer evidence
-AND SHALL NOT treat a read-only descriptor, current working directory, process root, executable text reference, or read-only mapping as write authority
+AND SHALL treat only a writable open descriptor whose access mode is `write_only` or `read_write`, or a writable shared mapping explicitly identified as such, as positive writer evidence
+AND SHALL NOT treat a read-only descriptor, current working directory, process root, executable text reference, or read-only/private mapping as write authority
 
-EACH positive ambient-writer observation SHALL durably identify the detector, process ID, process start/incarnation, executable, exact matched path, match kind, and descriptor access mode
+EACH positive ambient-writer decision that blocks retirement SHALL durably identify the detector, process ID, process start/incarnation, executable, exact matched path, match kind, and descriptor access mode
 AND THE SYSTEM SHALL treat an observation missing any of those facts as detector-indeterminate rather than fabricating positive evidence
 
 AFTER the sealed gate's owned resources have retired and before final worktree removal

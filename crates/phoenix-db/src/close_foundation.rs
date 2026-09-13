@@ -732,6 +732,81 @@ pub struct RecordCloseWorktreeCleanupPlanRequest {
     pub administrative_dir: std::path::PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub struct AdoptCloseWorktreeCleanupPlanRequest {
+    pub attempt_id: CloseAttemptId,
+    pub scope: WorkScopeId,
+    pub target_snapshot: CloseRetirementSnapshot,
+    pub resource: RetiredResourceIdentity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmbientWriterDetector {
+    MacosProcPidinfo,
+    LinuxProcfs,
+}
+
+impl AmbientWriterDetector {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::MacosProcPidinfo => "macos_proc_pidinfo",
+            Self::LinuxProcfs => "linux_procfs",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmbientWriterMatchKind {
+    Descriptor,
+    Mapping,
+}
+
+impl AmbientWriterMatchKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Descriptor => "descriptor",
+            Self::Mapping => "mapping",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmbientWriterAccessMode {
+    WriteOnly,
+    ReadWrite,
+    WritableSharedMapping,
+}
+
+impl AmbientWriterAccessMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::WriteOnly => "write_only",
+            Self::ReadWrite => "read_write",
+            Self::WritableSharedMapping => "writable_shared_mapping",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmbientWriterEvidence {
+    pub detector: AmbientWriterDetector,
+    pub process_id: i64,
+    pub process_incarnation: String,
+    pub executable: GitPathIdentity,
+    pub matched_path: GitPathIdentity,
+    pub match_kind: AmbientWriterMatchKind,
+    pub access_mode: AmbientWriterAccessMode,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecordCloseAmbientWriterEvidenceRequest {
+    pub attempt_id: CloseAttemptId,
+    pub scope: WorkScopeId,
+    pub snapshot: CloseRetirementSnapshot,
+    pub resource: RetiredResourceIdentity,
+    pub evidence: AmbientWriterEvidence,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CloseWorktreeFinalTombstone {
     pub root: std::path::PathBuf,
@@ -3397,6 +3472,269 @@ impl Database {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Persists one complete positive ambient-writer observation for an expected worktree.
+    ///
+    /// # Errors
+    /// Returns a typed evidence-invariant error when the observation is incomplete or
+    /// is not bound to the exact active retirement snapshot.
+    pub async fn record_close_ambient_writer_evidence(
+        &self,
+        request: RecordCloseAmbientWriterEvidenceRequest,
+    ) -> DbResult<()> {
+        if request.resource.kind() != RetiredResourceKind::Worktree
+            || request.evidence.process_id <= 0
+            || request.evidence.process_incarnation.is_empty()
+        {
+            return Err(DbError::CloseEvidenceInvariant {
+                invariant: "complete_positive_ambient_writer_identity",
+                relation: "close_ambient_writer_evidence",
+                detail: "writer evidence is incomplete or not a worktree".to_string(),
+            });
+        }
+        let identity = request.resource.identity();
+        let now = Utc::now().timestamp_micros();
+        sqlx::query(
+            "INSERT INTO close_ambient_writer_evidence (
+                 attempt_id, scope, inspection_generation, inspection_fingerprint,
+                 resource_kind, identity_kind, identity_codec, identity_value,
+                 detector, process_id, process_incarnation,
+                 executable_codec, executable_value,
+                 matched_path_codec, matched_path_value, match_kind, access_mode,
+                 observed_at_unix_micros
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(request.attempt_id.as_str())
+        .bind(request.scope.as_str())
+        .bind(request.snapshot.generation())
+        .bind(request.snapshot.fingerprint())
+        .bind(request.resource.kind().as_str())
+        .bind(identity.identity_kind())
+        .bind(identity.codec())
+        .bind(identity.value())
+        .bind(request.evidence.detector.as_str())
+        .bind(request.evidence.process_id)
+        .bind(&request.evidence.process_incarnation)
+        .bind(request.evidence.executable.codec())
+        .bind(request.evidence.executable.encode())
+        .bind(request.evidence.matched_path.codec())
+        .bind(request.evidence.matched_path.encode())
+        .bind(request.evidence.match_kind.as_str())
+        .bind(request.evidence.access_mode.as_str())
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| DbError::CloseEvidenceInvariant {
+            invariant: "positive_writer_must_reference_expected_worktree",
+            relation: "close_ambient_writer_evidence",
+            detail: error.to_string(),
+        })?;
+        Ok(())
+    }
+
+    /// Atomically adopts a unique compatible prior-generation worktree dispatch
+    /// and cleanup plan into the exact active retry generation.
+    ///
+    /// # Errors
+    /// Returns a typed evidence-invariant error when source authority is absent,
+    /// conflicting, or incompatible with the target sealed inventory.
+    pub async fn adopt_close_worktree_cleanup_plan(
+        &self,
+        request: AdoptCloseWorktreeCleanupPlanRequest,
+    ) -> DbResult<CloseWorktreeCleanupPlan> {
+        if request.resource.kind() != RetiredResourceKind::Worktree {
+            return Err(DbError::CloseEvidenceInvariant {
+                invariant: "cleanup_plan_requires_worktree_resource",
+                relation: "close_worktree_cleanup_plans",
+                detail: "adoption resource is not a worktree".to_string(),
+            });
+        }
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let current = close_obligation_for_update(&mut tx, request.attempt_id.as_str()).await?;
+        if !matches!(
+            current.phase(),
+            ClosePhase::RetirementRequested | ClosePhase::NeedsRepair
+        ) || current.snapshot() != Some(&request.target_snapshot)
+        {
+            return Err(DbError::CloseEvidenceInvariant {
+                invariant: "target_generation_requires_active_needs_repair_authority",
+                relation: "close_obligations",
+                detail: format!(
+                    "attempt {} lacks active retirement authority for the target retry generation",
+                    request.attempt_id
+                ),
+            });
+        }
+        let identity = request.resource.identity();
+        let sources: Vec<WorktreeCleanupPlanColumns> = sqlx::query_as(
+            "SELECT DISTINCT plan.administrative_dir_codec, plan.administrative_dir_value,
+                    plan.administrative_dir_incarnation, plan.final_tombstone_root_codec,
+                    plan.final_tombstone_root_value, plan.final_tombstone_root_device,
+                    plan.final_tombstone_root_inode, plan.final_tombstone_object_device,
+                    plan.final_tombstone_object_inode
+             FROM close_worktree_cleanup_plans plan
+             JOIN close_retirement_resource_dispatches dispatch
+               ON dispatch.attempt_id = plan.attempt_id AND dispatch.scope = plan.scope
+              AND dispatch.inspection_generation = plan.inspection_generation
+              AND dispatch.inspection_fingerprint = plan.inspection_fingerprint
+              AND dispatch.resource_kind = plan.resource_kind
+              AND dispatch.identity_kind = plan.identity_kind
+              AND dispatch.identity_codec = plan.identity_codec
+              AND dispatch.identity_value = plan.identity_value
+             WHERE plan.attempt_id = ?1 AND plan.scope = ?2
+               AND plan.resource_kind = ?3 AND plan.identity_kind = ?4
+               AND plan.identity_codec = ?5 AND plan.identity_value = ?6
+               AND (plan.inspection_generation <> ?7 OR plan.inspection_fingerprint <> ?8)",
+        )
+        .bind(request.attempt_id.as_str())
+        .bind(request.scope.as_str())
+        .bind(request.resource.kind().as_str())
+        .bind(identity.identity_kind())
+        .bind(identity.codec())
+        .bind(identity.value())
+        .bind(request.target_snapshot.generation())
+        .bind(request.target_snapshot.fingerprint())
+        .fetch_all(&mut *tx)
+        .await?;
+        let [source] = sources.as_slice() else {
+            return Err(DbError::CloseEvidenceInvariant {
+                invariant: "unique_compatible_prior_dispatch_and_cleanup_plan",
+                relation: "close_retirement_resource_dispatches+close_worktree_cleanup_plans",
+                detail: format!("found {} compatible source plans", sources.len()),
+            });
+        };
+        let dispatched_at_us = Utc::now().timestamp_micros();
+        let dispatch = sqlx::query(
+            "INSERT INTO close_retirement_resource_dispatches (
+                 attempt_id, scope, inspection_generation, inspection_fingerprint,
+                 resource_kind, identity_kind, identity_codec, identity_value, dispatched_at_us
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(request.attempt_id.as_str())
+        .bind(request.scope.as_str())
+        .bind(request.target_snapshot.generation())
+        .bind(request.target_snapshot.fingerprint())
+        .bind(request.resource.kind().as_str())
+        .bind(identity.identity_kind())
+        .bind(identity.codec())
+        .bind(identity.value())
+        .bind(dispatched_at_us)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| DbError::CloseEvidenceInvariant {
+            invariant: "target_dispatch_must_match_sealed_inventory",
+            relation: "close_retirement_resource_dispatches",
+            detail: error.to_string(),
+        })?;
+        if dispatch.rows_affected() == 0 {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM close_retirement_resource_dispatches
+                 WHERE attempt_id=?1 AND scope=?2 AND inspection_generation=?3
+                   AND inspection_fingerprint=?4 AND resource_kind=?5
+                   AND identity_kind=?6 AND identity_codec=?7 AND identity_value=?8)",
+            )
+            .bind(request.attempt_id.as_str())
+            .bind(request.scope.as_str())
+            .bind(request.target_snapshot.generation())
+            .bind(request.target_snapshot.fingerprint())
+            .bind(request.resource.kind().as_str())
+            .bind(identity.identity_kind())
+            .bind(identity.codec())
+            .bind(identity.value())
+            .fetch_one(&mut *tx)
+            .await?;
+            if !exists {
+                return Err(DbError::CloseEvidenceInvariant {
+                    invariant: "target_dispatch_must_match_sealed_inventory",
+                    relation: "close_retirement_resource_dispatches",
+                    detail: "target dispatch could not be adopted".to_string(),
+                });
+            }
+        }
+        let plan_insert = sqlx::query(
+            "INSERT INTO close_worktree_cleanup_plans (
+                 attempt_id, scope, inspection_generation, inspection_fingerprint,
+                 resource_kind, identity_kind, identity_codec, identity_value,
+                 administrative_dir_codec, administrative_dir_value,
+                 administrative_dir_incarnation, planned_at_us,
+                 final_tombstone_root_codec, final_tombstone_root_value,
+                 final_tombstone_root_device, final_tombstone_root_inode,
+                 final_tombstone_object_device, final_tombstone_object_inode
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(request.attempt_id.as_str())
+        .bind(request.scope.as_str())
+        .bind(request.target_snapshot.generation())
+        .bind(request.target_snapshot.fingerprint())
+        .bind(request.resource.kind().as_str())
+        .bind(identity.identity_kind())
+        .bind(identity.codec())
+        .bind(identity.value())
+        .bind(&source.0)
+        .bind(&source.1)
+        .bind(&source.2)
+        .bind(dispatched_at_us)
+        .bind(&source.3)
+        .bind(&source.4)
+        .bind(&source.5)
+        .bind(&source.6)
+        .bind(&source.7)
+        .bind(&source.8)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| DbError::CloseEvidenceInvariant {
+            invariant: "cleanup_plan_requires_generation_matched_dispatch",
+            relation: "close_worktree_cleanup_plans",
+            detail: error.to_string(),
+        })?;
+        if plan_insert.rows_affected() == 0 {
+            let target: WorktreeCleanupPlanColumns = sqlx::query_as(
+                "SELECT administrative_dir_codec, administrative_dir_value,
+                        administrative_dir_incarnation, final_tombstone_root_codec,
+                        final_tombstone_root_value, final_tombstone_root_device,
+                        final_tombstone_root_inode, final_tombstone_object_device,
+                        final_tombstone_object_inode
+                 FROM close_worktree_cleanup_plans
+                 WHERE attempt_id=?1 AND scope=?2 AND inspection_generation=?3
+                   AND inspection_fingerprint=?4 AND resource_kind=?5
+                   AND identity_kind=?6 AND identity_codec=?7 AND identity_value=?8",
+            )
+            .bind(request.attempt_id.as_str())
+            .bind(request.scope.as_str())
+            .bind(request.target_snapshot.generation())
+            .bind(request.target_snapshot.fingerprint())
+            .bind(request.resource.kind().as_str())
+            .bind(identity.identity_kind())
+            .bind(identity.codec())
+            .bind(identity.value())
+            .fetch_one(&mut *tx)
+            .await?;
+            if target != *source {
+                return Err(DbError::CloseEvidenceInvariant {
+                    invariant: "idempotent_target_cleanup_plan_matches_source",
+                    relation: "close_worktree_cleanup_plans",
+                    detail: "target retry generation already has conflicting cleanup authority"
+                        .to_string(),
+                });
+            }
+        }
+        tx.commit().await?;
+        self.close_worktree_cleanup_plan(
+            &request.attempt_id,
+            &request.scope,
+            &request.target_snapshot,
+            &request.resource,
+        )
+        .await?
+        .ok_or_else(|| DbError::CloseEvidenceInvariant {
+            invariant: "adopted_cleanup_plan_must_exist",
+            relation: "close_worktree_cleanup_plans",
+            detail: "transaction committed without an exact target plan".to_string(),
+        })
     }
 
     /// Durably binds the validated Git administrative directory to an exact
@@ -9209,6 +9547,275 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(divergent, DbError::CloseFoundationPrecondition(_)));
+    }
+
+    #[tokio::test]
+    async fn complete_ambient_writer_evidence_is_normalized_and_identity_bound() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let scope = allocate_scope_worktree(&db, "root").await;
+        let attempt_id = CloseAttemptId::parse("attempt-writer-evidence").unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            attempt_id.as_str(),
+        )
+        .await
+        .unwrap();
+        set_close_phase(&db, attempt_id.as_str(), ClosePhase::RetirementRequested).await;
+        let snapshot = current_test_snapshot(&db, attempt_id.as_str()).await;
+        let resource = RetiredResourceIdentity::parse(
+            RetiredResourceKind::Worktree,
+            LossItemIdentity::Worktree(current_test_worktree(&db, &scope).await),
+        )
+        .unwrap();
+        capture_test_inventory(
+            &db,
+            attempt_id.as_str(),
+            &scope,
+            &snapshot,
+            vec![resource.clone()],
+        )
+        .await;
+        let request = RecordCloseAmbientWriterEvidenceRequest {
+            attempt_id: attempt_id.clone(),
+            scope: scope.clone(),
+            snapshot: snapshot.clone(),
+            resource: resource.clone(),
+            evidence: AmbientWriterEvidence {
+                detector: AmbientWriterDetector::MacosProcPidinfo,
+                process_id: 4242,
+                process_incarnation: "1234:5678".to_string(),
+                executable: GitPathIdentity::from_bytes(b"/bin/writer".to_vec()),
+                matched_path: GitPathIdentity::from_bytes(b"/tmp/quarantine/open".to_vec()),
+                match_kind: AmbientWriterMatchKind::Descriptor,
+                access_mode: AmbientWriterAccessMode::ReadWrite,
+            },
+        };
+        db.record_close_ambient_writer_evidence(request.clone())
+            .await
+            .unwrap();
+        db.record_close_ambient_writer_evidence(request)
+            .await
+            .unwrap();
+        let row: (String, i64, String, String, String, String, String) = sqlx::query_as(
+            "SELECT detector, process_id, process_incarnation, executable_value,
+                    matched_path_value, match_kind, access_mode
+             FROM close_ambient_writer_evidence WHERE attempt_id=?1",
+        )
+        .bind(attempt_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(row.0, "macos_proc_pidinfo");
+        assert_eq!(row.1, 4242);
+        assert_eq!(row.2, "1234:5678");
+        assert_eq!(
+            GitPathIdentity::decode_exact(&row.3).unwrap().as_bytes(),
+            b"/bin/writer"
+        );
+        assert_eq!(
+            GitPathIdentity::decode_exact(&row.4).unwrap().as_bytes(),
+            b"/tmp/quarantine/open"
+        );
+        assert_eq!(row.5, "descriptor");
+        assert_eq!(row.6, "read_write");
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_ambient_writer_evidence WHERE attempt_id=?1",
+        )
+        .bind(attempt_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[tokio::test]
+    async fn retry_generation_atomically_adopts_prior_dispatch_and_cleanup_plan() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let scope = allocate_scope_worktree(&db, "root").await;
+        let attempt_id = CloseAttemptId::parse("attempt-adopt-plan").unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            attempt_id.as_str(),
+        )
+        .await
+        .unwrap();
+        set_close_phase(&db, attempt_id.as_str(), ClosePhase::RetirementRequested).await;
+        let source_snapshot = current_test_snapshot(&db, attempt_id.as_str()).await;
+        let resource = RetiredResourceIdentity::parse(
+            RetiredResourceKind::Worktree,
+            LossItemIdentity::Worktree(current_test_worktree(&db, &scope).await),
+        )
+        .unwrap();
+        capture_test_inventory(
+            &db,
+            attempt_id.as_str(),
+            &scope,
+            &source_snapshot,
+            vec![resource.clone()],
+        )
+        .await;
+        db.record_close_retirement_dispatch(RecordCloseRetirementDispatchRequest {
+            attempt_id: attempt_id.clone(),
+            scope: scope.clone(),
+            snapshot: source_snapshot.clone(),
+            resource: resource.clone(),
+        })
+        .await
+        .unwrap();
+        db.record_close_worktree_cleanup_plan(RecordCloseWorktreeCleanupPlanRequest {
+            attempt_id: attempt_id.clone(),
+            scope: scope.clone(),
+            snapshot: source_snapshot.clone(),
+            resource: resource.clone(),
+            administrative_dir: std::path::PathBuf::from("/tmp/git/worktrees/adopted"),
+            administrative_dir_incarnation: "admin-adopt-v1".to_string(),
+        })
+        .await
+        .unwrap();
+
+        db.route_close_attempt_to_repair(RouteCloseAttemptToRepairRequest {
+            attempt_id: attempt_id.clone(),
+            scope: scope.clone(),
+            residual: resource.clone(),
+            reason: RetirementFailureReason::IdentityNotProven,
+            detail: "retained quarantine requires exact-attempt retry".to_string(),
+        })
+        .await
+        .unwrap();
+        db.retry_close_retirement(&attempt_id).await.unwrap();
+        let target_snapshot =
+            CloseRetirementSnapshot::parse("retry-generation", "retry-fp").unwrap();
+        db.replace_close_inspection(ReplaceCloseInspectionRequest {
+            attempt_id: attempt_id.clone(),
+            scopes: vec![ReplaceCloseInspectionScopeRequest {
+                scope: scope.clone(),
+                snapshot: target_snapshot.clone(),
+                losses: Vec::new(),
+            }],
+        })
+        .await
+        .unwrap();
+        let authorized_target_snapshot = current_test_snapshot(&db, attempt_id.as_str()).await;
+        capture_test_inventory(
+            &db,
+            attempt_id.as_str(),
+            &scope,
+            &authorized_target_snapshot,
+            vec![resource.clone()],
+        )
+        .await;
+
+        let request = AdoptCloseWorktreeCleanupPlanRequest {
+            attempt_id: attempt_id.clone(),
+            scope: scope.clone(),
+            target_snapshot: authorized_target_snapshot.clone(),
+            resource: resource.clone(),
+        };
+        let adopted = db
+            .adopt_close_worktree_cleanup_plan(request.clone())
+            .await
+            .unwrap();
+        let replay = db.adopt_close_worktree_cleanup_plan(request).await.unwrap();
+        assert_eq!(adopted, replay);
+        assert_eq!(
+            adopted,
+            CloseWorktreeCleanupPlan {
+                administrative_dir: std::path::PathBuf::from("/tmp/git/worktrees/adopted"),
+                administrative_dir_incarnation: "admin-adopt-v1".to_string(),
+                final_tombstone: None,
+            }
+        );
+        let generations: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT inventory.inspection_generation,
+                    EXISTS(SELECT 1 FROM close_retirement_resource_dispatches dispatch
+                           WHERE dispatch.attempt_id=inventory.attempt_id
+                             AND dispatch.scope=inventory.scope
+                             AND dispatch.inspection_generation=inventory.inspection_generation),
+                    EXISTS(SELECT 1 FROM close_worktree_cleanup_plans plan
+                           WHERE plan.attempt_id=inventory.attempt_id
+                             AND plan.scope=inventory.scope
+                             AND plan.inspection_generation=inventory.inspection_generation)
+             FROM close_retirement_inventories inventory
+             WHERE inventory.attempt_id=?1 ORDER BY inventory.captured_at",
+        )
+        .bind(attempt_id.as_str())
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(generations.len(), 2);
+        assert!(generations
+            .iter()
+            .all(|(_, dispatch, plan)| *dispatch == 1 && *plan == 1));
+        let violations: Vec<(String, i64, String, i64)> =
+            sqlx::query_as("PRAGMA foreign_key_check")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert!(violations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn retry_generation_without_prior_cleanup_authority_fails_typed_and_rolls_back() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let scope = allocate_scope_worktree(&db, "root").await;
+        let attempt_id = CloseAttemptId::parse("attempt-no-plan").unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            attempt_id.as_str(),
+        )
+        .await
+        .unwrap();
+        set_close_phase(&db, attempt_id.as_str(), ClosePhase::RetirementRequested).await;
+        let resource = RetiredResourceIdentity::parse(
+            RetiredResourceKind::Worktree,
+            LossItemIdentity::Worktree(current_test_worktree(&db, &scope).await),
+        )
+        .unwrap();
+        let snapshot = current_test_snapshot(&db, attempt_id.as_str()).await;
+        capture_test_inventory(
+            &db,
+            attempt_id.as_str(),
+            &scope,
+            &snapshot,
+            vec![resource.clone()],
+        )
+        .await;
+        let error = db
+            .adopt_close_worktree_cleanup_plan(AdoptCloseWorktreeCleanupPlanRequest {
+                attempt_id: attempt_id.clone(),
+                scope: scope.clone(),
+                target_snapshot: snapshot.clone(),
+                resource: resource.clone(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            DbError::CloseEvidenceInvariant {
+                invariant: "unique_compatible_prior_dispatch_and_cleanup_plan",
+                relation: "close_retirement_resource_dispatches+close_worktree_cleanup_plans",
+                ..
+            }
+        ));
+        let target_dispatches: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_retirement_resource_dispatches
+             WHERE attempt_id=?1 AND scope=?2 AND inspection_generation=?3
+               AND inspection_fingerprint=?4",
+        )
+        .bind(attempt_id.as_str())
+        .bind(scope.as_str())
+        .bind(snapshot.generation())
+        .bind(snapshot.fingerprint())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(target_dispatches, 0);
     }
 
     #[tokio::test]

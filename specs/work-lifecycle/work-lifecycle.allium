@@ -114,6 +114,7 @@ enum DescriptorAccessMode {
     read_only
     | write_only
     | read_write
+    | writable_shared_mapping
 }
 
 enum AmbientReferenceClassification {
@@ -646,7 +647,7 @@ rule ReadOnlyAmbientReferenceNeverAuthorizesWriter {
 rule WritableAmbientDescriptorRecordsAuditableEvidence {
     when: AmbientPathReferenceObserved(product_conversation, attempt_id, scope, detector, process_id, process_incarnation, executable, matched_path, match_kind, access_mode)
     let attempt = RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope}
-    requires: access_mode in { write_only, read_write }
+    requires: access_mode in { write_only, read_write, writable_shared_mapping }
     requires: complete_ambient_writer_identity(detector, process_id, process_incarnation, executable, matched_path, match_kind, access_mode)
     ensures: AmbientWriterEvidenceRow.created(
         attempt: attempt,
@@ -667,7 +668,7 @@ rule WritableAmbientDescriptorRecordsAuditableEvidence {
 
 rule IncompleteAmbientWriterIdentityIsIndeterminate {
     when: AmbientPathReferenceObserved(product_conversation, attempt_id, scope, detector, process_id, process_incarnation, executable, matched_path, match_kind, access_mode)
-    requires: access_mode in { write_only, read_write }
+    requires: access_mode in { write_only, read_write, writable_shared_mapping }
     requires: not complete_ambient_writer_identity(detector, process_id, process_incarnation, executable, matched_path, match_kind, access_mode)
     ensures: AmbientReferenceClassified(product_conversation, attempt_id, scope, classification: detector_indeterminate)
 }
