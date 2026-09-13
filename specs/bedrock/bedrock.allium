@@ -1172,6 +1172,7 @@ rule UserApprovesTaskCurrentConversation {
         objective: conversation.approved_task_objective
     }
     ensures: WriteAuthorityPersistedBeforeResume(conversation)
+    ensures: ApprovalAdoptionPersistedAtomically(conversation)
     ensures: RuntimeCapabilitiesMatchPersistedAuthority(conversation)
     ensures: NoPostApprovalExecutionUsesRestrictedAuthority(conversation)
     ensures: conversation.core_status = llm_requesting
@@ -2301,6 +2302,13 @@ rule ModeChangeNotification {
 --
 -- Allium has no formal helper-function declaration; rules call these
 -- predicates by bare identifier. This block defines their complete semantics.
+--
+--   ApprovalAdoptionPersistedAtomically(
+--       conversation: Parent
+--   ) -> Boolean
+--       True exactly when the approved objective, WorkScope authority,
+--       post-approval conversation state, and approved-plan context message
+--       commit in one transaction before runtime capability publication.
 --
 --   RuntimeCapabilitiesMatchPersistedAuthority(
 --       conversation: Parent
