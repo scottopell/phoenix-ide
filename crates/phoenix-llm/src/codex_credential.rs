@@ -370,10 +370,14 @@ impl CredentialSource for AccountBoundCodexCredential {
     }
 
     async fn invalidate(&self) -> bool {
-        if self.source.account_id() == self.account_id {
-            self.source.invalidate().await
-        } else {
-            false
+        let auth_path = self.source.auth_path.clone();
+        let live_account_id = tokio::task::spawn_blocking(move || {
+            read_auth_file(&auth_path).map(|auth| auth.tokens.and_then(|tokens| tokens.account_id))
+        })
+        .await;
+        match live_account_id {
+            Ok(Ok(account_id)) if account_id == self.account_id => self.source.invalidate().await,
+            Ok(Ok(_) | Err(_)) | Err(_) => false,
         }
     }
 
@@ -756,6 +760,14 @@ mod tests {
         let bound = AccountBoundCodexCredential::new(credential, account_id);
         assert_eq!(bound.get().await.as_deref(), Some(first_jwt.as_str()));
 
+        let second_jwt = fake_jwt(now_unix() + 7200);
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"auth_mode":"chatgpt","tokens":{{"access_token":"{second_jwt}","refresh_token":"r","account_id":"account-b"}}}}"#
+            ),
+        )
+        .unwrap();
         *bound.source.account_id.lock().unwrap() = Some("account-b".to_string());
 
         assert_eq!(bound.get().await, None);

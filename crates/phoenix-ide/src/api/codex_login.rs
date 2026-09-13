@@ -499,16 +499,13 @@ async fn settle_pkce(
     // `kind: success` as "the bridge is live now" and may immediately fire
     // an OpenAI request — that request must hit the new credential, not the
     // pre-login state.
-    let outcome = match outcome {
+    match outcome {
         Ok((result, publication)) => {
             llm_registry.reload_codex_credential().await;
-            Ok((result, publication))
+            session.inner.lock().await.status.outcome = Some(Ok(result));
+            drop(publication);
         }
-        Err(error) => Err(error),
-    };
-    {
-        let mut inner = session.inner.lock().await;
-        inner.status.outcome = Some(outcome.map(|(result, _)| result));
+        Err(error) => session.inner.lock().await.status.outcome = Some(Err(error)),
     }
     schedule_pkce_sweep(mgr.clone(), session_id.to_string());
 }
@@ -849,16 +846,13 @@ async fn settle_device(
         );
     }
     // Reload before publishing status — see settle_pkce for the rationale.
-    let outcome = match outcome {
+    match outcome {
         Ok((result, publication)) => {
             llm_registry.reload_codex_credential().await;
-            Ok((result, publication))
+            session.status.lock().await.outcome = Some(Ok(result));
+            drop(publication);
         }
-        Err(error) => Err(error),
-    };
-    {
-        let mut status = session.status.lock().await;
-        status.outcome = Some(outcome.map(|(result, _)| result));
+        Err(error) => session.status.lock().await.outcome = Some(Err(error)),
     }
     schedule_device_sweep(mgr.clone(), session_id.to_string());
 }
