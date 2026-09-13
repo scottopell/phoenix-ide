@@ -66,11 +66,8 @@ A typed design should prevent `Turbocharge` from being serialized as `reasoning.
 - **Completion:** the owning agent exercises higher-effort judgment using normal Phoenix validation and reports the completed result. Turbocharge does not require a new scope ledger, approval gate, or mandatory independent-review verdict.
 - **Delegation:** optional and adaptive. Turbocharge may proceed solo when additional agents would not materially improve completeness.
 - **Presentation:** reuse current subagent interfaces rather than creating bespoke team-management UI.
-
-## Product questions to resolve
-
-- How should Phoenix explain useful additional quality work without introducing bespoke team-management UI or a formal scope ledger?
-- When complementary agents disagree, what judgment and synthesis obligations determine the owning agent's final answer?
+- **Handoff:** use the normal Phoenix handoff with complete context on scope, done criteria, validation, limitations, and remaining work. Do not add a separate “what Turbocharge changed” explanation or orchestration report.
+- **Synthesis judgment:** the owning model evaluates delegated evidence using normal model judgment. Agent disagreement is not a separate product concept and does not require voting, tie-breakers, or special workflow state.
 
 ## Engineering questions after product intent is settled
 
@@ -82,7 +79,6 @@ A typed design should prevent `Turbocharge` from being serialized as `reasoning.
 
 ## Acceptance criteria
 
-- [ ] Complete product discovery for concise result reporting and owning-agent synthesis when complementary work disagrees.
 - [ ] Write normative requirements centered on the strongest-result user promise and an ADR for the orchestration-versus-provider-effort distinction.
 - [ ] Persist message-bound activation as a one-way v1 conversation transition; preserve it structurally across compaction without relying on summary text.
 - [ ] Require an owning-agent decomposition without introducing a user approval gate or formal scope ledger, while allowing zero delegated agents when delegation adds no material value.
@@ -91,7 +87,6 @@ A typed design should prevent `Turbocharge` from being serialized as `reasoning.
 - [ ] Add or extend Allium for the resulting orchestration lifecycle, including role selection, synthesis, cancellation, retry, recovery, and bounded delegation.
 - [ ] Represent Turbocharge separately from `ModelEffort`; impossible provider effort values cannot be serialized.
 - [ ] Add an evidence-backed per-model Turbocharge orchestration-effort capability, including behavior for models that should not be trusted to coordinate many agents and fallback when metadata is absent.
-- [ ] Define how the owning agent resolves disagreement and demonstrates that independent work improved the final result.
 - [ ] Add deterministic tests for role selection, synthesis, cancellation, retry/recovery, recursion bounds, and unsupported-model fallback.
 - [ ] Compare against a newly pinned upstream Codex revision before implementation because the Ultra contract may change during rollout.
 
@@ -102,5 +97,6 @@ A typed design should prevent `Turbocharge` from being serialized as `reasoning.
 - Do not build a bespoke subagent dashboard or duplicate interfaces that already express the needed work.
 - Do not define Turbocharge by a minimum agent count, mandatory parallelism, or automatic activation.
 - Do not require task-plan approval, a new completion artifact, or an independent-review verdict for every Turbocharged request.
+- Do not add Turbocharge-specific orchestration reporting, agent voting, tie-breakers, or disagreement state.
 - Do not add Turbocharge deactivation in v1 or encode the owning agent's living task decomposition as special state-machine state.
 - Do not copy Codex prompts or limits without reviewing licensing, product fit, and Phoenix's own state-machine/recovery invariants.
