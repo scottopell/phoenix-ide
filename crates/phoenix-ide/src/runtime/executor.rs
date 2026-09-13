@@ -2865,18 +2865,21 @@ where
             );
             return Ok(());
         }
-        if matches!(event, Event::UserCancel { .. })
-            && self
-                .active_llm_attempt
-                .as_ref()
-                .and_then(phoenix_llm::LlmAttemptCapture::finalized)
-                .is_some_and(|metrics| metrics.outcome != phoenix_llm::LlmAttemptOutcome::Cancelled)
-        {
-            tracing::debug!(
-                conv_id = %self.context.conversation_id,
-                "absorbing user cancellation after the active LLM attempt reached a terminal classification"
-            );
-            return Ok(());
+        if matches!(event, Event::UserCancel { .. }) {
+            if let Some(capture) = self.active_llm_attempt.as_ref() {
+                match capture.claim_cancelled() {
+                    phoenix_llm::LlmAttemptCancellationClaim::Lost(metrics) => {
+                        tracing::debug!(
+                            conv_id = %self.context.conversation_id,
+                            ?metrics.outcome,
+                            "absorbing user cancellation after another LLM terminal classification won"
+                        );
+                        return Ok(());
+                    }
+                    phoenix_llm::LlmAttemptCancellationClaim::NotStarted
+                    | phoenix_llm::LlmAttemptCancellationClaim::Won(_) => {}
+                }
+            }
         }
         if matches!(event, Event::UserCancel { .. } | Event::Shutdown) {
             self.terminal_transition_retry = None;
