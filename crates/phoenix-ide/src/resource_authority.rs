@@ -117,6 +117,19 @@ pub(crate) mod tests {
         }
     }
 
+    pub(crate) fn approval_message(conversation_id: &str) -> crate::db::Message {
+        crate::db::Message {
+            message_id: format!("approval-{conversation_id}"),
+            conversation_id: conversation_id.to_string(),
+            sequence_id: 1,
+            message_type: crate::db::MessageType::User,
+            content: crate::db::MessageContent::User(crate::db::UserContent::meta("approved")),
+            display_data: None,
+            usage_data: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
     #[test]
     fn task_approval_requires_active_allocated_worktree() {
         let scope = ResourceScopeKey::Work(WorkScopeId::new());
@@ -206,6 +219,7 @@ pub(crate) mod tests {
         db.persist_approved_task_authority(
             &parent_id,
             &approval(),
+            &approval_message(&parent_id),
             &phoenix_core::domain::sm_state::ConvState::Idle,
             chrono::Utc::now(),
         )
@@ -261,6 +275,7 @@ pub(crate) mod tests {
         db.persist_approved_task_authority(
             id.as_str(),
             &approval(),
+            &approval_message(id.as_str()),
             &phoenix_core::domain::sm_state::ConvState::Idle,
             chrono::Utc::now(),
         )
