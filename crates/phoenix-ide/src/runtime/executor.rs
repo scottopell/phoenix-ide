@@ -16318,6 +16318,65 @@ mod approve_task_failure_effect_tests {
     }
 
     #[tokio::test]
+    async fn capability_publication_failure_after_persistence_fails_closed() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "capability-publish-failure";
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, "main");
+        std::fs::create_dir_all(explore_wt.join("tasks")).unwrap();
+        let task_filename = "12346-p0-ready--publish-failure.md";
+        std::fs::write(explore_wt.join("tasks").join(task_filename), "Plan").unwrap();
+
+        let mut context = ConvContext::new(conv_id, explore_wt, "test-model", 200_000);
+        context.desired_base_branch = Some("main".to_string());
+        context.mode_context = Some(ModeContext::Explore {
+            next_taskmd_id_hint: Some("12346".to_string()),
+        });
+        let (_event_tx, event_rx) = mpsc::channel(32);
+        let event_tx_dup = mpsc::channel::<Event>(1).0;
+        let storage = Arc::new(InMemoryStorage::new());
+        let llm = Arc::new(MockLlmClient::new("test-model"));
+        let tool_executor = Arc::new(MockToolExecutor::new().with_failed_capability_upgrade());
+        let mut rt = ConversationRuntime::new(
+            context,
+            ConvState::AwaitingTaskApproval {
+                task_file: format!("tasks/{task_filename}"),
+                title: "Publish failure".to_string(),
+                priority: crate::task_source::Priority::P0,
+                plan: "Plan".to_string(),
+            },
+            storage.clone(),
+            llm.clone(),
+            tool_executor.clone(),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx_dup,
+            SseBroadcaster::new(128, 0),
+        )
+        .with_fatal_local_authority_fence(crate::runtime::FatalLocalAuthorityFence::new());
+
+        let result = rt
+            .process_event(Event::TaskApprovalDecided {
+                outcome: TaskApprovalOutcome::Approved {
+                    handoff: TaskApprovalHandoff::ContinueInCurrentConversation,
+                },
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert!(storage.approved_task_authority_persisted(conv_id));
+        assert_eq!(
+            rt.tool_capability.authority,
+            crate::work_scope::ResourceAuthority::Restricted
+        );
+        assert_eq!(tool_executor.capability_snapshot().generation.value(), 0);
+        assert!(llm.recorded_requests().is_empty());
+    }
+
+    #[tokio::test]
     async fn approval_failure_does_not_dispatch_llm() {
         let (_tmp, repo_root) = init_repo();
         let conv_id = "collision-effect-1";
