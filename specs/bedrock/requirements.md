@@ -1018,6 +1018,14 @@ AND SHALL preserve that admitted snapshot unchanged when later topology changes 
 WHILE a non-completed Close attempt exists for a ProductConversation
 THE SYSTEM SHALL NOT permit a continuation successor to be created for that ProductConversation
 
+WHEN a Close lifecycle request encounters that ProductConversation's existing `needs_repair` attempt
+THE SYSTEM SHALL preserve and target the same exact Close-attempt identity
+AND SHALL either safely resume its typed retirement retry under aggregate mutation admission or return structured recovery guidance identifying the exact attempt, the active transcript, and the permitted retry action
+AND SHALL NOT create a replacement attempt or require the user to infer recovery coordinates from prose
+
+WHEN a Close persistence invariant prevents retry
+THE SYSTEM SHALL identify the typed invariant and owning persistence relation in that recovery guidance rather than expose a raw storage-engine code as the actionable error
+
 **Rationale:** Closing is the one product-facing way to retire active work. The
 conversation moves to History because its owned live environment is gone; there is no
 separate in-Phoenix merged-versus-abandoned lifecycle.

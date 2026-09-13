@@ -1802,6 +1802,41 @@ rule CloseNeedsRepairRetriesThroughReinspection {
         -- for another restart or synthesize a replacement Close attempt.
 }
 
+rule CloseRequestWithNeedsRepairUsesExactAttemptRecovery {
+    when: CloseRequested(product_conversation)
+    let obligation = active_close_obligation(product_conversation)
+    requires: exists obligation
+    requires: obligation.phase = needs_repair
+    requires: exact_attempt_retry_is_safe(product_conversation, obligation.attempt_id)
+    ensures: CloseRetirementRetryRequested(product_conversation, obligation.attempt_id)
+
+    @guidance
+        -- The aggregate mutation-admission boundary serializes the decision. A Close
+        -- compatibility request resumes only the existing attempt and never mints or
+        -- implies a replacement attempt.
+}
+
+rule CloseRequestWithNeedsRepairReturnsActionableGuidance {
+    when: CloseRequested(product_conversation)
+    let obligation = active_close_obligation(product_conversation)
+    requires: exists obligation
+    requires: obligation.phase = needs_repair
+    requires: not exact_attempt_retry_is_safe(product_conversation, obligation.attempt_id)
+    ensures: CloseRecoveryGuidanceReturned(
+        product_conversation,
+        attempt_id: obligation.attempt_id,
+        active_transcript_id: active_transcript_id(product_conversation),
+        recovery_action: exact_attempt_recovery_action(product_conversation, obligation.attempt_id),
+        failed_invariant: close_failed_invariant(product_conversation, obligation.attempt_id),
+        failed_relation: close_failed_relation(product_conversation, obligation.attempt_id)
+    )
+
+    @guidance
+        -- Recovery coordinates are typed response data. The invariant and relation are
+        -- present when persistence evidence is inconsistent; raw storage-engine codes
+        -- and prose parsing are not part of the recovery contract.
+}
+
 ------------------------------------------------------------
 -- Rules: Sub-agent-only
 ------------------------------------------------------------
