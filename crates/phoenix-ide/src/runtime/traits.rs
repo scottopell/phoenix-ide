@@ -576,22 +576,15 @@ impl ToolCapabilitySnapshot {
 /// Executor for tools
 #[async_trait]
 pub trait ToolExecutor: Send + Sync {
-    /// Execute a gate-cleared tool call. Accepting only a [`CheckedToolCall`]
-    /// — whose sole non-test mint is `DenyGate::check` — makes an ungated tool
-    /// call unrepresentable (specs/permissions REQ-PERM-001).
-    async fn execute(&self, call: CheckedToolCall, ctx: ToolContext) -> Option<ToolOutput>;
-
+    /// Execute a gate-cleared call only under its admitted capability generation.
+    /// Accepting both [`CheckedToolCall`] and [`ToolCapabilityGeneration`] makes
+    /// deny-gate and stale-capability bypasses unrepresentable at this boundary.
     async fn execute_at_generation(
         &self,
         expected: ToolCapabilityGeneration,
         call: CheckedToolCall,
         ctx: ToolContext,
-    ) -> Result<Option<ToolOutput>, String> {
-        if self.capability_snapshot().generation != expected {
-            return Err("stale tool capability generation".to_string());
-        }
-        Ok(self.execute(call, ctx).await)
-    }
+    ) -> Result<Option<ToolOutput>, String>;
 
     /// Get tool definitions for LLM (phoenix-native).
     async fn definitions(&self) -> Vec<phoenix_llm::ToolDefinition>;
@@ -1120,10 +1113,6 @@ impl<T: LlmClient + ?Sized> LlmClient for Arc<T> {
 
 #[async_trait]
 impl<T: ToolExecutor + ?Sized> ToolExecutor for Arc<T> {
-    async fn execute(&self, call: CheckedToolCall, ctx: ToolContext) -> Option<ToolOutput> {
-        (**self).execute(call, ctx).await
-    }
-
     async fn definitions(&self) -> Vec<phoenix_llm::ToolDefinition> {
         (**self).definitions().await
     }
@@ -2252,32 +2241,6 @@ impl ToolRegistryExecutor {
 
 #[async_trait]
 impl ToolExecutor for ToolRegistryExecutor {
-    async fn execute(&self, call: CheckedToolCall, ctx: ToolContext) -> Option<ToolOutput> {
-        let (name, input) = call.into_parts();
-        // Look up the tool while holding the read lock, then drop the guard
-        // before the async .run() call (RwLockReadGuard is !Send).
-        let tool = {
-            let capability = self
-                .capability
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            capability.registry.find_tool(&name)
-        };
-        if let Some(t) = tool {
-            return Some(t.run(input, ctx).await);
-        }
-
-        // Fall back to live MCP tool resolution.
-        if let Some(ref manager) = self.mcp_manager {
-            if let Some(mcp_tool) = crate::tools::mcp::create_mcp_tool_by_name(manager, &name).await
-            {
-                return Some(mcp_tool.run(input, ctx).await);
-            }
-        }
-
-        None
-    }
-
     async fn definitions(&self) -> Vec<phoenix_llm::ToolDefinition> {
         self.definitions_for_language(crate::llm_language::LlmLanguage::default())
             .await

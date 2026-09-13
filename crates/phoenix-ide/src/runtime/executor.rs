@@ -16692,17 +16692,21 @@ mod explore_prompt_cache_shape_tests {
 
     #[async_trait]
     impl ToolExecutor for TaskCreatingPatchExecutor {
-        async fn execute(
+        async fn execute_at_generation(
             &self,
+            expected: crate::runtime::traits::ToolCapabilityGeneration,
             call: crate::runtime::deny_gate::CheckedToolCall,
             _ctx: ToolContext,
-        ) -> Option<ToolOutput> {
+        ) -> Result<Option<ToolOutput>, String> {
+            if self.capability_snapshot().generation != expected {
+                return Err("stale tool capability generation".to_string());
+            }
             let (name, _input) = call.into_parts();
             if name != "patch" {
-                return None;
+                return Ok(None);
             }
             std::fs::write(&self.task_path, "# Draft\n").unwrap();
-            Some(ToolOutput::success("created task draft"))
+            Ok(Some(ToolOutput::success("created task draft")))
         }
 
         async fn definitions(&self) -> Vec<ToolDefinition> {
