@@ -8567,6 +8567,12 @@ CREATE TABLE close_hard_delete_claims (
         REFERENCES product_conversations(id) ON DELETE CASCADE
 );
 
+CREATE UNIQUE INDEX close_worktree_cleanup_plans_exact_identity
+ON close_worktree_cleanup_plans (
+    attempt_id, scope, inspection_generation, inspection_fingerprint,
+    resource_kind, identity_kind, identity_codec, identity_value
+);
+
 CREATE TABLE close_worktree_cleanup_adoptions (
     attempt_id TEXT NOT NULL,
     scope TEXT NOT NULL,
@@ -8590,17 +8596,17 @@ CREATE TABLE close_worktree_cleanup_adoptions (
     ),
     FOREIGN KEY (
         attempt_id, scope, source_inspection_generation, source_inspection_fingerprint,
-        resource_kind, identity_kind, identity_value
+        resource_kind, identity_kind, identity_codec, identity_value
     ) REFERENCES close_worktree_cleanup_plans (
         attempt_id, scope, inspection_generation, inspection_fingerprint,
-        resource_kind, identity_kind, identity_value
+        resource_kind, identity_kind, identity_codec, identity_value
     ) ON DELETE RESTRICT,
     FOREIGN KEY (
         attempt_id, scope, target_inspection_generation, target_inspection_fingerprint,
-        resource_kind, identity_kind, identity_value
+        resource_kind, identity_kind, identity_codec, identity_value
     ) REFERENCES close_worktree_cleanup_plans (
         attempt_id, scope, inspection_generation, inspection_fingerprint,
-        resource_kind, identity_kind, identity_value
+        resource_kind, identity_kind, identity_codec, identity_value
     ) ON DELETE RESTRICT
 );
 
