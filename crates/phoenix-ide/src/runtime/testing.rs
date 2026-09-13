@@ -193,6 +193,10 @@ pub struct MockToolExecutor {
     outputs: HashMap<String, ToolOutput>,
     definitions: Vec<ToolDefinition>,
     clearable: std::collections::HashSet<String>,
+    capability: Mutex<(
+        phoenix_core::work_scope::ResourceAuthority,
+        crate::runtime::traits::ToolCapabilityGeneration,
+    )>,
     model_ids: Arc<[String]>,
     /// Record of tool executions
     pub executions: Mutex<Vec<(String, Value)>>,
@@ -205,6 +209,10 @@ impl MockToolExecutor {
             outputs: HashMap::new(),
             definitions: Vec::new(),
             clearable: std::collections::HashSet::new(),
+            capability: Mutex::new((
+                phoenix_core::work_scope::ResourceAuthority::Restricted,
+                crate::runtime::traits::ToolCapabilityGeneration::INITIAL,
+            )),
             model_ids: Arc::from(Vec::new()),
             executions: Mutex::new(Vec::new()),
         }
@@ -226,6 +234,14 @@ impl MockToolExecutor {
     /// Mark `name` as a clearable tool (its stale results may be cleared).
     pub fn with_clearable_tool(mut self, name: impl Into<String>) -> Self {
         self.clearable.insert(name.into());
+        self
+    }
+
+    pub fn with_authority(
+        mut self,
+        authority: phoenix_core::work_scope::ResourceAuthority,
+    ) -> Self {
+        self.capability.get_mut().unwrap().0 = authority;
         self
     }
 
@@ -266,8 +282,23 @@ impl ToolExecutor for MockToolExecutor {
         self.model_ids.clone()
     }
 
-    fn clearable_tool_names(&self) -> std::collections::HashSet<String> {
-        self.clearable.clone()
+    fn capability_snapshot(&self) -> crate::runtime::traits::ToolCapabilitySnapshot {
+        let (authority, generation) = *self.capability.lock().unwrap();
+        crate::runtime::traits::ToolCapabilitySnapshot {
+            generation,
+            authority,
+            clearable_names: Arc::new(self.clearable.clone()),
+        }
+    }
+
+    fn upgrade_to_work_mode(
+        &self,
+    ) -> Result<crate::runtime::traits::ToolCapabilitySnapshot, String> {
+        let mut capability = self.capability.lock().unwrap();
+        capability.0 = phoenix_core::work_scope::ResourceAuthority::Work;
+        capability.1 = capability.1.next();
+        drop(capability);
+        Ok(self.capability_snapshot())
     }
 }
 
@@ -2374,6 +2405,25 @@ impl<L: LlmClient + 'static, T: ToolExecutor + 'static> TestRuntime<L, T> {
     pub fn messages(&self) -> Vec<Message> {
         self.storage.get_all_messages("test-conv")
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_tool_context_for_authority(
+    authority: phoenix_core::work_scope::ResourceAuthority,
+) -> ToolContext {
+    ToolContext::new_with_resource_access(
+        tokio_util::sync::CancellationToken::new(),
+        "test-capability-conversation".to_string(),
+        std::env::temp_dir(),
+        Arc::new(BrowserSessionManager::default()),
+        Arc::new(crate::tools::BashHandleRegistry::new()),
+        Arc::new(ModelRegistry::new_empty()),
+        crate::terminal::ActiveTerminals::new(),
+        Arc::new(crate::tools::TmuxRegistry::default()),
+        None,
+        crate::work_scope::WorkScopeId::new(),
+        authority,
+    )
 }
 
 // ============================================================================

@@ -2262,8 +2262,6 @@ pub struct ConvContext {
     /// Resource namespace for this runtime. Ordinary conversations carry a
     /// persisted work scope; the Coordinator occupies its disjoint namespace.
     pub resource_scope: crate::work_scope::ResourceScopeKey,
-    /// Effective authority used for same-scope runtime resources.
-    pub resource_authority: crate::work_scope::ResourceAuthority,
     /// Persisted worktree location, if this conversation has one. This is
     /// environment context only and never participates in resource identity.
     pub work_scope_worktree: Option<PathBuf>,
@@ -2329,7 +2327,6 @@ impl ConvContext {
             resource_scope: crate::work_scope::ResourceScopeKey::Work(
                 crate::work_scope::WorkScopeId::new(),
             ),
-            resource_authority: crate::work_scope::ResourceAuthority::Restricted,
             work_scope_worktree: None,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: crate::llm_language::LlmLanguage::default(),
@@ -2397,7 +2394,6 @@ impl ConvContext {
             resource_scope: crate::work_scope::ResourceScopeKey::Work(
                 crate::work_scope::WorkScopeId::new(),
             ),
-            resource_authority: crate::work_scope::ResourceAuthority::Restricted,
             work_scope_worktree: None,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: crate::llm_language::LlmLanguage::default(),

@@ -2005,6 +2005,61 @@ fn sub_agent_registry_for_authority(
     }
 }
 
+fn registry_for_runtime_authority(
+    authority: crate::work_scope::ResourceAuthority,
+    mode: ConvMode,
+    tasks_dir_name: &str,
+    agent_catalog: &[phoenix_agents::AgentDefinition],
+    model_ids: &[String],
+    explore_policy: ExploreToolPolicy,
+    writing_tools: crate::tools::WritingConversationTools,
+    filesystem_root: &std::path::Path,
+) -> Result<(ToolRegistry, Option<crate::tools::WritingConversationTools>), String> {
+    let agents = agent_catalog.to_vec();
+    let models = model_ids.to_vec();
+    match (authority, mode) {
+        (
+            crate::work_scope::ResourceAuthority::Restricted,
+            ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. },
+        ) => Ok((
+            ToolRegistry::explore(tasks_dir_name, agents, models, explore_policy),
+            Some(writing_tools),
+        )),
+        (
+            crate::work_scope::ResourceAuthority::Work,
+            ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. },
+        ) => Ok((
+            ToolRegistry::direct(agents, models)
+                .try_with_writing_conversation_tools(writing_tools)?,
+            None,
+        )),
+        (crate::work_scope::ResourceAuthority::Work, ConvMode::Direct) => {
+            let registry = ToolRegistry::direct(agents, models);
+            let registry = if phoenix_core::git::detect_git_repo_root(filesystem_root).is_some() {
+                registry.with_propose_task()
+            } else {
+                registry
+            };
+            Ok((
+                registry.try_with_writing_conversation_tools(writing_tools)?,
+                None,
+            ))
+        }
+        (
+            crate::work_scope::ResourceAuthority::Work,
+            ConvMode::Work { .. } | ConvMode::Branch { .. } | ConvMode::DetachedApprovedTask { .. },
+        ) => Ok((
+            ToolRegistry::direct(agents, models)
+                .with_propose_task()
+                .try_with_writing_conversation_tools(writing_tools)?,
+            None,
+        )),
+        (crate::work_scope::ResourceAuthority::Restricted, _) => {
+            Err("persisted Restricted authority conflicts with write-only conversation mode".into())
+        }
+    }
+}
+
 pub(crate) fn conversation_attachment_retains_work_scope(conv: &crate::db::Conversation) -> bool {
     use phoenix_core::domain::sm_state::ConvState;
 
@@ -3973,7 +4028,7 @@ impl RuntimeManager {
             || crate::work_scope::ResourceScopeKey::Unattached(conv.id.clone()),
             crate::work_scope::ResourceScopeKey::Work,
         );
-        conv_context.resource_authority = match spec.mode {
+        let resource_authority = match spec.mode {
             SubAgentMode::Explore => crate::work_scope::ResourceAuthority::Restricted,
             SubAgentMode::Work => crate::work_scope::ResourceAuthority::Work,
         };
@@ -4020,6 +4075,7 @@ impl RuntimeManager {
         };
         // Sub-agents cannot spawn, so they carry an empty agent catalog.
         let tool_executor = ToolRegistryExecutor::with_mcp(
+            resource_authority,
             registry,
             self.mcp_manager.clone(),
             Arc::from(Vec::new()),
@@ -4926,11 +4982,6 @@ impl RuntimeManager {
             .unwrap_or_else(|| self.llm_registry.default_model_id());
         let model_id = self.llm_registry.resolve_model_id(&stored_model_id);
         let context_window = self.llm_registry.context_window(&model_id);
-        let approved_task_objective = self
-            .db
-            .get_approved_task_objective(conversation_id)
-            .await
-            .map_err(|error| format!("Failed to load approved-task objective: {error}"))?;
         let mode_context = conv_mode_to_context(&conv.conv_mode);
         let mut context = if is_sub_agent {
             let root_id = find_root_conversation_id(&self.db, conversation_id).await;
@@ -4967,7 +5018,7 @@ impl RuntimeManager {
             }
             None => return Err("ordinary conversation is missing its work scope".to_string()),
         };
-        context.resource_authority =
+        let resource_authority =
             crate::resource_authority::resolve_resource_authority(self.db(), &conv)
                 .await
                 .map_err(|error| format!("Failed to load resource authority: {error}"))?
@@ -5059,105 +5110,59 @@ impl RuntimeManager {
 
         let tool_executor = if is_sub_agent {
             let registry = sub_agent_registry_for_authority(
-                context.resource_authority,
+                resource_authority,
                 ExploreToolPolicy::from_platform(&self.platform),
             );
             ToolRegistryExecutor::with_mcp(
+                resource_authority,
                 registry,
                 self.mcp_manager.clone(),
                 agent_catalog.clone(),
                 Arc::from(available_model_ids.clone()),
             )
+        } else if is_coordinator {
+            let service = crate::api::global_read::GlobalReadService::new(
+                self.db.clone(),
+                self.message_retriever.clone(),
+            );
+            let send_chat = Arc::new(crate::send_chat_service::SendChatApplicationService::new(
+                self.db.clone(),
+                self.clone(),
+            ));
+            ToolRegistryExecutor::builtin_only(
+                resource_authority,
+                ToolRegistry::coordinator(crate::coordinator_tools::tools(service, send_chat)),
+                agent_catalog.clone(),
+            )
         } else {
-            use crate::db::ConvMode;
-            if is_coordinator {
-                let service = crate::api::global_read::GlobalReadService::new(
-                    self.db.clone(),
-                    self.message_retriever.clone(),
-                );
-                let send_chat =
-                    Arc::new(crate::send_chat_service::SendChatApplicationService::new(
-                        self.db.clone(),
-                        self.clone(),
-                    ));
-                ToolRegistryExecutor::builtin_only(
-                    ToolRegistry::coordinator(crate::coordinator_tools::tools(service, send_chat)),
-                    agent_catalog.clone(),
-                )
-            } else {
-                let global_read = crate::api::global_read::GlobalReadService::new(
-                    self.db.clone(),
-                    self.message_retriever.clone(),
-                );
-                let send_chat =
-                    Arc::new(crate::send_chat_service::SendChatApplicationService::new(
-                        self.db.clone(),
-                        self.clone(),
-                    ));
-                let writing_tools = crate::coordinator_tools::writing_tools(global_read, send_chat);
-                let (registry, upgrade_writing_tools) = match conv.conv_mode {
-                    ConvMode::Explore { .. } if approved_task_objective.is_some() => (
-                        ToolRegistry::direct(agent_catalog.to_vec(), available_model_ids.clone())
-                            .try_with_writing_conversation_tools(writing_tools)
-                            .map_err(|error| error.clone())?,
-                        None,
-                    ),
-                    ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. } => (
-                        ToolRegistry::explore(
-                            &context.tasks_dir_name,
-                            agent_catalog.to_vec(),
-                            available_model_ids.clone(),
-                            ExploreToolPolicy::from_platform(&self.platform),
-                        ),
-                        Some(writing_tools),
-                    ),
-                    ConvMode::Direct => {
-                        // Full tool suite for Direct mode. `propose_task` (the
-                        // fork proposal) is offered only when the working dir is
-                        // inside a git repo — a fork cuts from the repository's
-                        // default branch (REQ-PROJ-036).
-                        let registry = ToolRegistry::direct(
-                            agent_catalog.to_vec(),
-                            available_model_ids.clone(),
-                        );
-                        let registry =
-                            if phoenix_core::git::detect_git_repo_root(context.filesystem_root())
-                                .is_some()
-                            {
-                                registry.with_propose_task()
-                            } else {
-                                registry
-                            };
-                        (
-                            registry.try_with_writing_conversation_tools(writing_tools)?,
-                            None,
-                        )
-                    }
-                    ConvMode::Work { .. }
-                    | ConvMode::Branch { .. }
-                    | ConvMode::DetachedApprovedTask { .. } => {
-                        // Full tool suite plus `propose_task` (non-blocking fork
-                        // proposal — REQ-PROJ-036). Work/Branch always sit on git
-                        // history, so the tool is always offered.
-                        (
-                            ToolRegistry::direct(
-                                agent_catalog.to_vec(),
-                                available_model_ids.clone(),
-                            )
-                            .with_propose_task()
-                            .try_with_writing_conversation_tools(writing_tools)?,
-                            None,
-                        )
-                    }
-                };
-                ToolRegistryExecutor::with_mcp(
-                    registry,
-                    self.mcp_manager.clone(),
-                    agent_catalog.clone(),
-                    Arc::from(available_model_ids.clone()),
-                )
-                .with_writing_tools(upgrade_writing_tools)
-            }
+            let global_read = crate::api::global_read::GlobalReadService::new(
+                self.db.clone(),
+                self.message_retriever.clone(),
+            );
+            let send_chat = Arc::new(crate::send_chat_service::SendChatApplicationService::new(
+                self.db.clone(),
+                self.clone(),
+            ));
+            let writing_tools = crate::coordinator_tools::writing_tools(global_read, send_chat);
+            let (registry, upgrade_writing_tools) = registry_for_runtime_authority(
+                resource_authority,
+                conv.conv_mode,
+                &context.tasks_dir_name,
+                agent_catalog.as_ref(),
+                &available_model_ids,
+                ExploreToolPolicy::from_platform(&self.platform),
+                writing_tools,
+                context.filesystem_root(),
+            )?;
+            let tool_executor = ToolRegistryExecutor::with_mcp(
+                resource_authority,
+                registry,
+                self.mcp_manager.clone(),
+                agent_catalog.clone(),
+                Arc::from(available_model_ids.clone()),
+            )
+            .with_writing_tools(upgrade_writing_tools);
+            tool_executor
         };
 
         let recovery_started = std::time::Instant::now();
@@ -6407,6 +6412,103 @@ mod bash_lifecycle_bridge_tests {
             }),
             BashLifecycleBridgeAction::Broadcast
         );
+    }
+}
+
+#[cfg(test)]
+mod runtime_capability_projection_tests {
+    use super::registry_for_runtime_authority;
+    use crate::db::ConvMode;
+    use crate::platform::PlatformCapability;
+    use crate::tools::{
+        ExploreToolPolicy, Tool, ToolContext, ToolOutput, WritingConversationTools,
+    };
+    use crate::work_scope::ResourceAuthority;
+    use std::sync::Arc;
+
+    struct NamedTool(&'static str);
+
+    #[async_trait::async_trait]
+    impl Tool for NamedTool {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn description(&self) -> String {
+            "capability fixture".into()
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn run(&self, _input: serde_json::Value, _ctx: ToolContext) -> ToolOutput {
+            ToolOutput::success("ok")
+        }
+    }
+
+    fn writing_tools() -> WritingConversationTools {
+        WritingConversationTools::new(
+            Arc::new(NamedTool("search_conversations")),
+            Arc::new(NamedTool("read_conversation")),
+            Arc::new(NamedTool("query_database")),
+            Arc::new(NamedTool("send_conversation_message")),
+        )
+        .unwrap()
+    }
+
+    fn detached_mode(path: &std::path::Path) -> ConvMode {
+        use phoenix_core::domain::db_schema::NonEmptyString;
+        ConvMode::DetachedProductCreation {
+            worktree_path: NonEmptyString::new(path.to_string_lossy()).unwrap(),
+            base_branch: NonEmptyString::new("main").unwrap(),
+        }
+    }
+
+    #[test]
+    fn detached_product_rematerialization_projects_workscope_authority() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let policy = ExploreToolPolicy::from_platform(&PlatformCapability::detect());
+        let (restricted, restricted_upgrade) = registry_for_runtime_authority(
+            ResourceAuthority::Restricted,
+            detached_mode(temp.path()),
+            "tasks",
+            &[],
+            &[],
+            policy.clone(),
+            writing_tools(),
+            temp.path(),
+        )
+        .unwrap();
+        assert!(restricted.find_tool("bash").is_some());
+        assert!(restricted_upgrade.is_some());
+
+        let (work, work_upgrade) = registry_for_runtime_authority(
+            ResourceAuthority::Work,
+            detached_mode(temp.path()),
+            "tasks",
+            &[],
+            &[],
+            policy,
+            writing_tools(),
+            temp.path(),
+        )
+        .unwrap();
+        assert!(work.find_tool("bash").is_some());
+        assert!(work.find_tool("spawn_agents").is_some());
+        assert!(work_upgrade.is_none());
+    }
+
+    #[test]
+    fn restricted_authority_fails_closed_for_write_only_mode() {
+        assert!(registry_for_runtime_authority(
+            ResourceAuthority::Restricted,
+            ConvMode::Direct,
+            "tasks",
+            &[],
+            &[],
+            ExploreToolPolicy::from_platform(&PlatformCapability::detect()),
+            writing_tools(),
+            std::path::Path::new("/tmp"),
+        )
+        .is_err());
     }
 }
 

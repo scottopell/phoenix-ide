@@ -647,6 +647,7 @@ async fn forward_tool_outcome(
 async fn execute_tool_to_outcome<S, T>(
     storage: S,
     tool_executor: Arc<T>,
+    capability_generation: crate::runtime::traits::ToolCapabilityGeneration,
     checked: crate::runtime::deny_gate::CheckedToolCall,
     tool_ctx: ToolContext,
     cancel_token_check: &CancellationToken,
@@ -680,10 +681,18 @@ where
     tracing::info!(parent: &span, conv_id = %conv_id, tool = %tool_name, id = %tool_use_id, "Executing tool");
     let tool_start = std::time::Instant::now();
 
-    let output = tool_executor
-        .execute(checked, tool_ctx)
+    let output = match tool_executor
+        .execute_at_generation(capability_generation, checked, tool_ctx)
         .instrument(span.clone())
-        .await;
+        .await
+    {
+        Ok(output) => output,
+        Err(error) => {
+            span.record("outcome", "stale_capability");
+            tracing::warn!(parent: &span, %error, "Rejected stale tool capability generation");
+            return ToolExecOutcome::Failed { tool_use_id, error };
+        }
+    };
 
     if cancel_token_check.is_cancelled() {
         span.record("outcome", "aborted");
@@ -952,7 +961,12 @@ mod grace_response_admission_tests {
 async fn forward_llm_outcome(
     llm_rx: oneshot::Receiver<LlmOutcome>,
     generation: u64,
-    llm_outcome_tx: mpsc::Sender<(u64, LlmOutcome)>,
+    capability_generation: crate::runtime::traits::ToolCapabilityGeneration,
+    llm_outcome_tx: mpsc::Sender<(
+        u64,
+        crate::runtime::traits::ToolCapabilityGeneration,
+        LlmOutcome,
+    )>,
 ) {
     let llm_outcome = match llm_rx.await {
         Ok(llm_outcome) => llm_outcome,
@@ -967,7 +981,9 @@ async fn forward_llm_outcome(
             }
         }
     };
-    let _ = llm_outcome_tx.send((generation, llm_outcome)).await;
+    let _ = llm_outcome_tx
+        .send((generation, capability_generation, llm_outcome))
+        .await;
 }
 
 /// The outcome of planning a stale tool-result clearing sweep over one
@@ -1616,11 +1632,9 @@ where
     llm_client: Arc<L>,
     tool_executor: Arc<T>,
     coordinator_read_service: Option<crate::api::global_read::GlobalReadService>,
-    /// Names of tools whose stale results may be cleared (specs/stale-tool-results).
-    /// Static for the conversation's tool set, so it is computed once and only
-    /// recomputed on the Explore→Work upgrade, avoiding a registry lock +
-    /// `HashSet` rebuild on every LLM dispatch.
-    clearable_names: Arc<std::collections::HashSet<String>>,
+    /// One authority projection consumed by prompt, history clearing, tool
+    /// context, dispatch, and sub-agent admission.
+    tool_capability: crate::runtime::traits::ToolCapabilitySnapshot,
     /// In-memory mirror of the durable clear watermark (specs/stale-tool-results).
     /// This runtime is the sole writer of its conversation's watermark, so the
     /// cache is authoritative after any successful read/write; a transient
@@ -1697,8 +1711,16 @@ where
     /// outcome to `process_outcome` only when the generation is still current.
     /// The epoch tag stays executor-side and
     /// never leaks into the pure `EffectOutcome` type.
-    llm_outcome_tx: mpsc::Sender<(u64, LlmOutcome)>,
-    llm_outcome_rx: mpsc::Receiver<(u64, LlmOutcome)>,
+    llm_outcome_tx: mpsc::Sender<(
+        u64,
+        crate::runtime::traits::ToolCapabilityGeneration,
+        LlmOutcome,
+    )>,
+    llm_outcome_rx: mpsc::Receiver<(
+        u64,
+        crate::runtime::traits::ToolCapabilityGeneration,
+        LlmOutcome,
+    )>,
     terminal_transition_retry: Option<TerminalTransitionRetry>,
     terminal_settlement_attempt: TerminalSettlementAttempt,
     /// Generation/epoch tag for the in-flight tool task, mirroring
@@ -1898,13 +1920,22 @@ where
         // oneshot channels; forwarders stamp the dispatch generation and relay
         // them here, where the select loop discards superseded outcomes before
         // routing live ones into `process_outcome`.
-        let (llm_outcome_tx, llm_outcome_rx) = mpsc::channel::<(u64, LlmOutcome)>(64);
+        let (llm_outcome_tx, llm_outcome_rx) = mpsc::channel::<(
+            u64,
+            crate::runtime::traits::ToolCapabilityGeneration,
+            LlmOutcome,
+        )>(64);
         let (tool_outcome_tx, tool_outcome_rx) = mpsc::channel::<(u64, ToolExecOutcome)>(64);
         let (retry_outcome_tx, retry_outcome_rx) = mpsc::channel::<(u64, u32)>(64);
         let (_acknowledged_event_tx, acknowledged_event_rx) = mpsc::channel(1);
 
         let tool_executor = Arc::new(tool_executor);
-        let clearable_names = Arc::new(tool_executor.clearable_tool_names());
+        let tool_capability = tool_executor.capability_snapshot();
+        assert_eq!(
+            tool_capability.authority,
+            tool_executor.capability_snapshot().authority,
+            "tool executor capability snapshot must be internally coherent"
+        );
 
         Self {
             context,
@@ -1916,7 +1947,7 @@ where
             llm_client: Arc::new(llm_client),
             tool_executor,
             coordinator_read_service: None,
-            clearable_names,
+            tool_capability,
             clear_watermark_cache: Arc::new(std::sync::Mutex::new(None)),
             active_prompt_projection: None,
             browser_sessions,
@@ -2428,8 +2459,8 @@ where
                         return RuntimeExitDisposition::Terminal;
                     }
                 }
-                Some((generation, llm_outcome)) = self.llm_outcome_rx.recv() => {
-                    self.process_generation_tagged_llm_outcome(generation, llm_outcome)
+                Some((generation, capability_generation, llm_outcome)) = self.llm_outcome_rx.recv() => {
+                    self.process_generation_tagged_llm_outcome(generation, capability_generation, llm_outcome)
                         .await;
                     // FM-5 prevention: terminal states exit the loop explicitly.
                     if let StepResult::Terminal(outcome) = self.state.step_result() {
@@ -2625,12 +2656,17 @@ where
     async fn process_generation_tagged_llm_outcome(
         &mut self,
         generation: u64,
+        capability_generation: crate::runtime::traits::ToolCapabilityGeneration,
         llm_outcome: LlmOutcome,
     ) {
-        if self.llm_outcome_is_stale(generation) {
+        if self.llm_outcome_is_stale(generation)
+            || capability_generation != self.tool_capability.generation
+        {
             tracing::debug!(
                 outcome_generation = generation,
                 current_generation = self.llm_request_generation,
+                outcome_capability_generation = capability_generation.value(),
+                current_capability_generation = self.tool_capability.generation.value(),
                 state = self.state.variant_name(),
                 "Ignoring stale LLM outcome — request superseded (abort/new dispatch)"
             );
@@ -4818,15 +4854,10 @@ where
         }
 
         // --- Mode validation and one-writer constraint (REQ-PROJ-008) ---
-        let parent_allows_work = match self.context.mode_context.as_ref() {
-            Some(
-                ModeContext::Work { .. }
-                | ModeContext::Direct
-                | ModeContext::Branch { .. }
-                | ModeContext::DetachedApprovedTask { .. },
-            ) => true,
-            Some(ModeContext::Explore { .. }) | None => false,
-        };
+        let parent_allows_work = matches!(
+            self.tool_capability.authority,
+            crate::work_scope::ResourceAuthority::Work
+        );
 
         let mut work_count_in_batch = 0u32;
         for &(_, mode) in &resolved_tasks {
@@ -4834,9 +4865,8 @@ where
                 if !parent_allows_work {
                     let result = ToolResult::error(
                         tool_use_id.clone(),
-                        "Work sub-agents require the parent to be in a write-capable mode \
-                         (Work, Branch, or Direct). Use mode: \"explore\" or omit mode \
-                         for read-only sub-agents."
+                        "Work sub-agents require Work authority on the parent WorkScope. \
+                         Use mode: \"explore\" or omit mode for read-only sub-agents."
                             .to_string(),
                     );
                     return Ok(Some(Event::ToolComplete {
@@ -6829,7 +6859,7 @@ where
                 .expect("projection refreshed above")
                 .messages,
             None,
-            &self.clearable_names,
+            &self.tool_capability.clearable_names,
             self.context.context_window,
             &self.clear_watermark_cache,
         )
@@ -6850,6 +6880,7 @@ where
         // intentional `Effect::AbortLlm`.
         self.llm_request_generation = self.llm_request_generation.wrapping_add(1);
         let dispatch_generation = self.llm_request_generation;
+        let capability_generation = self.tool_capability.generation;
         let llm_outcome_tx = self.llm_outcome_tx.clone();
 
         let llm_client = self.llm_client.clone();
@@ -6896,7 +6927,7 @@ where
         let mode_context = self.context.mode_context.clone();
         let has_approved_task_write_authority =
             matches!(
-                self.context.resource_authority,
+                self.tool_capability.authority,
                 crate::work_scope::ResourceAuthority::Work
             ) && matches!(mode_context, Some(ModeContext::Explore { .. }));
         let llm_language = self.context.llm_language;
@@ -6928,9 +6959,15 @@ where
         // Freeze the complete provider request before any provider or forwarding
         // task is spawned. Tool definitions, AGENTS-backed system prompt, and the
         // optional Coordinator capsule are request authority, not task-local inputs.
-        let available_tools = tool_executor.definitions_for_language(llm_language).await;
+        let available_tools = tool_executor
+            .definitions_for_generation(capability_generation, llm_language)
+            .await?;
         let explore_bash_capability =
-            if matches!(mode_context.as_ref(), Some(ModeContext::Explore { .. })) {
+            if matches!(
+                self.tool_capability.authority,
+                crate::work_scope::ResourceAuthority::Restricted
+            ) && matches!(mode_context.as_ref(), Some(ModeContext::Explore { .. }))
+            {
                 explore_bash
             } else {
                 phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable
@@ -7203,6 +7240,7 @@ where
         tokio::spawn(forward_llm_outcome(
             llm_rx,
             dispatch_generation,
+            capability_generation,
             llm_outcome_tx,
         ));
 
@@ -7353,6 +7391,7 @@ where
         // dispatch or an intentional `Effect::AbortTool` / backstop teardown.
         self.tool_request_generation = self.tool_request_generation.wrapping_add(1);
         let dispatch_generation = self.tool_request_generation;
+        let capability_generation = self.tool_capability.generation;
         let tool_outcome_tx = self.tool_outcome_tx.clone();
 
         // Create cancellation token for this tool execution
@@ -7400,7 +7439,7 @@ where
                 self.tmux_registry.clone(),
                 scope_worktree,
                 self.context.resource_scope.clone(),
-                self.context.resource_authority,
+                self.tool_capability.authority,
             ),
             phoenix_core::domain::sm_state::ConversationExecutionEnvironment::NoFilesystem => {
                 ToolContext::new_without_filesystem(
@@ -7464,6 +7503,7 @@ where
             let tool_outcome = execute_tool_to_outcome(
                 storage,
                 tool_executor,
+                capability_generation,
                 checked,
                 tool_ctx,
                 &cancel_token_check,
@@ -8130,7 +8170,7 @@ where
                 .handoff
                 .as_ref()
                 .map(|handoff| handoff.message_id.as_str()),
-            &self.clearable_names,
+            &self.tool_capability.clearable_names,
             context_window,
             &self.clear_watermark_cache,
         )
@@ -8493,13 +8533,18 @@ where
                         },
                     )
                     .await?;
-                self.context.resource_authority = crate::work_scope::ResourceAuthority::Work;
-
-                // Upgrade tool registry from Explore to Work mode so the agent
-                // gets bash, patch, etc. for the rest of this conversation.
-                self.tool_executor.upgrade_to_work_mode();
-                // The tool set changed, so refresh the cached clearable-tool set.
-                self.clearable_names = Arc::new(self.tool_executor.clearable_tool_names());
+                // Build the fallible Work tool surface before publishing Work to
+                // the actor context. A failed rebuild leaves every live consumer
+                // Restricted and stops the post-approval turn.
+                let tool_capability = self.tool_executor.upgrade_to_work_mode()?;
+                self.tool_capability = tool_capability;
+                tracing::info!(
+                    conv_id = %self.context.conversation_id,
+                    work_scope = %self.context.resource_scope,
+                    authority = "work",
+                    capability_generation = self.tool_capability.generation.value(),
+                    "Published approved WorkScope capability projection"
+                );
 
                 tracing::info!(
                     task_id = %approval_result.task_id,
@@ -13814,6 +13859,7 @@ mod authoritative_user_message_effect_tests {
 
         rt.process_generation_tagged_llm_outcome(
             0,
+            rt.tool_capability.generation,
             LlmOutcome::TimedOut {
                 message: "provider attempt deadline elapsed".to_string(),
             },
@@ -13865,7 +13911,8 @@ mod authoritative_user_message_effect_tests {
             request_id: "parent-terminal-retry-response".to_string(),
         };
 
-        rt.process_generation_tagged_llm_outcome(0, outcome).await;
+        rt.process_generation_tagged_llm_outcome(0, rt.tool_capability.generation, outcome)
+            .await;
 
         assert!(matches!(rt.state, ConvState::LlmRequesting { attempt: 1 }));
         assert!(rt.llm_task_handle.is_none());
@@ -14002,7 +14049,8 @@ mod authoritative_user_message_effect_tests {
             request_id: "pre-establishment-retry".to_string(),
         };
 
-        rt.process_generation_tagged_llm_outcome(0, outcome).await;
+        rt.process_generation_tagged_llm_outcome(0, rt.tool_capability.generation, outcome)
+            .await;
         for _ in 0..(DIRECT_TURN_TERMINAL_SETTLEMENT_RETRIES + 2) {
             tokio::time::advance(TERMINAL_SETTLEMENT_RETRY_DELAY).await;
             rt.retry_terminal_transition().await;
@@ -16211,6 +16259,65 @@ mod approve_task_failure_effect_tests {
     }
 
     #[tokio::test]
+    async fn same_conversation_approval_publishes_one_work_capability() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "atomic-capability-approval";
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, "main");
+        std::fs::create_dir_all(explore_wt.join("tasks")).unwrap();
+        let task_filename = "12345-p0-ready--atomic-capability.md";
+        std::fs::write(explore_wt.join("tasks").join(task_filename), "Plan").unwrap();
+
+        let mut context = ConvContext::new(conv_id, explore_wt, "test-model", 200_000);
+        context.desired_base_branch = Some("main".to_string());
+        context.mode_context = Some(ModeContext::Explore {
+            next_taskmd_id_hint: Some("12345".to_string()),
+        });
+        let (_event_tx, event_rx) = mpsc::channel(32);
+        let event_tx_dup = mpsc::channel::<Event>(1).0;
+        let tool_executor = Arc::new(MockToolExecutor::new());
+        let mut rt = ConversationRuntime::new(
+            context,
+            ConvState::AwaitingTaskApproval {
+                task_file: format!("tasks/{task_filename}"),
+                title: "Atomic capability".to_string(),
+                priority: crate::task_source::Priority::P0,
+                plan: "Plan".to_string(),
+            },
+            Arc::new(InMemoryStorage::new()),
+            Arc::new(MockLlmClient::new("test-model")),
+            tool_executor.clone(),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx_dup,
+            SseBroadcaster::new(128, 0),
+        )
+        .with_fatal_local_authority_fence(crate::runtime::FatalLocalAuthorityFence::new());
+
+        rt.process_event(Event::TaskApprovalDecided {
+            outcome: TaskApprovalOutcome::Approved {
+                handoff: TaskApprovalHandoff::ContinueInCurrentConversation,
+            },
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            rt.tool_capability.authority,
+            crate::work_scope::ResourceAuthority::Work
+        );
+        assert_eq!(rt.tool_capability.generation.value(), 1);
+        assert_eq!(tool_executor.capability_snapshot().generation.value(), 1);
+        assert!(matches!(
+            rt.context.mode_context,
+            Some(ModeContext::Explore { .. })
+        ));
+    }
+
+    #[tokio::test]
     async fn approval_failure_does_not_dispatch_llm() {
         let (_tmp, repo_root) = init_repo();
         let conv_id = "collision-effect-1";
@@ -16783,7 +16890,8 @@ mod steer_drain_detector_tests {
             request_id: "terminal-retry-response".to_string(),
         };
 
-        rt.process_generation_tagged_llm_outcome(0, outcome).await;
+        rt.process_generation_tagged_llm_outcome(0, rt.tool_capability.generation, outcome)
+            .await;
         assert!(matches!(rt.state, ConvState::LlmRequesting { attempt: 1 }));
         assert!(rt.terminal_transition_retry.is_some());
         assert!(rt.parent_event_tx.is_some());
@@ -18811,6 +18919,10 @@ mod work_subagent_cwd_guard_tests {
         );
         context.mode_context = Some(mode_context);
         context.mode = crate::state_machine::state::ModeKind::Managed;
+        let authority = match context.mode_context.as_ref() {
+            Some(ModeContext::Explore { .. }) => crate::work_scope::ResourceAuthority::Restricted,
+            _ => crate::work_scope::ResourceAuthority::Work,
+        };
 
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx_dup = mpsc::channel::<Event>(1).0;
@@ -18821,7 +18933,11 @@ mod work_subagent_cwd_guard_tests {
             ConvState::Idle,
             storage,
             Arc::new(MockLlmClient::new("test-model")),
-            Arc::new(MockToolExecutor::new().with_subagent_models(vec!["test-model".to_string()])),
+            Arc::new(
+                MockToolExecutor::new()
+                    .with_authority(authority)
+                    .with_subagent_models(vec!["test-model".to_string()]),
+            ),
             Arc::new(BrowserSessionManager::default()),
             Arc::new(crate::tools::BashHandleRegistry::new()),
             Arc::new(crate::tools::TmuxRegistry::new()),
@@ -18850,6 +18966,20 @@ mod work_subagent_cwd_guard_tests {
         working_dir: &std::path::Path,
     ) -> ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>> {
         runtime_in_mode(working_dir, ModeContext::Direct)
+    }
+
+    fn approved_explore_runtime(
+        worktree_path: &std::path::Path,
+    ) -> ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>> {
+        let mut runtime = runtime_in_mode(
+            worktree_path,
+            ModeContext::Explore {
+                next_taskmd_id_hint: Some("12345".to_string()),
+            },
+        );
+        let snapshot = runtime.tool_executor.upgrade_to_work_mode().unwrap();
+        runtime.tool_capability = snapshot;
+        runtime
     }
 
     fn spawn_tool(input: SpawnAgentsInput) -> ToolCall {
@@ -19000,6 +19130,34 @@ mod work_subagent_cwd_guard_tests {
             rt.active_work_subagents, 0,
             "rejected spawn must not increment active_work_subagents"
         );
+    }
+
+    #[tokio::test]
+    async fn approved_explore_origin_admits_work_subagent() {
+        let worktree = TempDir::new().expect("worktree tempdir");
+        let mut rt = approved_explore_runtime(worktree.path());
+
+        let result = rt
+            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                tasks: vec![SubAgentTask {
+                    task: "perform approved work".to_string(),
+                    cwd: None,
+                    mode: Some(SubAgentMode::Work),
+                    model: Some("test-model".to_string()),
+                    max_turns: Some(1),
+                    agent_type: None,
+                }],
+            }))
+            .await
+            .expect("authority admission should succeed");
+
+        if let Some(Event::ToolComplete { result, .. }) = result {
+            let text = tool_result_text(&result);
+            assert!(
+                !text.contains("require Work authority"),
+                "Explore provenance must not override WorkScope authority: {text}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -19593,14 +19751,28 @@ mod sender_drop_forwarder_tests {
     #[tokio::test]
     async fn llm_sender_drop_yields_network_error_outcome() {
         let (llm_tx, llm_rx) = oneshot::channel::<LlmOutcome>();
-        let (llm_outcome_tx, mut llm_outcome_rx) = mpsc::channel::<(u64, LlmOutcome)>(4);
+        let (llm_outcome_tx, mut llm_outcome_rx) = mpsc::channel::<(
+            u64,
+            crate::runtime::traits::ToolCapabilityGeneration,
+            LlmOutcome,
+        )>(4);
 
         drop(llm_tx);
 
-        forward_llm_outcome(llm_rx, 7, llm_outcome_tx).await;
+        forward_llm_outcome(
+            llm_rx,
+            7,
+            crate::runtime::traits::ToolCapabilityGeneration::INITIAL,
+            llm_outcome_tx,
+        )
+        .await;
 
         match llm_outcome_rx.try_recv() {
-            Ok((generation, LlmOutcome::NetworkError { message })) => {
+            Ok((generation, capability_generation, LlmOutcome::NetworkError { message })) => {
+                assert_eq!(
+                    capability_generation,
+                    crate::runtime::traits::ToolCapabilityGeneration::INITIAL
+                );
                 assert_eq!(
                     generation, 7,
                     "forwarder must stamp the dispatch generation"
@@ -20385,22 +20557,14 @@ mod stale_tool_result_clearing_tests {
         assert!(plan.cleared_sequence_ids.is_empty());
     }
 
-    /// Production wraps the tool registry in `Arc`, and the runtime caches the
-    /// clearable set from it. The `Arc<T>` blanket impl must forward
-    /// `clearable_tool_names` — falling back to the empty default would silently
-    /// make nothing clearable, disabling the whole feature in production while
-    /// the planner unit tests (which pass the set directly) stay green.
     #[tokio::test]
-    async fn arc_tool_executor_forwards_clearable_tool_names() {
+    async fn arc_tool_executor_forwards_capability_snapshot() {
         use crate::runtime::testing::MockToolExecutor;
         use crate::runtime::traits::ToolExecutor;
 
         let arc: Arc<MockToolExecutor> =
             Arc::new(MockToolExecutor::new().with_clearable_tool("bash"));
-        assert!(
-            arc.clearable_tool_names().contains("bash"),
-            "Arc<T> must forward clearable_tool_names, not use the empty default",
-        );
+        assert!(arc.capability_snapshot().clearable_names.contains("bash"));
     }
 
     /// True if `tool_use_id` is rendered as a cleared placeholder (no images).
@@ -20740,7 +20904,7 @@ mod llm_generation_guard_tests {
             request_id: "late-response".to_string(),
         };
 
-        rt.process_generation_tagged_llm_outcome(1, late_response)
+        rt.process_generation_tagged_llm_outcome(1, rt.tool_capability.generation, late_response)
             .await;
         tokio::task::yield_now().await;
 
@@ -20760,6 +20924,7 @@ mod llm_generation_guard_tests {
 
         rt.process_generation_tagged_llm_outcome(
             1,
+            rt.tool_capability.generation,
             LlmOutcome::NetworkError {
                 message: "stale aborted request".to_string(),
             },

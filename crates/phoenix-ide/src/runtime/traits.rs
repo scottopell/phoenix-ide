@@ -535,6 +535,41 @@ pub trait LlmClient: Send + Sync {
 use crate::runtime::deny_gate::CheckedToolCall;
 use crate::tools::ToolContext;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolCapabilityGeneration(pub u64);
+
+impl ToolCapabilityGeneration {
+    pub const INITIAL: Self = Self(0);
+
+    #[must_use]
+    pub const fn next(self) -> Self {
+        Self(self.0.wrapping_add(1))
+    }
+
+    #[must_use]
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolCapabilitySnapshot {
+    pub generation: ToolCapabilityGeneration,
+    pub authority: phoenix_core::work_scope::ResourceAuthority,
+    pub clearable_names: Arc<std::collections::HashSet<String>>,
+}
+
+impl ToolCapabilitySnapshot {
+    #[must_use]
+    pub fn restricted() -> Self {
+        Self {
+            generation: ToolCapabilityGeneration::INITIAL,
+            authority: phoenix_core::work_scope::ResourceAuthority::Restricted,
+            clearable_names: Arc::new(std::collections::HashSet::new()),
+        }
+    }
+}
+
 /// Executor for tools
 #[async_trait]
 pub trait ToolExecutor: Send + Sync {
@@ -542,6 +577,18 @@ pub trait ToolExecutor: Send + Sync {
     /// — whose sole non-test mint is `DenyGate::check` — makes an ungated tool
     /// call unrepresentable (specs/permissions REQ-PERM-001).
     async fn execute(&self, call: CheckedToolCall, ctx: ToolContext) -> Option<ToolOutput>;
+
+    async fn execute_at_generation(
+        &self,
+        expected: ToolCapabilityGeneration,
+        call: CheckedToolCall,
+        ctx: ToolContext,
+    ) -> Result<Option<ToolOutput>, String> {
+        if self.capability_snapshot().generation != expected {
+            return Err("stale tool capability generation".to_string());
+        }
+        Ok(self.execute(call, ctx).await)
+    }
 
     /// Get tool definitions for LLM (phoenix-native).
     async fn definitions(&self) -> Vec<phoenix_llm::ToolDefinition>;
@@ -556,14 +603,6 @@ pub trait ToolExecutor: Send + Sync {
         self.definitions().await
     }
 
-    /// Names of tools whose stale results may be cleared from the model-bound
-    /// history (specs/stale-tool-results). Default empty so a test double opts
-    /// out of clearing unless it overrides; the production registry executor
-    /// derives the set from `Tool::clearable()`.
-    fn clearable_tool_names(&self) -> std::collections::HashSet<String> {
-        std::collections::HashSet::new()
-    }
-
     /// Frozen model IDs advertised by the conversation's `spawn_agents`
     /// schema. Spawn-time validation uses this same snapshot so schema and
     /// executor acceptance cannot drift if the live registry changes.
@@ -571,10 +610,29 @@ pub trait ToolExecutor: Send + Sync {
         Arc::from(Vec::new())
     }
 
-    /// Replace the tool set (e.g., Explore -> Work mode transition).
-    /// Default is a no-op for test doubles that don't need dynamic swapping.
-    fn upgrade_to_work_mode(&self) {
-        // No-op by default
+    fn capability_snapshot(&self) -> ToolCapabilitySnapshot {
+        ToolCapabilitySnapshot::restricted()
+    }
+
+    async fn definitions_for_generation(
+        &self,
+        expected: ToolCapabilityGeneration,
+        language: crate::llm_language::LlmLanguage,
+    ) -> Result<Vec<phoenix_llm::ToolDefinition>, String> {
+        if self.capability_snapshot().generation != expected {
+            return Err("stale tool capability generation".to_string());
+        }
+        let definitions = self.definitions_for_language(language).await;
+        if self.capability_snapshot().generation != expected {
+            return Err("stale tool capability generation".to_string());
+        }
+        Ok(definitions)
+    }
+
+    /// Publish the Work-authority tool set before post-approval execution resumes.
+    /// Executors that cannot perform the authority transition fail closed.
+    fn upgrade_to_work_mode(&self) -> Result<ToolCapabilitySnapshot, String> {
+        Err("tool executor cannot publish Work authority".to_string())
     }
 }
 
@@ -1067,12 +1125,31 @@ impl<T: ToolExecutor + ?Sized> ToolExecutor for Arc<T> {
         (**self).subagent_model_ids()
     }
 
-    fn upgrade_to_work_mode(&self) {
-        (**self).upgrade_to_work_mode();
+    fn capability_snapshot(&self) -> ToolCapabilitySnapshot {
+        (**self).capability_snapshot()
     }
 
-    fn clearable_tool_names(&self) -> std::collections::HashSet<String> {
-        (**self).clearable_tool_names()
+    async fn definitions_for_generation(
+        &self,
+        expected: ToolCapabilityGeneration,
+        language: crate::llm_language::LlmLanguage,
+    ) -> Result<Vec<phoenix_llm::ToolDefinition>, String> {
+        (**self)
+            .definitions_for_generation(expected, language)
+            .await
+    }
+
+    async fn execute_at_generation(
+        &self,
+        expected: ToolCapabilityGeneration,
+        call: CheckedToolCall,
+        ctx: ToolContext,
+    ) -> Result<Option<ToolOutput>, String> {
+        (**self).execute_at_generation(expected, call, ctx).await
+    }
+
+    fn upgrade_to_work_mode(&self) -> Result<ToolCapabilitySnapshot, String> {
+        (**self).upgrade_to_work_mode()
     }
 }
 
@@ -2042,12 +2119,39 @@ impl LlmClient for RegistryLlmClient {
     }
 }
 
+struct PublishedToolCapability {
+    generation: ToolCapabilityGeneration,
+    authority: phoenix_core::work_scope::ResourceAuthority,
+    registry: ToolRegistry,
+    clearable_names: Arc<std::collections::HashSet<String>>,
+}
+
+impl PublishedToolCapability {
+    fn new(authority: phoenix_core::work_scope::ResourceAuthority, registry: ToolRegistry) -> Self {
+        let clearable_names = Arc::new(registry.clearable_tool_names());
+        Self {
+            generation: ToolCapabilityGeneration::INITIAL,
+            authority,
+            registry,
+            clearable_names,
+        }
+    }
+
+    fn snapshot(&self) -> ToolCapabilitySnapshot {
+        ToolCapabilitySnapshot {
+            generation: self.generation,
+            authority: self.authority,
+            clearable_names: Arc::clone(&self.clearable_names),
+        }
+    }
+}
+
 /// Adapter to use `ToolRegistry` as `ToolExecutor`
 ///
 /// Uses `RwLock` for interior mutability so the registry can be swapped
 /// at runtime (e.g., Explore -> Work mode transition after task approval).
 pub struct ToolRegistryExecutor {
-    registry: std::sync::RwLock<ToolRegistry>,
+    capability: std::sync::RwLock<PublishedToolCapability>,
     /// When set, MCP tools are resolved live from the manager on every
     /// `definitions()` and `execute()` call instead of being snapshotted
     /// into the registry. This means enable/disable and reload take effect
@@ -2068,11 +2172,12 @@ impl ToolRegistryExecutor {
     /// Used for sub-agents which have a restricted tool set.
     #[allow(dead_code)]
     pub fn builtin_only(
+        authority: phoenix_core::work_scope::ResourceAuthority,
         registry: ToolRegistry,
         agent_catalog: Arc<[phoenix_agents::AgentDefinition]>,
     ) -> Self {
         Self {
-            registry: std::sync::RwLock::new(registry),
+            capability: std::sync::RwLock::new(PublishedToolCapability::new(authority, registry)),
             mcp_manager: None,
             agent_catalog,
             model_ids: Arc::from(Vec::new()),
@@ -2084,13 +2189,14 @@ impl ToolRegistryExecutor {
     /// MCP tools are resolved from the manager on every `definitions()` and
     /// `execute()` call, so enable/disable and reload take effect immediately.
     pub fn with_mcp(
+        authority: phoenix_core::work_scope::ResourceAuthority,
         registry: ToolRegistry,
         manager: Arc<crate::tools::mcp::McpClientManager>,
         agent_catalog: Arc<[phoenix_agents::AgentDefinition]>,
         model_ids: Arc<[String]>,
     ) -> Self {
         Self {
-            registry: std::sync::RwLock::new(registry),
+            capability: std::sync::RwLock::new(PublishedToolCapability::new(authority, registry)),
             mcp_manager: Some(manager),
             agent_catalog,
             model_ids,
@@ -2104,13 +2210,17 @@ impl ToolRegistryExecutor {
         self
     }
 
-    /// Replace the inner `ToolRegistry` (e.g., after Explore -> Work mode transition).
-    pub fn swap_registry(&self, new_registry: ToolRegistry) {
+    fn publish_work_registry(&self, registry: ToolRegistry) -> ToolCapabilitySnapshot {
+        let clearable_names = Arc::new(registry.clearable_tool_names());
         let mut guard = self
-            .registry
+            .capability
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *guard = new_registry;
+        guard.generation = guard.generation.next();
+        guard.authority = phoenix_core::work_scope::ResourceAuthority::Work;
+        guard.registry = registry;
+        guard.clearable_names = clearable_names;
+        guard.snapshot()
     }
 }
 
@@ -2121,11 +2231,11 @@ impl ToolExecutor for ToolRegistryExecutor {
         // Look up the tool while holding the read lock, then drop the guard
         // before the async .run() call (RwLockReadGuard is !Send).
         let tool = {
-            let registry = self
-                .registry
+            let capability = self
+                .capability
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            registry.find_tool(&name)
+            capability.registry.find_tool(&name)
         };
         if let Some(t) = tool {
             return Some(t.run(input, ctx).await);
@@ -2147,23 +2257,16 @@ impl ToolExecutor for ToolRegistryExecutor {
             .await
     }
 
-    fn clearable_tool_names(&self) -> std::collections::HashSet<String> {
-        self.registry
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clearable_tool_names()
-    }
-
     async fn definitions_for_language(
         &self,
         language: crate::llm_language::LlmLanguage,
     ) -> Vec<phoenix_llm::ToolDefinition> {
         let mut defs = {
-            let registry = self
-                .registry
+            let capability = self
+                .capability
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            registry.definitions_for_language(language)
+            capability.registry.definitions_for_language(language)
         };
 
         // Merge live MCP tool definitions (respects current disabled state).
@@ -2206,22 +2309,58 @@ impl ToolExecutor for ToolRegistryExecutor {
         defs
     }
 
+    fn capability_snapshot(&self) -> ToolCapabilitySnapshot {
+        self.capability
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot()
+    }
+
+    async fn execute_at_generation(
+        &self,
+        expected: ToolCapabilityGeneration,
+        call: CheckedToolCall,
+        ctx: ToolContext,
+    ) -> Result<Option<ToolOutput>, String> {
+        let (name, input) = call.into_parts();
+        let tool = {
+            let capability = self
+                .capability
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if capability.generation != expected {
+                return Err("stale tool capability generation".to_string());
+            }
+            capability.registry.find_tool(&name)
+        };
+        if self.capability_snapshot().generation != expected {
+            return Err("stale tool capability generation".to_string());
+        }
+        if let Some(tool) = tool {
+            return Ok(Some(tool.run(input, ctx).await));
+        }
+        if let Some(ref manager) = self.mcp_manager {
+            if let Some(tool) = crate::tools::mcp::create_mcp_tool_by_name(manager, &name).await {
+                if self.capability_snapshot().generation != expected {
+                    return Err("stale tool capability generation".to_string());
+                }
+                return Ok(Some(tool.run(input, ctx).await));
+            }
+        }
+        Ok(None)
+    }
+
     fn subagent_model_ids(&self) -> Arc<[String]> {
         self.model_ids.clone()
     }
 
-    fn upgrade_to_work_mode(&self) {
-        // Reuse the frozen catalog so the upgraded registry advertises the same
-        // agent_type enum the executor resolves against (REQ-AG-008).
+    fn upgrade_to_work_mode(&self) -> Result<ToolCapabilitySnapshot, String> {
         let mut registry =
             ToolRegistry::direct(self.agent_catalog.to_vec(), self.model_ids.to_vec());
         if let Some(tools) = self.writing_tools.clone() {
-            registry = registry
-                .try_with_writing_conversation_tools(tools)
-                .expect("fresh Work registry has no global writing capabilities");
+            registry = registry.try_with_writing_conversation_tools(tools)?;
         }
-        self.swap_registry(registry);
-        tracing::info!("Tool registry upgraded to Work mode (full tool suite)");
+        Ok(self.publish_work_registry(registry))
     }
 }
 
@@ -2253,9 +2392,180 @@ mod tool_registry_executor_tests {
         }
     }
 
+    fn tool_context_for_path(
+        path: &std::path::Path,
+        authority: phoenix_core::work_scope::ResourceAuthority,
+    ) -> ToolContext {
+        ToolContext::new_with_resource_access(
+            tokio_util::sync::CancellationToken::new(),
+            "capability-e2e".to_string(),
+            path.to_path_buf(),
+            Arc::new(crate::tools::browser::BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(phoenix_llm::ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            Arc::new(crate::tools::TmuxRegistry::default()),
+            Some(path.to_path_buf()),
+            crate::work_scope::WorkScopeId::new(),
+            authority,
+        )
+    }
+
+    fn tool_output_text(output: ToolOutput) -> String {
+        match output {
+            ToolOutput::Success { output, .. } | ToolOutput::Error { output, .. } => output,
+        }
+    }
+
+    #[tokio::test]
+    async fn same_executor_after_approval_can_mutate_all_work_paths() {
+        use std::process::Command;
+
+        let repo = tempfile::TempDir::new().unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.email", "capability@test.invalid"],
+            vec!["config", "user.name", "Capability Test"],
+        ] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .unwrap()
+                .success());
+        }
+        std::fs::create_dir(repo.path().join("tasks")).unwrap();
+        std::fs::write(
+            repo.path().join("tasks/10000-p0-ready--fixture.md"),
+            "# fixture\n",
+        )
+        .unwrap();
+        std::fs::write(repo.path().join("README.md"), "fixture\n").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "."])
+            .current_dir(repo.path())
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["commit", "-m", "fixture"])
+            .current_dir(repo.path())
+            .status()
+            .unwrap()
+            .success());
+
+        let executor = ToolRegistryExecutor::builtin_only(
+            phoenix_core::work_scope::ResourceAuthority::Restricted,
+            ToolRegistry::explore(
+                "tasks",
+                Vec::new(),
+                Vec::new(),
+                crate::tools::ExploreToolPolicy::from_platform(
+                    &crate::platform::PlatformCapability::detect(),
+                ),
+            ),
+            Arc::from(Vec::new()),
+        );
+        let work = executor.upgrade_to_work_mode().unwrap();
+        let command = r#"
+            test -z "${PHOENIX_SANDBOX_SCRATCH:-}"
+            mv tasks/10000-p0-ready--fixture.md tasks/10000-p0-in-progress--fixture.md
+            common=$(git rev-parse --git-common-dir)
+            : > "$common/capability-transition.lock"
+            rm "$common/capability-transition.lock"
+            mkdir -p target/codegen .uv/cache
+            printf generated > target/codegen/output
+            printf cached > .uv/cache/output
+            printf committed > approved.txt
+            git add tasks approved.txt
+            git commit -m approved-capability
+        "#;
+        let call = CheckedToolCall::cleared_for_test(
+            "bash".to_string(),
+            serde_json::json!({"op":"run", "cmd":command, "wait_seconds":30}),
+        );
+        let output = executor
+            .execute_at_generation(
+                work.generation,
+                call,
+                tool_context_for_path(repo.path(), work.authority),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let text = tool_output_text(output);
+        assert!(text.contains("\"exit_code\":0"), "{text}");
+        assert!(repo
+            .path()
+            .join("tasks/10000-p0-in-progress--fixture.md")
+            .exists());
+        assert!(repo.path().join("target/codegen/output").exists());
+        assert!(repo.path().join(".uv/cache/output").exists());
+        let subject = Command::new("git")
+            .args(["log", "-1", "--pretty=%s"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&subject.stdout).trim(),
+            "approved-capability"
+        );
+    }
+
+    #[tokio::test]
+    async fn unapproved_explore_remains_sandboxed() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let executor = ToolRegistryExecutor::builtin_only(
+            phoenix_core::work_scope::ResourceAuthority::Restricted,
+            ToolRegistry::explore(
+                "tasks",
+                Vec::new(),
+                Vec::new(),
+                crate::tools::ExploreToolPolicy::from_platform(
+                    &crate::platform::PlatformCapability::detect(),
+                ),
+            ),
+            Arc::from(Vec::new()),
+        );
+        let definitions = executor.definitions().await;
+        if definitions
+            .iter()
+            .any(|definition| definition.name == "bash")
+        {
+            let call = CheckedToolCall::cleared_for_test(
+                "bash".to_string(),
+                serde_json::json!({
+                    "op":"run",
+                    "cmd":"test -n \"${PHOENIX_SANDBOX_SCRATCH:-}\" && ! touch source-denied",
+                    "wait_seconds":30
+                }),
+            );
+            let snapshot = executor.capability_snapshot();
+            let output = executor
+                .execute_at_generation(
+                    snapshot.generation,
+                    call,
+                    tool_context_for_path(repo.path(), snapshot.authority),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            let _text = tool_output_text(output);
+            assert!(
+                !repo.path().join("source-denied").exists(),
+                "Restricted Explore Bash must not mutate the source tree"
+            );
+        }
+        assert_eq!(
+            executor.capability_snapshot().authority,
+            phoenix_core::work_scope::ResourceAuthority::Restricted
+        );
+    }
+
     #[tokio::test]
     async fn explore_upgrade_preserves_host_bound_writing_tools() {
         let executor = ToolRegistryExecutor::builtin_only(
+            phoenix_core::work_scope::ResourceAuthority::Restricted,
             ToolRegistry::explore(
                 "tasks",
                 Vec::new(),
@@ -2283,7 +2593,44 @@ mod tool_registry_executor_tests {
             .await
             .iter()
             .any(|definition| definition.name == "search_conversations"));
-        executor.upgrade_to_work_mode();
+        let snapshot = executor.upgrade_to_work_mode().unwrap();
+        assert_eq!(
+            snapshot.authority,
+            phoenix_core::work_scope::ResourceAuthority::Work
+        );
+        assert_eq!(snapshot.generation.value(), 1);
+        assert_eq!(
+            executor.capability_snapshot().generation,
+            snapshot.generation
+        );
+        assert!(
+            executor
+                .definitions_for_generation(
+                    ToolCapabilityGeneration::INITIAL,
+                    crate::llm_language::LlmLanguage::default(),
+                )
+                .await
+                .is_err(),
+            "a precreated provider surface must not cross capability publication"
+        );
+        let stale_call = crate::runtime::deny_gate::CheckedToolCall::cleared_for_test(
+            "think".to_string(),
+            serde_json::json!({"thoughts": "stale"}),
+        );
+        let stale_context = crate::runtime::testing::test_tool_context_for_authority(
+            phoenix_core::work_scope::ResourceAuthority::Restricted,
+        );
+        assert!(
+            executor
+                .execute_at_generation(
+                    ToolCapabilityGeneration::INITIAL,
+                    stale_call,
+                    stale_context,
+                )
+                .await
+                .is_err(),
+            "a precreated tool call must not cross capability publication"
+        );
         assert!(executor
             .definitions()
             .await
