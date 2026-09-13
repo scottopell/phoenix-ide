@@ -587,6 +587,10 @@ AND set the working directory to the target directory (not a Phoenix-owned workt
 AND SHALL NOT include `propose_task`
 AND NOT create worktrees, branches, or task files for the Direct conversation itself
 
+WHEN a database upgrade encounters a Direct conversation whose attached `WorkScope` has Restricted Explore authority
+THE SYSTEM SHALL transform that `WorkScope` to Direct authority
+AND SHALL NOT change authority on a `WorkScope` attached only to non-Direct conversations
+
 THE SYSTEM SHALL visually distinguish Direct mode from Git-backed worktree conversations in the UI
 
 WHEN a Direct conversation targets a Git repository

@@ -500,6 +500,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_llm_request_timed_out_outcome",
         sql: MIGRATION_096,
     },
+    Migration {
+        version: 97,
+        name: "restore_direct_conversation_authority",
+        sql: MIGRATION_097,
+    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -10106,6 +10111,17 @@ WHERE type = 'table'
   AND instr(sql, '''timed_out''') = 0
 ";
 
+const MIGRATION_097: &str = r"
+UPDATE work_scopes
+SET authority_kind = 'direct'
+WHERE id IN (
+    SELECT work_scope_id
+    FROM conversations
+    WHERE cm_kind = 'direct'
+)
+  AND authority_kind = 'restricted_explore';
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10166,6 +10182,56 @@ mod tests {
             .connect_with(opts)
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn migration_097_restores_direct_conversation_authority() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE work_scopes (
+                 id TEXT PRIMARY KEY,
+                 authority_kind TEXT NOT NULL CHECK (authority_kind IN ('restricted_explore', 'work', 'direct'))
+             );
+             CREATE TABLE conversations (
+                 id TEXT PRIMARY KEY,
+                 cm_kind TEXT NOT NULL,
+                 work_scope_id TEXT NOT NULL REFERENCES work_scopes(id)
+             );
+             INSERT INTO work_scopes (id, authority_kind) VALUES
+                 ('direct-scope', 'restricted_explore'),
+                 ('explore-scope', 'restricted_explore');
+             INSERT INTO conversations (id, cm_kind, work_scope_id) VALUES
+                 ('direct-conv', 'direct', 'direct-scope'),
+                 ('explore-conv', 'detached_product_creation', 'explore-scope');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(MIGRATION_097).execute(&pool).await.unwrap();
+
+        let authorities = sqlx::query("SELECT id, authority_kind FROM work_scopes ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("id"),
+                    row.get::<String, _>("authority_kind"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            authorities,
+            vec![
+                ("direct-scope".to_string(), "direct".to_string()),
+                (
+                    "explore-scope".to_string(),
+                    "restricted_explore".to_string(),
+                ),
+            ]
+        );
     }
 
     #[tokio::test]

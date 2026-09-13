@@ -1877,6 +1877,7 @@ impl Database {
 
     fn authority_for_mode(cm: &ConvModeCols<'_>) -> AuthorityKind {
         match cm.kind {
+            "direct" => AuthorityKind::Direct,
             "work" | "branch" => AuthorityKind::Work,
             _ => AuthorityKind::RestrictedExplore,
         }
@@ -17224,12 +17225,9 @@ mod tests {
     }
 
     #[test]
-    fn direct_mode_receives_restricted_authority() {
+    fn direct_mode_receives_direct_authority() {
         let cm = conv_mode_columns(&ConvMode::Direct);
-        assert_eq!(
-            Database::authority_for_mode(&cm),
-            AuthorityKind::RestrictedExplore
-        );
+        assert_eq!(Database::authority_for_mode(&cm), AuthorityKind::Direct);
     }
 
     #[tokio::test]
