@@ -3586,6 +3586,7 @@ mod tests {
             recommended: false,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
+            codex_availability: crate::CodexAvailability::Established,
             effort_capabilities: crate::EffortCapabilities::unknown(),
             service_tier_capabilities: crate::models::ServiceTierCapabilities::Unsupported,
         }

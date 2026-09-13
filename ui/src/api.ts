@@ -1511,8 +1511,10 @@ export const api = {
     return resp.json();
   },
 
-  async codexPkceCancel(sessionId: string): Promise<void> {
-    await fetch(`/api/codex/login/pkce/${encodeURIComponent(sessionId)}/cancel`, { method: 'POST' });
+  async codexPkceCancel(sessionId: string): Promise<{ ok: boolean; cancelled: boolean }> {
+    const resp = await fetch(`/api/codex/login/pkce/${encodeURIComponent(sessionId)}/cancel`, { method: 'POST' });
+    if (!resp.ok) throw new Error(`Failed to cancel Codex login: ${resp.status}`);
+    return resp.json() as Promise<{ ok: boolean; cancelled: boolean }>;
   },
 
   async codexDeviceStart(): Promise<CodexDeviceStartResponse> {
@@ -1530,8 +1532,10 @@ export const api = {
     return resp.json();
   },
 
-  async codexDeviceCancel(sessionId: string): Promise<void> {
-    await fetch(`/api/codex/login/device/${encodeURIComponent(sessionId)}/cancel`, { method: 'POST' });
+  async codexDeviceCancel(sessionId: string): Promise<{ ok: boolean; cancelled: boolean }> {
+    const resp = await fetch(`/api/codex/login/device/${encodeURIComponent(sessionId)}/cancel`, { method: 'POST' });
+    if (!resp.ok) throw new Error(`Failed to cancel device flow: ${resp.status}`);
+    return resp.json() as Promise<{ ok: boolean; cancelled: boolean }>;
   },
 
   async codexSignout(): Promise<void> {

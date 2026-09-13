@@ -128,12 +128,9 @@ struct PkceSession {
     cancel: CancellationToken,
     settled: tokio::sync::Notify,
     is_settled: std::sync::atomic::AtomicBool,
-    credential_committed: std::sync::atomic::AtomicBool,
 }
 
 struct DeviceSession {
-    credential_committed: std::sync::atomic::AtomicBool,
-
     /// User-visible code retained for log lines on settle.
     user_code: String,
     status: Mutex<LoginStatus>,
@@ -146,22 +143,11 @@ struct DeviceSession {
     is_settled: std::sync::atomic::AtomicBool,
 }
 
-fn cancel_before_credential_commit(
-    cancel: &CancellationToken,
-    credential_committed: &std::sync::atomic::AtomicBool,
-) -> bool {
-    if credential_committed.load(std::sync::atomic::Ordering::Acquire) {
-        false
-    } else {
-        cancel.cancel();
-        true
-    }
-}
-
 #[derive(Default)]
 pub struct CodexLoginManager {
     pkce: Mutex<HashMap<String, Arc<PkceSession>>>,
     device: Mutex<HashMap<String, Arc<DeviceSession>>>,
+    publication_gate: Arc<Mutex<()>>,
     lifecycle: Mutex<()>,
 }
 
@@ -332,7 +318,6 @@ pub async fn pkce_start(
         cancel: cancel.clone(),
         settled: tokio::sync::Notify::new(),
         is_settled: std::sync::atomic::AtomicBool::new(false),
-        credential_committed: std::sync::atomic::AtomicBool::new(false),
     });
 
     // Cancel any prior in-flight PKCE session before binding. Without this,
@@ -370,17 +355,15 @@ pub async fn pkce_start(
                 cancel_for_task,
                 loopback,
                 manual_rx,
-                expected_state,
-                verifier,
-                redirect_uri,
-                login_target,
+                PkceDriveConfig {
+                    expected_state,
+                    verifier,
+                    redirect_uri,
+                    login_target,
+                    publication_gate: Arc::clone(&mgr_for_task.publication_gate),
+                },
             )
             .await;
-            if outcome.is_ok() {
-                session_for_task
-                    .credential_committed
-                    .store(true, std::sync::atomic::Ordering::Release);
-            }
             settle_pkce(
                 &mgr_for_task,
                 &registry_for_task,
@@ -404,15 +387,27 @@ pub async fn pkce_start(
     }))
 }
 
-async fn drive_pkce(
-    cancel: CancellationToken,
-    loopback: Option<LoopbackServer>,
-    manual_rx: oneshot::Receiver<ManualCallback>,
+struct PkceDriveConfig {
     expected_state: String,
     verifier: String,
     redirect_uri: String,
     login_target: PathBuf,
-) -> Result<LoginResult, LoginError> {
+    publication_gate: Arc<Mutex<()>>,
+}
+
+async fn drive_pkce(
+    cancel: CancellationToken,
+    loopback: Option<LoopbackServer>,
+    manual_rx: oneshot::Receiver<ManualCallback>,
+    config: PkceDriveConfig,
+) -> Result<(LoginResult, tokio::sync::OwnedMutexGuard<()>), LoginError> {
+    let PkceDriveConfig {
+        expected_state,
+        verifier,
+        redirect_uri,
+        login_target,
+        publication_gate,
+    } = config;
     // Race the loopback callback against the manual-paste channel and the
     // user-cancellation token. `biased` makes cancel preempt deterministically
     // when multiple branches ready simultaneously — we never want to hand a
@@ -480,18 +475,19 @@ async fn drive_pkce(
         r = exchange_pkce_code(ISSUER_BASE, CLIENT_ID, &redirect_uri, &verifier, &code) => r?,
     };
 
+    let publication = publication_gate.lock_owned().await;
     if cancel.is_cancelled() {
         return Err(LoginError::Cancelled);
     }
 
-    finalize_login(&login_target, tokens)
+    finalize_login(&login_target, tokens).map(|result| (result, publication))
 }
 
 async fn settle_pkce(
     mgr: &Arc<CodexLoginManager>,
     llm_registry: &Arc<phoenix_llm::ModelRegistry>,
     session_id: &str,
-    outcome: Result<LoginResult, LoginError>,
+    outcome: Result<(LoginResult, tokio::sync::OwnedMutexGuard<()>), LoginError>,
 ) {
     let session = {
         let sessions = mgr.pkce.lock().await;
@@ -503,12 +499,16 @@ async fn settle_pkce(
     // `kind: success` as "the bridge is live now" and may immediately fire
     // an OpenAI request — that request must hit the new credential, not the
     // pre-login state.
-    if outcome.is_ok() {
-        llm_registry.reload_codex_credential().await;
-    }
+    let outcome = match outcome {
+        Ok((result, publication)) => {
+            llm_registry.reload_codex_credential().await;
+            Ok((result, publication))
+        }
+        Err(error) => Err(error),
+    };
     {
         let mut inner = session.inner.lock().await;
-        inner.status.outcome = Some(outcome);
+        inner.status.outcome = Some(outcome.map(|(result, _)| result));
     }
     schedule_pkce_sweep(mgr.clone(), session_id.to_string());
 }
@@ -703,9 +703,14 @@ pub async fn pkce_cancel(
         let sessions = mgr.pkce.lock().await;
         sessions.get(&session_id).cloned()
     };
-    let cancelled = session.is_some_and(|session| {
-        cancel_before_credential_commit(&session.cancel, &session.credential_committed)
-    });
+    let _publication = mgr.publication_gate.lock().await;
+    let cancelled = match session {
+        Some(session) if session.inner.lock().await.status.outcome.is_none() => {
+            session.cancel.cancel();
+            true
+        }
+        _ => false,
+    };
     Json(serde_json::json!({ "ok": true, "cancelled": cancelled }))
 }
 
@@ -761,7 +766,6 @@ pub async fn device_start(
                 cancel: cancel.clone(),
                 settled: tokio::sync::Notify::new(),
                 is_settled: std::sync::atomic::AtomicBool::new(false),
-                credential_committed: std::sync::atomic::AtomicBool::new(false),
             }),
         );
     }
@@ -779,12 +783,13 @@ pub async fn device_start(
                 .expect("device session inserted")
         };
         tokio::spawn(async move {
-            let outcome = drive_device_code(cancel, device, login_target).await;
-            if outcome.is_ok() {
-                session_for_task
-                    .credential_committed
-                    .store(true, std::sync::atomic::Ordering::Release);
-            }
+            let outcome = drive_device_code(
+                cancel,
+                device,
+                login_target,
+                Arc::clone(&mgr_for_task.publication_gate),
+            )
+            .await;
             settle_device(
                 &mgr_for_task,
                 &registry_for_task,
@@ -806,7 +811,8 @@ async fn drive_device_code(
     cancel: CancellationToken,
     device: DeviceCode,
     login_target: PathBuf,
-) -> Result<LoginResult, LoginError> {
+    publication_gate: Arc<Mutex<()>>,
+) -> Result<(LoginResult, tokio::sync::OwnedMutexGuard<()>), LoginError> {
     // Race the long polling loop against user cancellation. Without this,
     // pressing Cancel only deletes the session record while the poll keeps
     // running — and if the user has already (or subsequently) completes the
@@ -817,17 +823,18 @@ async fn drive_device_code(
         () = cancel.cancelled() => return Err(LoginError::Cancelled),
         r = poll_device_code(&device) => r?,
     };
+    let publication = publication_gate.lock_owned().await;
     if cancel.is_cancelled() {
         return Err(LoginError::Cancelled);
     }
-    finalize_login(&login_target, tokens)
+    finalize_login(&login_target, tokens).map(|result| (result, publication))
 }
 
 async fn settle_device(
     mgr: &Arc<CodexLoginManager>,
     llm_registry: &Arc<phoenix_llm::ModelRegistry>,
     session_id: &str,
-    outcome: Result<LoginResult, LoginError>,
+    outcome: Result<(LoginResult, tokio::sync::OwnedMutexGuard<()>), LoginError>,
 ) {
     let session = {
         let sessions = mgr.device.lock().await;
@@ -842,12 +849,16 @@ async fn settle_device(
         );
     }
     // Reload before publishing status — see settle_pkce for the rationale.
-    if outcome.is_ok() {
-        llm_registry.reload_codex_credential().await;
-    }
+    let outcome = match outcome {
+        Ok((result, publication)) => {
+            llm_registry.reload_codex_credential().await;
+            Ok((result, publication))
+        }
+        Err(error) => Err(error),
+    };
     {
         let mut status = session.status.lock().await;
-        status.outcome = Some(outcome);
+        status.outcome = Some(outcome.map(|(result, _)| result));
     }
     schedule_device_sweep(mgr.clone(), session_id.to_string());
 }
@@ -894,9 +905,14 @@ pub async fn device_cancel(
         let sessions = mgr.device.lock().await;
         sessions.get(&session_id).cloned()
     };
-    let cancelled = session.is_some_and(|session| {
-        cancel_before_credential_commit(&session.cancel, &session.credential_committed)
-    });
+    let _publication = mgr.publication_gate.lock().await;
+    let cancelled = match session {
+        Some(session) if session.status.lock().await.outcome.is_none() => {
+            session.cancel.cancel();
+            true
+        }
+        _ => false,
+    };
     Json(serde_json::json!({ "ok": true, "cancelled": cancelled }))
 }
 
@@ -1148,24 +1164,6 @@ mod tests {
     /// login-target path). Asserting on the error type is what tells us
     /// the fix is in place — a regression that drops the cancel branch would
     /// surface as `LoginError::Network` or a hang on the unreachable issuer.
-    #[test]
-    fn cancel_is_rejected_after_credential_commit() {
-        let cancel = CancellationToken::new();
-        let committed = std::sync::atomic::AtomicBool::new(true);
-
-        assert!(!cancel_before_credential_commit(&cancel, &committed));
-        assert!(!cancel.is_cancelled());
-    }
-
-    #[test]
-    fn cancel_is_accepted_before_credential_commit() {
-        let cancel = CancellationToken::new();
-        let committed = std::sync::atomic::AtomicBool::new(false);
-
-        assert!(cancel_before_credential_commit(&cancel, &committed));
-        assert!(cancel.is_cancelled());
-    }
-
     #[tokio::test]
     async fn drive_device_code_cancelled_before_poll_short_circuits() {
         let cancel = CancellationToken::new();
@@ -1181,9 +1179,14 @@ mod tests {
             client_id: "client".into(),
         };
 
-        let err = drive_device_code(cancel, device, std::path::PathBuf::from("/dev/null"))
-            .await
-            .unwrap_err();
+        let err = drive_device_code(
+            cancel,
+            device,
+            std::path::PathBuf::from("/dev/null"),
+            Arc::new(Mutex::new(())),
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(err, LoginError::Cancelled),
             "expected Cancelled, got {err:?}"

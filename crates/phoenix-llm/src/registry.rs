@@ -3,8 +3,8 @@
 use super::codex_credential::AccountBoundCodexCredential;
 use super::{
     all_models, codex_credential, discover_models, merge_model_specs, parse_external_models,
-    CodexCredential, DiscoveredModels, DiscoveryConfig, LlmService, LlmServiceImpl, LlmTransport,
-    LoggingService, ModelBackend, ModelInfo, ModelSource,
+    CodexAvailability, CodexCredential, DiscoveredModels, DiscoveryConfig, LlmService,
+    LlmServiceImpl, LlmTransport, LoggingService, ModelBackend, ModelInfo, ModelSource,
 };
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use std::collections::{HashMap, HashSet};
@@ -884,7 +884,12 @@ impl ModelRegistry {
     }
 
     fn codex_catalog_allows(spec: &super::ModelSpec, catalog: Option<&HashSet<String>>) -> bool {
-        spec.id != "gpt-6-astra" || catalog.is_some_and(|models| models.contains(&spec.api_name))
+        match spec.codex_availability {
+            CodexAvailability::Established => true,
+            CodexAvailability::AccountCatalog => {
+                catalog.is_some_and(|models| models.contains(&spec.api_name))
+            }
+        }
     }
 
     fn codex_bridge_allows(spec: &super::ModelSpec, catalog: Option<&HashSet<String>>) -> bool {
