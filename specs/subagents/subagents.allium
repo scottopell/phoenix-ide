@@ -144,24 +144,26 @@ rule SpawnRejectedTooManyTasks {
 -- 2. MODE VALIDATION (REQ-PROJ-008, REQ-BED-018)
 -- ===========================================================
 
--- A Work sub-agent requires the parent to be writeable. "Writeable" here
--- means the parent's mode grants write access to a worktree (Work or
--- Branch) or to the user's cwd (Direct). An Explore parent has no place
--- to put a Work sub-agent's writes.
+-- A Work sub-agent requires Work authority on the parent's exact scope.
+-- Mode remains provenance and does not independently grant or deny writes.
 rule WorkSubAgentRequiresWriteableParent {
     when: SpawnAgentsToolInvoked(parent, tasks)
     requires: any_task_mode_is_work(tasks)
-    requires: parent.mode not in { work, branch, direct }
+    requires: parent.execution_authority = read_only
     ensures: SpawnAgentsRejected(parent,
-        reason: "Work sub-agents require the parent to be in a \
-                 write-capable mode (Work, Branch, or Direct)")
+        reason: "Work sub-agents require Work authority on the parent WorkScope")
+}
+
+rule WorkSubAgentAllowedForApprovedExploreOrigin {
+    when: SpawnAgentsToolInvoked(parent, tasks)
+    requires: any_task_mode_is_work(tasks)
+    requires: parent.execution_authority = write_capable
+    ensures: SpawnAgentsAuthorityAccepted(parent)
 
     @guidance
-        -- Parent mode is read from `ConvContext.mode_context` at the
-        -- call site. The only writeable-disqualifying mode is `explore`;
-        -- `parent.execution_authority = read_only` => reject. The error string also
-        -- instructs the LLM to use `mode: "explore"` or omit `mode` for
-        -- read-only sub-agents.
+        -- Explore-origin mode may remain as provenance after approval. The
+        -- parent's execution authority is the same WorkScope projection used by
+        -- tool dispatch and Bash isolation.
 }
 
 -- One-writer-per-batch: a single `spawn_agents` call carries at most one

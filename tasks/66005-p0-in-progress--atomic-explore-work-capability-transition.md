@@ -13,7 +13,7 @@ This P0 owns the product defect end-to-end and is separate from task 98016, whos
 - Approval had already done the task-artifact mutation successfully: task 98016 is `in-progress`, and commit `b613d6bf0` contains only that approval artifact. Later source `patch` calls also succeeded, proving some write capability was present.
 - Subsequent Bash invocations retained Explore policy: `PHOENIX_SANDBOX_SCRATCH` pointed under `explore-bash`; taskmd rename, Git common-dir `index.lock`, normal `target`/codegen, and uv/cache writes failed. The transcript later recorded Work-child rejection: `Work sub-agents require the parent to be in a write-capable mode` (production DB messages `1901-1902`, `14:00:08Z`).
 - After supported cancellation, a fresh user message in the **same** approved conversation requested a non-mutating capability probe (message `1908`, `14:02:49Z`). Bash still reported non-empty sandbox scratch and could not create/remove a uniquely named harmless file in the Git common directory; the turn stopped before mutation. This rejects a one-command or one-turn stale session.
-- Production is version `0.12.0`, Git `19fe992c72e5`; the process started before this conversation and no runtime reconstruction for this conversation appears in the incident interval. No matching bounded VictoriaTraces trace was retained; the production DB transcript and structured log are the independent evidence surfaces.
+- Production is version `0.12.0`, Git `19fe992c72e5`. Phoenix restarted at `13:57:13Z`, rematerialized this conversation at `13:57:27Z`, and immediately resumed it with a capability surface that stripped nine unavailable tools (`prod.log:10077,10123,10132`). Bash remained Restricted after that restart and Work-child admission still rejected at `14:00:08Z`. The defect therefore survives full process restart/rematerialization as well as actor reuse. No matching bounded VictoriaTraces trace was retained; the production DB transcript and structured log are the independent evidence surfaces.
 
 ### Failure chain and first stale snapshot
 
@@ -35,7 +35,7 @@ flowchart LR
 - Work-child admission is an independent stale consumer: `handle_spawn_agents_tool` reads `self.context.resource_authority` directly and rejects unless it is `Work` (`crates/phoenix-ide/src/runtime/executor.rs:4774-4808`). The incident's Work-child rejection therefore proves the live actor's context authority was stale/reverted despite the durable WorkScope authority. Conversation mode is not the legitimate authority; the error wording obscures that distinction.
 - Tool context is rebuilt per execution, but from actor-cached `self.context.resource_authority` and `resource_scope` (`ConversationRuntime::build_tool_context`, `executor.rs:7309-7349`). Fresh turns do not reload durable authority. `ConversationRuntime::new` also freezes `clearable_names` from the initial executor (`executor.rs:1872-1911`).
 - LLM requests freeze tool definitions and Explore Bash prompt capability per request (`executor.rs:6915-6945`), and detached tool tasks clone the executor before spawning (`executor.rs:7410-7467`). A registry swap cannot retract an already-frozen provider request or a tool object already cloned from the registry. These precreated/in-flight cases need an explicit generation/barrier policy; they are not sufficient to explain the fresh-turn failure, but they can reproduce partial-transition races.
-- A newly materialized runtime does use the correct durable sources: `RuntimeManager::build_runtime_from_db` resolves WorkScope authority, loads the typed approved objective, and selects a direct/Work registry for an Explore-mode approved conversation (`crates/phoenix-ide/src/runtime.rs:4929-4975,5060-5160`). Restart/rematerialization should heal this specific persisted incident state, but restart was not observed during the incident and is not an acceptable product fix.
+- Runtime rematerialization attempts to use the durable sources, but production proves the projection is incomplete or inconsistent: `RuntimeManager::build_runtime_from_db` separately resolves WorkScope authority, loads the approved objective, and selects registry/context values through distinct branches (`crates/phoenix-ide/src/runtime.rs:4929-4975,5060-5160`). A full process restart rebuilt the incident actor and still produced Restricted Bash and Work-child admission. Restart/rematerialization is therefore part of the defect and regression matrix, not a healing boundary.
 
 ### Rejected hypotheses
 
@@ -45,7 +45,7 @@ flowchart LR
 - **Fresh user input reconstructs capability:** false. The actor survives turns and builds tool context from cached authority.
 - **`/continue` is a rescue boundary:** false and unsafe. Continuation is defined only for context-exhausted conversations (REQ-BED-030, `specs/bedrock/requirements.md:1012-1049`); this parent is idle, not exhausted.
 - **Child delegation can rescue task 98016:** false. Work spawn is correctly rejected from the stale Restricted parent, and delegation would avoid rather than repair the owning actor.
-- **Deployment/restart caused the split:** not supported by evidence. Production started this actor before approval and kept it alive. Rematerialization is relevant as a recovery/test boundary, not the initial cause.
+- **A restart heals the split:** false. Production restarted and rematerialized the same approved conversation before the fresh Bash and Work-child failures. Redeploying `origin/main` would also be ineffective because it is the same deployed SHA, `19fe992c72e5`.
 
 ## Owning invariant and normative changes first
 
@@ -103,16 +103,9 @@ Build the test around a real temporary Git repository/worktree, real taskmd arti
 
 ## Safe rescue path for task 98016 (operationally separate)
 
-The exact supported per-conversation replacement boundary is `POST /api/conversations/:id/upgrade-model`: for an idle/error-like conversation, `upgrade_conversation_model` persists model settings, calls `RuntimeManager::evict_runtime(..., ModelUpgrade)`, removes the actor from the runtime map, sends shutdown, waits for its task to exit, and retains the broadcaster for rematerialization (`crates/phoenix-ide/src/api/handlers.rs:5028-5129`; `crates/phoenix-ide/src/runtime.rs:4550-4707`). `build_runtime_from_db` then derives Work authority and the Work registry from the persisted objective/WorkScope.
+`POST /api/conversations/:id/upgrade-model` is the supported per-conversation actor replacement boundary (`crates/phoenix-ide/src/api/handlers.rs:5028-5129`; `crates/phoenix-ide/src/runtime.rs:4550-4707`), but it is **not a safe rescue for this incident**: a stronger full-process restart already rematerialized the same persisted conversation and reproduced Restricted capability. Do not invoke model upgrade, restart, or redeploy as rescue.
 
-For incident rescue only, after this P0 postmortem/task is approved by the user:
-
-1. Keep task 98016's worktree untouched and verify the parent remains non-busy/idle, DB authority is Work, objective relation is intact, and the dirty status is unchanged.
-2. Use the supported upgrade-model API on **the same conversation**, selecting the current configured model (`gpt-5.6-sol`) and current effort/tier so no product intent changes. This is an actor eviction/rematerialization, not a process restart or deployment. The endpoint does not alter cwd, WorkScope, worktree, Git state, transcript identity, or dirty files.
-3. Re-open/rematerialize that same conversation, then run only the requested read/write capability probe. Proceed with task 98016 in the parent only if sandbox scratch is absent and the harmless Git common-dir fixture succeeds; otherwise stop and preserve all state.
-4. Do not use `/continue`, fabricate context exhaustion, create a replacement conversation/worktree, or delegate to a child.
-
-Caveat: same-model use is accepted by the handler/DB update path but is an operational recovery use of a model-upgrade endpoint, not a user-facing authority-repair contract. Do not encode it as the product fix or broaden compatibility guarantees around it.
+The only safe current path is preservation: leave task 98016's conversation, WorkScope, worktree, Git state, and dirty files untouched until this P0 fix is reviewed, merged, and a separately authorized production deployment installs it. After that deployment, rematerialize the same conversation and run only the Bash/common-dir plus Work-child admission probes. Continue task 98016 in its parent only if those probes pass; otherwise stop and preserve all state. Never use `/continue`, fabricate context exhaustion, create a replacement conversation/worktree, or delegate to a child.
 
 ## Validation and delivery
 

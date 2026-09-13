@@ -187,6 +187,14 @@ AND SHALL attach the sub-agent to that exact `WorkScope` identity rather than in
 WHEN a planning/read-only conversation spawns sub-agents
 THE SYSTEM SHALL configure those sub-agents with read-only authority
 
+WHEN a parent requests a write-authority sub-agent
+THE SYSTEM SHALL admit the request only when the parent's attached `WorkScope` has Work authority
+AND SHALL derive that decision from the same authority projection used by the parent's tool execution policy
+AND SHALL NOT deny the request solely because the parent retains Explore-origin mode provenance
+
+WHEN the parent's attached `WorkScope` has Restricted authority
+THE SYSTEM SHALL reject write-authority sub-agents even when the parent has a Git-backed worktree
+
 **Rationale:** The important distinction is execution authority, not lifecycle naming. Phoenix must preserve the single-writer guarantee for one worktree while still allowing parallel read-only analysis.
 
 ---
