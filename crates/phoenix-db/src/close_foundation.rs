@@ -3553,6 +3553,7 @@ impl Database {
     /// # Errors
     /// Returns a typed evidence-invariant error when source authority is absent,
     /// conflicting, or incompatible with the target sealed inventory.
+    #[allow(clippy::too_many_lines)]
     pub async fn adopt_close_worktree_cleanup_plan(
         &self,
         request: AdoptCloseWorktreeCleanupPlanRequest,
@@ -9763,6 +9764,7 @@ mod tests {
         assert_eq!(rows, 1);
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn retry_generation_atomically_adopts_prior_dispatch_and_cleanup_plan() {
         let db = Database::open_in_memory().await.unwrap();
@@ -9891,6 +9893,7 @@ mod tests {
         assert!(violations.is_empty());
     }
 
+    #[allow(clippy::items_after_statements, clippy::too_many_lines)]
     #[tokio::test]
     async fn repeated_retry_adopts_newest_cleanup_plan_lineage_idempotently() {
         let db = Database::open_in_memory().await.unwrap();

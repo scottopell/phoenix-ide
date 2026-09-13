@@ -3715,10 +3715,7 @@ fn classify_descriptor_access_mode(
 
 #[cfg(any(test, target_os = "macos"))]
 fn macos_descriptor_inspection_is_transient_disappearance(errno: Option<i32>) -> bool {
-    matches!(
-        errno,
-        Some(libc::ESRCH) | Some(libc::ENOENT) | Some(libc::EBADF)
-    )
+    matches!(errno, Some(libc::ESRCH | libc::ENOENT | libc::EBADF))
 }
 
 #[cfg(target_os = "linux")]
@@ -3811,6 +3808,7 @@ fn quarantine_has_writable_mappings_in(
     Ok(ExternalWriterEvidence::NoPositiveEvidence)
 }
 
+#[allow(clippy::too_many_lines)]
 #[cfg(target_os = "macos")]
 fn quarantine_has_writable_mappings(path: &Path) -> Result<ExternalWriterEvidence, String> {
     use std::ffi::CStr;
@@ -4327,7 +4325,7 @@ fn macos_process_owner_incarnation(pid: i32) -> Result<Option<(libc::uid_t, Stri
         let error = std::io::Error::last_os_error();
         if matches!(
             error.raw_os_error(),
-            Some(libc::ESRCH) | Some(libc::ENOENT) | Some(libc::EPERM)
+            Some(libc::ESRCH | libc::ENOENT | libc::EPERM)
         ) {
             return Ok(None);
         }
@@ -4354,7 +4352,7 @@ fn macos_process_executable(pid: i32) -> Result<Option<GitPathIdentity>, String>
         let error = std::io::Error::last_os_error();
         if matches!(
             error.raw_os_error(),
-            Some(libc::ESRCH) | Some(libc::ENOENT) | Some(libc::EPERM)
+            Some(libc::ESRCH | libc::ENOENT | libc::EPERM)
         ) {
             return Ok(None);
         }
@@ -4457,7 +4455,9 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence
                     .expect("vnode info size fits i32")
             {
                 let error = std::io::Error::last_os_error();
-                if macos_descriptor_inspection_is_transient_disappearance(error.raw_os_error()) {
+                if macos_descriptor_inspection_is_transient_disappearance(error.raw_os_error())
+                    || error.raw_os_error() == Some(libc::EPERM)
+                {
                     continue;
                 }
                 return Err(format!(
@@ -4473,7 +4473,7 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence
             let candidate_path = Path::new(std::ffi::OsStr::from_bytes(candidate.to_bytes()));
             let candidate_is_within = path_is_within(candidate_path, &canonical);
             let target_is_directory =
-                info.vnode.vip_vi.vi_stat.vst_mode & libc::S_IFMT as u16 == libc::S_IFDIR as u16;
+                info.vnode.vip_vi.vi_stat.vst_mode & libc::S_IFMT == libc::S_IFDIR;
             let Some(access_mode) = classify_descriptor_access_mode(
                 macos_descriptor_access_mode(info.file.open_flags),
                 candidate_is_within && target_is_directory,
@@ -7076,6 +7076,7 @@ mod tests {
         assert!(error.contains("process incarnation"));
     }
 
+    #[allow(clippy::items_after_statements)]
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_read_only_file_descriptor_under_quarantine_is_not_a_writer() {
@@ -7094,6 +7095,7 @@ mod tests {
             if marker.exists() {
                 break;
             }
+            // test-timing-allow: polling backoff; the helper's marker is the completion signal
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(marker.exists(), "external reader became ready");
@@ -7562,6 +7564,7 @@ mod tests {
                     if callback_marker.exists() {
                         return;
                     }
+                    // test-timing-allow: polling backoff; the helper's marker is the completion signal
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
                 panic!("external writer did not become ready");
