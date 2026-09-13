@@ -1109,6 +1109,7 @@ fn map_db_not_found(e: DbError) -> AppError {
         | DbError::ProductConversationUnavailable(_)
         | DbError::SteeringQueueFull
         | DbError::CloseFoundationPrecondition(_)
+        | DbError::CloseEvidenceInvariant { .. }
         | DbError::CloseFoundationRepairRequired(_)
         | DbError::CloseFoundationNotFound(_)
         | DbError::ForkProposalConflict(_)
