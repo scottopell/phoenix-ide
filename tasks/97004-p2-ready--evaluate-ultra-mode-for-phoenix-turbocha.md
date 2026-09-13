@@ -58,19 +58,17 @@ A typed design should prevent `Turbocharge` from being serialized as `reasoning.
 
 - **Quality target:** prevent incomplete work by discovering the full task scope, decomposing it, and closing implementation, validation, integration, and handoff obligations.
 - **Activation:** an explicit, easy inline affordance on the message that introduces the complex task, analogous to an `ultrathink` marker. The final interaction may be a keyword, compose-message chrome, or another message-bound control; Phoenix does not activate Turbocharge implicitly.
-- **Persistence:** activation applies as conversation policy after the triggering message. Whether the user can later turn it off, and whether compaction preserves or terminates it, remains a product decision.
+- **Lifecycle:** v1 has a one-way `off → on` transition for a conversation. Once activated, Turbocharge cannot be disabled in that conversation; future versions may add explicit deactivation.
+- **Compaction:** Turbocharge is durable structured conversation state and always survives compaction. Its persistence must not depend on retained prompt text or a compacted summary mentioning the mode.
 - **Scope authority:** the user's triggering message supplies the goal; Phoenix infers, owns, and continuously refines the decomposition without requiring plan approval.
 - **Scope growth:** Phoenix completes on-path and adjacent obligations a reasonable user would expect. It asks before broadening the user's product goal.
+- **Later messages:** clear follow-ups revise the owning agent's living decomposition; ambiguous pivots are clarified through ordinary LLM conversation. Task scope and decomposition do not introduce special state-machine states or transitions.
 - **Completion:** the owning agent exercises higher-effort judgment using normal Phoenix validation and reports the completed result. Turbocharge does not require a new scope ledger, approval gate, or mandatory independent-review verdict.
 - **Delegation:** optional and adaptive. Turbocharge may proceed solo when additional agents would not materially improve completeness.
 - **Presentation:** reuse current subagent interfaces rather than creating bespoke team-management UI.
 
 ## Product questions to resolve
 
-- Can Turbocharge be toggled off later in the conversation, or is activation an irreversible escalation for that conversation?
-- Does compaction preserve Turbocharge as durable conversation policy, deliberately terminate it, or ask the user to reaffirm it?
-- If deactivation is allowed, does it affect in-flight orchestration or only later messages?
-- How should scope changes from later user messages update the active Turbocharged task?
 - How should Phoenix explain useful additional quality work without introducing bespoke team-management UI or a formal scope ledger?
 - When complementary agents disagree, what judgment and synthesis obligations determine the owning agent's final answer?
 
@@ -84,10 +82,11 @@ A typed design should prevent `Turbocharge` from being serialized as `reasoning.
 
 ## Acceptance criteria
 
-- [ ] Complete product discovery for later-message scope changes, disable semantics, and concise result reporting.
+- [ ] Complete product discovery for concise result reporting and owning-agent synthesis when complementary work disagrees.
 - [ ] Write normative requirements centered on the strongest-result user promise and an ADR for the orchestration-versus-provider-effort distinction.
-- [ ] Define and persist the message-bound activation and its conversation lifecycle, including the decided deactivation and compaction semantics.
+- [ ] Persist message-bound activation as a one-way v1 conversation transition; preserve it structurally across compaction without relying on summary text.
 - [ ] Require an owning-agent decomposition without introducing a user approval gate or formal scope ledger, while allowing zero delegated agents when delegation adds no material value.
+- [ ] Keep decomposition and later scope refinement in ordinary LLM interaction; do not add task-scope lifecycle states to the conversation state machine.
 - [ ] Inventory current subagent capabilities against the required complementary roles; add no bespoke UI or tool without a demonstrated gap.
 - [ ] Add or extend Allium for the resulting orchestration lifecycle, including role selection, synthesis, cancellation, retry, recovery, and bounded delegation.
 - [ ] Represent Turbocharge separately from `ModelEffort`; impossible provider effort values cannot be serialized.
@@ -103,4 +102,5 @@ A typed design should prevent `Turbocharge` from being serialized as `reasoning.
 - Do not build a bespoke subagent dashboard or duplicate interfaces that already express the needed work.
 - Do not define Turbocharge by a minimum agent count, mandatory parallelism, or automatic activation.
 - Do not require task-plan approval, a new completion artifact, or an independent-review verdict for every Turbocharged request.
+- Do not add Turbocharge deactivation in v1 or encode the owning agent's living task decomposition as special state-machine state.
 - Do not copy Codex prompts or limits without reviewing licensing, product fit, and Phoenix's own state-machine/recovery invariants.
