@@ -35,6 +35,10 @@ fn resolve_endpoint(base_url_override: Option<&str>) -> String {
     )
 }
 
+pub(crate) fn is_official_responses_route(base_url_override: Option<&str>) -> bool {
+    base_url_override.is_none_or(|url| url == "https://api.openai.com/v1/responses")
+}
+
 fn resolve_chat_endpoint(base_url_override: Option<&str>) -> String {
     base_url_override.map_or_else(
         || "https://api.openai.com/v1/chat/completions".to_string(),
@@ -87,7 +91,7 @@ pub async fn complete(
         &spec.api_name,
         request,
         use_codex_backend,
-        use_codex_backend || base_url_override.is_none(),
+        use_codex_backend || is_official_responses_route(base_url_override),
     );
     responses_request.set_tags(request_tags);
 
@@ -1269,7 +1273,7 @@ pub async fn complete_streaming(
         &spec.api_name,
         request,
         use_codex_backend,
-        use_codex_backend || base_url_override.is_none(),
+        use_codex_backend || is_official_responses_route(base_url_override),
     );
     responses_request.set_streaming();
     responses_request.set_tags(request_tags);
@@ -4499,6 +4503,13 @@ mod tests {
 
         assert_eq!(direct["service_tier"], "priority");
         assert_eq!(codex["service_tier"], "priority");
+    }
+
+    #[test]
+    fn astra_fast_tier_is_supported_on_explicit_canonical_route() {
+        assert!(is_official_responses_route(Some(
+            "https://api.openai.com/v1/responses"
+        )));
     }
 
     #[test]

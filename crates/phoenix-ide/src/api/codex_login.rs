@@ -155,6 +155,10 @@ impl CodexLoginManager {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
+
+    pub async fn lock_publication(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.publication_gate.lock().await
+    }
 }
 
 fn new_session_id() -> String {
@@ -991,6 +995,7 @@ async fn fetch_codex_quota(
 }
 
 pub async fn codex_quota(State(state): State<AppState>) -> Json<Option<phoenix_llm::QuotaDetails>> {
+    let _publication = state.codex_login.lock_publication().await;
     let quota = match state.llm_registry.current_codex_credential() {
         Some(credential) => fetch_codex_quota(credential.as_ref())
             .await

@@ -238,7 +238,7 @@ impl LlmService for LlmServiceImpl {
     fn uses_official_openai_responses(&self) -> bool {
         self.spec.backend == crate::ModelBackend::OpenAIResponses
             && !self.use_codex_backend
-            && self.openai_responses_base_url.is_none()
+            && openai::is_official_responses_route(self.openai_responses_base_url.as_deref())
     }
 
     fn continuation_request_limits(&self) -> super::ContinuationRequestLimits {
