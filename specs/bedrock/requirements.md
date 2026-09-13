@@ -936,6 +936,12 @@ AND SHALL NOT use conversation mode provenance as capability authority
 IF the system cannot project the granted authority to every runtime capability consumer
 THEN THE SYSTEM SHALL NOT resume the conversation with a partially updated capability surface
 
+WHEN same-conversation approval adopts Work authority
+THE SYSTEM SHALL persist the approved objective, `WorkScope` authority, post-approval conversation state, and approved-plan context message in one atomic transaction before publishing the runtime capability projection
+
+IF any post-mutation approval step fails
+THEN THE SYSTEM SHALL retire the live actor for reconstruction from durable authority
+
 WHEN a runtime is reconstructed after interruption
 THE SYSTEM SHALL derive every capability consumer from persisted `WorkScope` authority rather than from conversation mode provenance
 
