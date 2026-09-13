@@ -3943,9 +3943,6 @@ fn quarantine_has_writable_mappings(path: &Path) -> Result<ExternalWriterEvidenc
                 let Some((uid, before_incarnation)) = macos_process_owner_incarnation(pid)? else {
                     continue;
                 };
-                if uid != unsafe { libc::geteuid() } {
-                    continue;
-                }
                 let Some(before_executable) = macos_process_executable(pid)? else {
                     continue;
                 };
@@ -4011,7 +4008,7 @@ fn quarantine_has_process_cwd_in(
         match std::fs::read_link(process.path().join("cwd")) {
             Ok(cwd) if path_is_within(&cwd, &canonical) => return Ok(true),
             Ok(_) => {}
-            Err(_) if !process.path().exists() => continue,
+            Err(_) if !process.path().exists() => {}
             Err(error) => return Err(format!("cannot inspect process cwd: {error}")),
         }
     }
@@ -4137,15 +4134,14 @@ impl LinuxProcessEffectiveUid {
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LinuxProcessOwner {
-    Relevant,
-    Unrelated,
+    Inspectable,
     Vanished,
 }
 
 #[cfg(target_os = "linux")]
 fn linux_process_owner(
     process: &std::fs::DirEntry,
-    effective_uid: libc::uid_t,
+    _effective_uid: libc::uid_t,
     inventory: &str,
 ) -> Result<LinuxProcessOwner, String> {
     let status = match std::fs::read_to_string(process.path().join("status")) {
@@ -4160,25 +4156,14 @@ fn linux_process_owner(
             ));
         }
     };
-    let process_effective_uid =
-        LinuxProcessEffectiveUid::parse_status(&status).map_err(|error| {
-            format!(
+    LinuxProcessEffectiveUid::parse_status(&status).map_err(|error| {
+        format!(
             "cannot attribute process {} {inventory} inventory from kernel credentials: {error}",
             process.file_name().to_string_lossy()
         )
-        })?;
+    })?;
 
-    // The scanned proc files use `PTRACE_MODE_READ_FSCREDS`: Linux compares the
-    // scanner's filesystem UID with the target's real, effective, and saved UIDs.
-    // Effective UID is Phoenix's process-ownership boundary; unlike proc-dir inode
-    // ownership, it is not rewritten to root when a same-user target is nondumpable.
-    Ok(
-        if process_effective_uid == LinuxProcessEffectiveUid(effective_uid) {
-            LinuxProcessOwner::Relevant
-        } else {
-            LinuxProcessOwner::Unrelated
-        },
-    )
+    Ok(LinuxProcessOwner::Inspectable)
 }
 
 #[cfg(target_os = "linux")]
@@ -4196,7 +4181,7 @@ fn linux_process_is_relevant(
         return Ok(false);
     }
     linux_process_owner(process, effective_uid, inventory)
-        .map(|owner| owner == LinuxProcessOwner::Relevant)
+        .map(|owner| owner == LinuxProcessOwner::Inspectable)
 }
 
 #[cfg(target_os = "linux")]
@@ -4517,9 +4502,6 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence
                 let Some((uid, before_incarnation)) = macos_process_owner_incarnation(pid)? else {
                     continue;
                 };
-                if uid != unsafe { libc::geteuid() } {
-                    continue;
-                }
                 let Some(before_executable) = macos_process_executable(pid)? else {
                     continue;
                 };
@@ -7069,6 +7051,24 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cross_uid_process_inventory_remains_inspectable() {
+        let temp = tempfile::tempdir().unwrap();
+        let process = temp.path().join("4242");
+        std::fs::create_dir(&process).unwrap();
+        std::fs::write(process.join("status"), "Name:\tother\nUid:\t7\t7\t7\t7\n").unwrap();
+        let entry = std::fs::read_dir(temp.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            super::linux_process_owner(&entry, 501, "descriptor").unwrap(),
+            super::LinuxProcessOwner::Inspectable,
+        );
+    }
+
     #[test]
     fn partial_descriptor_inventory_is_indeterminate() {
         assert_eq!(super::macos_descriptor_inventory_count(16, 8).unwrap(), 2);
@@ -7331,7 +7331,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             super::linux_process_owner(&process, effective_uid, "working-directory").unwrap(),
-            super::LinuxProcessOwner::Relevant,
+            super::LinuxProcessOwner::Inspectable,
             "same-user nondumpable process must be attributed from kernel credentials"
         );
         let cwd_scan = super::quarantine_has_process_cwd_in(temp.path(), &proc_root, effective_uid);
