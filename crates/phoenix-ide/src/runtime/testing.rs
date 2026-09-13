@@ -2445,11 +2445,12 @@ impl<L: LlmClient + 'static, T: ToolExecutor + 'static> TestRuntime<L, T> {
 #[cfg(test)]
 pub(crate) fn test_tool_context_for_authority(
     authority: phoenix_core::work_scope::ResourceAuthority,
+    cwd: std::path::PathBuf,
 ) -> ToolContext {
     ToolContext::new_with_resource_access(
         tokio_util::sync::CancellationToken::new(),
         "test-capability-conversation".to_string(),
-        std::env::temp_dir(),
+        cwd,
         Arc::new(BrowserSessionManager::default()),
         Arc::new(crate::tools::BashHandleRegistry::new()),
         Arc::new(ModelRegistry::new_empty()),

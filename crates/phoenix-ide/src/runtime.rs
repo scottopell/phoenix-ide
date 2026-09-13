@@ -2005,16 +2005,29 @@ fn sub_agent_registry_for_authority(
     }
 }
 
-fn registry_for_runtime_authority(
-    authority: crate::work_scope::ResourceAuthority,
+struct RuntimeRegistryProjection<'a> {
     mode: ConvMode,
-    tasks_dir_name: &str,
-    agent_catalog: &[phoenix_agents::AgentDefinition],
-    model_ids: &[String],
+    tasks_dir_name: &'a str,
+    agent_catalog: &'a [phoenix_agents::AgentDefinition],
+    model_ids: &'a [String],
     explore_policy: ExploreToolPolicy,
     writing_tools: crate::tools::WritingConversationTools,
-    filesystem_root: &std::path::Path,
+    filesystem_root: &'a std::path::Path,
+}
+
+fn registry_for_runtime_authority(
+    authority: crate::work_scope::ResourceAuthority,
+    projection: RuntimeRegistryProjection<'_>,
 ) -> Result<(ToolRegistry, Option<crate::tools::WritingConversationTools>), String> {
+    let RuntimeRegistryProjection {
+        mode,
+        tasks_dir_name,
+        agent_catalog,
+        model_ids,
+        explore_policy,
+        writing_tools,
+        filesystem_root,
+    } = projection;
     let agents = agent_catalog.to_vec();
     let models = model_ids.to_vec();
     match (authority, mode) {
@@ -5146,23 +5159,24 @@ impl RuntimeManager {
             let writing_tools = crate::coordinator_tools::writing_tools(global_read, send_chat);
             let (registry, upgrade_writing_tools) = registry_for_runtime_authority(
                 resource_authority,
-                conv.conv_mode,
-                &context.tasks_dir_name,
-                agent_catalog.as_ref(),
-                &available_model_ids,
-                ExploreToolPolicy::from_platform(&self.platform),
-                writing_tools,
-                context.filesystem_root(),
+                RuntimeRegistryProjection {
+                    mode: conv.conv_mode,
+                    tasks_dir_name: &context.tasks_dir_name,
+                    agent_catalog: agent_catalog.as_ref(),
+                    model_ids: &available_model_ids,
+                    explore_policy: ExploreToolPolicy::from_platform(&self.platform),
+                    writing_tools,
+                    filesystem_root: context.filesystem_root(),
+                },
             )?;
-            let tool_executor = ToolRegistryExecutor::with_mcp(
+            ToolRegistryExecutor::with_mcp(
                 resource_authority,
                 registry,
                 self.mcp_manager.clone(),
                 agent_catalog.clone(),
                 Arc::from(available_model_ids.clone()),
             )
-            .with_writing_tools(upgrade_writing_tools);
-            tool_executor
+            .with_writing_tools(upgrade_writing_tools)
         };
 
         let recovery_started = std::time::Instant::now();
@@ -6417,7 +6431,7 @@ mod bash_lifecycle_bridge_tests {
 
 #[cfg(test)]
 mod runtime_capability_projection_tests {
-    use super::registry_for_runtime_authority;
+    use super::{registry_for_runtime_authority, RuntimeRegistryProjection};
     use crate::db::ConvMode;
     use crate::platform::PlatformCapability;
     use crate::tools::{
@@ -6468,13 +6482,15 @@ mod runtime_capability_projection_tests {
         let policy = ExploreToolPolicy::from_platform(&PlatformCapability::detect());
         let (restricted, restricted_upgrade) = registry_for_runtime_authority(
             ResourceAuthority::Restricted,
-            detached_mode(temp.path()),
-            "tasks",
-            &[],
-            &[],
-            policy.clone(),
-            writing_tools(),
-            temp.path(),
+            RuntimeRegistryProjection {
+                mode: detached_mode(temp.path()),
+                tasks_dir_name: "tasks",
+                agent_catalog: &[],
+                model_ids: &[],
+                explore_policy: policy,
+                writing_tools: writing_tools(),
+                filesystem_root: temp.path(),
+            },
         )
         .unwrap();
         assert!(restricted.find_tool("bash").is_some());
@@ -6482,13 +6498,15 @@ mod runtime_capability_projection_tests {
 
         let (work, work_upgrade) = registry_for_runtime_authority(
             ResourceAuthority::Work,
-            detached_mode(temp.path()),
-            "tasks",
-            &[],
-            &[],
-            policy,
-            writing_tools(),
-            temp.path(),
+            RuntimeRegistryProjection {
+                mode: detached_mode(temp.path()),
+                tasks_dir_name: "tasks",
+                agent_catalog: &[],
+                model_ids: &[],
+                explore_policy: policy,
+                writing_tools: writing_tools(),
+                filesystem_root: temp.path(),
+            },
         )
         .unwrap();
         assert!(work.find_tool("bash").is_some());
@@ -6500,13 +6518,15 @@ mod runtime_capability_projection_tests {
     fn restricted_authority_fails_closed_for_write_only_mode() {
         assert!(registry_for_runtime_authority(
             ResourceAuthority::Restricted,
-            ConvMode::Direct,
-            "tasks",
-            &[],
-            &[],
-            ExploreToolPolicy::from_platform(&PlatformCapability::detect()),
-            writing_tools(),
-            std::path::Path::new("/tmp"),
+            RuntimeRegistryProjection {
+                mode: ConvMode::Direct,
+                tasks_dir_name: "tasks",
+                agent_catalog: &[],
+                model_ids: &[],
+                explore_policy: ExploreToolPolicy::from_platform(&PlatformCapability::detect()),
+                writing_tools: writing_tools(),
+                filesystem_root: std::path::Path::new("/tmp"),
+            },
         )
         .is_err());
     }
