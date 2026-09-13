@@ -182,7 +182,7 @@ pub async fn discover_models(config: &DiscoveryConfig) -> DiscoveredModels {
 pub async fn discover_codex_models(
     access_token: &str,
     account_id: Option<&str>,
-) -> Result<HashSet<String>, Box<dyn std::error::Error>> {
+) -> Result<HashSet<String>, reqwest::Error> {
     const CODEX_CATALOG_CONTRACT_VERSION: &str = "0.153.0";
     let url = format!(
         "https://chatgpt.com/backend-api/codex/models?client_version={CODEX_CATALOG_CONTRACT_VERSION}"
@@ -196,11 +196,7 @@ pub async fn discover_codex_models(
         request = request.header("chatgpt-account-id", account_id);
     }
 
-    let response = request.send().await?;
-    if !response.status().is_success() {
-        return Err(format!("Codex models endpoint returned {}", response.status()).into());
-    }
-
+    let response = request.send().await?.error_for_status()?;
     let models: CodexModelsResponse = response.json().await?;
     Ok(codex_model_slugs(models))
 }

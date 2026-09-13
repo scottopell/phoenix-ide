@@ -1,5 +1,6 @@
 //! Model registry for managing available LLM providers
 
+use super::codex_credential::AccountBoundCodexCredential;
 use super::{
     all_models, codex_credential, discover_models, merge_model_specs, parse_external_models,
     CodexCredential, DiscoveredModels, DiscoveryConfig, LlmService, LlmServiceImpl, LlmTransport,
@@ -837,19 +838,41 @@ impl ModelRegistry {
         })
     }
 
+    async fn fetch_codex_catalog(
+        credential: &Arc<CodexCredential>,
+    ) -> Option<(Option<HashSet<String>>, (String, Option<String>))> {
+        let mut identity = credential.get_with_account_id().await?;
+        match crate::discover_codex_models(&identity.0, identity.1.as_deref()).await {
+            Ok(models) => Some((Some(models), identity)),
+            Err(error) if error.status() == Some(reqwest::StatusCode::UNAUTHORIZED) => {
+                if !credential.invalidate().await {
+                    tracing::warn!(%error, "Codex model discovery rejected uncached credential");
+                    return Some((None, identity));
+                }
+                identity = credential.get_with_account_id().await?;
+                match crate::discover_codex_models(&identity.0, identity.1.as_deref()).await {
+                    Ok(models) => Some((Some(models), identity)),
+                    Err(error) => {
+                        tracing::warn!(%error, "Codex model discovery failed after credential refresh");
+                        Some((None, identity))
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Codex model discovery failed");
+                Some((None, identity))
+            }
+        }
+    }
+
     async fn discover_codex_catalog(config: &LlmConfig) -> Option<HashSet<String>> {
         let credential = config.codex_credential.as_ref()?;
         if !config.use_codex_auth {
             return None;
         }
-        let (access_token, account_id) = credential.get_with_account_id().await?;
-        match crate::discover_codex_models(&access_token, account_id.as_deref()).await {
-            Ok(models) => Some(models),
-            Err(error) => {
-                tracing::warn!(%error, "Codex model discovery failed; withholding account-scoped models");
-                None
-            }
-        }
+        Self::fetch_codex_catalog(credential)
+            .await
+            .and_then(|(models, _)| models)
     }
 
     fn codex_catalog_allows(spec: &super::ModelSpec, catalog: Option<&HashSet<String>>) -> bool {
@@ -898,15 +921,19 @@ impl ModelRegistry {
                 return None;
             }
             let cred = config.codex_credential.as_ref()?;
+            let bound_cred = Arc::new(AccountBoundCodexCredential::new(
+                Arc::clone(cred),
+                cred.account_id(),
+            ));
             let auth = LlmAuth::new(
-                Arc::clone(cred) as Arc<dyn CredentialSource>,
+                Arc::clone(&bound_cred) as Arc<dyn CredentialSource>,
                 AuthStyle::PlainBearer,
             );
             let service = Arc::new(LlmServiceImpl::new_with_codex_backend(
                 spec.clone(),
                 auth,
                 config.custom_headers.clone(),
-                Arc::clone(cred),
+                bound_cred,
             ));
             return Some(Arc::new(LoggingService::new(
                 service,
@@ -1369,20 +1396,9 @@ impl ModelRegistry {
         let Some((credential, _)) = cred_with_account.as_ref() else {
             return self.reload_codex_credential_snapshot(new_path, None, None);
         };
-        let Some(discovery_identity) = credential.get_with_account_id().await else {
+        let Some((catalog, discovery_identity)) = Self::fetch_codex_catalog(credential).await
+        else {
             return self.codex_reload_failure_outcome();
-        };
-        let catalog = match crate::discover_codex_models(
-            &discovery_identity.0,
-            discovery_identity.1.as_deref(),
-        )
-        .await
-        {
-            Ok(models) => Some(models),
-            Err(error) => {
-                tracing::warn!(%error, "Codex model discovery failed during credential reload; withholding account-scoped models");
-                None
-            }
         };
 
         let validation_path = new_path.clone();
@@ -1477,20 +1493,24 @@ impl ModelRegistry {
     ) -> CodexReloadOutcome {
         let mut new_codex_services: HashMap<String, Arc<dyn LlmService>> = HashMap::new();
         let mut new_codex_specs: HashMap<String, super::ModelSpec> = HashMap::new();
-        if let Some((cred, _)) = cred_with_account {
+        if let Some((cred, account_id)) = cred_with_account {
+            let bound_cred = Arc::new(AccountBoundCodexCredential::new(
+                Arc::clone(cred),
+                account_id.clone(),
+            ));
             for spec in Self::model_specs(&self.config) {
                 if !Self::codex_bridge_allows(&spec, codex_catalog) {
                     continue;
                 }
                 let auth = LlmAuth::new(
-                    Arc::clone(cred) as Arc<dyn CredentialSource>,
+                    Arc::clone(&bound_cred) as Arc<dyn CredentialSource>,
                     AuthStyle::PlainBearer,
                 );
                 let service = Arc::new(LlmServiceImpl::new_with_codex_backend(
                     spec.clone(),
                     auth,
                     self.config.custom_headers.clone(),
-                    Arc::clone(cred),
+                    Arc::clone(&bound_cred),
                 ));
                 new_codex_services.insert(
                     spec.id.clone(),

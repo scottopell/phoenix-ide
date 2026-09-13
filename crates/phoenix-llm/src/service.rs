@@ -1,11 +1,9 @@
 //! Unified LLM service implementation
 
+use super::codex_credential::AccountBoundCodexCredential;
 use super::models::{ApiFormat, ModelSpec};
 use super::types::{LlmRequest, LlmResponse};
-use super::{
-    anthropic, openai, CodexCredential, LlmAuth, LlmError, LlmService, TokenChunk,
-    CODEX_BACKEND_URL,
-};
+use super::{anthropic, openai, LlmAuth, LlmError, LlmService, TokenChunk, CODEX_BACKEND_URL};
 use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -87,11 +85,10 @@ pub struct LlmServiceImpl {
     /// `store: false` is set and a default `instructions` value is injected
     /// when the caller did not provide one.
     pub use_codex_backend: bool,
-    /// Concrete `CodexCredential` reference used to source the
-    /// `chatgpt-account-id` header per request — re-read each call so a
-    /// `codex login` against a different account during the session reaches
-    /// the wire instead of being pinned at registry build time.
-    pub codex_credential: Option<Arc<CodexCredential>>,
+    /// Account-bound Codex credential used for both the bearer token and the
+    /// `chatgpt-account-id` header. A file switch to another account fails
+    /// closed until registry reload publishes that account's catalog.
+    pub(crate) codex_credential: Option<Arc<AccountBoundCodexCredential>>,
     /// WebSocket continuation is shared by all calls through this service and
     /// isolated by the caller's prompt-cache cohort.
     attempt_deadline: LlmAttemptDeadline,
@@ -129,11 +126,12 @@ impl LlmServiceImpl {
     /// backend (codex bridge). The base URL is forced to `CODEX_BACKEND_URL`
     /// regardless of any `OPENAI_BASE_URL` setting; `Anthropic` URL fields are
     /// ignored on this path.
-    pub fn new_with_codex_backend(
+    #[must_use]
+    pub(crate) fn new_with_codex_backend(
         spec: ModelSpec,
         auth: LlmAuth,
         custom_headers: Vec<(String, String)>,
-        codex_credential: Arc<CodexCredential>,
+        codex_credential: Arc<AccountBoundCodexCredential>,
     ) -> Self {
         Self {
             spec,
@@ -238,7 +236,7 @@ impl LlmService for LlmServiceImpl {
     }
 
     fn continuation_request_limits(&self) -> super::ContinuationRequestLimits {
-        if self.use_codex_backend && self.spec.api_name.starts_with("gpt-5.6") {
+        if self.use_codex_backend && openai::supports_responses_lite(&self.spec.api_name) {
             super::ContinuationRequestLimits::codex_responses_lite()
         } else if self.use_codex_backend {
             super::ContinuationRequestLimits::codex_bridge()
@@ -250,9 +248,8 @@ impl LlmService for LlmServiceImpl {
 
 impl LlmServiceImpl {
     /// Build the custom headers for a request, auto-injecting `provider` based on the model spec.
-    /// When the codex bridge is in use, the live `chatgpt-account-id` is read
-    /// from the credential at every request so a mid-session account switch
-    /// (signing in with Codex from Phoenix) reaches the wire.
+    /// When the Codex bridge is in use, the account ID is pinned to the same
+    /// registry generation as its discovered model catalog.
     fn headers_for_provider(&self) -> Vec<(String, String)> {
         let mut headers = self.custom_headers.clone();
         if !headers.is_empty()
@@ -333,10 +330,9 @@ impl LlmServiceImpl {
         match self.spec.backend.api_format() {
             ApiFormat::Anthropic => {
                 let resolved = self.resolve_auth().await?;
-                // Build headers AFTER resolve so any per-request state the
-                // credential refresh updates (notably the codex account_id
-                // pulled from auth.json) is reflected in this request's
-                // headers, not the previous request's snapshot.
+                self.begin_provider_attempt(request, super::LlmTransport::HttpJson);
+                // Build headers after auth resolution so refresh state is
+                // reflected in this request's headers.
                 let headers = self.headers_for_provider();
                 anthropic::complete(
                     &self.spec,
@@ -779,6 +775,33 @@ mod tests {
                 .expect("service attempt is terminal")
                 .outcome,
             crate::LlmAttemptOutcome::AuthError
+        );
+    }
+
+    #[test]
+    fn astra_codex_continuation_reserves_responses_lite_prefix() {
+        let mut spec = all_models()
+            .into_iter()
+            .find(|spec| spec.id == "gpt-6-astra")
+            .expect("Astra spec");
+        spec.api_name = "gpt-6-astra".to_string();
+        let auth = LlmAuth::new(Arc::new(StaticCredential::new("k")), AuthStyle::PlainBearer);
+        let service = LlmServiceImpl {
+            spec,
+            auth,
+            anthropic_base_url: None,
+            openai_responses_base_url: Some(crate::CODEX_BACKEND_URL.to_string()),
+            openai_chat_completions_base_url: None,
+            custom_headers: Vec::new(),
+            request_tags: BTreeMap::new(),
+            use_codex_backend: true,
+            codex_credential: None,
+            codex_ws_sessions: Arc::new(Mutex::new(openai::CodexWsSessions::default())),
+        };
+
+        assert_eq!(
+            service.continuation_request_limits(),
+            crate::ContinuationRequestLimits::codex_responses_lite()
         );
     }
 
