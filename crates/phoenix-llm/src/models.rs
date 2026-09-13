@@ -163,6 +163,13 @@ const EFFORT_LEVELS_GPT_54: &[ModelEffort] = &[
     ModelEffort::High,
     ModelEffort::Xhigh,
 ];
+const EFFORT_LEVELS_GPT_6_ASTRA: &[ModelEffort] = &[
+    ModelEffort::Low,
+    ModelEffort::Medium,
+    ModelEffort::High,
+    ModelEffort::Xhigh,
+    ModelEffort::Max,
+];
 fn effort_anthropic_base() -> EffortCapabilities {
     EffortCapabilities::supported_known(EFFORT_LEVELS_ANTHROPIC_BASE, ModelEffort::High)
 }
@@ -177,6 +184,10 @@ fn effort_gpt_55_plus() -> EffortCapabilities {
 
 fn effort_gpt_54() -> EffortCapabilities {
     EffortCapabilities::supported_known(EFFORT_LEVELS_GPT_54, ModelEffort::None)
+}
+
+fn effort_gpt_6_astra() -> EffortCapabilities {
+    EffortCapabilities::supported_known(EFFORT_LEVELS_GPT_6_ASTRA, ModelEffort::Low)
 }
 
 /// Per-model metadata surfaced to API consumers (the `/api/models` response and
@@ -308,6 +319,12 @@ pub enum ModelSource {
     External,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexAvailability {
+    Established,
+    AccountCatalog,
+}
+
 /// Model specification with metadata
 #[derive(Debug, Clone)]
 pub struct ModelSpec {
@@ -339,14 +356,14 @@ pub struct ModelSpec {
     /// specs bypass the Codex bridge because their endpoint is operator-configured,
     /// not `ChatGPT`'s backend.
     pub source: ModelSource,
+    pub codex_availability: CodexAvailability,
     /// Route-aware effort capabilities. Built-in specs describe the native
     /// provider defaults, while external specs carry validated optional metadata
     /// when an operator knows the target route's support. When absent on an
     /// external model, Phoenix represents that absence honestly instead of
     /// fabricating unsupported/optional/native.
     pub effort_capabilities: EffortCapabilities,
-    /// Route-aware Codex fast-mode capability. Only built-in `OpenAI` Responses
-    /// models routed through the Codex bridge advertise support.
+    /// Route-aware Responses API fast-mode capability.
     pub service_tier_capabilities: ServiceTierCapabilities,
 }
 
@@ -389,7 +406,9 @@ impl ModelSpec {
         &self,
         service: &dyn crate::LlmService,
     ) -> ServiceTierCapabilities {
-        if service.uses_codex_bridge() {
+        if service.uses_codex_bridge()
+            || (self.api_name == "gpt-6-astra" && service.uses_official_openai_responses())
+        {
             self.service_tier_capabilities
         } else {
             ServiceTierCapabilities::Unsupported
@@ -557,6 +576,7 @@ fn external_model_spec_from_config(
         recommended: spec.recommended,
         supports_tool_search: spec.supports_tool_search,
         source: ModelSource::External,
+        codex_availability: CodexAvailability::Established,
         effort_capabilities,
         service_tier_capabilities: ServiceTierCapabilities::Unsupported,
     })
@@ -604,6 +624,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: true,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
+            codex_availability: CodexAvailability::Established,
             effort_capabilities: effort_anthropic_xhigh(),
             service_tier_capabilities: ServiceTierCapabilities::Unsupported,
         },
@@ -618,6 +639,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: false,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
+            codex_availability: CodexAvailability::Established,
             effort_capabilities: effort_anthropic_xhigh(),
             service_tier_capabilities: ServiceTierCapabilities::Unsupported,
         },
@@ -632,6 +654,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: false,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
+            codex_availability: CodexAvailability::Established,
             effort_capabilities: effort_anthropic_base(),
             service_tier_capabilities: ServiceTierCapabilities::Unsupported,
         },
@@ -646,6 +669,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: true,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
+            codex_availability: CodexAvailability::Established,
             effort_capabilities: effort_anthropic_xhigh(),
             service_tier_capabilities: ServiceTierCapabilities::Unsupported,
         },
@@ -660,6 +684,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: false,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
+            codex_availability: CodexAvailability::Established,
             effort_capabilities: effort_anthropic_base(),
             service_tier_capabilities: ServiceTierCapabilities::Unsupported,
         },
@@ -674,6 +699,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
+            codex_availability: CodexAvailability::Established,
             effort_capabilities: EffortCapabilities::unsupported(),
             service_tier_capabilities: ServiceTierCapabilities::Unsupported,
         },
@@ -683,6 +709,21 @@ pub fn all_models() -> Vec<ModelSpec> {
         // override is applied at registration time in `registry.rs` when the
         // bridge path is selected, so this spec's value reaches the runtime
         // only for direct/provider-compatible routes.
+        ModelSpec {
+            id: "gpt-6-astra".into(),
+            api_name: "gpt-6-astra".into(),
+            backend: ModelBackend::OpenAIResponses,
+            family: "OpenAI".into(),
+            description: "GPT-6 Astra (most capable)".into(),
+            context_window: 1_050_000,
+            max_output_tokens: Some(128_000),
+            recommended: true,
+            supports_tool_search: false,
+            source: ModelSource::BuiltIn,
+            codex_availability: CodexAvailability::AccountCatalog,
+            effort_capabilities: effort_gpt_6_astra(),
+            service_tier_capabilities: ServiceTierCapabilities::Supported,
+        },
         ModelSpec {
             id: "gpt-5.6-sol".into(),
             api_name: "gpt-5.6-sol".into(),
@@ -694,6 +735,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
+            codex_availability: CodexAvailability::Established,
             effort_capabilities: effort_gpt_55_plus(),
             service_tier_capabilities: ServiceTierCapabilities::Supported,
         },
@@ -708,6 +750,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
+            codex_availability: CodexAvailability::Established,
             effort_capabilities: effort_gpt_55_plus(),
             service_tier_capabilities: ServiceTierCapabilities::Supported,
         },
@@ -722,6 +765,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
+            codex_availability: CodexAvailability::Established,
             effort_capabilities: effort_gpt_55_plus(),
             service_tier_capabilities: ServiceTierCapabilities::Supported,
         },
@@ -736,6 +780,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
+            codex_availability: CodexAvailability::Established,
             effort_capabilities: effort_gpt_55_plus(),
             service_tier_capabilities: ServiceTierCapabilities::Supported,
         },
@@ -750,6 +795,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: false,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
+            codex_availability: CodexAvailability::Established,
             effort_capabilities: effort_gpt_54(),
             service_tier_capabilities: ServiceTierCapabilities::Supported,
         },
@@ -764,6 +810,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
+            codex_availability: CodexAvailability::Established,
             effort_capabilities: effort_gpt_54(),
             service_tier_capabilities: ServiceTierCapabilities::Unsupported,
         },
@@ -779,6 +826,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             recommended: false,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
+            codex_availability: CodexAvailability::Established,
             effort_capabilities: EffortCapabilities::unknown(),
             service_tier_capabilities: ServiceTierCapabilities::Unsupported,
         },
@@ -839,6 +887,18 @@ mod tests {
             by_id("claude-haiku-4-5").effort_capabilities,
             EffortCapabilities::Unsupported
         );
+        assert_eq!(
+            by_id("gpt-6-astra").effort_capabilities,
+            effort_gpt_6_astra()
+        );
+        assert_eq!(by_id("gpt-6-astra").context_window, 1_050_000);
+        assert_eq!(by_id("gpt-6-astra").output_token_limit(), Some(128_000));
+        assert!(by_id("gpt-6-astra")
+            .effort_capabilities
+            .supports(ModelEffort::Max));
+        assert!(!by_id("gpt-6-astra")
+            .effort_capabilities
+            .supports(ModelEffort::None));
         assert_eq!(
             by_id("gpt-5.6-sol").effort_capabilities,
             effort_gpt_55_plus()

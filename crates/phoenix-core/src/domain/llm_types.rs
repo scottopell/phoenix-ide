@@ -139,18 +139,18 @@ impl From<EffectiveServiceTier> for ServiceTier {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderRequestTier {
     Standard,
-    CodexFast,
+    Fast,
 }
 
 impl ProviderRequestTier {
     #[must_use]
     pub const fn from_effective_service_tier(
         tier: EffectiveServiceTier,
-        use_codex_backend: bool,
+        fast_supported: bool,
     ) -> Self {
-        match (tier, use_codex_backend) {
-            (EffectiveServiceTier::Fast, true) => Self::CodexFast,
-            (EffectiveServiceTier::Fast, false) | (EffectiveServiceTier::Standard, _) => {
+        match (tier, fast_supported) {
+            (EffectiveServiceTier::Fast, true) => Self::Fast,
+            (EffectiveServiceTier::Standard, _) | (EffectiveServiceTier::Fast, false) => {
                 Self::Standard
             }
         }
@@ -160,15 +160,15 @@ impl ProviderRequestTier {
     pub const fn as_service_tier(self) -> EffectiveServiceTier {
         match self {
             Self::Standard => EffectiveServiceTier::Standard,
-            Self::CodexFast => EffectiveServiceTier::Fast,
+            Self::Fast => EffectiveServiceTier::Fast,
         }
     }
 
     #[must_use]
-    pub const fn codex_request_value(self) -> Option<&'static str> {
+    pub const fn responses_request_value(self) -> Option<&'static str> {
         match self {
             Self::Standard => None,
-            Self::CodexFast => Some("priority"),
+            Self::Fast => Some("priority"),
         }
     }
 }

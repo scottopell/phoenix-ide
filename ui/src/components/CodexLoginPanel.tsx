@@ -237,10 +237,14 @@ function PkceFlow({
     };
   }, [start, onSuccess, onError]);
 
-  const handleCancel = useCallback(() => {
-    void api.codexPkceCancel(start.session_id);
-    onCancel();
-  }, [start, onCancel]);
+  const handleCancel = useCallback(async () => {
+    try {
+      const response = await api.codexPkceCancel(start.session_id);
+      if (response.cancelled) onCancel();
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e));
+    }
+  }, [start, onCancel, onError]);
 
   const handlePaste = useCallback(async () => {
     setSubmitting(true);
@@ -374,10 +378,15 @@ function DeviceFlow({
     };
   }, [start, onSuccess, onError]);
 
-  const handleCancel = useCallback(() => {
-    if (start) void api.codexDeviceCancel(start.session_id);
-    onCancel();
-  }, [start, onCancel]);
+  const handleCancel = useCallback(async () => {
+    if (!start) return;
+    try {
+      const response = await api.codexDeviceCancel(start.session_id);
+      if (response.cancelled) onCancel();
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e));
+    }
+  }, [start, onCancel, onError]);
 
   if (!start) {
     return <div className="codex-login-info">Requesting device code&hellip;</div>;

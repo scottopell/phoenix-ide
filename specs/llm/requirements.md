@@ -169,19 +169,19 @@ THE child conversation SHALL resolve its own model-native default from its selec
 
 ---
 
-### REQ-LLM-004g: Codex Fast Service Tier
+### REQ-LLM-004g: Fast Service Tier
 
-WHEN a conversation uses a built-in model routed through the ChatGPT/Codex bridge and that model advertises the Fast service tier
+WHEN a conversation uses a model and provider route that advertise the Fast service tier
 THE SYSTEM SHALL allow the user to select Standard or Fast independently of model reasoning effort
 AND SHALL disclose that Fast provides approximately 1.5x speed with increased usage
 
-WHEN Fast is selected for a supported Codex request
+WHEN Fast is selected for a supported Responses request
 THE SYSTEM SHALL send the provider-native `priority` service tier
 
 WHEN Standard is selected
 THE SYSTEM SHALL omit the service-tier field from the provider request
 
-WHEN the selected model or provider route does not support Codex Fast mode
+WHEN the selected model or provider route does not support Fast mode
 THE SYSTEM SHALL NOT advertise Fast capability
 AND SHALL reject an explicit attempt to enable Fast
 AND SHALL reset an inherited conversation selection to Standard when switching to that route
@@ -192,7 +192,25 @@ THE child conversation SHALL start with Standard service tier independently of t
 WHEN a conversation continues into a successor conversation
 THE successor SHALL preserve the parent's service-tier selection
 
-**Rationale:** Fast is a paid routing choice, not a model or reasoning-effort alias. Capability gating prevents Phoenix from claiming support on direct API-key and third-party routes, while independent subagent defaults avoid multiplying usage without an explicit child choice.
+**Rationale:** Fast is a paid routing choice, not a model or reasoning-effort alias. Capability gating prevents Phoenix from claiming support on routes whose model contract omits it, while independent subagent defaults avoid multiplying usage without an explicit child choice.
+
+---
+
+### REQ-LLM-004h: Account-Scoped Codex Model Availability
+
+WHEN a built-in model requires account-scoped Codex availability
+THE SYSTEM SHALL advertise and route that model through ChatGPT/Codex authentication only when the active account's model catalog lists its exact wire identifier
+
+WHEN Codex model discovery fails or the account catalog omits that model
+THE SYSTEM SHALL withhold that account-scoped model without suppressing established Codex models whose availability does not depend on that discovery
+
+WHEN direct OpenAI API authentication is configured
+THE SYSTEM SHALL determine direct model availability independently of the ChatGPT account catalog
+
+WHEN the active Codex credential changes while model discovery is in flight
+THE SYSTEM SHALL NOT publish the discovered catalog with a different account's credential
+
+**Rationale:** A global built-in catalog describes what Phoenix can speak, not what a particular ChatGPT account may use. Binding discovered availability to the credential identity prevents false picker choices and cross-account stale results while preserving direct API routing as a separate billing and authentication path.
 
 ---
 

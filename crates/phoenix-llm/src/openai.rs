@@ -35,6 +35,10 @@ fn resolve_endpoint(base_url_override: Option<&str>) -> String {
     )
 }
 
+pub(crate) fn is_official_responses_route(base_url_override: Option<&str>) -> bool {
+    base_url_override.is_none_or(|url| url == "https://api.openai.com/v1/responses")
+}
+
 fn resolve_chat_endpoint(base_url_override: Option<&str>) -> String {
     base_url_override.map_or_else(
         || "https://api.openai.com/v1/chat/completions".to_string(),
@@ -83,8 +87,12 @@ pub async fn complete(
             .attempt_capture
             .set_transport(crate::LlmTransport::HttpJson);
     }
-    let mut responses_request =
-        translate_to_backend_request(&spec.api_name, request, use_codex_backend);
+    let mut responses_request = translate_to_backend_request(
+        &spec.api_name,
+        request,
+        use_codex_backend,
+        use_codex_backend || is_official_responses_route(base_url_override),
+    );
     responses_request.set_tags(request_tags);
 
     let client = Client::builder()
@@ -1261,8 +1269,12 @@ pub async fn complete_streaming(
     ws_sessions: Option<&Arc<Mutex<CodexWsSessions>>>,
 ) -> Result<LlmResponse, LlmError> {
     let url = resolve_endpoint(base_url_override);
-    let mut responses_request =
-        translate_to_backend_request(&spec.api_name, request, use_codex_backend);
+    let mut responses_request = translate_to_backend_request(
+        &spec.api_name,
+        request,
+        use_codex_backend,
+        use_codex_backend || is_official_responses_route(base_url_override),
+    );
     responses_request.set_streaming();
     responses_request.set_tags(request_tags);
 
@@ -1444,6 +1456,7 @@ fn translate_to_responses_request(
     api_name: &str,
     request: &LlmRequest,
     use_codex_backend: bool,
+    official_openai_route: bool,
 ) -> ResponsesApiRequest {
     use super::types::ImageSource;
 
@@ -1630,7 +1643,8 @@ fn translate_to_responses_request(
         )
     };
 
-    let explicit_cache_supported = !use_codex_backend && supports_explicit_prompt_cache(api_name);
+    let explicit_cache_supported =
+        !use_codex_backend && official_openai_route && supports_explicit_prompt_cache(api_name);
     if explicit_cache_supported {
         place_explicit_cache_breakpoints(&mut input_items);
     }
@@ -1663,9 +1677,9 @@ fn translate_to_responses_request(
             .map(platform_reasoning),
         service_tier: ProviderRequestTier::from_effective_service_tier(
             request.service_tier,
-            use_codex_backend,
+            use_codex_backend || (official_openai_route && api_name == "gpt-6-astra"),
         )
-        .codex_request_value()
+        .responses_request_value()
         .map(str::to_string),
         // Match the explicit defaults Codex CLI and Pi send. `tool_choice`
         // mirrors the server-side default but stabilises the wire shape so
@@ -1716,8 +1730,10 @@ fn translate_to_backend_request(
     api_name: &str,
     request: &LlmRequest,
     use_codex_backend: bool,
+    official_openai_route: bool,
 ) -> ResponsesBackendRequest {
-    let platform = translate_to_responses_request(api_name, request, use_codex_backend);
+    let platform =
+        translate_to_responses_request(api_name, request, use_codex_backend, official_openai_route);
     if use_codex_backend && supports_responses_lite(api_name) {
         ResponsesBackendRequest::CodexLite(CodexResponsesLiteRequest::from_platform(platform))
     } else {
@@ -1725,12 +1741,16 @@ fn translate_to_backend_request(
     }
 }
 
+fn is_gpt_56_or_astra(api_name: &str) -> bool {
+    api_name == "gpt-5.6" || api_name.starts_with("gpt-5.6-") || api_name == "gpt-6-astra"
+}
+
 pub(crate) fn supports_responses_lite(api_name: &str) -> bool {
-    api_name == "gpt-5.6" || api_name.starts_with("gpt-5.6-")
+    is_gpt_56_or_astra(api_name)
 }
 
 fn supports_explicit_prompt_cache(api_name: &str) -> bool {
-    api_name == "gpt-5.6" || api_name.starts_with("gpt-5.6-")
+    is_gpt_56_or_astra(api_name)
 }
 
 /// Preserve `OpenAI`'s historical read boundaries while leaving the latest
@@ -3582,6 +3602,7 @@ mod tests {
             recommended: false,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
+            codex_availability: crate::CodexAvailability::Established,
             effort_capabilities: crate::EffortCapabilities::unknown(),
             service_tier_capabilities: crate::models::ServiceTierCapabilities::Unsupported,
         }
@@ -4431,6 +4452,7 @@ mod tests {
             "gpt-5.6-sol",
             &request,
             false,
+            true,
         ))
         .unwrap();
         assert!(native.get("reasoning").is_none());
@@ -4442,6 +4464,7 @@ mod tests {
             "gpt-5.6-sol",
             &request,
             false,
+            true,
         ))
         .unwrap();
         assert!(native_known.get("reasoning").is_none());
@@ -4452,6 +4475,7 @@ mod tests {
             "gpt-5.6-sol",
             &request,
             false,
+            true,
         ))
         .unwrap();
         assert_eq!(explicit["reasoning"]["effort"], "max");
@@ -4459,11 +4483,84 @@ mod tests {
     }
 
     #[test]
+    fn astra_fast_tier_serializes_on_direct_and_codex_routes() {
+        let mut request = empty_request();
+        request.service_tier = phoenix_core::domain::llm_types::EffectiveServiceTier::Fast;
+
+        let direct = serde_json::to_value(translate_to_responses_request(
+            "gpt-6-astra",
+            &request,
+            false,
+            true,
+        ))
+        .unwrap();
+        let codex = serde_json::to_value(translate_to_responses_request(
+            "gpt-6-astra",
+            &request,
+            true,
+            true,
+        ))
+        .unwrap();
+
+        assert_eq!(direct["service_tier"], "priority");
+        assert_eq!(codex["service_tier"], "priority");
+    }
+
+    #[test]
+    fn astra_explicit_cache_controls_are_omitted_on_custom_routes() {
+        let request = empty_request();
+
+        let custom = serde_json::to_value(translate_to_responses_request(
+            "gpt-6-astra",
+            &request,
+            false,
+            false,
+        ))
+        .unwrap();
+
+        assert!(custom.get("prompt_cache_options").is_none());
+    }
+
+    #[test]
+    fn astra_fast_tier_is_supported_on_explicit_canonical_route() {
+        assert!(is_official_responses_route(Some(
+            "https://api.openai.com/v1/responses"
+        )));
+    }
+
+    #[test]
+    fn astra_fast_tier_is_omitted_on_custom_responses_routes() {
+        let mut request = empty_request();
+        request.service_tier = phoenix_core::domain::llm_types::EffectiveServiceTier::Fast;
+
+        let custom = serde_json::to_value(translate_to_responses_request(
+            "gpt-6-astra",
+            &request,
+            false,
+            false,
+        ))
+        .unwrap();
+
+        assert!(custom.get("service_tier").is_none());
+    }
+
+    #[test]
+    fn astra_uses_responses_lite_only_on_the_codex_route() {
+        let request = empty_request();
+
+        let codex = translate_to_backend_request("gpt-6-astra", &request, true, true);
+        let platform = translate_to_backend_request("gpt-6-astra", &request, false, true);
+
+        assert!(matches!(codex, ResponsesBackendRequest::CodexLite(_)));
+        assert!(matches!(platform, ResponsesBackendRequest::Platform(_)));
+    }
+
+    #[test]
     fn codex_lite_composes_effort_with_reasoning_context() {
         let mut request = empty_request();
         request.effective_effort =
             phoenix_core::domain::llm_types::EffectiveEffort::explicit(ModelEffort::High);
-        let translated = translate_to_backend_request("gpt-5.6-sol", &request, true);
+        let translated = translate_to_backend_request("gpt-5.6-sol", &request, true, true);
         let json = serde_json::to_value(translated).unwrap();
 
         assert_eq!(json["reasoning"]["context"], "all_turns");
@@ -4564,7 +4661,7 @@ mod tests {
             }],
         }];
 
-        let translated = translate_to_responses_request("gpt-5.5", &req, false);
+        let translated = translate_to_responses_request("gpt-5.5", &req, false, true);
         let json = serde_json::to_value(&translated).unwrap();
         let parts = &json["input"][0]["output"];
 
@@ -4600,7 +4697,7 @@ mod tests {
             },
         ];
 
-        let translated = translate_to_responses_request("gpt-5.6-sol", &req, false);
+        let translated = translate_to_responses_request("gpt-5.6-sol", &req, false, true);
         let json = serde_json::to_value(&translated).unwrap();
         let input = json["input"].as_array().expect("input array");
 
@@ -4670,7 +4767,7 @@ mod tests {
             content: vec![ContentBlock::text("prepare continuation handoff")],
         });
 
-        let translated = translate_to_responses_request("gpt-5.5", &req, true);
+        let translated = translate_to_responses_request("gpt-5.5", &req, true, true);
         assert_eq!(translated.input.len(), history_cap + 1);
         assert!(
             translated.input.len() <= limits.max_input_items().unwrap(),
@@ -4698,7 +4795,7 @@ mod tests {
             content: vec![ContentBlock::text("prepare continuation handoff")],
         });
 
-        let translated = translate_to_backend_request("gpt-5.6-sol", &req, true);
+        let translated = translate_to_backend_request("gpt-5.6-sol", &req, true, true);
         let ResponsesBackendRequest::CodexLite(translated) = translated else {
             panic!("GPT-5.6 Codex must use Responses Lite");
         };
@@ -4708,7 +4805,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_request_tags_omitted_when_none() {
-        let req = translate_to_responses_request("gpt-5.5", &empty_request(), false);
+        let req = translate_to_responses_request("gpt-5.5", &empty_request(), false, true);
         let json = serde_json::to_value(&req).unwrap();
         assert!(
             json.get("tags").is_none(),
@@ -4901,7 +4998,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_request_tags_serialized_when_set() {
-        let mut req = translate_to_responses_request("gpt-5.5", &empty_request(), false);
+        let mut req = translate_to_responses_request("gpt-5.5", &empty_request(), false, true);
         let mut tags = BTreeMap::new();
         tags.insert("disable_data_logging".to_string(), "true".to_string());
         tags.insert("foo".to_string(), "bar".to_string());
@@ -5315,6 +5412,7 @@ mod tests {
             "gpt-5.6-2026-07-01",
             &request,
             false,
+            true,
         ))
         .unwrap();
         assert_eq!(wire["prompt_cache_options"]["mode"], "implicit");
@@ -5339,7 +5437,7 @@ mod tests {
 
         for (model, codex) in [("gpt-5.5", false), ("gpt-5.6", true)] {
             let legacy =
-                serde_json::to_value(translate_to_responses_request(model, &request, codex))
+                serde_json::to_value(translate_to_responses_request(model, &request, codex, true))
                     .unwrap();
             assert!(legacy.get("prompt_cache_options").is_none());
             assert!(!legacy.to_string().contains("prompt_cache_breakpoint"));
@@ -5356,8 +5454,10 @@ mod tests {
             });
         }
 
-        let wire = serde_json::to_value(translate_to_responses_request("gpt-5.6", &request, false))
-            .unwrap();
+        let wire = serde_json::to_value(translate_to_responses_request(
+            "gpt-5.6", &request, false, true,
+        ))
+        .unwrap();
         let input = wire["input"].as_array().unwrap();
         assert_eq!(
             wire.to_string().matches("prompt_cache_breakpoint").count(),
@@ -5399,8 +5499,10 @@ mod tests {
             content: vec![ContentBlock::text("latest")],
         });
 
-        let wire = serde_json::to_value(translate_to_responses_request("gpt-5.6", &request, false))
-            .unwrap();
+        let wire = serde_json::to_value(translate_to_responses_request(
+            "gpt-5.6", &request, false, true,
+        ))
+        .unwrap();
         assert_eq!(
             wire.to_string().matches("prompt_cache_breakpoint").count(),
             50,
@@ -5926,7 +6028,7 @@ pub(crate) mod test_helpers {
         api_name: &str,
         request: &crate::types::LlmRequest,
     ) -> ResponsesApiRequest {
-        super::translate_to_responses_request(api_name, request, false)
+        super::translate_to_responses_request(api_name, request, false, true)
     }
 
     pub fn translate_to_backend_request_wire(
@@ -5938,6 +6040,7 @@ pub(crate) mod test_helpers {
             api_name,
             request,
             use_codex_backend,
+            true,
         ))
         .expect("request serializes")
     }
@@ -5946,6 +6049,6 @@ pub(crate) mod test_helpers {
         api_name: &str,
         request: &crate::types::LlmRequest,
     ) -> ResponsesApiRequest {
-        super::translate_to_responses_request(api_name, request, true)
+        super::translate_to_responses_request(api_name, request, true, true)
     }
 }

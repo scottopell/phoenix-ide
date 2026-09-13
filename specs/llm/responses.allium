@@ -234,7 +234,7 @@ rule ResponsesEndpointResolved {
 rule CodexWebSocketContinuationSelected {
     when: SendCodexResponses(model, cache_key, request)
 
-    requires: starts_with(model, "gpt-5.6")
+    requires: starts_with(model, "gpt-5.6") or model = "gpt-6-astra"
 
     ensures:
         if CodexWebSocketSession.exists(
@@ -320,7 +320,7 @@ rule CodexWebSocketPoolBoundedAndCancellationSafe {
 rule CodexResponsesLitePrefixTranslated {
     when: TranslateCodexResponsesRequest(model, request)
 
-    requires: starts_with(model, "gpt-5.6")
+    requires: starts_with(model, "gpt-5.6") or model = "gpt-6-astra"
 
     ensures:
         CodexResponsesLiteRequest.created(

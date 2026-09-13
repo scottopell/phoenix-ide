@@ -57,7 +57,7 @@ pub use codex_credential::{
     CodexCredential, CODEX_BACKEND_URL, CODEX_BRIDGE_CONTEXT_WINDOW, CODEX_USAGE_URL,
 };
 pub use credential_helper::{CredentialHelper, CredentialStatus};
-pub use discovery::{discover_models, DiscoveredModels, DiscoveryConfig};
+pub use discovery::{discover_codex_models, discover_models, DiscoveredModels, DiscoveryConfig};
 pub use error::{LlmAttemptReason, LlmError, LlmErrorKind};
 // AutoRetryPolicy / UserResumePolicy live in phoenix-core
 // (phoenix_core::domain::retry_policy) and are not re-exported here: nothing
@@ -67,8 +67,8 @@ pub use error::{LlmAttemptReason, LlmError, LlmErrorKind};
 // and the executor mapper. CreditsSnapshot / RateLimitWindow live behind it,
 // accessed via the `rate_limit` submodule.
 pub use models::{
-    all_models, merge_model_specs, parse_external_models, EffortCapabilities, ModelBackend,
-    ModelInfo, ModelSource, ModelSpec, NativeDefault, DEFAULT_MAX_OUTPUT_TOKENS,
+    all_models, merge_model_specs, parse_external_models, CodexAvailability, EffortCapabilities,
+    ModelBackend, ModelInfo, ModelSource, ModelSpec, NativeDefault, DEFAULT_MAX_OUTPUT_TOKENS,
 };
 #[allow(unused_imports)]
 pub use rate_limit::{CreditsSnapshot, QuotaDetails, RateLimitWindow};
@@ -188,6 +188,10 @@ pub trait LlmService: Send + Sync {
     /// bridge's 272K cap regardless of the model's platform-API ceiling.
     /// Default `false` covers Anthropic, mock, and direct `OpenAI`.
     fn uses_codex_bridge(&self) -> bool {
+        false
+    }
+
+    fn uses_official_openai_responses(&self) -> bool {
         false
     }
 
@@ -506,6 +510,10 @@ impl LlmService for LoggingService {
 
     fn uses_codex_bridge(&self) -> bool {
         self.inner.uses_codex_bridge()
+    }
+
+    fn uses_official_openai_responses(&self) -> bool {
+        self.inner.uses_official_openai_responses()
     }
 
     fn continuation_request_limits(&self) -> ContinuationRequestLimits {

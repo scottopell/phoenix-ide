@@ -147,12 +147,17 @@ struct DeviceSession {
 pub struct CodexLoginManager {
     pkce: Mutex<HashMap<String, Arc<PkceSession>>>,
     device: Mutex<HashMap<String, Arc<DeviceSession>>>,
+    publication_gate: Arc<Mutex<()>>,
     lifecycle: Mutex<()>,
 }
 
 impl CodexLoginManager {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    pub async fn lock_publication(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.publication_gate.lock().await
     }
 }
 
@@ -354,10 +359,13 @@ pub async fn pkce_start(
                 cancel_for_task,
                 loopback,
                 manual_rx,
-                expected_state,
-                verifier,
-                redirect_uri,
-                login_target,
+                PkceDriveConfig {
+                    expected_state,
+                    verifier,
+                    redirect_uri,
+                    login_target,
+                    publication_gate: Arc::clone(&mgr_for_task.publication_gate),
+                },
             )
             .await;
             settle_pkce(
@@ -383,15 +391,27 @@ pub async fn pkce_start(
     }))
 }
 
-async fn drive_pkce(
-    cancel: CancellationToken,
-    loopback: Option<LoopbackServer>,
-    manual_rx: oneshot::Receiver<ManualCallback>,
+struct PkceDriveConfig {
     expected_state: String,
     verifier: String,
     redirect_uri: String,
     login_target: PathBuf,
-) -> Result<LoginResult, LoginError> {
+    publication_gate: Arc<Mutex<()>>,
+}
+
+async fn drive_pkce(
+    cancel: CancellationToken,
+    loopback: Option<LoopbackServer>,
+    manual_rx: oneshot::Receiver<ManualCallback>,
+    config: PkceDriveConfig,
+) -> Result<(LoginResult, tokio::sync::OwnedMutexGuard<()>), LoginError> {
+    let PkceDriveConfig {
+        expected_state,
+        verifier,
+        redirect_uri,
+        login_target,
+        publication_gate,
+    } = config;
     // Race the loopback callback against the manual-paste channel and the
     // user-cancellation token. `biased` makes cancel preempt deterministically
     // when multiple branches ready simultaneously — we never want to hand a
@@ -459,18 +479,19 @@ async fn drive_pkce(
         r = exchange_pkce_code(ISSUER_BASE, CLIENT_ID, &redirect_uri, &verifier, &code) => r?,
     };
 
+    let publication = publication_gate.lock_owned().await;
     if cancel.is_cancelled() {
         return Err(LoginError::Cancelled);
     }
 
-    finalize_login(&login_target, tokens)
+    finalize_login(&login_target, tokens).map(|result| (result, publication))
 }
 
 async fn settle_pkce(
     mgr: &Arc<CodexLoginManager>,
     llm_registry: &Arc<phoenix_llm::ModelRegistry>,
     session_id: &str,
-    outcome: Result<LoginResult, LoginError>,
+    outcome: Result<(LoginResult, tokio::sync::OwnedMutexGuard<()>), LoginError>,
 ) {
     let session = {
         let sessions = mgr.pkce.lock().await;
@@ -482,15 +503,13 @@ async fn settle_pkce(
     // `kind: success` as "the bridge is live now" and may immediately fire
     // an OpenAI request — that request must hit the new credential, not the
     // pre-login state.
-    if outcome.is_ok() {
-        let registry = llm_registry.clone();
-        tokio::task::spawn_blocking(move || registry.reload_codex_credential())
-            .await
-            .ok();
-    }
-    {
-        let mut inner = session.inner.lock().await;
-        inner.status.outcome = Some(outcome);
+    match outcome {
+        Ok((result, publication)) => {
+            llm_registry.reload_codex_credential().await;
+            session.inner.lock().await.status.outcome = Some(Ok(result));
+            drop(publication);
+        }
+        Err(error) => session.inner.lock().await.status.outcome = Some(Err(error)),
     }
     schedule_pkce_sweep(mgr.clone(), session_id.to_string());
 }
@@ -685,10 +704,15 @@ pub async fn pkce_cancel(
         let sessions = mgr.pkce.lock().await;
         sessions.get(&session_id).cloned()
     };
-    if let Some(session) = session {
-        session.cancel.cancel();
-    }
-    Json(serde_json::json!({ "ok": true }))
+    let _publication = mgr.publication_gate.lock().await;
+    let cancelled = match session {
+        Some(session) if session.inner.lock().await.status.outcome.is_none() => {
+            session.cancel.cancel();
+            true
+        }
+        _ => false,
+    };
+    Json(serde_json::json!({ "ok": true, "cancelled": cancelled }))
 }
 
 // ---------------------------------------------------------------------------
@@ -760,7 +784,13 @@ pub async fn device_start(
                 .expect("device session inserted")
         };
         tokio::spawn(async move {
-            let outcome = drive_device_code(cancel, device, login_target).await;
+            let outcome = drive_device_code(
+                cancel,
+                device,
+                login_target,
+                Arc::clone(&mgr_for_task.publication_gate),
+            )
+            .await;
             settle_device(
                 &mgr_for_task,
                 &registry_for_task,
@@ -782,7 +812,8 @@ async fn drive_device_code(
     cancel: CancellationToken,
     device: DeviceCode,
     login_target: PathBuf,
-) -> Result<LoginResult, LoginError> {
+    publication_gate: Arc<Mutex<()>>,
+) -> Result<(LoginResult, tokio::sync::OwnedMutexGuard<()>), LoginError> {
     // Race the long polling loop against user cancellation. Without this,
     // pressing Cancel only deletes the session record while the poll keeps
     // running — and if the user has already (or subsequently) completes the
@@ -793,17 +824,18 @@ async fn drive_device_code(
         () = cancel.cancelled() => return Err(LoginError::Cancelled),
         r = poll_device_code(&device) => r?,
     };
+    let publication = publication_gate.lock_owned().await;
     if cancel.is_cancelled() {
         return Err(LoginError::Cancelled);
     }
-    finalize_login(&login_target, tokens)
+    finalize_login(&login_target, tokens).map(|result| (result, publication))
 }
 
 async fn settle_device(
     mgr: &Arc<CodexLoginManager>,
     llm_registry: &Arc<phoenix_llm::ModelRegistry>,
     session_id: &str,
-    outcome: Result<LoginResult, LoginError>,
+    outcome: Result<(LoginResult, tokio::sync::OwnedMutexGuard<()>), LoginError>,
 ) {
     let session = {
         let sessions = mgr.device.lock().await;
@@ -818,15 +850,13 @@ async fn settle_device(
         );
     }
     // Reload before publishing status — see settle_pkce for the rationale.
-    if outcome.is_ok() {
-        let registry = llm_registry.clone();
-        tokio::task::spawn_blocking(move || registry.reload_codex_credential())
-            .await
-            .ok();
-    }
-    {
-        let mut status = session.status.lock().await;
-        status.outcome = Some(outcome);
+    match outcome {
+        Ok((result, publication)) => {
+            llm_registry.reload_codex_credential().await;
+            session.status.lock().await.outcome = Some(Ok(result));
+            drop(publication);
+        }
+        Err(error) => session.status.lock().await.outcome = Some(Err(error)),
     }
     schedule_device_sweep(mgr.clone(), session_id.to_string());
 }
@@ -873,10 +903,15 @@ pub async fn device_cancel(
         let sessions = mgr.device.lock().await;
         sessions.get(&session_id).cloned()
     };
-    if let Some(session) = session {
-        session.cancel.cancel();
-    }
-    Json(serde_json::json!({ "ok": true }))
+    let _publication = mgr.publication_gate.lock().await;
+    let cancelled = match session {
+        Some(session) if session.status.lock().await.outcome.is_none() => {
+            session.cancel.cancel();
+            true
+        }
+        _ => false,
+    };
+    Json(serde_json::json!({ "ok": true, "cancelled": cancelled }))
 }
 
 // ---------------------------------------------------------------------------
@@ -960,6 +995,7 @@ async fn fetch_codex_quota(
 }
 
 pub async fn codex_quota(State(state): State<AppState>) -> Json<Option<phoenix_llm::QuotaDetails>> {
+    let _publication = state.codex_login.lock_publication().await;
     let quota = match state.llm_registry.current_codex_credential() {
         Some(credential) => fetch_codex_quota(credential.as_ref())
             .await
@@ -1021,10 +1057,7 @@ pub async fn signout(State(state): State<AppState>) -> Json<serde_json::Value> {
         Ok(()) => true,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
         Err(e) => {
-            let registry = state.llm_registry.clone();
-            let restored = tokio::task::spawn_blocking(move || registry.reload_codex_credential())
-                .await
-                .ok();
+            let restored = Some(state.llm_registry.reload_codex_credential().await);
             tracing::warn!(error = %e, path = %auth_path.display(),
                 credential_restored = restored.as_ref().is_some_and(|o| o.credential_loaded),
                 "codex_login: signout failed to remove auth file");
@@ -1034,10 +1067,7 @@ pub async fn signout(State(state): State<AppState>) -> Json<serde_json::Value> {
             }));
         }
     };
-    let registry = state.llm_registry.clone();
-    let outcome = tokio::task::spawn_blocking(move || registry.reload_codex_credential())
-        .await
-        .ok();
+    let outcome = Some(state.llm_registry.reload_codex_credential().await);
     tracing::info!(
         removed,
         drained_pkce_sessions = drained,
@@ -1148,9 +1178,14 @@ mod tests {
             client_id: "client".into(),
         };
 
-        let err = drive_device_code(cancel, device, std::path::PathBuf::from("/dev/null"))
-            .await
-            .unwrap_err();
+        let err = drive_device_code(
+            cancel,
+            device,
+            std::path::PathBuf::from("/dev/null"),
+            Arc::new(Mutex::new(())),
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(err, LoginError::Cancelled),
             "expected Cancelled, got {err:?}"

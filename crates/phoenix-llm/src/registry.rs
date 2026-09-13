@@ -1,9 +1,10 @@
 //! Model registry for managing available LLM providers
 
+use super::codex_credential::AccountBoundCodexCredential;
 use super::{
     all_models, codex_credential, discover_models, merge_model_specs, parse_external_models,
-    CodexCredential, DiscoveredModels, DiscoveryConfig, LlmService, LlmServiceImpl, LlmTransport,
-    LoggingService, ModelBackend, ModelInfo, ModelSource,
+    CodexAvailability, CodexCredential, DiscoveredModels, DiscoveryConfig, LlmService,
+    LlmServiceImpl, LlmTransport, LoggingService, ModelBackend, ModelInfo, ModelSource,
 };
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use std::collections::{HashMap, HashSet};
@@ -541,6 +542,7 @@ pub struct ModelRegistry {
     /// in lockstep with the `OpenAI` bridge services.
     current_codex_loaded_path: std::sync::RwLock<Option<std::path::PathBuf>>,
     current_codex_credential: std::sync::RwLock<Option<Arc<CodexCredential>>>,
+    codex_reload: tokio::sync::Mutex<()>,
     /// Config template kept for rebuilding bridge services on reload. The
     /// `codex_credential` / `codex_credential_path` fields are ignored on
     /// reload — we always re-resolve those from the filesystem.
@@ -559,18 +561,24 @@ impl ModelRegistry {
             codex_bridge_loaded_at_startup: false,
             current_codex_loaded_path: std::sync::RwLock::new(None),
             current_codex_credential: std::sync::RwLock::new(None),
+            codex_reload: tokio::sync::Mutex::new(()),
             config: Arc::new(LlmConfig::default()),
         }
     }
 
     #[must_use]
     pub fn new(config: &LlmConfig) -> Self {
+        Self::new_with_codex_catalog(config, None)
+    }
+
+    fn new_with_codex_catalog(config: &LlmConfig, codex_catalog: Option<&HashSet<String>>) -> Self {
         let mut services: HashMap<String, Arc<dyn LlmService>> = HashMap::new();
         let mut specs: HashMap<String, super::ModelSpec> = HashMap::new();
 
-        // Try to create each model from the centralized definitions plus valid external additions.
         for spec in Self::model_specs(config) {
-            if let Some(service) = Self::try_create_model(&spec, config) {
+            if let Some(service) =
+                Self::try_create_model_with_codex_catalog(&spec, config, codex_catalog)
+            {
                 services.insert(spec.id.clone(), service);
                 specs.insert(spec.id.clone(), spec);
             }
@@ -585,6 +593,7 @@ impl ModelRegistry {
             codex_bridge_loaded_at_startup: config.codex_credential.is_some(),
             current_codex_loaded_path: std::sync::RwLock::new(config.codex_credential_path.clone()),
             current_codex_credential: std::sync::RwLock::new(config.codex_credential.clone()),
+            codex_reload: tokio::sync::Mutex::new(()),
             config: Arc::new(config.clone()),
         }
     }
@@ -599,6 +608,7 @@ impl ModelRegistry {
             "claude-sonnet-5",
             "claude-sonnet-4-6",
             "claude-sonnet-4-5",
+            "gpt-6-astra",
             "gpt-5.6-sol",
             "gpt-5.6-luna",
             "gpt-5.6-terra",
@@ -635,7 +645,8 @@ impl ModelRegistry {
     /// to the configured model list if discovery is unavailable or unhelpful.
     pub async fn new_with_discovery(config: &LlmConfig) -> Self {
         let Some(discovery) = Self::build_discovery_config(config).await else {
-            return Self::new(config);
+            let codex_catalog = Self::discover_codex_catalog(config).await;
+            return Self::new_with_codex_catalog(config, codex_catalog.as_ref());
         };
 
         tracing::info!("Discovering models from configured base URL endpoints");
@@ -645,11 +656,13 @@ impl ModelRegistry {
             tracing::warn!(
                 "Model discovery returned no models, falling back to configured model list"
             );
-            return Self::new(config);
+            let codex_catalog = Self::discover_codex_catalog(config).await;
+            return Self::new_with_codex_catalog(config, codex_catalog.as_ref());
         }
 
         tracing::info!("Discovered {} models", discovered.len());
 
+        let codex_catalog = Self::discover_codex_catalog(config).await;
         let configured_specs = Self::model_specs(config);
         let fallback_backends = Self::discovery_fallback_backends(&configured_specs, &discovered);
 
@@ -668,7 +681,9 @@ impl ModelRegistry {
             if should_filter && !listed_backend_match {
                 continue;
             }
-            if let Some(service) = Self::try_create_model(&spec, config) {
+            if let Some(service) =
+                Self::try_create_model_with_codex_catalog(&spec, config, codex_catalog.as_ref())
+            {
                 services.insert(spec.id.clone(), service);
                 specs.insert(spec.id.clone(), spec);
             }
@@ -679,7 +694,7 @@ impl ModelRegistry {
                 discovered = discovered.len(),
                 "No configured known models found in discovery; falling back to configured model list"
             );
-            return Self::new(config);
+            return Self::new_with_codex_catalog(config, codex_catalog.as_ref());
         }
 
         tracing::info!("Registered {} discovered configured models", services.len());
@@ -693,6 +708,7 @@ impl ModelRegistry {
             codex_bridge_loaded_at_startup: config.codex_credential.is_some(),
             current_codex_loaded_path: std::sync::RwLock::new(config.codex_credential_path.clone()),
             current_codex_credential: std::sync::RwLock::new(config.codex_credential.clone()),
+            codex_reload: tokio::sync::Mutex::new(()),
             config: Arc::new(config.clone()),
         }
     }
@@ -824,10 +840,71 @@ impl ModelRegistry {
         })
     }
 
-    /// Try to create a model service, validating prerequisites
-    fn try_create_model(
+    async fn fetch_codex_catalog(
+        credential: &Arc<CodexCredential>,
+    ) -> Option<(Option<HashSet<String>>, (String, Option<String>))> {
+        let mut identity = credential.get_with_account_id().await?;
+        if identity.1.is_none() {
+            tracing::warn!("Codex account ID is unavailable; withholding account-scoped models");
+            return Some((None, identity));
+        }
+        match crate::discover_codex_models(&identity.0, identity.1.as_deref()).await {
+            Ok(models) => Some((Some(models), identity)),
+            Err(error) if error.status() == Some(reqwest::StatusCode::UNAUTHORIZED) => {
+                if !credential.invalidate().await {
+                    tracing::warn!(%error, "Codex model discovery rejected uncached credential");
+                    return Some((None, identity));
+                }
+                identity = credential.get_with_account_id().await?;
+                if identity.1.is_none() {
+                    tracing::warn!("Refreshed Codex credential has no account ID; withholding account-scoped models");
+                    return Some((None, identity));
+                }
+                match crate::discover_codex_models(&identity.0, identity.1.as_deref()).await {
+                    Ok(models) => Some((Some(models), identity)),
+                    Err(error) => {
+                        tracing::warn!(%error, "Codex model discovery failed after credential refresh");
+                        Some((None, identity))
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Codex model discovery failed");
+                Some((None, identity))
+            }
+        }
+    }
+
+    async fn discover_codex_catalog(config: &LlmConfig) -> Option<HashSet<String>> {
+        let credential = config.codex_credential.as_ref()?;
+        if !config.use_codex_auth {
+            return None;
+        }
+        Self::fetch_codex_catalog(credential)
+            .await
+            .and_then(|(models, _)| models)
+    }
+
+    fn codex_catalog_allows(spec: &super::ModelSpec, catalog: Option<&HashSet<String>>) -> bool {
+        match spec.codex_availability {
+            CodexAvailability::Established => true,
+            CodexAvailability::AccountCatalog => {
+                catalog.is_some_and(|models| models.contains(&spec.api_name))
+            }
+        }
+    }
+
+    fn codex_bridge_allows(spec: &super::ModelSpec, catalog: Option<&HashSet<String>>) -> bool {
+        spec.backend == ModelBackend::OpenAIResponses
+            && spec.source == ModelSource::BuiltIn
+            && Self::codex_catalog_allows(spec, catalog)
+    }
+
+    /// Try to create a model service, validating prerequisites.
+    fn try_create_model_with_codex_catalog(
         spec: &super::ModelSpec,
         config: &LlmConfig,
+        codex_catalog: Option<&HashSet<String>>,
     ) -> Option<Arc<dyn LlmService>> {
         // Mock provider: opt-in only via PHOENIX_ENABLE_MOCK_MODEL=1
         if spec.backend == ModelBackend::Mock {
@@ -854,16 +931,24 @@ impl ModelRegistry {
             && spec.backend == ModelBackend::OpenAIResponses
             && spec.source == ModelSource::BuiltIn
         {
+            if !Self::codex_catalog_allows(spec, codex_catalog) {
+                tracing::debug!(model = %spec.id, "withholding account-scoped Codex model absent from the discovered catalog");
+                return None;
+            }
             let cred = config.codex_credential.as_ref()?;
+            let bound_cred = Arc::new(AccountBoundCodexCredential::new(
+                Arc::clone(cred),
+                cred.account_id(),
+            ));
             let auth = LlmAuth::new(
-                Arc::clone(cred) as Arc<dyn CredentialSource>,
+                Arc::clone(&bound_cred) as Arc<dyn CredentialSource>,
                 AuthStyle::PlainBearer,
             );
             let service = Arc::new(LlmServiceImpl::new_with_codex_backend(
                 spec.clone(),
                 auth,
                 config.custom_headers.clone(),
-                Arc::clone(cred),
+                bound_cred,
             ));
             return Some(Arc::new(LoggingService::new(
                 service,
@@ -1183,6 +1268,7 @@ impl ModelRegistry {
             codex_bridge_loaded_at_startup: false,
             current_codex_loaded_path: std::sync::RwLock::new(None),
             current_codex_credential: std::sync::RwLock::new(None),
+            codex_reload: tokio::sync::Mutex::new(()),
             config: Arc::new(LlmConfig::default()),
         }
     }
@@ -1294,10 +1380,70 @@ impl ModelRegistry {
     /// `current_codex_loaded_path` for the duration. Concurrent `get()` /
     /// `available_models()` callers either see the prior state or the new
     /// state — never a torn map.
-    pub fn reload_codex_credential(&self) -> CodexReloadOutcome {
-        self.reload_codex_credential_with(codex_credential::resolve_active_auth_path(
-            &self.config.runtime_env,
-        ))
+    pub async fn reload_codex_credential(&self) -> CodexReloadOutcome {
+        let _reload = self.codex_reload.lock().await;
+        let runtime_env = self.config.runtime_env.clone();
+        let snapshot = tokio::task::spawn_blocking(move || {
+            let path = codex_credential::resolve_active_auth_path(&runtime_env);
+            let credential = path
+                .as_ref()
+                .map(|path| CodexCredential::load(path.clone()));
+            (path, credential)
+        })
+        .await;
+
+        let (new_path, credential) = match snapshot {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!(%error, "Codex credential snapshot task failed; preserving prior bridge state");
+                return self.codex_reload_failure_outcome();
+            }
+        };
+        let cred_with_account = match credential {
+            Some(Ok(credential)) => Some(credential),
+            Some(Err(error)) => {
+                tracing::warn!(%error, "Codex credential snapshot failed; preserving prior bridge state");
+                return self.codex_reload_failure_outcome();
+            }
+            None => None,
+        };
+
+        let Some((credential, _)) = cred_with_account.as_ref() else {
+            return self.reload_codex_credential_snapshot(new_path, None, None);
+        };
+        let Some((catalog, discovery_identity)) = Self::fetch_codex_catalog(credential).await
+        else {
+            return self.codex_reload_failure_outcome();
+        };
+
+        let validation_path = new_path.clone();
+        let validation =
+            tokio::task::spawn_blocking(move || validation_path.map(CodexCredential::load)).await;
+        let validated_credential = match validation {
+            Ok(Some(Ok(credential))) => credential,
+            Ok(None) => return self.codex_reload_failure_outcome(),
+            Ok(Some(Err(error))) => {
+                tracing::warn!(%error, "Codex credential changed during model discovery; preserving prior bridge state");
+                return self.codex_reload_failure_outcome();
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Codex credential validation task failed; preserving prior bridge state");
+                return self.codex_reload_failure_outcome();
+            }
+        };
+        let Some(validated_identity) = validated_credential.0.get_with_account_id().await else {
+            return self.codex_reload_failure_outcome();
+        };
+        if validated_identity != discovery_identity {
+            tracing::warn!("Codex credential identity changed during model discovery; preserving prior bridge state");
+            return self.codex_reload_failure_outcome();
+        }
+
+        self.reload_codex_credential_snapshot(
+            new_path,
+            Some(&validated_credential),
+            catalog.as_ref(),
+        )
     }
 
     /// Same as [`Self::reload_codex_credential`] but accepts an explicit
@@ -1338,27 +1484,48 @@ impl ModelRegistry {
             },
             None => None,
         };
+        self.reload_codex_credential_snapshot(new_path, cred_with_account.as_ref(), None)
+    }
 
-        // Rebuild the OpenAI bridge services off-lock so the write window is
-        // short. Build into a separate map; we'll merge under lock.
+    fn codex_reload_failure_outcome(&self) -> CodexReloadOutcome {
+        let prior_path = self
+            .current_codex_loaded_path
+            .read()
+            .ok()
+            .and_then(|path| path.clone());
+        CodexReloadOutcome {
+            previous_path: prior_path.clone(),
+            current_path: prior_path,
+            credential_loaded: false,
+        }
+    }
+
+    fn reload_codex_credential_snapshot(
+        &self,
+        new_path: Option<std::path::PathBuf>,
+        cred_with_account: Option<&(Arc<CodexCredential>, Option<String>)>,
+        codex_catalog: Option<&HashSet<String>>,
+    ) -> CodexReloadOutcome {
         let mut new_codex_services: HashMap<String, Arc<dyn LlmService>> = HashMap::new();
         let mut new_codex_specs: HashMap<String, super::ModelSpec> = HashMap::new();
-        if let Some((cred, _)) = cred_with_account.as_ref() {
+        if let Some((cred, account_id)) = cred_with_account {
+            let bound_cred = Arc::new(AccountBoundCodexCredential::new(
+                Arc::clone(cred),
+                account_id.clone(),
+            ));
             for spec in Self::model_specs(&self.config) {
-                if spec.backend != ModelBackend::OpenAIResponses
-                    || spec.source != ModelSource::BuiltIn
-                {
+                if !Self::codex_bridge_allows(&spec, codex_catalog) {
                     continue;
                 }
                 let auth = LlmAuth::new(
-                    Arc::clone(cred) as Arc<dyn CredentialSource>,
+                    Arc::clone(&bound_cred) as Arc<dyn CredentialSource>,
                     AuthStyle::PlainBearer,
                 );
                 let service = Arc::new(LlmServiceImpl::new_with_codex_backend(
                     spec.clone(),
                     auth,
                     self.config.custom_headers.clone(),
-                    Arc::clone(cred),
+                    Arc::clone(&bound_cred),
                 ));
                 new_codex_services.insert(
                     spec.id.clone(),
@@ -1407,9 +1574,7 @@ impl ModelRegistry {
 
             let prev = current_path.clone();
             current_path.clone_from(&new_path);
-            *current_credential = cred_with_account
-                .as_ref()
-                .map(|(credential, _)| Arc::clone(credential));
+            *current_credential = cred_with_account.map(|(credential, _)| Arc::clone(credential));
             if let Ok(mut default_model) = self.default_model.write() {
                 *default_model = Self::pick_default_model(&services, &self.config);
             }
@@ -1513,6 +1678,55 @@ mod tests {
     #[test]
     fn codex_bridge_transport_is_websocket_across_registration_paths() {
         assert_eq!(codex_bridge_transport(), LlmTransport::Websocket);
+    }
+
+    #[test]
+    fn astra_codex_registration_requires_account_catalog_membership() {
+        let spec = all_models()
+            .into_iter()
+            .find(|spec| spec.id == "gpt-6-astra")
+            .expect("Astra spec");
+        let absent = HashSet::from(["gpt-5.6-sol".to_string()]);
+        let present = HashSet::from(["gpt-6-astra".to_string()]);
+
+        assert!(!ModelRegistry::codex_catalog_allows(&spec, None));
+        assert!(!ModelRegistry::codex_catalog_allows(&spec, Some(&absent)));
+        assert!(ModelRegistry::codex_catalog_allows(&spec, Some(&present)));
+    }
+
+    #[test]
+    fn established_codex_models_remain_available_without_catalog_discovery() {
+        let spec = all_models()
+            .into_iter()
+            .find(|spec| spec.id == "gpt-5.6-sol")
+            .expect("GPT-5.6 Sol spec");
+
+        assert!(ModelRegistry::codex_catalog_allows(&spec, None));
+    }
+
+    #[test]
+    fn astra_registration_is_independent_across_direct_and_codex_routes() {
+        let direct = ModelRegistry::new(&LlmConfig {
+            openai_api_key: Some("test-key".to_string()),
+            ..Default::default()
+        });
+        assert!(direct.get("gpt-6-astra").is_some());
+        assert_eq!(direct.context_window("gpt-6-astra"), 1_050_000);
+
+        let dir = tempfile::tempdir().unwrap();
+        let codex_config = LlmConfig {
+            use_codex_auth: true,
+            codex_credential: Some(fake_codex_credential(&dir)),
+            ..Default::default()
+        };
+        let absent = ModelRegistry::new_with_codex_catalog(&codex_config, Some(&HashSet::new()));
+        assert!(absent.get("gpt-6-astra").is_none());
+        assert!(absent.get("gpt-5.6-sol").is_some());
+
+        let catalog = HashSet::from(["gpt-6-astra".to_string()]);
+        let present = ModelRegistry::new_with_codex_catalog(&codex_config, Some(&catalog));
+        assert!(present.get("gpt-6-astra").is_some());
+        assert_eq!(present.context_window("gpt-6-astra"), 272_000);
     }
 
     #[test]

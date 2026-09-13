@@ -1,11 +1,9 @@
 //! Unified LLM service implementation
 
+use super::codex_credential::AccountBoundCodexCredential;
 use super::models::{ApiFormat, ModelSpec};
 use super::types::{LlmRequest, LlmResponse};
-use super::{
-    anthropic, openai, CodexCredential, LlmAuth, LlmError, LlmService, TokenChunk,
-    CODEX_BACKEND_URL,
-};
+use super::{anthropic, openai, LlmAuth, LlmError, LlmService, TokenChunk, CODEX_BACKEND_URL};
 use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -87,11 +85,10 @@ pub struct LlmServiceImpl {
     /// `store: false` is set and a default `instructions` value is injected
     /// when the caller did not provide one.
     pub use_codex_backend: bool,
-    /// Concrete `CodexCredential` reference used to source the
-    /// `chatgpt-account-id` header per request — re-read each call so a
-    /// `codex login` against a different account during the session reaches
-    /// the wire instead of being pinned at registry build time.
-    pub codex_credential: Option<Arc<CodexCredential>>,
+    /// Account-bound Codex credential used for both the bearer token and the
+    /// `chatgpt-account-id` header. A file switch to another account fails
+    /// closed until registry reload publishes that account's catalog.
+    pub(crate) codex_credential: Option<Arc<AccountBoundCodexCredential>>,
     /// WebSocket continuation is shared by all calls through this service and
     /// isolated by the caller's prompt-cache cohort.
     attempt_deadline: LlmAttemptDeadline,
@@ -129,11 +126,12 @@ impl LlmServiceImpl {
     /// backend (codex bridge). The base URL is forced to `CODEX_BACKEND_URL`
     /// regardless of any `OPENAI_BASE_URL` setting; `Anthropic` URL fields are
     /// ignored on this path.
-    pub fn new_with_codex_backend(
+    #[must_use]
+    pub(crate) fn new_with_codex_backend(
         spec: ModelSpec,
         auth: LlmAuth,
         custom_headers: Vec<(String, String)>,
-        codex_credential: Arc<CodexCredential>,
+        codex_credential: Arc<AccountBoundCodexCredential>,
     ) -> Self {
         Self {
             spec,
@@ -237,8 +235,14 @@ impl LlmService for LlmServiceImpl {
         self.use_codex_backend
     }
 
+    fn uses_official_openai_responses(&self) -> bool {
+        self.spec.backend == crate::ModelBackend::OpenAIResponses
+            && !self.use_codex_backend
+            && openai::is_official_responses_route(self.openai_responses_base_url.as_deref())
+    }
+
     fn continuation_request_limits(&self) -> super::ContinuationRequestLimits {
-        if self.use_codex_backend && self.spec.api_name.starts_with("gpt-5.6") {
+        if self.use_codex_backend && openai::supports_responses_lite(&self.spec.api_name) {
             super::ContinuationRequestLimits::codex_responses_lite()
         } else if self.use_codex_backend {
             super::ContinuationRequestLimits::codex_bridge()
@@ -250,9 +254,8 @@ impl LlmService for LlmServiceImpl {
 
 impl LlmServiceImpl {
     /// Build the custom headers for a request, auto-injecting `provider` based on the model spec.
-    /// When the codex bridge is in use, the live `chatgpt-account-id` is read
-    /// from the credential at every request so a mid-session account switch
-    /// (signing in with Codex from Phoenix) reaches the wire.
+    /// When the Codex bridge is in use, the account ID is pinned to the same
+    /// registry generation as its discovered model catalog.
     fn headers_for_provider(&self) -> Vec<(String, String)> {
         let mut headers = self.custom_headers.clone();
         if !headers.is_empty()
@@ -272,13 +275,9 @@ impl LlmServiceImpl {
             }
         }
         if let Some(ref cred) = self.codex_credential {
+            headers.retain(|(name, _)| !name.eq_ignore_ascii_case("chatgpt-account-id"));
             if let Some(account_id) = cred.account_id() {
-                if !headers
-                    .iter()
-                    .any(|(k, _)| k.eq_ignore_ascii_case("chatgpt-account-id"))
-                {
-                    headers.push(("chatgpt-account-id".to_string(), account_id));
-                }
+                headers.push(("chatgpt-account-id".to_string(), account_id));
             }
             // OpenAI-Beta is required by the ChatGPT-backend Responses
             // endpoint for the experimental Responses surface; Codex CLI
@@ -333,10 +332,9 @@ impl LlmServiceImpl {
         match self.spec.backend.api_format() {
             ApiFormat::Anthropic => {
                 let resolved = self.resolve_auth().await?;
-                // Build headers AFTER resolve so any per-request state the
-                // credential refresh updates (notably the codex account_id
-                // pulled from auth.json) is reflected in this request's
-                // headers, not the previous request's snapshot.
+                self.begin_provider_attempt(request, super::LlmTransport::HttpJson);
+                // Build headers after auth resolution so refresh state is
+                // reflected in this request's headers.
                 let headers = self.headers_for_provider();
                 anthropic::complete(
                     &self.spec,
@@ -441,7 +439,9 @@ impl LlmServiceImpl {
 mod tests {
     use super::*;
     use crate::all_models;
-    use crate::registry::{AuthStyle, StaticCredential};
+    use crate::registry::{AuthStyle, CredentialSource, StaticCredential};
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
 
     #[derive(Debug)]
     struct MissingCredential;
@@ -779,6 +779,72 @@ mod tests {
                 .expect("service attempt is terminal")
                 .outcome,
             crate::LlmAttemptOutcome::AuthError
+        );
+    }
+
+    #[test]
+    fn codex_bound_account_header_replaces_custom_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(br#"{"exp":4102444800}"#);
+        let jwt = format!("{header}.{payload}.");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"auth_mode":"chatgpt","tokens":{{"access_token":"{jwt}","refresh_token":"r","account_id":"catalog-account"}}}}"#
+            ),
+        )
+        .unwrap();
+        let (credential, account_id) = crate::CodexCredential::load(path).unwrap();
+        let bound = Arc::new(AccountBoundCodexCredential::new(credential, account_id));
+        let mut spec = all_models()
+            .into_iter()
+            .find(|spec| spec.id == "gpt-6-astra")
+            .unwrap();
+        spec.api_name = "gpt-6-astra".to_string();
+        let auth = LlmAuth::new(
+            Arc::clone(&bound) as Arc<dyn CredentialSource>,
+            AuthStyle::PlainBearer,
+        );
+        let mut service = LlmServiceImpl::new_with_codex_backend(spec, auth, Vec::new(), bound);
+        service.custom_headers = vec![(
+            "ChatGPT-Account-ID".to_string(),
+            "custom-account".to_string(),
+        )];
+
+        let headers = service.headers_for_provider();
+        assert!(!headers.iter().any(|(_, value)| value == "custom-account"));
+        assert!(headers.iter().any(|(name, value)| name
+            .eq_ignore_ascii_case("chatgpt-account-id")
+            && value == "catalog-account"));
+    }
+
+    #[test]
+    fn astra_codex_continuation_reserves_responses_lite_prefix() {
+        let mut spec = all_models()
+            .into_iter()
+            .find(|spec| spec.id == "gpt-6-astra")
+            .expect("Astra spec");
+        spec.api_name = "gpt-6-astra".to_string();
+        let auth = LlmAuth::new(Arc::new(StaticCredential::new("k")), AuthStyle::PlainBearer);
+        let service = LlmServiceImpl {
+            spec,
+            auth,
+            anthropic_base_url: None,
+            openai_responses_base_url: Some(crate::CODEX_BACKEND_URL.to_string()),
+            openai_chat_completions_base_url: None,
+            custom_headers: Vec::new(),
+            request_tags: BTreeMap::new(),
+            use_codex_backend: true,
+            codex_credential: None,
+            codex_ws_sessions: Arc::new(Mutex::new(openai::CodexWsSessions::default())),
+            attempt_deadline: LlmAttemptDeadline::default(),
+        };
+
+        assert_eq!(
+            service.continuation_request_limits(),
+            crate::ContinuationRequestLimits::codex_responses_lite()
         );
     }
 
