@@ -647,6 +647,7 @@ async fn forward_tool_outcome(
 async fn execute_tool_to_outcome<S, T>(
     storage: S,
     tool_executor: Arc<T>,
+    capability_generation: crate::runtime::traits::ToolCapabilityGeneration,
     checked: crate::runtime::deny_gate::CheckedToolCall,
     tool_ctx: ToolContext,
     cancel_token_check: &CancellationToken,
@@ -680,10 +681,18 @@ where
     tracing::info!(parent: &span, conv_id = %conv_id, tool = %tool_name, id = %tool_use_id, "Executing tool");
     let tool_start = std::time::Instant::now();
 
-    let output = tool_executor
-        .execute(checked, tool_ctx)
+    let output = match tool_executor
+        .execute_at_generation(capability_generation, checked, tool_ctx)
         .instrument(span.clone())
-        .await;
+        .await
+    {
+        Ok(output) => output,
+        Err(error) => {
+            span.record("outcome", "stale_capability");
+            tracing::warn!(parent: &span, %error, "Rejected stale tool capability generation");
+            return ToolExecOutcome::Failed { tool_use_id, error };
+        }
+    };
 
     if cancel_token_check.is_cancelled() {
         span.record("outcome", "aborted");
@@ -952,7 +961,12 @@ mod grace_response_admission_tests {
 async fn forward_llm_outcome(
     llm_rx: oneshot::Receiver<LlmOutcome>,
     generation: u64,
-    llm_outcome_tx: mpsc::Sender<(u64, LlmOutcome)>,
+    capability_generation: crate::runtime::traits::ToolCapabilityGeneration,
+    llm_outcome_tx: mpsc::Sender<(
+        u64,
+        crate::runtime::traits::ToolCapabilityGeneration,
+        LlmOutcome,
+    )>,
 ) {
     let llm_outcome = match llm_rx.await {
         Ok(llm_outcome) => llm_outcome,
@@ -967,7 +981,9 @@ async fn forward_llm_outcome(
             }
         }
     };
-    let _ = llm_outcome_tx.send((generation, llm_outcome)).await;
+    let _ = llm_outcome_tx
+        .send((generation, capability_generation, llm_outcome))
+        .await;
 }
 
 /// The outcome of planning a stale tool-result clearing sweep over one
@@ -1616,11 +1632,9 @@ where
     llm_client: Arc<L>,
     tool_executor: Arc<T>,
     coordinator_read_service: Option<crate::api::global_read::GlobalReadService>,
-    /// Names of tools whose stale results may be cleared (specs/stale-tool-results).
-    /// Static for the conversation's tool set, so it is computed once and only
-    /// recomputed on the Explore→Work upgrade, avoiding a registry lock +
-    /// `HashSet` rebuild on every LLM dispatch.
-    clearable_names: Arc<std::collections::HashSet<String>>,
+    /// One authority projection consumed by prompt, history clearing, tool
+    /// context, dispatch, and sub-agent admission.
+    tool_capability: crate::runtime::traits::ToolCapabilitySnapshot,
     /// In-memory mirror of the durable clear watermark (specs/stale-tool-results).
     /// This runtime is the sole writer of its conversation's watermark, so the
     /// cache is authoritative after any successful read/write; a transient
@@ -1697,8 +1711,16 @@ where
     /// outcome to `process_outcome` only when the generation is still current.
     /// The epoch tag stays executor-side and
     /// never leaks into the pure `EffectOutcome` type.
-    llm_outcome_tx: mpsc::Sender<(u64, LlmOutcome)>,
-    llm_outcome_rx: mpsc::Receiver<(u64, LlmOutcome)>,
+    llm_outcome_tx: mpsc::Sender<(
+        u64,
+        crate::runtime::traits::ToolCapabilityGeneration,
+        LlmOutcome,
+    )>,
+    llm_outcome_rx: mpsc::Receiver<(
+        u64,
+        crate::runtime::traits::ToolCapabilityGeneration,
+        LlmOutcome,
+    )>,
     terminal_transition_retry: Option<TerminalTransitionRetry>,
     terminal_settlement_attempt: TerminalSettlementAttempt,
     /// Generation/epoch tag for the in-flight tool task, mirroring
@@ -1837,8 +1859,12 @@ where
     /// Credential helper for recovery settlement (REQ-BED-030).
     /// When the state is `AwaitingRecovery`, the select loop awaits `settled.notified()`.
     credential_helper: Option<Arc<phoenix_llm::CredentialHelper>>,
-    agent_config: phoenix_agents::AgentConfig,
-    spawn_catalog: Option<super::agent_execution::SpawnCatalog>,
+    /// Named-agent catalog frozen at conversation start (parent conversations
+    /// only). The same catalog renders the `spawn_agents` `agent_type` enum and
+    /// resolves `agent_type` at spawn time, so the advertised choice and the
+    /// runtime resolution never diverge mid-conversation (REQ-AG-004/008).
+    /// Empty for sub-agents (which cannot spawn).
+    agent_catalog: Arc<[phoenix_agents::AgentDefinition]>,
     /// Sender to the single serialized fork-resolution consumer, used solely to
     /// retire this conversation's still-pending fork proposals when it reaches a
     /// terminal state (`ForkProposalsRetiredOnOriginTerminal`, REQ-PROJ-035). Set
@@ -1865,12 +1891,6 @@ where
     /// [`super::ConversationHandle`] via `turn_trigger_slot()`; consumed by
     /// `current_turn_span`, which records the trigger as an `OTel` span link.
     turn_trigger: super::TurnTriggerSlot,
-}
-
-#[derive(Debug)]
-enum FollowUpApprovalError {
-    BeforeGit(String),
-    AuthorityLost(String),
 }
 
 impl<S, L, T> ConversationRuntime<S, L, T>
@@ -1900,13 +1920,22 @@ where
         // oneshot channels; forwarders stamp the dispatch generation and relay
         // them here, where the select loop discards superseded outcomes before
         // routing live ones into `process_outcome`.
-        let (llm_outcome_tx, llm_outcome_rx) = mpsc::channel::<(u64, LlmOutcome)>(64);
+        let (llm_outcome_tx, llm_outcome_rx) = mpsc::channel::<(
+            u64,
+            crate::runtime::traits::ToolCapabilityGeneration,
+            LlmOutcome,
+        )>(64);
         let (tool_outcome_tx, tool_outcome_rx) = mpsc::channel::<(u64, ToolExecOutcome)>(64);
         let (retry_outcome_tx, retry_outcome_rx) = mpsc::channel::<(u64, u32)>(64);
         let (_acknowledged_event_tx, acknowledged_event_rx) = mpsc::channel(1);
 
         let tool_executor = Arc::new(tool_executor);
-        let clearable_names = Arc::new(tool_executor.clearable_tool_names());
+        let tool_capability = tool_executor.capability_snapshot();
+        assert_eq!(
+            tool_capability.authority,
+            tool_executor.capability_snapshot().authority,
+            "tool executor capability snapshot must be internally coherent"
+        );
 
         Self {
             context,
@@ -1918,7 +1947,7 @@ where
             llm_client: Arc::new(llm_client),
             tool_executor,
             coordinator_read_service: None,
-            clearable_names,
+            tool_capability,
             clear_watermark_cache: Arc::new(std::sync::Mutex::new(None)),
             active_prompt_projection: None,
             browser_sessions,
@@ -1985,8 +2014,7 @@ where
             direct_turn_cancellation_initiated: false,
             parent_tool_cycle_cap: parent_tool_cycle_cap_from_env(),
             credential_helper: None,
-            agent_config: phoenix_agents::AgentConfig::default(),
-            spawn_catalog: None,
+            agent_catalog: Arc::from(Vec::new()),
             fork_cmd_tx: None,
             state_watcher: None,
         }
@@ -2148,18 +2176,12 @@ where
         self
     }
 
-    pub fn with_agent_config(mut self, config: phoenix_agents::AgentConfig) -> Self {
-        self.agent_config = config;
-        self.spawn_catalog = None;
+    /// Freeze the named-agent catalog used to render the `spawn_agents` schema
+    /// and resolve `agent_type` at spawn time. Set by the runtime manager for
+    /// parent conversations so both surfaces share one catalog (REQ-AG-008).
+    pub fn with_agent_catalog(mut self, catalog: Arc<[phoenix_agents::AgentDefinition]>) -> Self {
+        self.agent_catalog = catalog;
         self
-    }
-
-    #[cfg(test)]
-    fn with_agent_catalog(self, catalog: &[phoenix_agents::AgentDefinition]) -> Self {
-        self.with_agent_config(phoenix_agents::AgentConfig {
-            agents: catalog.to_vec(),
-            tiers: std::collections::BTreeMap::default(),
-        })
     }
 
     /// Set the spawn/cancel channels (for parent conversations)
@@ -2437,8 +2459,8 @@ where
                         return RuntimeExitDisposition::Terminal;
                     }
                 }
-                Some((generation, llm_outcome)) = self.llm_outcome_rx.recv() => {
-                    self.process_generation_tagged_llm_outcome(generation, llm_outcome)
+                Some((generation, capability_generation, llm_outcome)) = self.llm_outcome_rx.recv() => {
+                    self.process_generation_tagged_llm_outcome(generation, capability_generation, llm_outcome)
                         .await;
                     // FM-5 prevention: terminal states exit the loop explicitly.
                     if let StepResult::Terminal(outcome) = self.state.step_result() {
@@ -2634,12 +2656,17 @@ where
     async fn process_generation_tagged_llm_outcome(
         &mut self,
         generation: u64,
+        capability_generation: crate::runtime::traits::ToolCapabilityGeneration,
         llm_outcome: LlmOutcome,
     ) {
-        if self.llm_outcome_is_stale(generation) {
+        if self.llm_outcome_is_stale(generation)
+            || capability_generation != self.tool_capability.generation
+        {
             tracing::debug!(
                 outcome_generation = generation,
                 current_generation = self.llm_request_generation,
+                outcome_capability_generation = capability_generation.value(),
+                current_capability_generation = self.tool_capability.generation.value(),
                 state = self.state.variant_name(),
                 "Ignoring stale LLM outcome — request superseded (abort/new dispatch)"
             );
@@ -3401,27 +3428,12 @@ where
             for (effect_index, effect) in result.effects.into_iter().enumerate() {
                 let is_authoritative_persist =
                     matches!(effect, Effect::PersistAuthoritativeUserMessage { .. });
-                let checkpoint_commits_state = matches!(
-                    effect,
-                    Effect::PersistCheckpoint { .. }
-                        if matches!(self.state, ConvState::AwaitingTaskApproval { .. })
-                );
-                let approval_commits_state = matches!(
-                    effect,
-                    Effect::ApproveTask { .. }
-                        if self.has_existing_write_scope()
-                );
-                let redundant_approval_state_persist = matches!(effect, Effect::PersistState)
-                    && (state_committed || approval_commits_state);
                 let is_state_persist = matches!(
                     effect,
                     Effect::PersistState
                         | Effect::CompleteCreation { .. }
                         | Effect::MaterializeCreation { .. }
-                ) || checkpoint_commits_state;
-                if redundant_approval_state_persist {
-                    continue;
-                }
+                );
                 if matches!(effect, Effect::PersistState)
                     && self.handoff_completion_authority.is_some()
                     && matches!(self.state, ConvState::HandedOff { .. })
@@ -3726,12 +3738,6 @@ where
                 };
                 if let Some(gen_event) = effect_result {
                     generated_events.push(gen_event);
-                }
-                if checkpoint_commits_state {
-                    state_committed = true;
-                }
-                if approval_commits_state {
-                    state_committed = true;
                 }
                 if self.creation_settlement_disposition
                     == CreationSettlementDisposition::StaleAuthority
@@ -4804,31 +4810,63 @@ where
         // so each round still starts clean without a destructive reassignment.
         self.sub_agent_result_buffer.reserve(input.tasks.len());
 
-        let resolved_tasks: Vec<SubAgentMode> = input
-            .tasks
-            .iter()
-            .map(|task| task.mode.unwrap_or_default())
-            .collect();
+        // --- Named-agent resolution (REQ-AG-005, REQ-AG-007) ---
+        // Resolve against the catalog frozen at conversation start — the same
+        // one that rendered the spawn_agents schema — so the advertised
+        // agent_type enum and this validation never diverge if agent files
+        // change mid-conversation (REQ-AG-008). Reject an unknown agent_type and
+        // resolve each task's effective mode (task field > agent default >
+        // Explore) up front, so the write-capability checks below run on the
+        // *resolved* mode.
+        let agents: &[phoenix_agents::AgentDefinition] = &self.agent_catalog;
+        let mut resolved_tasks: Vec<(Option<&phoenix_agents::AgentDefinition>, SubAgentMode)> =
+            Vec::with_capacity(input.tasks.len());
+        for task in &input.tasks {
+            let agent = if let Some(ref agent_type) = task.agent_type {
+                let Some(found) = phoenix_agents::find_agent(agents, agent_type) else {
+                    let available: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
+                    let result = ToolResult::error(
+                        tool_use_id.clone(),
+                        format!(
+                            "Unknown agent_type '{}'. Available: {}",
+                            agent_type,
+                            if available.is_empty() {
+                                "none".to_string()
+                            } else {
+                                available.join(", ")
+                            }
+                        ),
+                    );
+                    return Ok(Some(Event::ToolComplete {
+                        tool_use_id,
+                        result,
+                    }));
+                };
+                Some(found)
+            } else {
+                None
+            };
+            let mode = task
+                .mode
+                .or_else(|| agent.and_then(|a| a.mode))
+                .unwrap_or_default();
+            resolved_tasks.push((agent, mode));
+        }
+
         // --- Mode validation and one-writer constraint (REQ-PROJ-008) ---
-        let parent_allows_work = match self.context.mode_context.as_ref() {
-            Some(
-                ModeContext::Work { .. }
-                | ModeContext::Direct
-                | ModeContext::Branch { .. }
-                | ModeContext::DetachedApprovedTask { .. },
-            ) => true,
-            Some(ModeContext::Explore { .. }) | None => false,
-        };
+        let parent_allows_work = matches!(
+            self.tool_capability.authority,
+            crate::work_scope::ResourceAuthority::Work
+        );
 
         let mut work_count_in_batch = 0u32;
-        for &mode in &resolved_tasks {
+        for &(_, mode) in &resolved_tasks {
             if mode == SubAgentMode::Work {
                 if !parent_allows_work {
                     let result = ToolResult::error(
                         tool_use_id.clone(),
-                        "Work sub-agents require the parent to be in a write-capable mode \
-                         (Work, Branch, or Direct). Use mode: \"explore\" or omit mode \
-                         for read-only sub-agents."
+                        "Work sub-agents require Work authority on the parent WorkScope. \
+                         Use mode: \"explore\" or omit mode for read-only sub-agents."
                             .to_string(),
                     );
                     return Ok(Some(Event::ToolComplete {
@@ -4888,15 +4926,12 @@ where
         // tool call then reports failure instead of SpawnAgentsComplete) when a
         // later task's effective model is unknown. Build-and-validate first,
         // then send the whole batch.
-        let catalog = self.spawn_catalog.get_or_insert_with(|| {
-            super::agent_execution::SpawnCatalog::resolve(
-                &self.agent_config,
-                self.llm_registry.available_execution_routes(),
-            )
-        });
+        let frozen_model_ids = self.tool_executor.subagent_model_ids();
+        let frozen_model_ids: std::collections::HashSet<&str> =
+            frozen_model_ids.iter().map(String::as_str).collect();
         let mut specs: Vec<SubAgentSpec> = Vec::with_capacity(input.tasks.len());
 
-        for (task, &mode) in input.tasks.iter().zip(&resolved_tasks) {
+        for (task, &(agent, mode)) in input.tasks.iter().zip(&resolved_tasks) {
             let cwd_override = nonblank(task.cwd.as_deref());
             let cwd_path = cwd_override.map_or_else(
                 || self.context.filesystem_root().to_path_buf(),
@@ -4943,30 +4978,46 @@ where
                 }));
             }
 
-            let selected = match catalog.select(
-                task.agent_type.as_deref(),
-                task.execution.as_ref(),
-                &self.context.model_id,
-                self.context.effort,
-            ) {
-                Ok(selected) => selected,
-                Err(error) => {
+            // Resolve model: task field > agent default > mode default
+            // (REQ-AG-005, REQ-PROJ-008). An explicit model from either the
+            // task or the agent definition must exist in the registry.
+            let explicit_model = nonblank(task.model.as_deref())
+                .or_else(|| agent.and_then(|definition| nonblank(definition.model.as_deref())));
+            let resolved_model = if let Some(model) = explicit_model {
+                if !frozen_model_ids.contains(model) || self.llm_registry.get(model).is_none() {
+                    let result = ToolResult::error(
+                        tool_use_id.clone(),
+                        format!(
+                            "Unknown model '{}'. Available: {:?}",
+                            model,
+                            frozen_model_ids.iter().copied().collect::<Vec<_>>()
+                        ),
+                    );
                     return Ok(Some(Event::ToolComplete {
-                        tool_use_id: tool_use_id.clone(),
-                        result: ToolResult::error(tool_use_id, error),
-                    }))
+                        tool_use_id,
+                        result,
+                    }));
+                }
+                model.to_string()
+            } else {
+                match mode {
+                    SubAgentMode::Explore => {
+                        let cheap_model = self
+                            .llm_registry
+                            .cheap_model_id_for_provider(&self.context.model_id);
+                        match self.context.effort {
+                            Some(effort)
+                                if !self.llm_registry.supports_effort(&cheap_model, effort) =>
+                            {
+                                self.context.model_id.clone()
+                            }
+                            _ => cheap_model,
+                        }
+                    }
+                    SubAgentMode::Work => self.context.model_id.clone(),
                 }
             };
-            if let Err(error) = self.llm_registry.validate_execution_route(
-                &selected.execution.model,
-                &selected.execution.connection,
-                selected.execution.reasoning_effort,
-            ) {
-                return Ok(Some(Event::ToolComplete {
-                    tool_use_id: tool_use_id.clone(),
-                    result: ToolResult::error(tool_use_id, error),
-                }));
-            }
+
             // Resolve max turns (REQ-PROJ-008)
             let max_turns = task.max_turns.unwrap_or(match mode {
                 SubAgentMode::Explore => 20,
@@ -4975,8 +5026,7 @@ where
 
             tracing::debug!(
                 mode = ?mode,
-                model = %selected.execution.model,
-                connection = %selected.execution.connection,
+                model_source = if explicit_model.is_some() { "override" } else { "default" },
                 cwd_source = if cwd_override.is_some() { "override" } else { "parent" },
                 "resolved sub-agent spawn defaults"
             );
@@ -4987,12 +5037,10 @@ where
                 cwd,
                 timeout: DEFAULT_SUBAGENT_TIMEOUT,
                 mode,
-                model_id: selected.execution.model,
-                connection: selected.execution.connection,
-                effort: selected.execution.reasoning_effort,
+                model_id: resolved_model,
                 max_turns,
-                agent_name: selected.name,
-                persona: selected.persona,
+                agent_name: agent.map(|a| a.name.clone()),
+                persona: agent.map(|a| a.body.clone()),
             });
         }
 
@@ -6811,7 +6859,7 @@ where
                 .expect("projection refreshed above")
                 .messages,
             None,
-            &self.clearable_names,
+            &self.tool_capability.clearable_names,
             self.context.context_window,
             &self.clear_watermark_cache,
         )
@@ -6832,6 +6880,7 @@ where
         // intentional `Effect::AbortLlm`.
         self.llm_request_generation = self.llm_request_generation.wrapping_add(1);
         let dispatch_generation = self.llm_request_generation;
+        let capability_generation = self.tool_capability.generation;
         let llm_outcome_tx = self.llm_outcome_tx.clone();
 
         let llm_client = self.llm_client.clone();
@@ -6878,7 +6927,7 @@ where
         let mode_context = self.context.mode_context.clone();
         let has_approved_task_write_authority =
             matches!(
-                self.context.resource_authority,
+                self.tool_capability.authority,
                 crate::work_scope::ResourceAuthority::Work
             ) && matches!(mode_context, Some(ModeContext::Explore { .. }));
         let llm_language = self.context.llm_language;
@@ -6910,20 +6959,15 @@ where
         // Freeze the complete provider request before any provider or forwarding
         // task is spawned. Tool definitions, AGENTS-backed system prompt, and the
         // optional Coordinator capsule are request authority, not task-local inputs.
-        let mut available_tools = tool_executor.definitions_for_language(llm_language).await;
-        if let Some(tool) = available_tools
-            .iter_mut()
-            .find(|tool| tool.name == "spawn_agents")
-        {
-            let catalog = super::agent_execution::SpawnCatalog::resolve(
-                &self.agent_config,
-                self.llm_registry.available_execution_routes(),
-            );
-            tool.input_schema = catalog.schema();
-            self.spawn_catalog = Some(catalog);
-        }
+        let available_tools = tool_executor
+            .definitions_for_generation(capability_generation, llm_language)
+            .await?;
         let explore_bash_capability =
-            if matches!(mode_context.as_ref(), Some(ModeContext::Explore { .. })) {
+            if matches!(
+                self.tool_capability.authority,
+                crate::work_scope::ResourceAuthority::Restricted
+            ) && matches!(mode_context.as_ref(), Some(ModeContext::Explore { .. }))
+            {
                 explore_bash
             } else {
                 phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable
@@ -7196,6 +7240,7 @@ where
         tokio::spawn(forward_llm_outcome(
             llm_rx,
             dispatch_generation,
+            capability_generation,
             llm_outcome_tx,
         ));
 
@@ -7346,6 +7391,7 @@ where
         // dispatch or an intentional `Effect::AbortTool` / backstop teardown.
         self.tool_request_generation = self.tool_request_generation.wrapping_add(1);
         let dispatch_generation = self.tool_request_generation;
+        let capability_generation = self.tool_capability.generation;
         let tool_outcome_tx = self.tool_outcome_tx.clone();
 
         // Create cancellation token for this tool execution
@@ -7393,7 +7439,7 @@ where
                 self.tmux_registry.clone(),
                 scope_worktree,
                 self.context.resource_scope.clone(),
-                self.context.resource_authority,
+                self.tool_capability.authority,
             ),
             phoenix_core::domain::sm_state::ConversationExecutionEnvironment::NoFilesystem => {
                 ToolContext::new_without_filesystem(
@@ -7457,6 +7503,7 @@ where
             let tool_outcome = execute_tool_to_outcome(
                 storage,
                 tool_executor,
+                capability_generation,
                 checked,
                 tool_ctx,
                 &cancel_token_check,
@@ -7658,21 +7705,9 @@ where
                 // transaction: either the full round is durable or none of it
                 // is. A partial write would leave an unpaired `tool_use` that
                 // 400s every later LLM request (REQ-BED-007, FM-2 Prevention).
-                if matches!(self.state, ConvState::AwaitingTaskApproval { .. }) {
-                    self.storage
-                        .persist_tool_round_and_state(
-                            &conv_id,
-                            &agent_msg,
-                            &tool_msgs,
-                            &self.state,
-                            self.state_updated_at,
-                        )
-                        .await?;
-                } else {
-                    self.storage
-                        .persist_tool_round(&conv_id, &agent_msg, &tool_msgs)
-                        .await?;
-                }
+                self.storage
+                    .persist_tool_round(&conv_id, &agent_msg, &tool_msgs)
+                    .await?;
 
                 // Broadcast the now-durable rows so connected clients render
                 // the assistant message and each tool result. Tool-result
@@ -8135,7 +8170,7 @@ where
                 .handoff
                 .as_ref()
                 .map(|handoff| handoff.message_id.as_str()),
-            &self.clearable_names,
+            &self.tool_capability.clearable_names,
             context_window,
             &self.clear_watermark_cache,
         )
@@ -8392,161 +8427,6 @@ where
         Ok(())
     }
 
-    fn has_existing_write_scope(&self) -> bool {
-        self.context.resource_authority == crate::work_scope::ResourceAuthority::Work
-            && self.context.work_scope_worktree.is_some()
-    }
-
-    #[allow(clippy::too_many_lines)]
-    async fn approve_follow_up_in_existing_scope(
-        &mut self,
-        task_file: &str,
-        title: &str,
-        priority: crate::task_source::Priority,
-        plan: &str,
-        admitted: &mut crate::runtime::AdmittedOperation,
-    ) -> Result<(), FollowUpApprovalError> {
-        reread_reviewed_task_handoff_snapshot_at_exact_path(
-            self.context.filesystem_root(),
-            self.context.filesystem_root(),
-            &self.context.tasks_dir_name,
-            task_file,
-            title,
-            priority,
-            plan,
-        )
-        .map_err(FollowUpApprovalError::BeforeGit)?;
-        let cwd = self.context.filesystem_root().to_path_buf();
-        let tasks_dir_name = self.context.tasks_dir_name.clone();
-        let task_file_owned = task_file.to_string();
-        let title_owned = title.to_string();
-        let plan_owned = plan.to_string();
-        let blocking_admission = admitted.reborrow();
-        let reviewed =
-            crate::runtime::creation_worker::run_admitted_blocking(blocking_admission, move || {
-                persist_fresh_approved_task_artifact_blocking(
-                    &cwd,
-                    &tasks_dir_name,
-                    &task_file_owned,
-                    &title_owned,
-                    priority,
-                    &plan_owned,
-                )
-            })
-            .await
-            .map_err(|error| {
-                FollowUpApprovalError::AuthorityLost(format!(
-                    "Follow-up task approval join error after Git admission: {error}"
-                ))
-            })?
-            .map_err(|error| match error {
-                FollowUpArtifactError::BeforeGit(error) => FollowUpApprovalError::BeforeGit(error),
-                FollowUpArtifactError::AfterGit(error) => {
-                    FollowUpApprovalError::AuthorityLost(error)
-                }
-            })?;
-
-        let approval_msg = format!(
-            "Follow-up task approved in the existing worktree {}.\n\n## Approved plan: {title}\n\nPriority: {priority}\n\n{plan}",
-            self.context.filesystem_root().display(),
-        );
-        let msg_id = uuid::Uuid::new_v4().to_string();
-        let content = MessageContent::User(crate::db::UserContent::meta(&approval_msg));
-        let seq = self.broadcast_tx.next_seq();
-        let message = crate::db::Message {
-            message_id: msg_id,
-            conversation_id: self.context.conversation_id.clone(),
-            sequence_id: seq,
-            message_type: crate::db::MessageType::User,
-            content,
-            display_data: None,
-            usage_data: None,
-            created_at: Utc::now(),
-        };
-        self.storage
-            .persist_approved_task_authority_and_state(
-                &self.context.conversation_id,
-                &TaskApprovalHandoffData {
-                    task_id: reviewed.task_id,
-                    task_title: reviewed.task_title.clone(),
-                    title: title.to_string(),
-                    priority,
-                    plan: plan.to_string(),
-                    task_file: task_file.to_string(),
-                    artifact_body: reviewed.artifact_body,
-                },
-                &message,
-                &self.state,
-                self.state_updated_at,
-            )
-            .await
-            .map_err(FollowUpApprovalError::AuthorityLost)?;
-
-        let _ = self
-            .broadcast_tx
-            .admitted_publication(admitted)
-            .persisted_message(message);
-        let task_title = reviewed.task_title;
-        let _ = self
-            .broadcast_tx
-            .admitted_publication(admitted)
-            .event(|sequence_id| SseEvent::ConversationUpdate {
-                sequence_id,
-                update: crate::runtime::ConversationMetadataUpdate {
-                    slug: None,
-                    title: None,
-                    cwd: None,
-                    project_id: None,
-                    project_name: None,
-                    updated_at: None,
-                    branch_name: None,
-                    worktree_path: None,
-                    conv_mode_label: None,
-                    base_branch: None,
-                    task_title: Some(task_title),
-                    work_scope_key: None,
-                    model: None,
-                    archived: None,
-                },
-            });
-        Ok(())
-    }
-
-    fn restore_retryable_task_approval(
-        &mut self,
-        task_file: String,
-        title: String,
-        priority: crate::task_source::Priority,
-        plan: String,
-        error: &str,
-        admitted: &mut crate::runtime::AdmittedOperation,
-    ) -> Result<(), String> {
-        self.install_live_state(
-            ConvState::AwaitingTaskApproval {
-                task_file,
-                title,
-                priority,
-                plan,
-            },
-            Utc::now(),
-            true,
-        )?;
-        self.settle_turn_span();
-        let _ = self
-            .broadcast_tx
-            .admitted_publication(admitted)
-            .event(|seq| SseEvent::Error {
-                sequence_id: seq,
-                error: crate::runtime::user_facing_error::UserFacingError::retryable(
-                    "Task approval failed",
-                    format!(
-                        "Phoenix could not finalise the task: {error}. The conversation stays in approval state — try approving again or abandon."
-                    ),
-                ),
-            });
-        Ok(())
-    }
-
     /// REQ-BED-028: Execute git operations for task approval.
     ///
     /// Sequence: parse on-disk task file -> create worktree (or promote early one) ->
@@ -8563,23 +8443,6 @@ where
         plan: String,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<(), String> {
-        if self.has_existing_write_scope() {
-            let result = self
-                .approve_follow_up_in_existing_scope(&task_file, &title, priority, &plan, admitted)
-                .await;
-            return match result {
-                Ok(()) => Ok(()),
-                Err(FollowUpApprovalError::BeforeGit(error)) => {
-                    self.restore_retryable_task_approval(
-                        task_file, title, priority, plan, &error, admitted,
-                    )?;
-                    Err(error)
-                }
-                Err(FollowUpApprovalError::AuthorityLost(error)) => Err(format!(
-                    "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: follow-up approval crossed the Git authority boundary without durable settlement: {error}"
-                )),
-            };
-        }
         if matches!(
             self.context.mode_context.as_ref(),
             Some(ModeContext::DetachedApprovedTask { .. })
@@ -8670,13 +8533,18 @@ where
                         },
                     )
                     .await?;
-                self.context.resource_authority = crate::work_scope::ResourceAuthority::Work;
-
-                // Upgrade tool registry from Explore to Work mode so the agent
-                // gets bash, patch, etc. for the rest of this conversation.
-                self.tool_executor.upgrade_to_work_mode();
-                // The tool set changed, so refresh the cached clearable-tool set.
-                self.clearable_names = Arc::new(self.tool_executor.clearable_tool_names());
+                // Build the fallible Work tool surface before publishing Work to
+                // the actor context. A failed rebuild leaves every live consumer
+                // Restricted and stops the post-approval turn.
+                let tool_capability = self.tool_executor.upgrade_to_work_mode()?;
+                self.tool_capability = tool_capability;
+                tracing::info!(
+                    conv_id = %self.context.conversation_id,
+                    work_scope = %self.context.resource_scope,
+                    authority = "work",
+                    capability_generation = self.tool_capability.generation.value(),
+                    "Published approved WorkScope capability projection"
+                );
 
                 tracing::info!(
                     task_id = %approval_result.task_id,
@@ -8687,9 +8555,10 @@ where
                 );
 
                 // Persist as a user message so the LLM sees the approval + plan context.
-                // This must be the last message before the next LLM call to avoid ending
-                // on an assistant message (Anthropic rejects trailing assistant as
-                // "prefill").
+                // The propose_task tool_use/result get stripped from history (tool not in
+                // Work registry), so this message carries the plan forward. Must be the
+                // last message before the next LLM call to avoid ending on an assistant
+                // message (Anthropic rejects trailing assistant as "prefill").
                 let branch_msg = format!(
                     "Task approved. You are on branch {} in {}.\n\n\
                      ## Approved plan: {}\n\n\
@@ -8837,12 +8706,7 @@ where
 
         let approval = match result {
             Ok(result) => result,
-            Err(FollowUpArtifactError::AfterGit(error)) => {
-                return Err(format!(
-                    "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: fresh task approval crossed the Git authority boundary without reconciliation: {error}"
-                ));
-            }
-            Err(FollowUpArtifactError::BeforeGit(e)) => {
+            Err(e) => {
                 tracing::error!(error = %e, "Fresh task approval artifact verification failed");
                 self.install_live_state(
                     ConvState::AwaitingTaskApproval {
@@ -8926,53 +8790,6 @@ struct ReviewedTaskHandoffSnapshot {
     artifact_body: String,
 }
 
-#[derive(Debug)]
-enum FollowUpArtifactError {
-    BeforeGit(String),
-    AfterGit(String),
-}
-
-impl std::fmt::Display for FollowUpArtifactError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let message = match self {
-            Self::BeforeGit(message) | Self::AfterGit(message) => message,
-        };
-        formatter.write_str(message)
-    }
-}
-
-fn compensate_follow_up_artifact_failure(
-    cwd: &Path,
-    original_relative: &str,
-    promoted_relative: &str,
-    original_path: &Path,
-    promoted_path: &Path,
-    error: String,
-) -> FollowUpArtifactError {
-    let reset = run_git(
-        cwd,
-        &[
-            "reset",
-            "--quiet",
-            "--",
-            original_relative,
-            promoted_relative,
-        ],
-    );
-    let rename = std::fs::rename(promoted_path, original_path).map_err(|rename_error| {
-        format!("failed to restore '{original_relative}' after '{error}': {rename_error}")
-    });
-    match (reset, rename) {
-        (Ok(_), Ok(())) => FollowUpArtifactError::BeforeGit(error),
-        (reset, rename) => FollowUpArtifactError::AfterGit(format!(
-            "{error}; task artifact compensation failed (index: {}; worktree: {})",
-            reset.err().unwrap_or_else(|| "restored".to_string()),
-            rename.err().unwrap_or_else(|| "restored".to_string()),
-        )),
-    }
-}
-
-#[allow(clippy::too_many_lines)]
 fn persist_fresh_approved_task_artifact_blocking(
     cwd: &std::path::Path,
     tasks_dir_name: &str,
@@ -8980,13 +8797,11 @@ fn persist_fresh_approved_task_artifact_blocking(
     expected_title: &str,
     expected_priority: crate::task_source::Priority,
     expected_plan: &str,
-) -> Result<ReviewedTaskHandoffSnapshot, FollowUpArtifactError> {
+) -> Result<ReviewedTaskHandoffSnapshot, String> {
     let _guard = TASK_APPROVAL_MUTEX
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let original_path_was_tracked =
-        run_git(cwd, &["ls-files", "--error-unmatch", "--", task_file]).is_ok();
-    let mut snapshot = reread_reviewed_task_handoff_snapshot_at_exact_path(
+    let mut snapshot = reread_reviewed_task_handoff_snapshot(
         cwd,
         cwd,
         tasks_dir_name,
@@ -8994,155 +8809,42 @@ fn persist_fresh_approved_task_artifact_blocking(
         expected_title,
         expected_priority,
         expected_plan,
-    )
-    .map_err(FollowUpArtifactError::BeforeGit)?;
-    let mut promotion: Option<(String, String, std::path::PathBuf, std::path::PathBuf)> = None;
+    )?;
     if detect_plain_markdown_task_stem(task_file).is_none() {
         let filename = Path::new(task_file)
             .file_name()
             .and_then(|name| name.to_str())
-            .ok_or_else(|| {
-                FollowUpArtifactError::BeforeGit(format!(
-                    "task_file has no filename component: '{task_file}'"
-                ))
-            })?;
-        let parsed = taskmd_core::filename::parse_filename(filename).ok_or_else(|| {
-            FollowUpArtifactError::BeforeGit(format!("invalid taskmd filename: '{filename}'"))
-        })?;
+            .ok_or_else(|| format!("task_file has no filename component: '{task_file}'"))?;
+        let parsed = taskmd_core::filename::parse_filename(filename)
+            .ok_or_else(|| format!("invalid taskmd filename: '{filename}'"))?;
         let promoted = promote_task_status_to_in_progress(
             &cwd.join(tasks_dir_name),
             &parsed.id,
             parsed.status,
             filename,
-        )
-        .map_err(FollowUpArtifactError::BeforeGit)?;
+        )?;
         if promoted != filename {
-            let promoted_relative = format!("{tasks_dir_name}/{promoted}");
-            promotion = Some((
-                task_file.to_string(),
-                promoted_relative.clone(),
-                cwd.join(task_file),
-                cwd.join(&promoted_relative),
-            ));
             let _ = run_git(cwd, &["add", "--", task_file]);
-            snapshot.task_file = promoted_relative;
+            snapshot.task_file = format!("{tasks_dir_name}/{promoted}");
         }
     }
-    let compensate = |error: String| match &promotion {
-        Some((original_relative, promoted_relative, original_path, promoted_path)) => {
-            compensate_follow_up_artifact_failure(
-                cwd,
-                original_relative,
-                promoted_relative,
-                original_path,
-                promoted_path,
-                error,
-            )
-        }
-        None => FollowUpArtifactError::BeforeGit(error),
-    };
-    crate::git_ops::ensure_local_exclude_has_phoenix(cwd).map_err(&compensate)?;
-    run_git(cwd, &["add", "--", &snapshot.task_file]).map_err(&compensate)?;
-    let mut approved_paths = vec![snapshot.task_file.as_str()];
-    if original_path_was_tracked && snapshot.task_file != task_file {
-        approved_paths.push(task_file);
-    }
-    let mut diff_args = vec!["diff", "--cached", "--quiet", "--"];
-    diff_args.extend(approved_paths.iter().copied());
-    if run_git(cwd, &diff_args).is_err() {
-        let commit_message = format!("task {}: {}", snapshot.task_id, expected_title);
-        let mut commit_args = vec![
-            "commit",
-            "--only",
-            "--no-verify",
-            "-m",
-            &commit_message,
-            "--",
-        ];
-        commit_args.extend(approved_paths.iter().copied());
-        run_git(cwd, &commit_args).map_err(|error| {
-            compensate(format!("Failed to commit approved task artifact: {error}"))
-        })?;
-        let mut hash = phoenix_core::git::command()
-            .arg("hash-object")
-            .arg("--stdin")
-            .current_dir(cwd)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|error| FollowUpArtifactError::AfterGit(error.to_string()))?;
-        std::io::Write::write_all(
-            &mut hash.stdin.take().expect("hash-object stdin"),
-            snapshot.artifact_body.as_bytes(),
+    ensure_gitignore_has_phoenix(cwd)?;
+    run_git(cwd, &["add", "--", &snapshot.task_file])?;
+    if run_git(cwd, &["diff", "--cached", "--quiet"]).is_err() {
+        run_git(
+            cwd,
+            &[
+                "commit",
+                "-m",
+                &format!("task {}: {}", snapshot.task_id, expected_title),
+            ],
         )
-        .map_err(|error| FollowUpArtifactError::AfterGit(error.to_string()))?;
-        let reviewed_blob = String::from_utf8(
-            hash.wait_with_output()
-                .map_err(|error| FollowUpArtifactError::AfterGit(error.to_string()))?
-                .stdout,
-        )
-        .map_err(|error| FollowUpArtifactError::AfterGit(error.to_string()))?
-        .trim()
-        .to_string();
-        let committed_blob = run_git(cwd, &["rev-parse", &format!("HEAD:{}", snapshot.task_file)])
-            .map_err(FollowUpArtifactError::AfterGit)?;
-        if committed_blob != reviewed_blob {
-            return Err(FollowUpArtifactError::AfterGit(
-                "committed task artifact differs from the reviewed bytes".to_string(),
-            ));
-        }
+        .map_err(|error| format!("Failed to commit approved task artifact: {error}"))?;
     }
     Ok(snapshot)
 }
 
 fn reread_reviewed_task_handoff_snapshot(
-    cwd: &std::path::Path,
-    approval_root: &std::path::Path,
-    tasks_dir_name: &str,
-    task_file: &str,
-    expected_title: &str,
-    expected_priority: crate::task_source::Priority,
-    expected_plan: &str,
-) -> Result<ReviewedTaskHandoffSnapshot, String> {
-    let proposed_path = cwd.join(task_file);
-    if proposed_path.exists() {
-        return reread_reviewed_task_handoff_snapshot_at_exact_path(
-            cwd,
-            approval_root,
-            tasks_dir_name,
-            task_file,
-            expected_title,
-            expected_priority,
-            expected_plan,
-        );
-    }
-    let filename = proposed_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| format!("task_file has no filename component: '{task_file}'"))?;
-    let parsed = taskmd_core::filename::parse_filename(filename).ok_or_else(|| {
-        format!("Failed to read reviewed task file '{task_file}': file not found")
-    })?;
-    let promoted_file = format!(
-        "{}-{}-in-progress--{}.md",
-        parsed.id, parsed.priority, parsed.slug
-    );
-    let promoted = Path::new(task_file).with_file_name(promoted_file);
-    let promoted = promoted
-        .to_str()
-        .ok_or_else(|| format!("promoted task path is not UTF-8: '{}'", promoted.display()))?;
-    reread_reviewed_task_handoff_snapshot_at_exact_path(
-        cwd,
-        approval_root,
-        tasks_dir_name,
-        promoted,
-        expected_title,
-        expected_priority,
-        expected_plan,
-    )
-}
-
-fn reread_reviewed_task_handoff_snapshot_at_exact_path(
     cwd: &std::path::Path,
     _repo_root: &std::path::Path,
     tasks_dir_name: &str,
@@ -9152,27 +8854,29 @@ fn reread_reviewed_task_handoff_snapshot_at_exact_path(
     expected_plan: &str,
 ) -> Result<ReviewedTaskHandoffSnapshot, String> {
     let path = cwd.join(task_file);
-    let metadata = path
-        .symlink_metadata()
-        .map_err(|error| format!("Failed to inspect reviewed task file '{task_file}': {error}"))?;
-    if !metadata.file_type().is_file() {
-        return Err(format!(
-            "Reviewed task file '{task_file}' must remain a regular file. Reject and re-approve the replacement artifact."
-        ));
-    }
-    let canonical_path = path
-        .canonicalize()
-        .map_err(|error| format!("Failed to resolve reviewed task file '{task_file}': {error}"))?;
-    let canonical_cwd = cwd
-        .canonicalize()
-        .map_err(|error| format!("Failed to resolve the working directory: {error}"))?;
-    if !canonical_path.starts_with(&canonical_cwd) {
-        return Err(format!(
-            "Reviewed task file '{task_file}' resolves outside the working directory. Reject and re-approve the replacement artifact."
-        ));
-    }
-    let body = std::fs::read_to_string(&path)
-        .map_err(|error| format!("Failed to read reviewed task file '{task_file}': {error}"))?;
+    let body = match std::fs::read_to_string(&path) {
+        Ok(body) => body,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let filename = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| format!("task_file has no filename component: '{task_file}'"))?;
+            let parsed = taskmd_core::filename::parse_filename(filename).ok_or_else(|| {
+                format!("Failed to read reviewed task file '{task_file}': {error}")
+            })?;
+            let promoted = path.with_file_name(format!(
+                "{}-{}-in-progress--{}.md",
+                parsed.id, parsed.priority, parsed.slug
+            ));
+            std::fs::read_to_string(promoted)
+                .map_err(|_| format!("Failed to read reviewed task file '{task_file}': {error}"))?
+        }
+        Err(error) => {
+            return Err(format!(
+                "Failed to read reviewed task file '{task_file}': {error}"
+            ))
+        }
+    };
     if body != expected_plan {
         return Err(format!(
             "Reviewed task file '{task_file}' no longer matches the approved plan. Reject and re-approve the updated artifact."
@@ -14155,6 +13859,7 @@ mod authoritative_user_message_effect_tests {
 
         rt.process_generation_tagged_llm_outcome(
             0,
+            rt.tool_capability.generation,
             LlmOutcome::TimedOut {
                 message: "provider attempt deadline elapsed".to_string(),
             },
@@ -14206,7 +13911,8 @@ mod authoritative_user_message_effect_tests {
             request_id: "parent-terminal-retry-response".to_string(),
         };
 
-        rt.process_generation_tagged_llm_outcome(0, outcome).await;
+        rt.process_generation_tagged_llm_outcome(0, rt.tool_capability.generation, outcome)
+            .await;
 
         assert!(matches!(rt.state, ConvState::LlmRequesting { attempt: 1 }));
         assert!(rt.llm_task_handle.is_none());
@@ -14343,7 +14049,8 @@ mod authoritative_user_message_effect_tests {
             request_id: "pre-establishment-retry".to_string(),
         };
 
-        rt.process_generation_tagged_llm_outcome(0, outcome).await;
+        rt.process_generation_tagged_llm_outcome(0, rt.tool_capability.generation, outcome)
+            .await;
         for _ in 0..(DIRECT_TURN_TERMINAL_SETTLEMENT_RETRIES + 2) {
             tokio::time::advance(TERMINAL_SETTLEMENT_RETRY_DELAY).await;
             rt.retry_terminal_transition().await;
@@ -15491,225 +15198,6 @@ mod authoritative_user_message_effect_tests {
 }
 
 #[cfg(test)]
-mod approved_explore_follow_up_tests {
-    use super::test_git_helpers::{add_worktree, init_repo};
-    use super::*;
-    use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
-    use crate::state_machine::ConvContext;
-    use crate::tools::BrowserSessionManager;
-    use phoenix_llm::ModelRegistry;
-    use std::path::PathBuf;
-    use std::sync::Arc;
-    use tokio::sync::mpsc;
-
-    fn approved_explore_runtime(
-        worktree: PathBuf,
-        task_file: &str,
-        plan: &str,
-        storage: Arc<InMemoryStorage>,
-        broadcast_tx: SseBroadcaster,
-    ) -> ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>> {
-        let mut context = ConvContext::new(
-            "approved-explore-follow-up",
-            worktree.clone(),
-            "test-model",
-            200_000,
-        );
-        context.mode_context = Some(ModeContext::Explore {
-            next_taskmd_id_hint: None,
-        });
-        context.resource_authority = crate::work_scope::ResourceAuthority::Work;
-        context.work_scope_worktree = Some(worktree);
-        let (_event_tx, event_rx) = mpsc::channel(8);
-        let event_tx = mpsc::channel::<Event>(1).0;
-        ConversationRuntime::new(
-            context,
-            ConvState::AwaitingTaskApproval {
-                task_file: task_file.to_string(),
-                title: "Follow up".to_string(),
-                priority: crate::task_source::Priority::P1,
-                plan: plan.to_string(),
-            },
-            storage,
-            Arc::new(MockLlmClient::new("test-model")),
-            Arc::new(MockToolExecutor::new()),
-            Arc::new(BrowserSessionManager::default()),
-            Arc::new(crate::tools::BashHandleRegistry::new()),
-            Arc::new(crate::tools::TmuxRegistry::new()),
-            Arc::new(ModelRegistry::new_empty()),
-            crate::terminal::ActiveTerminals::new(),
-            event_rx,
-            event_tx,
-            broadcast_tx,
-        )
-    }
-
-    #[test]
-    fn reread_rejects_symlink_replacement() {
-        use std::os::unix::fs::symlink;
-
-        let cwd = tempfile::tempdir().unwrap();
-        std::fs::create_dir(cwd.path().join("tasks")).unwrap();
-        let task_file = "tasks/72004-p1-ready--follow-up.md";
-        let plan = "# Follow up\n";
-        let outside = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(outside.path(), plan).unwrap();
-        symlink(outside.path(), cwd.path().join(task_file)).unwrap();
-
-        let error = reread_reviewed_task_handoff_snapshot_at_exact_path(
-            cwd.path(),
-            cwd.path(),
-            "tasks",
-            task_file,
-            "Follow up",
-            crate::task_source::Priority::P1,
-            plan,
-        )
-        .expect_err("symlink replacement must be rejected");
-
-        assert!(error.contains("must remain a regular file"));
-    }
-
-    #[tokio::test]
-    async fn follow_up_validation_failure_restores_approval_state() {
-        let (_tmp, repo_root) = init_repo();
-        let worktree = PathBuf::from(add_worktree(
-            &repo_root,
-            "approved-explore-follow-up-failure",
-            "task-72003-existing-failure",
-        ));
-        std::fs::create_dir(worktree.join("tasks")).unwrap();
-        let task_file = "tasks/72004-p1-ready--follow-up.md";
-        let reviewed_plan = "# Follow up\n\nReviewed.\n";
-        std::fs::write(worktree.join(task_file), "# Follow up\n\nEdited.\n").unwrap();
-        let storage = Arc::new(InMemoryStorage::new());
-        let broadcast_tx = SseBroadcaster::new(16, 0);
-        let mut runtime =
-            approved_explore_runtime(worktree, task_file, reviewed_plan, storage, broadcast_tx);
-        runtime.state = ConvState::LlmRequesting { attempt: 1 };
-        let authority_fence = crate::runtime::FatalLocalAuthorityFence::new();
-        let mut admitted = authority_fence.try_acquire().expect("open authority fence");
-
-        let error = runtime
-            .execute_approve_task(
-                task_file.to_string(),
-                "Follow up".to_string(),
-                crate::task_source::Priority::P1,
-                reviewed_plan.to_string(),
-                &mut admitted,
-            )
-            .await
-            .expect_err("edited task must fail approval");
-
-        assert!(error.contains("no longer matches the approved plan"));
-        assert!(matches!(
-            runtime.state,
-            ConvState::AwaitingTaskApproval { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn follow_up_approval_preserves_existing_branch_and_replaces_objective() {
-        let (_tmp, repo_root) = init_repo();
-        let worktree = PathBuf::from(add_worktree(
-            &repo_root,
-            "approved-explore-follow-up",
-            "task-72003-existing",
-        ));
-        std::fs::create_dir(worktree.join("tasks")).unwrap();
-        let task_file = "tasks/72004-p1-ready--follow-up.md";
-        let plan = "# Follow up\n\nImplement the next bounded change.\n";
-        std::fs::write(worktree.join(task_file), plan).unwrap();
-        std::fs::write(worktree.join("unrelated.txt"), "base\n").unwrap();
-        run_git(&worktree, &["add", "unrelated.txt"]).unwrap();
-        run_git(&worktree, &["commit", "-m", "unrelated baseline"]).unwrap();
-        std::fs::write(worktree.join("unrelated.txt"), "staged work\n").unwrap();
-        run_git(&worktree, &["add", "unrelated.txt"]).unwrap();
-
-        let storage = Arc::new(InMemoryStorage::new());
-        storage
-            .persist_approved_task_authority(
-                "approved-explore-follow-up",
-                &TaskApprovalHandoffData {
-                    task_id: "72003".to_string(),
-                    task_title: "Existing task".to_string(),
-                    title: "Existing task".to_string(),
-                    priority: crate::task_source::Priority::P1,
-                    plan: "# Existing task\n".to_string(),
-                    task_file: "tasks/72003-p1-done--existing.md".to_string(),
-                    artifact_body: "# Existing task\n".to_string(),
-                },
-            )
-            .await
-            .expect("existing approved objective");
-        let broadcast_tx = SseBroadcaster::new(16, 0);
-        let mut broadcast_rx = broadcast_tx.subscribe();
-        let mut runtime = approved_explore_runtime(
-            worktree.clone(),
-            task_file,
-            plan,
-            storage.clone(),
-            broadcast_tx,
-        );
-        let branch_before = run_git(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
-        let authority_fence = crate::runtime::FatalLocalAuthorityFence::new();
-        let mut admitted = authority_fence.try_acquire().expect("open authority fence");
-
-        runtime
-            .execute_approve_task(
-                task_file.to_string(),
-                "Follow up".to_string(),
-                crate::task_source::Priority::P1,
-                plan.to_string(),
-                &mut admitted,
-            )
-            .await
-            .expect("follow-up approval");
-
-        let promoted_task_file = "tasks/72004-p1-in-progress--follow-up.md";
-        assert!(!worktree.join(task_file).exists());
-        assert!(worktree.join(promoted_task_file).exists());
-        assert_eq!(
-            run_git(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap(),
-            branch_before,
-            "follow-up approval must not replace or promote the existing branch"
-        );
-        run_git(&worktree, &["diff", "--exit-code", "HEAD", "--", "tasks"])
-            .expect("approved follow-up artifact must be committed");
-        assert_eq!(
-            run_git(&worktree, &["show", "HEAD:unrelated.txt"]).unwrap(),
-            "base",
-            "follow-up commit must exclude unrelated staged work"
-        );
-        assert!(
-            run_git(&worktree, &["diff", "--cached", "--name-only"])
-                .unwrap()
-                .lines()
-                .any(|path| path == "unrelated.txt"),
-            "unrelated staged work must remain staged"
-        );
-        assert_eq!(storage.recorded_messages().len(), 1);
-        let replacement = storage
-            .approved_task_authority("approved-explore-follow-up")
-            .expect("replacement objective");
-        assert_eq!(replacement.task_id, "72004");
-        assert_eq!(replacement.task_file, task_file);
-        assert!(
-            std::iter::from_fn(|| broadcast_rx.try_recv().ok()).any(|event| matches!(
-                event,
-                SseEvent::ConversationUpdate {
-                    update: crate::runtime::ConversationMetadataUpdate {
-                        task_title: Some(ref title),
-                        ..
-                    },
-                    ..
-                } if title == "Follow up"
-            ))
-        );
-    }
-}
-
-#[cfg(test)]
 mod context_exhausted_preserves_worktree_tests {
     use super::test_git_helpers::{add_worktree, branch_exists, init_repo};
     use super::*;
@@ -16771,6 +16259,65 @@ mod approve_task_failure_effect_tests {
     }
 
     #[tokio::test]
+    async fn same_conversation_approval_publishes_one_work_capability() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "atomic-capability-approval";
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, "main");
+        std::fs::create_dir_all(explore_wt.join("tasks")).unwrap();
+        let task_filename = "12345-p0-ready--atomic-capability.md";
+        std::fs::write(explore_wt.join("tasks").join(task_filename), "Plan").unwrap();
+
+        let mut context = ConvContext::new(conv_id, explore_wt, "test-model", 200_000);
+        context.desired_base_branch = Some("main".to_string());
+        context.mode_context = Some(ModeContext::Explore {
+            next_taskmd_id_hint: Some("12345".to_string()),
+        });
+        let (_event_tx, event_rx) = mpsc::channel(32);
+        let event_tx_dup = mpsc::channel::<Event>(1).0;
+        let tool_executor = Arc::new(MockToolExecutor::new());
+        let mut rt = ConversationRuntime::new(
+            context,
+            ConvState::AwaitingTaskApproval {
+                task_file: format!("tasks/{task_filename}"),
+                title: "Atomic capability".to_string(),
+                priority: crate::task_source::Priority::P0,
+                plan: "Plan".to_string(),
+            },
+            Arc::new(InMemoryStorage::new()),
+            Arc::new(MockLlmClient::new("test-model")),
+            tool_executor.clone(),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx_dup,
+            SseBroadcaster::new(128, 0),
+        )
+        .with_fatal_local_authority_fence(crate::runtime::FatalLocalAuthorityFence::new());
+
+        rt.process_event(Event::TaskApprovalDecided {
+            outcome: TaskApprovalOutcome::Approved {
+                handoff: TaskApprovalHandoff::ContinueInCurrentConversation,
+            },
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            rt.tool_capability.authority,
+            crate::work_scope::ResourceAuthority::Work
+        );
+        assert_eq!(rt.tool_capability.generation.value(), 1);
+        assert_eq!(tool_executor.capability_snapshot().generation.value(), 1);
+        assert!(matches!(
+            rt.context.mode_context,
+            Some(ModeContext::Explore { .. })
+        ));
+    }
+
+    #[tokio::test]
     async fn approval_failure_does_not_dispatch_llm() {
         let (_tmp, repo_root) = init_repo();
         let conv_id = "collision-effect-1";
@@ -17343,7 +16890,8 @@ mod steer_drain_detector_tests {
             request_id: "terminal-retry-response".to_string(),
         };
 
-        rt.process_generation_tagged_llm_outcome(0, outcome).await;
+        rt.process_generation_tagged_llm_outcome(0, rt.tool_capability.generation, outcome)
+            .await;
         assert!(matches!(rt.state, ConvState::LlmRequesting { attempt: 1 }));
         assert!(rt.terminal_transition_retry.is_some());
         assert!(rt.parent_event_tx.is_some());
@@ -19366,11 +18914,15 @@ mod work_subagent_cwd_guard_tests {
         let mut context = ConvContext::new(
             "cwd-guard-conv",
             working_dir.to_path_buf(),
-            "gpt-5.6-sol",
+            "test-model",
             200_000,
         );
         context.mode_context = Some(mode_context);
         context.mode = crate::state_machine::state::ModeKind::Managed;
+        let authority = match context.mode_context.as_ref() {
+            Some(ModeContext::Explore { .. }) => crate::work_scope::ResourceAuthority::Restricted,
+            _ => crate::work_scope::ResourceAuthority::Work,
+        };
 
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx_dup = mpsc::channel::<Event>(1).0;
@@ -19380,15 +18932,16 @@ mod work_subagent_cwd_guard_tests {
             context,
             ConvState::Idle,
             storage,
-            Arc::new(MockLlmClient::new("gpt-5.6-sol")),
-            Arc::new(MockToolExecutor::new()),
+            Arc::new(MockLlmClient::new("test-model")),
+            Arc::new(
+                MockToolExecutor::new()
+                    .with_authority(authority)
+                    .with_subagent_models(vec!["test-model".to_string()]),
+            ),
             Arc::new(BrowserSessionManager::default()),
             Arc::new(crate::tools::BashHandleRegistry::new()),
             Arc::new(crate::tools::TmuxRegistry::new()),
-            Arc::new(ModelRegistry::new(&phoenix_llm::LlmConfig {
-                openai_api_key: Some("test-key".into()),
-                ..Default::default()
-            })),
+            Arc::new(ModelRegistry::new_empty()),
             crate::terminal::ActiveTerminals::new(),
             event_rx,
             event_tx_dup,
@@ -19415,6 +18968,20 @@ mod work_subagent_cwd_guard_tests {
         runtime_in_mode(working_dir, ModeContext::Direct)
     }
 
+    fn approved_explore_runtime(
+        worktree_path: &std::path::Path,
+    ) -> ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>> {
+        let mut runtime = runtime_in_mode(
+            worktree_path,
+            ModeContext::Explore {
+                next_taskmd_id_hint: Some("12345".to_string()),
+            },
+        );
+        let snapshot = runtime.tool_executor.upgrade_to_work_mode().unwrap();
+        runtime.tool_capability = snapshot;
+        runtime
+    }
+
     fn spawn_tool(input: SpawnAgentsInput) -> ToolCall {
         ToolCall::new("tool-spawn-1", ToolInput::SpawnAgents(input))
     }
@@ -19439,7 +19006,7 @@ mod work_subagent_cwd_guard_tests {
                     task: "inspect everything".to_string(),
                     cwd: Some("/".to_string()),
                     mode: Some(SubAgentMode::Explore),
-                    execution: None,
+                    model: None,
                     max_turns: None,
                     agent_type: None,
                 }],
@@ -19471,7 +19038,7 @@ mod work_subagent_cwd_guard_tests {
                     task: "inherit root".to_string(),
                     cwd: None,
                     mode: Some(SubAgentMode::Explore),
-                    execution: None,
+                    model: None,
                     max_turns: None,
                     agent_type: None,
                 }],
@@ -19503,7 +19070,7 @@ mod work_subagent_cwd_guard_tests {
                     task: "inspect project".to_string(),
                     cwd: Some(deep.to_string_lossy().to_string()),
                     mode: Some(SubAgentMode::Explore),
-                    execution: None,
+                    model: None,
                     max_turns: None,
                     agent_type: None,
                 }],
@@ -19540,7 +19107,7 @@ mod work_subagent_cwd_guard_tests {
                     task: "do unsafe writes".to_string(),
                     cwd: Some(outside.path().to_string_lossy().to_string()),
                     mode: Some(SubAgentMode::Work),
-                    execution: None,
+                    model: None,
                     max_turns: None,
                     agent_type: None,
                 }],
@@ -19566,6 +19133,34 @@ mod work_subagent_cwd_guard_tests {
     }
 
     #[tokio::test]
+    async fn approved_explore_origin_admits_work_subagent() {
+        let worktree = TempDir::new().expect("worktree tempdir");
+        let mut rt = approved_explore_runtime(worktree.path());
+
+        let result = rt
+            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                tasks: vec![SubAgentTask {
+                    task: "perform approved work".to_string(),
+                    cwd: None,
+                    mode: Some(SubAgentMode::Work),
+                    model: Some("test-model".to_string()),
+                    max_turns: Some(1),
+                    agent_type: None,
+                }],
+            }))
+            .await
+            .expect("authority admission should succeed");
+
+        if let Some(Event::ToolComplete { result, .. }) = result {
+            let text = tool_result_text(&result);
+            assert!(
+                !text.contains("require Work authority"),
+                "Explore provenance must not override WorkScope authority: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn accepts_unnamed_generic_work_subagent() {
         let worktree = TempDir::new().expect("worktree tempdir");
         let (spawn_tx, mut spawn_rx) = mpsc::channel::<SubAgentSpawnRequest>(1);
@@ -19578,7 +19173,7 @@ mod work_subagent_cwd_guard_tests {
                     task: "implement the fix".to_string(),
                     cwd: None,
                     mode: Some(SubAgentMode::Work),
-                    execution: None,
+                    model: None,
                     max_turns: None,
                     agent_type: None,
                 }],
@@ -19603,12 +19198,13 @@ mod work_subagent_cwd_guard_tests {
         assert_eq!(request.spec.mode, SubAgentMode::Work);
         assert_eq!(request.spec.agent_name, None);
         assert_eq!(request.spec.persona, None);
-        assert_eq!(request.spec.model_id, "gpt-5.6-sol");
-        assert_eq!(request.spec.connection, "openai_responses");
-        assert_eq!(request.spec.effort, None);
+        assert_eq!(request.spec.model_id, "test-model");
         assert_eq!(rt.active_work_subagents, 1);
     }
 
+    /// An `agent_type` that matches no discovered agent is rejected before any
+    /// sub-agent is spawned (REQ-AG-007). The empty worktree has no
+    /// `.claude/agents/`, so discovery returns nothing and the lookup fails.
     #[tokio::test]
     async fn rejects_unknown_agent_type() {
         let worktree = TempDir::new().expect("worktree tempdir");
@@ -19620,7 +19216,7 @@ mod work_subagent_cwd_guard_tests {
                     task: "review".to_string(),
                     cwd: None,
                     mode: None,
-                    execution: None,
+                    model: None,
                     max_turns: None,
                     agent_type: Some("ghost".to_string()),
                 }],
@@ -19636,7 +19232,7 @@ mod work_subagent_cwd_guard_tests {
                 );
                 let msg = tool_result_text(&result);
                 assert!(
-                    msg.contains("Unknown or unavailable agent_type 'ghost'"),
+                    msg.contains("Unknown agent_type 'ghost'"),
                     "error should name the unknown agent_type, got: {msg}"
                 );
             }
@@ -19665,7 +19261,7 @@ mod work_subagent_cwd_guard_tests {
                         task: "first".to_string(),
                         cwd: None,
                         mode: Some(SubAgentMode::Explore),
-                        execution: None,
+                        model: None,
                         max_turns: None,
                         agent_type: None,
                     },
@@ -19673,13 +19269,7 @@ mod work_subagent_cwd_guard_tests {
                         task: "second".to_string(),
                         cwd: None,
                         mode: Some(SubAgentMode::Explore),
-                        execution: Some(
-                            phoenix_core::domain::sm_state::ExecutionSelection::Model {
-                                model: "ghost-model".to_string(),
-                                connection: "openai_responses".into(),
-                                reasoning_effort: None,
-                            },
-                        ),
+                        model: Some("ghost-model".to_string()),
                         max_turns: None,
                         agent_type: None,
                     },
@@ -19706,13 +19296,8 @@ mod work_subagent_cwd_guard_tests {
     async fn advertised_model_removed_from_live_registry_is_rejected() {
         let parent = TempDir::new().expect("parent tempdir");
         let mut rt = runtime_in_direct_mode(parent.path());
-        rt.spawn_catalog = Some(super::super::agent_execution::SpawnCatalog::resolve(
-            &rt.agent_config,
-            rt.llm_registry.available_execution_routes(),
-        ));
-        rt.llm_registry = Arc::new(ModelRegistry::new_empty());
         assert!(
-            rt.llm_registry.get("gpt-5.6-sol").is_none(),
+            rt.llm_registry.get("test-model").is_none(),
             "test requires the live registry to disagree with the frozen snapshot"
         );
 
@@ -19722,11 +19307,7 @@ mod work_subagent_cwd_guard_tests {
                     task: "inspect".to_string(),
                     cwd: None,
                     mode: Some(SubAgentMode::Explore),
-                    execution: Some(phoenix_core::domain::sm_state::ExecutionSelection::Model {
-                        model: "gpt-5.6-sol".to_string(),
-                        connection: "openai_responses".into(),
-                        reasoning_effort: None,
-                    }),
+                    model: Some("test-model".to_string()),
                     max_turns: None,
                     agent_type: None,
                 }],
@@ -19738,7 +19319,7 @@ mod work_subagent_cwd_guard_tests {
             Some(Event::ToolComplete { result, .. }) => {
                 let message = tool_result_text(&result);
                 assert!(
-                    message.contains("gpt-5.6-sol") && message.contains("unavailable"),
+                    message.contains("Unknown model 'test-model'"),
                     "got: {message}"
                 );
             }
@@ -19747,12 +19328,9 @@ mod work_subagent_cwd_guard_tests {
     }
 
     #[tokio::test]
-    async fn omitted_execution_and_blank_cwd_use_defaults() {
+    async fn blank_model_and_cwd_use_defaults() {
         let parent = TempDir::new().expect("parent tempdir");
-        let (spawn_tx, mut spawn_rx) = mpsc::channel::<SubAgentSpawnRequest>(1);
-        let (cancel_tx, _cancel_rx) = mpsc::channel(1);
-        let mut rt = runtime_in_direct_mode(parent.path()).with_spawn_channels(spawn_tx, cancel_tx);
-        rt.context.effort = Some(phoenix_core::domain::llm_types::ModelEffort::High);
+        let mut rt = runtime_in_direct_mode(parent.path());
 
         let result = rt
             .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
@@ -19760,7 +19338,7 @@ mod work_subagent_cwd_guard_tests {
                     task: "inspect".to_string(),
                     cwd: Some("  ".to_string()),
                     mode: Some(SubAgentMode::Explore),
-                    execution: None,
+                    model: Some(String::new()),
                     max_turns: None,
                     agent_type: None,
                 }],
@@ -19768,16 +19346,15 @@ mod work_subagent_cwd_guard_tests {
             .await
             .expect("handle_spawn_agents_tool returned error");
 
-        assert!(matches!(result, Some(Event::SpawnAgentsComplete { .. })));
-        let request = spawn_rx.try_recv().expect("spawn request sent");
-        assert_eq!(request.spec.model_id, "gpt-5.6-sol");
-        assert_eq!(request.spec.connection, "openai_responses");
-        assert_eq!(request.spec.effort, rt.context.effort);
-        assert_eq!(request.spec.mode, SubAgentMode::Explore);
-        assert_eq!(
-            std::fs::canonicalize(request.spec.cwd).unwrap(),
-            std::fs::canonicalize(parent.path()).unwrap()
-        );
+        match result {
+            Some(Event::ToolComplete { result, .. }) => {
+                let message = tool_result_text(&result);
+                assert!(!message.contains("Unknown model"), "got: {message}");
+                assert!(!message.contains("working directory"), "got: {message}");
+                assert!(message.contains("not configured"), "got: {message}");
+            }
+            other => panic!("expected missing-channel ToolComplete, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -19792,7 +19369,7 @@ mod work_subagent_cwd_guard_tests {
                     task: "inspect".to_string(),
                     cwd: Some("nested".to_string()),
                     mode: Some(SubAgentMode::Explore),
-                    execution: None,
+                    model: None,
                     max_turns: None,
                     agent_type: None,
                 }],
@@ -19810,16 +19387,24 @@ mod work_subagent_cwd_guard_tests {
         }
     }
 
+    /// `agent_type` resolves against the catalog frozen on the runtime, not a
+    /// fresh filesystem scan (REQ-AG-008): the worktree has no `.claude/agents`,
+    /// yet a frozen-catalog agent resolves, so we reach the missing-spawn-channel
+    /// path rather than an "Unknown `agent_type`" rejection.
     #[tokio::test]
-    async fn agent_type_resolves_from_loaded_config() {
+    async fn agent_type_resolves_from_frozen_catalog_not_filesystem() {
         let worktree = TempDir::new().expect("worktree tempdir");
         let catalog = std::sync::Arc::from(vec![phoenix_agents::AgentDefinition {
             name: "reviewer".to_string(),
             description: "Reviews".to_string(),
             body: "You are a reviewer.".to_string(),
-            execution: None,
+            path: std::path::PathBuf::from("/virtual/reviewer.md"),
+            source_dir: ".claude/agents".to_string(),
+            model: None,
+            mode: None,
+            tools: None,
         }]);
-        let mut rt = runtime_in_work_mode(worktree.path()).with_agent_catalog(&catalog);
+        let mut rt = runtime_in_work_mode(worktree.path()).with_agent_catalog(catalog);
 
         let result = rt
             .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
@@ -19827,7 +19412,7 @@ mod work_subagent_cwd_guard_tests {
                     task: "review".to_string(),
                     cwd: None,
                     mode: Some(SubAgentMode::Explore),
-                    execution: None,
+                    model: None,
                     max_turns: None,
                     agent_type: Some("reviewer".to_string()),
                 }],
@@ -19869,7 +19454,7 @@ mod work_subagent_cwd_guard_tests {
                     task: "do scoped writes".to_string(),
                     cwd: Some(nested.to_string_lossy().to_string()),
                     mode: Some(SubAgentMode::Work),
-                    execution: None,
+                    model: None,
                     max_turns: None,
                     agent_type: None,
                 }],
@@ -19912,7 +19497,7 @@ mod work_subagent_cwd_guard_tests {
                     task: "follow the symlink".to_string(),
                     cwd: Some(symlink.to_string_lossy().to_string()),
                     mode: Some(SubAgentMode::Work),
-                    execution: None,
+                    model: None,
                     max_turns: None,
                     agent_type: None,
                 }],
@@ -20028,7 +19613,7 @@ mod work_subagent_cwd_guard_tests {
                     task: "traverse out".to_string(),
                     cwd: Some(traversing),
                     mode: Some(SubAgentMode::Work),
-                    execution: None,
+                    model: None,
                     max_turns: None,
                     agent_type: None,
                 }],
@@ -20166,14 +19751,28 @@ mod sender_drop_forwarder_tests {
     #[tokio::test]
     async fn llm_sender_drop_yields_network_error_outcome() {
         let (llm_tx, llm_rx) = oneshot::channel::<LlmOutcome>();
-        let (llm_outcome_tx, mut llm_outcome_rx) = mpsc::channel::<(u64, LlmOutcome)>(4);
+        let (llm_outcome_tx, mut llm_outcome_rx) = mpsc::channel::<(
+            u64,
+            crate::runtime::traits::ToolCapabilityGeneration,
+            LlmOutcome,
+        )>(4);
 
         drop(llm_tx);
 
-        forward_llm_outcome(llm_rx, 7, llm_outcome_tx).await;
+        forward_llm_outcome(
+            llm_rx,
+            7,
+            crate::runtime::traits::ToolCapabilityGeneration::INITIAL,
+            llm_outcome_tx,
+        )
+        .await;
 
         match llm_outcome_rx.try_recv() {
-            Ok((generation, LlmOutcome::NetworkError { message })) => {
+            Ok((generation, capability_generation, LlmOutcome::NetworkError { message })) => {
+                assert_eq!(
+                    capability_generation,
+                    crate::runtime::traits::ToolCapabilityGeneration::INITIAL
+                );
                 assert_eq!(
                     generation, 7,
                     "forwarder must stamp the dispatch generation"
@@ -20958,22 +20557,14 @@ mod stale_tool_result_clearing_tests {
         assert!(plan.cleared_sequence_ids.is_empty());
     }
 
-    /// Production wraps the tool registry in `Arc`, and the runtime caches the
-    /// clearable set from it. The `Arc<T>` blanket impl must forward
-    /// `clearable_tool_names` — falling back to the empty default would silently
-    /// make nothing clearable, disabling the whole feature in production while
-    /// the planner unit tests (which pass the set directly) stay green.
     #[tokio::test]
-    async fn arc_tool_executor_forwards_clearable_tool_names() {
+    async fn arc_tool_executor_forwards_capability_snapshot() {
         use crate::runtime::testing::MockToolExecutor;
         use crate::runtime::traits::ToolExecutor;
 
         let arc: Arc<MockToolExecutor> =
             Arc::new(MockToolExecutor::new().with_clearable_tool("bash"));
-        assert!(
-            arc.clearable_tool_names().contains("bash"),
-            "Arc<T> must forward clearable_tool_names, not use the empty default",
-        );
+        assert!(arc.capability_snapshot().clearable_names.contains("bash"));
     }
 
     /// True if `tool_use_id` is rendered as a cleared placeholder (no images).
@@ -21313,7 +20904,7 @@ mod llm_generation_guard_tests {
             request_id: "late-response".to_string(),
         };
 
-        rt.process_generation_tagged_llm_outcome(1, late_response)
+        rt.process_generation_tagged_llm_outcome(1, rt.tool_capability.generation, late_response)
             .await;
         tokio::task::yield_now().await;
 
@@ -21333,6 +20924,7 @@ mod llm_generation_guard_tests {
 
         rt.process_generation_tagged_llm_outcome(
             1,
+            rt.tool_capability.generation,
             LlmOutcome::NetworkError {
                 message: "stale aborted request".to_string(),
             },

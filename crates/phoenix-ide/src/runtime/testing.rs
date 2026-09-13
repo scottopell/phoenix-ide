@@ -193,6 +193,11 @@ pub struct MockToolExecutor {
     outputs: HashMap<String, ToolOutput>,
     definitions: Vec<ToolDefinition>,
     clearable: std::collections::HashSet<String>,
+    capability: Mutex<(
+        phoenix_core::work_scope::ResourceAuthority,
+        crate::runtime::traits::ToolCapabilityGeneration,
+    )>,
+    model_ids: Arc<[String]>,
     /// Record of tool executions
     pub executions: Mutex<Vec<(String, Value)>>,
 }
@@ -204,6 +209,11 @@ impl MockToolExecutor {
             outputs: HashMap::new(),
             definitions: Vec::new(),
             clearable: std::collections::HashSet::new(),
+            capability: Mutex::new((
+                phoenix_core::work_scope::ResourceAuthority::Restricted,
+                crate::runtime::traits::ToolCapabilityGeneration::INITIAL,
+            )),
+            model_ids: Arc::from(Vec::new()),
             executions: Mutex::new(Vec::new()),
         }
     }
@@ -224,6 +234,19 @@ impl MockToolExecutor {
     /// Mark `name` as a clearable tool (its stale results may be cleared).
     pub fn with_clearable_tool(mut self, name: impl Into<String>) -> Self {
         self.clearable.insert(name.into());
+        self
+    }
+
+    pub fn with_authority(
+        mut self,
+        authority: phoenix_core::work_scope::ResourceAuthority,
+    ) -> Self {
+        self.capability.get_mut().unwrap().0 = authority;
+        self
+    }
+
+    pub fn with_subagent_models(mut self, model_ids: Vec<String>) -> Self {
+        self.model_ids = Arc::from(model_ids);
         self
     }
 
@@ -255,8 +278,27 @@ impl ToolExecutor for MockToolExecutor {
         self.definitions.clone()
     }
 
-    fn clearable_tool_names(&self) -> std::collections::HashSet<String> {
-        self.clearable.clone()
+    fn subagent_model_ids(&self) -> Arc<[String]> {
+        self.model_ids.clone()
+    }
+
+    fn capability_snapshot(&self) -> crate::runtime::traits::ToolCapabilitySnapshot {
+        let (authority, generation) = *self.capability.lock().unwrap();
+        crate::runtime::traits::ToolCapabilitySnapshot {
+            generation,
+            authority,
+            clearable_names: Arc::new(self.clearable.clone()),
+        }
+    }
+
+    fn upgrade_to_work_mode(
+        &self,
+    ) -> Result<crate::runtime::traits::ToolCapabilitySnapshot, String> {
+        let mut capability = self.capability.lock().unwrap();
+        capability.0 = phoenix_core::work_scope::ResourceAuthority::Work;
+        capability.1 = capability.1.next();
+        drop(capability);
+        Ok(self.capability_snapshot())
     }
 }
 
@@ -944,17 +986,6 @@ impl InMemoryStorage {
             .flatten()
             .cloned()
             .collect()
-    }
-
-    pub fn approved_task_authority(
-        &self,
-        conv_id: &str,
-    ) -> Option<phoenix_core::task_handoff::ApprovedTaskSnapshot> {
-        self.approved_task_authorities
-            .lock()
-            .unwrap()
-            .get(conv_id)
-            .cloned()
     }
 
     pub fn queue_complete_creation_job_result(
@@ -1776,19 +1807,6 @@ impl MessageStore for InMemoryStorage {
         Ok(())
     }
 
-    async fn persist_tool_round_and_state(
-        &self,
-        conv_id: &str,
-        assistant: &Message,
-        tool_results: &[Message],
-        state: &ConvState,
-        state_updated_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), String> {
-        self.persist_tool_round(conv_id, assistant, tool_results)
-            .await?;
-        self.update_state(conv_id, state, state_updated_at).await
-    }
-
     async fn persist_tool_round_with_terminal_obligation(
         &self,
         conv_id: &str,
@@ -2045,30 +2063,17 @@ impl StateStore for InMemoryStorage {
         approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
     ) -> Result<(), String> {
         let snapshot = phoenix_core::task_handoff::ApprovedTaskSnapshot::from(approval);
-        self.approved_task_authorities
-            .lock()
-            .unwrap()
-            .insert(conv_id.to_string(), snapshot);
-        Ok(())
-    }
-
-    async fn persist_approved_task_authority_and_state(
-        &self,
-        conv_id: &str,
-        approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
-        approval_message: &Message,
-        state: &ConvState,
-        state_updated_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), String> {
-        self.persist_approved_task_authority(conv_id, approval)
-            .await?;
-        self.messages
-            .lock()
-            .unwrap()
-            .entry(conv_id.to_string())
-            .or_default()
-            .push(approval_message.clone());
-        self.update_state(conv_id, state, state_updated_at).await
+        let mut authorities = self.approved_task_authorities.lock().unwrap();
+        match authorities.get(conv_id) {
+            Some(existing) if existing != &snapshot => {
+                Err("approved task conflicts with the committed objective".to_string())
+            }
+            Some(_) => Ok(()),
+            None => {
+                authorities.insert(conv_id.to_string(), snapshot);
+                Ok(())
+            }
+        }
     }
 
     async fn get_conversation_mode(&self, conv_id: &str) -> Result<crate::db::ConvMode, String> {
@@ -2400,6 +2405,25 @@ impl<L: LlmClient + 'static, T: ToolExecutor + 'static> TestRuntime<L, T> {
     pub fn messages(&self) -> Vec<Message> {
         self.storage.get_all_messages("test-conv")
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_tool_context_for_authority(
+    authority: phoenix_core::work_scope::ResourceAuthority,
+) -> ToolContext {
+    ToolContext::new_with_resource_access(
+        tokio_util::sync::CancellationToken::new(),
+        "test-capability-conversation".to_string(),
+        std::env::temp_dir(),
+        Arc::new(BrowserSessionManager::default()),
+        Arc::new(crate::tools::BashHandleRegistry::new()),
+        Arc::new(ModelRegistry::new_empty()),
+        crate::terminal::ActiveTerminals::new(),
+        Arc::new(crate::tools::TmuxRegistry::default()),
+        None,
+        crate::work_scope::WorkScopeId::new(),
+        authority,
+    )
 }
 
 // ============================================================================
@@ -3549,7 +3573,7 @@ mod tests {
                 task: format!("task {i}"),
                 cwd: None,
                 mode: None,
-                execution: None,
+                model: None,
                 max_turns: None,
                 agent_type: None,
             })

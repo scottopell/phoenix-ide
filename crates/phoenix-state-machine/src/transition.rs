@@ -4722,7 +4722,6 @@ mod tests {
             resource_scope: phoenix_core::work_scope::ResourceScopeKey::Work(
                 phoenix_core::work_scope::WorkScopeId::new(),
             ),
-            resource_authority: phoenix_core::work_scope::ResourceAuthority::Restricted,
             work_scope_worktree: None,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: phoenix_core::llm_language::LlmLanguage::default(),
@@ -4802,7 +4801,6 @@ mod tests {
             resource_scope: phoenix_core::work_scope::ResourceScopeKey::Work(
                 phoenix_core::work_scope::WorkScopeId::new(),
             ),
-            resource_authority: phoenix_core::work_scope::ResourceAuthority::Restricted,
             work_scope_worktree: None,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: phoenix_core::llm_language::LlmLanguage::default(),
@@ -5148,7 +5146,6 @@ mod tests {
             resource_scope: phoenix_core::work_scope::ResourceScopeKey::Work(
                 phoenix_core::work_scope::WorkScopeId::new(),
             ),
-            resource_authority: phoenix_core::work_scope::ResourceAuthority::Restricted,
             work_scope_worktree: None,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: phoenix_core::llm_language::LlmLanguage::default(),
@@ -5350,7 +5347,6 @@ mod tests {
             resource_scope: phoenix_core::work_scope::ResourceScopeKey::Work(
                 phoenix_core::work_scope::WorkScopeId::new(),
             ),
-            resource_authority: phoenix_core::work_scope::ResourceAuthority::Restricted,
             work_scope_worktree: None,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: phoenix_core::llm_language::LlmLanguage::default(),
@@ -5415,7 +5411,6 @@ mod tests {
             resource_scope: phoenix_core::work_scope::ResourceScopeKey::Work(
                 phoenix_core::work_scope::WorkScopeId::new(),
             ),
-            resource_authority: phoenix_core::work_scope::ResourceAuthority::Restricted,
             work_scope_worktree: None,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: phoenix_core::llm_language::LlmLanguage::default(),
@@ -5487,7 +5482,6 @@ mod tests {
             resource_scope: phoenix_core::work_scope::ResourceScopeKey::Work(
                 phoenix_core::work_scope::WorkScopeId::new(),
             ),
-            resource_authority: phoenix_core::work_scope::ResourceAuthority::Restricted,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: phoenix_core::llm_language::LlmLanguage::default(),
             persona: None,
