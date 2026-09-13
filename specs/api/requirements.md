@@ -159,6 +159,13 @@ WHEN the client requests Close conversation
 THE SYSTEM SHALL transition the conversation from Open to History through the explicit Close flow
 AND run the resource-cleanup cascade required by that Close flow
 
+WHEN a Close or compatibility lifecycle request encounters an existing needs-repair Close attempt
+THE SYSTEM SHALL either resume retirement for that same exact attempt when safe
+OR SHALL return a typed conflict containing `attempt_id`, `active_transcript_id`, and a structured `recovery_action`
+AND the recovery action SHALL identify the exact retry-retirement method and route only when retry is permitted
+AND a persistence-evidence conflict SHALL additionally contain stable `failed_invariant` and `failed_relation` identifiers
+AND the actionable response SHALL NOT expose or require parsing a raw storage-engine error code
+
 THE SYSTEM SHALL NOT expose `archive`, `unarchive`, `abandon`, or `mark_merged` as current ordinary lifecycle write operations
 
 WHEN the client requests delete for a History conversation
