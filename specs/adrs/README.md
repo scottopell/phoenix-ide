@@ -60,6 +60,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [046](046_productconversation-owns-aggregate-presentation.md) | ProductConversation owns aggregate presentation without duplicating transcript authority | Accepted | REQ-BED-030A; `ProductConversation`, transcript members |
 | [047](047_global-coordinator-unsandboxed-bash.md) | Global Coordinator uses explicitly targeted unsandboxed Bash | Accepted | REQ-BASH-012/013, REQ-GR-007; singleton Coordinator, explicit active WorkScope target |
 | [048](048_absolute-llm-provider-attempt-deadline.md) | LLM provider attempts use one absolute service deadline | Accepted | REQ-LLM-011–013; request liveness, timeout metrics, durable retry/terminalization |
+| [049](049_close-retirement-persists-writer-authority-and-atomically-adopts-retry-evidence.md) | Close retirement persists writer authority and atomically adopts retry evidence | Accepted | REQ-WL-002b/002c, REQ-BED-029, REQ-API-006; `AmbientWriterEvidenceRow`, `RetainedCleanupEvidenceAdoption` |
 
 ## For agents: which decisions bind your task
 
@@ -85,6 +86,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying wake-plane registration receipts, durable wake observations, or wake resume outbox | 006, 011, 012 |
 | Specifying the shared durable workflow engine, profiles, migration, or drain | 013, 014, 015, 016, 019, 020, 024 |
 | Specifying product conversation lifecycle versus WorkScope resource ownership, continuation topology, or worktree lifecycle across continuations | 026 |
+| Specifying Close ambient-writer evidence, post-retirement quiescence, exact-attempt retained cleanup adoption, or needs-repair recovery guidance | 048, then 042, 041, 040, 039, 034, 031, and 026 |
 | Specifying ProductConversation persistence identity, aggregate presentation, transcript-member authority, Close-attempt ownership, or staged lifecycle/attachment authority cutover | 031 and 026, refined by 046 |
 | Specifying hidden GitRepository identity, mutable repository locator/default-branch observations, database replacement/rollback, retained restart-repair evidence, repository authority activation, or repository survival beyond one deleted conversation | 035 for activation, then 033, 032, 031, and 026 |
 | Specifying workflow CAS, effect claims, leases, ambiguity, or compensation | 014, 019 |
@@ -145,6 +147,7 @@ ADR-000 (adopt spEARS v2 for new work)
           │       └── ADR-030 (iOS prose-review authority survives the composer handoff)
           └── ADR-031 (ProductConversation persistence uses staged single authority)
               ├── ADR-046 (ProductConversation owns aggregate presentation without duplicating transcript authority)
+              ├── ADR-049 (Close retirement persists writer authority and atomically adopts retry evidence)
               ├── ADR-043 (Creation staging uses a private locked namespace)
               ├── ADR-044 (Creation publication uses request-bound identity and immutable starting pins)
               └── ADR-032 (GitRepository is hidden infrastructure; Project is retired)

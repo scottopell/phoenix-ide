@@ -137,6 +137,21 @@ WHEN retirement cannot confidently identify a resource as the resource owned by 
 THE SYSTEM SHALL leave that resource untouched
 AND SHALL report typed repair information rather than silently succeeding
 
+WHEN Phoenix inspects processes outside the sealed gate for authority to write a quarantined worktree
+THE SYSTEM SHALL distinguish a filesystem path reference from write authority
+AND SHALL treat only a writable open descriptor whose access mode is `write_only` or `read_write` as positive writer evidence
+AND SHALL NOT treat a read-only descriptor, current working directory, process root, executable text reference, or read-only mapping as write authority
+
+EACH positive ambient-writer observation SHALL durably identify the detector, process ID, process start/incarnation, executable, exact matched path, match kind, and descriptor access mode
+AND THE SYSTEM SHALL treat an observation missing any of those facts as detector-indeterminate rather than fabricating positive evidence
+
+AFTER the sealed gate's owned resources have retired and before final worktree removal
+THE SYSTEM SHALL perform at most three ambient-writer observations separated by 100 milliseconds on a monotonic clock
+AND SHALL proceed only after two consecutive authoritative observations report no writer
+AND SHALL permit a writable process incarnation that disappears to be treated as transient only after those two consecutive no-writer observations
+AND SHALL preserve the quarantine and route the exact attempt to typed repair when the same writable process incarnation remains across observations, the final observation still reports a writer, the observation budget ends without two consecutive no-writer observations, or any observation is detector-indeterminate
+AND SHALL make observation count and spacing injectable so deterministic tests require no wall-clock sleep
+
 THE SYSTEM SHALL treat the WorkScope admission gate and Phoenix-created private resource directories as the trust boundary for normal Close reliability
 AND SHALL perform final directory retirement only through a random Phoenix-owned private directory with owner-only permissions after descriptor-bound identity validation of that directory and the object being removed
 
@@ -161,6 +176,14 @@ THE SYSTEM SHALL reseal its exact WorkScope gate and reinspect the current workt
 AND SHALL safely retire a tmux server only when its sealed socket path and Phoenix-controlled server token identify the same server
 AND SHALL leave process-epoch resources that have no live in-memory permit untouched
 AND SHALL route an ambiguous tmux server, worktree, or ownership record to `NeedsRepair`
+
+WHEN a retry seals a fresh inspection generation for the same exact Close attempt and compatible prior-generation dispatch plus worktree cleanup-plan evidence exists
+THE SYSTEM SHALL validate the same attempt, WorkScope, worktree identity, worktree fingerprint, typed worktree locator, administrative-directory identity, and expected retry-generation resource
+AND SHALL adopt the dispatch parent and cleanup-plan child into the fresh generation in one transaction while preserving every prior-generation row unchanged
+AND SHALL write the adopted dispatch before its cleanup-plan child within that transaction
+AND SHALL make an identical replay an idempotent no-op
+AND SHALL roll back the complete adoption when either row conflicts or cannot be persisted
+AND SHALL identify the failed typed evidence invariant and persistence relation in repair output rather than exposing a raw storage-engine error code
 
 WHEN the attached `WorkScope` also owns attachments or other work-affine retained resources that are shared across transcript rows of the same open product conversation
 THE SYSTEM SHALL retire or preserve those resources according to that same WorkScope ownership boundary rather than according to individual transcript-row ownership
@@ -231,6 +254,13 @@ WHEN the user invokes retry from needs-repair
 THE SYSTEM SHALL request retirement again for that same exact Close attempt
 AND SHALL preserve the attempt-bound retirement evidence and residual state already recorded for prior steps
 AND SHALL NOT mint a new Close attempt, silently complete the Close obligation, or mutate ProductConversation lifecycle state outside the typed Close retry command
+
+WHEN a Close compatibility request encounters an existing needs-repair attempt
+THE SYSTEM SHALL either safely issue retry for that same exact attempt under aggregate mutation admission
+OR SHALL return structured recovery guidance containing the exact attempt identifier, active transcript identifier, and typed retry action
+AND SHALL include a typed failed invariant and persistence relation when persistence evidence is inconsistent
+AND SHALL NOT require a client to parse prose or a raw storage-engine error to discover the recovery action
+AND SHALL NOT mint or imply a replacement Close attempt
 
 WHEN repair completes automatically through operator action or an idempotent external precondition change
 THE SYSTEM SHALL converge by driving the same exact-attempt retry/completion authority rather than by fabricating an unbound success path that bypasses the visible needs-repair attempt
