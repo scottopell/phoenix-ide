@@ -406,7 +406,9 @@ impl ModelSpec {
         &self,
         service: &dyn crate::LlmService,
     ) -> ServiceTierCapabilities {
-        if service.uses_codex_bridge() || self.api_name == "gpt-6-astra" {
+        if service.uses_codex_bridge()
+            || (self.api_name == "gpt-6-astra" && service.uses_official_openai_responses())
+        {
             self.service_tier_capabilities
         } else {
             ServiceTierCapabilities::Unsupported

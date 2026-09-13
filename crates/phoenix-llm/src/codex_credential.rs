@@ -370,15 +370,7 @@ impl CredentialSource for AccountBoundCodexCredential {
     }
 
     async fn invalidate(&self) -> bool {
-        let auth_path = self.source.auth_path.clone();
-        let live_account_id = tokio::task::spawn_blocking(move || {
-            read_auth_file(&auth_path).map(|auth| auth.tokens.and_then(|tokens| tokens.account_id))
-        })
-        .await;
-        match live_account_id {
-            Ok(Ok(account_id)) if account_id == self.account_id => self.source.invalidate().await,
-            Ok(Ok(_) | Err(_)) | Err(_) => false,
-        }
+        false
     }
 
     async fn last_error_hint(&self) -> Option<String> {
@@ -791,7 +783,7 @@ mod tests {
         let bound = AccountBoundCodexCredential::new(credential, account_id);
 
         assert_eq!(bound.get().await.as_deref(), Some(jwt.as_str()));
-        assert!(bound.invalidate().await);
+        assert!(!bound.invalidate().await);
     }
 
     #[tokio::test]

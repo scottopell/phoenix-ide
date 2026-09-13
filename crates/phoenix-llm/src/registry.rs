@@ -644,8 +644,8 @@ impl ModelRegistry {
     /// endpoints derived from `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL`. Falls back
     /// to the configured model list if discovery is unavailable or unhelpful.
     pub async fn new_with_discovery(config: &LlmConfig) -> Self {
-        let codex_catalog = Self::discover_codex_catalog(config).await;
         let Some(discovery) = Self::build_discovery_config(config).await else {
+            let codex_catalog = Self::discover_codex_catalog(config).await;
             return Self::new_with_codex_catalog(config, codex_catalog.as_ref());
         };
 
@@ -656,11 +656,13 @@ impl ModelRegistry {
             tracing::warn!(
                 "Model discovery returned no models, falling back to configured model list"
             );
+            let codex_catalog = Self::discover_codex_catalog(config).await;
             return Self::new_with_codex_catalog(config, codex_catalog.as_ref());
         }
 
         tracing::info!("Discovered {} models", discovered.len());
 
+        let codex_catalog = Self::discover_codex_catalog(config).await;
         let configured_specs = Self::model_specs(config);
         let fallback_backends = Self::discovery_fallback_backends(&configured_specs, &discovered);
 

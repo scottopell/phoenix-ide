@@ -191,6 +191,10 @@ pub trait LlmService: Send + Sync {
         false
     }
 
+    fn uses_official_openai_responses(&self) -> bool {
+        false
+    }
+
     /// Request-shape limits for tool-less continuation-summary requests.
     fn continuation_request_limits(&self) -> ContinuationRequestLimits {
         ContinuationRequestLimits::TokenWindowOnly
@@ -506,6 +510,10 @@ impl LlmService for LoggingService {
 
     fn uses_codex_bridge(&self) -> bool {
         self.inner.uses_codex_bridge()
+    }
+
+    fn uses_official_openai_responses(&self) -> bool {
+        self.inner.uses_official_openai_responses()
     }
 
     fn continuation_request_limits(&self) -> ContinuationRequestLimits {

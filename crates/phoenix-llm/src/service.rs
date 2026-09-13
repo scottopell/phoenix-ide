@@ -235,6 +235,12 @@ impl LlmService for LlmServiceImpl {
         self.use_codex_backend
     }
 
+    fn uses_official_openai_responses(&self) -> bool {
+        self.spec.backend == crate::ModelBackend::OpenAIResponses
+            && !self.use_codex_backend
+            && self.openai_responses_base_url.is_none()
+    }
+
     fn continuation_request_limits(&self) -> super::ContinuationRequestLimits {
         if self.use_codex_backend && openai::supports_responses_lite(&self.spec.api_name) {
             super::ContinuationRequestLimits::codex_responses_lite()
