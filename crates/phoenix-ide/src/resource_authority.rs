@@ -203,9 +203,14 @@ pub(crate) mod tests {
         db.create_conversation(&parent_id, "parent", "/tmp", true, None, None)
             .await
             .unwrap();
-        db.persist_approved_task_authority(&parent_id, &approval())
-            .await
-            .unwrap();
+        db.persist_approved_task_authority(
+            &parent_id,
+            &approval(),
+            &phoenix_core::domain::sm_state::ConvState::Idle,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
         let parent = db.get_conversation(&parent_id).await.unwrap();
         let scope = parent.attached_work_scope_id.clone().unwrap();
         let child = db
@@ -253,9 +258,14 @@ pub(crate) mod tests {
         let restricted = resolve_resource_authority(&db, &before).await.unwrap();
         assert_eq!(restricted.authority, ResourceAuthority::Restricted);
 
-        db.persist_approved_task_authority(id.as_str(), &approval())
-            .await
-            .unwrap();
+        db.persist_approved_task_authority(
+            id.as_str(),
+            &approval(),
+            &phoenix_core::domain::sm_state::ConvState::Idle,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
         let after = db.get_conversation(id.as_str()).await.unwrap();
         assert!(matches!(after.conv_mode, ConvMode::Explore { .. }));
         let promoted = resolve_resource_authority(&db, &after).await.unwrap();

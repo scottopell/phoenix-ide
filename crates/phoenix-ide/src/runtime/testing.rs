@@ -252,6 +252,11 @@ impl MockToolExecutor {
         self
     }
 
+    pub fn advance_capability_generation_for_test(&self) {
+        let mut capability = self.capability.lock().unwrap();
+        capability.1 = capability.1.next();
+    }
+
     pub fn with_subagent_models(mut self, model_ids: Vec<String>) -> Self {
         self.model_ids = Arc::from(model_ids);
         self
@@ -298,7 +303,7 @@ impl ToolExecutor for MockToolExecutor {
         }
     }
 
-    fn upgrade_to_work_mode(
+    async fn upgrade_to_work_mode(
         &self,
     ) -> Result<crate::runtime::traits::ToolCapabilitySnapshot, String> {
         if self.fail_capability_upgrade {
@@ -2078,8 +2083,14 @@ impl StateStore for InMemoryStorage {
         &self,
         conv_id: &str,
         approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
+        approved_state: &ConvState,
+        _state_updated_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), String> {
         let snapshot = phoenix_core::task_handoff::ApprovedTaskSnapshot::from(approval);
+        self.states
+            .lock()
+            .unwrap()
+            .insert(conv_id.to_string(), approved_state.clone());
         let mut authorities = self.approved_task_authorities.lock().unwrap();
         match authorities.get(conv_id) {
             Some(existing) if existing != &snapshot => {

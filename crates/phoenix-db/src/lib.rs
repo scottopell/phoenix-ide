@@ -33,17 +33,11 @@ use phoenix_core::domain::creation_protocol::{
     CreationStage, CreationStatus, CreationWorkerId,
 };
 use phoenix_core::domain::db_schema as schema;
-use phoenix_core::domain::product_conversation::{
-    AutoContinueOnContextExhaustion, AutomaticContinuationPhase, ContinuationOpeningAuthority,
-    ProductConversationId,
-};
 use phoenix_core::domain::sm_state::LEGACY_CONTINUATION_OPERATION_ID;
 use phoenix_core::work_scope::{
     AuthorityKind, EnvironmentContext, RuntimeRole, WorkScopeId, WorkScopeLifecycle,
     WorkScopeRetirementBlocker, WorkScopeRetirementOutcome, WorkScopeRetirementPrecondition,
 };
-#[cfg(test)]
-use std::future::Future;
 
 pub use close_foundation::*;
 pub use coordinator_query::{
@@ -75,13 +69,6 @@ pub use workflow::*;
 
 /// Maximum pending steering entries permitted per conversation.
 pub const MAX_STEERING_QUEUE_DEPTH: usize = 5;
-
-/// Resolved spawn settings written in the child's creation transaction.
-pub struct SubAgentExecution<'a> {
-    pub connection: &'a str,
-    pub effort: Option<ModelEffort>,
-    pub persona: Option<&'a str>,
-}
 
 use chrono::{DateTime, Utc};
 use phoenix_core::domain::llm_types::{
@@ -401,62 +388,7 @@ pub(crate) async fn commit_continuation_tx(
     if updated.rows_affected() == 0 {
         return Ok(ContinuationCommitOutcome::Stale);
     }
-    admit_automatic_continuation_tx(
-        tx,
-        conversation_id,
-        operation_id,
-        &message.message_id,
-        state_updated_at.timestamp_micros(),
-    )
-    .await?;
     Ok(ContinuationCommitOutcome::Applied)
-}
-
-async fn admit_automatic_continuation_tx(
-    tx: &mut Transaction<'_, Sqlite>,
-    conversation_id: &str,
-    operation_id: &str,
-    summary_message_id: &str,
-    admitted_at_unix_micros: i64,
-) -> DbResult<()> {
-    let first_message_id = format!("automatic-continuation-{conversation_id}-{operation_id}");
-    sqlx::query(
-        "INSERT INTO automatic_continuation_admissions (
-             predecessor_conversation_id, product_conversation_id, summary_message_id,
-             operation_id, first_message_id, opening_authority, phase,
-             no_progress_attempts, last_error,
-             admitted_at_unix_micros, updated_at_unix_micros
-         )
-         SELECT conversation.id, conversation.product_conversation_id, ?2, ?3, ?4,
-                'generated_predecessor_context', 'admitted', 0, NULL, ?5, ?5
-         FROM conversations conversation
-         JOIN product_conversations product
-           ON product.id = conversation.product_conversation_id
-         WHERE conversation.id = ?1
-           AND conversation.parent_conversation_id IS NULL
-           AND conversation.runtime_role IN ('user', 'coordinator')
-           AND conversation.state_kind = 'context_exhausted'
-           AND conversation.continued_in_conv_id IS NULL
-           AND product.auto_continue_on_context_exhaustion = 1
-           AND (
-               product.kind = 'coordinator'
-               OR (product.kind = 'ordinary' AND product.ordinary_lifecycle = 'open')
-           )
-           AND NOT EXISTS (
-               SELECT 1 FROM close_obligations obligation
-               WHERE obligation.product_conversation_id = product.id
-                 AND obligation.phase <> 'completed'
-           )
-         ON CONFLICT(predecessor_conversation_id) DO NOTHING",
-    )
-    .bind(conversation_id)
-    .bind(summary_message_id)
-    .bind(operation_id)
-    .bind(first_message_id)
-    .bind(admitted_at_unix_micros)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
 }
 
 pub(crate) async fn reconcile_legacy_half_committed_continuation_tx(
@@ -579,50 +511,20 @@ pub struct ConversationCreationMetadataUpdate {
     pub desired_base_branch: Option<Option<String>>,
 }
 
-use phoenix_workflow::ClientTurnKey;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContinuationDispatchIntent {
     pub parent_conversation_id: String,
     pub successor_conversation_id: String,
-    pub message_id: ClientTurnKey,
+    pub message_id: String,
     pub handoff: String,
     pub user_agent: Option<String>,
-    pub opening_authority: ContinuationOpeningAuthority,
 }
 
 #[derive(Debug, Clone)]
 pub struct NewContinuationDispatchIntent {
-    pub message_id: ClientTurnKey,
+    pub message_id: String,
     pub handoff: String,
     pub user_agent: Option<String>,
-    pub opening_authority: ContinuationOpeningAuthority,
-}
-
-impl NewContinuationDispatchIntent {
-    #[must_use]
-    pub fn user_authorized(
-        message_id: ClientTurnKey,
-        handoff: String,
-        user_agent: Option<String>,
-    ) -> Self {
-        Self {
-            message_id,
-            handoff,
-            user_agent,
-            opening_authority: ContinuationOpeningAuthority::UserAuthorizedInstruction,
-        }
-    }
-
-    #[must_use]
-    pub fn generated_predecessor_context(message_id: ClientTurnKey, handoff: String) -> Self {
-        Self {
-            message_id,
-            handoff,
-            user_agent: None,
-            opening_authority: ContinuationOpeningAuthority::GeneratedPredecessorContext,
-        }
-    }
 }
 
 /// Outcome of [`Database::continue_conversation`] (REQ-BED-030).
@@ -1285,21 +1187,6 @@ pub enum ContinuationCommitOutcome {
     Stale,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AutomaticContinuationAdmission {
-    pub predecessor_conversation_id: String,
-    pub product_conversation_id: ProductConversationId,
-    pub summary_message_id: String,
-    pub operation_id: String,
-    pub first_message_id: ClientTurnKey,
-    pub opening_authority: ContinuationOpeningAuthority,
-    pub phase: AutomaticContinuationPhase,
-    pub no_progress_attempts: u32,
-    pub last_error: Option<String>,
-    pub admitted_at_unix_micros: i64,
-    pub updated_at_unix_micros: i64,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartupParentAction {
     Reconcile,
@@ -1345,15 +1232,6 @@ impl SubAgentCreationTestLatch {
 pub(crate) struct CloseFoundationTestLatch {
     pub transaction_entered: tokio::sync::Notify,
     pub release_transaction: tokio::sync::Notify,
-}
-
-#[cfg(test)]
-#[derive(Debug)]
-enum ContinuationTestHook {
-    PreReservationBarrier(std::sync::Arc<tokio::sync::Barrier>),
-    ContendedBeginImmediate {
-        attempted: std::sync::Arc<tokio::sync::Notify>,
-    },
 }
 
 #[cfg(test)]
@@ -1457,8 +1335,6 @@ pub struct Database {
     #[cfg(test)]
     pub(crate) close_foundation_test_latch: Option<std::sync::Arc<CloseFoundationTestLatch>>,
     #[cfg(test)]
-    continuation_test_hook: Option<std::sync::Arc<ContinuationTestHook>>,
-    #[cfg(test)]
     steering_begin_test_latch: Option<std::sync::Arc<SteeringBeginTestLatch>>,
     #[cfg(test)]
     steering_drain_test_latch: Option<std::sync::Arc<SteeringDrainTestLatch>>,
@@ -1479,8 +1355,6 @@ impl Clone for Database {
             sub_agent_creation_test_latch: self.sub_agent_creation_test_latch.clone(),
             #[cfg(test)]
             close_foundation_test_latch: self.close_foundation_test_latch.clone(),
-            #[cfg(test)]
-            continuation_test_hook: self.continuation_test_hook.clone(),
             #[cfg(test)]
             steering_begin_test_latch: self.steering_begin_test_latch.clone(),
             #[cfg(test)]
@@ -1716,8 +1590,6 @@ impl Database {
             sub_agent_creation_test_latch: None,
             #[cfg(test)]
             close_foundation_test_latch: None,
-            #[cfg(test)]
-            continuation_test_hook: None,
             #[cfg(test)]
             steering_begin_test_latch: None,
             #[cfg(test)]
@@ -3498,27 +3370,10 @@ impl Database {
         Ok(())
     }
 
-    /// Read a sub-agent's connection; pre-feature conversations have no row.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`DbError`] if the underlying database operation fails.
-    pub async fn get_sub_agent_execution_connection(
-        &self,
-        conversation_id: &str,
-    ) -> DbResult<Option<String>> {
-        sqlx::query_scalar(
-            "SELECT connection FROM sub_agent_execution_routes WHERE conversation_id = ?1",
-        )
-        .bind(conversation_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(DbError::from)
-    }
-
     /// Read a sub-agent conversation's persisted persona, if any.
     ///
     /// # Errors
+    ///
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn get_sub_agent_persona(&self, conversation_id: &str) -> DbResult<Option<String>> {
         let row: Option<(String,)> =
@@ -4045,7 +3900,6 @@ impl Database {
             seed_label,
             llm_language,
             ExpectedParentScope::NotChecked,
-            None,
         )
         .await
     }
@@ -4065,7 +3919,6 @@ impl Database {
         conv_mode: &ConvMode,
         llm_language: phoenix_core::llm_language::LlmLanguage,
         parent_scope: Option<&WorkScopeId>,
-        execution: SubAgentExecution<'_>,
     ) -> DbResult<Conversation> {
         self.create_conversation_with_project_inner(
             id,
@@ -4081,7 +3934,6 @@ impl Database {
             None,
             llm_language,
             ExpectedParentScope::Snapshot(parent_scope),
-            Some(execution),
         )
         .await
     }
@@ -4102,7 +3954,6 @@ impl Database {
         seed_label: Option<&str>,
         llm_language: phoenix_core::llm_language::LlmLanguage,
         expected_parent_scope: ExpectedParentScope<'_>,
-        sub_agent_execution: Option<SubAgentExecution<'_>>,
     ) -> DbResult<Conversation> {
         let now = Utc::now();
         let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
@@ -4177,9 +4028,6 @@ impl Database {
                         values
                     }
                 };
-            let inherited_effort = sub_agent_execution
-                .as_ref()
-                .map_or(inherited_effort, |execution| execution.effort);
             let product_conversation_id =
                 if let Some(product_conversation_id) = inherited_product_conversation_id {
                     product_conversation_id
@@ -4249,24 +4097,6 @@ impl Database {
 
             match result {
                 Ok(_) => {
-                    if let Some(execution) = &sub_agent_execution {
-                        sqlx::query(
-                            "INSERT INTO sub_agent_execution_routes (conversation_id, connection) VALUES (?1, ?2)",
-                        )
-                        .bind(id)
-                        .bind(execution.connection)
-                        .execute(&mut *tx)
-                        .await?;
-                        if let Some(persona) = execution.persona {
-                            sqlx::query(
-                                "INSERT INTO sub_agent_personas (conversation_id, persona) VALUES (?1, ?2)",
-                            )
-                            .bind(id)
-                            .bind(persona)
-                            .execute(&mut *tx)
-                            .await?;
-                        }
-                    }
                     tx.commit().await?;
                     break (work_scope_id, inherited_effort, product_conversation_id);
                 }
@@ -4431,30 +4261,18 @@ impl Database {
         parent_id: &str,
     ) -> DbResult<Option<ContinuationDispatchIntent>> {
         let row = sqlx::query(
-            "SELECT parent_conversation_id, successor_conversation_id, message_id,
-                    handoff, user_agent, opening_authority
-             FROM continuation_dispatch_intents WHERE parent_conversation_id = ?1",
+            "SELECT parent_conversation_id, successor_conversation_id, message_id, handoff, user_agent FROM continuation_dispatch_intents WHERE parent_conversation_id = ?1",
         )
         .bind(parent_id)
         .fetch_optional(&self.pool)
         .await?;
-        row.map(|row| {
-            Ok(ContinuationDispatchIntent {
-                parent_conversation_id: row.get("parent_conversation_id"),
-                successor_conversation_id: row.get("successor_conversation_id"),
-                message_id: ClientTurnKey::try_from(row.get::<String, _>("message_id"))
-                    .map_err(|error| DbError::Serialization(error.to_string()))?,
-                handoff: row.get("handoff"),
-                user_agent: row.get("user_agent"),
-                opening_authority: ContinuationOpeningAuthority::from_db_str(
-                    &row.get::<String, _>("opening_authority"),
-                )
-                .ok_or_else(|| {
-                    DbError::Serialization("unknown continuation opening authority".to_string())
-                })?,
-            })
-        })
-        .transpose()
+        Ok(row.map(|row| ContinuationDispatchIntent {
+            parent_conversation_id: row.get("parent_conversation_id"),
+            successor_conversation_id: row.get("successor_conversation_id"),
+            message_id: row.get("message_id"),
+            handoff: row.get("handoff"),
+            user_agent: row.get("user_agent"),
+        }))
     }
 
     /// Deletes a continuation intent after its message is durably represented elsewhere.
@@ -6518,109 +6336,6 @@ impl Database {
         Ok(ids)
     }
 
-    /// Read the aggregate-scoped automatic-continuation preference.
-    ///
-    /// # Errors
-    /// Returns an error when the conversation is missing or its preference cannot be read.
-    pub async fn auto_continue_on_context_exhaustion(
-        &self,
-        product_conversation_id: &ProductConversationId,
-    ) -> DbResult<AutoContinueOnContextExhaustion> {
-        let enabled: Option<i64> = sqlx::query_scalar(
-            "SELECT auto_continue_on_context_exhaustion
-             FROM product_conversations WHERE id = ?1",
-        )
-        .bind(product_conversation_id.as_str())
-        .fetch_optional(&self.pool)
-        .await?;
-        enabled
-            .map(|value| AutoContinueOnContextExhaustion::from(value != 0))
-            .ok_or_else(|| DbError::ProductConversationUnavailable(product_conversation_id.clone()))
-    }
-
-    /// Persist the aggregate-scoped automatic-continuation preference.
-    ///
-    /// The update is prospective: it never scans or admits an already-exhausted transcript.
-    ///
-    /// # Errors
-    /// Returns an error when the conversation is missing or the update fails.
-    pub async fn set_auto_continue_on_context_exhaustion(
-        &self,
-        product_conversation_id: &ProductConversationId,
-        preference: AutoContinueOnContextExhaustion,
-    ) -> DbResult<()> {
-        let updated = sqlx::query(
-            "UPDATE product_conversations
-             SET auto_continue_on_context_exhaustion = ?1
-             WHERE id = ?2",
-        )
-        .bind(i64::from(bool::from(preference)))
-        .bind(product_conversation_id.as_str())
-        .execute(&self.pool)
-        .await?;
-        if updated.rows_affected() == 0 {
-            return Err(DbError::ProductConversationUnavailable(
-                product_conversation_id.clone(),
-            ));
-        }
-        Ok(())
-    }
-
-    /// Return the automatic continuation admitted for this predecessor, if any.
-    ///
-    /// # Errors
-    /// Returns an error when persisted admission fields are invalid or cannot be read.
-    pub async fn automatic_continuation_admission(
-        &self,
-        predecessor_conversation_id: &str,
-    ) -> DbResult<Option<AutomaticContinuationAdmission>> {
-        let row = sqlx::query(
-            "SELECT product_conversation_id, summary_message_id, operation_id,
-                    first_message_id, opening_authority, phase,
-                    no_progress_attempts, last_error,
-                    admitted_at_unix_micros, updated_at_unix_micros
-             FROM automatic_continuation_admissions
-             WHERE predecessor_conversation_id = ?1",
-        )
-        .bind(predecessor_conversation_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let product_conversation_id: String = row.try_get("product_conversation_id")?;
-        let first_message_id: String = row.try_get("first_message_id")?;
-        let opening_authority: String = row.try_get("opening_authority")?;
-        let phase: String = row.try_get("phase")?;
-        let attempts: i64 = row.try_get("no_progress_attempts")?;
-        Ok(Some(AutomaticContinuationAdmission {
-            predecessor_conversation_id: predecessor_conversation_id.to_string(),
-            product_conversation_id: ProductConversationId::parse(product_conversation_id)
-                .map_err(|error| DbError::Serialization(error.to_string()))?,
-            summary_message_id: row.try_get("summary_message_id")?,
-            operation_id: row.try_get("operation_id")?,
-            first_message_id: ClientTurnKey::try_from(first_message_id)
-                .map_err(|error| DbError::Serialization(error.to_string()))?,
-            opening_authority: ContinuationOpeningAuthority::from_db_str(&opening_authority)
-                .ok_or_else(|| {
-                    DbError::Serialization(format!(
-                        "unknown continuation opening authority: {opening_authority}"
-                    ))
-                })?,
-            phase: AutomaticContinuationPhase::from_db_str(&phase).ok_or_else(|| {
-                DbError::Serialization(format!("unknown automatic continuation phase: {phase}"))
-            })?,
-            no_progress_attempts: u32::try_from(attempts).map_err(|_| {
-                DbError::Serialization(format!(
-                    "invalid automatic continuation no-progress attempts: {attempts}"
-                ))
-            })?,
-            last_error: row.try_get("last_error")?,
-            admitted_at_unix_micros: row.try_get("admitted_at_unix_micros")?,
-            updated_at_unix_micros: row.try_get("updated_at_unix_micros")?,
-        }))
-    }
-
     /// Atomically commit a generated continuation summary when the persisted
     /// continuation operation still matches `operation_id`.
     ///
@@ -7538,37 +7253,8 @@ impl Database {
         &self,
         conversation_id: &str,
         approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
-    ) -> DbResult<()> {
-        self.persist_approved_task_authority_inner(conversation_id, approval, None)
-            .await
-    }
-
-    /// Persist replacement task authority and the selected state atomically.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`DbError`] when validation, update, or commit fails.
-    pub async fn persist_approved_task_authority_and_state(
-        &self,
-        conversation_id: &str,
-        approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
-        approval_message: &Message,
-        state: &ConvState,
+        approved_state: &ConvState,
         state_updated_at: DateTime<Utc>,
-    ) -> DbResult<()> {
-        self.persist_approved_task_authority_inner(
-            conversation_id,
-            approval,
-            Some((approval_message, state, state_updated_at)),
-        )
-        .await
-    }
-
-    async fn persist_approved_task_authority_inner(
-        &self,
-        conversation_id: &str,
-        approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
-        settlement: Option<(&Message, &ConvState, DateTime<Utc>)>,
     ) -> DbResult<()> {
         let snapshot = phoenix_core::task_handoff::ApprovedTaskSnapshot::from(approval);
         let priority = serde_json::to_string(&snapshot.priority)
@@ -7632,19 +7318,22 @@ impl Database {
         .bind(work_scope_id)
         .execute(&mut *tx)
         .await?;
-        if let Some((approval_message, state, state_updated_at)) = settlement {
-            insert_message_tx(&mut tx, approval_message).await?;
-            let state_json = serde_json::to_string(state).unwrap();
-            sqlx::query(
-                "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4 WHERE id = ?5",
-            )
-            .bind(state_json)
-            .bind(conv_state_kind(state))
-            .bind(state_updated_at.to_rfc3339())
-            .bind(Utc::now().to_rfc3339())
-            .bind(conversation_id)
-            .execute(&mut *tx)
-            .await?;
+        let state_json = serde_json::to_string(approved_state)
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let state_result = sqlx::query(
+            "UPDATE conversations
+             SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4
+             WHERE id = ?5",
+        )
+        .bind(state_json)
+        .bind(conv_state_kind(approved_state))
+        .bind(state_updated_at.to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        if state_result.rows_affected() == 0 {
+            return Err(DbError::ConversationNotFound(conversation_id.to_string()));
         }
         tx.commit().await?;
         Ok(())
@@ -7986,13 +7675,6 @@ impl Database {
             ));
         }
 
-        #[cfg(test)]
-        if let Some(ContinuationTestHook::PreReservationBarrier(barrier)) =
-            self.continuation_test_hook.as_deref()
-        {
-            barrier.wait().await;
-        }
-
         let new_id = uuid::Uuid::new_v4().to_string();
 
         // Sequential slug: walk to chain root, count existing members, then
@@ -8019,59 +7701,22 @@ impl Database {
 
         // Atomic INSERT + UPDATE. On any error before `commit()`, the
         // transaction guard drops and SQLite rolls back.
-        let mut conn = self.pool.acquire().await?;
-        let begin_immediate = Box::pin(conn.begin_with("BEGIN IMMEDIATE"));
-        #[cfg(test)]
-        let mut begin_immediate = begin_immediate;
-        #[cfg(test)]
-        if let Some(ContinuationTestHook::ContendedBeginImmediate { attempted }) =
-            self.continuation_test_hook.as_deref()
-        {
-            std::future::poll_fn(|cx| match begin_immediate.as_mut().poll(cx) {
-                std::task::Poll::Pending => {
-                    attempted.notify_waiters();
-                    std::task::Poll::Ready(())
-                }
-                std::task::Poll::Ready(_) => {
-                    panic!("test expected BEGIN IMMEDIATE to contend with Close")
-                }
-            })
-            .await;
-        }
-        let mut tx = begin_immediate.await?;
+        let mut tx = self.pool.begin().await?;
 
-        require_product_conversation_admission_tx(&mut tx, parent_id).await?;
         sqlx::query("PRAGMA defer_foreign_keys = ON")
             .execute(&mut *tx)
             .await?;
-        let reservation = sqlx::query(
+        sqlx::query(
             "INSERT INTO product_continuation_reservations (
                  predecessor_conversation_id, successor_conversation_id,
                  product_conversation_id
-             ) SELECT ?1, ?2, ?3
-             WHERE EXISTS (
-                 SELECT 1 FROM conversations
-                 WHERE id = ?1 AND continued_in_conv_id IS NULL
-             )",
+             ) VALUES (?1, ?2, ?3)",
         )
         .bind(parent_id)
         .bind(&new_id)
         .bind(parent.product_conversation_id.as_str())
         .execute(&mut *tx)
         .await?;
-        if reservation.rows_affected() == 0 {
-            drop(tx);
-            drop(conn);
-            let refetched = self.get_conversation(parent_id).await?;
-            if let Some(existing_id) = refetched.continued_in_conv_id {
-                return Ok(ContinueOutcome::AlreadyContinued(
-                    self.get_conversation(&existing_id).await?,
-                ));
-            }
-            return Err(DbError::ContinuationPrecondition(
-                "continuation reservation was not admitted".to_string(),
-            ));
-        }
         let reserved = if parent.runtime_role == RuntimeRole::Coordinator {
             sqlx::query(
                 "UPDATE conversations
@@ -8096,7 +7741,6 @@ impl Database {
         };
         if reserved.rows_affected() == 0 {
             drop(tx);
-            drop(conn);
             let refetched = self.get_conversation(parent_id).await?;
             if let Some(existing_id) = refetched.continued_in_conv_id {
                 return Ok(ContinueOutcome::AlreadyContinued(
@@ -8201,17 +7845,13 @@ impl Database {
 
         if let Some(intent) = intent {
             sqlx::query(
-                "INSERT INTO continuation_dispatch_intents (
-                     parent_conversation_id, successor_conversation_id, message_id,
-                     handoff, user_agent, opening_authority, created_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO continuation_dispatch_intents (parent_conversation_id, successor_conversation_id, message_id, handoff, user_agent, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )
             .bind(parent_id)
             .bind(&new_id)
-            .bind(intent.message_id.as_str())
+            .bind(&intent.message_id)
             .bind(&intent.handoff)
             .bind(intent.user_agent.as_deref())
-            .bind(intent.opening_authority.as_str())
             .bind(&now_str)
             .execute(&mut *tx)
             .await?;
@@ -8713,46 +8353,6 @@ impl Database {
         Ok(())
     }
 
-    /// Persist a tool round and its selected conversation state atomically.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`DbError`] when message insertion, state update, or commit fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the conversation state cannot be serialized.
-    pub async fn persist_tool_round_and_state(
-        &self,
-        conversation_id: &str,
-        assistant: &Message,
-        tool_results: &[Message],
-        state: &ConvState,
-        state_updated_at: DateTime<Utc>,
-    ) -> DbResult<()> {
-        let mut tx = self.pool.begin().await?;
-        insert_message_tx(&mut tx, assistant).await?;
-        for msg in tool_results {
-            insert_message_tx(&mut tx, msg).await?;
-        }
-        let state_json = serde_json::to_string(state).unwrap();
-        let result = sqlx::query(
-            "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4 WHERE id = ?5",
-        )
-        .bind(state_json)
-        .bind(conv_state_kind(state))
-        .bind(state_updated_at.to_rfc3339())
-        .bind(Utc::now().to_rfc3339())
-        .bind(conversation_id)
-        .execute(&mut *tx)
-        .await?;
-        if result.rows_affected() == 0 {
-            return Err(DbError::ConversationNotFound(conversation_id.to_string()));
-        }
-        tx.commit().await?;
-        Ok(())
-    }
-
     /// Persist a terminal tool checkpoint and its direct-turn obligation atomically.
     ///
     /// # Errors
@@ -9213,7 +8813,7 @@ impl Database {
         Ok(false)
     }
 
-    /// Atomically update model settings and the selected connection of a child.
+    /// Atomically update the model, effort, and service tier.
     ///
     /// # Errors
     ///
@@ -9224,10 +8824,8 @@ impl Database {
         model: &str,
         effort: Option<ModelEffort>,
         service_tier: ServiceTier,
-        connection: &str,
     ) -> DbResult<()> {
         let now = Utc::now();
-        let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             "UPDATE conversations SET model = ?1, effort = ?2, service_tier = ?3, updated_at = ?4 WHERE id = ?5",
         )
@@ -9236,21 +8834,11 @@ impl Database {
         .bind(service_tier.as_wire_name())
         .bind(now.to_rfc3339())
         .bind(id)
-        .execute(&mut *tx)
+        .execute(&self.pool)
         .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
-        sqlx::query(
-            "INSERT INTO sub_agent_execution_routes (conversation_id, connection)
-             SELECT id, ?1 FROM conversations WHERE id = ?2 AND parent_conversation_id IS NOT NULL
-             ON CONFLICT(conversation_id) DO UPDATE SET connection = excluded.connection",
-        )
-        .bind(connection)
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
         Ok(())
     }
 
@@ -17271,7 +16859,6 @@ mod tests {
             "gpt-5.4",
             Some(ModelEffort::Low),
             ServiceTier::Fast,
-            "codex",
         )
         .await
         .unwrap();
@@ -17300,24 +16887,12 @@ mod tests {
         db.create_conversation("tier-cas", "tier-cas", "/tmp", true, None, None)
             .await
             .unwrap();
-        db.update_conversation_model_and_effort(
-            "tier-cas",
-            "gpt-5.4",
-            None,
-            ServiceTier::Fast,
-            "codex",
-        )
-        .await
-        .unwrap();
-        db.update_conversation_model_and_effort(
-            "tier-cas",
-            "gpt-5.6-sol",
-            None,
-            ServiceTier::Fast,
-            "codex",
-        )
-        .await
-        .unwrap();
+        db.update_conversation_model_and_effort("tier-cas", "gpt-5.4", None, ServiceTier::Fast)
+            .await
+            .unwrap();
+        db.update_conversation_model_and_effort("tier-cas", "gpt-5.6-sol", None, ServiceTier::Fast)
+            .await
+            .unwrap();
 
         let normalized = db
             .compare_and_set_conversation_service_tier(
@@ -17915,309 +17490,6 @@ mod tests {
             db.get_messages("continuation-commit").await.unwrap().len(),
             1
         );
-    }
-
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn continuation_commit_admits_automatic_work_only_when_preference_was_enabled() {
-        let db = Database::open_in_memory().await.unwrap();
-        for (conversation_id, operation_id, enabled) in [
-            ("auto-off", "shared-operation", false),
-            ("auto-on", "shared-operation", true),
-            ("auto-on-second", "shared-operation", true),
-        ] {
-            db.create_conversation(conversation_id, conversation_id, "/tmp", true, None, None)
-                .await
-                .unwrap();
-            if enabled {
-                let product_conversation_id = db
-                    .get_conversation(conversation_id)
-                    .await
-                    .unwrap()
-                    .product_conversation_id;
-                db.set_auto_continue_on_context_exhaustion(
-                    &product_conversation_id,
-                    AutoContinueOnContextExhaustion::Enabled,
-                )
-                .await
-                .unwrap();
-            }
-            db.update_conversation_state(
-                conversation_id,
-                &ConvState::AwaitingContinuation {
-                    request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
-                        operation_id: operation_id.to_string(),
-                        rejected_tool_calls: Vec::new(),
-                        attempt: 1,
-                    },
-                },
-            )
-            .await
-            .unwrap();
-            let summary = format!("exact summary for {conversation_id}  \n");
-            let content = MessageContent::continuation(&summary);
-            let message = Message {
-                message_id: format!("continuation-{conversation_id}"),
-                conversation_id: conversation_id.to_string(),
-                sequence_id: 1,
-                message_type: content.message_type(),
-                content,
-                display_data: None,
-                usage_data: None,
-                created_at: Utc::now(),
-            };
-            assert_eq!(
-                db.commit_continuation(
-                    conversation_id,
-                    operation_id,
-                    &message,
-                    &ConvState::ContextExhausted { summary },
-                    Utc::now(),
-                )
-                .await
-                .unwrap(),
-                ContinuationCommitOutcome::Applied
-            );
-        }
-
-        assert!(db
-            .automatic_continuation_admission("auto-off")
-            .await
-            .unwrap()
-            .is_none());
-        let auto_off_product = db
-            .get_conversation("auto-off")
-            .await
-            .unwrap()
-            .product_conversation_id;
-        db.set_auto_continue_on_context_exhaustion(
-            &auto_off_product,
-            AutoContinueOnContextExhaustion::Enabled,
-        )
-        .await
-        .unwrap();
-        assert!(db
-            .automatic_continuation_admission("auto-off")
-            .await
-            .unwrap()
-            .is_none());
-
-        let admitted = db
-            .automatic_continuation_admission("auto-on")
-            .await
-            .unwrap()
-            .expect("enabled aggregate admits automatic continuation atomically");
-        assert_eq!(admitted.predecessor_conversation_id, "auto-on");
-        assert_eq!(admitted.operation_id, "shared-operation");
-        assert_eq!(admitted.summary_message_id, "continuation-auto-on");
-        assert_eq!(
-            admitted.opening_authority,
-            ContinuationOpeningAuthority::GeneratedPredecessorContext
-        );
-        assert_eq!(admitted.phase, AutomaticContinuationPhase::Admitted);
-        assert_eq!(admitted.no_progress_attempts, 0);
-        assert!(admitted.last_error.is_none());
-        assert!(admitted.admitted_at_unix_micros >= 0);
-        assert_eq!(
-            admitted.updated_at_unix_micros,
-            admitted.admitted_at_unix_micros
-        );
-        let immutable_authority = sqlx::query(
-            "UPDATE automatic_continuation_admissions
-             SET opening_authority = 'user_authorized_instruction'
-             WHERE predecessor_conversation_id = 'auto-on'",
-        )
-        .execute(&db.pool)
-        .await;
-        assert!(immutable_authority.is_err());
-        assert!(db
-            .automatic_continuation_admission("auto-on-second")
-            .await
-            .unwrap()
-            .is_some());
-
-        let auto_on_product = admitted.product_conversation_id.clone();
-        db.set_auto_continue_on_context_exhaustion(
-            &auto_on_product,
-            AutoContinueOnContextExhaustion::Disabled,
-        )
-        .await
-        .unwrap();
-        assert!(db
-            .automatic_continuation_admission("auto-on")
-            .await
-            .unwrap()
-            .is_some());
-        assert_eq!(
-            db.commit_continuation(
-                "auto-on",
-                "shared-operation",
-                &db.get_messages("auto-on").await.unwrap()[0],
-                &ConvState::ContextExhausted {
-                    summary: "exact summary for auto-on  \n".to_string(),
-                },
-                Utc::now(),
-            )
-            .await
-            .unwrap(),
-            ContinuationCommitOutcome::Duplicate
-        );
-        let admission_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM automatic_continuation_admissions
-             WHERE operation_id = 'shared-operation'",
-        )
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
-        assert_eq!(admission_count, 2);
-    }
-
-    #[tokio::test]
-    async fn coordinator_continuation_commit_admits_automatic_work() {
-        let db = Database::open_in_memory().await.unwrap();
-        let coordinator = db
-            .get_or_create_coordinator(
-                Some("test-model"),
-                phoenix_core::llm_language::LlmLanguage::default(),
-            )
-            .await
-            .unwrap();
-        db.set_auto_continue_on_context_exhaustion(
-            &coordinator.product_conversation_id,
-            AutoContinueOnContextExhaustion::Enabled,
-        )
-        .await
-        .unwrap();
-        let operation_id = "coordinator-operation";
-        db.update_conversation_state(
-            &coordinator.id,
-            &ConvState::AwaitingContinuation {
-                request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
-                    operation_id: operation_id.to_string(),
-                    rejected_tool_calls: Vec::new(),
-                    attempt: 1,
-                },
-            },
-        )
-        .await
-        .unwrap();
-        let summary = "coordinator exact summary".to_string();
-        let content = MessageContent::continuation(&summary);
-        let message = Message {
-            message_id: "coordinator-continuation-summary".to_string(),
-            conversation_id: coordinator.id.clone(),
-            sequence_id: 1,
-            message_type: content.message_type(),
-            content,
-            display_data: None,
-            usage_data: None,
-            created_at: Utc::now(),
-        };
-        assert_eq!(
-            db.commit_continuation(
-                &coordinator.id,
-                operation_id,
-                &message,
-                &ConvState::ContextExhausted { summary },
-                Utc::now(),
-            )
-            .await
-            .unwrap(),
-            ContinuationCommitOutcome::Applied
-        );
-        let admission = db
-            .automatic_continuation_admission(&coordinator.id)
-            .await
-            .unwrap()
-            .expect("coordinator aggregate is eligible for automatic admission");
-        assert_eq!(
-            admission.product_conversation_id,
-            coordinator.product_conversation_id
-        );
-        assert_eq!(
-            admission.opening_authority,
-            ContinuationOpeningAuthority::GeneratedPredecessorContext
-        );
-    }
-
-    #[tokio::test]
-    async fn automatic_continuation_admission_obeys_history_and_close_fences() {
-        for (conversation_id, history, active_close) in
-            [("auto-history", true, false), ("auto-close", false, true)]
-        {
-            let db = Database::open_in_memory().await.unwrap();
-            db.create_conversation(conversation_id, conversation_id, "/tmp", true, None, None)
-                .await
-                .unwrap();
-            let conversation = db.get_conversation(conversation_id).await.unwrap();
-            db.set_auto_continue_on_context_exhaustion(
-                &conversation.product_conversation_id,
-                AutoContinueOnContextExhaustion::Enabled,
-            )
-            .await
-            .unwrap();
-            if history {
-                sqlx::query(
-                    "UPDATE product_conversations SET ordinary_lifecycle = 'history'
-                     WHERE id = ?1",
-                )
-                .bind(conversation.product_conversation_id.as_str())
-                .execute(db.pool())
-                .await
-                .unwrap();
-            }
-            if active_close {
-                db.begin_close_foundation(
-                    &conversation.product_conversation_id,
-                    &TranscriptConversationId::parse(conversation.id.clone()).unwrap(),
-                    "automatic-continuation-close-fence",
-                )
-                .await
-                .unwrap();
-            }
-            let operation_id = format!("operation-{conversation_id}");
-            db.update_conversation_state(
-                conversation_id,
-                &ConvState::AwaitingContinuation {
-                    request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
-                        operation_id: operation_id.clone(),
-                        rejected_tool_calls: Vec::new(),
-                        attempt: 1,
-                    },
-                },
-            )
-            .await
-            .unwrap();
-            let summary = format!("summary-{conversation_id}");
-            let content = MessageContent::continuation(&summary);
-            let message = Message {
-                message_id: format!("summary-{conversation_id}"),
-                conversation_id: conversation_id.to_string(),
-                sequence_id: 1,
-                message_type: content.message_type(),
-                content,
-                display_data: None,
-                usage_data: None,
-                created_at: Utc::now(),
-            };
-            assert_eq!(
-                db.commit_continuation(
-                    conversation_id,
-                    &operation_id,
-                    &message,
-                    &ConvState::ContextExhausted { summary },
-                    Utc::now(),
-                )
-                .await
-                .unwrap(),
-                ContinuationCommitOutcome::Applied
-            );
-            assert!(db
-                .automatic_continuation_admission(conversation_id)
-                .await
-                .unwrap()
-                .is_none());
-        }
     }
 
     #[tokio::test]
@@ -22440,7 +21712,6 @@ mod tests {
             "gpt-5.4",
             Some(ModelEffort::High),
             ServiceTier::Standard,
-            "codex",
         )
         .await
         .unwrap();
@@ -22463,7 +21734,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unattached_sub_agent_persists_selection_without_parent_effort_leak() {
+    async fn unattached_sub_agent_inherits_parent_effort_without_a_work_scope() {
         let db = Database::open_in_memory().await.unwrap();
         let parent = db
             .get_or_create_coordinator(
@@ -22477,7 +21748,6 @@ mod tests {
             "gpt-5.4",
             Some(ModelEffort::High),
             ServiceTier::Standard,
-            "codex",
         )
         .await
         .unwrap();
@@ -22495,212 +21765,15 @@ mod tests {
                 },
                 phoenix_core::llm_language::LlmLanguage::default(),
                 None,
-                SubAgentExecution {
-                    connection: "codex",
-                    effort: None,
-                    persona: Some("Review carefully."),
-                },
             )
             .await
             .unwrap();
 
         assert_eq!(child.attached_work_scope_id, None);
-        assert_eq!(child.effort, None);
-        assert_eq!(db.get_conversation(&child.id).await.unwrap().effort, None);
-        assert_eq!(
-            db.get_sub_agent_execution_connection(&child.id)
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("codex")
-        );
-        assert_eq!(
-            db.get_sub_agent_persona(&child.id)
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("Review carefully.")
-        );
+        assert_eq!(child.effort, Some(ModelEffort::High));
         assert_eq!(
             child.product_conversation_id,
             parent.product_conversation_id
-        );
-    }
-
-    #[tokio::test]
-    async fn sub_agent_selection_failure_rolls_back_conversation_and_persona() {
-        let db = Database::open_in_memory().await.unwrap();
-        let parent = db
-            .get_or_create_coordinator(
-                Some("gpt-5.4"),
-                phoenix_core::llm_language::LlmLanguage::default(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            db.get_sub_agent_execution_connection(&parent.id)
-                .await
-                .unwrap(),
-            None
-        );
-        let result = db
-            .create_subagent_conversation(
-                "invalid-route-child",
-                "invalid-route-child",
-                "/tmp",
-                &parent.id,
-                "gpt-5.4",
-                &ConvMode::Explore {
-                    worktree_path: None,
-                    next_taskmd_id_hint: None,
-                },
-                phoenix_core::llm_language::LlmLanguage::default(),
-                None,
-                SubAgentExecution {
-                    connection: " ",
-                    effort: Some(ModelEffort::High),
-                    persona: Some("Must not survive failed creation."),
-                },
-            )
-            .await;
-        assert!(result.is_err());
-        let count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM conversations WHERE id = 'invalid-route-child'",
-        )
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-        assert_eq!(count, 0);
-        assert_eq!(
-            db.get_sub_agent_persona("invalid-route-child")
-                .await
-                .unwrap(),
-            None
-        );
-        assert_eq!(
-            db.get_sub_agent_execution_connection("invalid-route-child")
-                .await
-                .unwrap(),
-            None
-        );
-    }
-
-    #[tokio::test]
-    async fn child_model_upgrade_updates_connection_atomically_without_pinning_parent() {
-        let db = Database::open_in_memory().await.unwrap();
-        let parent = db
-            .get_or_create_coordinator(
-                Some("gpt-5.4"),
-                phoenix_core::llm_language::LlmLanguage::default(),
-            )
-            .await
-            .unwrap();
-        let child = db
-            .create_subagent_conversation(
-                "route-upgrade-child",
-                "route-upgrade-child",
-                "/tmp",
-                &parent.id,
-                "gpt-5.4",
-                &ConvMode::Explore {
-                    worktree_path: None,
-                    next_taskmd_id_hint: None,
-                },
-                phoenix_core::llm_language::LlmLanguage::default(),
-                None,
-                SubAgentExecution {
-                    connection: "codex",
-                    effort: Some(ModelEffort::High),
-                    persona: None,
-                },
-            )
-            .await
-            .unwrap();
-        for id in [&child.id, &parent.id] {
-            db.update_conversation_model_and_effort(
-                id,
-                "claude-sonnet-5",
-                Some(ModelEffort::Low),
-                ServiceTier::Standard,
-                "anthropic",
-            )
-            .await
-            .unwrap();
-        }
-        assert_eq!(
-            db.get_sub_agent_execution_connection(&parent.id)
-                .await
-                .unwrap(),
-            None
-        );
-        assert!(db
-            .update_conversation_model_and_effort(
-                &child.id,
-                "gpt-5.4",
-                Some(ModelEffort::High),
-                ServiceTier::Fast,
-                " ",
-            )
-            .await
-            .is_err());
-        let child = db.get_conversation(&child.id).await.unwrap();
-        assert_eq!(child.model.as_deref(), Some("claude-sonnet-5"));
-        assert_eq!(child.effort, Some(ModelEffort::Low));
-        assert_eq!(child.service_tier, ServiceTier::Standard);
-        assert_eq!(
-            db.get_sub_agent_execution_connection(&child.id)
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("anthropic")
-        );
-    }
-
-    #[tokio::test]
-    async fn legacy_child_model_change_records_newly_selected_connection() {
-        let db = Database::open_in_memory().await.unwrap();
-        db.create_conversation("legacy-parent", "parent", "/tmp", true, None, None)
-            .await
-            .unwrap();
-        db.create_conversation(
-            "legacy-child",
-            "child",
-            "/tmp",
-            false,
-            Some("legacy-parent"),
-            Some("gpt-5.4"),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            db.get_sub_agent_execution_connection("legacy-child")
-                .await
-                .unwrap(),
-            None
-        );
-
-        db.update_conversation_model_and_effort(
-            "legacy-child",
-            "claude-sonnet-5",
-            None,
-            ServiceTier::Standard,
-            "anthropic",
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            db.get_sub_agent_execution_connection("legacy-child")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("anthropic")
-        );
-        assert_eq!(
-            db.get_sub_agent_execution_connection("legacy-parent")
-                .await
-                .unwrap(),
-            None
         );
     }
 
@@ -22750,11 +21823,6 @@ mod tests {
                     },
                     phoenix_core::llm_language::LlmLanguage::default(),
                     Some(&expected_scope),
-                    SubAgentExecution {
-                        connection: "codex",
-                        effort: Some(ModelEffort::High),
-                        persona: None,
-                    },
                 )
                 .await
         });
@@ -22813,7 +21881,6 @@ mod tests {
             "gpt-5.4",
             Some(ModelEffort::High),
             ServiceTier::Standard,
-            "codex",
         )
         .await
         .unwrap();
@@ -22839,11 +21906,6 @@ mod tests {
                     },
                     phoenix_core::llm_language::LlmLanguage::default(),
                     Some(&expected_scope),
-                    SubAgentExecution {
-                        connection: "codex",
-                        effort: Some(ModelEffort::High),
-                        persona: None,
-                    },
                 )
                 .await
             });
@@ -22934,11 +21996,6 @@ mod tests {
                 },
                 phoenix_core::llm_language::LlmLanguage::default(),
                 Some(&captured_scope),
-                SubAgentExecution {
-                    connection: "codex",
-                    effort: None,
-                    persona: None,
-                },
             )
             .await
             .unwrap();
@@ -23147,11 +22204,11 @@ mod tests {
         )
         .await;
 
-        let requested = NewContinuationDispatchIntent::user_authorized(
-            ClientTurnKey::try_from("opening-message").unwrap(),
-            "Exact edited handoff".to_string(),
-            Some("test-agent".to_string()),
-        );
+        let requested = NewContinuationDispatchIntent {
+            message_id: "opening-message".to_string(),
+            handoff: "Exact edited handoff".to_string(),
+            user_agent: Some("test-agent".to_string()),
+        };
         let (outcome, intent) = db
             .continue_conversation_with_intent("parent-intent", requested)
             .await
@@ -23165,12 +22222,8 @@ mod tests {
         };
         let intent = intent.expect("created successor must have an intent");
         assert_eq!(intent.successor_conversation_id, successor_id);
-        assert_eq!(intent.message_id.as_str(), "opening-message");
+        assert_eq!(intent.message_id, "opening-message");
         assert_eq!(intent.handoff, "Exact edited handoff");
-        assert_eq!(
-            intent.opening_authority,
-            ContinuationOpeningAuthority::UserAuthorizedInstruction
-        );
 
         let content = MessageContent::User(UserContent::new("Exact edited handoff"));
         db.add_message("opening-message", &successor_id, &content, None, None)
@@ -23181,69 +22234,6 @@ mod tests {
             .await
             .unwrap()
             .is_none());
-    }
-
-    #[tokio::test]
-    async fn generated_context_authority_survives_dispatch_settlement() {
-        let db = Database::open_in_memory().await.unwrap();
-        setup_exhausted_parent(
-            &db,
-            "generated-authority-parent",
-            "generated-authority-parent",
-            "/tmp",
-            &ConvMode::Direct,
-        )
-        .await;
-        let content = MessageContent::continuation("exact generated context");
-        db.add_message(
-            "generated-summary",
-            "generated-authority-parent",
-            &content,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        let (outcome, intent) = db
-            .continue_conversation_with_intent(
-                "generated-authority-parent",
-                NewContinuationDispatchIntent::generated_predecessor_context(
-                    ClientTurnKey::try_from("generated-opening").unwrap(),
-                    "exact generated context".to_string(),
-                ),
-            )
-            .await
-            .unwrap();
-        let successor = match outcome {
-            ContinueOutcome::Created(conversation) => conversation,
-            ContinueOutcome::AlreadyContinued(conversation) => {
-                panic!("expected Created, already continued to {}", conversation.id)
-            }
-            ContinueOutcome::ParentNotContextExhausted { state_variant } => {
-                panic!("expected Created, parent state was {state_variant}")
-            }
-        };
-        assert_eq!(
-            intent.unwrap().opening_authority,
-            ContinuationOpeningAuthority::GeneratedPredecessorContext
-        );
-        let opening = MessageContent::User(UserContent::new("exact generated context"));
-        db.add_message("generated-opening", &successor.id, &opening, None, None)
-            .await
-            .unwrap();
-        assert!(db
-            .continuation_dispatch_intent("generated-authority-parent")
-            .await
-            .unwrap()
-            .is_none());
-        let authority: String = sqlx::query_scalar(
-            "SELECT opening_authority FROM completed_continuation_handoffs
-             WHERE predecessor_conversation_id = 'generated-authority-parent'",
-        )
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
-        assert_eq!(authority, "generated_predecessor_context");
     }
 
     #[tokio::test]
@@ -23259,11 +22249,11 @@ mod tests {
         .await;
         db.continue_conversation_with_intent(
             "parent-retry-intent",
-            NewContinuationDispatchIntent::user_authorized(
-                ClientTurnKey::try_from("original-message").unwrap(),
-                "Original handoff".to_string(),
-                None,
-            ),
+            NewContinuationDispatchIntent {
+                message_id: "original-message".to_string(),
+                handoff: "Original handoff".to_string(),
+                user_agent: None,
+            },
         )
         .await
         .unwrap();
@@ -23271,17 +22261,17 @@ mod tests {
         let (outcome, intent) = db
             .continue_conversation_with_intent(
                 "parent-retry-intent",
-                NewContinuationDispatchIntent::user_authorized(
-                    ClientTurnKey::try_from("different-message").unwrap(),
-                    "Must not replace original".to_string(),
-                    None,
-                ),
+                NewContinuationDispatchIntent {
+                    message_id: "different-message".to_string(),
+                    handoff: "Must not replace original".to_string(),
+                    user_agent: None,
+                },
             )
             .await
             .unwrap();
         assert!(matches!(outcome, ContinueOutcome::AlreadyContinued(_)));
         let intent = intent.unwrap();
-        assert_eq!(intent.message_id.as_str(), "original-message");
+        assert_eq!(intent.message_id, "original-message");
         assert_eq!(intent.handoff, "Original handoff");
     }
 
@@ -23298,7 +22288,6 @@ mod tests {
             "claude-opus-test",
             Some(ModelEffort::High),
             ServiceTier::Standard,
-            "anthropic",
         )
         .await
         .unwrap();
@@ -23473,12 +22462,8 @@ mod tests {
     /// the first (idempotent return) and does NOT create a second new conv.
     /// The parent's `continued_in_conv_id` is unchanged by the second call.
     #[tokio::test]
-    async fn max_one_pool_idempotent_continuation_releases_fallback_connection() {
-        let mut db = Database::open_in_memory().await.unwrap();
-        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
-        db.continuation_test_hook = Some(std::sync::Arc::new(
-            ContinuationTestHook::PreReservationBarrier(barrier.clone()),
-        ));
+    async fn test_continue_conversation_idempotent_double_continue() {
+        let db = Database::open_in_memory().await.unwrap();
         setup_exhausted_parent(
             &db,
             "parent-double",
@@ -23488,53 +22473,30 @@ mod tests {
         )
         .await;
 
-        let first_db = db.clone();
-        let second_db = db.clone();
-        let first =
-            tokio::spawn(async move { first_db.continue_conversation("parent-double").await });
-        let second =
-            tokio::spawn(async move { second_db.continue_conversation("parent-double").await });
-        barrier.wait().await;
-
-        let first = tokio::time::timeout(std::time::Duration::from_secs(1), first)
-            .await
-            .expect("first max-one continuation must not hang")
-            .unwrap()
-            .unwrap();
-        let second = tokio::time::timeout(std::time::Duration::from_secs(1), second)
-            .await
-            .expect("second max-one continuation must not hang")
-            .unwrap()
-            .unwrap();
-        let outcomes = [first, second];
-        assert_eq!(
-            outcomes
-                .iter()
-                .filter(|outcome| matches!(outcome, ContinueOutcome::Created(_)))
-                .count(),
-            1,
-            "one contender must reserve the continuation"
-        );
-        assert_eq!(
-            outcomes
-                .iter()
-                .filter(|outcome| matches!(outcome, ContinueOutcome::AlreadyContinued(_)))
-                .count(),
-            1,
-            "the contender that loses reservation must take the fallback"
-        );
-        let ids = outcomes.map(|outcome| match outcome {
-            ContinueOutcome::Created(conversation)
-            | ContinueOutcome::AlreadyContinued(conversation) => conversation.id,
-            ContinueOutcome::ParentNotContextExhausted { .. } => {
-                panic!("expected continuation outcome")
+        let first = match db.continue_conversation("parent-double").await.unwrap() {
+            ContinueOutcome::Created(c) => c,
+            other @ (ContinueOutcome::AlreadyContinued(_)
+            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("first call should create, got {other:?}")
             }
-        });
-        assert_eq!(ids[0], ids[1], "both contenders share the winner");
+        };
+
+        let second = match db.continue_conversation("parent-double").await.unwrap() {
+            ContinueOutcome::AlreadyContinued(c) => c,
+            other @ (ContinueOutcome::Created(_)
+            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("second call should return AlreadyContinued, got {other:?}")
+            }
+        };
+
+        assert_eq!(
+            first.id, second.id,
+            "idempotent return must yield the same continuation id"
+        );
 
         // Parent pointer unchanged.
         let refreshed_parent = db.get_conversation("parent-double").await.unwrap();
-        assert_eq!(refreshed_parent.continued_in_conv_id, Some(ids[0].clone()));
+        assert_eq!(refreshed_parent.continued_in_conv_id, Some(first.id));
 
         // No phantom third conversation exists.
         let all = db.list_conversations().await.unwrap();
@@ -23544,119 +22506,6 @@ mod tests {
             "only parent + single continuation should be listed; got: {:?}",
             all.iter().map(|c| &c.id).collect::<Vec<_>>(),
         );
-    }
-
-    #[tokio::test]
-    async fn close_and_continuation_serialize_to_typed_admission_fence() {
-        let (_dir, mut close_db, mut continuation_db) = open_test_db_pair().await;
-        let close_latch = std::sync::Arc::new(CloseFoundationTestLatch::new());
-        let continuation_immediate_attempted = std::sync::Arc::new(tokio::sync::Notify::new());
-        close_db.close_foundation_test_latch = Some(close_latch.clone());
-        continuation_db.continuation_test_hook = Some(std::sync::Arc::new(
-            ContinuationTestHook::ContendedBeginImmediate {
-                attempted: continuation_immediate_attempted.clone(),
-            },
-        ));
-        let parent = setup_exhausted_parent(
-            &close_db,
-            "parent-close-race",
-            "parent-close-race",
-            "/tmp",
-            &ConvMode::Direct,
-        )
-        .await;
-        let product_conversation_id = parent.product_conversation_id.clone();
-        let parent_id = parent.id.clone();
-
-        let close_entered = close_latch.transaction_entered.notified();
-        let close = tokio::spawn(async move {
-            close_db
-                .begin_close_foundation(
-                    &product_conversation_id,
-                    &TranscriptConversationId::parse(parent_id).unwrap(),
-                    "close-vs-continuation",
-                )
-                .await
-        });
-        close_entered.await;
-
-        let continuation_immediate_attempted = continuation_immediate_attempted.notified();
-        let continuation_parent_id = parent.id.clone();
-        let continuation = tokio::spawn(async move {
-            continuation_db
-                .continue_conversation(&continuation_parent_id)
-                .await
-        });
-        continuation_immediate_attempted.await;
-        close_latch.release_transaction.notify_waiters();
-        close.await.unwrap().unwrap();
-
-        assert!(matches!(
-            continuation.await.unwrap(),
-            Err(DbError::CloseAdmissionFenced(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn continuation_refuses_parent_with_active_close_obligation() {
-        let db = Database::open_in_memory().await.unwrap();
-        let parent = setup_exhausted_parent(
-            &db,
-            "parent-close-fenced",
-            "parent-close-fenced",
-            "/tmp",
-            &ConvMode::Direct,
-        )
-        .await;
-        db.begin_close_foundation(
-            &parent.product_conversation_id,
-            &TranscriptConversationId::parse(parent.id.clone()).unwrap(),
-            "continue-close-fence",
-        )
-        .await
-        .unwrap();
-
-        assert!(matches!(
-            db.continue_conversation(&parent.id).await,
-            Err(DbError::CloseAdmissionFenced(_))
-        ));
-        assert!(db
-            .get_conversation(&parent.id)
-            .await
-            .unwrap()
-            .continued_in_conv_id
-            .is_none());
-    }
-
-    #[tokio::test]
-    async fn continuation_refuses_history_product_conversation() {
-        let db = Database::open_in_memory().await.unwrap();
-        let parent = setup_exhausted_parent(
-            &db,
-            "parent-history",
-            "parent-history",
-            "/tmp",
-            &ConvMode::Direct,
-        )
-        .await;
-        sqlx::query(
-            "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1",
-        )
-        .bind(parent.product_conversation_id.as_str())
-        .execute(db.pool())
-        .await
-        .unwrap();
-
-        assert!(matches!(
-            db.continue_conversation(&parent.id).await,
-            Err(DbError::ProductConversationUnavailable(id)) if id == parent.product_conversation_id
-        ));
-        assert!(db
-            .get_conversation(&parent.id)
-            .await
-            .unwrap()
-            .continued_in_conv_id
-            .is_none());
     }
 
     /// Parent not in `ContextExhausted` state: transaction does not run;
@@ -26860,6 +25709,49 @@ mod tests {
                 Some("/tmp/promoted-worktree".to_string())
             )
         );
+    }
+
+    #[tokio::test]
+    async fn approved_authority_and_post_approval_state_commit_together() {
+        let db = Database::open_in_memory().await.unwrap();
+        let conv_id = "atomic-approval-state";
+        db.create_conversation(
+            conv_id,
+            "atomic-approval-state",
+            "/tmp/atomic-approval-state",
+            true,
+            None,
+            Some("model"),
+        )
+        .await
+        .unwrap();
+        let approval = phoenix_core::task_handoff::TaskApprovalHandoffData {
+            task_id: "12345".to_string(),
+            task_title: "atomic-capability".to_string(),
+            title: "Atomic capability".to_string(),
+            priority: phoenix_core::task_source::Priority::P0,
+            plan: "Plan".to_string(),
+            task_file: "tasks/12345-p0-in-progress--atomic-capability.md".to_string(),
+            artifact_body: "Plan".to_string(),
+        };
+        let approved_state = ConvState::LlmRequesting { attempt: 1 };
+
+        db.persist_approved_task_authority(conv_id, &approval, &approved_state, Utc::now())
+            .await
+            .unwrap();
+
+        let conversation = db.get_conversation(conv_id).await.unwrap();
+        assert_eq!(conversation.state, approved_state);
+        let (authority, _, _) = db
+            .get_conversation_work_scope_context(conv_id)
+            .await
+            .unwrap();
+        assert_eq!(authority, phoenix_core::work_scope::AuthorityKind::Work);
+        assert!(db
+            .get_approved_task_objective(conv_id)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     /// Task 02667: a fresh DB's `conversations` table must not carry the

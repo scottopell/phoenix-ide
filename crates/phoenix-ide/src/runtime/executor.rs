@@ -1632,9 +1632,6 @@ where
     llm_client: Arc<L>,
     tool_executor: Arc<T>,
     coordinator_read_service: Option<crate::api::global_read::GlobalReadService>,
-    /// One authority projection consumed by prompt, history clearing, tool
-    /// context, dispatch, and sub-agent admission.
-    tool_capability: crate::runtime::traits::ToolCapabilitySnapshot,
     /// In-memory mirror of the durable clear watermark (specs/stale-tool-results).
     /// This runtime is the sole writer of its conversation's watermark, so the
     /// cache is authoritative after any successful read/write; a transient
@@ -1930,13 +1927,6 @@ where
         let (_acknowledged_event_tx, acknowledged_event_rx) = mpsc::channel(1);
 
         let tool_executor = Arc::new(tool_executor);
-        let tool_capability = tool_executor.capability_snapshot();
-        assert_eq!(
-            tool_capability.authority,
-            tool_executor.capability_snapshot().authority,
-            "tool executor capability snapshot must be internally coherent"
-        );
-
         Self {
             context,
             state,
@@ -1947,7 +1937,6 @@ where
             llm_client: Arc::new(llm_client),
             tool_executor,
             coordinator_read_service: None,
-            tool_capability,
             clear_watermark_cache: Arc::new(std::sync::Mutex::new(None)),
             active_prompt_projection: None,
             browser_sessions,
@@ -2659,14 +2648,15 @@ where
         capability_generation: crate::runtime::traits::ToolCapabilityGeneration,
         llm_outcome: LlmOutcome,
     ) {
+        let current_capability = self.tool_executor.capability_snapshot();
         if self.llm_outcome_is_stale(generation)
-            || capability_generation != self.tool_capability.generation
+            || capability_generation != current_capability.generation
         {
             tracing::debug!(
                 outcome_generation = generation,
                 current_generation = self.llm_request_generation,
                 outcome_capability_generation = capability_generation.value(),
-                current_capability_generation = self.tool_capability.generation.value(),
+                current_capability_generation = current_capability.generation.value(),
                 state = self.state.variant_name(),
                 "Ignoring stale LLM outcome — request superseded (abort/new dispatch)"
             );
@@ -4854,8 +4844,9 @@ where
         }
 
         // --- Mode validation and one-writer constraint (REQ-PROJ-008) ---
+        let capability = self.tool_executor.capability_snapshot();
         let parent_allows_work = matches!(
-            self.tool_capability.authority,
+            capability.authority,
             crate::work_scope::ResourceAuthority::Work
         );
 
@@ -4912,14 +4903,7 @@ where
         // Direct parents have no worktree to scope against -- writes there
         // are unscoped by design -- so the check only fires for parents
         // that own a worktree (Work/Branch).
-        let parent_worktree_path: Option<&str> = match self.context.mode_context.as_ref() {
-            Some(
-                ModeContext::Work { worktree_path, .. }
-                | ModeContext::Branch { worktree_path, .. }
-                | ModeContext::DetachedApprovedTask { worktree_path, .. },
-            ) => Some(worktree_path.as_str()),
-            _ => None,
-        };
+        let parent_worktree_path = self.context.work_scope_worktree.as_deref();
         // Resolve and validate every spec BEFORE sending any spawn request.
         // Model validation can fail per-task; doing it inside the send loop
         // would leave earlier tasks already spawned (and untracked, since the
@@ -4961,15 +4945,17 @@ where
             };
 
             if mode == SubAgentMode::Work
-                && parent_worktree_path.is_some_and(|root| !path_is_within(&cwd, root))
+                && parent_worktree_path
+                    .is_some_and(|root| !path_is_within(&cwd, &root.to_string_lossy()))
             {
                 let worktree_root = parent_worktree_path.expect("checked as present");
                 let result = ToolResult::error(
                     tool_use_id.clone(),
                     format!(
                         "Work sub-agent cwd '{cwd}' must be inside the parent's worktree \
-                         '{worktree_root}'. Omit `cwd` to inherit the worktree, or pass a path \
-                         that resolves under it."
+                         '{}'. Omit `cwd` to inherit the worktree, or pass a path that \
+                         resolves under it.",
+                        worktree_root.display()
                     ),
                 );
                 return Ok(Some(Event::ToolComplete {
@@ -6850,6 +6836,7 @@ where
         // Refresh and render now, before any provider task exists, so scheduling
         // cannot admit later steering into this request.
         self.refresh_active_prompt_projection().await?;
+        let capability = self.tool_executor.capability_snapshot();
         let frozen_messages = assemble_cleared_messages(
             &self.storage,
             &self.context.conversation_id,
@@ -6859,7 +6846,7 @@ where
                 .expect("projection refreshed above")
                 .messages,
             None,
-            &self.tool_capability.clearable_names,
+            &capability.clearable_names,
             self.context.context_window,
             &self.clear_watermark_cache,
         )
@@ -6880,7 +6867,7 @@ where
         // intentional `Effect::AbortLlm`.
         self.llm_request_generation = self.llm_request_generation.wrapping_add(1);
         let dispatch_generation = self.llm_request_generation;
-        let capability_generation = self.tool_capability.generation;
+        let capability_generation = capability.generation;
         let llm_outcome_tx = self.llm_outcome_tx.clone();
 
         let llm_client = self.llm_client.clone();
@@ -6927,7 +6914,7 @@ where
         let mode_context = self.context.mode_context.clone();
         let has_approved_task_write_authority =
             matches!(
-                self.tool_capability.authority,
+                capability.authority,
                 crate::work_scope::ResourceAuthority::Work
             ) && matches!(mode_context, Some(ModeContext::Explore { .. }));
         let llm_language = self.context.llm_language;
@@ -6964,7 +6951,7 @@ where
             .await?;
         let explore_bash_capability =
             if matches!(
-                self.tool_capability.authority,
+                capability.authority,
                 crate::work_scope::ResourceAuthority::Restricted
             ) && matches!(mode_context.as_ref(), Some(ModeContext::Explore { .. }))
             {
@@ -7391,7 +7378,8 @@ where
         // dispatch or an intentional `Effect::AbortTool` / backstop teardown.
         self.tool_request_generation = self.tool_request_generation.wrapping_add(1);
         let dispatch_generation = self.tool_request_generation;
-        let capability_generation = self.tool_capability.generation;
+        let capability = self.tool_executor.capability_snapshot();
+        let capability_generation = capability.generation;
         let tool_outcome_tx = self.tool_outcome_tx.clone();
 
         // Create cancellation token for this tool execution
@@ -7439,7 +7427,7 @@ where
                 self.tmux_registry.clone(),
                 scope_worktree,
                 self.context.resource_scope.clone(),
-                self.tool_capability.authority,
+                capability.authority,
             ),
             phoenix_core::domain::sm_state::ConversationExecutionEnvironment::NoFilesystem => {
                 ToolContext::new_without_filesystem(
@@ -8162,6 +8150,7 @@ where
         let mut continuation_prompt = policy.instruction(&rejected_tool_calls);
         continuation_prompt.push_str(&history.selection_notice(&conv_id));
         let system_prompt = policy.system_prompt();
+        let capability = self.tool_executor.capability_snapshot();
         let frozen_messages = assemble_cleared_messages(
             &self.storage,
             &conv_id,
@@ -8170,7 +8159,7 @@ where
                 .handoff
                 .as_ref()
                 .map(|handoff| handoff.message_id.as_str()),
-            &self.tool_capability.clearable_names,
+            &capability.clearable_names,
             context_window,
             &self.clear_watermark_cache,
         )
@@ -8531,18 +8520,26 @@ where
                             task_file: task_file_backup.clone(),
                             artifact_body: approval_result.artifact_body.clone(),
                         },
+                        &self.state,
+                        self.state_updated_at,
                     )
                     .await?;
                 // Build the fallible Work tool surface before publishing Work to
                 // the actor context. A failed rebuild leaves every live consumer
                 // Restricted and stops the post-approval turn.
-                let tool_capability = self.tool_executor.upgrade_to_work_mode()?;
-                self.tool_capability = tool_capability;
+                let tool_capability = match self.tool_executor.upgrade_to_work_mode().await {
+                    Ok(tool_capability) => tool_capability,
+                    Err(error) => {
+                        self.recovery_disposition =
+                            RuntimeRecoveryDisposition::RecreateFromDatabase;
+                        return Err(error);
+                    }
+                };
                 tracing::info!(
                     conv_id = %self.context.conversation_id,
                     work_scope = %self.context.resource_scope,
                     authority = "work",
-                    capability_generation = self.tool_capability.generation.value(),
+                    capability_generation = tool_capability.generation.value(),
                     "Published approved WorkScope capability projection"
                 );
 
@@ -13859,7 +13856,7 @@ mod authoritative_user_message_effect_tests {
 
         rt.process_generation_tagged_llm_outcome(
             0,
-            rt.tool_capability.generation,
+            rt.tool_executor.capability_snapshot().generation,
             LlmOutcome::TimedOut {
                 message: "provider attempt deadline elapsed".to_string(),
             },
@@ -13911,8 +13908,12 @@ mod authoritative_user_message_effect_tests {
             request_id: "parent-terminal-retry-response".to_string(),
         };
 
-        rt.process_generation_tagged_llm_outcome(0, rt.tool_capability.generation, outcome)
-            .await;
+        rt.process_generation_tagged_llm_outcome(
+            0,
+            rt.tool_executor.capability_snapshot().generation,
+            outcome,
+        )
+        .await;
 
         assert!(matches!(rt.state, ConvState::LlmRequesting { attempt: 1 }));
         assert!(rt.llm_task_handle.is_none());
@@ -14049,8 +14050,12 @@ mod authoritative_user_message_effect_tests {
             request_id: "pre-establishment-retry".to_string(),
         };
 
-        rt.process_generation_tagged_llm_outcome(0, rt.tool_capability.generation, outcome)
-            .await;
+        rt.process_generation_tagged_llm_outcome(
+            0,
+            rt.tool_executor.capability_snapshot().generation,
+            outcome,
+        )
+        .await;
         for _ in 0..(DIRECT_TURN_TERMINAL_SETTLEMENT_RETRIES + 2) {
             tokio::time::advance(TERMINAL_SETTLEMENT_RETRY_DELAY).await;
             rt.retry_terminal_transition().await;
@@ -16306,10 +16311,10 @@ mod approve_task_failure_effect_tests {
         .unwrap();
 
         assert_eq!(
-            rt.tool_capability.authority,
+            rt.tool_executor.capability_snapshot().authority,
             crate::work_scope::ResourceAuthority::Work
         );
-        assert_eq!(rt.tool_capability.generation.value(), 1);
+        assert_eq!(rt.tool_executor.capability_snapshot().generation.value(), 1);
         assert_eq!(tool_executor.capability_snapshot().generation.value(), 1);
         assert!(matches!(
             rt.context.mode_context,
@@ -16369,10 +16374,14 @@ mod approve_task_failure_effect_tests {
         assert!(result.is_err());
         assert!(storage.approved_task_authority_persisted(conv_id));
         assert_eq!(
-            rt.tool_capability.authority,
+            rt.tool_executor.capability_snapshot().authority,
             crate::work_scope::ResourceAuthority::Restricted
         );
         assert_eq!(tool_executor.capability_snapshot().generation.value(), 0);
+        assert!(matches!(
+            rt.recovery_disposition,
+            RuntimeRecoveryDisposition::RecreateFromDatabase
+        ));
         assert!(llm.recorded_requests().is_empty());
     }
 
@@ -16949,8 +16958,12 @@ mod steer_drain_detector_tests {
             request_id: "terminal-retry-response".to_string(),
         };
 
-        rt.process_generation_tagged_llm_outcome(0, rt.tool_capability.generation, outcome)
-            .await;
+        rt.process_generation_tagged_llm_outcome(
+            0,
+            rt.tool_executor.capability_snapshot().generation,
+            outcome,
+        )
+        .await;
         assert!(matches!(rt.state, ConvState::LlmRequesting { attempt: 1 }));
         assert!(rt.terminal_transition_retry.is_some());
         assert!(rt.parent_event_tx.is_some());
@@ -19027,7 +19040,7 @@ mod work_subagent_cwd_guard_tests {
         runtime_in_mode(working_dir, ModeContext::Direct)
     }
 
-    fn approved_explore_runtime(
+    async fn approved_explore_runtime(
         worktree_path: &std::path::Path,
     ) -> ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>> {
         let mut runtime = runtime_in_mode(
@@ -19036,8 +19049,12 @@ mod work_subagent_cwd_guard_tests {
                 next_taskmd_id_hint: Some("12345".to_string()),
             },
         );
-        let snapshot = runtime.tool_executor.upgrade_to_work_mode().unwrap();
-        runtime.tool_capability = snapshot;
+        let snapshot = runtime.tool_executor.upgrade_to_work_mode().await.unwrap();
+        runtime.context.work_scope_worktree = Some(worktree_path.to_path_buf());
+        assert_eq!(
+            runtime.tool_executor.capability_snapshot().generation,
+            snapshot.generation
+        );
         runtime
     }
 
@@ -19194,7 +19211,7 @@ mod work_subagent_cwd_guard_tests {
     #[tokio::test]
     async fn approved_explore_origin_admits_work_subagent() {
         let worktree = TempDir::new().expect("worktree tempdir");
-        let mut rt = approved_explore_runtime(worktree.path());
+        let mut rt = approved_explore_runtime(worktree.path()).await;
 
         let result = rt
             .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
@@ -19217,6 +19234,33 @@ mod work_subagent_cwd_guard_tests {
                 "Explore provenance must not override WorkScope authority: {text}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn approved_explore_work_subagent_cannot_escape_workscope() {
+        let worktree = TempDir::new().expect("worktree tempdir");
+        let outside = TempDir::new().expect("outside tempdir");
+        let mut rt = approved_explore_runtime(worktree.path()).await;
+
+        let result = rt
+            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                tasks: vec![SubAgentTask {
+                    task: "escape scope".to_string(),
+                    cwd: Some(outside.path().to_string_lossy().into_owned()),
+                    mode: Some(SubAgentMode::Work),
+                    model: Some("test-model".to_string()),
+                    max_turns: Some(1),
+                    agent_type: None,
+                }],
+            }))
+            .await
+            .unwrap()
+            .expect("scope escape must return an error event");
+
+        let Event::ToolComplete { result, .. } = result else {
+            panic!("expected ToolComplete rejection");
+        };
+        assert!(tool_result_text(&result).contains("must be inside the parent's worktree"));
     }
 
     #[tokio::test]
@@ -20963,12 +21007,54 @@ mod llm_generation_guard_tests {
             request_id: "late-response".to_string(),
         };
 
-        rt.process_generation_tagged_llm_outcome(1, rt.tool_capability.generation, late_response)
-            .await;
+        rt.process_generation_tagged_llm_outcome(
+            1,
+            rt.tool_executor.capability_snapshot().generation,
+            late_response,
+        )
+        .await;
         tokio::task::yield_now().await;
 
         assert_eq!(rt.state, state_before);
         assert!(rt.llm_outcome_is_stale(1));
+        assert!(storage.recorded_messages().is_empty());
+        assert!(tools.recorded_executions().is_empty());
+        assert!(rt.tool_task_handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_capability_generation_cannot_persist_response_or_execute_tools() {
+        let mut rt = runtime_requesting();
+        let stale_capability = rt.tool_executor.capability_snapshot().generation;
+        rt.tool_executor.advance_capability_generation_for_test();
+        let state_before = rt.state.clone();
+        let storage = rt.storage.clone();
+        let tools = rt.tool_executor.clone();
+
+        rt.process_generation_tagged_llm_outcome(
+            rt.llm_request_generation,
+            stale_capability,
+            LlmOutcome::Response {
+                content: vec![ContentBlock::Text {
+                    text: "stale capability response".to_string(),
+                }],
+                tool_calls: vec![ToolCall {
+                    id: "stale-capability-tool".to_string(),
+                    input: phoenix_core::domain::sm_state::ToolInput::Bash(
+                        phoenix_core::domain::bash_types::BashInvocation::from_context(
+                            phoenix_core::domain::bash_types::BashToolInput::run("echo stale"),
+                        )
+                        .unwrap(),
+                    ),
+                }],
+                end_turn: false,
+                usage: phoenix_llm::Usage::default(),
+                request_id: "stale-capability-response".to_string(),
+            },
+        )
+        .await;
+
+        assert_eq!(rt.state, state_before);
         assert!(storage.recorded_messages().is_empty());
         assert!(tools.recorded_executions().is_empty());
         assert!(rt.tool_task_handle.is_none());
@@ -20983,7 +21069,7 @@ mod llm_generation_guard_tests {
 
         rt.process_generation_tagged_llm_outcome(
             1,
-            rt.tool_capability.generation,
+            rt.tool_executor.capability_snapshot().generation,
             LlmOutcome::NetworkError {
                 message: "stale aborted request".to_string(),
             },

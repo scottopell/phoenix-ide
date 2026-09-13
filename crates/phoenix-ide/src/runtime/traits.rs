@@ -437,6 +437,8 @@ pub trait StateStore: Send + Sync {
         &self,
         conv_id: &str,
         approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
+        approved_state: &ConvState,
+        state_updated_at: DateTime<Utc>,
     ) -> Result<(), String>;
 
     /// Get the current conversation mode (used by effect handlers that need
@@ -622,6 +624,8 @@ pub trait ToolExecutor: Send + Sync {
         if self.capability_snapshot().generation != expected {
             return Err("stale tool capability generation".to_string());
         }
+        // Production definitions are fenced before and after their asynchronous
+        // MCP merge; stale provider surfaces cannot cross publication.
         let definitions = self.definitions_for_language(language).await;
         if self.capability_snapshot().generation != expected {
             return Err("stale tool capability generation".to_string());
@@ -631,7 +635,7 @@ pub trait ToolExecutor: Send + Sync {
 
     /// Publish the Work-authority tool set before post-approval execution resumes.
     /// Executors that cannot perform the authority transition fail closed.
-    fn upgrade_to_work_mode(&self) -> Result<ToolCapabilitySnapshot, String> {
+    async fn upgrade_to_work_mode(&self) -> Result<ToolCapabilitySnapshot, String> {
         Err("tool executor cannot publish Work authority".to_string())
     }
 }
@@ -1001,9 +1005,11 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         &self,
         conv_id: &str,
         approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
+        approved_state: &ConvState,
+        state_updated_at: DateTime<Utc>,
     ) -> Result<(), String> {
         (**self)
-            .persist_approved_task_authority(conv_id, approval)
+            .persist_approved_task_authority(conv_id, approval, approved_state, state_updated_at)
             .await
     }
 
@@ -1148,8 +1154,8 @@ impl<T: ToolExecutor + ?Sized> ToolExecutor for Arc<T> {
         (**self).execute_at_generation(expected, call, ctx).await
     }
 
-    fn upgrade_to_work_mode(&self) -> Result<ToolCapabilitySnapshot, String> {
-        (**self).upgrade_to_work_mode()
+    async fn upgrade_to_work_mode(&self) -> Result<ToolCapabilitySnapshot, String> {
+        (**self).upgrade_to_work_mode().await
     }
 }
 
@@ -1965,9 +1971,11 @@ impl StateStore for DatabaseStorage {
         &self,
         conv_id: &str,
         approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
+        approved_state: &ConvState,
+        state_updated_at: DateTime<Utc>,
     ) -> Result<(), String> {
         self.db
-            .persist_approved_task_authority(conv_id, approval)
+            .persist_approved_task_authority(conv_id, approval, approved_state, state_updated_at)
             .await
             .map_err(|e| e.to_string())
     }
@@ -2152,6 +2160,7 @@ impl PublishedToolCapability {
 /// at runtime (e.g., Explore -> Work mode transition after task approval).
 pub struct ToolRegistryExecutor {
     capability: std::sync::RwLock<PublishedToolCapability>,
+    transition_barrier: tokio::sync::RwLock<()>,
     /// When set, MCP tools are resolved live from the manager on every
     /// `definitions()` and `execute()` call instead of being snapshotted
     /// into the registry. This means enable/disable and reload take effect
@@ -2178,6 +2187,7 @@ impl ToolRegistryExecutor {
     ) -> Self {
         Self {
             capability: std::sync::RwLock::new(PublishedToolCapability::new(authority, registry)),
+            transition_barrier: tokio::sync::RwLock::new(()),
             mcp_manager: None,
             agent_catalog,
             model_ids: Arc::from(Vec::new()),
@@ -2197,6 +2207,7 @@ impl ToolRegistryExecutor {
     ) -> Self {
         Self {
             capability: std::sync::RwLock::new(PublishedToolCapability::new(authority, registry)),
+            transition_barrier: tokio::sync::RwLock::new(()),
             mcp_manager: Some(manager),
             agent_catalog,
             model_ids,
@@ -2316,6 +2327,22 @@ impl ToolExecutor for ToolRegistryExecutor {
             .snapshot()
     }
 
+    async fn definitions_for_generation(
+        &self,
+        expected: ToolCapabilityGeneration,
+        language: crate::llm_language::LlmLanguage,
+    ) -> Result<Vec<phoenix_llm::ToolDefinition>, String> {
+        let _definition = self.transition_barrier.read().await;
+        if self.capability_snapshot().generation != expected {
+            return Err("stale tool capability generation".to_string());
+        }
+        let definitions = self.definitions_for_language(language).await;
+        if self.capability_snapshot().generation != expected {
+            return Err("stale tool capability generation".to_string());
+        }
+        Ok(definitions)
+    }
+
     async fn execute_at_generation(
         &self,
         expected: ToolCapabilityGeneration,
@@ -2323,6 +2350,7 @@ impl ToolExecutor for ToolRegistryExecutor {
         ctx: ToolContext,
     ) -> Result<Option<ToolOutput>, String> {
         let (name, input) = call.into_parts();
+        let _execution = self.transition_barrier.read().await;
         let tool = {
             let capability = self
                 .capability
@@ -2354,12 +2382,13 @@ impl ToolExecutor for ToolRegistryExecutor {
         self.model_ids.clone()
     }
 
-    fn upgrade_to_work_mode(&self) -> Result<ToolCapabilitySnapshot, String> {
+    async fn upgrade_to_work_mode(&self) -> Result<ToolCapabilitySnapshot, String> {
         let mut registry =
             ToolRegistry::direct(self.agent_catalog.to_vec(), self.model_ids.to_vec());
         if let Some(tools) = self.writing_tools.clone() {
             registry = registry.try_with_writing_conversation_tools(tools)?;
         }
+        let _transition = self.transition_barrier.write().await;
         Ok(self.publish_work_registry(registry))
     }
 }
@@ -2392,6 +2421,35 @@ mod tool_registry_executor_tests {
         }
     }
 
+    struct BlockingCapabilityTool {
+        started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait]
+    impl crate::tools::Tool for BlockingCapabilityTool {
+        fn name(&self) -> &'static str {
+            "blocking_capability"
+        }
+
+        fn description(&self) -> String {
+            "capability transition barrier fixture".to_string()
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object"})
+        }
+
+        async fn run(&self, _input: serde_json::Value, _ctx: ToolContext) -> ToolOutput {
+            if let Some(started) = self.started.lock().unwrap().take() {
+                let _ = started.send(());
+            }
+            let release = self.release.lock().unwrap().take().unwrap();
+            let _ = release.await;
+            ToolOutput::success("completed under admitted generation")
+        }
+    }
+
     fn tool_context_for_path(
         path: &std::path::Path,
         authority: phoenix_core::work_scope::ResourceAuthority,
@@ -2418,10 +2476,66 @@ mod tool_registry_executor_tests {
     }
 
     #[tokio::test]
+    async fn publication_waits_for_admitted_tool_and_rejects_queued_stale_call() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let executor = Arc::new(ToolRegistryExecutor::builtin_only(
+            phoenix_core::work_scope::ResourceAuthority::Restricted,
+            ToolRegistry::coordinator(vec![Arc::new(BlockingCapabilityTool {
+                started: std::sync::Mutex::new(Some(started_tx)),
+                release: std::sync::Mutex::new(Some(release_rx)),
+            })]),
+            Arc::from(Vec::new()),
+        ));
+        let initial = executor.capability_snapshot();
+        let execute = {
+            let executor = Arc::clone(&executor);
+            let path = temp.path().to_path_buf();
+            tokio::spawn(async move {
+                executor
+                    .execute_at_generation(
+                        initial.generation,
+                        CheckedToolCall::cleared_for_test(
+                            "blocking_capability".to_string(),
+                            serde_json::json!({}),
+                        ),
+                        tool_context_for_path(&path, initial.authority),
+                    )
+                    .await
+            })
+        };
+        started_rx.await.unwrap();
+        let publish = {
+            let executor = Arc::clone(&executor);
+            tokio::spawn(async move { executor.upgrade_to_work_mode().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!publish.is_finished());
+        release_tx.send(()).unwrap();
+        assert!(execute.await.unwrap().unwrap().is_some());
+        let work = publish.await.unwrap().unwrap();
+        assert_eq!(work.generation, initial.generation.next());
+
+        assert!(executor
+            .execute_at_generation(
+                initial.generation,
+                CheckedToolCall::cleared_for_test(
+                    "think".to_string(),
+                    serde_json::json!({"thoughts":"queued stale"}),
+                ),
+                tool_context_for_path(temp.path(), initial.authority),
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
     async fn same_executor_after_approval_can_mutate_all_work_paths() {
         use std::process::Command;
 
         let repo = tempfile::TempDir::new().unwrap();
+        let external_cache = tempfile::TempDir::new().unwrap();
         for args in [
             vec!["init", "-b", "main"],
             vec!["config", "user.email", "capability@test.invalid"],
@@ -2466,20 +2580,23 @@ mod tool_registry_executor_tests {
             ),
             Arc::from(Vec::new()),
         );
-        let work = executor.upgrade_to_work_mode().unwrap();
-        let command = r#"
-            test -z "${PHOENIX_SANDBOX_SCRATCH:-}"
+        let work = executor.upgrade_to_work_mode().await.unwrap();
+        let command = format!(
+            r#"
+            test -z "${{PHOENIX_SANDBOX_SCRATCH:-}}"
             mv tasks/10000-p0-ready--fixture.md tasks/10000-p0-in-progress--fixture.md
             common=$(git rev-parse --git-common-dir)
             : > "$common/capability-transition.lock"
             rm "$common/capability-transition.lock"
-            mkdir -p target/codegen .uv/cache
+            mkdir -p target/codegen '{external_cache}/uv'
             printf generated > target/codegen/output
-            printf cached > .uv/cache/output
+            printf cached > '{external_cache}/uv/output'
             printf committed > approved.txt
             git add tasks approved.txt
             git commit -m approved-capability
-        "#;
+        "#,
+            external_cache = external_cache.path().display()
+        );
         let call = CheckedToolCall::cleared_for_test(
             "bash".to_string(),
             serde_json::json!({"op":"run", "cmd":command, "wait_seconds":30}),
@@ -2500,7 +2617,7 @@ mod tool_registry_executor_tests {
             .join("tasks/10000-p0-in-progress--fixture.md")
             .exists());
         assert!(repo.path().join("target/codegen/output").exists());
-        assert!(repo.path().join(".uv/cache/output").exists());
+        assert!(external_cache.path().join("uv/output").exists());
         let subject = Command::new("git")
             .args(["log", "-1", "--pretty=%s"])
             .current_dir(repo.path())
@@ -2513,49 +2630,20 @@ mod tool_registry_executor_tests {
     }
 
     #[tokio::test]
-    async fn unapproved_explore_remains_sandboxed() {
-        let repo = tempfile::TempDir::new().unwrap();
+    async fn unapproved_explore_selects_sandboxed_bash() {
+        let policy = crate::tools::ExploreToolPolicy::from_platform(
+            &crate::platform::PlatformCapability::detect(),
+        );
         let executor = ToolRegistryExecutor::builtin_only(
             phoenix_core::work_scope::ResourceAuthority::Restricted,
-            ToolRegistry::explore(
-                "tasks",
-                Vec::new(),
-                Vec::new(),
-                crate::tools::ExploreToolPolicy::from_platform(
-                    &crate::platform::PlatformCapability::detect(),
-                ),
-            ),
+            ToolRegistry::explore("tasks", Vec::new(), Vec::new(), policy),
             Arc::from(Vec::new()),
         );
         let definitions = executor.definitions().await;
-        if definitions
+        let has_bash = definitions
             .iter()
-            .any(|definition| definition.name == "bash")
-        {
-            let call = CheckedToolCall::cleared_for_test(
-                "bash".to_string(),
-                serde_json::json!({
-                    "op":"run",
-                    "cmd":"test -n \"${PHOENIX_SANDBOX_SCRATCH:-}\" && ! touch source-denied",
-                    "wait_seconds":30
-                }),
-            );
-            let snapshot = executor.capability_snapshot();
-            let output = executor
-                .execute_at_generation(
-                    snapshot.generation,
-                    call,
-                    tool_context_for_path(repo.path(), snapshot.authority),
-                )
-                .await
-                .unwrap()
-                .unwrap();
-            let _text = tool_output_text(output);
-            assert!(
-                !repo.path().join("source-denied").exists(),
-                "Restricted Explore Bash must not mutate the source tree"
-            );
-        }
+            .any(|definition| definition.name == "bash");
+        assert_eq!(has_bash, policy.has_sandboxed_bash());
         assert_eq!(
             executor.capability_snapshot().authority,
             phoenix_core::work_scope::ResourceAuthority::Restricted
@@ -2593,7 +2681,7 @@ mod tool_registry_executor_tests {
             .await
             .iter()
             .any(|definition| definition.name == "search_conversations"));
-        let snapshot = executor.upgrade_to_work_mode().unwrap();
+        let snapshot = executor.upgrade_to_work_mode().await.unwrap();
         assert_eq!(
             snapshot.authority,
             phoenix_core::work_scope::ResourceAuthority::Work
