@@ -6949,16 +6949,16 @@ where
         let available_tools = tool_executor
             .definitions_for_generation(capability_generation, llm_language)
             .await?;
-        let explore_bash_capability =
-            if matches!(
-                capability.authority,
-                crate::work_scope::ResourceAuthority::Restricted
-            ) && matches!(mode_context.as_ref(), Some(ModeContext::Explore { .. }))
-            {
-                explore_bash
-            } else {
-                phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable
-            };
+        let explore_bash_capability = match (capability.authority, mode_context.as_ref()) {
+            (
+                crate::work_scope::ResourceAuthority::Restricted,
+                Some(ModeContext::Explore { .. }),
+            ) => explore_bash.into(),
+            (crate::work_scope::ResourceAuthority::Work, Some(ModeContext::Explore { .. })) => {
+                phoenix_core::llm_language::ExploreBashPromptCapability::Unsandboxed
+            }
+            _ => phoenix_core::llm_language::ExploreBashPromptCapability::Unavailable,
+        };
         let mut system_prompt = if is_coordinator {
             crate::system_prompt::build_coordinator_system_prompt(llm_language)
         } else {
