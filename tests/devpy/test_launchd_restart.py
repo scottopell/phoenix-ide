@@ -96,6 +96,22 @@ class RestartHelperTests(unittest.TestCase):
                 text=True,
             )
 
+    def test_inspection_failure_preserves_launchctl_diagnostic(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            run = mock.Mock(return_value=subprocess.CompletedProcess(
+                [],
+                64,
+                "",
+                "launchctl domain temporarily unavailable",
+            ))
+
+            with self.assertRaisesRegex(
+                helper.RestartError,
+                "domain temporarily unavailable",
+            ):
+                helper.Launchctl(manifest, run=run).inspect()
+
     def test_restart_preserves_installed_artifacts_and_commits_exact_identity(self):
         with tempfile.TemporaryDirectory() as td:
             manifest = make_manifest(Path(td))

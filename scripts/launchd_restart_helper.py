@@ -203,8 +203,15 @@ class Launchctl:
             text=True,
         )
         output = result.stdout + "\n" + result.stderr
-        if result.returncode != 0 or "Could not find service" in output:
+        if "Could not find service" in output:
             return "not_loaded", None
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()
+            suffix = f": {detail}" if detail else ""
+            raise RestartError(
+                f"launchctl could not inspect the installed service "
+                f"(exit {result.returncode}){suffix}"
+            )
         state = "unknown"
         pid = None
         for raw in result.stdout.splitlines():
