@@ -9621,6 +9621,34 @@ impl Database {
         product_conversation_id: &str,
     ) -> DbResult<()> {
         sqlx::query(
+            "DELETE FROM close_ambient_writer_evidence
+             WHERE attempt_id IN (
+                 SELECT attempt_id FROM close_obligations
+                 WHERE product_conversation_id = ?1
+             )
+               AND NOT EXISTS (
+                   SELECT 1 FROM conversations
+                   WHERE product_conversation_id = ?1
+               )",
+        )
+        .bind(product_conversation_id)
+        .execute(&mut *connection)
+        .await?;
+        sqlx::query(
+            "DELETE FROM close_worktree_cleanup_adoptions
+             WHERE attempt_id IN (
+                 SELECT attempt_id FROM close_obligations
+                 WHERE product_conversation_id = ?1
+             )
+               AND NOT EXISTS (
+                   SELECT 1 FROM conversations
+                   WHERE product_conversation_id = ?1
+               )",
+        )
+        .bind(product_conversation_id)
+        .execute(&mut *connection)
+        .await?;
+        sqlx::query(
             "DELETE FROM close_worktree_cleanup_plans
              WHERE attempt_id IN (
                  SELECT attempt_id FROM close_obligations
@@ -9823,6 +9851,100 @@ impl Database {
         else {
             return Ok(false);
         };
+        sqlx::query(
+            "INSERT INTO close_hard_delete_claims (product_conversation_id)
+             SELECT ?1
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM conversations WHERE product_conversation_id = ?1
+             )",
+        )
+        .bind(&product_conversation_id)
+        .execute(&mut *connection)
+        .await?;
+        sqlx::query(
+            "DELETE FROM close_worktree_cleanup_adoptions
+             WHERE attempt_id IN (
+                 SELECT obligation.attempt_id
+                 FROM close_obligations obligation
+                 JOIN close_hard_delete_claims claim
+                   ON claim.product_conversation_id = obligation.product_conversation_id
+                 WHERE obligation.product_conversation_id = ?1
+                   AND obligation.phase = 'completed'
+             )",
+        )
+        .bind(&product_conversation_id)
+        .execute(&mut *connection)
+        .await?;
+        sqlx::query(
+            "DELETE FROM close_ambient_writer_evidence
+             WHERE attempt_id IN (
+                 SELECT obligation.attempt_id
+                 FROM close_obligations obligation
+                 JOIN close_hard_delete_claims claim
+                   ON claim.product_conversation_id = obligation.product_conversation_id
+                 WHERE obligation.product_conversation_id = ?1
+                   AND obligation.phase = 'completed'
+             )",
+        )
+        .bind(&product_conversation_id)
+        .execute(&mut *connection)
+        .await?;
+        sqlx::query(
+            "DELETE FROM close_retirement_resource_history
+             WHERE attempt_id IN (
+                 SELECT obligation.attempt_id
+                 FROM close_obligations obligation
+                 JOIN close_hard_delete_claims claim
+                   ON claim.product_conversation_id = obligation.product_conversation_id
+                 WHERE obligation.product_conversation_id = ?1
+                   AND obligation.phase = 'completed'
+             )",
+        )
+        .bind(&product_conversation_id)
+        .execute(&mut *connection)
+        .await?;
+        for statement in [
+            "DELETE FROM close_worktree_cleanup_plans WHERE attempt_id IN (SELECT obligation.attempt_id FROM close_obligations obligation JOIN close_hard_delete_claims claim ON claim.product_conversation_id = obligation.product_conversation_id WHERE obligation.product_conversation_id = ?1 AND obligation.phase = 'completed')",
+            "DELETE FROM close_retirement_resource_dispatches WHERE attempt_id IN (SELECT obligation.attempt_id FROM close_obligations obligation JOIN close_hard_delete_claims claim ON claim.product_conversation_id = obligation.product_conversation_id WHERE obligation.product_conversation_id = ?1 AND obligation.phase = 'completed')",
+            "DELETE FROM close_retirement_resources WHERE attempt_id IN (SELECT obligation.attempt_id FROM close_obligations obligation JOIN close_hard_delete_claims claim ON claim.product_conversation_id = obligation.product_conversation_id WHERE obligation.product_conversation_id = ?1 AND obligation.phase = 'completed')",
+            "DELETE FROM close_expected_retirement_resources WHERE attempt_id IN (SELECT obligation.attempt_id FROM close_obligations obligation JOIN close_hard_delete_claims claim ON claim.product_conversation_id = obligation.product_conversation_id WHERE obligation.product_conversation_id = ?1 AND obligation.phase = 'completed')",
+            "DELETE FROM close_retirement_inventories WHERE attempt_id IN (SELECT obligation.attempt_id FROM close_obligations obligation JOIN close_hard_delete_claims claim ON claim.product_conversation_id = obligation.product_conversation_id WHERE obligation.product_conversation_id = ?1 AND obligation.phase = 'completed')",
+            "DELETE FROM close_retirement_losses WHERE attempt_id IN (SELECT obligation.attempt_id FROM close_obligations obligation JOIN close_hard_delete_claims claim ON claim.product_conversation_id = obligation.product_conversation_id WHERE obligation.product_conversation_id = ?1 AND obligation.phase = 'completed')",
+            "DELETE FROM close_retirement_inspections WHERE attempt_id IN (SELECT obligation.attempt_id FROM close_obligations obligation JOIN close_hard_delete_claims claim ON claim.product_conversation_id = obligation.product_conversation_id WHERE obligation.product_conversation_id = ?1 AND obligation.phase = 'completed')",
+        ] {
+            sqlx::query(statement)
+                .bind(&product_conversation_id)
+                .execute(&mut *connection)
+                .await?;
+        }
+        sqlx::query(
+            "DELETE FROM close_attempt_members
+             WHERE attempt_id IN (
+                 SELECT obligation.attempt_id
+                 FROM close_obligations obligation
+                 JOIN close_hard_delete_claims claim
+                   ON claim.product_conversation_id = obligation.product_conversation_id
+                 WHERE obligation.product_conversation_id = ?1
+                   AND obligation.phase = 'completed'
+             )",
+        )
+        .bind(&product_conversation_id)
+        .execute(&mut *connection)
+        .await?;
+        sqlx::query(
+            "DELETE FROM close_attempt_scopes
+             WHERE attempt_id IN (
+                 SELECT obligation.attempt_id
+                 FROM close_obligations obligation
+                 JOIN close_hard_delete_claims claim
+                   ON claim.product_conversation_id = obligation.product_conversation_id
+                 WHERE obligation.product_conversation_id = ?1
+                   AND obligation.phase = 'completed'
+             )",
+        )
+        .bind(&product_conversation_id)
+        .execute(&mut *connection)
+        .await?;
         Self::delete_subordinates_if_last_parent(
             connection,
             &product_conversation_id,

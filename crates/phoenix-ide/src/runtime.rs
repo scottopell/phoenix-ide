@@ -7276,9 +7276,10 @@ mod scope_liveness_tests {
     use super::*;
     use crate::platform::PlatformCapability;
     use crate::tools::mcp::McpClientManager;
-    use phoenix_core::domain::close::CloseAttemptId;
+    use phoenix_core::domain::close::{CapturedWorktreeIdentity, CloseAttemptId};
     use phoenix_core::domain::db_schema::{ConvMode, NonEmptyString};
     use phoenix_core::domain::sm_state::ConvState;
+    use phoenix_db::AdoptCloseWorktreeCleanupPlanRequest;
     use phoenix_llm::ModelRegistry;
 
     fn work_mode(worktree_path: &str) -> ConvMode {
@@ -7640,8 +7641,96 @@ mod scope_liveness_tests {
             .await
             .unwrap();
         assert_eq!(retried.phase(), ClosePhase::AwaitingRetirementInspection);
+        let retry_snapshot = manager
+            .inspect_close_retirement_only(attempt_id.clone())
+            .await
+            .unwrap();
         manager
-            .inspect_close_retirement(attempt_id.clone())
+            .capture_close_retirement_inventory(attempt_id.clone(), retry_snapshot.clone())
+            .await
+            .unwrap();
+        manager
+            .db()
+            .adopt_close_worktree_cleanup_plan(AdoptCloseWorktreeCleanupPlanRequest {
+                attempt_id: attempt_id.clone(),
+                scope: scope.clone(),
+                target_snapshot: retry_snapshot.clone(),
+                resource: phoenix_core::domain::close::RetiredResourceIdentity::parse(
+                    phoenix_core::domain::close::RetiredResourceKind::Worktree,
+                    phoenix_core::domain::close::LossItemIdentity::Worktree(
+                        match manager
+                            .db()
+                            .list_close_attempt_scopes(attempt_id.as_str())
+                            .await
+                            .unwrap()
+                            .into_iter()
+                            .find(|candidate| candidate.scope == scope)
+                            .unwrap()
+                            .captured_worktree
+                            .unwrap()
+                        {
+                            CapturedWorktreeIdentity::Resolved(identity) => identity,
+                            CapturedWorktreeIdentity::Unresolved { .. } => {
+                                panic!("test worktree identity must resolve")
+                            }
+                        },
+                    ),
+                )
+                .unwrap(),
+            })
+            .await
+            .unwrap();
+        for kind in [
+            phoenix_core::domain::close::RetiredResourceKind::Worktree,
+            phoenix_core::domain::close::RetiredResourceKind::WorkScope,
+        ] {
+            let resource = manager
+                .db()
+                .list_close_expected_retirement_resources(attempt_id.as_str())
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|resource| resource.scope == scope && resource.resource.kind() == kind)
+                .unwrap()
+                .resource;
+            let outcome = if kind == phoenix_core::domain::close::RetiredResourceKind::Worktree {
+                phoenix_core::domain::close::RetirementOutcome::AbsenceAdopted {
+                    absence_basis:
+                        phoenix_core::domain::close::AbsenceBasis::SameAttemptPriorRetirement,
+                }
+            } else {
+                manager
+                    .db()
+                    .record_close_retirement_dispatch(
+                        phoenix_db::RecordCloseRetirementDispatchRequest {
+                            attempt_id: attempt_id.clone(),
+                            scope: scope.clone(),
+                            snapshot: retry_snapshot.clone(),
+                            resource: resource.clone(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                phoenix_core::domain::close::RetirementOutcome::Retired
+            };
+            manager
+                .db()
+                .record_close_retirement_evidence(
+                    phoenix_db::RecordCloseRetirementEvidenceRequest {
+                        attempt_id: attempt_id.clone(),
+                        scope: scope.clone(),
+                        snapshot: retry_snapshot.clone(),
+                        resource,
+                        outcome,
+                        detail: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        manager
+            .db()
+            .complete_close_retirement(&attempt_id)
             .await
             .unwrap();
 
@@ -7651,7 +7740,7 @@ mod scope_liveness_tests {
             .await
             .unwrap();
         assert_eq!(completed.phase(), ClosePhase::Completed);
-        let retry_snapshot = completed.snapshot().cloned().unwrap();
+        assert_eq!(completed.snapshot(), Some(&retry_snapshot));
         assert_ne!(retry_snapshot.generation(), original_snapshot.generation());
         let evidence_shape: Vec<(String, i64, i64)> = sqlx::query_as(
             "SELECT inventory.inspection_generation,
@@ -7717,6 +7806,40 @@ mod scope_liveness_tests {
         .await
         .unwrap();
         assert!(ambient_rows >= 1);
+        let adoption_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_worktree_cleanup_adoptions WHERE attempt_id=?1",
+        )
+        .bind(attempt_id.as_str())
+        .fetch_one(manager.db().pool())
+        .await
+        .unwrap();
+        assert_eq!(adoption_rows, 1);
+        manager
+            .db()
+            .delete_conversation("retained-retry")
+            .await
+            .unwrap();
+        assert!(manager
+            .db()
+            .get_conversation("retained-retry")
+            .await
+            .is_err());
+        let retained_evidence_rows: i64 = sqlx::query_scalar(
+            "SELECT
+                 (SELECT COUNT(*) FROM close_ambient_writer_evidence WHERE attempt_id=?1)
+               + (SELECT COUNT(*) FROM close_worktree_cleanup_adoptions WHERE attempt_id=?1)",
+        )
+        .bind(attempt_id.as_str())
+        .fetch_one(manager.db().pool())
+        .await
+        .unwrap();
+        assert_eq!(retained_evidence_rows, 0);
+        let violations: Vec<(String, i64, String, i64)> =
+            sqlx::query_as("PRAGMA foreign_key_check")
+                .fetch_all(manager.db().pool())
+                .await
+                .unwrap();
+        assert!(violations.is_empty());
     }
 
     #[tokio::test]

@@ -8803,6 +8803,150 @@ mod migration_094_tests {
 }
 
 const MIGRATION_099: &str = r"
+CREATE TABLE close_hard_delete_claims (
+    product_conversation_id TEXT PRIMARY KEY
+        REFERENCES product_conversations(id) ON DELETE CASCADE
+);
+
+CREATE TABLE close_worktree_cleanup_adoptions (
+    attempt_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    source_inspection_generation TEXT NOT NULL,
+    source_inspection_fingerprint TEXT NOT NULL,
+    target_inspection_generation TEXT NOT NULL,
+    target_inspection_fingerprint TEXT NOT NULL,
+    resource_kind TEXT NOT NULL CHECK (resource_kind = 'worktree'),
+    identity_kind TEXT NOT NULL,
+    identity_codec TEXT NOT NULL,
+    identity_value TEXT NOT NULL,
+    adopted_at_unix_micros INTEGER NOT NULL
+        CHECK (typeof(adopted_at_unix_micros) = 'integer' AND adopted_at_unix_micros >= 0),
+    PRIMARY KEY (
+        attempt_id, scope, target_inspection_generation, target_inspection_fingerprint,
+        resource_kind, identity_kind, identity_codec, identity_value
+    ),
+    UNIQUE (
+        attempt_id, scope, source_inspection_generation, source_inspection_fingerprint,
+        resource_kind, identity_kind, identity_codec, identity_value
+    ),
+    FOREIGN KEY (
+        attempt_id, scope, source_inspection_generation, source_inspection_fingerprint,
+        resource_kind, identity_kind, identity_value
+    ) REFERENCES close_worktree_cleanup_plans (
+        attempt_id, scope, inspection_generation, inspection_fingerprint,
+        resource_kind, identity_kind, identity_value
+    ) ON DELETE RESTRICT,
+    FOREIGN KEY (
+        attempt_id, scope, target_inspection_generation, target_inspection_fingerprint,
+        resource_kind, identity_kind, identity_value
+    ) REFERENCES close_worktree_cleanup_plans (
+        attempt_id, scope, inspection_generation, inspection_fingerprint,
+        resource_kind, identity_kind, identity_value
+    ) ON DELETE RESTRICT
+);
+
+DROP TRIGGER close_retirement_inspections_reject_sealed_delete;
+CREATE TRIGGER close_retirement_inspections_reject_sealed_delete
+BEFORE DELETE ON close_retirement_inspections
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM close_obligations obligation
+    JOIN product_conversations root ON root.id = obligation.product_conversation_id
+    WHERE obligation.attempt_id = OLD.attempt_id
+      AND obligation.phase <> 'awaiting_retirement_inspection'
+      AND NOT EXISTS (
+          SELECT 1 FROM close_hard_delete_claims claim
+          WHERE claim.product_conversation_id = obligation.product_conversation_id
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'persisted close inspection snapshot is sealed');
+END;
+
+DROP TRIGGER close_retirement_losses_require_open_inspection_on_delete;
+CREATE TRIGGER close_retirement_losses_require_open_inspection_on_delete
+BEFORE DELETE ON close_retirement_losses
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM close_obligations obligation
+    JOIN product_conversations root ON root.id = obligation.product_conversation_id
+    WHERE obligation.attempt_id = OLD.attempt_id
+      AND obligation.phase <> 'awaiting_retirement_inspection'
+      AND NOT EXISTS (
+          SELECT 1 FROM close_hard_delete_claims claim
+          WHERE claim.product_conversation_id = obligation.product_conversation_id
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'close loss inventory is sealed outside inspection replacement');
+END;
+
+DROP TRIGGER close_retirement_resource_history_reject_delete;
+CREATE TRIGGER close_retirement_resource_history_reject_delete
+BEFORE DELETE ON close_retirement_resource_history
+WHEN EXISTS (
+    SELECT 1 FROM close_obligations obligation
+    WHERE obligation.attempt_id = OLD.attempt_id
+      AND NOT EXISTS (
+          SELECT 1 FROM close_hard_delete_claims claim
+          WHERE claim.product_conversation_id = obligation.product_conversation_id
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'retirement resource history belongs to its Close aggregate');
+END;
+
+DROP TRIGGER close_retirement_inventories_reject_standalone_delete;
+CREATE TRIGGER close_retirement_inventories_reject_standalone_delete
+BEFORE DELETE ON close_retirement_inventories
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM close_obligations obligation
+    JOIN product_conversations root ON root.id = obligation.product_conversation_id
+    WHERE obligation.attempt_id = OLD.attempt_id
+      AND NOT EXISTS (
+          SELECT 1 FROM close_hard_delete_claims claim
+          WHERE claim.product_conversation_id = obligation.product_conversation_id
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'captured retirement inventory can only be deleted with its root');
+END;
+
+DROP TRIGGER close_expected_retirement_resources_reject_standalone_delete;
+CREATE TRIGGER close_expected_retirement_resources_reject_standalone_delete
+BEFORE DELETE ON close_expected_retirement_resources
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM close_obligations obligation
+    JOIN product_conversations root ON root.id = obligation.product_conversation_id
+    WHERE obligation.attempt_id = OLD.attempt_id
+      AND NOT EXISTS (
+          SELECT 1 FROM close_hard_delete_claims claim
+          WHERE claim.product_conversation_id = obligation.product_conversation_id
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'expected retirement resource can only be deleted with its root');
+END;
+
+DROP TRIGGER close_retirement_resources_reject_standalone_delete;
+CREATE TRIGGER close_retirement_resources_reject_standalone_delete
+BEFORE DELETE ON close_retirement_resources
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM close_obligations obligation
+    JOIN product_conversations root ON root.id = obligation.product_conversation_id
+    WHERE obligation.attempt_id = OLD.attempt_id
+      AND NOT EXISTS (
+          SELECT 1 FROM close_hard_delete_claims claim
+          WHERE claim.product_conversation_id = obligation.product_conversation_id
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'retirement evidence can only be deleted with its root');
+END;
+
 CREATE TABLE close_ambient_writer_evidence (
     attempt_id TEXT NOT NULL,
     scope TEXT NOT NULL,
