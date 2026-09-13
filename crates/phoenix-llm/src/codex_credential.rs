@@ -370,7 +370,11 @@ impl CredentialSource for AccountBoundCodexCredential {
     }
 
     async fn invalidate(&self) -> bool {
-        self.source.invalidate().await
+        if self.source.account_id() == self.account_id {
+            self.source.invalidate().await
+        } else {
+            false
+        }
     }
 
     async fn last_error_hint(&self) -> Option<String> {
@@ -755,6 +759,7 @@ mod tests {
         *bound.source.account_id.lock().unwrap() = Some("account-b".to_string());
 
         assert_eq!(bound.get().await, None);
+        assert!(!bound.invalidate().await);
         assert_eq!(bound.account_id().as_deref(), Some("account-a"));
     }
 
