@@ -1,8 +1,8 @@
 # ADR-051: WorkScope authority projects one runtime capability
 
-- Status: Accepted
-- Date: 2026-09-13
-- Affects: REQ-BED-028, REQ-BED-046, REQ-BASH-013a, REQ-PROJ-008; runtime tool and sub-agent authority
+- **Status:** Accepted
+- **Date:** 2026-09-13
+- **Affects:** REQ-BED-028, REQ-BED-046, REQ-BASH-013a, REQ-PROJ-008; runtime tool and sub-agent authority
 
 ## Context
 

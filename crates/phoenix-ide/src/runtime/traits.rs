@@ -2547,8 +2547,6 @@ mod tool_registry_executor_tests {
 
     #[tokio::test]
     async fn same_executor_after_approval_can_mutate_all_work_paths() {
-        use std::process::Command;
-
         let repo = tempfile::TempDir::new().unwrap();
         let external_cache = tempfile::TempDir::new().unwrap();
         for args in [
@@ -2556,7 +2554,7 @@ mod tool_registry_executor_tests {
             vec!["config", "user.email", "capability@test.invalid"],
             vec!["config", "user.name", "Capability Test"],
         ] {
-            assert!(Command::new("git")
+            assert!(phoenix_core::git::command()
                 .args(args)
                 .current_dir(repo.path())
                 .status()
@@ -2570,13 +2568,13 @@ mod tool_registry_executor_tests {
         )
         .unwrap();
         std::fs::write(repo.path().join("README.md"), "fixture\n").unwrap();
-        assert!(Command::new("git")
+        assert!(phoenix_core::git::command()
             .args(["add", "."])
             .current_dir(repo.path())
             .status()
             .unwrap()
             .success());
-        assert!(Command::new("git")
+        assert!(phoenix_core::git::command()
             .args(["commit", "-m", "fixture"])
             .current_dir(repo.path())
             .status()
@@ -2633,7 +2631,7 @@ mod tool_registry_executor_tests {
             .exists());
         assert!(repo.path().join("target/codegen/output").exists());
         assert!(external_cache.path().join("uv/output").exists());
-        let subject = Command::new("git")
+        let subject = phoenix_core::git::command()
             .args(["log", "-1", "--pretty=%s"])
             .current_dir(repo.path())
             .output()
@@ -2720,8 +2718,10 @@ mod tool_registry_executor_tests {
             "think".to_string(),
             serde_json::json!({"thoughts": "stale"}),
         );
+        let stale_context_root = tempfile::TempDir::new().unwrap();
         let stale_context = crate::runtime::testing::test_tool_context_for_authority(
             phoenix_core::work_scope::ResourceAuthority::Restricted,
+            stale_context_root.path().to_path_buf(),
         );
         assert!(
             executor
