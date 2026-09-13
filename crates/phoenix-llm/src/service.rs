@@ -839,6 +839,7 @@ mod tests {
             use_codex_backend: true,
             codex_credential: None,
             codex_ws_sessions: Arc::new(Mutex::new(openai::CodexWsSessions::default())),
+            attempt_deadline: LlmAttemptDeadline::default(),
         };
 
         assert_eq!(
