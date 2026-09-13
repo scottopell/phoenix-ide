@@ -30,9 +30,11 @@ use phoenix_tools::{
 use super::creation_worker::RepositoryMutationLock;
 use super::RuntimeManager;
 use crate::db::{
-    BindCloseWorktreeFinalTombstoneObjectRequest, BindCloseWorktreeFinalTombstoneRequest,
-    CaptureCloseRetirementInventoryRequest, CaptureCloseRetirementInventoryScopeRequest,
-    CloseWorktreeFinalTombstone, RecordCloseRetirementDispatchRequest,
+    AdoptCloseWorktreeCleanupPlanRequest, AmbientWriterAccessMode, AmbientWriterDetector,
+    AmbientWriterEvidence, AmbientWriterMatchKind, BindCloseWorktreeFinalTombstoneObjectRequest,
+    BindCloseWorktreeFinalTombstoneRequest, CaptureCloseRetirementInventoryRequest,
+    CaptureCloseRetirementInventoryScopeRequest, CloseWorktreeFinalTombstone,
+    RecordCloseAmbientWriterEvidenceRequest, RecordCloseRetirementDispatchRequest,
     RecordCloseRetirementEvidenceRequest, RecordCloseWorktreeCleanupPlanRequest,
     ReplaceCloseInspectionRequest, ReplaceCloseInspectionScopeRequest,
     RouteCloseAttemptToRepairRequest,
@@ -294,7 +296,9 @@ impl RuntimeManager {
                                         } else {
                                             prior_snapshot
                                         };
-                                        self.retire_close_runtime_resources(attempt_id).await?;
+                                        self.retire_close_runtime_resources(attempt_id)
+                                            .await
+                                            .map_err(String::from)?;
                                         return Ok(active_snapshot);
                                     }
                                     return Ok(prior_snapshot);
@@ -367,7 +371,9 @@ impl RuntimeManager {
             .cloned()
             .ok_or_else(|| "server inspection did not persist aggregate snapshot".to_string())?;
         if continue_clean_retirement && obligation.phase() == ClosePhase::RetirementRequested {
-            self.retire_close_runtime_resources(attempt_id).await?;
+            self.retire_close_runtime_resources(attempt_id)
+                .await
+                .map_err(String::from)?;
         }
         Ok(snapshot)
     }
@@ -686,7 +692,7 @@ impl RuntimeManager {
     pub(crate) async fn retire_close_runtime_resources(
         &self,
         attempt_id: CloseAttemptId,
-    ) -> Result<(), String> {
+    ) -> Result<(), CloseRetirementError> {
         let _execution = self
             .close_retirement_execution
             .lock(attempt_id.as_str())
@@ -1139,7 +1145,7 @@ impl RuntimeManager {
         &self,
         attempt_id: &CloseAttemptId,
         snapshot: &CloseRetirementSnapshot,
-    ) -> Result<(), String> {
+    ) -> Result<(), CloseRetirementError> {
         let targets = self
             .db()
             .list_close_expected_retirement_resources(attempt_id.as_str())
@@ -1237,6 +1243,32 @@ impl RuntimeManager {
                         .close_worktree_cleanup_plan(attempt_id, &scope, snapshot, &target.resource)
                         .await
                         .map_err(|error| error.to_string())?;
+                    let existing_cleanup_plan = if captured_path
+                        .try_exists()
+                        .map_err(|error| error.to_string())?
+                    {
+                        existing_cleanup_plan
+                    } else if quarantine_path
+                        .try_exists()
+                        .map_err(|error| error.to_string())?
+                        && existing_cleanup_plan.is_none()
+                    {
+                        Some(
+                            self.db()
+                                .adopt_close_worktree_cleanup_plan(
+                                    AdoptCloseWorktreeCleanupPlanRequest {
+                                        attempt_id: attempt_id.clone(),
+                                        scope: scope.clone(),
+                                        target_snapshot: snapshot.clone(),
+                                        resource: target.resource.clone(),
+                                    },
+                                )
+                                .await
+                                .map_err(map_close_retirement_db_error)?,
+                        )
+                    } else {
+                        existing_cleanup_plan
+                    };
                     if let Some(cleanup_plan) = existing_cleanup_plan
                         .as_ref()
                         .filter(|plan| plan.final_tombstone.is_some())
@@ -1547,7 +1579,7 @@ impl RuntimeManager {
                                     .map_err(|error| error.to_string())?;
                                 Box::pin(self.inspect_close_retirement_only(attempt_id.clone()))
                                     .await?;
-                                return Err(detail);
+                                return Err(CloseRetirementError::Message(detail));
                             }
                             Ok(ExactWorktreeRemoval::Residual { detail }) => {
                                 return self
@@ -1558,6 +1590,30 @@ impl RuntimeManager {
                                         target.resource.clone(),
                                         RetirementFailureReason::IdentityNotProven,
                                         &detail,
+                                    )
+                                    .await;
+                            }
+                            Ok(ExactWorktreeRemoval::AmbientWriterResidual(residual)) => {
+                                self.db()
+                                    .record_close_ambient_writer_evidence(
+                                        RecordCloseAmbientWriterEvidenceRequest {
+                                            attempt_id: attempt_id.clone(),
+                                            scope: scope.clone(),
+                                            snapshot: snapshot.clone(),
+                                            resource: target.resource.clone(),
+                                            evidence: residual.evidence,
+                                        },
+                                    )
+                                    .await
+                                    .map_err(map_close_retirement_db_error)?;
+                                return self
+                                    .record_close_residual(
+                                        attempt_id,
+                                        snapshot,
+                                        &scope,
+                                        target.resource.clone(),
+                                        RetirementFailureReason::IdentityNotProven,
+                                        &residual.detail,
                                     )
                                     .await;
                             }
@@ -1695,13 +1751,16 @@ impl RuntimeManager {
             .map_err(|error| error.to_string())
     }
 
-    pub(crate) async fn route_close_attempt_to_repair<T>(
+    pub(crate) async fn route_close_attempt_to_repair<T, E>(
         &self,
         attempt_id: &CloseAttemptId,
         scope: &WorkScopeId,
         reason: RetirementFailureReason,
         detail: impl Into<String>,
-    ) -> Result<T, String> {
+    ) -> Result<T, E>
+    where
+        E: From<String>,
+    {
         let detail = detail.into();
         let captured = self
             .db()
@@ -1740,10 +1799,10 @@ impl RuntimeManager {
         self.cancel_close_resource_leases(attempt_id)
             .await
             .map_err(|cancel_error| format!("{detail}; fence reopening failed: {cancel_error}"))?;
-        Err(detail)
+        Err(E::from(detail))
     }
 
-    async fn record_close_residual<T>(
+    async fn record_close_residual<T, E>(
         &self,
         attempt_id: &CloseAttemptId,
         snapshot: &CloseRetirementSnapshot,
@@ -1751,7 +1810,10 @@ impl RuntimeManager {
         resource: RetiredResourceIdentity,
         reason: RetirementFailureReason,
         detail: &str,
-    ) -> Result<T, String> {
+    ) -> Result<T, E>
+    where
+        E: From<String>,
+    {
         self.db()
             .record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
                 attempt_id: attempt_id.clone(),
@@ -1768,7 +1830,7 @@ impl RuntimeManager {
         self.cancel_close_resource_leases(attempt_id)
             .await
             .map_err(|cancel_error| format!("{detail}; fence reopening failed: {cancel_error}"))?;
-        Err(detail.to_string())
+        Err(E::from(detail.to_string()))
     }
 
     /// Completes one live lease. Callers must persist exactly one receipt per
@@ -2579,10 +2641,54 @@ fn worktree_quarantine_path(identity: &WorktreeIdentity) -> Result<PathBuf, Stri
     Ok(parent.join(name))
 }
 
+#[derive(Clone, Debug, thiserror::Error)]
+pub(crate) enum CloseRetirementError {
+    #[error("{0}")]
+    Message(String),
+    #[error("Close evidence invariant {invariant} failed in {relation}")]
+    EvidenceInvariant {
+        invariant: &'static str,
+        relation: &'static str,
+    },
+}
+
+impl From<String> for CloseRetirementError {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
+impl From<CloseRetirementError> for String {
+    fn from(error: CloseRetirementError) -> Self {
+        error.to_string()
+    }
+}
+
+fn map_close_retirement_db_error(error: crate::db::DbError) -> CloseRetirementError {
+    match error {
+        crate::db::DbError::CloseEvidenceInvariant {
+            invariant,
+            relation,
+            ..
+        } => CloseRetirementError::EvidenceInvariant {
+            invariant,
+            relation,
+        },
+        error => CloseRetirementError::Message(error.to_string()),
+    }
+}
+
 enum ExactWorktreeRemoval {
     Retired,
     ReinspectionRequired { detail: String },
     Residual { detail: String },
+    AmbientWriterResidual(AmbientWriterResidual),
+}
+
+#[derive(Debug)]
+struct AmbientWriterResidual {
+    detail: String,
+    evidence: AmbientWriterEvidence,
 }
 
 enum FinalTombstoneRecovery {
@@ -3512,26 +3618,85 @@ fn exact_worktree_administrative_dir(
     Ok(git_dir)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum ExternalWriterEvidence {
-    PositiveWriterFound,
+    PositiveWriterFound(AmbientWriterEvidence),
     NoPositiveEvidence,
 }
 
-impl ExternalWriterEvidence {
-    fn found(self) -> bool {
-        matches!(self, Self::PositiveWriterFound)
+const AMBIENT_WRITER_MAX_OBSERVATIONS: usize = 3;
+const AMBIENT_WRITER_REQUIRED_CLEAN: usize = 2;
+const AMBIENT_WRITER_OBSERVATION_SPACING: std::time::Duration =
+    std::time::Duration::from_millis(100);
+
+fn inspect_ambient_writer_until_quiescent(
+    mut observe: impl FnMut() -> Result<ExternalWriterEvidence, String>,
+    mut wait: impl FnMut(std::time::Duration),
+) -> Result<Option<AmbientWriterEvidence>, String> {
+    let mut consecutive_clean = 0;
+    let mut last_writer = None;
+    for observation in 0..AMBIENT_WRITER_MAX_OBSERVATIONS {
+        match observe()? {
+            ExternalWriterEvidence::NoPositiveEvidence => {
+                consecutive_clean += 1;
+                if consecutive_clean == AMBIENT_WRITER_REQUIRED_CLEAN {
+                    return Ok(None);
+                }
+            }
+            ExternalWriterEvidence::PositiveWriterFound(evidence) => {
+                consecutive_clean = 0;
+                last_writer = Some(evidence);
+            }
+        }
+        if observation + 1 < AMBIENT_WRITER_MAX_OBSERVATIONS {
+            wait(AMBIENT_WRITER_OBSERVATION_SPACING);
+        }
+    }
+    last_writer.map_or_else(
+        || {
+            Err(
+                "ambient writer observation budget ended without two clean observations"
+                    .to_string(),
+            )
+        },
+        |evidence| Ok(Some(evidence)),
+    )
+}
+
+fn quarantine_has_external_writer(path: &Path) -> Result<Option<AmbientWriterEvidence>, String> {
+    inspect_ambient_writer_until_quiescent(
+        || match quarantine_has_open_descriptors(path)? {
+            positive @ ExternalWriterEvidence::PositiveWriterFound(_) => Ok(positive),
+            ExternalWriterEvidence::NoPositiveEvidence => quarantine_has_writable_mappings(path),
+        },
+        std::thread::sleep,
+    )
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn linux_descriptor_access_mode_from_flags(open_flags: i32) -> Option<AmbientWriterAccessMode> {
+    match open_flags & libc::O_ACCMODE {
+        libc::O_WRONLY => Some(AmbientWriterAccessMode::WriteOnly),
+        libc::O_RDWR => Some(AmbientWriterAccessMode::ReadWrite),
+        _ => None,
     }
 }
 
-fn quarantine_has_external_writer(path: &Path) -> Result<bool, String> {
-    Ok(quarantine_has_open_descriptors(path)?.found()
-        || quarantine_has_process_cwd(path)?
-        || quarantine_has_writable_mappings(path)?)
+#[cfg(any(test, target_os = "macos"))]
+fn macos_descriptor_access_mode(open_flags: u32) -> Option<AmbientWriterAccessMode> {
+    const FREAD: u32 = 0x0000_0001;
+    const FWRITE: u32 = 0x0000_0002;
+    if open_flags & FWRITE == 0 {
+        None
+    } else if open_flags & FREAD != 0 {
+        Some(AmbientWriterAccessMode::ReadWrite)
+    } else {
+        Some(AmbientWriterAccessMode::WriteOnly)
+    }
 }
 
 #[cfg(target_os = "linux")]
-fn quarantine_has_writable_mappings(path: &Path) -> Result<bool, String> {
+fn quarantine_has_writable_mappings(path: &Path) -> Result<ExternalWriterEvidence, String> {
     // SAFETY: `geteuid` has no preconditions.
     let effective_uid = unsafe { libc::geteuid() };
     quarantine_has_writable_mappings_in(path, Path::new("/proc"), effective_uid)
@@ -3542,12 +3707,12 @@ fn quarantine_has_writable_mappings_in(
     path: &Path,
     proc_root: &Path,
     effective_uid: libc::uid_t,
-) -> Result<bool, String> {
+) -> Result<ExternalWriterEvidence, String> {
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         format!("cannot canonicalize quarantine before mapping inspection: {error}")
     })?;
     let Ok(processes) = std::fs::read_dir(proc_root) else {
-        return Ok(false);
+        return Ok(ExternalWriterEvidence::NoPositiveEvidence);
     };
     for process in processes.flatten() {
         if !linux_process_is_relevant(&process, effective_uid, "mapping") {
@@ -3570,15 +3735,36 @@ fn quarantine_has_writable_mappings_in(
                 && permissions.as_bytes().get(3) == Some(&b's')
                 && path_is_within(Path::new(mapped_path), &canonical)
             {
-                return Ok(true);
+                let process_incarnation = linux_process_incarnation(&process.path())?;
+                let executable = std::fs::read_link(process.path().join("exe"))
+                    .map_err(|error| format!("cannot inspect process executable: {error}"))?;
+                let process_id = process
+                    .file_name()
+                    .to_string_lossy()
+                    .parse::<i64>()
+                    .map_err(|error| format!("process id is malformed: {error}"))?;
+                use std::os::unix::ffi::OsStrExt as _;
+                return Ok(ExternalWriterEvidence::PositiveWriterFound(
+                    AmbientWriterEvidence {
+                        detector: AmbientWriterDetector::LinuxProcfs,
+                        process_id,
+                        process_incarnation,
+                        executable: GitPathIdentity::from_bytes(
+                            executable.as_os_str().as_bytes().to_vec(),
+                        ),
+                        matched_path: GitPathIdentity::from_bytes(mapped_path.as_bytes().to_vec()),
+                        match_kind: AmbientWriterMatchKind::Mapping,
+                        access_mode: AmbientWriterAccessMode::WritableSharedMapping,
+                    },
+                ));
             }
         }
     }
-    Ok(false)
+    Ok(ExternalWriterEvidence::NoPositiveEvidence)
 }
 
 #[cfg(target_os = "macos")]
-fn quarantine_has_writable_mappings(path: &Path) -> Result<bool, String> {
+fn quarantine_has_writable_mappings(path: &Path) -> Result<ExternalWriterEvidence, String> {
     use std::ffi::CStr;
     use std::mem::{size_of, MaybeUninit};
     use std::os::unix::ffi::OsStrExt as _;
@@ -3622,7 +3808,7 @@ fn quarantine_has_writable_mappings(path: &Path) -> Result<bool, String> {
         format!("cannot canonicalize quarantine before mapping inspection: {error}")
     })?;
     let Some(pids) = macos_all_pids() else {
-        return Ok(false);
+        return Ok(ExternalWriterEvidence::NoPositiveEvidence);
     };
     for pid in pids.into_iter().filter(|pid| *pid > 0) {
         let mut address = 0_u64;
@@ -3669,26 +3855,39 @@ fn quarantine_has_writable_mappings(path: &Path) -> Result<bool, String> {
                     &canonical,
                 )
             {
-                return Ok(true);
+                let Some((process_incarnation, executable)) = macos_process_identity(pid)? else {
+                    continue;
+                };
+                return Ok(ExternalWriterEvidence::PositiveWriterFound(
+                    AmbientWriterEvidence {
+                        detector: AmbientWriterDetector::MacosProcPidinfo,
+                        process_id: i64::from(pid),
+                        process_incarnation,
+                        executable,
+                        matched_path: GitPathIdentity::from_bytes(mapped_path.to_bytes().to_vec()),
+                        match_kind: AmbientWriterMatchKind::Mapping,
+                        access_mode: AmbientWriterAccessMode::WritableSharedMapping,
+                    },
+                ));
             }
         }
     }
-    Ok(false)
+    Ok(ExternalWriterEvidence::NoPositiveEvidence)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn quarantine_has_writable_mappings(_path: &Path) -> Result<bool, String> {
+fn quarantine_has_writable_mappings(_path: &Path) -> Result<ExternalWriterEvidence, String> {
     Err("writable memory-mapping inspection is unsupported on this platform".to_string())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn quarantine_has_process_cwd(path: &Path) -> Result<bool, String> {
     // SAFETY: `geteuid` has no preconditions.
     let effective_uid = unsafe { libc::geteuid() };
     quarantine_has_process_cwd_in(path, Path::new("/proc"), effective_uid)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn quarantine_has_process_cwd_in(
     path: &Path,
     proc_root: &Path,
@@ -3746,7 +3945,7 @@ fn macos_all_pids_with(mut list: impl FnMut(*mut libc::c_void, i32) -> i32) -> O
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(test, target_os = "macos"))]
 fn quarantine_has_process_cwd(path: &Path) -> Result<bool, String> {
     use std::ffi::CStr;
     use std::mem::{size_of, MaybeUninit};
@@ -3789,7 +3988,7 @@ fn quarantine_has_process_cwd(path: &Path) -> Result<bool, String> {
     Ok(false)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(test, not(any(target_os = "linux", target_os = "macos"))))]
 fn quarantine_has_process_cwd(_path: &Path) -> Result<bool, String> {
     Err("process working-directory inspection is unsupported on this platform".to_string())
 }
@@ -3895,6 +4094,35 @@ fn linux_descriptor_target_is_within(
 }
 
 #[cfg(target_os = "linux")]
+fn linux_process_incarnation(process: &Path) -> Result<String, String> {
+    let stat = std::fs::read_to_string(process.join("stat"))
+        .map_err(|error| format!("cannot inspect process incarnation: {error}"))?;
+    let after_command = stat
+        .rfind(") ")
+        .and_then(|index| stat.get(index + 2..))
+        .ok_or_else(|| "process stat command is malformed".to_string())?;
+    after_command
+        .split_ascii_whitespace()
+        .nth(19)
+        .filter(|start_time| !start_time.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "process stat has no start-time incarnation".to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_descriptor_access_mode(path: &Path) -> Result<Option<AmbientWriterAccessMode>, String> {
+    let fdinfo = std::fs::read_to_string(path)
+        .map_err(|error| format!("cannot inspect descriptor access mode: {error}"))?;
+    let flags = fdinfo
+        .lines()
+        .find_map(|line| line.strip_prefix("flags:\t"))
+        .ok_or_else(|| "descriptor inventory has no flags".to_string())?;
+    let flags = i32::from_str_radix(flags, 8)
+        .map_err(|error| format!("descriptor flags are malformed: {error}"))?;
+    Ok(linux_descriptor_access_mode_from_flags(flags))
+}
+
+#[cfg(target_os = "linux")]
 fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence, String> {
     quarantine_has_open_descriptors_in(path, Path::new("/proc"))
 }
@@ -3921,10 +4149,53 @@ fn quarantine_has_open_descriptors_in(
             continue;
         };
         for descriptor in descriptors.flatten() {
-            if linux_descriptor_target_is_within(std::fs::read_link(descriptor.path()), &canonical)
-            {
-                return Ok(ExternalWriterEvidence::PositiveWriterFound);
+            let target = match std::fs::read_link(descriptor.path()) {
+                Ok(target) => target,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(format!("cannot inspect descriptor target: {error}")),
+            };
+            if !linux_descriptor_target_is_within(Ok(target.clone()), &canonical) {
+                continue;
             }
+            let access_mode = match linux_descriptor_access_mode(
+                &process.path().join("fdinfo").join(descriptor.file_name()),
+            ) {
+                Ok(Some(access_mode)) => access_mode,
+                Ok(None) => continue,
+                Err(_) if !process.path().exists() => continue,
+                Err(error) => return Err(error),
+            };
+            let process_incarnation = match linux_process_incarnation(&process.path()) {
+                Ok(process_incarnation) => process_incarnation,
+                Err(_) if !process.path().exists() => continue,
+                Err(error) => return Err(error),
+            };
+            let executable = match std::fs::read_link(process.path().join("exe")) {
+                Ok(executable) => executable,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(format!("cannot inspect process executable: {error}")),
+            };
+            let process_id = process
+                .file_name()
+                .to_string_lossy()
+                .parse::<i64>()
+                .map_err(|error| format!("process id is malformed: {error}"))?;
+            use std::os::unix::ffi::OsStrExt as _;
+            return Ok(ExternalWriterEvidence::PositiveWriterFound(
+                AmbientWriterEvidence {
+                    detector: AmbientWriterDetector::LinuxProcfs,
+                    process_id,
+                    process_incarnation,
+                    executable: GitPathIdentity::from_bytes(
+                        executable.as_os_str().as_bytes().to_vec(),
+                    ),
+                    matched_path: GitPathIdentity::from_bytes(
+                        target.as_os_str().as_bytes().to_vec(),
+                    ),
+                    match_kind: AmbientWriterMatchKind::Descriptor,
+                    access_mode,
+                },
+            ));
         }
     }
     Ok(ExternalWriterEvidence::NoPositiveEvidence)
@@ -3933,6 +4204,50 @@ fn quarantine_has_open_descriptors_in(
 #[cfg(target_os = "macos")]
 fn descriptor_inventory_may_be_truncated(returned_bytes: usize, capacity_bytes: usize) -> bool {
     returned_bytes >= capacity_bytes
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_identity(pid: i32) -> Result<Option<(String, GitPathIdentity)>, String> {
+    use std::mem::{size_of, MaybeUninit};
+
+    let mut info = MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let bytes = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            i32::try_from(size_of::<libc::proc_bsdinfo>()).expect("bsd info fits i32"),
+        )
+    };
+    if bytes != i32::try_from(size_of::<libc::proc_bsdinfo>()).expect("bsd info size fits i32") {
+        let error = std::io::Error::last_os_error();
+        if matches!(error.raw_os_error(), Some(libc::ESRCH) | Some(libc::ENOENT)) {
+            return Ok(None);
+        }
+        return Err(format!("cannot inspect process {pid} incarnation: {error}"));
+    }
+    let info = unsafe { info.assume_init() };
+    let mut executable = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let executable_bytes = unsafe {
+        libc::proc_pidpath(
+            pid,
+            executable.as_mut_ptr().cast(),
+            u32::try_from(executable.len()).expect("process path buffer fits u32"),
+        )
+    };
+    if executable_bytes <= 0 {
+        let error = std::io::Error::last_os_error();
+        if matches!(error.raw_os_error(), Some(libc::ESRCH) | Some(libc::ENOENT)) {
+            return Ok(None);
+        }
+        return Err(format!("cannot inspect process {pid} executable: {error}"));
+    }
+    executable.truncate(usize::try_from(executable_bytes).expect("positive process path size"));
+    Ok(Some((
+        format!("{}:{}", info.pbi_start_tvsec, info.pbi_start_tvusec),
+        GitPathIdentity::from_bytes(executable),
+    )))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4027,11 +4342,27 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence
             let path_bytes = info.vnode.vip_path.as_flattened();
             // SAFETY: the kernel returns a NUL-terminated MAXPATHLEN path buffer.
             let candidate = unsafe { CStr::from_ptr(path_bytes.as_ptr()) };
+            let Some(access_mode) = macos_descriptor_access_mode(info.file.open_flags) else {
+                continue;
+            };
             if path_is_within(
                 Path::new(std::ffi::OsStr::from_bytes(candidate.to_bytes())),
                 &canonical,
             ) {
-                return Ok(ExternalWriterEvidence::PositiveWriterFound);
+                let Some((process_incarnation, executable)) = macos_process_identity(pid)? else {
+                    continue;
+                };
+                return Ok(ExternalWriterEvidence::PositiveWriterFound(
+                    AmbientWriterEvidence {
+                        detector: AmbientWriterDetector::MacosProcPidinfo,
+                        process_id: i64::from(pid),
+                        process_incarnation,
+                        executable,
+                        matched_path: GitPathIdentity::from_bytes(candidate.to_bytes().to_vec()),
+                        match_kind: AmbientWriterMatchKind::Descriptor,
+                        access_mode,
+                    },
+                ));
             }
         }
     }
@@ -4241,14 +4572,6 @@ where
         }
 
         after_quarantine(&path);
-        if quarantine_has_open_descriptors(&quarantine)?.found() {
-            return Ok(ExactWorktreeRemoval::Residual {
-                detail: format!(
-                    "open descriptors can still modify the confirmed worktree; retained at {}",
-                    quarantine.display()
-                ),
-            });
-        }
         if path
             .try_exists()
             .map_err(|error| format!("cannot inspect original worktree path: {error}"))?
@@ -4261,13 +4584,16 @@ where
                 ),
             });
         }
-        if quarantine_has_external_writer(&quarantine)? {
-            return Ok(ExactWorktreeRemoval::Residual {
-                detail: format!(
-                    "an external process can still write the confirmed worktree; retained at {}",
-                    quarantine.display()
-                ),
-            });
+        if let Some(evidence) = quarantine_has_external_writer(&quarantine)? {
+            return Ok(ExactWorktreeRemoval::AmbientWriterResidual(
+                AmbientWriterResidual {
+                    detail: format!(
+                        "a stable ambient writer retains the confirmed worktree quarantine at {}",
+                        quarantine.display()
+                    ),
+                    evidence,
+                },
+            ));
         }
         let administrative_dir = exact_worktree_administrative_dir(&quarantine, &common)?;
         if administrative_dir != planned_administrative_dir {
@@ -4958,9 +5284,8 @@ mod tests {
     use phoenix_core::domain::close::{
         CloseLossItem, GitPathIdentity, WorktreeFingerprint, WorktreeId, WorktreeIdentity,
     };
-    use std::io::Write as _;
     #[cfg(target_os = "linux")]
-    use std::io::{BufRead as _, Read as _};
+    use std::io::{BufRead as _, Read as _, Write as _};
     use std::path::Path;
 
     #[cfg(target_os = "macos")]
@@ -6484,6 +6809,128 @@ mod tests {
         assert!(!source.contains("Command::new(\"lsof\")"));
     }
 
+    fn writer_evidence(incarnation: &str) -> super::AmbientWriterEvidence {
+        super::AmbientWriterEvidence {
+            detector: super::AmbientWriterDetector::MacosProcPidinfo,
+            process_id: 42,
+            process_incarnation: incarnation.to_string(),
+            executable: GitPathIdentity::from_bytes(b"/bin/writer".to_vec()),
+            matched_path: GitPathIdentity::from_bytes(b"/tmp/quarantine/file".to_vec()),
+            match_kind: super::AmbientWriterMatchKind::Descriptor,
+            access_mode: super::AmbientWriterAccessMode::ReadWrite,
+        }
+    }
+
+    #[test]
+    fn read_only_descriptor_flags_never_authorize_writer() {
+        assert_eq!(
+            super::linux_descriptor_access_mode_from_flags(libc::O_RDONLY),
+            None
+        );
+        assert_eq!(
+            super::linux_descriptor_access_mode_from_flags(libc::O_WRONLY),
+            Some(super::AmbientWriterAccessMode::WriteOnly)
+        );
+        assert_eq!(
+            super::linux_descriptor_access_mode_from_flags(libc::O_RDWR),
+            Some(super::AmbientWriterAccessMode::ReadWrite)
+        );
+        assert_eq!(super::macos_descriptor_access_mode(0x1), None);
+        assert_eq!(
+            super::macos_descriptor_access_mode(0x2),
+            Some(super::AmbientWriterAccessMode::WriteOnly)
+        );
+        assert_eq!(
+            super::macos_descriptor_access_mode(0x3),
+            Some(super::AmbientWriterAccessMode::ReadWrite)
+        );
+    }
+
+    #[test]
+    fn transient_writer_requires_two_clean_observations_without_sleeping() {
+        let mut observations = vec![
+            super::ExternalWriterEvidence::NoPositiveEvidence,
+            super::ExternalWriterEvidence::NoPositiveEvidence,
+            super::ExternalWriterEvidence::PositiveWriterFound(writer_evidence("start-1")),
+        ];
+        let mut waits = Vec::new();
+        let result = super::inspect_ambient_writer_until_quiescent(
+            || Ok(observations.pop().unwrap()),
+            |duration| waits.push(duration),
+        )
+        .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(waits.len(), 2);
+    }
+
+    #[test]
+    fn stable_writer_is_retained_with_complete_evidence_without_sleeping() {
+        let evidence = writer_evidence("start-stable");
+        let result = super::inspect_ambient_writer_until_quiescent(
+            || {
+                Ok(super::ExternalWriterEvidence::PositiveWriterFound(
+                    evidence.clone(),
+                ))
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(result, Some(evidence));
+    }
+
+    #[test]
+    fn pid_reuse_keeps_the_new_process_incarnation_distinct() {
+        let mut observations = vec![
+            super::ExternalWriterEvidence::PositiveWriterFound(writer_evidence("start-new")),
+            super::ExternalWriterEvidence::PositiveWriterFound(writer_evidence("start-new")),
+            super::ExternalWriterEvidence::PositiveWriterFound(writer_evidence("start-old")),
+        ];
+        let result = super::inspect_ambient_writer_until_quiescent(
+            || Ok(observations.pop().unwrap()),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(result.unwrap().process_incarnation, "start-new");
+    }
+
+    #[test]
+    fn detector_indeterminacy_fails_closed() {
+        let error = super::inspect_ambient_writer_until_quiescent(
+            || Err("detector cannot establish process incarnation".to_string()),
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(error.contains("process incarnation"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_read_only_descriptor_under_quarantine_is_not_a_writer() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("read-only");
+        let marker = temp.path().join("reader-ready");
+        std::fs::write(&path, b"evidence").unwrap();
+        let mut reader = std::process::Command::new("sh")
+            .args(["-c", "exec 3<\"$TARGET\"; touch \"$MARKER\"; exec sleep 30"])
+            .env("TARGET", &path)
+            .env("MARKER", &marker)
+            .spawn()
+            .unwrap();
+        for _ in 0..100 {
+            if marker.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(marker.exists(), "external reader became ready");
+        assert_eq!(
+            super::quarantine_has_open_descriptors(temp.path()).unwrap(),
+            super::ExternalWriterEvidence::NoPositiveEvidence
+        );
+        reader.kill().unwrap();
+        reader.wait().unwrap();
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_status_parser_returns_only_the_effective_uid() {
@@ -6586,6 +7033,18 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn write_synthetic_process_identity(process: &Path, pid: i64) {
+        std::fs::write(process.join("status"), "Name:\twriter\nUid:\t1\t1\t1\t1\n").unwrap();
+        let fields = std::iter::repeat_n("0", 18).collect::<Vec<_>>().join(" ");
+        std::fs::write(
+            process.join("stat"),
+            format!("{pid} (writer) S {fields} 4242\n"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("/bin/writer", process.join("exe")).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn descriptor_scan_skips_unreadable_links() {
         let worktree = Path::new("/quarantine/worktree");
@@ -6615,13 +7074,27 @@ mod tests {
         let writer = proc_root.join("1274");
         std::fs::create_dir_all(&ambient).unwrap();
         std::fs::create_dir_all(writer.join("fd")).unwrap();
+        std::fs::create_dir_all(writer.join("fdinfo")).unwrap();
         std::fs::create_dir(&quarantine).unwrap();
         std::fs::write(ambient.join("fd"), b"not a descriptor directory").unwrap();
+        write_synthetic_process_identity(&writer, 1274);
         std::os::unix::fs::symlink(quarantine.join("open-file"), writer.join("fd/3")).unwrap();
+        std::fs::write(writer.join("fdinfo/3"), "flags:\t00000001\n").unwrap();
 
+        let super::ExternalWriterEvidence::PositiveWriterFound(evidence) =
+            super::quarantine_has_open_descriptors_in(&quarantine, &proc_root).unwrap()
+        else {
+            panic!("writable descriptor must produce complete evidence");
+        };
+        assert_eq!(evidence.process_id, 1274);
+        assert_eq!(evidence.process_incarnation, "4242");
         assert_eq!(
-            super::quarantine_has_open_descriptors_in(&quarantine, &proc_root).unwrap(),
-            super::ExternalWriterEvidence::PositiveWriterFound,
+            evidence.access_mode,
+            super::AmbientWriterAccessMode::WriteOnly
+        );
+        assert_eq!(
+            evidence.match_kind,
+            super::AmbientWriterMatchKind::Descriptor
         );
     }
 
@@ -6642,6 +7115,10 @@ mod tests {
         std::fs::create_dir_all(&descriptors).unwrap();
         std::os::unix::fs::symlink(temp.path().join("outside"), descriptors.join("3")).unwrap();
         std::os::unix::fs::symlink(temp.path().join("missing"), descriptors.join("4")).unwrap();
+        std::fs::create_dir_all(proc_root.join("1273/fdinfo")).unwrap();
+        write_synthetic_process_identity(&proc_root.join("1273"), 1273);
+        std::fs::write(proc_root.join("1273/fdinfo/3"), "flags:\t00000000\n").unwrap();
+        std::fs::write(proc_root.join("1273/fdinfo/4"), "flags:\t00000001\n").unwrap();
         std::fs::create_dir_all(proc_root.join("self/fd")).unwrap();
         std::os::unix::fs::symlink(quarantine.join("ignored"), proc_root.join("self/fd/5"))
             .unwrap();
@@ -6690,9 +7167,12 @@ mod tests {
         std::fs::create_dir_all(unreadable_maps.join("maps")).unwrap();
         std::fs::create_dir_all(&writer).unwrap();
         std::fs::create_dir(&quarantine).unwrap();
-        for process in [&unreadable_maps, &writer] {
-            std::fs::write(process.join("status"), "Name:\ttest\nUid:\t1\t1\t1\t1\n").unwrap();
-        }
+        std::fs::write(
+            unreadable_maps.join("status"),
+            "Name:\ttest\nUid:\t1\t1\t1\t1\n",
+        )
+        .unwrap();
+        write_synthetic_process_identity(&writer, 3);
         std::fs::write(
             writer.join("maps"),
             format!(
@@ -6702,7 +7182,18 @@ mod tests {
         )
         .unwrap();
 
-        assert!(super::quarantine_has_writable_mappings_in(&quarantine, &proc_root, 1).unwrap());
+        let super::ExternalWriterEvidence::PositiveWriterFound(evidence) =
+            super::quarantine_has_writable_mappings_in(&quarantine, &proc_root, 1).unwrap()
+        else {
+            panic!("writable shared mapping must produce complete evidence");
+        };
+        assert_eq!(evidence.process_id, 3);
+        assert_eq!(evidence.process_incarnation, "4242");
+        assert_eq!(evidence.match_kind, super::AmbientWriterMatchKind::Mapping);
+        assert_eq!(
+            evidence.access_mode,
+            super::AmbientWriterAccessMode::WritableSharedMapping
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -6715,7 +7206,10 @@ mod tests {
         std::fs::write(&proc_root, b"not a proc directory").unwrap();
 
         assert!(!super::quarantine_has_process_cwd_in(&quarantine, &proc_root, 1).unwrap());
-        assert!(!super::quarantine_has_writable_mappings_in(&quarantine, &proc_root, 1).unwrap());
+        assert_eq!(
+            super::quarantine_has_writable_mappings_in(&quarantine, &proc_root, 1).unwrap(),
+            super::ExternalWriterEvidence::NoPositiveEvidence
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -6763,7 +7257,16 @@ mod tests {
             super::quarantine_has_open_descriptors(temp.path()).unwrap(),
             super::ExternalWriterEvidence::NoPositiveEvidence,
         );
-        assert!(super::quarantine_has_writable_mappings(temp.path()).unwrap());
+        let super::ExternalWriterEvidence::PositiveWriterFound(evidence) =
+            super::quarantine_has_writable_mappings(temp.path()).unwrap()
+        else {
+            panic!("live writable shared mapping must produce complete evidence");
+        };
+        assert_eq!(evidence.match_kind, super::AmbientWriterMatchKind::Mapping);
+        assert_eq!(
+            evidence.access_mode,
+            super::AmbientWriterAccessMode::WritableSharedMapping
+        );
 
         // SAFETY: `mapping` is the successful result of the matching 4096-byte mmap call.
         assert_eq!(unsafe { libc::munmap(mapping, 4096) }, 0);
@@ -6794,10 +7297,12 @@ mod tests {
         run_git(&closing, &["add", "tracked"]);
         run_git(&closing, &["commit", "--quiet", "-m", "tracked"]);
         let identity = inspection_identity(&closing);
-        let mut descriptor = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&tracked)
-            .unwrap();
+        let marker = temp.path().join("writer-ready");
+        let quarantine = worktree_quarantine_path(&identity).unwrap();
+        let child = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let callback_child = child.clone();
+        let callback_marker = marker.clone();
+        let callback_quarantine = quarantine.clone();
 
         let administrative_dir = closing.join(".git");
         let outcome = quarantine_and_remove_exact_worktree(
@@ -6807,24 +7312,48 @@ mod tests {
             None,
             |_, _, _| Ok(()),
             move |_| {
-                descriptor.write_all(b"after\n").unwrap();
-                descriptor.flush().unwrap();
-                std::mem::forget(descriptor);
+                let spawned = std::process::Command::new("sh")
+                    .args([
+                        "-c",
+                        "exec 3>>\"$TARGET\"; printf 'after\\n' >&3; touch \"$MARKER\"; exec sleep 30",
+                    ])
+                    .env("TARGET", callback_quarantine.join("tracked"))
+                    .env("MARKER", &callback_marker)
+                    .spawn()
+                    .unwrap();
+                *callback_child.lock().unwrap() = Some(spawned);
+                for _ in 0..100 {
+                    if callback_marker.exists() {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                panic!("external writer did not become ready");
             },
         )
         .await
         .unwrap();
 
-        let ExactWorktreeRemoval::Residual { detail } = outcome else {
-            panic!("open descriptor must preserve quarantine");
+        let ExactWorktreeRemoval::AmbientWriterResidual(residual) = outcome else {
+            panic!("stable external writer must preserve quarantine");
         };
-        assert!(detail.contains("open descriptors"));
+        assert_eq!(
+            residual.evidence.access_mode,
+            super::AmbientWriterAccessMode::WriteOnly
+        );
+        assert_eq!(
+            residual.evidence.match_kind,
+            super::AmbientWriterMatchKind::Descriptor
+        );
+        assert!(residual.detail.contains("stable ambient writer"));
         assert!(!closing.exists());
-        let quarantine = worktree_quarantine_path(&identity).unwrap();
         assert_eq!(
             std::fs::read_to_string(quarantine.join("tracked")).unwrap(),
             "before\nafter\n"
         );
+        let mut child = child.lock().unwrap().take().unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[cfg(unix)]

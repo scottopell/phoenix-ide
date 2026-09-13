@@ -117,7 +117,7 @@ function CloseStatusPanel({
           ))}
         </ul>
         <button type="button" className="work-actions-btn" disabled={busy} onClick={onRetry}>
-          {busy ? 'Retrying…' : 'Retry exact Close attempt'}
+          {busy ? 'Retrying retirement…' : 'Retry retirement'}
         </button>
       </section>
     );
