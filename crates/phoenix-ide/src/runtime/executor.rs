@@ -6427,10 +6427,11 @@ where
         let mut owner_guard = AuthorityBoundaryConsumerGuard {
             fence: Some(self.fatal_local_authority_fence.clone()),
         };
-        let (outcome, mut boundary_admission) = boundary_owner.await.map_err(|error| {
+        let (outcome, boundary_admission) = boundary_owner.await.map_err(|error| {
             tracing::error!(?error, "question authority boundary owner disappeared");
             "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:question_boundary_disappeared".to_string()
         })?;
+        *admitted = boundary_admission;
         owner_guard.disarm();
         match outcome {
             phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(
@@ -6462,7 +6463,7 @@ where
         self.settle_turn_span();
         let _ = self
             .broadcast_tx
-            .admitted_publication(&mut boundary_admission)
+            .admitted_publication(admitted)
             .persisted_message(message);
         Ok(None)
     }
@@ -18353,6 +18354,63 @@ mod steer_drain_detector_tests {
             );
             assert_eq!(storage.get_all_messages(id).len(), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn question_mutations_dismissal_retains_admission_through_terminal_publications() {
+        let id = "question-dismiss-publication-owners";
+        let pending = ConvState::AwaitingUserResponse {
+            questions: vec![],
+            tool_use_id: "provider-id".into(),
+            request_id: "request-id".into(),
+        };
+        let (mut rt, storage) = build_runtime_with_state_and_queue(id, pending.clone(), vec![]);
+        storage
+            .update_state(id, &pending, Utc::now())
+            .await
+            .unwrap();
+        let turn = crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(77),
+            generation: 0,
+        };
+        storage.set_active_direct_turn(Some(turn.clone()));
+        rt.active_direct_turn = Some(Box::new(turn));
+        let mut published = rt.broadcast_tx.subscribe();
+        let (reservation, _) = rt
+            .broadcast_tx
+            .persisted_message_reservation_authority()
+            .await
+            .reserve_next_range(1)
+            .unwrap();
+
+        assert_eq!(
+            rt.process_acknowledged_event(Event::UserQuestionDismissed {
+                request_id: "request-id".into(),
+            })
+            .await
+            .unwrap(),
+            AcknowledgedEventOutcome::Settled
+        );
+        assert!(published.try_recv().is_err());
+        assert_eq!(rt.fatal_local_authority_fence.owner_count(), 2);
+        rt.fatal_local_authority_fence
+            .close("test_terminal_publications");
+        assert!(rt.admit_authoritative_effect().is_err());
+
+        drop(reservation);
+        assert!(matches!(
+            published.try_recv().unwrap(),
+            SseEvent::Message { .. }
+        ));
+        assert!(matches!(
+            published.try_recv().unwrap(),
+            SseEvent::StateChange {
+                state: ConvState::Idle,
+                ..
+            }
+        ));
+        assert!(published.try_recv().is_err());
+        assert_eq!(rt.fatal_local_authority_fence.owner_count(), 0);
     }
 
     #[tokio::test]

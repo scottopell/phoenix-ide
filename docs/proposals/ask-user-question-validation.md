@@ -86,6 +86,21 @@ indefinitely, stronger than the reordered-turn symptom suggested by the review.
 The corrections and regressions are recorded above. Follow-up review must cover
 the updated PR commit; the initial review is not approval of the changes.
 
+A second isolated local pass targeted
+`dd54a4fb04588ceb06e328082b66a6638cd6d1fa..ea46b58a95ad67207d6b9a9134b77cb59fff9708`.
+It found that the question commit returned an admission token without restoring
+it to the enclosing terminal operation. The correction keeps dismissal tracked
+through its final state publication. A focused regression reserves an SSE range,
+dismisses an active question, closes the authority fence, and verifies that the
+queued message and state notification retain ownership until publication.
+All nine focused runtime/API question-mutation tests passed with this correction.
+
+The full check on that review target passed 18/19 gates. An unchanged database
+telemetry test, `two_connections_record_overlapping_native_reads`, failed its
+concurrency-peak assertion and stopped the Rust suite early. The remaining Rust
+coverage and the final correction require a follow-up run; this result is not
+reported as a clean full check.
+
 ## Qualification limits
 
 Browser automation and the native iOS simulator suite do not establish physical
