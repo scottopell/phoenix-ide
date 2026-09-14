@@ -20,7 +20,6 @@ import {
 } from './conversationRouteFocus';
 import { ConversationNavStack } from '../components/ConversationNavStack';
 import {
-  historyMergeEventCursorFloor,
   historyRequestHasCursor,
   historyResponseMatchesCurrentRequest,
   initialHistoryExpansionState,
@@ -1038,6 +1037,7 @@ function ConversationPageContent({
       });
       return;
     }
+    const requestStartedAtEventSeq = request.snapshotStartedAtEventSeq;
     const requestTranscriptGeneration = request.view.transcriptGeneration;
 
     dispatchHistoryExpansion({ type: 'request_started', request });
@@ -1078,8 +1078,8 @@ function ConversationPageContent({
         contextWindow: { used: result.context_window_size || 0 },
         transcriptGeneration: responseTranscriptGeneration,
         transcriptCoverage: 'complete',
-        eventCursorFloor: historyMergeEventCursorFloor(request),
-        snapshotStartedAtEventSeq: request.snapshotStartedAtEventSeq,
+        eventCursorFloor: requestStartedAtEventSeq,
+        snapshotStartedAtEventSeq: requestStartedAtEventSeq,
         snapshotStartedAtPhase: request.snapshotStartedAtPhase,
       });
       dispatchHistoryExpansion({
