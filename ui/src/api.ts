@@ -1751,7 +1751,7 @@ export const api = {
       body: JSON.stringify(report),
       keepalive: true,
     });
-    if (!resp.ok) throw new Error(await errorMessageFromResponse(resp, 'Failed to report product conversation open'));
+    if (!resp.ok) throw new Error('Failed to report product conversation open');
   },
 
   async getProductConversationSnapshot(

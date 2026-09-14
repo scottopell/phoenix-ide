@@ -445,6 +445,8 @@ describe('ProductConversationPage', () => {
       visible: true,
     }));
     const report = vi.mocked(api.reportProductConversationOpen).mock.calls[0]?.[0];
+    expect(report).toBeDefined();
+    if (!report) throw new Error('expected product conversation open report');
     expect(report.snapshot_received_ms).toBeLessThanOrEqual(report.store_ready_ms);
     expect(report.store_ready_ms).toBeLessThanOrEqual(report.first_paint_ms);
     expect(report.first_paint_ms).toBeLessThanOrEqual(report.total_ms);

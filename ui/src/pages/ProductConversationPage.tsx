@@ -75,7 +75,7 @@ type OwnedSnapshot = {
 type ProductConversationOpenMeasurement = {
   openId: string;
   routeReference: string;
-  request?: Promise<ProductConversationSnapshotView>;
+  request: Promise<ProductConversationSnapshotView> | undefined;
   startedAt: number;
   snapshotReceivedAt?: number;
   storeReadyAt?: number;
@@ -757,6 +757,7 @@ function ProductConversationPageInner() {
     openMeasurementRef.current = productConversationId ? {
       openId: generateUUID(),
       routeReference: productConversationId,
+      request: undefined,
       startedAt: performance.now(),
       reported: false,
     } : null;
