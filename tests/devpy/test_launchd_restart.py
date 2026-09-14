@@ -84,7 +84,9 @@ class FakeLaunchctl:
             (str(self.manifest.socket_service),),
         )
 
-    def signal_hup(self):
+    def signal_hup(self, expected_pid):
+        if expected_pid != 100:
+            raise AssertionError("wrong expected PID")
         self.signals.append("HUP")
         return 100
 
@@ -113,7 +115,7 @@ class RestartHelperTests(unittest.TestCase):
             ))
             kill = mock.Mock()
 
-            signal_pid = helper.Launchctl(manifest, run=run, kill=kill).signal_hup()
+            signal_pid = helper.Launchctl(manifest, run=run, kill=kill).signal_hup(100)
 
             self.assertEqual(100, signal_pid)
             run.assert_called_once_with(
@@ -173,34 +175,31 @@ class RestartHelperTests(unittest.TestCase):
             self.assertEqual(100, status["previous_pid"])
             self.assertEqual(101, status["running_pid"])
 
-    def test_restart_waits_for_replacement_of_pid_signaled_after_rebind(self):
-        class ReboundLaunchctl(FakeLaunchctl):
-            def inspect(self):
-                pid = 100 if not self.signals else 102
-                return dataclasses.replace(super().inspect(), pid=pid)
-
-            def signal_hup(self):
-                self.signals.append("HUP")
-                return 101
-
-            def wait_for_new_pid(self, previous_pid):
-                if previous_pid != 101:
-                    raise AssertionError("restart used the stale preparation PID")
-                return 102
-
+    def test_signal_rejects_pid_rebound_after_identity_verification(self):
         with tempfile.TemporaryDirectory() as td:
             manifest = make_manifest(Path(td))
-            launchctl = ReboundLaunchctl(manifest)
+            run = mock.Mock(return_value=subprocess.CompletedProcess(
+                [],
+                0,
+                (
+                    f"path = {manifest.plist_path}\n"
+                    "state = running\n"
+                    f"program = {manifest.binary_path}\n"
+                    "pid = 101\n"
+                    "service name = 1\n"
+                    "properties = keepalive | runatload\n"
+                ),
+                "",
+            ))
+            kill = mock.Mock()
 
-            with mock.patch.object(helper, "Launchctl", return_value=launchctl), \
-                 mock.patch.object(helper, "fetch_identity", return_value=manifest.expected), \
-                 mock.patch.object(helper, "wait_for_identity"):
-                state = helper.restart(manifest)
+            with self.assertRaisesRegex(
+                helper.RestartError,
+                "PID changed between identity verification and signaling",
+            ):
+                helper.Launchctl(manifest, run=run, kill=kill).signal_hup(100)
 
-            self.assertEqual("committed", state)
-            status = json.loads(Path(manifest.status_path).read_text())
-            self.assertEqual(101, status["previous_pid"])
-            self.assertEqual(102, status["running_pid"])
+            kill.assert_not_called()
 
     def test_replacement_deadline_includes_bounded_shutdown_budget(self):
         with tempfile.TemporaryDirectory() as td:
@@ -698,6 +697,39 @@ class RestartCommandTests(unittest.TestCase):
             self.dev._claim_launchd_deploy("deploy-two")
             with self.assertRaisesRegex(SystemExit, "deploy-two"):
                 self.dev._claim_launchd_restart("restart-three")
+
+    def test_deploy_rejected_by_active_restart_is_durably_recorded(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+
+            with self._isolated_operation_paths(root):
+                self.dev._claim_launchd_restart("restart-owner")
+                with mock.patch.object(
+                    self.dev,
+                    "_launchd_candidate_env",
+                    return_value=({}, None),
+                ), mock.patch.object(
+                    self.dev,
+                    "_preflight_prod_bind_auth",
+                ), mock.patch.object(self.dev, "prod_build") as build:
+                    with self.assertRaisesRegex(
+                        self.dev.ActiveLaunchdRestart,
+                        "restart-owner",
+                    ):
+                        self.dev.launchd_prod_deploy()
+
+                rejection = json.loads(
+                    self.dev.LAUNCHD_DEPLOY_STATUS_PATH.read_text()
+                )
+                self.assertEqual("rejected_concurrent", rejection["state"])
+                self.assertEqual("local_head", rejection["source_kind"])
+                self.assertIn("restart-owner", rejection["failure"])
+                self.assertEqual(
+                    "restart-owner\n",
+                    self.dev.LAUNCHD_RESTART_ACTIVE_PATH.read_text(),
+                )
+                self.assertFalse(self.dev.LAUNCHD_DEPLOY_ACTIVE_PATH.exists())
+                build.assert_not_called()
 
     def test_concurrent_restart_rejection_is_durable_without_overwriting_owner(self):
         with tempfile.TemporaryDirectory() as td:

@@ -42,8 +42,11 @@ Status includes source kind/tag, expected version/SHA, terminal outcome, and rol
 The launchd plist owns Phoenix's production listener through a socket named
 `Listeners`. The Phoenix binary calls `launch_activate_socket("Listeners", …)` at
 startup; if launchd supplies that socket, Phoenix adopts it instead of binding a
-new port. SIGHUP exits immediately in this mode so launchd can restart the
-process while keeping the listener open.
+new port. SIGHUP begins bounded shutdown in this mode: Phoenix stops accepting
+connections, drains requests for up to 30 seconds, flushes tracing, and cleans
+up live Bash process groups before exiting. launchd keeps the listener open and
+restarts the process; the restart helper reserves 35 seconds for this shutdown
+before its separate replacement-process deadline begins.
 
 `./dev.py prod restart` uses that path through an independent one-shot
 LaunchAgent. It verifies a new PID with the same exact runtime identity and

@@ -292,7 +292,7 @@ class Launchctl:
                 f"socket_services={job.socket_services!r}"
             )
 
-    def signal_hup(self) -> int:
+    def signal_hup(self, expected_pid: int) -> int:
         job = self.inspect()
         if (
             job.state not in {"running", "active"}
@@ -301,6 +301,11 @@ class Launchctl:
             raise RestartError(
                 "installed service changed immediately before restart; "
                 f"observed state={job.state} pid={job.pid} keepalive={job.keep_alive}"
+            )
+        if job.pid != expected_pid:
+            raise RestartError(
+                "installed service PID changed between identity verification and signaling; "
+                f"expected {expected_pid}, observed {job.pid}"
             )
         self.require_configuration(
             job,
@@ -432,7 +437,7 @@ def restart(manifest: Manifest) -> str:
                     f"installed runtime identity changed before restart: {observed}"
                 )
 
-            signal_pid = launchctl.signal_hup()
+            signal_pid = launchctl.signal_hup(job.pid)
             disrupted = True
             write_status(manifest, "restarting", previous_pid=signal_pid)
             running_pid = launchctl.wait_for_new_pid(signal_pid)

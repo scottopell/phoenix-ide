@@ -8984,6 +8984,10 @@ class ConcurrentLaunchdOperation(SystemExit):
     pass
 
 
+class ActiveLaunchdRestart(ConcurrentLaunchdOperation):
+    pass
+
+
 class LaunchdClaimAcquisitionFailed(SystemExit):
     pass
 
@@ -9627,7 +9631,7 @@ def _claim_launchd_deploy(transaction_id: str) -> None:
             _release_launchd_restart_claim_unlocked(restart_owner)
             restart_owner = None
         if restart_owner is not None or LAUNCHD_RESTART_ACTIVE_PATH.exists():
-            raise ConcurrentLaunchdOperation(
+            raise ActiveLaunchdRestart(
                 f"another launchd restart ({restart_owner or 'unknown'}) is active or needs recovery. "
                 "Run './dev.py prod status'; remove the restart marker only after confirming no helper is running."
             )
@@ -9848,7 +9852,6 @@ def launchd_prod_deploy(
     _preflight_prod_bind_auth(launchd_env, socket_activated=True)
 
     transaction_id = controller.transaction_id or f"{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
-    _claim_launchd_deploy(transaction_id)
     claimed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     staging = LAUNCHD_DEPLOY_DIR / "transactions" / transaction_id
     source_kind = "published_release" if release else "local_head"
@@ -9856,6 +9859,21 @@ def launchd_prod_deploy(
     release_commit = None
     release_tag = release
     selected_identity: RuntimeIdentity | None = None
+    try:
+        _claim_launchd_deploy(transaction_id)
+    except ActiveLaunchdRestart as exc:
+        rejected_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
+            "transaction_id": transaction_id, "state": "rejected_concurrent",
+            "source_kind": source_kind,
+            "source_commit": source_commit,
+            "release_commit": release_commit,
+            "release_tag": release_tag,
+            "expected_version": None, "expected_git_sha": None,
+            "created_at": claimed_at, "updated_at": rejected_at,
+            "failure": str(exc), "rollback_failure": None,
+        })
+        raise
     try:
         _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
             "transaction_id": transaction_id, "state": "preparing",
