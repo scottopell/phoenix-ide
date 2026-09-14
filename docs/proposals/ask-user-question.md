@@ -1,10 +1,10 @@
 # AskUserQuestion design proposal
 
-Revision 3 · 2026-09-14 · Proposed for user approval, not implemented.
+Revision 3 · 2026-09-14 · Approved design implemented and automatically verified. Physical-device and assistive-technology release qualification remains in task 10006.
 
 Owner: task 10005. Baseline: b56a657c5 (fixtures), product ce66022db.
-This proposal is the implementation brief pending approval. Existing normative
-specifications remain authoritative until the approved changes are recorded there.
+This approved proposal is the implementation brief. Normative specifications
+record its standing contract; implementation progress lives in executive docs.
 
 ## Decision requested
 

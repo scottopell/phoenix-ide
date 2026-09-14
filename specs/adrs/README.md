@@ -63,13 +63,19 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [049](049_compaction-protects-accepted-handoffs-and-coordinator-context.md) | Compaction protects accepted handoffs and Coordinator context | Accepted | REQ-BED-020, REQ-GR-011, REQ-GR-013 |
 | [050](050_launchd-restart-preserves-installed-state.md) | launchd restart preserves installed state through an independent helper | Accepted | REQ-LDD-014 through REQ-LDD-016; `RestartTransaction` |
 | [051](051_predecessor-recall-is-bound-to-the-executing-transcript.md) | Predecessor recall is bound to the executing transcript | Accepted | REQ-RET-009, REQ-GR-007 |
+| [053](053_question-interactions-bind-explicit-answers-to-request-identity.md) | Question interactions bind explicit answers to request identity | Accepted | REQ-AUQ-001–004/007/009–013, REQ-KB-001/004/008, REQ-COMP-006 |
 
 ## For agents: which decisions bind your task
+
+Question answer semantics, responsive question layout, native AUQ keyboard
+navigation, and question mutation protocol changes are governed by
+[ADR-053](053_question-interactions-bind-explicit-answers-to-request-identity.md).
 
 Consult the relevant ADRs before starting work of each kind.
 
 | Task type | Relevant ADRs |
 | --- | --- |
+| Changing question answer UX, responsive layout, or request mutation identity | 053, 050, 034 |
 | Creating or restructuring Phoenix spec artifacts | 000 |
 | Deciding whether to create a new `design.md` | 000 |
 | Migrating legacy `specs/*/design.md` content | 000, 001, 002, 003, 004, 005, 006 |
@@ -119,7 +125,8 @@ ADR-000 (adopt spEARS v2 for new work)
       ├── ADR-008 (Multi-PR selection uses durable settled-branch observations plus explicit active-PR targeting)
       ├── ADR-009 (Native process metrics use shared demand-driven observation generations)
       ├── ADR-034 (Compatibility guarantees are explicit and data-aware)
-      │   └── ADR-038 (Commission review is retired with forward history recovery)
+      │   ├── ADR-038 (Commission review is retired with forward history recovery)
+      │   └── ADR-053 (Question interactions bind explicit answers to request identity)
       ├── ADR-036 (Local SQLite authority loss fails stop)
       │   └── applies ADR-014, ADR-020, ADR-024, and ADR-034 at the local persistence-health boundary
       ├── ADR-037 (Legacy direct-turn terminal ambiguity is retired as failure)

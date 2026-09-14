@@ -548,11 +548,14 @@ pub enum Event {
     // Ask user question events (REQ-AUQ-001)
     /// User answered the pending questions (POST /api/conversations/{id}/respond)
     UserQuestionResponse {
+        tool_use_id: String,
         answers: HashMap<String, String>,
         annotations: Option<HashMap<String, QuestionAnnotation>>,
     },
     /// User dismissed the structured question UI without answering it.
-    UserQuestionDismissed,
+    UserQuestionDismissed {
+        tool_use_id: String,
+    },
 
     /// User dismissed a persisted `Error` state, returning the conversation to
     /// `Idle`. Server-authoritative: the UI does not fake the idle phase
@@ -665,7 +668,7 @@ impl Event {
             Event::TaskApprovalDecided { .. } => "TaskApprovalDecided",
             Event::TaskHandoffComplete { .. } => "TaskHandoffComplete",
             Event::UserQuestionResponse { .. } => "UserQuestionResponse",
-            Event::UserQuestionDismissed => "UserQuestionDismissed",
+            Event::UserQuestionDismissed { .. } => "UserQuestionDismissed",
             Event::DismissError => "DismissError",
             Event::GraceTurnExhausted { .. } => "GraceTurnExhausted",
             Event::CredentialBecameAvailable => "CredentialBecameAvailable",
@@ -790,10 +793,13 @@ pub enum ParentOnlyEvent {
         successor_conv_id: String,
     },
     UserQuestionResponse {
+        tool_use_id: String,
         answers: HashMap<String, String>,
         annotations: Option<HashMap<String, QuestionAnnotation>>,
     },
-    UserQuestionDismissed,
+    UserQuestionDismissed {
+        tool_use_id: String,
+    },
     DismissError,
     CredentialBecameAvailable,
     CredentialHelperFailed {
@@ -997,15 +1003,17 @@ impl TryFrom<Event> for ParentEvent {
                 }))
             }
             Event::UserQuestionResponse {
+                tool_use_id,
                 answers,
                 annotations,
             } => Ok(ParentEvent::Parent(ParentOnlyEvent::UserQuestionResponse {
+                tool_use_id,
                 answers,
                 annotations,
             })),
-            Event::UserQuestionDismissed => {
-                Ok(ParentEvent::Parent(ParentOnlyEvent::UserQuestionDismissed))
-            }
+            Event::UserQuestionDismissed { tool_use_id } => Ok(ParentEvent::Parent(
+                ParentOnlyEvent::UserQuestionDismissed { tool_use_id },
+            )),
             Event::DismissError => Ok(ParentEvent::Parent(ParentOnlyEvent::DismissError)),
             Event::CredentialBecameAvailable => Ok(ParentEvent::Parent(
                 ParentOnlyEvent::CredentialBecameAvailable,
@@ -1176,7 +1184,7 @@ impl TryFrom<Event> for SubAgentEvent {
             Event::TaskApprovalDecided { .. }
             | Event::TaskHandoffComplete { .. }
             | Event::UserQuestionResponse { .. }
-            | Event::UserQuestionDismissed
+            | Event::UserQuestionDismissed { .. }
             | Event::DismissError
             | Event::CredentialBecameAvailable
             | Event::CredentialHelperFailed { .. }
@@ -1228,7 +1236,7 @@ impl ParentEvent {
                 ParentOnlyEvent::TaskApprovalDecided { .. } => "TaskApprovalDecided",
                 ParentOnlyEvent::TaskHandoffComplete { .. } => "TaskHandoffComplete",
                 ParentOnlyEvent::UserQuestionResponse { .. } => "UserQuestionResponse",
-                ParentOnlyEvent::UserQuestionDismissed => "UserQuestionDismissed",
+                ParentOnlyEvent::UserQuestionDismissed { .. } => "UserQuestionDismissed",
                 ParentOnlyEvent::DismissError => "DismissError",
                 ParentOnlyEvent::CredentialBecameAvailable => "CredentialBecameAvailable",
                 ParentOnlyEvent::CredentialHelperFailed { .. } => "CredentialHelperFailed",

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { api } from '../../api';
+import { api, QuestionMutationError } from '../../api';
 import { QuestionPanel } from '../../components/QuestionPanel';
 import { FocusScopeProvider } from '../../hooks/useFocusScope';
 import type { AskUserQuestionScenario } from './scenarios';
@@ -15,9 +15,9 @@ export function AskUserQuestionFixture({ scenario }: { scenario: AskUserQuestion
     document.documentElement.dataset['theme'] = 'light';
     const respond = api.respondToQuestion;
     const dismiss = api.dismissQuestion;
-    api.respondToQuestion = async (_id, answers, annotations) => {
-      if (scenario.fail) throw new Error('Fixture: response failed. Please retry.');
-      setResult(JSON.stringify({ answers, annotations }, null, 2));
+    api.respondToQuestion = async (_id, toolUseId, answers, annotations) => {
+      if (scenario.fail) throw new QuestionMutationError('Fixture: response rejected. Please retry.', 'question_request_invalid');
+      setResult(JSON.stringify({ toolUseId, answers, annotations }, null, 2));
       return { success: true };
     };
     api.dismissQuestion = async () => {
@@ -34,14 +34,14 @@ export function AskUserQuestionFixture({ scenario }: { scenario: AskUserQuestion
   }, [scenario]);
   return (
     <FocusScopeProvider>
-      <main data-ask-user-question-fixture={ready ? scenario.id : undefined} style={{ height: '100dvh', display: 'flex', flexDirection: 'column', background: 'var(--bg-primary)', color: 'var(--text-primary)' }}>
-        <section style={{ flex: 1, minHeight: 0, overflow: 'auto', padding: 16 }}>
+      <main className="conversation-column" data-ask-user-question-fixture={ready ? scenario.id : undefined} style={{ height: '100dvh', display: 'flex', flexDirection: 'column', background: 'var(--bg-primary)', color: 'var(--text-primary)' }}>
+        <section className="question-fixture-transcript" style={{ flex: 1, minHeight: 0, overflow: 'auto', padding: 16 }}>
           <h2>AskUserQuestion validation: {scenario.id}</h2>
           <p>Fixture transcript. Submitted responses appear here.</p>
           <pre aria-label="Captured response">{result}</pre>
           <p role="status">{toast}</p>
         </section>
-        {ready && !finished && <QuestionPanel questions={scenario.questions} conversationId="fixture-auq" showToast={setToast} onAnswered={() => setFinished(true)} onDismissed={() => setFinished(true)} readOnly={scenario.readOnly ?? false} />}
+        {ready && !finished && <QuestionPanel questions={scenario.questions} conversationId="fixture-auq" toolUseId="fixture-question" onResolved={() => setFinished(true)} showToast={setToast} onAnswered={() => setFinished(true)} onDismissed={() => setFinished(true)} readOnly={scenario.readOnly ?? false} />}
         <footer style={{ padding: 12 }}>Fixture conversation · {finished ? 'Response handled' : 'Awaiting your reply'}</footer>
       </main>
     </FocusScopeProvider>

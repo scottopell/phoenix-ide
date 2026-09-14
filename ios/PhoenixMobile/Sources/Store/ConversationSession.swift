@@ -428,19 +428,82 @@ final class ConversationSession {
     /// The action currently being executed, or nil. Views use this to
     /// disable controls and show progress — approval buttons especially
     /// must not double-fire.
+    private enum QuestionAttemptPhase {
+        case sending
+        case uncertain(String)
+        case checking
+        case resolvedWaitingForStream
+    }
     private struct ActionAttempt {
         let action: ConversationAction
         let originState: ConversationState?
         let token: UUID
+        var phase: QuestionAttemptPhase = .sending
     }
     private var actionAttempt: ActionAttempt?
     var actionInFlight: ConversationAction? { actionAttempt?.action }
+
+    var questionResolvedWaitingForStream: Bool {
+        if case .resolvedWaitingForStream = actionAttempt?.phase { return true }
+        return false
+    }
+
+    var uncertainQuestionMessage: String? {
+        guard let attempt = actionAttempt, attempt.action.questionToolUseId != nil else { return nil }
+        switch attempt.phase {
+        case .sending: return nil
+        case .uncertain(let message): return message
+        case .checking: return "Checking question status…"
+        case .resolvedWaitingForStream: return "This question is no longer awaiting an answer. Refreshing…"
+        }
+    }
+
+    var canRetryQuestionOperation: Bool {
+        guard let attempt = actionAttempt, attempt.action.questionToolUseId != nil,
+              case .uncertain = attempt.phase else { return false }
+        return connectivity.isOnline
+    }
+
+    func retryQuestionOperation() {
+        guard canRetryQuestionOperation, let attempt = actionAttempt else { return }
+        actionAttempt?.phase = .sending
+        executeAction(attempt.action, token: attempt.token, previouslyUncertain: true)
+    }
+
+    func checkQuestionStatus() {
+        guard canRetryQuestionOperation, let attempt = actionAttempt else { return }
+        actionAttempt?.phase = .checking
+        Task {
+            do {
+                let response = try await api.getConversation(id: conversationId)
+                guard actionAttempt?.token == attempt.token else { return }
+                if Self.actionStillAwaitsOriginalState(
+                    action: attempt.action, origin: attempt.originState,
+                    current: ConversationState.parse(response.conversation.state)) {
+                    actionAttempt?.phase = .uncertain("Your original action may still be processing. Retry sends only the same answer or dismissal.")
+                } else {
+                    actionAttempt?.phase = .resolvedWaitingForStream
+                    streamTask?.cancel()
+                    streamTask = nil
+                    connection = .idle
+                    resumeLiveTasks()
+                }
+            } catch {
+                guard actionAttempt?.token == attempt.token else { return }
+                actionAttempt?.phase = .uncertain("Could not check question status. Check status again when connected.")
+            }
+        }
+    }
 
     /// Execute a session-scoped action per its declared delivery policy
     /// (ConversationAction). Online-only actions fail fast with a toast
     /// when offline — deliberately not queued, see the policy doc.
     func perform(_ action: ConversationAction) {
         guard acceptsConversationActions, actionAttempt == nil else { return }
+        if let toolUseId = action.questionToolUseId {
+            guard case .awaitingUserResponse(let currentId, _) = typedState,
+                  currentId == toolUseId else { return }
+        }
         switch ClientOperation.conversationAction(action).policy {
         case .onlineOnly:
             guard connectivity.isOnline else {
@@ -453,8 +516,12 @@ final class ConversationSession {
         let token = UUID()
         actionAttempt = ActionAttempt(
             action: action,
-            originState: typedState,
+            originState: action.questionToolUseId == nil ? typedState : nil,
             token: token)
+        executeAction(action, token: token, previouslyUncertain: false)
+    }
+
+    private func executeAction(_ action: ConversationAction, token: UUID, previouslyUncertain: Bool) {
         Task {
             do {
                 switch action {
@@ -470,14 +537,20 @@ final class ConversationSession {
                 case .provideTaskFeedback(let feedback):
                     try await api.sendTaskFeedback(
                         conversationId: conversationId, annotations: feedback.text)
-                case .respondToQuestions(let answers):
+                case .respondToQuestions(let toolUseId, let answers):
                     try await api.respondToQuestion(
-                        conversationId: conversationId, answers: answers)
-                case .dismissQuestion:
-                    try await api.dismissQuestion(conversationId: conversationId)
+                        conversationId: conversationId, toolUseId: toolUseId, answers: answers)
+                case .dismissQuestion(let toolUseId):
+                    try await api.dismissQuestion(conversationId: conversationId, toolUseId: toolUseId)
                 }
             } catch {
                 guard actionAttempt?.token == token else { return }
+                if action.questionToolUseId != nil,
+                   Self.questionFailureRemainsUncertain(error, previouslyUncertain: previouslyUncertain) {
+                    actionAttempt?.phase = .uncertain("Could not confirm the action. Check status before continuing.")
+                    checkQuestionStatus()
+                    return
+                }
                 if case .cancel = action {
                     cancelNeedsAgentDoneFallback = false
                 }
@@ -486,6 +559,10 @@ final class ConversationSession {
                     ?? error.localizedDescription
             }
         }
+    }
+
+    nonisolated static func questionFailureRemainsUncertain(_ error: Error, previouslyUncertain: Bool) -> Bool {
+        previouslyUncertain || (error as? APIError)?.isDefinitiveQuestionRejection != true
     }
 
     func clearErrorToast() {
@@ -945,6 +1022,11 @@ final class ConversationSession {
         origin: ConversationState?,
         current: ConversationState
     ) -> Bool {
+        if let toolUseId = action.questionToolUseId {
+            if current == .questionIdentityUnavailable || current == .unknown { return true }
+            guard case .awaitingUserResponse(let currentId, _) = current else { return false }
+            return currentId == toolUseId
+        }
         switch action {
         case .cancel:
             return current.isCancellable

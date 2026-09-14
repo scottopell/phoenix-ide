@@ -320,6 +320,62 @@ pub(crate) async fn persist_continuation_start_tx(
     Ok(ContinuationCommitOutcome::Applied)
 }
 
+pub(crate) async fn commit_question_response_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    conversation_id: &str,
+    tool_use_id: &str,
+    message: &Message,
+    completed_state: &ConvState,
+    state_updated_at: DateTime<Utc>,
+) -> DbResult<bool> {
+    if message.conversation_id != conversation_id {
+        return Err(DbError::Serialization(
+            "question response message targets another conversation".to_string(),
+        ));
+    }
+    if !matches!(
+        completed_state,
+        ConvState::Idle | ConvState::LlmRequesting { attempt: 1 }
+    ) {
+        return Err(DbError::Serialization(
+            "question response requires idle or initial LLM requesting state".to_string(),
+        ));
+    }
+    require_product_conversation_admission_tx(tx, conversation_id).await?;
+    let persisted_json: String =
+        sqlx::query_scalar("SELECT state FROM conversations WHERE id = ?1")
+            .bind(conversation_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .ok_or_else(|| DbError::ConversationNotFound(conversation_id.to_string()))?;
+    let persisted: ConvState = serde_json::from_str(&persisted_json)
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    if !matches!(&persisted, ConvState::AwaitingUserResponse { tool_use_id: pending, .. } if pending == tool_use_id)
+    {
+        return Ok(false);
+    }
+    insert_message_tx(tx, message).await?;
+    let completed_json = serde_json::to_string(completed_state)
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    let updated = sqlx::query(
+        "UPDATE conversations
+             SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4
+             WHERE id = ?5 AND state = ?6",
+    )
+    .bind(completed_json)
+    .bind(conv_state_kind(completed_state))
+    .bind(state_updated_at.to_rfc3339())
+    .bind(Utc::now().to_rfc3339())
+    .bind(conversation_id)
+    .bind(persisted_json)
+    .execute(&mut **tx)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 pub(crate) async fn commit_continuation_tx(
     tx: &mut Transaction<'_, Sqlite>,
     conversation_id: &str,
@@ -6334,6 +6390,37 @@ impl Database {
             }
         }
         Ok(ids)
+    }
+
+    /// Atomically consume a matching pending question and record its answer or dismissal.
+    ///
+    /// # Errors
+    /// Returns an error for invalid message ownership, denied conversation admission,
+    /// malformed persisted state, or failure to commit the message and state together.
+    pub async fn commit_question_response(
+        &self,
+        conversation_id: &str,
+        tool_use_id: &str,
+        message: &Message,
+        completed_state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> DbResult<bool> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let committed = commit_question_response_tx(
+            &mut tx,
+            conversation_id,
+            tool_use_id,
+            message,
+            completed_state,
+            state_updated_at,
+        )
+        .await?;
+        if committed {
+            tx.commit().await?;
+        } else {
+            tx.rollback().await?;
+        }
+        Ok(committed)
     }
 
     /// Atomically commit a generated continuation summary when the persisted
@@ -19712,6 +19799,139 @@ mod tests {
             user_agent: None,
             skill_invocation: None,
         }
+    }
+
+    #[tokio::test]
+    async fn question_response_commit_consumes_identity_once_and_preserves_exact_message() {
+        let db = Database::open_in_memory().await.unwrap();
+        let id = "question-atomic";
+        db.create_conversation(id, id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let pending = ConvState::AwaitingUserResponse {
+            questions: vec![],
+            tool_use_id: "first".into(),
+        };
+        db.update_conversation_state(id, &pending).await.unwrap();
+        let message = steering_drain_message(id, "answer", 1);
+        let next = ConvState::LlmRequesting { attempt: 1 };
+        let timestamp = Utc::now();
+        assert!(!db
+            .commit_question_response(id, "stale", &message, &next, timestamp)
+            .await
+            .unwrap());
+        assert!(db.get_messages(id).await.unwrap().is_empty());
+        assert!(db
+            .commit_question_response(id, "first", &message, &next, timestamp)
+            .await
+            .unwrap());
+        assert!(!db
+            .commit_question_response(id, "first", &message, &next, timestamp)
+            .await
+            .unwrap());
+        let messages = db.get_messages(id).await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, message.content);
+        assert_eq!(messages[0].message_id, message.message_id);
+        let conversation = db.get_conversation(id).await.unwrap();
+        assert_eq!(conversation.state, next);
+        assert_eq!(conversation.state_updated_at, timestamp);
+
+        let following = ConvState::AwaitingUserResponse {
+            questions: vec![],
+            tool_use_id: "second".into(),
+        };
+        db.update_conversation_state(id, &following).await.unwrap();
+        let mut dismissal = steering_drain_message(id, "dismissal", 2);
+        dismissal.content = MessageContent::system("[ask-user-question-dismissed]");
+        dismissal.message_type = dismissal.content.message_type();
+        dismissal.display_data = Some(serde_json::json!({"hidden": true}));
+        assert!(!db
+            .commit_question_response(id, "first", &dismissal, &ConvState::Idle, timestamp)
+            .await
+            .unwrap());
+        assert_eq!(db.get_conversation(id).await.unwrap().state, following);
+        assert!(db
+            .commit_question_response(id, "second", &dismissal, &ConvState::Idle, timestamp)
+            .await
+            .unwrap());
+        let messages = db.get_messages(id).await.unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].content, dismissal.content);
+        assert_eq!(messages[1].display_data, dismissal.display_data);
+        assert_eq!(
+            db.get_conversation(id).await.unwrap().state,
+            ConvState::Idle
+        );
+    }
+
+    #[tokio::test]
+    async fn question_response_commit_rolls_back_both_writes_on_failure() {
+        for fail_message in [false, true] {
+            let db = Database::open_in_memory().await.unwrap();
+            let id = "question-rollback";
+            db.create_conversation(id, id, "/tmp", true, None, None)
+                .await
+                .unwrap();
+            let pending = ConvState::AwaitingUserResponse {
+                questions: vec![],
+                tool_use_id: "pending".into(),
+            };
+            db.update_conversation_state(id, &pending).await.unwrap();
+            let trigger = if fail_message {
+                "CREATE TRIGGER reject_question_write BEFORE INSERT ON messages
+                 BEGIN SELECT RAISE(ABORT, 'injected question message failure'); END"
+            } else {
+                "CREATE TRIGGER reject_question_write BEFORE UPDATE OF state ON conversations
+                 BEGIN SELECT RAISE(ABORT, 'injected question state failure'); END"
+            };
+            sqlx::query(trigger).execute(db.pool()).await.unwrap();
+            let message = steering_drain_message(id, "answer", 1);
+            let next = ConvState::LlmRequesting { attempt: 1 };
+            assert!(db
+                .commit_question_response(id, "pending", &message, &next, Utc::now())
+                .await
+                .is_err());
+            assert!(db.get_messages(id).await.unwrap().is_empty());
+            assert_eq!(db.get_conversation(id).await.unwrap().state, pending);
+            sqlx::query("DROP TRIGGER reject_question_write")
+                .execute(db.pool())
+                .await
+                .unwrap();
+            assert!(db
+                .commit_question_response(id, "pending", &message, &next, Utc::now())
+                .await
+                .unwrap());
+            assert_eq!(db.get_messages(id).await.unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn question_response_commit_allows_only_one_concurrent_consumer() {
+        let db = Database::open_in_memory().await.unwrap();
+        let id = "question-concurrent";
+        db.create_conversation(id, id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.update_conversation_state(
+            id,
+            &ConvState::AwaitingUserResponse {
+                questions: vec![],
+                tool_use_id: "pending".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let first = steering_drain_message(id, "first-answer", 1);
+        let second = steering_drain_message(id, "second-answer", 2);
+        let state = ConvState::LlmRequesting { attempt: 1 };
+        let now = Utc::now();
+        let (first, second) = tokio::join!(
+            db.commit_question_response(id, "pending", &first, &state, now),
+            db.commit_question_response(id, "pending", &second, &state, now),
+        );
+        assert_ne!(first.unwrap(), second.unwrap());
+        assert_eq!(db.get_messages(id).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

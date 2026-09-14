@@ -161,7 +161,7 @@ struct FixtureStateInspection: View {
         case .toolExecuting: return "tool_executing"
         case .awaitingSubAgents: return "awaiting_sub_agents"
         case .awaitingContinuation: return "awaiting_continuation"
-        case .awaitingUserResponse: return "awaiting_user_response"
+        case .awaitingUserResponse, .questionIdentityUnavailable: return "awaiting_user_response"
         case .awaitingTaskApproval: return "awaiting_task_approval"
         case .awaitingRecovery: return "awaiting_recovery"
         case .provisioning: return "provisioning"
@@ -496,6 +496,7 @@ private extension FixtureScenario {
                 streamingText: "",
                 statePayload: .object([
                     "type": .string("awaiting_user_response"),
+                    "tool_use_id": .string("fixture-question"),
                     "questions": .array([
                         .object([
                             "question": .string("Which fixture state should ship first?"),

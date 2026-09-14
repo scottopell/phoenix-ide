@@ -97,20 +97,36 @@ struct StateDetailView: View {
     }
 
     var body: some View {
-        StateDetailBody(
-            state: session.typedState,
-            presentationMode: session.presentationMode ?? "idle",
-            agentWorking: session.agentWorking,
-            isOnline: model.connectivity.isOnline,
-            acceptsActions: session.acceptsConversationActions,
-            busy: session.actionInFlight != nil,
-            convState: session.convState,
-            resolveNavigation: { successorConversationId in
-                model.resolvedNavigationConversationId(
-                    aggregateId: model.listStore.aggregateId(forTranscriptRowId: successorConversationId),
-                    latestTranscriptRowId: successorConversationId)
-            },
-            onAction: { session.perform($0) })
+        if !session.questionResolvedWaitingForStream {
+            StateDetailBody(
+                state: session.typedState,
+                presentationMode: session.presentationMode ?? "idle",
+                agentWorking: session.agentWorking,
+                isOnline: model.connectivity.isOnline,
+                acceptsActions: session.acceptsConversationActions,
+                busy: session.actionInFlight != nil,
+                convState: session.convState,
+                resolveNavigation: { successorConversationId in
+                    model.resolvedNavigationConversationId(
+                        aggregateId: model.listStore.aggregateId(forTranscriptRowId: successorConversationId),
+                        latestTranscriptRowId: successorConversationId)
+                },
+                onAction: { session.perform($0) })
+                .id(session.conversationId)
+        }
+        if let message = session.uncertainQuestionMessage {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(message).font(.callout)
+                HStack {
+                    Button("Check status again") { session.checkQuestionStatus() }
+                    Button(session.actionInFlight?.questionRetryLabel ?? "Retry same answer") {
+                        session.retryQuestionOperation()
+                    }
+                }
+                .disabled(!session.canRetryQuestionOperation)
+            }
+            .padding(.horizontal, 12)
+        }
     }
 }
 
@@ -154,18 +170,21 @@ struct StateDetailBody: View {
                     .foregroundStyle(.secondary)
             }
 
-        case .awaitingUserResponse(let questions):
+        case .questionIdentityUnavailable:
+            Text("Question identity is missing. Update Phoenix and reload this conversation before answering.")
+                .font(.callout)
+        case .awaitingUserResponse(let toolUseId, let questions):
             if questions.isEmpty {
-                emptyQuestionCard
+                emptyQuestionCard(toolUseId: toolUseId)
             } else {
                 QuestionCardBody(
                     questions: questions,
                     isOnline: isOnline,
                     acceptsActions: acceptsActions,
                     busy: busy,
-                    onAnswer: { onAction(.respondToQuestions(answers: $0)) },
-                    onDismiss: { onAction(.dismissQuestion) })
-                    .id(questions)
+                    onAnswer: { onAction(.respondToQuestions(toolUseId: toolUseId, answers: $0)) },
+                    onDismiss: { onAction(.dismissQuestion(toolUseId: toolUseId)) })
+                    .id(toolUseId)
             }
 
         case .awaitingTaskApproval(let title, let priority, let plan):
@@ -302,7 +321,7 @@ struct StateDetailBody: View {
             onDismiss: { onAction(.dismissError) })
     }
 
-    private var emptyQuestionCard: some View {
+    private func emptyQuestionCard(toolUseId: String) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             Label("The agent is waiting for a response", systemImage: "questionmark.bubble")
                 .font(.callout.bold())
@@ -338,7 +357,7 @@ struct StateDetailBody: View {
             titleVisibility: .visible
         ) {
             Button("Dismiss question", role: .destructive) {
-                onAction(.dismissQuestion)
+                onAction(.dismissQuestion(toolUseId: toolUseId))
             }
         }
     }

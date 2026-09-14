@@ -284,6 +284,15 @@ pub trait MessageStore: Send + Sync {
         response_message_id: Option<&str>,
     ) -> TerminalMutationEstablishment;
 
+    async fn get_latest_message(&self, conv_id: &str) -> Result<Option<Message>, String>;
+
+    async fn settle_question_direct_turn(
+        &self,
+        settlement: &ActiveDirectTurnSettlement,
+        tool_use_id: &str,
+        message: &Message,
+    ) -> Result<bool, String>;
+
     async fn settle_continuation_direct_turn(
         &self,
         settlement: &ContinuationDirectTurnSettlement,
@@ -423,6 +432,15 @@ pub trait StateStore: Send + Sync {
         &self,
         settlement: &ContinuationStartRecoverySettlement,
     ) -> Result<crate::db::ContinuationCommitOutcome, String>;
+
+    async fn commit_question_response(
+        &self,
+        conv_id: &str,
+        tool_use_id: &str,
+        message: &crate::db::Message,
+        completed_state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> Result<bool, String>;
 
     async fn commit_continuation(
         &self,
@@ -790,6 +808,21 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
         (**self).settle_active_direct_turn(settlement).await
     }
 
+    async fn get_latest_message(&self, conv_id: &str) -> Result<Option<Message>, String> {
+        (**self).get_latest_message(conv_id).await
+    }
+
+    async fn settle_question_direct_turn(
+        &self,
+        settlement: &ActiveDirectTurnSettlement,
+        tool_use_id: &str,
+        message: &Message,
+    ) -> Result<bool, String> {
+        (**self)
+            .settle_question_direct_turn(settlement, tool_use_id, message)
+            .await
+    }
+
     async fn settle_continuation_direct_turn(
         &self,
         settlement: &ContinuationDirectTurnSettlement,
@@ -918,6 +951,25 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         settlement: &ContinuationStartRecoverySettlement,
     ) -> Result<crate::db::ContinuationCommitOutcome, String> {
         (**self).recover_continuation_start(settlement).await
+    }
+
+    async fn commit_question_response(
+        &self,
+        conv_id: &str,
+        tool_use_id: &str,
+        message: &crate::db::Message,
+        completed_state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> Result<bool, String> {
+        (**self)
+            .commit_question_response(
+                conv_id,
+                tool_use_id,
+                message,
+                completed_state,
+                state_updated_at,
+            )
+            .await
     }
 
     async fn commit_continuation(
@@ -1528,6 +1580,39 @@ impl MessageStore for DatabaseStorage {
         .map_err(|error| error.to_string())
     }
 
+    async fn get_latest_message(&self, conv_id: &str) -> Result<Option<Message>, String> {
+        self.db
+            .get_latest_messages(conv_id, 1)
+            .await
+            .map(|mut messages| messages.pop())
+            .map_err(|error| error.to_string())
+    }
+
+    async fn settle_question_direct_turn(
+        &self,
+        settlement: &ActiveDirectTurnSettlement,
+        tool_use_id: &str,
+        message: &Message,
+    ) -> Result<bool, String> {
+        self.db
+            .workflow_repository()
+            .settle_question_direct_turn_atomically(
+                &phoenix_db::workflow::AtomicQuestionSettlementInput {
+                    conversation_id: settlement.conversation_id.clone(),
+                    tool_use_id: tool_use_id.to_string(),
+                    message: message.clone(),
+                    completed_state: settlement.state.clone(),
+                    state_updated_at: settlement.state_updated_at,
+                    command: direct_turn_terminal_command(
+                        &settlement.turn,
+                        settlement.terminal.clone(),
+                    ),
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn settle_continuation_direct_turn(
         &self,
         settlement: &ContinuationDirectTurnSettlement,
@@ -1862,6 +1947,26 @@ impl StateStore for DatabaseStorage {
                 .await
                 .map_err(|error| error.to_string())
         }
+    }
+
+    async fn commit_question_response(
+        &self,
+        conv_id: &str,
+        tool_use_id: &str,
+        message: &crate::db::Message,
+        completed_state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> Result<bool, String> {
+        self.db
+            .commit_question_response(
+                conv_id,
+                tool_use_id,
+                message,
+                completed_state,
+                state_updated_at,
+            )
+            .await
+            .map_err(|error| error.to_string())
     }
 
     async fn commit_continuation(

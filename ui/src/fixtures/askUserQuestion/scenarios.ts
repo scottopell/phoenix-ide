@@ -21,6 +21,8 @@ export const askUserQuestionScenarios = [
   { id: 'multiple', questions: [plain, { ...plain, header: 'Output', question: 'Which output format?', options: [{ label: 'Summary' }, { label: 'Detailed report' }] }, { ...plain, header: 'Checks', question: 'Which checks should run?', multiSelect: true }] },
   { id: 'multi-select', questions: [{ ...plain, multiSelect: true }] },
   { id: 'submit-error', questions: [plain], fail: true },
+  { id: 'long-preview', questions: [{ ...plain, options: [{label:'Long preview', preview: 'A long wrapped preview must disclose its full content. '.repeat(70)}, {label:'No preview'}] }] },
+  { id: 'compact-headers', questions: ['A','B','C','D'].map(header => ({...plain,header,question:`Question ${header}?`})) },
   { id: 'read-only', questions: [preview], readOnly: true },
 ] satisfies { id: string; questions: UserQuestion[]; fail?: boolean; readOnly?: boolean }[];
 

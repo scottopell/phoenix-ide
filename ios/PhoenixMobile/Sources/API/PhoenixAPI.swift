@@ -28,6 +28,15 @@ enum APIError: Error, LocalizedError {
         }
     }
 
+    var isDefinitiveQuestionRejection: Bool {
+        guard case .http(let status, let body) = self,
+              let data = body.data(using: .utf8),
+              let payload = try? JSONDecoder().decode(JSONValue.self, from: data)
+        else { return false }
+        return (status == 400 && payload["error_type"]?.stringValue == "question_request_invalid")
+            || (status == 409 && payload["error_type"]?.stringValue == "question_request_stale")
+    }
+
     var isTransport: Bool {
         if case .transport = self { return true }
         return false
@@ -179,7 +188,8 @@ struct PhoenixAPI: Sendable {
     /// idle timeout covers gaps between events (the server keep-alives).
     private let streamSession: URLSession
 
-    init?(baseURL: URL, password: String?, allowSelfSigned: Bool) {
+    init?(baseURL: URL, password: String?, allowSelfSigned: Bool,
+          configuration: URLSessionConfiguration = .default) {
         guard password?.isEmpty != false || baseURL.scheme?.lowercased() == "https" else {
             return nil
         }
@@ -189,7 +199,7 @@ struct PhoenixAPI: Sendable {
         let delegate = ServerTrustDelegate(allowSelfSigned: allowSelfSigned)
         self.trustDelegate = delegate
 
-        let config = URLSessionConfiguration.default
+        let config = configuration
         config.timeoutIntervalForRequest = 30
         config.waitsForConnectivity = false
         self.session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
@@ -430,18 +440,18 @@ struct PhoenixAPI: Sendable {
     // Question response (awaiting_user_response): the server 409s when the
     // conversation isn't in that state — e.g. answered from another client.
 
-    func respondToQuestion(conversationId: String, answers: [String: String]) async throws {
+    func respondToQuestion(conversationId: String, toolUseId: String, answers: [String: String]) async throws {
         struct SuccessResponse: Codable { var success: Bool? }
         _ = try await post(
             "api/conversations/\(conversationId)/respond",
-            body: ["answers": answers],
+            body: ["tool_use_id": toolUseId, "answers": answers],
             as: SuccessResponse.self)
     }
 
-    func dismissQuestion(conversationId: String) async throws {
+    func dismissQuestion(conversationId: String, toolUseId: String) async throws {
         struct SuccessResponse: Codable { var success: Bool? }
         _ = try await post(
-            "api/conversations/\(conversationId)/dismiss-question", body: [:],
+            "api/conversations/\(conversationId)/dismiss-question", body: ["tool_use_id": toolUseId],
             as: SuccessResponse.self)
     }
 

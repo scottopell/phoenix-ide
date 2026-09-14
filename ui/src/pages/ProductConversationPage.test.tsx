@@ -335,7 +335,7 @@ function emitLatestProjection(overrides: Partial<Record<string, unknown>> = {}) 
       images: [],
       status: 'pending',
     }],
-    convState: { type: 'awaiting_user_response', questions: [] },
+    convState: { type: 'awaiting_user_response', tool_use_id: 'test-question', questions: [] },
     isArchived: false,
     serverArchived: false,
     onRetryPending: vi.fn(),
@@ -1036,8 +1036,7 @@ describe('ProductConversationPage', () => {
     await waitForPageReady();
     act(() => emitLatestProjection({
       convState: {
-        type: 'awaiting_user_response',
-        questions: [{
+        type: 'awaiting_user_response', tool_use_id: 'test-question', questions: [{
           question: 'Choose a direction',
           header: 'Direction',
           options: [{ label: 'A', description: 'First' }, { label: 'B', description: 'Second' }],

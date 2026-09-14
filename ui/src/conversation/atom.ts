@@ -358,6 +358,7 @@ export type SSEAction =
       phase: ConversationState;
       expectedConversationId: string;
     }
+  | { type: 'question_phase_change'; phase: ConversationState; expectedConversationId: string; toolUseId: string }
   // Client-originated optimistic conversation update (e.g. model swap confirmation).
   | {
       type: 'local_conversation_update';
@@ -1475,6 +1476,10 @@ export function conversationReducer(
       // so even a stale/duplicate event or a payload-less keep-alive `ping`
       // correctly resets the heartbeat — "any observed traffic = alive."
       return { ...atom, lastSseEventAt: Date.now() };
+
+    case 'question_phase_change':
+      if (action.expectedConversationId !== atom.conversationId || atom.phase.type !== 'awaiting_user_response' || atom.phase.tool_use_id !== action.toolUseId) return atom;
+      return { ...atom, phase: action.phase, phaseStateUpdatedAt: null };
 
     case 'local_phase_change':
       if (action.expectedConversationId !== atom.conversationId) return atom;
