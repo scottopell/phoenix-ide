@@ -19,7 +19,7 @@ use phoenix_workflow::{
     TurnCommand, TurnConflict, TurnLifecycle, TurnOutcome, TurnStep, TurnTerminal, Version,
     WorkflowId, WorkflowStatus,
 };
-use sqlx::{Acquire, Connection, Row};
+use sqlx::{Connection, Row};
 
 use super::{
     CommitTransitionPlanCas, CreateWorkflowWithExternalAcceptance, DeliveryResolutionDecision,
@@ -1467,7 +1467,9 @@ impl WorkflowRepository {
             .await?;
         let (mut tx, transaction_timing) = telemetry
             .observe_transaction_admission_db(pool_timing, async {
-                Ok(super::WorkflowTx::new(connection.begin().await?))
+                Ok(super::WorkflowTx::new(
+                    connection.begin_with("BEGIN IMMEDIATE").await?,
+                ))
             })
             .await?;
         let outcome = telemetry
@@ -1524,7 +1526,9 @@ impl WorkflowRepository {
             .await?;
         let (mut tx, transaction_timing) = telemetry
             .observe_transaction_admission_db(pool_timing, async {
-                Ok(super::WorkflowTx::new(connection.begin().await?))
+                Ok(super::WorkflowTx::new(
+                    connection.begin_with("BEGIN IMMEDIATE").await?,
+                ))
             })
             .await?;
         let summary = telemetry
@@ -1576,13 +1580,24 @@ impl WorkflowRepository {
         &self,
         input: &AtomicContinuationSettlementInput,
     ) -> DbResult<crate::ContinuationCommitOutcome> {
+        self.settle_continuation_direct_turn_at_cut(input, TransactionCut::None)
+            .await
+    }
+
+    async fn settle_continuation_direct_turn_at_cut(
+        &self,
+        input: &AtomicContinuationSettlementInput,
+        cut: TransactionCut,
+    ) -> DbResult<crate::ContinuationCommitOutcome> {
         let telemetry = self.sqlite_telemetry(SqliteOperation::DirectTurnTerminalSettlement);
         let (mut connection, pool_timing) = telemetry
             .observe_pool_acquisition_sqlx(self.pool.acquire())
             .await?;
         let (mut tx, transaction_timing) = telemetry
             .observe_transaction_admission_db(pool_timing, async {
-                Ok(super::WorkflowTx::new(connection.begin().await?))
+                Ok(super::WorkflowTx::new(
+                    connection.begin_with("BEGIN IMMEDIATE").await?,
+                ))
             })
             .await?;
         let outcome = telemetry
@@ -1617,14 +1632,21 @@ impl WorkflowRepository {
                 Ok(outcome)
             })
             .await?;
-        if outcome == crate::ContinuationCommitOutcome::Stale {
+        if outcome == crate::ContinuationCommitOutcome::Stale || cut == TransactionCut::BeforeCommit
+        {
             telemetry
                 .observe_rollback_db(transaction_timing, tx.rollback())
                 .await?;
+            if cut == TransactionCut::BeforeCommit {
+                return Err(injected_cut(cut));
+            }
         } else {
             telemetry
                 .observe_commit_db(transaction_timing, tx.commit())
                 .await?;
+            if cut == TransactionCut::AfterCommit {
+                return Err(injected_cut(cut));
+            }
         }
         Ok(outcome)
     }
@@ -4872,6 +4894,162 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn continuation_settlement_rollback_and_ambiguous_commit_retry_converge_exactly() {
+        for (key, cut, expected_retry) in [
+            (
+                "continuation-before-commit",
+                TransactionCut::BeforeCommit,
+                crate::ContinuationCommitOutcome::Applied,
+            ),
+            (
+                "continuation-after-commit",
+                TransactionCut::AfterCommit,
+                crate::ContinuationCommitOutcome::Duplicate,
+            ),
+        ] {
+            let repo = repo().await;
+            let created = repo
+                .accept_authoritative_turn(&input("conv-a", key, 11))
+                .await
+                .unwrap();
+            let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+                panic!("expected created turn")
+            };
+            let operation_id = format!("{key}-operation");
+            let awaiting = ConvState::AwaitingContinuation {
+                request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                    operation_id: operation_id.clone(),
+                    rejected_tool_calls: Vec::new(),
+                    attempt: 1,
+                },
+            };
+            sqlx::query("UPDATE conversations SET state = ?1, state_kind = ?2 WHERE id = 'conv-a'")
+                .bind(serde_json::to_string(&awaiting).unwrap())
+                .bind("awaiting_continuation")
+                .execute(&repo.pool)
+                .await
+                .unwrap();
+            let completed = ConvState::ContextExhausted {
+                summary: "cut summary".to_string(),
+            };
+            let content = crate::MessageContent::continuation("cut summary");
+            let settlement = AtomicContinuationSettlementInput {
+                conversation_id: "conv-a".to_string(),
+                operation_id: operation_id.clone(),
+                message: crate::Message {
+                    message_id: format!("continuation-conv-a-{operation_id}"),
+                    conversation_id: "conv-a".to_string(),
+                    sequence_id: 1,
+                    message_type: content.message_type(),
+                    content,
+                    display_data: None,
+                    usage_data: None,
+                    created_at: Utc::now(),
+                },
+                completed_state: completed,
+                state_updated_at: Utc::now(),
+                command: TurnCommand::Complete {
+                    turn_id,
+                    expected_generation: 0,
+                },
+            };
+
+            assert!(repo
+                .settle_continuation_direct_turn_at_cut(&settlement, cut)
+                .await
+                .is_err());
+            let after_cut_turn = repo
+                .load_authoritative_turn(turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let after_cut_state: String =
+                sqlx::query_scalar("SELECT state FROM conversations WHERE id = 'conv-a'")
+                    .fetch_one(&repo.pool)
+                    .await
+                    .unwrap();
+            let after_cut_messages: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE message_id = ?1")
+                    .bind(&settlement.message.message_id)
+                    .fetch_one(&repo.pool)
+                    .await
+                    .unwrap();
+            match cut {
+                TransactionCut::BeforeCommit => {
+                    assert_eq!(after_cut_turn.generation, 0);
+                    assert!(after_cut_turn.owns_conversation());
+                    assert_eq!(after_cut_messages, 0);
+                    assert_eq!(
+                        serde_json::from_str::<ConvState>(&after_cut_state).unwrap(),
+                        awaiting
+                    );
+                }
+                TransactionCut::AfterCommit => {
+                    assert_eq!(after_cut_turn.generation, 1);
+                    assert!(!after_cut_turn.owns_conversation());
+                    assert!(matches!(
+                        after_cut_turn.lifecycle,
+                        TurnLifecycle::Terminal {
+                            terminal: TurnTerminal::Completed,
+                            ..
+                        }
+                    ));
+                    assert_eq!(after_cut_messages, 1);
+                    assert_eq!(
+                        serde_json::from_str::<ConvState>(&after_cut_state).unwrap(),
+                        settlement.completed_state
+                    );
+                }
+                TransactionCut::None => unreachable!(),
+            }
+            assert_eq!(
+                repo.settle_continuation_direct_turn_atomically(&settlement)
+                    .await
+                    .unwrap(),
+                expected_retry
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages WHERE message_id = ?1")
+                    .bind(&settlement.message.message_id)
+                    .fetch_one(&repo.pool)
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                repo.load_authoritative_turn(turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .generation,
+                1
+            );
+            let final_turn = repo
+                .load_authoritative_turn(turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!final_turn.owns_conversation());
+            assert!(matches!(
+                final_turn.lifecycle,
+                TurnLifecycle::Terminal {
+                    terminal: TurnTerminal::Completed,
+                    ..
+                }
+            ));
+            let final_state: String =
+                sqlx::query_scalar("SELECT state FROM conversations WHERE id = 'conv-a'")
+                    .fetch_one(&repo.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                serde_json::from_str::<ConvState>(&final_state).unwrap(),
+                settlement.completed_state
+            );
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn continuation_settlement_contention_records_statement_failure() {
         let (directory, setup_repo, _) = open_workflow_repo_pair().await;
@@ -4941,7 +5119,7 @@ mod tests {
 
         let capture = EventCapture::default();
         let subscriber = tracing_subscriber::registry().with(capture.clone());
-        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let subscriber_guard = tracing::subscriber::set_default(subscriber);
         let error = contending_repo
             .settle_continuation_direct_turn_atomically(&settlement)
             .await
@@ -4957,16 +5135,178 @@ mod tests {
         );
         assert_eq!(
             events[0].get("db_phase").map(String::as_str),
-            Some("statement")
+            Some("transaction_acquisition")
         );
         assert_eq!(
             events[0].get("db_sqlite_primary_code").map(String::as_str),
             Some("5")
         );
+        assert_eq!(
+            events[0].get("db_sqlite_extended_code").map(String::as_str),
+            Some("5")
+        );
+        drop(subscriber_guard);
+
+        assert_eq!(
+            contending_repo
+                .settle_continuation_direct_turn_atomically(&settlement)
+                .await
+                .unwrap(),
+            crate::ContinuationCommitOutcome::Applied
+        );
+        assert_eq!(
+            contending_repo
+                .settle_continuation_direct_turn_atomically(&settlement)
+                .await
+                .unwrap(),
+            crate::ContinuationCommitOutcome::Duplicate
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn legacy_continuation_reconciliation_records_statement_failure() {
+    async fn continuation_start_contention_is_admission_failure_then_exact_retry() {
+        let (directory, setup_repo, _) = open_workflow_repo_pair().await;
+        let created = setup_repo
+            .accept_authoritative_turn(&input("conv-a", "continuation-start-contention", 10))
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+            panic!("expected created turn")
+        };
+        let operation_id = "continuation-start-contention-operation";
+        let requesting = ConvState::LlmRequesting { attempt: 1 };
+        sqlx::query("UPDATE conversations SET state = ?1, state_kind = ?2 WHERE id = 'conv-a'")
+            .bind(serde_json::to_string(&requesting).unwrap())
+            .bind("llm_requesting")
+            .execute(&setup_repo.pool)
+            .await
+            .unwrap();
+        let target_state = ConvState::RecoverableContinuationFailure {
+            failure: phoenix_core::domain::sm_state::RecoverableContinuationFailure {
+                request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                    operation_id: operation_id.to_string(),
+                    rejected_tool_calls: Vec::new(),
+                    attempt: 1,
+                },
+                error_kind: phoenix_core::domain::db_schema::ErrorKind::ServerError,
+                message: "continuation start failed".to_string(),
+            },
+        };
+        let content = crate::MessageContent::continuation("failed start summary");
+        let settlement = AtomicContinuationSettlementInput {
+            conversation_id: "conv-a".to_string(),
+            operation_id: operation_id.to_string(),
+            message: crate::Message {
+                message_id: format!("continuation-conv-a-{operation_id}"),
+                conversation_id: "conv-a".to_string(),
+                sequence_id: 1,
+                message_type: content.message_type(),
+                content,
+                display_data: None,
+                usage_data: None,
+                created_at: Utc::now(),
+            },
+            completed_state: target_state,
+            state_updated_at: Utc::now(),
+            command: TurnCommand::Fail {
+                turn_id,
+                expected_generation: 0,
+                reason: "continuation start failed".to_string(),
+            },
+        };
+        let path = directory.path().join("direct-turn.db");
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
+                    .unwrap()
+                    .journal_mode(SqliteJournalMode::Wal)
+                    .busy_timeout(std::time::Duration::ZERO),
+            )
+            .await
+            .unwrap();
+        let contending_repo = WorkflowRepository::new(pool);
+        let mut writer = setup_repo.pool.acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+
+        let capture = EventCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let subscriber_guard = tracing::subscriber::set_default(subscriber);
+        assert!(matches!(
+            contending_repo
+                .settle_failed_continuation_start_atomically(&settlement)
+                .await,
+            Err(DbError::Sqlx(_))
+        ));
+        sqlx::query("ROLLBACK").execute(&mut *writer).await.unwrap();
+        let events = capture.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].get("db_phase").map(String::as_str),
+            Some("transaction_acquisition")
+        );
+        assert_eq!(
+            events[0].get("db_sqlite_primary_code").map(String::as_str),
+            Some("5")
+        );
+        assert_eq!(
+            events[0].get("db_sqlite_extended_code").map(String::as_str),
+            Some("5")
+        );
+        drop(subscriber_guard);
+
+        assert_eq!(
+            contending_repo
+                .settle_failed_continuation_start_atomically(&settlement)
+                .await
+                .unwrap(),
+            crate::ContinuationCommitOutcome::Applied
+        );
+        assert_eq!(
+            contending_repo
+                .settle_failed_continuation_start_atomically(&settlement)
+                .await
+                .unwrap(),
+            crate::ContinuationCommitOutcome::Duplicate
+        );
+        let turn = contending_repo
+            .load_authoritative_turn(turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(turn.generation, 1);
+        assert!(!turn.owns_conversation());
+        assert!(matches!(
+            turn.lifecycle,
+            TurnLifecycle::Terminal {
+                terminal: TurnTerminal::Failed { .. },
+                ..
+            }
+        ));
+        let persisted_state: String =
+            sqlx::query_scalar("SELECT state FROM conversations WHERE id = 'conv-a'")
+                .fetch_one(&contending_repo.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            serde_json::from_str::<ConvState>(&persisted_state).unwrap(),
+            settlement.completed_state
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages WHERE message_id = ?1")
+                .bind(&settlement.message.message_id)
+                .fetch_one(&contending_repo.pool)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_continuation_reconciliation_records_admission_failure() {
         let (directory, setup_repo, _) = open_workflow_repo_pair().await;
         let awaiting = ConvState::AwaitingContinuation {
             request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
@@ -5030,7 +5370,7 @@ mod tests {
         );
         assert_eq!(
             events[0].get("db_phase").map(String::as_str),
-            Some("statement")
+            Some("transaction_acquisition")
         );
         assert_eq!(
             events[0].get("db_sqlite_primary_code").map(String::as_str),
