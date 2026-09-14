@@ -28,3 +28,7 @@ QuestionPanel QuestionItem (Other click/focus callbacks, notes condition, radio/
 Local evidence: ui/dogfood-output/report.md, screenshots/, videos/ in the dedicated worktree. Evidence artifacts are ignored; exact reproduction steps above and committed fixture scenarios are the portable source.
 
 Scope: AUQ user interaction and fixtures. No provider changes, production edits/deploy, or conversation lifecycle redesign.
+
+## Design proposal awaiting approval
+
+See [revision 3 design proposal](../docs/proposals/ask-user-question.md). This is the complete implementation brief, including the cross-client request-identity contract and uncertain/late-response rules. Independent design review found no remaining design-consistency blockers after two revision rounds. User approval is still required before product implementation; task remains ready.
