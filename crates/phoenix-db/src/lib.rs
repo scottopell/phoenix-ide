@@ -6645,7 +6645,15 @@ impl Database {
 
         let queue_depth = usize::try_from(queue_position)
             .map_err(|_| DbError::Serialization("steering queue depth overflow".to_string()))?;
-        if queue_depth >= MAX_STEERING_QUEUE_DEPTH {
+        let consumes_dismissal_pause = source == SteeringAdmissionSource::ExplicitUserMessage
+            && sqlx::query_scalar::<_, i64>(
+                "SELECT EXISTS(SELECT 1 FROM question_dismissal_pauses WHERE conversation_id = ?1)",
+            )
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?
+                != 0;
+        if queue_depth >= MAX_STEERING_QUEUE_DEPTH && !consumes_dismissal_pause {
             tx.rollback().await?;
             return Err(DbError::SteeringQueueFull);
         }
@@ -19746,6 +19754,83 @@ mod tests {
             db.update_steering_queue(
                 "capacity-update",
                 &[queue.clone(), vec![steering_entry("overflow")]].concat(),
+            )
+            .await
+            .unwrap_err(),
+            DbError::SteeringQueueFull
+        ));
+    }
+
+    #[tokio::test]
+    async fn explicit_resume_after_question_dismissal_is_admitted_past_full_queue() {
+        let db = Database::open_in_memory().await.unwrap();
+        let id = "dismissal-resume-full-queue";
+        db.create_conversation(id, id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        for index in 0..MAX_STEERING_QUEUE_DEPTH {
+            db.append_steering_entry(
+                id,
+                &steering_entry(&format!("queued-{index}")),
+                &format!("queued-fingerprint-{index}"),
+                crate::SteeringAdmissionSource::DeferredObjective,
+            )
+            .await
+            .unwrap();
+        }
+        db.update_conversation_state(
+            id,
+            &ConvState::AwaitingUserResponse {
+                questions: vec![],
+                tool_use_id: "question".into(),
+                request_id: "question".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut dismissal = steering_drain_message(id, "dismissal", 1);
+        dismissal.content = MessageContent::system("[ask-user-question-dismissed]");
+        dismissal.message_type = dismissal.content.message_type();
+        db.commit_question_response(id, "question", &dismissal, &ConvState::Idle, Utc::now())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            db.append_steering_entry(
+                id,
+                &steering_entry("deferred-overflow"),
+                "deferred-overflow-fingerprint",
+                crate::SteeringAdmissionSource::DeferredObjective,
+            )
+            .await
+            .unwrap_err(),
+            DbError::SteeringQueueFull
+        ));
+
+        let resume_position = db
+            .append_steering_entry(
+                id,
+                &steering_entry("explicit-resume"),
+                "explicit-resume-fingerprint",
+                crate::SteeringAdmissionSource::ExplicitUserMessage,
+            )
+            .await
+            .expect("dismissal pause reserves capacity for the explicit resume message");
+
+        assert_eq!(resume_position, MAX_STEERING_QUEUE_DEPTH);
+        let queue = db.get_steering_queue(id).await.unwrap();
+        assert_eq!(queue.len(), MAX_STEERING_QUEUE_DEPTH + 1);
+        assert_eq!(queue[0].message_id, "queued-0");
+        assert_eq!(
+            queue[MAX_STEERING_QUEUE_DEPTH].message_id,
+            "explicit-resume"
+        );
+        assert!(matches!(
+            db.append_steering_entry(
+                id,
+                &steering_entry("ordinary-overflow"),
+                "ordinary-overflow-fingerprint",
+                crate::SteeringAdmissionSource::ExplicitUserMessage,
             )
             .await
             .unwrap_err(),

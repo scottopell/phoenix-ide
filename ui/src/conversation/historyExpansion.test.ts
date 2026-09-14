@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   historyMergeEventCursorFloor,
+  historyResponseMatchesCurrentRequest,
   initialHistoryExpansionState,
   reduceHistoryExpansion,
   type ActiveHistoryRequest,
@@ -34,6 +35,29 @@ describe('history expansion reducer', () => {
     const request = { ...manualRequest(view('a', 1)), snapshotStartedAtEventSeq: 17 };
 
     expect(historyMergeEventCursorFloor(request)).toBe(17);
+  });
+
+  it('rejects a superseded equal-cursor history response by request token', () => {
+    const currentView = view('a', 1);
+    const first = { ...deepLinkRequest(currentView, 1), snapshotStartedAtEventSeq: 12 };
+    const second = { ...deepLinkRequest(currentView, 2), snapshotStartedAtEventSeq: 12 };
+
+    expect(historyResponseMatchesCurrentRequest(
+      first,
+      second.token,
+      currentView,
+      currentView.transcriptGeneration,
+      currentView.conversationId,
+      currentView.transcriptGeneration,
+    )).toBe(false);
+    expect(historyResponseMatchesCurrentRequest(
+      second,
+      second.token,
+      currentView,
+      currentView.transcriptGeneration,
+      currentView.conversationId,
+      currentView.transcriptGeneration,
+    )).toBe(true);
   });
 
   it('rejects an A generation 1 response after A generation 3 replaces it', () => {

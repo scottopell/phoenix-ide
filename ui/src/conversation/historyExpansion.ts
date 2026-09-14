@@ -27,6 +27,23 @@ export function historyMergeEventCursorFloor(request: ActiveHistoryRequest): num
   return request.snapshotStartedAtEventSeq;
 }
 
+export function historyResponseMatchesCurrentRequest(
+  request: ActiveHistoryRequest,
+  latestStartedRequestToken: number,
+  currentView: HistoryView,
+  authoritativeTranscriptGeneration: number,
+  responseConversationId: string,
+  responseTranscriptGeneration: number,
+): boolean {
+  return request.token === latestStartedRequestToken
+    && responseConversationId === request.view.conversationId
+    && currentView.conversationId === request.view.conversationId
+    && currentView.generation === request.view.generation
+    && currentView.transcriptGeneration === request.view.transcriptGeneration
+    && authoritativeTranscriptGeneration === request.view.transcriptGeneration
+    && responseTranscriptGeneration === request.view.transcriptGeneration;
+}
+
 export type HistoryCommandToken = number;
 
 export type HistoryScrollCommand =
