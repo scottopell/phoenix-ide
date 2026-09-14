@@ -20,6 +20,8 @@ LLM-powered coding agent. Rust backend (axum, SQLite) + React frontend (TypeScri
 
 The core is a **state machine-driven conversation runtime**: messages flow through deterministic state transitions, tools execute as effects, and everything persists to SQLite for crash recovery.
 
+Read [`VISION.md`](VISION.md) for Phoenix's product direction before proposing or evaluating product changes.
+
 ### Architecture
 
 The Rust workspace is split into focused crates under `crates/`:
