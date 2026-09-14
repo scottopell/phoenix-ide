@@ -2932,6 +2932,7 @@ mod conversation_open_telemetry_tests {
             ("store_ready_ms", serde_json::json!(9.0)),
             ("first_paint_ms", serde_json::json!(11.0)),
             ("total_ms", serde_json::json!(15.0)),
+            ("total_ms", serde_json::json!(11.0)),
             ("visible", serde_json::json!(false)),
         ] {
             let mut invalid = valid.clone();
@@ -3048,6 +3049,7 @@ impl ProductConversationOpenTelemetry {
             && self.first_paint_ms.is_none_or(valid)
             && valid(self.total_ms)
             && self.snapshot_received_ms <= self.store_ready_ms
+            && self.store_ready_ms <= self.total_ms
             && (self.first_paint_ms.is_some() == self.visible)
             && self.first_paint_ms.is_none_or(|first_paint| {
                 self.store_ready_ms <= first_paint && first_paint <= self.total_ms

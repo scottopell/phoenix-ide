@@ -292,9 +292,12 @@ function makeChain(overrides: Partial<ChainView> = {}): ChainView {
   };
 }
 
-function NavigateToSecondProduct() {
+function ProductRouteSwitch() {
   const navigate = useNavigate();
-  return <button onClick={() => navigate('/product-conversations/pc-2')}>open second product</button>;
+  return <>
+    <button onClick={() => navigate('/product-conversations/pc-1')}>open first product</button>
+    <button onClick={() => navigate('/product-conversations/pc-2')}>open second product</button>
+  </>;
 }
 
 function renderPage(initialEntry = '/product-conversations/pc-1', withRouteSwitch = false, strict = false) {
@@ -304,7 +307,7 @@ function renderPage(initialEntry = '/product-conversations/pc-1', withRouteSwitc
         <ViewerSlotProvider browserSessionActive={false}>
           <ChainProvider>
             <FileExplorerProvider>
-            {withRouteSwitch && <NavigateToSecondProduct />}
+            {withRouteSwitch && <ProductRouteSwitch />}
             <Routes>
               <Route path="/product-conversations/:productConversationId" element={<ProductConversationPage />} />
             </Routes>
@@ -418,7 +421,7 @@ describe('ProductConversationPage', () => {
     expect(api.reportProductConversationOpen).toHaveBeenCalledTimes(1);
   });
 
-  it('starts a new measured open when revisiting a cached product route', async () => {
+  it('starts a new measured open when revisiting a previously loaded product route', async () => {
     const { api } = await import('../api');
     renderPage('/product-conversations/pc-1', true);
     await waitForPageReady();
@@ -426,8 +429,13 @@ describe('ProductConversationPage', () => {
     fireEvent.click(screen.getByRole('button', { name: 'open second product' }));
     await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
     const secondOpenId = vi.mocked(api.getProductConversationSnapshot).mock.calls[1]?.[1]?.open_id;
+    fireEvent.click(screen.getByRole('button', { name: 'open first product' }));
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(3));
+    const revisitOpenId = vi.mocked(api.getProductConversationSnapshot).mock.calls[2]?.[1]?.open_id;
+    expect(firstOpenId).toMatch(/^[0-9a-f-]{36}$/);
     expect(secondOpenId).toMatch(/^[0-9a-f-]{36}$/);
-    expect(secondOpenId).not.toBe(firstOpenId);
+    expect(revisitOpenId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(new Set([firstOpenId, secondOpenId, revisitOpenId]).size).toBe(3);
   });
 
   it('reuses one open id across StrictMode effect replay', async () => {
