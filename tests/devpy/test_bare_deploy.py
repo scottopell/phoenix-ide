@@ -136,6 +136,37 @@ class BareDeployCommandTests(unittest.TestCase):
             self.dev._bare_api_health_url({"PHOENIX_BIND_ADDR": "2001:db8::10", "PHOENIX_TLS": "auto"}),
         )
 
+    def test_protocol_upgrade_stops_replaces_and_restarts_supervisor(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            socket = root / "run/supervisor.sock"
+            socket.parent.mkdir(parents=True)
+            socket.touch()
+            installed = root / "bin/phoenix-supervisor.py"
+            installed.parent.mkdir()
+            installed.write_text("old supervisor")
+            selected = root / "selected.py"
+            selected.write_text("new supervisor")
+            layout = {"root": root, "socket": socket, "supervisor": installed}
+
+            def run(command, **kwargs):
+                if command[-1] == "status":
+                    return subprocess.CompletedProcess(command, 0, json.dumps({"protocol_version": 1}), "")
+                socket.unlink()
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            def start(*args, **kwargs):
+                socket.touch()
+                return mock.Mock()
+
+            with mock.patch.object(self.dev.subprocess, "run", side_effect=run) as calls, \
+                 mock.patch.object(self.dev.subprocess, "Popen", side_effect=start) as started:
+                self.dev._start_bare_supervisor(layout, "2", selected)
+
+            self.assertEqual("new supervisor", installed.read_text())
+            self.assertEqual(2, calls.call_count)
+            started.assert_called_once()
+
     def test_changed_same_protocol_supervisor_refuses_without_stopping_production(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -152,10 +183,10 @@ class BareDeployCommandTests(unittest.TestCase):
             with mock.patch.object(
                 self.dev.subprocess,
                 "run",
-                return_value=subprocess.CompletedProcess([], 0, json.dumps({"protocol_version": 1}), ""),
+                return_value=subprocess.CompletedProcess([], 0, json.dumps({"protocol_version": 2}), ""),
             ) as run, mock.patch.object(self.dev.subprocess, "Popen") as started:
                 with self.assertRaisesRegex(SystemExit, "production was left running"):
-                    self.dev._start_bare_supervisor(layout, "1", selected)
+                    self.dev._start_bare_supervisor(layout, "2", selected)
 
             self.assertEqual("old supervisor", installed.read_text())
             self.assertEqual(1, run.call_count)
@@ -247,7 +278,7 @@ class BareDeployCommandTests(unittest.TestCase):
                 binary=candidate_binary,
                 source_kind=self.dev.ProdSourceKind.PUBLISHED_RELEASE,
                 source_commit="b" * 40,
-                identity=self.dev.RuntimeIdentity("2.0.0", "b" * 12),
+                identity=self.dev.RuntimeIdentity("2.0.0", "b" * 40),
                 release_tag="v2.0.0",
                 release_commit="b" * 40,
             )
@@ -256,11 +287,11 @@ class BareDeployCommandTests(unittest.TestCase):
             def run(command, *args, **kwargs):
                 commands.append(command)
                 if "--protocol-version" in command:
-                    return subprocess.CompletedProcess(command, 0, "1\n", "")
+                    return subprocess.CompletedProcess(command, 0, "2\n", "")
                 if "activate" in command:
                     return subprocess.CompletedProcess(command, 0, json.dumps({"ok": True, "state": "committed"}), "")
                 if "status" in command:
-                    return subprocess.CompletedProcess(command, 0, json.dumps({"protocol_version": 1, "child": None}), "")
+                    return subprocess.CompletedProcess(command, 0, json.dumps({"protocol_version": 2, "child": None}), "")
                 return subprocess.CompletedProcess(command, 0, "", "")
 
             def materialize(_commit, _source, destination, _kind):

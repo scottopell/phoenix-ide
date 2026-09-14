@@ -162,7 +162,7 @@ async fn request_bare_status(path: &std::path::Path) -> Result<(String, u32), St
     let peer_pid =
         u32::try_from(credentials.pid).map_err(|_| "supervisor peer PID is invalid".to_string())?;
     stream
-        .write_all(br#"{"protocol_version":1,"action":"status"}"#)
+        .write_all(br#"{"protocol_version":2,"action":"status"}"#)
         .await
         .map_err(|error| error.to_string())?;
     stream.shutdown().await.map_err(|error| error.to_string())?;
@@ -190,7 +190,7 @@ fn bare_evidence(
             ))
         }
     };
-    if !status.ok || status.protocol_version != 1 || status.supervisor_pid != peer_pid {
+    if !status.ok || status.protocol_version != 2 || status.supervisor_pid != peer_pid {
         return BareSupervisorEvidence::Unreadable(
             "supervisor status did not match the authenticated protocol peer".to_string(),
         );
@@ -331,7 +331,7 @@ mod tests {
     fn unrelated_bare_supervisor_is_not_owner_evidence() {
         let response = serde_json::json!({
             "ok": true,
-            "protocol_version": 1,
+            "protocol_version": 2,
             "supervisor_pid": 42,
             "child": null,
         })
@@ -347,7 +347,7 @@ mod tests {
     fn false_bare_claim_is_unreadable_evidence() {
         let response = serde_json::json!({
             "ok": true,
-            "protocol_version": 1,
+            "protocol_version": 2,
             "supervisor_pid": 42,
             "child": {
                 "pid": 100,

@@ -67,7 +67,7 @@ class SystemdDeployCommandTests(unittest.TestCase):
             binary.write_text("binary")
             helper_source = base / "helper.py"
             helper_source.write_text("print(1)\n")
-            identity = self.dev.RuntimeIdentity("2.0.0", "b" * 12)
+            identity = self.dev.RuntimeIdentity("2.0.0", "b" * 40)
             candidate = self.dev.PreparedCandidate(
                 binary=binary,
                 source_kind=self.dev.ProdSourceKind.LOCAL_HEAD,
@@ -147,10 +147,10 @@ class SystemdDeployCommandTests(unittest.TestCase):
             env.write_text("PHOENIX_PORT=8031\n")
             binary.write_text("runtime")
             with mock.patch.object(
-                self.dev, "_binary_identity", return_value=self.dev.RuntimeIdentity("1.0.0", "a" * 12)
+                self.dev, "_binary_identity", return_value=self.dev.RuntimeIdentity("1.0.0", "a" * 40)
             ):
                 identity, url = self.dev._installed_runtime(binary, env)
-            self.assertEqual(self.dev.RuntimeIdentity("1.0.0", "a" * 12), identity)
+            self.assertEqual(self.dev.RuntimeIdentity("1.0.0", "a" * 40), identity)
             self.assertEqual("http://localhost:8031/api/version", url)
         self.assertEqual("http://localhost:8031/api/version", self.dev._prod_api_health_url(previous))
 
@@ -164,7 +164,7 @@ class SystemdDeployCommandTests(unittest.TestCase):
         self.assertEqual(["sudo", "cat", str(self.dev.SYSTEMD_DEPLOYED_SHA_PATH)], run.call_args.args[0])
 
     def test_runtime_identity_refuses_incomplete_status_values(self):
-        identity = self.dev.RuntimeIdentity(None, "a" * 12)
+        identity = self.dev.RuntimeIdentity(None, "a" * 40)
         with self.assertRaisesRegex(ValueError, "exact runtime identity"):
             identity.as_dict()
 

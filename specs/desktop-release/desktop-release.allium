@@ -1,0 +1,423 @@
+-- allium: 3
+-- Phoenix macOS desktop release lifecycle
+--
+-- Scope: exact-tag release gating, architecture-specific helper/app builds,
+-- standalone-helper signing, app notarization/stapling, publish retries, and
+-- convergent same-tag publication for the desktop release workflow.
+--
+-- Requirement traceability: REQ-DESKTOP-REL-001 through REQ-DESKTOP-REL-008.
+
+enum TagGateState { unresolved | exact_tag_match | new_tag_created | different_commit_refused }
+enum BuildState { pending | ready | built | failed }
+enum HelperSignatureState { unsigned | signed_once | verified | failed }
+enum AppSignatureState { unsigned | app_signed | app_verified | failed }
+enum NotaryState { pending | submitted | stapled | validated | failed }
+enum PublishState { idle | creating | replacing | committing | interrupted | mixed | completed | failed }
+enum FailureDomain {
+    none | tag_gate | helper_build | app_build | helper_signing | notarization | publish | credentials
+}
+
+value ReleaseIdentity {
+    tag: String
+    full_commit: String
+}
+
+value StandaloneHelperAsset {
+    name: String
+    target: String
+    identity: ReleaseIdentity
+}
+
+value DesktopArchiveAsset {
+    name: String
+    target: String
+    identity: ReleaseIdentity
+}
+
+entity ReleaseGate {
+    identity: ReleaseIdentity
+    state: TagGateState
+
+    transitions state {
+        unresolved -> exact_tag_match
+        unresolved -> new_tag_created
+        unresolved -> different_commit_refused
+        exact_tag_match -> exact_tag_match
+        new_tag_created -> new_tag_created
+        different_commit_refused -> different_commit_refused
+    }
+}
+
+entity StandaloneHelperBuild {
+    target: String
+    identity: ReleaseIdentity
+    build: BuildState
+    signature: HelperSignatureState
+    published_asset: StandaloneHelperAsset?
+
+    transitions build {
+        pending -> ready
+        ready -> built
+        ready -> failed
+        built -> failed
+        failed -> failed
+    }
+
+    transitions signature {
+        unsigned -> signed_once
+        unsigned -> failed
+        signed_once -> verified
+        signed_once -> failed
+        verified -> failed
+        failed -> failed
+    }
+}
+
+entity DesktopArchiveBuild {
+    target: String
+    identity: ReleaseIdentity
+    build: BuildState
+    app_signature: AppSignatureState
+    notarization: NotaryState
+    archive_asset: DesktopArchiveAsset?
+
+    transitions build {
+        pending -> ready
+        ready -> built
+        ready -> failed
+        built -> failed
+        failed -> failed
+    }
+
+    transitions app_signature {
+        unsigned -> failed
+        unsigned -> app_signed
+        app_signed -> app_verified
+        app_signed -> failed
+        app_verified -> failed
+        failed -> failed
+    }
+
+    transitions notarization {
+        pending -> submitted
+        submitted -> stapled
+        submitted -> failed
+        stapled -> validated
+        stapled -> failed
+        validated -> failed
+        failed -> failed
+    }
+}
+
+entity ReleasePublication {
+    identity: ReleaseIdentity
+    state: PublishState
+    failure_domain: FailureDomain
+
+    transitions state {
+        idle -> creating
+        idle -> replacing
+        idle -> failed
+        replacing -> committing
+        replacing -> interrupted
+        replacing -> failed
+        committing -> mixed
+        committing -> interrupted
+        committing -> failed
+        mixed -> replacing
+        mixed -> completed
+        mixed -> failed
+        interrupted -> replacing
+        interrupted -> mixed
+        interrupted -> failed
+        creating -> completed
+        creating -> failed
+        completed -> completed
+        failed -> failed
+    }
+}
+
+surface DesktopReleaseWorkflow {
+}
+
+-- Helpers
+--
+-- full_commit_identity(identity) -> Boolean
+--   identity.full_commit is exactly forty lowercase hexadecimal characters.
+-- release_tag_matches_semver(identity) -> Boolean
+--   identity.tag is a v-prefixed semantic version with no prerelease/build suffix.
+-- tag_points_at_exact_commit(gate) -> Boolean
+--   the existing release tag resolves to gate.identity.full_commit exactly.
+-- tag_absent_for_identity(gate) -> Boolean
+--   no existing release tag with gate.identity.tag exists.
+-- release_absent_for_identity(identity) -> Boolean
+--   no GitHub Release exists for identity.tag.
+-- helper_bytes_equal_signed_asset(helper, archive) -> Boolean
+--   the helper embedded in archive is byte-identical to the signed standalone
+--   helper artifact published for the same target and identity both before and
+--   after outer-app signing.
+-- helper_signature_verified(helper) -> Boolean
+--   the standalone helper artifact has passed codesign verification after being
+--   signed exactly once.
+-- app_info_matches_release(archive) -> Boolean
+--   the built app Info.plist carries MARKETING_VERSION from archive.identity.tag
+--   and the deterministic CURRENT_PROJECT_VERSION for that release.
+-- app_signature_verified(archive) -> Boolean
+--   the signed outer app passed hardened-runtime codesign verification.
+-- notarization_credentials_available(archive) -> Boolean
+--   Apple ID, team ID, app-specific password, and signing identity are all present.
+-- stapled_ticket_valid(archive) -> Boolean
+--   stapler validate and spctl assessment both passed for archive.
+-- required_release_assets_complete(publication) -> Boolean
+--   the publication includes every standalone helper, every desktop archive, and
+--   SHA256SUMS for publication.identity.
+-- checksum_membership_complete(publication) -> Boolean
+--   SHA256SUMS covers every required standalone-helper and desktop-archive asset
+--   exactly once for publication.identity.
+-- staged_replacement_assets_complete(publication) -> Boolean
+--   the staged upload contains the complete replacement asset and checksum set
+--   for publication.identity before one-by-one commit steps begin.
+-- stale_stage_names_removed(publication) -> Boolean
+--   any leftover stage names from an earlier interrupted retry were deleted
+--   before the current commit sequence resumes.
+-- release_contains_only_required_assets(publication) -> Boolean
+--   the published release contains exactly the required asset names for
+--   publication.identity and no stale stage names.
+-- release_checksums_match_required_assets(publication) -> Boolean
+--   the published SHA256SUMS matches the exact required asset set and bytes for
+--   publication.identity.
+-- release_builds_verified(publication) -> Boolean
+--   every helper/desktop asset in publication is backed by matching identity builds
+--   whose helper signature, app signature, and notarization are verified/validated.
+-- publish_interrupted_mid_commit(publication) -> Boolean
+--   an interruption occurred after replacement began but before the exact final
+--   asset and checksum set was fully committed.
+-- release_is_temporarily_mixed(publication) -> Boolean
+--   the release currently contains a mixture of old and new committed assets or
+--   checksums for publication.identity.
+
+rule GateAcceptsExistingExactTag {
+    when: ExactReleaseTagFound(gate)
+    requires: release_tag_matches_semver(gate.identity)
+    requires: full_commit_identity(gate.identity)
+    requires: tag_points_at_exact_commit(gate)
+    ensures: gate.state = exact_tag_match
+}
+
+rule GateCreatesNewTagOnlyWhenAbsent {
+    when: ReleaseTagCreated(gate)
+    requires: release_tag_matches_semver(gate.identity)
+    requires: full_commit_identity(gate.identity)
+    requires: tag_absent_for_identity(gate)
+    ensures: gate.state = new_tag_created
+}
+
+rule GateRefusesDifferentCommitReuse {
+    when: ReleaseTagConflictDetected(gate)
+    requires: release_tag_matches_semver(gate.identity)
+    requires: full_commit_identity(gate.identity)
+    requires: not tag_points_at_exact_commit(gate)
+    requires: not tag_absent_for_identity(gate)
+    ensures: gate.state = different_commit_refused
+}
+
+rule StandaloneHelperBuildMustCompleteBeforeSigning {
+    when: StandaloneHelperBuilt(helper)
+    requires: helper.build = ready
+    ensures: helper.build = built
+}
+
+rule StandaloneHelperMustBeSignedBeforeDesktopPackaging {
+    when: StandaloneHelperSigned(helper)
+    requires: helper.build = built
+    ensures: helper.signature = signed_once
+}
+
+rule StandaloneHelperSigningFailureStopsRelease {
+    when: StandaloneHelperSignatureRejected(helper)
+    requires: helper.build = built
+    ensures: helper.signature = failed
+}
+
+rule StandaloneHelperVerificationPrecedesDesktopEmbedding {
+    when: StandaloneHelperVerified(helper)
+    requires: helper.signature = signed_once
+    requires: helper_signature_verified(helper)
+    ensures: helper.signature = verified
+}
+
+rule MissingCredentialsRejectSignedReleasePath {
+    when: ReleaseCredentialsMissing(archive, publication)
+    requires: archive.build = ready
+    requires: publication.state = idle
+    requires: archive.identity = publication.identity
+    requires: not notarization_credentials_available(archive)
+    ensures: archive.build = failed
+    ensures: publication.state = failed
+    ensures: publication.failure_domain = credentials
+}
+
+rule DesktopBuildConsumesVerifiedStandaloneHelper {
+    when: DesktopArchiveBuilt(helper, archive)
+    requires: helper.target = archive.target
+    requires: helper.identity = archive.identity
+    requires: helper.signature = verified
+    requires: archive.build = ready
+    requires: app_info_matches_release(archive)
+    requires: helper_bytes_equal_signed_asset(helper, archive)
+    ensures: archive.build = built
+}
+
+rule OuterAppSigningRequiresBuiltArchive {
+    when: OuterAppSigned(archive)
+    requires: archive.build = built
+    ensures: archive.app_signature = app_signed
+}
+
+rule OuterAppSigningFailureStopsRelease {
+    when: OuterAppSignatureRejected(archive)
+    requires: archive.build = built
+    ensures: archive.app_signature = failed
+}
+
+rule OuterAppVerificationFollowsSigning {
+    when: OuterAppVerified(archive, helper)
+    requires: archive.app_signature = app_signed
+    requires: helper.target = archive.target
+    requires: helper.identity = archive.identity
+    requires: helper.signature = verified
+    requires: app_signature_verified(archive)
+    requires: helper_bytes_equal_signed_asset(helper, archive)
+    ensures: archive.app_signature = app_verified
+}
+
+rule NotarizationSubmissionRequiresVerifiedApp {
+    when: NotarizationSubmitted(archive)
+    requires: archive.app_signature = app_verified
+    requires: notarization_credentials_available(archive)
+    ensures: archive.notarization = submitted
+}
+
+rule NotarizationSubmissionFailureStopsRelease {
+    when: NotarizationSubmissionRejected(archive)
+    requires: archive.app_signature = app_verified
+    ensures: archive.notarization = failed
+}
+
+rule NotarizationStaplingRequiresSubmission {
+    when: NotarizationStapled(archive)
+    requires: archive.notarization = submitted
+    ensures: archive.notarization = stapled
+}
+
+rule NotarizationStapleFailureStopsRelease {
+    when: NotarizationStapleRejected(archive)
+    requires: archive.notarization = submitted
+    ensures: archive.notarization = failed
+}
+
+rule NotarizationValidationRequiresStapledArchive {
+    when: NotarizationValidated(archive)
+    requires: archive.notarization = stapled
+    requires: stapled_ticket_valid(archive)
+    ensures: archive.notarization = validated
+}
+
+rule NotarizationValidationFailureStopsRelease {
+    when: NotarizationValidationRejected(archive)
+    requires: archive.notarization = stapled
+    ensures: archive.notarization = failed
+}
+
+rule PublishCreatesFreshReleaseFromCompleteAssetSet {
+    when: ReleaseCreated(gate, publication)
+    requires: publication.state = creating
+    requires: gate.state = new_tag_created or gate.state = exact_tag_match
+    requires: gate.identity = publication.identity
+    requires: release_absent_for_identity(publication.identity)
+    requires: release_builds_verified(publication)
+    requires: required_release_assets_complete(publication)
+    requires: checksum_membership_complete(publication)
+    requires: release_contains_only_required_assets(publication)
+    requires: release_checksums_match_required_assets(publication)
+    ensures: publication.state = completed
+}
+
+rule PublishReplacementStartsOnlyForExactTagRetry {
+    when: ReplacementUploadStarted(gate, publication)
+    requires: publication.state = idle or publication.state = interrupted or publication.state = mixed
+    requires: gate.state = exact_tag_match
+    requires: gate.identity = publication.identity
+    ensures: publication.state = replacing
+}
+
+rule ReplacementRetryCleansStaleStageNamesAndStagesCompleteSet {
+    when: ReplacementAssetsStaged(publication)
+    requires: publication.state = replacing
+    requires: stale_stage_names_removed(publication)
+    requires: staged_replacement_assets_complete(publication)
+    requires: required_release_assets_complete(publication)
+    requires: checksum_membership_complete(publication)
+    ensures: publication.state = committing
+}
+
+rule InterruptedReplacementIsObservable {
+    when: ReplacementInterrupted(publication)
+    requires: publication.state = replacing or publication.state = committing
+    requires: publish_interrupted_mid_commit(publication)
+    ensures: publication.state = interrupted
+    ensures: publication.failure_domain = publish
+}
+
+rule MixedReleaseStateIsObservableAfterPartialCommit {
+    when: ReleaseObservedMixed(publication)
+    requires: publication.state = committing or publication.state = interrupted
+    requires: release_is_temporarily_mixed(publication)
+    ensures: publication.state = mixed
+    ensures: publication.failure_domain = publish
+}
+
+rule RetryFromInterruptedOrMixedStateMustRestageExactSet {
+    when: ReplacementRetryStarted(gate, publication)
+    requires: publication.state = interrupted or publication.state = mixed
+    requires: gate.state = exact_tag_match
+    requires: gate.identity = publication.identity
+    ensures: publication.state = replacing
+}
+
+rule SuccessfulReplacementRequiresExactPublishedSet {
+    when: ReplacementUploadCompleted(publication)
+    requires: publication.state = committing or publication.state = mixed
+    requires: release_builds_verified(publication)
+    requires: release_contains_only_required_assets(publication)
+    requires: release_checksums_match_required_assets(publication)
+    ensures: publication.state = completed
+}
+
+rule FailedReplacementWithoutExactSetRemainsUnsuccessful {
+    when: ReplacementVerificationFailed(publication)
+    requires: publication.state = committing or publication.state = mixed or publication.state = interrupted
+    requires: not release_contains_only_required_assets(publication) or not release_checksums_match_required_assets(publication)
+    ensures: publication.state = failed
+    ensures: publication.failure_domain = publish
+}
+
+invariant ExactReleaseIdentityAlwaysUsesFullCommit {
+    full_commit_identity(ReleaseGate.identity) and full_commit_identity(ReleasePublication.identity)
+}
+
+invariant DesktopArchiveNeverMutatesSignedHelperBytes {
+    helper_bytes_equal_signed_asset(StandaloneHelperBuild, DesktopArchiveBuild)
+}
+
+invariant CompletedPublicationHasExactRequiredAssetsAndChecksums {
+    ReleasePublication.state = completed implies (
+        release_contains_only_required_assets(ReleasePublication) and
+        release_checksums_match_required_assets(ReleasePublication)
+    )
+}
+
+invariant InterruptedOrMixedPublicationDoesNotPromiseRollback {
+    ReleasePublication.state = interrupted or ReleasePublication.state = mixed implies
+        ReleasePublication.failure_domain = publish
+}

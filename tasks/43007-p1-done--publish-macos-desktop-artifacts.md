@@ -1,0 +1,1 @@
+Publish a separately checksummed Phoenix.app zip for each macOS architecture. The app must embed the exact same-commit server binary already produced by release CI, require Developer ID signing and Apple notarization, and preserve all existing server assets.

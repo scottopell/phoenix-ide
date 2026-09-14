@@ -1,3 +1,4 @@
+import json
 import importlib.util
 import io
 import os
@@ -45,10 +46,19 @@ class BareSupervisorUnitTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             owner = supervisor.Supervisor(supervisor.Layout(Path(td)))
             owner.stop_child = mock.Mock()
-            response = owner.dispatch({"protocol_version": 1, "action": "stop"})
+            response = owner.dispatch({"protocol_version": supervisor.PROTOCOL_VERSION, "action": "stop"})
             self.assertTrue(response["ok"])
             self.assertTrue(owner.running)
             owner.stop_child.assert_called_once()
+
+    def test_legacy_protocol_one_is_read_only_status_compatible(self):
+        with tempfile.TemporaryDirectory() as td:
+            owner = supervisor.Supervisor(supervisor.Layout(Path(td)))
+            response = owner.dispatch({"protocol_version": 1, "action": "status"})
+            self.assertTrue(response["ok"])
+            self.assertEqual(1, response["protocol_version"])
+            with self.assertRaisesRegex(supervisor.SupervisorError, "unsupported supervisor protocol"):
+                owner.dispatch({"protocol_version": 1, "action": "stop"})
 
     def test_protocol_mismatch_is_rejected(self):
         owner = supervisor.Supervisor(supervisor.Layout(Path("unused")))
@@ -124,6 +134,14 @@ class BareSupervisorUnitTests(unittest.TestCase):
             self.assertIn("candidate loader failure", snapshot)
             self.assertEqual("rollback warning", layout.direct_diagnostic.read_text())
 
+    def test_validate_runtime_identity_accepts_full_and_legacy_embedded_sha_lengths(self):
+        supervisor.validate_runtime_identity(supervisor.RuntimeIdentity("1.0.0", "a" * 40))
+        supervisor.validate_runtime_identity(supervisor.RuntimeIdentity("1.0.0", "a" * 12))
+
+    def test_validate_runtime_identity_rejects_malformed_sha_length(self):
+        with self.assertRaisesRegex(supervisor.SupervisorError, "runtime identity is malformed"):
+            supervisor.validate_runtime_identity(supervisor.RuntimeIdentity("1.0.0", "a" * 13))
+
 
 class BareTransactionTests(unittest.TestCase):
     def setUp(self):
@@ -143,15 +161,16 @@ class BareTransactionTests(unittest.TestCase):
         path.chmod(0o600)
         return {"name": name, "sha256": supervisor.sha256(path)}
 
-    def manifest(self, *, previous=False):
+    def manifest(self, *, previous=False, expected_sha=None, source_kind="local_head"):
         candidate_binary = self.artifact("candidate-binary", "new binary")
         candidate_environment = self.artifact("candidate.env", "MODE=new\n")
         rollback_binary = self.artifact("rollback-binary", "old binary") if previous else None
         rollback_environment = self.artifact("rollback.env", "MODE=old\n") if previous else None
         value = {
-            "manifest_version": 1,
+            "manifest_version": supervisor.PROTOCOL_VERSION,
             "transaction_id": self.transaction_id,
-            "expected": {"version": "2.0.0", "git_sha": "b" * 12},
+            "source_kind": source_kind,
+            "expected": {"version": "2.0.0", "git_sha": expected_sha or "b" * 40},
             "previous": {"version": "1.0.0", "git_sha": "a" * 12} if previous else None,
             "expected_health_url": "http://127.0.0.1:49155/api/version",
             "previous_health_url": "http://127.0.0.1:49155/api/version" if previous else None,
@@ -250,6 +269,43 @@ class BareTransactionTests(unittest.TestCase):
         owner.activate(self.transaction_id, supervisor.sha256(path))
         with self.assertRaisesRegex(supervisor.SupervisorError, "already been used"):
             owner.activate(self.transaction_id, supervisor.sha256(path))
+
+    def test_rejects_candidate_manifest_with_legacy_twelve_char_expected_sha(self):
+        path = self.manifest(expected_sha="b" * 12)
+        owner = supervisor.Supervisor(self.layout)
+        with self.assertRaisesRegex(supervisor.SupervisorError, "expected identity must use a full lowercase embedded git SHA"):
+            owner.validated_transaction(self.transaction_id, supervisor.sha256(path))
+
+    def test_rejects_unknown_transaction_source_kind(self):
+        path = self.manifest(source_kind="publshed_release")
+        owner = supervisor.Supervisor(self.layout)
+        with self.assertRaisesRegex(supervisor.SupervisorError, "unsupported transaction source kind"):
+            owner.validated_transaction(self.transaction_id, supervisor.sha256(path))
+
+    def test_installed_restart_accepts_legacy_twelve_char_expected_sha(self):
+        path = self.manifest(expected_sha="b" * 12, source_kind="installed_restart")
+        owner = supervisor.Supervisor(self.layout)
+        manifest, *_ = owner.validated_transaction(self.transaction_id, supervisor.sha256(path))
+        self.assertEqual("b" * 12, manifest.expected.git_sha)
+
+    def test_protocol_two_manifest_without_source_kind_is_rejected(self):
+        path = self.manifest(expected_sha="b" * 12, source_kind="installed_restart")
+        self.transaction.chmod(0o700)
+        path.chmod(0o600)
+        value = json.loads(path.read_text())
+        value.pop("source_kind")
+        path.write_text(json.dumps(value))
+        path.chmod(0o400)
+        self.transaction.chmod(0o500)
+
+        with self.assertRaisesRegex(ValueError, "requires source_kind"):
+            supervisor.TransactionManifest.load(path)
+
+    def test_accepts_previous_manifest_identity_with_legacy_twelve_char_sha(self):
+        path = self.manifest(previous=True)
+        owner = supervisor.Supervisor(self.layout)
+        manifest, *_rest = owner.validated_transaction(self.transaction_id, supervisor.sha256(path))
+        self.assertEqual("a" * 12, manifest.previous.git_sha)
 
     def test_rollback_failure_preserves_claim_and_both_failures(self):
         self.layout.binary.parent.mkdir(parents=True)
@@ -414,8 +470,8 @@ class BareTransactionTests(unittest.TestCase):
 
         owner.start_child.assert_called_once_with(
             [str(self.layout.binary)],
-            mock.ANY,
-            supervisor.RuntimeIdentity("2.0.0", "b" * 12),
+            {"MODE": "new"},
+            supervisor.RuntimeIdentity("2.0.0", "b" * 40),
             "http://127.0.0.1:49155/api/version",
             1,
         )
@@ -544,7 +600,7 @@ class BareSupervisorLinuxIntegrationTests(unittest.TestCase):
             try:
                 supervisor.request(
                     socket_path,
-                    {"protocol_version": 1, "action": "status"},
+                    {"protocol_version": supervisor.PROTOCOL_VERSION, "action": "status"},
                 )
                 break
             except (FileNotFoundError, ConnectionRefusedError):
@@ -557,7 +613,7 @@ class BareSupervisorLinuxIntegrationTests(unittest.TestCase):
             try:
                 supervisor.request(
                     self.root / "run/supervisor.sock",
-                    {"protocol_version": 1, "action": "shutdown-supervisor"},
+                    {"protocol_version": supervisor.PROTOCOL_VERSION, "action": "shutdown-supervisor"},
                 )
                 self.process.wait(timeout=5)
             except Exception:
@@ -568,7 +624,7 @@ class BareSupervisorLinuxIntegrationTests(unittest.TestCase):
     def test_supervisor_directly_owns_exact_fixture_and_stop_leaves_owner_alive(self):
         supervisor.request(
             self.root / "run/supervisor.sock",
-            {"protocol_version": 1, "action": "shutdown-supervisor"},
+            {"protocol_version": supervisor.PROTOCOL_VERSION, "action": "shutdown-supervisor"},
         )
         self.process.wait(timeout=5)
         ready_port = 49321
