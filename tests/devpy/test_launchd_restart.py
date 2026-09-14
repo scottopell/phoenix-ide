@@ -345,6 +345,68 @@ class RestartCommandTests(unittest.TestCase):
             self.assertNotIn("bootout", flattened)
             self.assertNotIn("kill", flattened)
 
+    def test_interrupted_bootstrap_does_not_overwrite_helper_terminal_status(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            install = root / "install"
+            install.mkdir()
+            binary = install / "phoenix-ide"
+            binary.write_bytes(b"installed")
+            plist = root / "service.plist"
+            plist.write_bytes(self._installed_plist(binary))
+            deployed_sha = root / "deployed.sha"
+            deployed_sha.write_text("a" * 40 + "\n")
+            identity = self.dev.RuntimeIdentity("2.0.0", "aaaaaaaaaaaa")
+            installed = self.dev.InstalledLaunchdRuntime(
+                binary=binary,
+                plist=plist,
+                deployed_sha=deployed_sha,
+                identity=identity,
+                pid=100,
+                health_url="http://localhost:9555/api/version",
+                health_insecure_tls=False,
+            )
+            real_write = self.dev._write_json_atomic
+
+            def run(command, **_kwargs):
+                if "--protocol-version" in command:
+                    return subprocess.CompletedProcess(command, 0, "1\n", "")
+                if command[:2] == ["launchctl", "bootstrap"]:
+                    status_path = next(
+                        (root / "restart" / "transactions").glob("*/status.json")
+                    )
+                    status = json.loads(status_path.read_text())
+                    status.update({
+                        "state": "committed",
+                        "running_pid": 101,
+                        "updated_at": "2026-01-01T00:00:01+00:00",
+                    })
+                    real_write(status_path, status)
+                    (root / "restart" / "active").unlink()
+                    raise KeyboardInterrupt
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with self._isolated_operation_paths(root), \
+                 mock.patch.object(
+                     self.dev,
+                     "LAUNCHD_RESTART_HELPER_SOURCE",
+                     ROOT / "scripts" / "launchd_restart_helper.py",
+                 ), \
+                 mock.patch.object(
+                     self.dev,
+                     "_installed_launchd_runtime_for_restart",
+                     return_value=installed,
+                 ), \
+                 mock.patch.object(self.dev.subprocess, "run", side_effect=run):
+                with self.assertRaises(KeyboardInterrupt):
+                    self.dev.launchd_prod_restart()
+
+            status_path = next(
+                (root / "restart" / "transactions").glob("*/status.json")
+            )
+            self.assertEqual("committed", json.loads(status_path.read_text())["state"])
+            self.assertFalse((root / "restart" / "active").exists())
+
     def test_restart_rejects_non_socket_activated_installation(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

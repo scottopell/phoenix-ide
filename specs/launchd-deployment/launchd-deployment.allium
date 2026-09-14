@@ -54,6 +54,7 @@ entity RestartTransaction {
         preparing -> rejected_concurrent
         prepared -> restarting
         prepared -> precondition_failed
+        prepared -> rejected_concurrent
         restarting -> committed
         restarting -> restart_failed
         terminal: committed, precondition_failed, restart_failed,

@@ -10025,6 +10025,8 @@ def launchd_prod_restart() -> None:
         raise
 
     installed: InstalledLaunchdRuntime | None = None
+    bootstrap_attempted = False
+    bootstrap_rejected = False
     try:
         installed = _installed_launchd_runtime_for_restart()
 
@@ -10118,16 +10120,20 @@ def launchd_prod_restart() -> None:
             "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "failure": None,
         })
+        bootstrap_attempted = True
         result = subprocess.run(
             ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(helper_plist)],
             capture_output=True,
             text=True,
         )
         if result.returncode != 0:
+            bootstrap_rejected = True
             detail = (result.stderr or result.stdout).strip()
             suffix = f": {detail}" if detail else ""
             raise SystemExit(f"could not hand restart to launchd{suffix}")
     except BaseException as exc:
+        if bootstrap_attempted and not bootstrap_rejected:
+            raise
         failed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
         _write_json_atomic(status_path, {
             "transaction_id": transaction_id,
