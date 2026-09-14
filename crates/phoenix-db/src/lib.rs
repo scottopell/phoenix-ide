@@ -6228,7 +6228,7 @@ impl Database {
         target_state: &ConvState,
         state_updated_at: DateTime<Utc>,
     ) -> DbResult<ContinuationCommitOutcome> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let outcome = persist_continuation_start_tx(
             &mut tx,
             conversation_id,
@@ -6351,7 +6351,7 @@ impl Database {
         completed_state: &ConvState,
         state_updated_at: DateTime<Utc>,
     ) -> DbResult<ContinuationCommitOutcome> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let outcome = commit_continuation_tx(
             &mut tx,
             conversation_id,
@@ -17470,6 +17470,132 @@ mod tests {
         assert_eq!(
             db.get_messages("continuation-commit").await.unwrap().len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn raw_continuation_start_and_commit_reserve_writer_before_reads() {
+        let (_dir, setup, contender) = open_test_db_pair().await;
+        setup
+            .create_conversation("raw-continuation", "raw", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        setup
+            .update_conversation_state("raw-continuation", &ConvState::LlmRequesting { attempt: 1 })
+            .await
+            .unwrap();
+        let operation_id = "raw-operation";
+        let awaiting = ConvState::AwaitingContinuation {
+            request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                operation_id: operation_id.to_string(),
+                rejected_tool_calls: Vec::new(),
+                attempt: 1,
+            },
+        };
+        let start_content =
+            MessageContent::agent(vec![phoenix_core::domain::llm_types::ContentBlock::text(
+                "threshold response",
+            )]);
+        let start_message = Message {
+            message_id: "raw-start-message".to_string(),
+            conversation_id: "raw-continuation".to_string(),
+            sequence_id: 1,
+            message_type: start_content.message_type(),
+            content: start_content,
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+        let mut writer = setup.pool.acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        assert!(matches!(
+            contender
+                .begin_continuation(
+                    "raw-continuation",
+                    operation_id,
+                    &start_message,
+                    &awaiting,
+                    Utc::now(),
+                )
+                .await,
+            Err(DbError::Sqlx(_))
+        ));
+        sqlx::query("ROLLBACK").execute(&mut *writer).await.unwrap();
+        assert_eq!(
+            contender
+                .begin_continuation(
+                    "raw-continuation",
+                    operation_id,
+                    &start_message,
+                    &awaiting,
+                    Utc::now(),
+                )
+                .await
+                .unwrap(),
+            ContinuationCommitOutcome::Applied
+        );
+
+        let completed = ConvState::ContextExhausted {
+            summary: "raw summary".to_string(),
+        };
+        let commit_content = MessageContent::continuation("raw summary");
+        let commit_message = Message {
+            message_id: "raw-commit-message".to_string(),
+            conversation_id: "raw-continuation".to_string(),
+            sequence_id: 2,
+            message_type: commit_content.message_type(),
+            content: commit_content,
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+        let mut writer = setup.pool.acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        assert!(matches!(
+            contender
+                .commit_continuation(
+                    "raw-continuation",
+                    operation_id,
+                    &commit_message,
+                    &completed,
+                    Utc::now(),
+                )
+                .await,
+            Err(DbError::Sqlx(_))
+        ));
+        sqlx::query("ROLLBACK").execute(&mut *writer).await.unwrap();
+        assert_eq!(
+            contender
+                .commit_continuation(
+                    "raw-continuation",
+                    operation_id,
+                    &commit_message,
+                    &completed,
+                    Utc::now(),
+                )
+                .await
+                .unwrap(),
+            ContinuationCommitOutcome::Applied
+        );
+        assert_eq!(
+            contender
+                .commit_continuation(
+                    "raw-continuation",
+                    operation_id,
+                    &commit_message,
+                    &completed,
+                    Utc::now(),
+                )
+                .await
+                .unwrap(),
+            ContinuationCommitOutcome::Duplicate
         );
     }
 
