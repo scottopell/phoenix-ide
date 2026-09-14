@@ -1273,7 +1273,7 @@ impl RuntimeManager {
                     } else if quarantine_path
                         .try_exists()
                         .map_err(|error| error.to_string())?
-                        && (existing_cleanup_plan.is_none() || route_adoption_invariant_to_repair)
+                        && existing_cleanup_plan.is_none()
                     {
                         let adopted = self
                             .db()
@@ -2958,7 +2958,9 @@ fn exact_worktree_common_git_dir(worktree: &Path) -> Result<PathBuf, String> {
     Ok(path_buf_from_git_bytes(output.stdout.trim_ascii()))
 }
 
-fn observe_administrative_dir_incarnation(administrative_dir: &Path) -> Result<String, String> {
+pub(super) fn observe_administrative_dir_incarnation(
+    administrative_dir: &Path,
+) -> Result<String, String> {
     let metadata = std::fs::symlink_metadata(administrative_dir).map_err(|error| {
         format!(
             "cannot observe worktree administrative-directory incarnation {}: {error}",
@@ -3737,7 +3739,7 @@ where
     )
 }
 
-fn exact_worktree_administrative_dir(
+pub(super) fn exact_worktree_administrative_dir(
     worktree: &Path,
     common_git_dir: &Path,
 ) -> Result<PathBuf, String> {
@@ -3853,6 +3855,25 @@ fn inspect_ambient_writer_until_quiescent(
     )
 }
 
+#[cfg(target_os = "linux")]
+fn quarantine_has_external_writer(path: &Path) -> Result<Option<AmbientWriterEvidence>, String> {
+    inspect_ambient_writer_until_quiescent(
+        AmbientWriterObservationPolicy::production(),
+        || match quarantine_has_open_descriptors(path)? {
+            positive @ ExternalWriterEvidence::PositiveWriterFound(_) => Ok(positive),
+            ExternalWriterEvidence::NoPositiveEvidence => match quarantine_has_namespace_cwd(path)?
+            {
+                positive @ ExternalWriterEvidence::PositiveWriterFound(_) => Ok(positive),
+                ExternalWriterEvidence::NoPositiveEvidence => {
+                    quarantine_has_writable_mappings(path)
+                }
+            },
+        },
+        std::thread::sleep,
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
 fn quarantine_has_external_writer(path: &Path) -> Result<Option<AmbientWriterEvidence>, String> {
     inspect_ambient_writer_until_quiescent(
         AmbientWriterObservationPolicy::production(),
@@ -3889,9 +3910,9 @@ fn macos_descriptor_access_mode(open_flags: u32) -> Option<AmbientWriterAccessMo
 #[cfg(any(test, target_os = "linux", target_os = "macos"))]
 fn classify_descriptor_access_mode(
     access_mode: Option<AmbientWriterAccessMode>,
-    _target_is_directory: bool,
+    target_is_directory: bool,
 ) -> Option<AmbientWriterAccessMode> {
-    access_mode
+    access_mode.or_else(|| target_is_directory.then_some(AmbientWriterAccessMode::NamespaceWrite))
 }
 
 #[cfg(any(test, target_os = "macos"))]
@@ -3978,6 +3999,20 @@ fn linux_revalidated_writer_identity(
     resource_still_matches: bool,
     after_incarnation: &str,
     after_executable: &Path,
+) -> Result<bool, String> {
+    if after_incarnation != before_incarnation || after_executable != before_executable {
+        return Err("matching writer identity changed during inspection".to_string());
+    }
+    Ok(resource_still_matches)
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn revalidated_writer_identity(
+    before_incarnation: &str,
+    before_executable: &GitPathIdentity,
+    resource_still_matches: bool,
+    after_incarnation: &str,
+    after_executable: &GitPathIdentity,
 ) -> Result<bool, String> {
     if after_incarnation != before_incarnation || after_executable != before_executable {
         return Err("matching writer identity changed during inspection".to_string());
@@ -4250,10 +4285,16 @@ fn quarantine_has_writable_mappings(path: &Path) -> Result<ExternalWriterEvidenc
                 let Some(after_executable) = macos_process_executable(pid)? else {
                     continue;
                 };
-                if after_uid != uid
-                    || after_incarnation != before_incarnation
-                    || after_executable != before_executable
-                {
+                if after_uid != uid {
+                    return Err("matching writer identity changed during inspection".to_string());
+                }
+                if !revalidated_writer_identity(
+                    &before_incarnation,
+                    &before_executable,
+                    true,
+                    &after_incarnation,
+                    &after_executable,
+                )? {
                     continue;
                 }
                 return Ok(ExternalWriterEvidence::PositiveWriterFound(
@@ -4744,10 +4785,152 @@ fn linux_descriptor_writer_evidence(
             process_incarnation: before_incarnation.to_string(),
             executable: GitPathIdentity::from_bytes(executable.as_os_str().as_bytes().to_vec()),
             matched_path: GitPathIdentity::from_bytes(target.as_os_str().as_bytes().to_vec()),
-            match_kind: AmbientWriterMatchKind::Descriptor,
+            match_kind: if access_mode == AmbientWriterAccessMode::NamespaceWrite {
+                AmbientWriterMatchKind::NamespaceDirectory
+            } else {
+                AmbientWriterMatchKind::Descriptor
+            },
             access_mode,
         },
     )))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_namespace_cwd_writer_evidence_if_stable(
+    process: &std::fs::DirEntry,
+    before_incarnation: &str,
+    canonical: &Path,
+) -> Result<Option<ExternalWriterEvidence>, String> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let process_path = process.path();
+    let Some(cwd) = linux_read_leaf_after_capture(
+        &process_path,
+        before_incarnation,
+        AmbientWriterDiagnosticOperation::ReadWorkingDirectory,
+        || std::fs::read_link(process_path.join("cwd")),
+    )?
+    else {
+        return Ok(None);
+    };
+    if !path_is_within(&cwd, canonical) {
+        return Ok(None);
+    }
+    let Some(executable) = linux_read_leaf_after_capture(
+        &process_path,
+        before_incarnation,
+        AmbientWriterDiagnosticOperation::ReadProcessExecutable,
+        || std::fs::read_link(process_path.join("exe")),
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(identity_incarnation) =
+        linux_process_incarnation_after_capture(&process_path, before_incarnation)?
+    else {
+        return Ok(None);
+    };
+    if identity_incarnation != before_incarnation {
+        return Err("matching writer identity changed during inspection".to_string());
+    }
+    let Some(current_cwd) = linux_read_leaf_after_capture(
+        &process_path,
+        before_incarnation,
+        AmbientWriterDiagnosticOperation::ReadWorkingDirectory,
+        || std::fs::read_link(process_path.join("cwd")),
+    )?
+    else {
+        return Ok(None);
+    };
+    let resource_still_matches = path_is_within(&current_cwd, canonical);
+    let Some(after_incarnation) =
+        linux_process_incarnation_after_capture(&process_path, before_incarnation)?
+    else {
+        return Ok(None);
+    };
+    let Some(after_executable) = linux_read_leaf_after_capture(
+        &process_path,
+        before_incarnation,
+        AmbientWriterDiagnosticOperation::ReadProcessExecutable,
+        || std::fs::read_link(process_path.join("exe")),
+    )?
+    else {
+        return Ok(None);
+    };
+    if !linux_revalidated_writer_identity(
+        before_incarnation,
+        &executable,
+        resource_still_matches,
+        &after_incarnation,
+        &after_executable,
+    )? {
+        return Ok(None);
+    }
+    let Some(final_incarnation) =
+        linux_process_incarnation_after_capture(&process_path, &after_incarnation)?
+    else {
+        return Ok(None);
+    };
+    if final_incarnation != after_incarnation {
+        return Err("matching writer identity changed during inspection".to_string());
+    }
+    let process_id = process
+        .file_name()
+        .to_string_lossy()
+        .parse::<i64>()
+        .map_err(|error| format!("process id is malformed: {error}"))?;
+    Ok(Some(ExternalWriterEvidence::PositiveWriterFound(
+        AmbientWriterEvidence {
+            detector: AmbientWriterDetector::LinuxProcfs,
+            process_id,
+            process_incarnation: before_incarnation.to_string(),
+            executable: GitPathIdentity::from_bytes(executable.as_os_str().as_bytes().to_vec()),
+            matched_path: GitPathIdentity::from_bytes(cwd.as_os_str().as_bytes().to_vec()),
+            match_kind: AmbientWriterMatchKind::NamespaceDirectory,
+            access_mode: AmbientWriterAccessMode::NamespaceWrite,
+        },
+    )))
+}
+
+#[cfg(target_os = "linux")]
+fn quarantine_has_namespace_cwd(path: &Path) -> Result<ExternalWriterEvidence, String> {
+    // SAFETY: `geteuid` has no preconditions.
+    let effective_uid = unsafe { libc::geteuid() };
+    quarantine_has_namespace_cwd_in(path, Path::new("/proc"), effective_uid)
+}
+
+#[cfg(target_os = "linux")]
+fn quarantine_has_namespace_cwd_in(
+    path: &Path,
+    proc_root: &Path,
+    effective_uid: libc::uid_t,
+) -> Result<ExternalWriterEvidence, String> {
+    let canonical = std::fs::canonicalize(path).map_err(|error| {
+        format!("cannot canonicalize quarantine before cwd inspection: {error}")
+    })?;
+    let processes = std::fs::read_dir(proc_root)
+        .map_err(|error| format!("cannot enumerate processes for cwd inspection: {error}"))?;
+    for process in processes {
+        let process = process
+            .map_err(|error| format!("cannot enumerate a process for cwd inspection: {error}"))?;
+        if !linux_process_is_relevant(&process, effective_uid, "cwd")? {
+            continue;
+        }
+        let process_path = process.path();
+        let before_incarnation = match linux_process_incarnation(&process_path) {
+            Ok(incarnation) => incarnation,
+            Err(LinuxScannerError::ProcessDisappeared) => continue,
+            Err(error) => return Err(error.into_marker()),
+        };
+        if let Some(evidence) = linux_namespace_cwd_writer_evidence_if_stable(
+            &process,
+            &before_incarnation,
+            &canonical,
+        )? {
+            return Ok(evidence);
+        }
+    }
+    Ok(ExternalWriterEvidence::NoPositiveEvidence)
 }
 
 #[cfg(target_os = "linux")]
@@ -5057,10 +5240,16 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence
                 let Some(after_executable) = macos_process_executable(pid)? else {
                     continue;
                 };
-                if after_uid != uid
-                    || after_incarnation != before_incarnation
-                    || after_executable != before_executable
-                {
+                if after_uid != uid {
+                    return Err("matching writer identity changed during inspection".to_string());
+                }
+                if !revalidated_writer_identity(
+                    &before_incarnation,
+                    &before_executable,
+                    true,
+                    &after_incarnation,
+                    &after_executable,
+                )? {
                     continue;
                 }
                 return Ok(ExternalWriterEvidence::PositiveWriterFound(
@@ -7569,8 +7758,11 @@ mod tests {
     }
 
     #[test]
-    fn read_only_directory_descriptor_has_no_write_authority() {
-        assert_eq!(super::classify_descriptor_access_mode(None, true), None);
+    fn read_only_directory_descriptor_authorizes_namespace_mutation() {
+        assert_eq!(
+            super::classify_descriptor_access_mode(None, true),
+            Some(super::AmbientWriterAccessMode::NamespaceWrite)
+        );
         assert_eq!(super::classify_descriptor_access_mode(None, false), None);
     }
 
@@ -7594,6 +7786,28 @@ mod tests {
         assert!(super::macos_process_identity_failure_is_disappearance(
             Some(libc::ENOENT)
         ));
+    }
+
+    #[test]
+    fn changed_successful_writer_identity_is_indeterminate() {
+        assert!(super::revalidated_writer_identity(
+            "before",
+            &GitPathIdentity::from_bytes(b"/bin/writer".to_vec()),
+            true,
+            "after",
+            &GitPathIdentity::from_bytes(b"/bin/writer".to_vec()),
+        )
+        .unwrap_err()
+        .contains("identity changed"));
+        assert!(super::revalidated_writer_identity(
+            "stable",
+            &GitPathIdentity::from_bytes(b"/bin/before".to_vec()),
+            true,
+            "stable",
+            &GitPathIdentity::from_bytes(b"/bin/after".to_vec()),
+        )
+        .unwrap_err()
+        .contains("identity changed"));
     }
 
     #[cfg(target_os = "linux")]
@@ -7879,7 +8093,8 @@ mod tests {
             super::LinuxProcessOwner::Inspectable,
             "same-user nondumpable process must be attributed from kernel credentials"
         );
-        let cwd_scan = super::quarantine_has_process_cwd_in(temp.path(), &proc_root, effective_uid);
+        let cwd_scan =
+            super::quarantine_has_namespace_cwd_in(temp.path(), &proc_root, effective_uid);
         let mapping_scan =
             super::quarantine_has_writable_mappings_in(temp.path(), &proc_root, effective_uid);
         let descriptor_scan = super::quarantine_has_open_descriptors_in(temp.path(), &proc_root);
@@ -8208,7 +8423,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn read_only_directory_descriptor_is_indeterminate_in_synthetic_procfs() {
+    fn read_only_directory_descriptor_is_namespace_writer_in_synthetic_procfs() {
         let temp = tempfile::tempdir().unwrap();
         let quarantine = temp.path().join("quarantine");
         let process = temp.path().join("proc/1275");
@@ -8219,13 +8434,54 @@ mod tests {
         std::os::unix::fs::symlink(&quarantine, process.join("fd/3")).unwrap();
         std::fs::write(process.join("fdinfo/3"), "flags:\t00000000\n").unwrap();
 
-        assert_eq!(
+        let super::ExternalWriterEvidence::PositiveWriterFound(evidence) =
             super::quarantine_has_open_descriptors_in(
                 &quarantine,
                 temp.path().join("proc").as_path(),
             )
-            .unwrap(),
-            super::ExternalWriterEvidence::NoPositiveEvidence,
+            .unwrap()
+        else {
+            panic!("read-only directory descriptor must preserve namespace mutation authority");
+        };
+        assert_eq!(
+            evidence.match_kind,
+            super::AmbientWriterMatchKind::NamespaceDirectory
+        );
+        assert_eq!(
+            evidence.access_mode,
+            super::AmbientWriterAccessMode::NamespaceWrite
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_cwd_is_namespace_writer_in_synthetic_procfs() {
+        let temp = tempfile::tempdir().unwrap();
+        let quarantine = temp.path().join("quarantine");
+        let process = temp.path().join("proc/1279");
+        std::fs::create_dir_all(&process).unwrap();
+        std::fs::create_dir(&quarantine).unwrap();
+        write_synthetic_process_identity(&process, 1279);
+        std::os::unix::fs::symlink(&quarantine, process.join("cwd")).unwrap();
+
+        let super::ExternalWriterEvidence::PositiveWriterFound(evidence) =
+            super::quarantine_has_namespace_cwd_in(
+                &quarantine,
+                temp.path().join("proc").as_path(),
+                unsafe { libc::geteuid() },
+            )
+            .unwrap()
+        else {
+            panic!("retained cwd must preserve namespace mutation authority");
+        };
+        assert_eq!(evidence.process_id, 1279);
+        assert_eq!(
+            evidence.match_kind,
+            super::AmbientWriterMatchKind::NamespaceDirectory
+        );
+        assert_eq!(
+            evidence.access_mode,
+            super::AmbientWriterAccessMode::NamespaceWrite
         );
     }
 
