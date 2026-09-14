@@ -21,10 +21,12 @@ import {
 import { ConversationNavStack } from '../components/ConversationNavStack';
 import {
   historyMergeEventCursorFloor,
+  historyRequestHasCursor,
   historyResponseMatchesCurrentRequest,
   initialHistoryExpansionState,
   reduceHistoryExpansion,
   type HistoryIntent,
+  type PendingHistoryRequest,
   type HistoryScrollCommand,
   type RestoreBasis,
 } from '../conversation/historyExpansion';
@@ -1019,13 +1021,23 @@ function ConversationPageContent({
 
   const loadOlderMessagesForIntent = useCallback(async (intent: HistoryIntent) => {
     if (!slug || !conversationId || historyExpansion.coverage !== 'tail' || historyExpansion.activeRequest) return;
-    const request = {
+    const request: PendingHistoryRequest = {
       token: ++historyRequestTokenRef.current,
       view: historyExpansion.view,
       snapshotStartedAtEventSeq: eventCursorRef.current,
       snapshotStartedAtPhase: atomRef.current.phase,
       intent,
     };
+    if (!historyRequestHasCursor(request)) {
+      dispatchHistoryExpansion({
+        type: 'history_failed',
+        requestToken: request.token,
+        view: request.view,
+        transcriptGeneration: request.view.transcriptGeneration,
+        message: 'Cannot load earlier history until the live event cursor is available',
+      });
+      return;
+    }
     const requestTranscriptGeneration = request.view.transcriptGeneration;
 
     dispatchHistoryExpansion({ type: 'request_started', request });
