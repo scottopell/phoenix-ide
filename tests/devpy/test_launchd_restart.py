@@ -237,7 +237,10 @@ class RestartHelperTests(unittest.TestCase):
 
             self.assertFalse(helper.release_claim(helper.dataclasses.replace(manifest, transaction_id="other")))
             self.assertEqual("restart-tx", active.read_text().strip())
-            self.assertTrue(helper.release_claim(manifest))
+            real_fsync = os.fsync
+            with mock.patch.object(helper.os, "fsync", wraps=real_fsync) as fsync:
+                self.assertTrue(helper.release_claim(manifest))
+            self.assertEqual(1, fsync.call_count)
             self.assertFalse(active.exists())
 
 
@@ -289,6 +292,25 @@ class RestartCommandTests(unittest.TestCase):
 
             self.assertEqual(2, fsync.call_count)
             self.assertEqual({"state": "committed"}, json.loads(path.read_text()))
+
+    def test_durable_mkdir_fsyncs_new_ancestors_and_existing_parent(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            leaf = root / "restart" / "transactions" / "tx"
+
+            with mock.patch.object(self.dev, "_fsync_directory") as fsync_directory:
+                self.dev._mkdir_durable(leaf, mode=0o700)
+
+            self.assertTrue(leaf.is_dir())
+            self.assertEqual(
+                [
+                    mock.call(leaf),
+                    mock.call(leaf.parent),
+                    mock.call(leaf.parent.parent),
+                    mock.call(root),
+                ],
+                fsync_directory.call_args_list,
+            )
 
     def test_launchd_restart_hands_off_installed_state_without_build_or_env_reload(self):
         with tempfile.TemporaryDirectory() as td:
@@ -455,6 +477,51 @@ class RestartCommandTests(unittest.TestCase):
             self.assertIn("deploy-owner", rejection["failure"])
             self.assertEqual("deploy-owner\n", (deploy / "active").read_text())
             self.assertFalse((root / "restart" / "active").exists())
+
+    def test_definitive_claim_lock_failure_is_terminalized(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            claim_lock = root / "deploy" / "claim.lock"
+            claim_lock.mkdir(parents=True)
+
+            with self._isolated_operation_paths(root):
+                with self.assertRaisesRegex(SystemExit, "could not acquire"):
+                    self.dev.launchd_prod_restart()
+
+            statuses = list((root / "restart" / "transactions").glob("*/status.json"))
+            self.assertEqual(1, len(statuses))
+            failure = json.loads(statuses[0].read_text())
+            self.assertEqual("precondition_failed", failure["state"])
+            self.assertIn("claim", failure["failure"])
+            self.assertFalse((root / "restart" / "active").exists())
+
+    def test_ambiguous_claim_persistence_failure_retains_unresolved_fence(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            real_fsync_directory = self.dev._fsync_directory
+
+            def fsync_directory(path):
+                active = root / "restart" / "active"
+                if path == active.parent and active.exists():
+                    raise OSError("directory sync failed")
+                return real_fsync_directory(path)
+
+            with self._isolated_operation_paths(root), \
+                 mock.patch.object(
+                     self.dev,
+                     "_fsync_directory",
+                     side_effect=fsync_directory,
+                 ):
+                with self.assertRaisesRegex(OSError, "directory sync failed"):
+                    self.dev.launchd_prod_restart()
+
+            active = root / "restart" / "active"
+            self.assertTrue(active.is_file())
+            transaction_id = active.read_text().strip()
+            status = json.loads(
+                (root / "restart" / "transactions" / transaction_id / "status.json").read_text()
+            )
+            self.assertEqual("preparing", status["state"])
 
     def test_precondition_status_write_failure_retains_restart_claim(self):
         with tempfile.TemporaryDirectory() as td:

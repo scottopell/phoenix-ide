@@ -8978,6 +8978,10 @@ class ConcurrentLaunchdOperation(SystemExit):
     pass
 
 
+class LaunchdClaimAcquisitionFailed(SystemExit):
+    pass
+
+
 @dataclasses.dataclass(frozen=True)
 class PreparedCandidate:
     binary: Path
@@ -9541,6 +9545,7 @@ def _release_launchd_restart_claim_unlocked(transaction_id: str) -> bool:
         return False
     try:
         LAUNCHD_RESTART_ACTIVE_PATH.unlink()
+        _fsync_directory(LAUNCHD_RESTART_ACTIVE_PATH.parent)
         return True
     except FileNotFoundError:
         return False
@@ -9588,45 +9593,84 @@ def _claim_launchd_deploy(transaction_id: str) -> None:
 
 
 def _claim_launchd_restart(transaction_id: str) -> None:
-    LAUNCHD_RESTART_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-    LAUNCHD_RESTART_DIR.chmod(0o700)
-    with _launchd_claim_lock():
-        deploy_owner = _deploy_claim_owner()
-        if deploy_owner and _status_is_terminal_for_owner(
-            LAUNCHD_DEPLOY_STATUS_PATH, deploy_owner, _DEPLOY_TERMINAL_STATES
-        ):
-            _release_launchd_deploy_claim_unlocked(deploy_owner)
-            deploy_owner = None
-        if deploy_owner is not None or LAUNCHD_DEPLOY_ACTIVE_PATH.exists():
-            raise ConcurrentLaunchdOperation(
-                f"another launchd deployment ({deploy_owner or 'unknown'}) is active or needs recovery. "
-                "Run './dev.py prod status'; remove the deploy marker only after confirming no helper is running."
-            )
+    claim_fd: int | None = None
+    try:
+        LAUNCHD_RESTART_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        LAUNCHD_RESTART_DIR.chmod(0o700)
+        with _launchd_claim_lock():
+            deploy_owner = _deploy_claim_owner()
+            if deploy_owner and _status_is_terminal_for_owner(
+                LAUNCHD_DEPLOY_STATUS_PATH, deploy_owner, _DEPLOY_TERMINAL_STATES
+            ):
+                _release_launchd_deploy_claim_unlocked(deploy_owner)
+                deploy_owner = None
+            if deploy_owner is not None or LAUNCHD_DEPLOY_ACTIVE_PATH.exists():
+                raise ConcurrentLaunchdOperation(
+                    f"another launchd deployment ({deploy_owner or 'unknown'}) is active or needs recovery. "
+                    "Run './dev.py prod status'; remove the deploy marker only after confirming no helper is running."
+                )
 
-        owner = _restart_claim_owner()
-        if owner and _status_is_terminal_for_owner(
-            _restart_transaction_status_path(owner), owner, _RESTART_TERMINAL_STATES
-        ):
-            _release_launchd_restart_claim_unlocked(owner)
-            owner = None
-        if owner is not None or LAUNCHD_RESTART_ACTIVE_PATH.exists():
-            raise ConcurrentLaunchdOperation(
-                f"another launchd restart ({owner or 'unknown'}) is active or needs recovery. "
-                "Run './dev.py prod status'; remove the restart marker only after confirming no helper is running."
-            )
-        fd = os.open(
-            LAUNCHD_RESTART_ACTIVE_PATH,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-            0o600,
-        )
-        with os.fdopen(fd, "w") as stream:
-            stream.write(transaction_id + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
+            owner = _restart_claim_owner()
+            if owner and _status_is_terminal_for_owner(
+                _restart_transaction_status_path(owner), owner, _RESTART_TERMINAL_STATES
+            ):
+                _release_launchd_restart_claim_unlocked(owner)
+                owner = None
+            if owner is not None or LAUNCHD_RESTART_ACTIVE_PATH.exists():
+                raise ConcurrentLaunchdOperation(
+                    f"another launchd restart ({owner or 'unknown'}) is active or needs recovery. "
+                    "Run './dev.py prod status'; remove the restart marker only after confirming no helper is running."
+                )
+            try:
+                claim_fd = os.open(
+                    LAUNCHD_RESTART_ACTIVE_PATH,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+            except FileExistsError as exc:
+                raise ConcurrentLaunchdOperation(
+                    "another launchd restart (unknown) acquired the claim concurrently. "
+                    "Run './dev.py prod status'; remove the restart marker only after confirming no helper is running."
+                ) from exc
+            with os.fdopen(claim_fd, "w") as stream:
+                stream.write(transaction_id + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            _fsync_directory(LAUNCHD_RESTART_ACTIVE_PATH.parent)
+    except (ConcurrentLaunchdOperation, LaunchdClaimAcquisitionFailed):
+        raise
+    except OSError as exc:
+        if claim_fd is not None:
+            raise
+        raise LaunchdClaimAcquisitionFailed(
+            f"could not acquire the launchd operation claim: {exc}"
+        ) from exc
+
+
+def _fsync_directory(path: Path) -> None:
+    directory = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def _mkdir_durable(path: Path, mode: int = 0o777) -> None:
+    missing = []
+    cursor = path
+    while not cursor.exists():
+        missing.append(cursor)
+        cursor = cursor.parent
+    path.mkdir(parents=True, exist_ok=True, mode=mode)
+    if not missing:
+        return
+    for directory in missing:
+        _fsync_directory(directory)
+    _fsync_directory(cursor)
 
 
 def _write_json_atomic(path: Path, value: dict, mode: int = 0o600) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _mkdir_durable(path.parent)
     temporary = path.with_name(f".{path.name}.{os.getpid()}")
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
     try:
@@ -9636,11 +9680,7 @@ def _write_json_atomic(path: Path, value: dict, mode: int = 0o600) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
-        directory = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        _fsync_directory(path.parent)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
@@ -9998,7 +10038,7 @@ def launchd_prod_restart() -> None:
     created_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     staging = LAUNCHD_RESTART_TRANSACTIONS_DIR / transaction_id
     status_path = _restart_transaction_status_path(transaction_id)
-    staging.mkdir(parents=True)
+    _mkdir_durable(staging, mode=0o700)
     staging.chmod(0o700)
     _write_json_atomic(status_path, {
         "transaction_id": transaction_id,
@@ -10018,6 +10058,20 @@ def launchd_prod_restart() -> None:
         _write_json_atomic(status_path, {
             "transaction_id": transaction_id,
             "state": "rejected_concurrent",
+            "source_kind": ProdSourceKind.INSTALLED_RESTART.value,
+            "expected_version": None,
+            "expected_git_sha": None,
+            "previous_pid": None,
+            "running_pid": None,
+            "created_at": created_at,
+            "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "failure": str(exc),
+        })
+        raise
+    except LaunchdClaimAcquisitionFailed as exc:
+        _write_json_atomic(status_path, {
+            "transaction_id": transaction_id,
+            "state": "precondition_failed",
             "source_kind": ProdSourceKind.INSTALLED_RESTART.value,
             "expected_version": None,
             "expected_git_sha": None,

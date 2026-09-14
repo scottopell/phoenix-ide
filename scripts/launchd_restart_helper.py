@@ -376,6 +376,11 @@ def release_claim(manifest: Manifest) -> bool:
             if claim.read_text().strip() != manifest.transaction_id:
                 return False
             claim.unlink()
+            directory = os.open(claim.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
             return True
         except FileNotFoundError:
             return False
