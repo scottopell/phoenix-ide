@@ -571,6 +571,8 @@ pub struct InMemoryStorage {
     approved_task_authorities:
         Mutex<HashMap<String, phoenix_core::task_handoff::ApprovedTaskSnapshot>>,
     next_msg_id: Mutex<u64>,
+    accepted_continuation_handoff_message_ids: Mutex<HashMap<String, String>>,
+    fail_continuation_handoff_provenance: Mutex<bool>,
     complete_creation_job_results: Mutex<VecDeque<Result<crate::db::CreationCasOutcome, String>>>,
     complete_creation_job_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     complete_creation_job_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
@@ -638,6 +640,8 @@ impl InMemoryStorage {
             cwds: Mutex::new(HashMap::new()),
             approved_task_authorities: Mutex::new(HashMap::new()),
             next_msg_id: Mutex::new(1),
+            accepted_continuation_handoff_message_ids: Mutex::new(HashMap::new()),
+            fail_continuation_handoff_provenance: Mutex::new(false),
             complete_creation_job_results: Mutex::new(VecDeque::new()),
             complete_creation_job_started: Mutex::new(None),
             complete_creation_job_release: Mutex::new(None),
@@ -691,6 +695,17 @@ impl InMemoryStorage {
 
     pub fn set_fail_continuation_commit(&self, fail: bool) {
         *self.fail_continuation_commit.lock().unwrap() = fail;
+    }
+
+    pub fn set_accepted_continuation_handoff_message_id(&self, conv_id: &str, message_id: &str) {
+        self.accepted_continuation_handoff_message_ids
+            .lock()
+            .unwrap()
+            .insert(conv_id.to_string(), message_id.to_string());
+    }
+
+    pub fn set_fail_continuation_handoff_provenance(&self, fail: bool) {
+        *self.fail_continuation_handoff_provenance.lock().unwrap() = fail;
     }
 
     pub fn set_continuation_start_recovery_error(&self, error: bool) {
@@ -1082,6 +1097,21 @@ impl Default for InMemoryStorage {
 
 #[async_trait]
 impl MessageStore for InMemoryStorage {
+    async fn accepted_continuation_handoff_message_id(
+        &self,
+        conv_id: &str,
+    ) -> Result<Option<String>, String> {
+        if *self.fail_continuation_handoff_provenance.lock().unwrap() {
+            return Err("injected continuation handoff provenance failure".to_string());
+        }
+        Ok(self
+            .accepted_continuation_handoff_message_ids
+            .lock()
+            .unwrap()
+            .get(conv_id)
+            .cloned())
+    }
+
     async fn add_message(
         &self,
         message_id: &str,

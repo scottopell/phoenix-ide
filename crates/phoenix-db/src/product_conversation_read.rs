@@ -220,6 +220,24 @@ fn continuation_summary(row: &sqlx::sqlite::SqliteRow, content_column: &str) -> 
 }
 
 impl Database {
+    /// Returns the accepted opening message ID for a completed continuation edge.
+    ///
+    /// # Errors
+    /// Returns an error if the provenance query fails.
+    pub async fn accepted_continuation_handoff_message_id(
+        &self,
+        conv_id: &str,
+    ) -> DbResult<Option<String>> {
+        sqlx::query_scalar(
+            "SELECT accepted_successor_message_id FROM completed_continuation_handoffs
+             WHERE successor_conversation_id = ?1",
+        )
+        .bind(conv_id)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(DbError::from)
+    }
+
     /// Resolves one ordinary aggregate reference.
     ///
     /// # Errors
@@ -1005,6 +1023,7 @@ mod tests {
     };
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn resolves_member_identity_and_reads_typed_handoff() {
         let db = Database::open_in_memory().await.unwrap();
         let root = db
@@ -1061,6 +1080,19 @@ mod tests {
             .resolve_ordinary_product_conversation(&successor.id)
             .await
             .unwrap();
+        assert_eq!(
+            db.accepted_continuation_handoff_message_id(&successor.id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("opening")
+        );
+        assert_eq!(
+            db.accepted_continuation_handoff_message_id(&root.id)
+                .await
+                .unwrap(),
+            None
+        );
         assert_eq!(resolved.requested_transcript_row_id, successor.id);
         let aggregate = db
             .get_ordinary_product_conversation(&resolved.product_conversation_id)
@@ -1143,6 +1175,12 @@ mod tests {
             .get_ordinary_product_conversation(&root.product_conversation_id)
             .await
             .unwrap();
+        assert_eq!(
+            db.accepted_continuation_handoff_message_id(&successor.id)
+                .await
+                .unwrap(),
+            None
+        );
         assert_eq!(aggregate.latest_transcript_row_id, successor.id);
         assert!(matches!(
             aggregate.segments[0].handoff.as_ref(),

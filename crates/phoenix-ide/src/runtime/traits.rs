@@ -118,6 +118,11 @@ pub struct AuthoritativeUserMessageAdoptionInput {
 /// Storage for conversation messages
 #[async_trait]
 pub trait MessageStore: Send + Sync {
+    async fn accepted_continuation_handoff_message_id(
+        &self,
+        conv_id: &str,
+    ) -> Result<Option<String>, String>;
+
     /// Add a message to the conversation
     ///
     /// `message_id` is the canonical identifier for this message. For user messages,
@@ -583,6 +588,15 @@ impl<T: MessageStore + StateStore> Storage for T {}
 
 #[async_trait]
 impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
+    async fn accepted_continuation_handoff_message_id(
+        &self,
+        conv_id: &str,
+    ) -> Result<Option<String>, String> {
+        (**self)
+            .accepted_continuation_handoff_message_id(conv_id)
+            .await
+    }
+
     async fn add_message(
         &self,
         message_id: &str,
@@ -1111,6 +1125,16 @@ fn direct_turn_terminal_command(
 
 #[async_trait]
 impl MessageStore for DatabaseStorage {
+    async fn accepted_continuation_handoff_message_id(
+        &self,
+        conv_id: &str,
+    ) -> Result<Option<String>, String> {
+        self.db
+            .accepted_continuation_handoff_message_id(conv_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn add_message(
         &self,
         message_id: &str,
