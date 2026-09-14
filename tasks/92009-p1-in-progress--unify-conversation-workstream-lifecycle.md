@@ -286,7 +286,17 @@ Search rules are host-bound:
 
 Expose retrieval as two host-scoped operations/capabilities rather than a model-selected scope parameter: **search this conversation** and, only when one typed source link exists, **search source conversation**. Results identify source conversation, transcript row, message, and continuation-boundary context and can navigate to the exact message in the unified page. A deleted source returns typed unavailable-source behavior; it never broadens to global or sibling search.
 
-This is separate from Coordinator global recall: `/global` retains its existing bounded global message-search and relational-read authority, while ordinary agents receive only the workstream/source scopes above.
+Global evidence eligibility is governed by ADR-027 and REQ-GR-007:
+write-capable ordinary parents and the Coordinator may use global tools;
+restricted planning parents and subagents do not receive those global tools.
+The workstream/source scopes above are dedicated recall paths, not a replacement
+for that global capability policy.
+
+[Task 58058](58058-p2-ready--predecessor-transcript-recall.md), coordinated with
+gate 6 task 92015, specifies the strict predecessor subset under REQ-RET-009 and
+ADR-051. It supplies a direct list/search/read path and host-authored continuation
+orientation for ordinary parents, including restricted planning parents. Gate 6
+retains whole-conversation/source recall, provenance, and UI navigation.
 
 ## User journeys that must work
 

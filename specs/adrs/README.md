@@ -62,6 +62,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [048](048_absolute-llm-provider-attempt-deadline.md) | LLM provider attempts use one absolute service deadline | Accepted | REQ-LLM-011–013; request liveness, timeout metrics, durable retry/terminalization |
 | [049](049_compaction-protects-accepted-handoffs-and-coordinator-context.md) | Compaction protects accepted handoffs and Coordinator context | Accepted | REQ-BED-020, REQ-GR-011, REQ-GR-013 |
 | [050](050_launchd-restart-preserves-installed-state.md) | launchd restart preserves installed state through an independent helper | Accepted | REQ-LDD-014 through REQ-LDD-016; `RestartTransaction` |
+| [051](051_predecessor-recall-is-bound-to-the-executing-transcript.md) | Predecessor recall is bound to the executing transcript | Accepted | REQ-RET-009, REQ-GR-007 |
 
 ## For agents: which decisions bind your task
 
@@ -101,6 +102,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying continuation summary retry, restart recovery, or exactly-once commit | 025 |
 | Specifying provider prompt persistence authority, bounded transcript projection, or continuation prompt freezing | 045, then 025 and 031 |
 | Specifying iOS grounding, server-backed file browsing, prose reading, or anchored comments | 030, then 029, 028, and 026 for draft authority, reader sessions, the companion boundary, ProductConversation, and WorkScope ownership |
+| Specifying ordinary-parent predecessor recall, planning-parent recall eligibility, or continuation recall orientation | 051, then 027, 031, and 045 |
 
 ## Decision dependencies
 
@@ -140,6 +142,7 @@ ADR-000 (adopt spEARS v2 for new work)
       ├── ADR-021 (The Coordinator surface is chat-only)
       │   └── ADR-022 (The Coordinator uses bounded relational evidence)
       │       └── ADR-027 (Write-capable ProductConversations use bounded global evidence)
+      │           └── ADR-051 (Predecessor recall is bound to the executing transcript)
       ├── ADR-023 (Projects accept taskmd files by default and plain markdown briefs through one task-source seam)
       ├── ADR-024 (Direct-turn authority is partitioned by semantic fact)
       └── ADR-026 (Product conversation lifecycle is separate from WorkScope resource ownership)
