@@ -8503,7 +8503,9 @@ mod scope_liveness_tests {
             return;
         }
         let owner = phoenix_tools::tmux::test_server::TestTmuxServerOwner::new();
-        let mut manager = test_manager().await;
+        let mut manager = test_manager()
+            .await
+            .with_test_no_ambient_writers(Arc::new(std::sync::atomic::AtomicUsize::new(0)));
         manager.tmux_registry = Arc::new(owner.registry());
         let (_repository, attempt_id, scope, socket, stale_token, _) =
             prepare_clean_close_with_tmux(
@@ -8543,7 +8545,9 @@ mod scope_liveness_tests {
             return;
         }
         let owner = phoenix_tools::tmux::test_server::TestTmuxServerOwner::new();
-        let mut manager = test_manager().await;
+        let mut manager = test_manager()
+            .await
+            .with_test_no_ambient_writers(Arc::new(std::sync::atomic::AtomicUsize::new(0)));
         manager.tmux_registry = Arc::new(owner.registry());
         let (_repository, attempt_id, scope, socket, stale_token, _) =
             prepare_clean_close_with_tmux(
