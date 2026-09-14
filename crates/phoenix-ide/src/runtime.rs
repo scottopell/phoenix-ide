@@ -4295,7 +4295,13 @@ impl RuntimeManager {
         conversation_id: String,
     ) -> futures::future::BoxFuture<'static, Result<(), String>> {
         let manager = Arc::clone(self);
-        Box::pin(async move { manager.get_or_create(&conversation_id).await.map(drop) })
+        Box::pin(async move {
+            manager.require_local_authority_admission()?;
+            manager
+                .get_or_create_inner(&conversation_id, None)
+                .await
+                .map(drop)
+        })
     }
 
     /// Get or materialize the in-memory runtime for a durable conversation.
@@ -6101,9 +6107,15 @@ impl RuntimeManager {
         let row_state_updated_at = conv.state_updated_at;
 
         if matches!(conv.state, ConvState::LlmRequesting { .. })
-            && self
+            && (self
                 .has_persisted_llm_request_owner(conversation_id)
                 .await?
+                || self
+                    .db
+                    .get_approved_task_objective(conversation_id)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .is_some())
         {
             return Ok((conv.state, row_state_updated_at, false));
         }
@@ -9041,6 +9053,7 @@ mod scope_liveness_tests {
             .unwrap());
     }
 
+    #[derive(Default)]
     struct RecordingLlm {
         requests: std::sync::atomic::AtomicUsize,
     }
@@ -10716,16 +10729,43 @@ mod scope_liveness_tests {
 
     #[tokio::test]
     async fn recreate_from_database_replaces_finished_actor_and_preserves_stream() {
-        let mgr = Arc::new(test_manager().await);
+        let llm = Arc::new(RecordingLlm::default());
+        let mgr = Arc::new(test_manager_with_recording_llm(Arc::clone(&llm)).await);
         let conversation_id = "recreate-finished-runtime";
         mgr.db()
             .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
             .await
             .expect("create");
+        let approval = TaskApprovalHandoffData {
+            task_id: "12345".to_string(),
+            task_title: "Recreate".to_string(),
+            title: "Recreate".to_string(),
+            priority: crate::task_source::Priority::P0,
+            plan: "Plan".to_string(),
+            task_file: "tasks/12345-p0-ready--recreate.md".to_string(),
+            artifact_body: "# Recreate\n\nPlan\n".to_string(),
+        };
         mgr.db()
-            .update_conversation_state(conversation_id, &ConvState::LlmRequesting { attempt: 1 })
+            .persist_approved_task_authority(
+                conversation_id,
+                &approval,
+                &crate::db::Message {
+                    message_id: "approval-message".to_string(),
+                    conversation_id: conversation_id.to_string(),
+                    sequence_id: 1,
+                    message_type: crate::db::MessageType::User,
+                    content: crate::db::MessageContent::User(crate::db::UserContent::meta(
+                        "approved",
+                    )),
+                    display_data: None,
+                    usage_data: None,
+                    created_at: Utc::now(),
+                },
+                &ConvState::LlmRequesting { attempt: 1 },
+                Utc::now(),
+            )
             .await
-            .expect("persist committed approval state");
+            .expect("persist committed approval transaction");
         let _stale_events = mgr
             .inject_handle_with_event_capture_for_test(
                 conversation_id,
@@ -10762,15 +10802,15 @@ mod scope_liveness_tests {
             .expect("replacement handle");
         assert!(!Arc::ptr_eq(&stale_identity, &replacement.identity));
         assert!(reserved_stream.same_channel(&replacement.broadcast_tx));
-        assert_ne!(
+        assert!(matches!(
             *replacement.state_rx.borrow(),
-            ConvState::AwaitingTaskApproval {
-                task_file: "tasks/12345-p0-ready--recreate.md".to_string(),
-                title: "Recreate".to_string(),
-                priority: crate::task_source::Priority::P0,
-                plan: "Plan".to_string(),
-            }
-        );
+            ConvState::LlmRequesting { attempt: 1 }
+        ));
+        let mut state_rx = replacement.state_rx.clone();
+        while matches!(*state_rx.borrow(), ConvState::LlmRequesting { .. }) {
+            state_rx.changed().await.expect("replacement remains live");
+        }
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
