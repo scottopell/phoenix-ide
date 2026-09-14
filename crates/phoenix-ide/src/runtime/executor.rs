@@ -3238,12 +3238,7 @@ where
         let old_state = self.state.clone();
         let will_settle_active_direct_turn =
             self.active_direct_turn.is_some() && self.pending_direct_turn_terminal.is_some();
-        if is_direct_turn_adoption {
-            self.proposed_authoritative_state = Some(ProposedAuthoritativeState {
-                state: result.new_state.clone(),
-                updated_at: Utc::now(),
-            });
-        } else if is_task_approval_adoption {
+        if is_direct_turn_adoption || is_task_approval_adoption {
             self.proposed_authoritative_state = Some(ProposedAuthoritativeState {
                 state: result.new_state.clone(),
                 updated_at: Utc::now(),
