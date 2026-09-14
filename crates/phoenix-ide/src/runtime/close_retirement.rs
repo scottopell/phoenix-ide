@@ -3862,8 +3862,6 @@ fn quarantine_has_writable_mappings_in(
     proc_root: &Path,
     effective_uid: libc::uid_t,
 ) -> Result<ExternalWriterEvidence, String> {
-    use std::os::unix::ffi::OsStrExt as _;
-
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         format!("cannot canonicalize quarantine before mapping inspection: {error}")
     })?;
@@ -4339,7 +4337,7 @@ fn linux_descriptor_writer_evidence(
     descriptor: &std::fs::DirEntry,
     canonical: &Path,
     before_incarnation: &str,
-    target: PathBuf,
+    target: &Path,
     target_is_directory: bool,
     access_mode: AmbientWriterAccessMode,
 ) -> Result<Option<ExternalWriterEvidence>, String> {
@@ -4423,8 +4421,6 @@ fn quarantine_has_open_descriptors_in(
     path: &Path,
     proc_root: &Path,
 ) -> Result<ExternalWriterEvidence, String> {
-    use std::os::unix::ffi::OsStrExt as _;
-
     let canonical = std::fs::canonicalize(path).map_err(|error| {
         format!("cannot canonicalize quarantined worktree before descriptor inspection: {error}")
     })?;
@@ -4486,7 +4482,7 @@ fn quarantine_has_open_descriptors_in(
                 &descriptor,
                 &canonical,
                 &before_incarnation,
-                target,
+                &target,
                 target_metadata.is_dir(),
                 access_mode,
             )? {
