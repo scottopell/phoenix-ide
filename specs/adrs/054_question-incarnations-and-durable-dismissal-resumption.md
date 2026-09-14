@@ -44,8 +44,18 @@ and live queue drain consult the durable pause owner, so accepted inputs resume
 in FIFO order without depending on the enqueue notification surviving.
 
 The marker remains historical explanation for dismissal; pause rows own whether
-queued work may resume. Migration preserves the paused meaning of a latest
-question-dismissal marker on an idle conversation. Question settlement continues
+queued work may resume. Migration creates pause ownership for a latest
+question-dismissal marker on an idle conversation only when its queue is empty.
+Databases without pause ownership retain FIFO eligibility for existing queued
+inputs. The baseline `dd54a4fb` executor's `commit_startup_steering_queue` and
+`prepare_immediate_steering_drain` resume any nonempty idle queue without checking
+the dismissal marker. Legacy queue rows contain neither acceptance time nor
+admission source, and conversation `updated_at` also records unrelated changes;
+they cannot prove whether an explicit message was accepted after dismissal.
+Preserving the established restart behavior avoids inventing that evidence or
+blocking an accepted message whose wake notification was lost. New dismissals
+use transactional pause ownership regardless of queue contents.
+Question settlement continues
 to follow ADR-036: classify a lost local SQLite result once from exact durable
 evidence or close admission/publication and fail stop.
 

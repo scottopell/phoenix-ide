@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { api, QuestionMutationError } from '../../api';
+import { api, QuestionMutationError, type Conversation } from '../../api';
 import { QuestionPanel } from '../../components/QuestionPanel';
 import { FocusScopeProvider } from '../../hooks/useFocusScope';
 import type { AskUserQuestionScenario } from './scenarios';
@@ -15,6 +15,8 @@ export function AskUserQuestionFixture({ scenario }: { scenario: AskUserQuestion
     document.documentElement.dataset['theme'] = 'light';
     const respond = api.respondToQuestion;
     const dismiss = api.dismissQuestion;
+    const getConversation = api.getConversation;
+    api.getConversation = async () => ({ conversation: { id: 'fixture-auq', state: { type: 'idle' } } as Conversation, messages: [], agent_working: false, presentation_mode: 'chat', context_window_size: 100000 });
     api.respondToQuestion = async (_id, requestId, answers, annotations) => {
       if (scenario.fail) throw new QuestionMutationError('Fixture: response rejected. Please retry.', 'question_request_invalid');
       setResult(JSON.stringify({ requestId, answers, annotations }, null, 2));
@@ -28,6 +30,7 @@ export function AskUserQuestionFixture({ scenario }: { scenario: AskUserQuestion
     return () => {
       api.respondToQuestion = respond;
       api.dismissQuestion = dismiss;
+      api.getConversation = getConversation;
       if (theme === undefined) delete document.documentElement.dataset['theme'];
       else document.documentElement.dataset['theme'] = theme;
     };
@@ -41,7 +44,7 @@ export function AskUserQuestionFixture({ scenario }: { scenario: AskUserQuestion
           <pre aria-label="Captured response">{result}</pre>
           <p role="status">{toast}</p>
         </section>
-        {ready && !finished && <QuestionPanel questions={scenario.questions} conversationId="fixture-auq" requestId="fixture-question" onResolved={() => setFinished(true)} showToast={setToast} onAnswered={() => setFinished(true)} onDismissed={() => setFinished(true)} readOnly={scenario.readOnly ?? false} />}
+        {ready && !finished && <QuestionPanel questions={scenario.questions} conversationId="fixture-auq" requestId="fixture-question" onResolved={() => setFinished(true)} showToast={setToast} readOnly={scenario.readOnly ?? false} />}
         <footer style={{ padding: 12 }}>Fixture conversation · {finished ? 'Response handled' : 'Awaiting your reply'}</footer>
       </main>
     </FocusScopeProvider>

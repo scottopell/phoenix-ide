@@ -88,6 +88,15 @@ runSurfaceCapture({
         await page.getByRole('radio',{name:'Include ancestors',exact:true}).check();
         assert.equal(await panel.locator('.question-choice-block').nth(1).evaluate(e=>e.offsetTop),optionTop,'Choice positions remain stable');
         assert.equal(await page.getByText('No preview for this option.').count(),1);
+        if (width < 840) {
+          await page.getByRole('radio',{name:'Other',exact:true}).check();
+          const previewLink = page.getByRole('button',{name:'Preview below'});
+          assert.ok(await previewLink.isEnabled());
+          await previewLink.click();
+          assert.ok(await page.getByRole('heading',{name:'Preview — Other'}).evaluate(e=>e===document.activeElement));
+          await controls.first().check();
+        }
+
       }
       if (id === 'plain' && viewport.width >= 480) {
         await page.getByRole('button',{name:'Expand questions'}).click();

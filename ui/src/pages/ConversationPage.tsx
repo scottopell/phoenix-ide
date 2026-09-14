@@ -1768,8 +1768,6 @@ function ConversationPageContent({
   }, [parentConvSlugForCallback, navigate]);
 
   const convStateForChildren = atom.phase;
-  const pendingQuestionRef = useRef<string | null>(null);
-  pendingQuestionRef.current = atom.phase.type === 'awaiting_user_response' ? `${conversation?.id}:${atom.phase.request_id}` : null;
   const ordinaryComposerEligible = !isArchived
     && convStateForChildren.type !== 'provisioning'
     && convStateForChildren.type !== 'creation_failed'
@@ -2556,14 +2554,6 @@ function ConversationPageContent({
           conversationId={conversation.id}
           showToast={showInfo}
           readOnly={readOnly || isArchived}
-          onAnswered={() => {
-            if (pendingQuestionRef.current !== `${conversation.id}:${convStateForChildren.request_id}`) return;
-            dispatch({ type: 'question_phase_change', phase: { type: 'llm_requesting', attempt: 1 }, expectedConversationId: conversation.id, requestId: convStateForChildren.request_id });
-          }}
-          onDismissed={() => {
-            if (pendingQuestionRef.current !== `${conversation.id}:${convStateForChildren.request_id}`) return;
-            dispatch({ type: 'question_phase_change', phase: { type: 'idle' }, expectedConversationId: conversation.id, requestId: convStateForChildren.request_id });
-          }}
           onResolved={phase => dispatch({ type: 'question_phase_change', phase, expectedConversationId: conversation.id, requestId: convStateForChildren.request_id })}
         />
       ) : mutationEnabled && ordinaryComposerEligible ? (
