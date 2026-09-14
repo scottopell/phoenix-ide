@@ -1109,8 +1109,6 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // shutdown indefinitely.
     crate::tools::bash::shutdown_kill_tree(&bash_handles_for_shutdown).await;
 
-    // After graceful shutdown, check if we should hot restart
-    // (This does not return if hot restart is performed)
     hot_restart::maybe_perform_hot_restart();
 
     Ok(())
