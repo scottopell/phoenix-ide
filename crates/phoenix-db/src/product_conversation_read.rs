@@ -219,6 +219,24 @@ fn continuation_summary(row: &sqlx::sqlite::SqliteRow, content_column: &str) -> 
     Ok(content.summary)
 }
 
+const PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL: &str = "WITH RECURSIVE transcript(id, ordinal) AS (
+     SELECT root.id, 0 FROM conversations root WHERE root.product_conversation_id = ?1 AND root.runtime_role = 'user' AND root.parent_conversation_id IS NULL
+     AND NOT EXISTS (SELECT 1 FROM conversations predecessor WHERE predecessor.product_conversation_id = root.product_conversation_id AND predecessor.continued_in_conv_id = root.id)
+     UNION ALL SELECT successor.id, transcript.ordinal + 1 FROM transcript JOIN conversations predecessor ON predecessor.id = transcript.id JOIN conversations successor ON successor.id = predecessor.continued_in_conv_id
+     WHERE successor.product_conversation_id = ?1 AND successor.runtime_role = 'user' AND successor.parent_conversation_id IS NULL
+ ), snapshot_ceiling AS (
+     SELECT json_extract(value, '$.transcript_row_id') AS transcript_row_id,
+            json_extract(value, '$.tail_sequence_id') AS tail_sequence_id,
+            json_extract(value, '$.tail_message_id') AS tail_message_id
+     FROM json_each(?2)
+ ) SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, transcript.ordinal
+ FROM transcript
+ CROSS JOIN messages INDEXED BY messages_conversation_sequence
+   ON messages.conversation_id = transcript.id
+ WHERE (?2 IS NULL OR EXISTS (SELECT 1 FROM snapshot_ceiling ceiling WHERE ceiling.transcript_row_id = transcript.id AND (messages.sequence_id < ceiling.tail_sequence_id OR (messages.sequence_id = ceiling.tail_sequence_id AND messages.message_id <= ceiling.tail_message_id))))
+   AND (?3 IS NULL OR transcript.ordinal < ?3 OR (transcript.ordinal = ?3 AND (messages.sequence_id < ?4 OR (messages.sequence_id = ?4 AND messages.message_id < ?5))))
+ ORDER BY transcript.ordinal DESC, messages.sequence_id DESC, messages.message_id DESC LIMIT ?6";
+
 impl Database {
     /// Returns the accepted opening message ID for a completed continuation edge.
     ///
@@ -865,20 +883,13 @@ impl Database {
         let before_ordinal = before.as_ref().map(|(ordinal, _, _)| *ordinal);
         let before_sequence_id = before.as_ref().map(|(_, sequence_id, _)| *sequence_id);
         let before_message_id = before.map(|(_, _, message_id)| message_id);
-        sqlx::query("WITH RECURSIVE transcript(id, ordinal) AS (
-             SELECT root.id, 0 FROM conversations root WHERE root.product_conversation_id = ?1 AND root.runtime_role = 'user' AND root.parent_conversation_id IS NULL
-             AND NOT EXISTS (SELECT 1 FROM conversations predecessor WHERE predecessor.product_conversation_id = root.product_conversation_id AND predecessor.continued_in_conv_id = root.id)
-             UNION ALL SELECT successor.id, transcript.ordinal + 1 FROM transcript JOIN conversations predecessor ON predecessor.id = transcript.id JOIN conversations successor ON successor.id = predecessor.continued_in_conv_id
-             WHERE successor.product_conversation_id = ?1 AND successor.runtime_role = 'user' AND successor.parent_conversation_id IS NULL
-         ), snapshot_ceiling AS (
-             SELECT json_extract(value, '$.transcript_row_id') AS transcript_row_id,
-                    json_extract(value, '$.tail_sequence_id') AS tail_sequence_id,
-                    json_extract(value, '$.tail_message_id') AS tail_message_id
-             FROM json_each(?2)
-         ) SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, transcript.ordinal FROM transcript JOIN messages ON messages.conversation_id = transcript.id
-         WHERE (?2 IS NULL OR EXISTS (SELECT 1 FROM snapshot_ceiling ceiling WHERE ceiling.transcript_row_id = transcript.id AND (messages.sequence_id < ceiling.tail_sequence_id OR (messages.sequence_id = ceiling.tail_sequence_id AND messages.message_id <= ceiling.tail_message_id))))
-           AND (?3 IS NULL OR transcript.ordinal < ?3 OR (transcript.ordinal = ?3 AND (messages.sequence_id < ?4 OR (messages.sequence_id = ?4 AND messages.message_id < ?5)))) ORDER BY transcript.ordinal DESC, messages.sequence_id DESC, messages.message_id DESC LIMIT ?6")
-        .bind(product_conversation_id.as_str().to_string()).bind(segment_ceilings).bind(before_ordinal).bind(before_sequence_id).bind(before_message_id).bind(i64::try_from(limit).expect("page limit fits i64"))
+        sqlx::query(PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL)
+            .bind(product_conversation_id.as_str().to_string())
+            .bind(segment_ceilings)
+            .bind(before_ordinal)
+            .bind(before_sequence_id)
+            .bind(before_message_id)
+            .bind(i64::try_from(limit).expect("page limit fits i64"))
     }
 
     /// Fetches one bounded, newest-first page across the ordered aggregate transcript.
@@ -1062,9 +1073,34 @@ mod tests {
                 .unwrap();
                 segment = match db.continue_conversation(&segment.id).await.unwrap() {
                     ContinueOutcome::Created(successor) => successor,
-                    other => panic!("expected fixture continuation, got {other:?}"),
+                    other @ (ContinueOutcome::AlreadyContinued(_)
+                    | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                        panic!("expected fixture continuation, got {other:?}")
+                    }
                 };
             }
+        }
+        let distractor = db
+            .create_conversation("perf-noise", "perf-noise", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let noise_content = serde_json::to_string(&MessageContent::user("noise")).unwrap();
+        for chunk in 0..200 {
+            sqlx::query(
+                "WITH RECURSIVE ordinal(value) AS (
+                     VALUES(1) UNION ALL SELECT value + 1 FROM ordinal WHERE value < 1000
+                 ) INSERT INTO messages (
+                     message_id, conversation_id, sequence_id, message_type, content, created_at
+                 ) SELECT printf('noise-%d-%d', ?1, value), ?2, (?1 * 1000) + value,
+                          'user', ?3, '2026-01-01T00:00:00Z'
+                   FROM ordinal",
+            )
+            .bind(chunk)
+            .bind(&distractor.id)
+            .bind(&noise_content)
+            .execute(db.pool())
+            .await
+            .unwrap();
         }
         (db, root)
     }
@@ -1107,6 +1143,41 @@ mod tests {
             page_micros,
             rollback_micros,
         )
+    }
+
+    #[tokio::test]
+    async fn message_page_plan_drives_from_bounded_transcript() {
+        let db = Database::open_in_memory().await.unwrap();
+        let explain = format!("EXPLAIN QUERY PLAN {PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL}");
+        let plan = sqlx::query(sqlx::AssertSqlSafe(explain))
+            .bind("fixture-product")
+            .bind(Option::<String>::None)
+            .bind(Option::<i64>::None)
+            .bind(Option::<i64>::None)
+            .bind(Option::<String>::None)
+            .bind(51_i64)
+            .fetch_all(db.pool())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>();
+        assert!(
+            plan.iter().any(|detail| detail.contains("SCAN transcript")),
+            "query plan must drive the bounded page from transcript rows: {plan:?}"
+        );
+        assert!(
+            plan.iter().any(|detail| {
+                detail.contains("SEARCH messages USING INDEX messages_conversation_sequence")
+            }),
+            "query plan must probe messages by transcript conversation: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|detail| {
+                detail.contains("SCAN messages USING INDEX messages_conversation_sequence")
+            }),
+            "query plan must not scan the global messages index: {plan:?}"
+        );
     }
 
     #[tokio::test]

@@ -12,6 +12,11 @@ restart, or deployment was performed.
 The same capture contains 147 detail 404 responses, all for a coordinator
 reference, with median 2 ms, p95 3 ms, and maximum 23 ms. Those fast failures
 are route/fallback churn, not the mechanism for slow successful detail reads.
+The requester is `ProductConversationAliasRedirect`, mounted on legacy
+`/c/:slug` and `/chains/:rootConvId`: it probes ProductConversation detail and
+falls back to `EmbeddedConversationPage` after a 404. The capture does not prove
+why coordinator references enter those alias routes in bursts, so this work does
+not alter or coalesce that behavior.
 
 ## Read path and invariants
 
@@ -54,29 +59,48 @@ bounded limit, instead of driving from the 23 transcript rows and probing the
 
 The ignored deterministic diagnostic
 `product_conversation_snapshot_scale_diagnostic` builds 23 segments with 1,020
-messages each and records 11 warm stage samples in microseconds:
+messages each plus 200,000 unrelated messages, then records one cold and ten
+warm stage samples. The unrelated population is required to reproduce the
+planner cliff: without it both plans touch approximately the same 23k rows.
+
+Baseline raw samples in microseconds:
 
 ```text
-resolve=[203,63,60,72,65,95,61,95,69,60,68]
-aggregate=[14969,14150,14190,14006,13773,14216,14365,14279,13719,13920,13833]
-page=[30665,30347,30139,30325,30331,30176,30505,30595,30171,29684,30068]
-rollback=[22,33,40,49,42,45,35,62,42,33,38]
+[(261,15341,90121,105),(76,14823,89144,38),(69,14735,89136,36),
+ (69,14930,89381,40),(78,13919,88481,64),(81,14421,88544,34),
+ (66,14888,89389,81),(70,14578,89114,42),(67,14440,89457,34),
+ (90,14833,88784,35),(70,15221,89267,44)]
 ```
 
-Warm medians are 0.068 ms resolve, 14.150 ms aggregate, 30.325 ms page, and
-44.452 ms total; warm p95/max values are 0.203, 14.969, 30.665, and 45.859 ms.
-The page query is the dominant reproducible stage. The production multi-second
-scale is consistent with the same globally scanning plan under a 3.8 GiB,
-concurrently used database; browser/network and continuation-summary changes do
-not explain server-measured successful GET duration.
+Each tuple is `(resolve, aggregate, page, rollback)`. The baseline cold total is
+105.828 ms. Warm p50/p95 are 0.070/0.090 ms resolve, 14.779/15.221 ms aggregate,
+89.140/89.457 ms page, and 103.987/104.602 ms total.
+
+After forcing transcript-first indexed probes, identical-shape raw samples are:
+
+```text
+[(243,15169,25565,29),(59,14139,25436,40),(58,14785,26043,40),
+ (61,15130,25637,57),(64,14462,25474,44),(61,14968,25292,39),
+ (98,14549,25152,34),(66,14768,25173,37),(62,14910,25415,35),
+ (67,15788,34123,43),(232,16754,26473,45)]
+```
+
+The candidate cold total is 41.006 ms. Warm p50/p95 are 0.063/0.232 ms resolve,
+14.848/16.754 ms aggregate, 25.455/34.123 ms page, and 40.391/50.021 ms total.
+The page p50 falls 71%, and total p50 falls 61%, while aggregate hydration is
+unchanged within run noise. The production multi-second scale is consistent
+with the globally scanning plan under a 3.8 GiB, concurrently used database;
+browser/network and continuation-summary changes do not explain server-measured
+successful GET duration.
 
 ## Bounded fix plan
 
 1. Force the bounded page query to drive from the recursive transcript rows and
-   probe the existing message index, retaining the same predicates, ordering,
-   segment ceilings, and `LIMIT` inside the same read transaction.
-2. Lock the desired query plan with a representative local fixture and compare
-   identical raw cold/warm samples before and after.
+   probe the current-schema `messages_conversation_sequence` index, retaining
+   the same predicates, ordering, segment ceilings, and `LIMIT` inside the same
+   read transaction.
+2. Keep the representative diagnostic fixture and query-plan assertion as
+   regressions for the bounded hot path.
 3. Reassess aggregate hydration only after the page fix; batch per-segment
    metadata/handoffs only if it remains a measured dominant stage.
 4. Trace coordinator 404 request ownership separately. Do not mix route-churn
@@ -86,8 +110,11 @@ not explain server-measured successful GET duration.
 ## Remaining end-to-end stages
 
 The supplied evidence measures server HTTP duration, and the local fixture
-separates SQLite stages. It does not contain response-byte, serialization,
-SSE/store, or browser first-paint marks. Those stages remain unclaimed rather
-than being inferred from unrelated readiness work. Privacy-safe `open.id` plus
+separates the transaction's SQLite stages. After that transaction,
+`snapshot_view` performs close-projection, source-deletion, and writable-row
+lookups before serialization; these were not separable in the supplied capture.
+It also does not contain response-byte, serialization, SSE/store, or browser
+first-paint marks. Those stages remain unclaimed rather than being inferred from
+unrelated readiness work. Privacy-safe `open.id` plus
 durable product reference are the intended correlation keys for future traces;
 content and secrets are excluded.
