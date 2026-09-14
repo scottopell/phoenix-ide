@@ -809,6 +809,7 @@ impl AmbientWriterDetector {
 pub enum AmbientWriterMatchKind {
     Descriptor,
     Mapping,
+    NamespaceDirectory,
 }
 
 impl AmbientWriterMatchKind {
@@ -816,6 +817,7 @@ impl AmbientWriterMatchKind {
         match self {
             Self::Descriptor => "descriptor",
             Self::Mapping => "mapping",
+            Self::NamespaceDirectory => "namespace_directory",
         }
     }
 }
@@ -825,6 +827,7 @@ pub enum AmbientWriterAccessMode {
     WriteOnly,
     ReadWrite,
     WritableSharedMapping,
+    NamespaceWrite,
 }
 
 impl AmbientWriterAccessMode {
@@ -833,6 +836,7 @@ impl AmbientWriterAccessMode {
             Self::WriteOnly => "write_only",
             Self::ReadWrite => "read_write",
             Self::WritableSharedMapping => "writable_shared_mapping",
+            Self::NamespaceWrite => "namespace_write",
         }
     }
 }

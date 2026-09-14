@@ -6,7 +6,7 @@
 
 ## Context
 
-Close retirement first stops resources owned through a sealed WorkScope gate, then quarantines and removes the worktree. Processes outside that gate may still hold filesystem references. A pathname reference alone does not prove write authority: read-only descriptors, current working directories, process roots, executable text, and read-only mappings may all name a path without being able to modify it. A positive decision also becomes unauditable if process identity and descriptor mode disappear before they are durably recorded.
+Close retirement first stops resources owned through a sealed WorkScope gate, then quarantines and removes the worktree. Processes outside that gate may still hold filesystem references. A pathname reference alone does not prove write authority: read-only non-directory descriptors, process roots, executable text, and read-only mappings may all name a path without being able to modify it. Retained current working directories and read-only directory descriptors are different because relative path operations can mutate the quarantined namespace. A positive decision also becomes unauditable if process identity and authority mode disappear before they are durably recorded.
 
 Close retry introduces a second evidence boundary. Reinspection needs a fresh generation, while already-authorized dispatch and cleanup-plan evidence from the same exact attempt must remain usable. The relational schema correctly requires a cleanup plan to have a generation-matched dispatch parent. Rotating only the plan into a fresh generation creates an invalid parent/child combination; weakening that foreign key would instead allow cleanup without dispatch authority.
 
@@ -22,7 +22,7 @@ Recovery is user-facing. A raw storage-engine code cannot tell the client which 
 
 Choose option 3.
 
-An ambient positive writer is a complete typed observation: detector, process ID plus start/incarnation, executable, exact matched path, match kind, and writable access mode. Writable descriptors and explicitly writable shared mappings qualify. Read-only descriptors, read-only/private mappings, and non-authorizing path relationships never confer write authority. Missing mandatory positive identity is detector-indeterminate and fails closed.
+An ambient positive writer is a complete typed observation: detector, process ID plus start/incarnation, executable, exact matched path, match kind, and authority mode. Writable descriptors, retained namespace directories, and explicitly writable shared mappings qualify. Read-only non-directory descriptors, read-only/private mappings, and non-authorizing path relationships never confer write authority. Missing mandatory positive identity is detector-indeterminate and fails closed.
 
 After owned resources retire, Phoenix performs no more than three ambient observations separated by 100 milliseconds on a monotonic clock. Final removal requires two consecutive authoritative no-writer observations. A transient writable incarnation may disappear, but that disappearance is accepted only after the two clean observations. A stable writer, a writer in the final observation, exhausted budget without two clean observations, or detector indeterminacy preserves quarantine and produces typed repair. Observation count, spacing, and clock are injectable for deterministic tests.
 

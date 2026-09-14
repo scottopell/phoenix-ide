@@ -8733,8 +8733,8 @@ CREATE TABLE close_ambient_writer_evidence (
     executable_value TEXT NOT NULL,
     matched_path_codec TEXT NOT NULL,
     matched_path_value TEXT NOT NULL,
-    match_kind TEXT NOT NULL CHECK (match_kind IN ('descriptor', 'mapping')),
-    access_mode TEXT NOT NULL CHECK (access_mode IN ('write_only', 'read_write', 'writable_shared_mapping')),
+    match_kind TEXT NOT NULL CHECK (match_kind IN ('descriptor', 'mapping', 'namespace_directory')),
+    access_mode TEXT NOT NULL CHECK (access_mode IN ('write_only', 'read_write', 'writable_shared_mapping', 'namespace_write')),
     observed_at_unix_micros INTEGER NOT NULL
         CHECK (typeof(observed_at_unix_micros) = 'integer' AND observed_at_unix_micros >= 0),
     PRIMARY KEY (
