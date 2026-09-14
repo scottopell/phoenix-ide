@@ -2042,7 +2042,9 @@ fn registry_for_runtime_authority(
         )),
         (
             crate::work_scope::ResourceAuthority::Work,
-            ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. },
+            ConvMode::Explore { .. }
+            | ConvMode::AttachedWorkChild { .. }
+            | ConvMode::DetachedProductCreation { .. },
         ) => Ok((
             ToolRegistry::direct(agents, models)
                 .try_with_writing_conversation_tools(writing_tools)?,
@@ -2145,6 +2147,7 @@ pub(crate) fn cleanup_branch_for_unretained_work_scope<'a>(
         ConvMode::Work { branch_name, .. } => Some(branch_name.as_str().to_string()),
         ConvMode::Explore { .. }
         | ConvMode::Direct
+        | ConvMode::AttachedWorkChild { .. }
         | ConvMode::Branch { .. }
         | ConvMode::DetachedProductCreation { .. }
         | ConvMode::DetachedApprovedTask { .. } => None,
@@ -3820,9 +3823,12 @@ impl RuntimeManager {
                 next_taskmd_id_hint: None,
             },
             SubAgentMode::Work => match parent_mode {
-                ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. } => {
-                    ConvMode::Direct
-                }
+                ConvMode::Explore {
+                    worktree_path: Some(worktree_path),
+                    ..
+                } => ConvMode::AttachedWorkChild {
+                    worktree_path: worktree_path.clone(),
+                },
                 mode => mode.clone(),
             },
         }
@@ -4061,6 +4067,7 @@ impl RuntimeManager {
         conv_context.mode = match &sub_conv_mode {
             ConvMode::Direct => ModeKind::Direct,
             ConvMode::Explore { .. }
+            | ConvMode::AttachedWorkChild { .. }
             | ConvMode::Work { .. }
             | ConvMode::DetachedProductCreation { .. }
             | ConvMode::DetachedApprovedTask { .. } => ModeKind::Managed,
@@ -5130,6 +5137,7 @@ impl RuntimeManager {
         context.mode = match &conv.conv_mode {
             ConvMode::Direct => ModeKind::Direct,
             ConvMode::Explore { .. }
+            | ConvMode::AttachedWorkChild { .. }
             | ConvMode::Work { .. }
             | ConvMode::DetachedProductCreation { .. }
             | ConvMode::DetachedApprovedTask { .. } => ModeKind::Managed,
@@ -6439,6 +6447,9 @@ pub(crate) fn conv_mode_to_context(mode: &ConvMode) -> ModeContext {
             base_branch: base_branch.to_string(),
             worktree_path: worktree_path.to_string(),
         },
+        ConvMode::AttachedWorkChild { worktree_path } => ModeContext::AttachedWorkChild {
+            worktree_path: worktree_path.to_string(),
+        },
         ConvMode::DetachedProductCreation { .. } => ModeContext::Explore {
             next_taskmd_id_hint: None,
         },
@@ -6473,6 +6484,19 @@ mod persisted_subagent_mode_tests {
     use phoenix_core::domain::sm_state::SubAgentMode;
 
     #[test]
+    fn attached_work_child_context_retains_inherited_worktree() {
+        let mode = ConvMode::AttachedWorkChild {
+            worktree_path: NonEmptyString::new("/tmp/approved-worktree").unwrap(),
+        };
+        assert!(matches!(
+            super::conv_mode_to_context(&mode),
+            phoenix_core::domain::mode_context::ModeContext::AttachedWorkChild { worktree_path }
+                if worktree_path == "/tmp/approved-worktree"
+        ));
+        assert_eq!(mode.worktree_path(), Some("/tmp/approved-worktree"));
+    }
+
+    #[test]
     fn approved_explore_parent_persists_distinct_child_execution_modes() {
         let parent = ConvMode::Explore {
             worktree_path: Some(NonEmptyString::new("/tmp/approved-worktree").unwrap()),
@@ -6485,7 +6509,9 @@ mod persisted_subagent_mode_tests {
         ));
         assert_eq!(
             RuntimeManager::persisted_subagent_mode(&parent, SubAgentMode::Work),
-            ConvMode::Direct
+            ConvMode::AttachedWorkChild {
+                worktree_path: NonEmptyString::new("/tmp/approved-worktree").unwrap(),
+            }
         );
     }
 }

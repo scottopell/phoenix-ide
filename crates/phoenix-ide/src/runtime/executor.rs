@@ -3238,10 +3238,15 @@ where
         let old_state = self.state.clone();
         let will_settle_active_direct_turn =
             self.active_direct_turn.is_some() && self.pending_direct_turn_terminal.is_some();
-        if is_direct_turn_adoption || is_task_approval_adoption {
+        if is_direct_turn_adoption {
             self.proposed_authoritative_state = Some(ProposedAuthoritativeState {
                 state: result.new_state.clone(),
                 updated_at: Utc::now(),
+            });
+        } else if is_task_approval_adoption {
+            self.proposed_authoritative_state = Some(ProposedAuthoritativeState {
+                state: result.new_state.clone(),
+                updated_at: self.state_updated_at,
             });
         } else {
             let state_changed = result.new_state != old_state;
@@ -8421,9 +8426,10 @@ where
         plan: String,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<(), String> {
-        let proposed = self
+        let proposed_state = self
             .proposed_authoritative_state
-            .clone()
+            .as_ref()
+            .map(|proposed| proposed.state.clone())
             .ok_or_else(|| "task approval missing proposed state".to_string())?;
         if matches!(
             self.context.mode_context.as_ref(),
@@ -8456,6 +8462,7 @@ where
                 usage_data: None,
                 created_at: chrono::Utc::now(),
             };
+            let adopted_at = Utc::now();
             let establishment = self
                 .storage
                 .persist_approved_task_authority(
@@ -8470,8 +8477,8 @@ where
                         artifact_body: reviewed.artifact_body,
                     },
                     &approval_message,
-                    &proposed.state,
-                    proposed.updated_at,
+                    &proposed_state,
+                    adopted_at,
                 )
                 .await
                 .inspect_err(|_| {
@@ -8481,6 +8488,7 @@ where
                 establishment,
                 crate::db::LocalAuthorityResult::DurableFactUnclassified
             ) {
+                admitted.close("task_approval_authority_establishment");
                 self.recovery_disposition = RuntimeRecoveryDisposition::RecreateFromDatabase;
                 return Err("approval authority establishment is unclassified".to_string());
             }
@@ -8488,8 +8496,8 @@ where
                 .broadcast_tx
                 .admitted_publication(admitted)
                 .persisted_message(approval_message);
-            self.state = proposed.state;
-            self.state_updated_at = proposed.updated_at;
+            self.state = proposed_state;
+            self.state_updated_at = adopted_at;
             self.publish_live_state_admitted();
             return Ok(());
         }
@@ -8557,6 +8565,7 @@ where
                     usage_data: None,
                     created_at: chrono::Utc::now(),
                 };
+                let adopted_at = Utc::now();
                 let persist_result = storage
                     .persist_approved_task_authority(
                         &self.context.conversation_id,
@@ -8570,13 +8579,14 @@ where
                             artifact_body: approval_result.artifact_body.clone(),
                         },
                         &approval_message,
-                        &proposed.state,
-                        proposed.updated_at,
+                        &proposed_state,
+                        adopted_at,
                     )
                     .await;
                 match persist_result {
                     Ok(crate::db::LocalAuthorityResult::DurableFactEstablished(())) => {}
                     Ok(crate::db::LocalAuthorityResult::DurableFactUnclassified) => {
+                        admitted.close("task_approval_authority_establishment");
                         self.recovery_disposition =
                             RuntimeRecoveryDisposition::RecreateFromDatabase;
                         return Err("approval authority establishment is unclassified".to_string());
@@ -8633,6 +8643,7 @@ where
                         (Some(branch_name.clone()), "Branch")
                     }
                     Some(ModeContext::Explore { .. }) => (None, "Explore"),
+                    Some(ModeContext::AttachedWorkChild { .. }) => (None, "Work Child"),
                     Some(ModeContext::DetachedApprovedTask { .. }) => (None, "Approved Task"),
                     Some(ModeContext::Direct) | None => (None, "Direct"),
                 };
@@ -8659,8 +8670,8 @@ where
                         },
                     });
 
-                self.state = proposed.state;
-                self.state_updated_at = proposed.updated_at;
+                self.state = proposed_state;
+                self.state_updated_at = adopted_at;
                 self.publish_live_state_admitted();
                 Ok(())
             }
@@ -16575,6 +16586,7 @@ mod approve_task_failure_effect_tests {
             rt.recovery_disposition,
             RuntimeRecoveryDisposition::RecreateFromDatabase
         ));
+        assert!(rt.fatal_local_authority_fence.is_closed());
         assert!(llm.recorded_requests().is_empty());
     }
 
@@ -19252,6 +19264,7 @@ mod work_subagent_cwd_guard_tests {
         context.work_scope_worktree = match &mode_context {
             ModeContext::Work { worktree_path, .. }
             | ModeContext::DetachedApprovedTask { worktree_path, .. }
+            | ModeContext::AttachedWorkChild { worktree_path }
             | ModeContext::Branch { worktree_path, .. } => {
                 Some(std::path::PathBuf::from(worktree_path))
             }

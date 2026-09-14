@@ -71,6 +71,7 @@ pub(crate) async fn resolve_resource_authority(
                     ResourceAuthority::Restricted
                 }
                 ConvMode::Direct
+                | ConvMode::AttachedWorkChild { .. }
                 | ConvMode::Work { .. }
                 | ConvMode::Branch { .. }
                 | ConvMode::DetachedApprovedTask { .. } => ResourceAuthority::Work,
@@ -216,6 +217,18 @@ pub(crate) mod tests {
         db.create_conversation(&parent_id, "parent", "/tmp", true, None, None)
             .await
             .unwrap();
+        db.update_conversation_mode_and_cwd(
+            &parent_id,
+            &ConvMode::Explore {
+                worktree_path: Some(
+                    phoenix_core::domain::db_schema::NonEmptyString::new("/tmp").unwrap(),
+                ),
+                next_taskmd_id_hint: None,
+            },
+            "/tmp",
+        )
+        .await
+        .unwrap();
         db.persist_approved_task_authority(
             &parent_id,
             &approval(),
@@ -255,7 +268,10 @@ pub(crate) mod tests {
                 "/tmp",
                 &parent_id,
                 "gpt-5.4",
-                &ConvMode::Direct,
+                &ConvMode::AttachedWorkChild {
+                    worktree_path: phoenix_core::domain::db_schema::NonEmptyString::new("/tmp")
+                        .unwrap(),
+                },
                 phoenix_core::llm_language::LlmLanguage::default(),
                 Some(&scope),
             )
@@ -268,6 +284,12 @@ pub(crate) mod tests {
         assert_eq!(explore.scope, ResourceScopeKey::Work(scope.clone()));
         assert_eq!(explore.authority, ResourceAuthority::Restricted);
 
+        let reloaded_work_child = db.get_conversation(&work_child.id).await.unwrap();
+        assert!(matches!(
+            reloaded_work_child.conv_mode,
+            ConvMode::AttachedWorkChild { ref worktree_path }
+                if worktree_path.as_str() == "/tmp"
+        ));
         let work = resolve_resource_authority(&db, &work_child).await.unwrap();
         assert_eq!(work.scope, ResourceScopeKey::Work(scope));
         assert_eq!(work.authority, ResourceAuthority::Work);

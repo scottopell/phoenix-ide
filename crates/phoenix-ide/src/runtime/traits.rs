@@ -1981,7 +1981,6 @@ impl StateStore for DatabaseStorage {
                 state_updated_at,
             )
             .await
-            .map(|()| crate::db::LocalAuthorityResult::DurableFactEstablished(()))
             .map_err(|e| e.to_string())
     }
 

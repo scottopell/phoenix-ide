@@ -364,7 +364,7 @@ AND materialize the pending continuation operation at startup
 
 WHEN the owning execution boundary determines under REQ-DWF-043 that the durable
 fact needed to continue cannot be established
-THE SYSTEM SHALL stop admission and semantic publication
+THE SYSTEM SHALL stop admission and semantic publication before publishing any capability derived from the unclassified operation
 AND SHALL NOT perform database-backed cleanup that depends on the suspect
 persistence path
 AND SHALL attempt only bounded best-effort shutdown work
@@ -1001,6 +1001,9 @@ AND SHALL derive the approval sequence from the referenced message rather than s
 AND SHALL preserve the requesting state across process restart while that obligation remains pending
 AND SHALL retire the obligation when the first later agent response is durably stored or the conversation leaves `LlmRequesting`
 AND SHALL NOT treat the lifetime approved-task objective as ownership of later requests
+
+WHEN approval performs Git or worktree mutation before adopting `LlmRequesting`
+THE SYSTEM SHALL capture the requesting-state timestamp after that mutation succeeds and immediately before atomic persistence and live-state adoption
 
 WHEN a runtime is reconstructed after interruption
 THE SYSTEM SHALL derive every capability consumer from persisted `WorkScope` authority rather than from conversation mode provenance
