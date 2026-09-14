@@ -1143,6 +1143,9 @@ rule UserApprovesTaskCurrentConversation {
         objective: conversation.approved_task_objective
     }
     ensures: WriteAuthorityPersistedBeforeResume(conversation)
+    ensures: ApprovalAdoptionPersistedAtomically(conversation)
+    ensures: RuntimeCapabilitiesMatchPersistedAuthority(conversation)
+    ensures: NoPostApprovalExecutionUsesRestrictedAuthority(conversation)
     ensures: conversation.core_status = llm_requesting
     ensures: conversation.retry_attempt = 1
     ensures: LlmRequestDispatched(conversation)
@@ -1154,6 +1157,23 @@ rule UserApprovesTaskCurrentConversation {
         -- not transition product lifecycle, product mode, work-scope attachment,
         -- continuation topology, provenance, or branch/worktree state beyond the
         -- approval checkpoint itself.
+        --
+        -- The approval adoption operation is the sole persistence owner for the
+        -- destination state, approved objective, Work authority, and approval
+        -- context message. They commit in one transaction before runtime capability
+        -- publication; no later generic state write repeats that committed state.
+        --
+        -- If capability publication fails after commit, actor retirement preserves the
+        -- stream reservation and directly rematerializes the conversation from durable
+        -- state; unfinished-turn discovery is not the recovery owner. If bounded
+        -- rematerialization attempts fail, the reservation is released so clients
+        -- reconnect and can initiate reconstruction.
+        --
+        -- An operation-scoped obligation, bound by foreign key to the approval context
+        -- message and deriving its sequence from that message, preserves the first
+        -- post-approval request across restart. A later durable
+        -- agent message or any state progression out of LlmRequesting retires it;
+        -- the lifetime approved objective never owns later requests.
         --
         -- ApprovalRereadSnapshot / ApprovalMatchesReviewedSnapshot bind approval to
         -- the reviewed repo-relative path, task kind, and content digest. The
@@ -2105,6 +2125,27 @@ rule ModeChangeNotification {
 --
 -- Allium has no formal helper-function declaration; rules call these
 -- predicates by bare identifier. This block defines their complete semantics.
+--
+--   ApprovalAdoptionPersistedAtomically(
+--       conversation: Parent
+--   ) -> Boolean
+--       True exactly when the approved objective, WorkScope authority,
+--       post-approval conversation state, and approved-plan context message
+--       commit in one transaction before runtime capability publication.
+--
+--   RuntimeCapabilitiesMatchPersistedAuthority(
+--       conversation: Parent
+--   ) -> Boolean
+--       True exactly when tool definitions, tool dispatch, Bash isolation,
+--       tool context, and Work-child admission all derive from the authority
+--       persisted on conversation's attached WorkScope.
+--
+--   NoPostApprovalExecutionUsesRestrictedAuthority(
+--       conversation: Parent
+--   ) -> Boolean
+--       True exactly when no provider request or tool execution admitted after
+--       Work authority persistence uses a pre-approval Restricted capability
+--       projection. False while any capability consumer remains stale.
 --
 --   retirement_inventory_is_complete_and_sealed(
 --       product_conversation: ProductConversation,

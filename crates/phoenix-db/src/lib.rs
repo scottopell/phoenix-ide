@@ -1852,6 +1852,14 @@ impl Database {
                     base_branch: Some(base_branch.to_string()),
                 }
             }
+            ("attached_work_child", Some(worktree_path), _, _) => {
+                EnvironmentContext::AllocatedWorktree {
+                    cwd: cwd.to_string(),
+                    worktree_path: worktree_path.to_string(),
+                    branch_name: None,
+                    base_branch: None,
+                }
+            }
             ("explore", Some(worktree_path), _, _) => EnvironmentContext::AllocatedWorktree {
                 cwd: worktree_path.to_string(),
                 worktree_path: worktree_path.to_string(),
@@ -1877,7 +1885,10 @@ impl Database {
 
     fn authority_for_mode(cm: &ConvModeCols<'_>) -> AuthorityKind {
         match cm.kind {
-            "work" | "branch" => AuthorityKind::Work,
+            "direct" => AuthorityKind::Direct,
+            "work" | "branch" | "attached_work_child" | "detached_approved_task" => {
+                AuthorityKind::Work
+            }
             _ => AuthorityKind::RestrictedExplore,
         }
     }
@@ -6370,6 +6381,40 @@ impl Database {
         Ok(outcome)
     }
 
+    /// Return whether an approval-triggered request is still owed.
+    ///
+    /// The approval message's sequence binds the obligation to one request. A
+    /// later durable agent message proves the request produced output even if
+    /// its following state write was interrupted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] when the obligation query fails.
+    pub async fn has_pending_approval_request(&self, conversation_id: &str) -> DbResult<bool> {
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1
+                 FROM approval_request_obligations obligation
+                 WHERE obligation.conversation_id = ?1
+                         AND NOT EXISTS (
+                             SELECT 1
+                             FROM messages approval
+                             JOIN messages later
+                               ON later.conversation_id = approval.conversation_id
+                              AND later.message_type = 'agent'
+                              AND later.sequence_id > approval.sequence_id
+                             WHERE approval.message_id = obligation.approval_message_id
+                               AND approval.conversation_id = obligation.conversation_id
+                         )
+
+             )",
+        )
+        .bind(conversation_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(pending != 0)
+    }
+
     /// Update conversation state, stamping `state_updated_at = now()`.
     /// Callers that own the authoritative entry timestamp (the runtime
     /// executor) should use [`Self::update_conversation_state_at`] so the
@@ -6983,15 +7028,7 @@ impl Database {
             tx.rollback().await?;
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
-        let authority = match mode {
-            ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. } => {
-                AuthorityKind::RestrictedExplore
-            }
-            ConvMode::Direct
-            | ConvMode::Work { .. }
-            | ConvMode::Branch { .. }
-            | ConvMode::DetachedApprovedTask { .. } => AuthorityKind::Work,
-        };
+        let authority = Self::authority_for_mode(&cm);
         sqlx::query("UPDATE work_scopes SET authority_kind = ?1, updated_at = ?2 WHERE id = ?3")
             .bind(authority.as_str())
             .bind(&now)
@@ -7249,11 +7286,15 @@ impl Database {
     ///
     /// # Errors
     /// Returns [`DbError`] if the conversation has no attached scope or the snapshot conflicts.
+    #[allow(clippy::too_many_lines)]
     pub async fn persist_approved_task_authority(
         &self,
         conversation_id: &str,
         approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
-    ) -> DbResult<()> {
+        approval_message: &Message,
+        approved_state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> DbResult<LocalAuthorityResult<()>> {
         let snapshot = phoenix_core::task_handoff::ApprovedTaskSnapshot::from(approval);
         let priority = serde_json::to_string(&snapshot.priority)
             .map_err(|error| DbError::Serialization(error.to_string()))?;
@@ -7289,7 +7330,7 @@ impl Database {
         .bind(&snapshot.task_id)
         .bind(&snapshot.task_title)
         .bind(&snapshot.title)
-        .bind(priority)
+        .bind(&priority)
         .bind(&snapshot.plan)
         .bind(&snapshot.task_file)
         .bind(&snapshot.artifact_body)
@@ -7316,11 +7357,120 @@ impl Database {
         .bind(work_scope_id)
         .execute(&mut *tx)
         .await?;
-        tx.commit().await?;
-        Ok(())
+        insert_message_tx(&mut tx, approval_message).await?;
+        sqlx::query(
+            "INSERT INTO approval_request_obligations
+             (conversation_id, approval_message_id, created_at_us)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(conversation_id) DO UPDATE SET
+                 approval_message_id = excluded.approval_message_id,
+                 created_at_us = excluded.created_at_us",
+        )
+        .bind(conversation_id)
+        .bind(&approval_message.message_id)
+        .bind(approval_message.created_at.timestamp_micros())
+        .execute(&mut *tx)
+        .await?;
+        let state_json = serde_json::to_string(approved_state)
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let state_result = sqlx::query(
+            "UPDATE conversations
+             SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4
+             WHERE id = ?5",
+        )
+        .bind(&state_json)
+        .bind(conv_state_kind(approved_state))
+        .bind(state_updated_at.to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        if state_result.rows_affected() == 0 {
+            return Err(DbError::ConversationNotFound(conversation_id.to_string()));
+        }
+        match tx.commit().await {
+            Ok(()) => Ok(LocalAuthorityResult::DurableFactEstablished(())),
+            Err(commit_error) => {
+                let established = self
+                    .classify_approved_task_authority(
+                        conversation_id,
+                        &approval_message.message_id,
+                        &state_json,
+                        approved_state,
+                        state_updated_at,
+                        &snapshot,
+                        &priority,
+                    )
+                    .await;
+                match established {
+                    Ok(true) => Ok(LocalAuthorityResult::DurableFactEstablished(())),
+                    Ok(false) => Err(commit_error.into()),
+                    Err(_) => Ok(LocalAuthorityResult::DurableFactUnclassified),
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn classify_approved_task_authority(
+        &self,
+        conversation_id: &str,
+        approval_message_id: &str,
+        state_json: &str,
+        approved_state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+        snapshot: &phoenix_core::task_handoff::ApprovedTaskSnapshot,
+        priority: &str,
+    ) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                 SELECT 1
+                 FROM conversations conversation
+                 JOIN conversation_approved_task_objectives objective
+                   ON objective.conversation_id = conversation.id
+                 JOIN work_scope_approved_task_authorities authority
+                   ON authority.objective_conversation_id = conversation.id
+                  AND authority.work_scope_id = conversation.work_scope_id
+                 JOIN work_scopes scope
+                   ON scope.id = authority.work_scope_id
+                  AND scope.authority_kind = 'work'
+                 JOIN messages approval_message
+                   ON approval_message.message_id = ?2
+                  AND approval_message.conversation_id = conversation.id
+                 JOIN approval_request_obligations obligation
+                   ON obligation.conversation_id = conversation.id
+                  AND obligation.approval_message_id = approval_message.message_id
+                 WHERE conversation.id = ?1
+                   AND conversation.state = ?3
+                   AND conversation.state_kind = ?4
+                   AND conversation.state_updated_at = ?5
+                   AND objective.task_id = ?6
+                   AND objective.task_title = ?7
+                   AND objective.approved_title = ?8
+                   AND objective.approved_priority = ?9
+                   AND objective.approved_plan = ?10
+                   AND objective.approved_task_file = ?11
+                   AND objective.approved_artifact_body = ?12
+             )",
+        )
+        .bind(conversation_id)
+        .bind(approval_message_id)
+        .bind(state_json)
+        .bind(conv_state_kind(approved_state))
+        .bind(state_updated_at.to_rfc3339())
+        .bind(&snapshot.task_id)
+        .bind(&snapshot.task_title)
+        .bind(&snapshot.title)
+        .bind(priority)
+        .bind(&snapshot.plan)
+        .bind(&snapshot.task_file)
+        .bind(&snapshot.artifact_body)
+        .fetch_one(&self.pool)
+        .await
     }
 
     /// Create a fresh Work conversation and `ProductConversation` for an approved task.
+    /// Load the typed approved-task objective    /// Create a fresh Work conversation and `ProductConversation` for an approved task.
     /// Load the typed approved-task objective that currently grants this conversation write authority.
     ///
     /// # Errors
@@ -9073,15 +9223,7 @@ impl Database {
                         .await?;
                     }
 
-                    let authority = match mode {
-                        ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. } => {
-                            AuthorityKind::RestrictedExplore
-                        }
-                        ConvMode::Direct
-                        | ConvMode::Work { .. }
-                        | ConvMode::Branch { .. }
-                        | ConvMode::DetachedApprovedTask { .. } => AuthorityKind::Work,
-                    };
+                    let authority = Self::authority_for_mode(&cm);
                     sqlx::query(
                         "UPDATE work_scopes
                          SET authority_kind = ?1, updated_at = ?2
@@ -9550,6 +9692,7 @@ impl Database {
     /// # Panics
     ///
     /// Panics if persisted JSON columns cannot be (de)serialized.
+    #[allow(clippy::too_many_lines)]
     pub async fn reset_all_to_idle(&self) -> DbResult<()> {
         let now = Utc::now();
         let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
@@ -9639,6 +9782,21 @@ impl Database {
                              AND t.owns_conversation = 1
                              AND t.canonical_message_id IS NOT NULL
                              AND t.terminal_kind IS NULL
+                       )
+                       OR EXISTS (
+                           SELECT 1
+                           FROM approval_request_obligations approval
+                           WHERE approval.conversation_id = conversations.id
+                             AND NOT EXISTS (
+                                 SELECT 1
+                                 FROM messages approval_message
+                                 JOIN messages later
+                                   ON later.conversation_id = approval_message.conversation_id
+                                  AND later.message_type = 'agent'
+                                  AND later.sequence_id > approval_message.sequence_id
+                                 WHERE approval_message.message_id = approval.approval_message_id
+                                   AND approval_message.conversation_id = approval.conversation_id
+                             )
                        )
                        OR EXISTS (
                            SELECT 1
@@ -12081,6 +12239,15 @@ fn conv_mode_columns(mode: &ConvMode) -> ConvModeCols<'_> {
             task_title: None,
             next_taskmd_id_hint: None,
         },
+        ConvMode::AttachedWorkChild { worktree_path } => ConvModeCols {
+            kind: "attached_work_child",
+            branch_name: None,
+            worktree_path: Some(worktree_path.as_str()),
+            base_branch: None,
+            task_id: None,
+            task_title: None,
+            next_taskmd_id_hint: None,
+        },
         ConvMode::DetachedProductCreation {
             worktree_path,
             base_branch,
@@ -12161,6 +12328,14 @@ fn conv_mode_from_row(row: &SqliteRow, conv_id: &str) -> ConvMode {
                 }
             } else {
                 tracing::warn!(conv_id = %conv_id, "branch conv_mode row missing required fields, defaulting to Explore");
+                ConvMode::default()
+            }
+        }
+        Some("attached_work_child") => {
+            if let Some(worktree_path) = ne_env("env_worktree_path") {
+                ConvMode::AttachedWorkChild { worktree_path }
+            } else {
+                tracing::warn!(conv_id = %conv_id, "attached Work child row missing worktree, defaulting to Explore");
                 ConvMode::default()
             }
         }
@@ -14802,6 +14977,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn detached_approved_task_creation_metadata_preserves_work_authority() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_test_creation_job(&db, "job-approved-authority", "conv-approved-authority").await;
+        let claimed = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-approved".into()),
+                &CreationClaimToken("token-approved".into()),
+                Utc::now(),
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(job) = claimed else {
+            panic!("expected claim");
+        };
+        let CreationStatus::Claimed(claim) = job.protocol.status else {
+            panic!("expected claim authority");
+        };
+
+        let mode = ConvMode::DetachedApprovedTask {
+            worktree_path: NonEmptyString::new("/tmp/approved-task").unwrap(),
+            base_branch: NonEmptyString::new("main").unwrap(),
+            task_id: NonEmptyString::new("66005").unwrap(),
+            task_title: NonEmptyString::new("Approved task").unwrap(),
+        };
+        let outcome = db
+            .update_conversation_creation_metadata_and_mode(
+                "job-approved-authority",
+                &claim,
+                "conv-approved-authority",
+                &ConversationCreationMetadataUpdate {
+                    slug: None,
+                    title: None,
+                    cwd: Some("/tmp/approved-task".into()),
+                    project_id: None,
+                    desired_base_branch: None,
+                },
+                &mode,
+                "test-model",
+                CreationStage::ValidateIntent,
+                CreationStage::ResolveRepository,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, CreationCasOutcome::Applied);
+
+        let (authority, _, _) = db
+            .get_conversation_work_scope_context("conv-approved-authority")
+            .await
+            .unwrap();
+        assert_eq!(authority, AuthorityKind::Work);
+    }
+
+    #[tokio::test]
+    async fn direct_creation_metadata_preserves_direct_authority() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_test_creation_job(&db, "job-direct-authority", "conv-direct-authority").await;
+        let claimed = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-direct".into()),
+                &CreationClaimToken("token-direct".into()),
+                Utc::now(),
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(job) = claimed else {
+            panic!("expected claim");
+        };
+        let CreationStatus::Claimed(claim) = job.protocol.status else {
+            panic!("expected claim authority");
+        };
+
+        let outcome = db
+            .update_conversation_creation_metadata_and_mode(
+                "job-direct-authority",
+                &claim,
+                "conv-direct-authority",
+                &ConversationCreationMetadataUpdate {
+                    slug: None,
+                    title: None,
+                    cwd: Some("/tmp/direct-authority".into()),
+                    project_id: None,
+                    desired_base_branch: None,
+                },
+                &ConvMode::Direct,
+                "test-model",
+                CreationStage::ValidateIntent,
+                CreationStage::ResolveRepository,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, CreationCasOutcome::Applied);
+
+        let (authority, _, _) = db
+            .get_conversation_work_scope_context("conv-direct-authority")
+            .await
+            .unwrap();
+        assert_eq!(authority, AuthorityKind::Direct);
+    }
+
+    #[tokio::test]
     async fn stale_claim_cannot_commit_creation_metadata() {
         let db = Database::open_in_memory().await.unwrap();
         insert_test_creation_job(&db, "job-stale-metadata", "conv-stale-metadata").await;
@@ -17187,12 +17464,50 @@ mod tests {
     }
 
     #[test]
-    fn direct_mode_receives_restricted_authority() {
+    fn direct_mode_receives_direct_authority() {
         let cm = conv_mode_columns(&ConvMode::Direct);
-        assert_eq!(
-            Database::authority_for_mode(&cm),
-            AuthorityKind::RestrictedExplore
-        );
+        assert_eq!(Database::authority_for_mode(&cm), AuthorityKind::Direct);
+    }
+
+    #[test]
+    fn detached_approved_task_receives_work_authority() {
+        let mode = ConvMode::DetachedApprovedTask {
+            worktree_path: NonEmptyString::new("/tmp/approved-task").unwrap(),
+            base_branch: NonEmptyString::new("main").unwrap(),
+            task_id: NonEmptyString::new("66005").unwrap(),
+            task_title: NonEmptyString::new("Approved task").unwrap(),
+        };
+        let cm = conv_mode_columns(&mode);
+        assert_eq!(Database::authority_for_mode(&cm), AuthorityKind::Work);
+    }
+
+    #[tokio::test]
+    async fn all_direct_mode_writers_preserve_direct_authority() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation(
+            "direct-authority-writers",
+            "direct-authority-writers",
+            "/tmp/direct-authority-writers",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        db.update_conversation_mode_and_cwd(
+            "direct-authority-writers",
+            &ConvMode::Direct,
+            "/tmp/direct-authority-writers",
+        )
+        .await
+        .unwrap();
+
+        let (authority, _, _) = db
+            .get_conversation_work_scope_context("direct-authority-writers")
+            .await
+            .unwrap();
+        assert_eq!(authority, AuthorityKind::Direct);
     }
 
     #[tokio::test]
@@ -21409,6 +21724,102 @@ mod tests {
                 assert!(content.text.to_ascii_lowercase().contains("interrupted"));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn approval_request_obligation_survives_restart_only_until_progress() {
+        let db = Database::open_in_memory().await.unwrap();
+        let conversation_id = "approval-request-obligation";
+        db.create_conversation(conversation_id, conversation_id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let approval_message = Message {
+            message_id: "approval-request-message".to_string(),
+            conversation_id: conversation_id.to_string(),
+            sequence_id: 1,
+            message_type: MessageType::User,
+            content: MessageContent::User(UserContent::meta("approved")),
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+        let approval = phoenix_core::task_handoff::TaskApprovalHandoffData {
+            task_id: "12345".to_string(),
+            task_title: "Approval obligation".to_string(),
+            title: "Approval obligation".to_string(),
+            priority: phoenix_core::task_source::Priority::P0,
+            plan: "Plan".to_string(),
+            task_file: "tasks/12345-p0-ready--approval-obligation.md".to_string(),
+            artifact_body: "# Approval obligation\n".to_string(),
+        };
+        db.persist_approved_task_authority(
+            conversation_id,
+            &approval,
+            &approval_message,
+            &ConvState::LlmRequesting { attempt: 1 },
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+
+        db.reset_all_to_idle().await.unwrap();
+        assert!(matches!(
+            db.get_conversation(conversation_id).await.unwrap().state,
+            ConvState::LlmRequesting { attempt: 1 }
+        ));
+        assert!(db
+            .has_pending_approval_request(conversation_id)
+            .await
+            .unwrap());
+
+        db.add_message_with_seq(
+            "queued-user-message",
+            conversation_id,
+            2,
+            &MessageContent::User(UserContent::new("queued")),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.has_pending_approval_request(conversation_id)
+                .await
+                .unwrap(),
+            "a queued user message cannot settle the approval request"
+        );
+
+        db.add_message_with_seq(
+            "approval-response",
+            conversation_id,
+            3,
+            &MessageContent::agent(vec![phoenix_core::domain::llm_types::ContentBlock::text(
+                "done",
+            )]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!db
+            .has_pending_approval_request(conversation_id)
+            .await
+            .unwrap());
+        db.reset_all_to_idle().await.unwrap();
+        assert_eq!(
+            db.get_conversation(conversation_id).await.unwrap().state,
+            ConvState::Idle
+        );
+
+        db.update_conversation_state(conversation_id, &ConvState::LlmRequesting { attempt: 2 })
+            .await
+            .unwrap();
+        db.reset_all_to_idle().await.unwrap();
+        assert_eq!(
+            db.get_conversation(conversation_id).await.unwrap().state,
+            ConvState::Idle,
+            "the lifetime approved objective cannot own later requests"
+        );
     }
 
     #[tokio::test]
@@ -25690,6 +26101,83 @@ mod tests {
                 Some("/tmp/promoted-worktree".to_string())
             )
         );
+    }
+
+    #[tokio::test]
+    async fn approved_authority_and_post_approval_state_commit_together() {
+        use crate::retrieval::MessageRetriever;
+
+        let db = Database::open_in_memory().await.unwrap();
+        let conv_id = "atomic-approval-state";
+        db.create_conversation(
+            conv_id,
+            "atomic-approval-state",
+            "/tmp/atomic-approval-state",
+            true,
+            None,
+            Some("model"),
+        )
+        .await
+        .unwrap();
+        let approval = phoenix_core::task_handoff::TaskApprovalHandoffData {
+            task_id: "12345".to_string(),
+            task_title: "atomic-capability".to_string(),
+            title: "Atomic capability".to_string(),
+            priority: phoenix_core::task_source::Priority::P0,
+            plan: "Plan".to_string(),
+            task_file: "tasks/12345-p0-in-progress--atomic-capability.md".to_string(),
+            artifact_body: "Plan".to_string(),
+        };
+        let approved_state = ConvState::LlmRequesting { attempt: 1 };
+        let approval_message = Message {
+            message_id: "atomic-approval-message".to_string(),
+            conversation_id: conv_id.to_string(),
+            sequence_id: 1,
+            message_type: MessageType::User,
+            content: MessageContent::User(UserContent::meta("approved plan")),
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+
+        db.persist_approved_task_authority(
+            conv_id,
+            &approval,
+            &approval_message,
+            &approved_state,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+
+        let conversation = db.get_conversation(conv_id).await.unwrap();
+        assert_eq!(conversation.state, approved_state);
+        let messages = db.get_messages(conv_id).await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_id, approval_message.message_id);
+        assert_eq!(messages[0].sequence_id, approval_message.sequence_id);
+        let retrieved = db
+            .fts_retriever()
+            .retrieve(crate::retrieval::RetrievalRequest::natural_language(
+                "approved plan",
+                crate::retrieval::RetrievalScope::Conversations(vec![conv_id.to_string()]),
+                10,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(retrieved.len(), 1);
+        assert_eq!(retrieved[0].message_id, approval_message.message_id);
+        let (authority, _, _) = db
+            .get_conversation_work_scope_context(conv_id)
+            .await
+            .unwrap();
+        assert_eq!(authority, phoenix_core::work_scope::AuthorityKind::Work);
+        assert!(db
+            .get_approved_task_objective(conv_id)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(db.has_pending_approval_request(conv_id).await.unwrap());
     }
 
     /// Task 02667: a fresh DB's `conversations` table must not carry the

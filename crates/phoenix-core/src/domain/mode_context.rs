@@ -23,6 +23,8 @@ pub enum ModeContext {
         task_id: String,
         task_title: String,
     },
+    /// Write-capable sub-agent attached to its parent's isolated worktree.
+    AttachedWorkChild { worktree_path: String },
     /// Direct mode: full tool access, no lifecycle ceremony.
     Direct,
     /// Branch mode: work directly on an existing branch. No task file.

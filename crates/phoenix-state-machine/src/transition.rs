@@ -1837,7 +1837,6 @@ pub fn transition_parent(
                     priority: *priority,
                     plan: plan.clone(),
                 })
-                .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_state_change())
                 .with_effect(Effect::RequestLlm),
         ),
@@ -3640,6 +3639,40 @@ mod tests {
     }
 
     #[test]
+    fn same_conversation_approval_has_one_atomic_state_owner() {
+        let state = ConvState::AwaitingTaskApproval {
+            task_file: "tasks/12345-p1-ready--review.md".to_string(),
+            title: "Review".to_string(),
+            priority: phoenix_core::task_source::Priority::P1,
+            plan: "Check the result".to_string(),
+        };
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::TaskApprovalDecided {
+                outcome: TaskApprovalOutcome::Approved {
+                    handoff: TaskApprovalHandoff::ContinueInCurrentConversation,
+                },
+            },
+        )
+        .expect("task approval transitions");
+
+        assert!(matches!(
+            result.new_state,
+            ConvState::LlmRequesting { attempt: 1 }
+        ));
+        assert!(matches!(
+            result.effects.first(),
+            Some(Effect::ApproveTask { .. })
+        ));
+        assert!(!result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::PersistState)));
+        assert!(matches!(result.effects.last(), Some(Effect::RequestLlm)));
+    }
+
+    #[test]
     fn rejecting_task_approval_broadcasts_idle_before_agent_done() {
         let state = ConvState::AwaitingTaskApproval {
             task_file: "tasks/12345-p1-ready--review.md".to_string(),
@@ -4754,7 +4787,6 @@ mod tests {
             resource_scope: phoenix_core::work_scope::ResourceScopeKey::Work(
                 phoenix_core::work_scope::WorkScopeId::new(),
             ),
-            resource_authority: phoenix_core::work_scope::ResourceAuthority::Restricted,
             work_scope_worktree: None,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: phoenix_core::llm_language::LlmLanguage::default(),
@@ -4834,7 +4866,6 @@ mod tests {
             resource_scope: phoenix_core::work_scope::ResourceScopeKey::Work(
                 phoenix_core::work_scope::WorkScopeId::new(),
             ),
-            resource_authority: phoenix_core::work_scope::ResourceAuthority::Restricted,
             work_scope_worktree: None,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: phoenix_core::llm_language::LlmLanguage::default(),
@@ -5180,7 +5211,6 @@ mod tests {
             resource_scope: phoenix_core::work_scope::ResourceScopeKey::Work(
                 phoenix_core::work_scope::WorkScopeId::new(),
             ),
-            resource_authority: phoenix_core::work_scope::ResourceAuthority::Restricted,
             work_scope_worktree: None,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: phoenix_core::llm_language::LlmLanguage::default(),
@@ -5382,7 +5412,6 @@ mod tests {
             resource_scope: phoenix_core::work_scope::ResourceScopeKey::Work(
                 phoenix_core::work_scope::WorkScopeId::new(),
             ),
-            resource_authority: phoenix_core::work_scope::ResourceAuthority::Restricted,
             work_scope_worktree: None,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: phoenix_core::llm_language::LlmLanguage::default(),
@@ -5447,7 +5476,6 @@ mod tests {
             resource_scope: phoenix_core::work_scope::ResourceScopeKey::Work(
                 phoenix_core::work_scope::WorkScopeId::new(),
             ),
-            resource_authority: phoenix_core::work_scope::ResourceAuthority::Restricted,
             work_scope_worktree: None,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: phoenix_core::llm_language::LlmLanguage::default(),
@@ -5519,7 +5547,6 @@ mod tests {
             resource_scope: phoenix_core::work_scope::ResourceScopeKey::Work(
                 phoenix_core::work_scope::WorkScopeId::new(),
             ),
-            resource_authority: phoenix_core::work_scope::ResourceAuthority::Restricted,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: phoenix_core::llm_language::LlmLanguage::default(),
             persona: None,

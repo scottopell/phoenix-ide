@@ -71,6 +71,7 @@ pub(crate) async fn resolve_resource_authority(
                     ResourceAuthority::Restricted
                 }
                 ConvMode::Direct
+                | ConvMode::AttachedWorkChild { .. }
                 | ConvMode::Work { .. }
                 | ConvMode::Branch { .. }
                 | ConvMode::DetachedApprovedTask { .. } => ResourceAuthority::Work,
@@ -114,6 +115,19 @@ pub(crate) mod tests {
             plan: "Execute it".to_string(),
             task_file: "tasks/12345-p1-in-progress--approved-objective.md".to_string(),
             artifact_body: "# Approved objective".to_string(),
+        }
+    }
+
+    pub(crate) fn approval_message(conversation_id: &str) -> crate::db::Message {
+        crate::db::Message {
+            message_id: format!("approval-{conversation_id}"),
+            conversation_id: conversation_id.to_string(),
+            sequence_id: 1,
+            message_type: crate::db::MessageType::User,
+            content: crate::db::MessageContent::User(crate::db::UserContent::meta("approved")),
+            display_data: None,
+            usage_data: None,
+            created_at: chrono::Utc::now(),
         }
     }
 
@@ -192,18 +206,36 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn attached_explore_subagent_stays_restricted_on_work_scope() {
+    async fn persisted_child_mode_distinguishes_work_from_explore_authority() {
         let db = Database::open_in_memory().await.unwrap();
         let parent_id = uuid::Uuid::new_v4().to_string();
         db.create_conversation(&parent_id, "parent", "/tmp", true, None, None)
             .await
             .unwrap();
-        db.persist_approved_task_authority(&parent_id, &approval())
-            .await
-            .unwrap();
+        db.update_conversation_mode_and_cwd(
+            &parent_id,
+            &ConvMode::Explore {
+                worktree_path: Some(
+                    phoenix_core::domain::db_schema::NonEmptyString::new("/tmp").unwrap(),
+                ),
+                next_taskmd_id_hint: None,
+            },
+            "/tmp",
+        )
+        .await
+        .unwrap();
+        db.persist_approved_task_authority(
+            &parent_id,
+            &approval(),
+            &approval_message(&parent_id),
+            &phoenix_core::domain::sm_state::ConvState::Idle,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
         let parent = db.get_conversation(&parent_id).await.unwrap();
         let scope = parent.attached_work_scope_id.clone().unwrap();
-        let child = db
+        let explore_child = db
             .create_subagent_conversation(
                 "attached-explore-child",
                 "attached-explore-child",
@@ -219,10 +251,38 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
+        let work_child = db
+            .create_subagent_conversation(
+                "attached-work-child",
+                "attached-work-child",
+                "/tmp",
+                &parent_id,
+                "gpt-5.4",
+                &ConvMode::AttachedWorkChild {
+                    worktree_path: phoenix_core::domain::db_schema::NonEmptyString::new("/tmp")
+                        .unwrap(),
+                },
+                phoenix_core::llm_language::LlmLanguage::default(),
+                Some(&scope),
+            )
+            .await
+            .unwrap();
 
-        let resolved = resolve_resource_authority(&db, &child).await.unwrap();
-        assert_eq!(resolved.scope, ResourceScopeKey::Work(scope));
-        assert_eq!(resolved.authority, ResourceAuthority::Restricted);
+        let explore = resolve_resource_authority(&db, &explore_child)
+            .await
+            .unwrap();
+        assert_eq!(explore.scope, ResourceScopeKey::Work(scope.clone()));
+        assert_eq!(explore.authority, ResourceAuthority::Restricted);
+
+        let reloaded_work_child = db.get_conversation(&work_child.id).await.unwrap();
+        assert!(matches!(
+            reloaded_work_child.conv_mode,
+            ConvMode::AttachedWorkChild { ref worktree_path }
+                if worktree_path.as_str() == "/tmp"
+        ));
+        let work = resolve_resource_authority(&db, &work_child).await.unwrap();
+        assert_eq!(work.scope, ResourceScopeKey::Work(scope));
+        assert_eq!(work.authority, ResourceAuthority::Work);
     }
 
     #[tokio::test]
@@ -243,9 +303,15 @@ pub(crate) mod tests {
         let restricted = resolve_resource_authority(&db, &before).await.unwrap();
         assert_eq!(restricted.authority, ResourceAuthority::Restricted);
 
-        db.persist_approved_task_authority(id.as_str(), &approval())
-            .await
-            .unwrap();
+        db.persist_approved_task_authority(
+            id.as_str(),
+            &approval(),
+            &approval_message(id.as_str()),
+            &phoenix_core::domain::sm_state::ConvState::Idle,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
         let after = db.get_conversation(id.as_str()).await.unwrap();
         assert!(matches!(after.conv_mode, ConvMode::Explore { .. }));
         let promoted = resolve_resource_authority(&db, &after).await.unwrap();

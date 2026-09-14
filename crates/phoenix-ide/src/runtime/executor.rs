@@ -23,7 +23,7 @@ use super::{
     TaskApprovalHandoffRequest,
 };
 
-use crate::db::{MessageContent, ToolOutcome, ToolResult};
+use crate::db::{Message, MessageContent, MessageType, ToolOutcome, ToolResult};
 use crate::state_machine::outcome::{EffectOutcome, LlmOutcome, ToolExecOutcome};
 use crate::state_machine::state::{
     SubAgentMode, SubAgentOutcome, SubAgentResult, ToolCall, ToolInput,
@@ -647,6 +647,7 @@ async fn forward_tool_outcome(
 async fn execute_tool_to_outcome<S, T>(
     storage: S,
     tool_executor: Arc<T>,
+    capability_generation: crate::runtime::traits::ToolCapabilityGeneration,
     checked: crate::runtime::deny_gate::CheckedToolCall,
     tool_ctx: ToolContext,
     cancel_token_check: &CancellationToken,
@@ -680,10 +681,18 @@ where
     tracing::info!(parent: &span, conv_id = %conv_id, tool = %tool_name, id = %tool_use_id, "Executing tool");
     let tool_start = std::time::Instant::now();
 
-    let output = tool_executor
-        .execute(checked, tool_ctx)
+    let output = match tool_executor
+        .execute_at_generation(capability_generation, checked, tool_ctx)
         .instrument(span.clone())
-        .await;
+        .await
+    {
+        Ok(output) => output,
+        Err(error) => {
+            span.record("outcome", "stale_capability");
+            tracing::warn!(parent: &span, %error, "Rejected stale tool capability generation");
+            return ToolExecOutcome::Failed { tool_use_id, error };
+        }
+    };
 
     if cancel_token_check.is_cancelled() {
         span.record("outcome", "aborted");
@@ -952,7 +961,12 @@ mod grace_response_admission_tests {
 async fn forward_llm_outcome(
     llm_rx: oneshot::Receiver<LlmOutcome>,
     generation: u64,
-    llm_outcome_tx: mpsc::Sender<(u64, LlmOutcome)>,
+    capability_generation: crate::runtime::traits::ToolCapabilityGeneration,
+    llm_outcome_tx: mpsc::Sender<(
+        u64,
+        crate::runtime::traits::ToolCapabilityGeneration,
+        LlmOutcome,
+    )>,
 ) {
     let llm_outcome = match llm_rx.await {
         Ok(llm_outcome) => llm_outcome,
@@ -967,7 +981,9 @@ async fn forward_llm_outcome(
             }
         }
     };
-    let _ = llm_outcome_tx.send((generation, llm_outcome)).await;
+    let _ = llm_outcome_tx
+        .send((generation, capability_generation, llm_outcome))
+        .await;
 }
 
 /// The outcome of planning a stale tool-result clearing sweep over one
@@ -1512,8 +1528,8 @@ enum CreationSettlementDisposition {
     StaleAuthority,
 }
 
-#[derive(Debug)]
-struct ProposedDirectTurnState {
+#[derive(Debug, Clone)]
+struct ProposedAuthoritativeState {
     state: ConvState,
     updated_at: DateTime<Utc>,
 }
@@ -1616,11 +1632,6 @@ where
     llm_client: Arc<L>,
     tool_executor: Arc<T>,
     coordinator_read_service: Option<crate::api::global_read::GlobalReadService>,
-    /// Names of tools whose stale results may be cleared (specs/stale-tool-results).
-    /// Static for the conversation's tool set, so it is computed once and only
-    /// recomputed on the Explore→Work upgrade, avoiding a registry lock +
-    /// `HashSet` rebuild on every LLM dispatch.
-    clearable_names: Arc<std::collections::HashSet<String>>,
     /// In-memory mirror of the durable clear watermark (specs/stale-tool-results).
     /// This runtime is the sole writer of its conversation's watermark, so the
     /// cache is authoritative after any successful read/write; a transient
@@ -1697,8 +1708,16 @@ where
     /// outcome to `process_outcome` only when the generation is still current.
     /// The epoch tag stays executor-side and
     /// never leaks into the pure `EffectOutcome` type.
-    llm_outcome_tx: mpsc::Sender<(u64, LlmOutcome)>,
-    llm_outcome_rx: mpsc::Receiver<(u64, LlmOutcome)>,
+    llm_outcome_tx: mpsc::Sender<(
+        u64,
+        crate::runtime::traits::ToolCapabilityGeneration,
+        LlmOutcome,
+    )>,
+    llm_outcome_rx: mpsc::Receiver<(
+        u64,
+        crate::runtime::traits::ToolCapabilityGeneration,
+        LlmOutcome,
+    )>,
     terminal_transition_retry: Option<TerminalTransitionRetry>,
     terminal_settlement_attempt: TerminalSettlementAttempt,
     /// Generation/epoch tag for the in-flight tool task, mirroring
@@ -1822,7 +1841,7 @@ where
     local_terminal_authority: LocalTerminalAuthority,
     direct_turn_cancellation_initiated: bool,
     direct_turn_materialization_aborted: bool,
-    proposed_direct_turn_state: Option<ProposedDirectTurnState>,
+    proposed_authoritative_state: Option<ProposedAuthoritativeState>,
     fatal_local_authority_fence: Arc<crate::runtime::FatalLocalAuthorityFence>,
     handoff_completion_authority: Option<crate::runtime::AdmittedOperation>,
     handoff_completion_timestamp: Option<DateTime<Utc>>,
@@ -1898,14 +1917,16 @@ where
         // oneshot channels; forwarders stamp the dispatch generation and relay
         // them here, where the select loop discards superseded outcomes before
         // routing live ones into `process_outcome`.
-        let (llm_outcome_tx, llm_outcome_rx) = mpsc::channel::<(u64, LlmOutcome)>(64);
+        let (llm_outcome_tx, llm_outcome_rx) = mpsc::channel::<(
+            u64,
+            crate::runtime::traits::ToolCapabilityGeneration,
+            LlmOutcome,
+        )>(64);
         let (tool_outcome_tx, tool_outcome_rx) = mpsc::channel::<(u64, ToolExecOutcome)>(64);
         let (retry_outcome_tx, retry_outcome_rx) = mpsc::channel::<(u64, u32)>(64);
         let (_acknowledged_event_tx, acknowledged_event_rx) = mpsc::channel(1);
 
         let tool_executor = Arc::new(tool_executor);
-        let clearable_names = Arc::new(tool_executor.clearable_tool_names());
-
         Self {
             context,
             state,
@@ -1916,7 +1937,6 @@ where
             llm_client: Arc::new(llm_client),
             tool_executor,
             coordinator_read_service: None,
-            clearable_names,
             clear_watermark_cache: Arc::new(std::sync::Mutex::new(None)),
             active_prompt_projection: None,
             browser_sessions,
@@ -1970,7 +1990,7 @@ where
             grace_turn_started_at: None,
             parent_tool_cycle_count: 0,
             direct_turn_materialization_aborted: false,
-            proposed_direct_turn_state: None,
+            proposed_authoritative_state: None,
             fatal_local_authority_fence: crate::runtime::FatalLocalAuthorityFence::new(),
             handoff_completion_authority: None,
             handoff_completion_timestamp: None,
@@ -2428,8 +2448,8 @@ where
                         return RuntimeExitDisposition::Terminal;
                     }
                 }
-                Some((generation, llm_outcome)) = self.llm_outcome_rx.recv() => {
-                    self.process_generation_tagged_llm_outcome(generation, llm_outcome)
+                Some((generation, capability_generation, llm_outcome)) = self.llm_outcome_rx.recv() => {
+                    self.process_generation_tagged_llm_outcome(generation, capability_generation, llm_outcome)
                         .await;
                     // FM-5 prevention: terminal states exit the loop explicitly.
                     if let StepResult::Terminal(outcome) = self.state.step_result() {
@@ -2625,12 +2645,18 @@ where
     async fn process_generation_tagged_llm_outcome(
         &mut self,
         generation: u64,
+        capability_generation: crate::runtime::traits::ToolCapabilityGeneration,
         llm_outcome: LlmOutcome,
     ) {
-        if self.llm_outcome_is_stale(generation) {
+        let current_capability = self.tool_executor.capability_snapshot();
+        if self.llm_outcome_is_stale(generation)
+            || capability_generation != current_capability.generation
+        {
             tracing::debug!(
                 outcome_generation = generation,
                 current_generation = self.llm_request_generation,
+                outcome_capability_generation = capability_generation.value(),
+                current_capability_generation = current_capability.generation.value(),
                 state = self.state.variant_name(),
                 "Ignoring stale LLM outcome — request superseded (abort/new dispatch)"
             );
@@ -3175,7 +3201,7 @@ where
     ) -> Result<Vec<Event>, String> {
         let mut generated_events = Vec::new();
         self.direct_turn_materialization_aborted = false;
-        self.proposed_direct_turn_state = None;
+        self.proposed_authoritative_state = None;
         self.continuation_effect_disposition = ContinuationEffectDisposition::Continue;
         let terminal_subagent_transition = self.context.is_sub_agent
             && matches!(result.new_state.step_result(), StepResult::Terminal(_));
@@ -3205,13 +3231,22 @@ where
             .effects
             .iter()
             .any(|effect| matches!(effect, Effect::PersistAuthoritativeUserMessage { .. }));
+        let is_task_approval_adoption = result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::ApproveTask { .. }));
         let old_state = self.state.clone();
         let will_settle_active_direct_turn =
             self.active_direct_turn.is_some() && self.pending_direct_turn_terminal.is_some();
         if is_direct_turn_adoption {
-            self.proposed_direct_turn_state = Some(ProposedDirectTurnState {
+            self.proposed_authoritative_state = Some(ProposedAuthoritativeState {
                 state: result.new_state.clone(),
                 updated_at: Utc::now(),
+            });
+        } else if is_task_approval_adoption {
+            self.proposed_authoritative_state = Some(ProposedAuthoritativeState {
+                state: result.new_state.clone(),
+                updated_at: self.state_updated_at,
             });
         } else {
             let state_changed = result.new_state != old_state;
@@ -4818,15 +4853,11 @@ where
         }
 
         // --- Mode validation and one-writer constraint (REQ-PROJ-008) ---
-        let parent_allows_work = match self.context.mode_context.as_ref() {
-            Some(
-                ModeContext::Work { .. }
-                | ModeContext::Direct
-                | ModeContext::Branch { .. }
-                | ModeContext::DetachedApprovedTask { .. },
-            ) => true,
-            Some(ModeContext::Explore { .. }) | None => false,
-        };
+        let capability = self.tool_executor.capability_snapshot();
+        let parent_allows_work = matches!(
+            capability.authority,
+            crate::work_scope::ResourceAuthority::Work
+        );
 
         let mut work_count_in_batch = 0u32;
         for &(_, mode) in &resolved_tasks {
@@ -4834,9 +4865,8 @@ where
                 if !parent_allows_work {
                     let result = ToolResult::error(
                         tool_use_id.clone(),
-                        "Work sub-agents require the parent to be in a write-capable mode \
-                         (Work, Branch, or Direct). Use mode: \"explore\" or omit mode \
-                         for read-only sub-agents."
+                        "Work sub-agents require Work authority on the parent WorkScope. \
+                         Use mode: \"explore\" or omit mode for read-only sub-agents."
                             .to_string(),
                     );
                     return Ok(Some(Event::ToolComplete {
@@ -4882,14 +4912,7 @@ where
         // Direct parents have no worktree to scope against -- writes there
         // are unscoped by design -- so the check only fires for parents
         // that own a worktree (Work/Branch).
-        let parent_worktree_path: Option<&str> = match self.context.mode_context.as_ref() {
-            Some(
-                ModeContext::Work { worktree_path, .. }
-                | ModeContext::Branch { worktree_path, .. }
-                | ModeContext::DetachedApprovedTask { worktree_path, .. },
-            ) => Some(worktree_path.as_str()),
-            _ => None,
-        };
+        let parent_worktree_path = self.context.work_scope_worktree.as_deref();
         // Resolve and validate every spec BEFORE sending any spawn request.
         // Model validation can fail per-task; doing it inside the send loop
         // would leave earlier tasks already spawned (and untracked, since the
@@ -4931,15 +4954,17 @@ where
             };
 
             if mode == SubAgentMode::Work
-                && parent_worktree_path.is_some_and(|root| !path_is_within(&cwd, root))
+                && parent_worktree_path
+                    .is_some_and(|root| !path_is_within(&cwd, &root.to_string_lossy()))
             {
                 let worktree_root = parent_worktree_path.expect("checked as present");
                 let result = ToolResult::error(
                     tool_use_id.clone(),
                     format!(
                         "Work sub-agent cwd '{cwd}' must be inside the parent's worktree \
-                         '{worktree_root}'. Omit `cwd` to inherit the worktree, or pass a path \
-                         that resolves under it."
+                         '{}'. Omit `cwd` to inherit the worktree, or pass a path that \
+                         resolves under it.",
+                        worktree_root.display()
                     ),
                 );
                 return Ok(Some(Event::ToolComplete {
@@ -5294,14 +5319,14 @@ where
                     sequence_id: reserved_seqs[0],
                     created_at: phoenix_workflow::Timestamp(now),
                     accepted_state: self
-                        .proposed_direct_turn_state
+                        .proposed_authoritative_state
                         .as_ref()
                         .map(|proposed| proposed.state.clone())
                         .ok_or_else(|| {
                             "authoritative materialization missing proposed state".to_string()
                         })?,
                     state_updated_at: self
-                        .proposed_direct_turn_state
+                        .proposed_authoritative_state
                         .as_ref()
                         .map(|proposed| proposed.updated_at)
                         .ok_or_else(|| {
@@ -5350,7 +5375,7 @@ where
                         active,
                     } => {
                         let proposed = self
-                            .proposed_direct_turn_state
+                            .proposed_authoritative_state
                             .take()
                             .ok_or_else(|| "committed direct turn missing proposed state".to_string())?;
                         self.state = proposed.state;
@@ -5368,12 +5393,12 @@ where
                     | crate::runtime::traits::AuthoritativeUserMessageMaterialization::NotCommitted
                     | crate::runtime::traits::AuthoritativeUserMessageMaterialization::StaleAuthority
                     | crate::runtime::traits::AuthoritativeUserMessageMaterialization::CommandRejected => {
-                        self.proposed_direct_turn_state = None;
+                        self.proposed_authoritative_state = None;
                         self.direct_turn_materialization_aborted = true;
                         Ok(None)
                     }
                     crate::runtime::traits::AuthoritativeUserMessageMaterialization::DurableFactUnclassified => {
-                        self.proposed_direct_turn_state = None;
+                        self.proposed_authoritative_state = None;
                         Err("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:direct_turn_materialization"
                             .to_string())
                     }
@@ -6820,6 +6845,7 @@ where
         // Refresh and render now, before any provider task exists, so scheduling
         // cannot admit later steering into this request.
         self.refresh_active_prompt_projection().await?;
+        let capability = self.tool_executor.capability_snapshot();
         let frozen_messages = assemble_cleared_messages(
             &self.storage,
             &self.context.conversation_id,
@@ -6829,7 +6855,7 @@ where
                 .expect("projection refreshed above")
                 .messages,
             None,
-            &self.clearable_names,
+            &capability.clearable_names,
             self.context.context_window,
             &self.clear_watermark_cache,
         )
@@ -6850,6 +6876,7 @@ where
         // intentional `Effect::AbortLlm`.
         self.llm_request_generation = self.llm_request_generation.wrapping_add(1);
         let dispatch_generation = self.llm_request_generation;
+        let capability_generation = capability.generation;
         let llm_outcome_tx = self.llm_outcome_tx.clone();
 
         let llm_client = self.llm_client.clone();
@@ -6894,11 +6921,6 @@ where
         let tasks_dir_name = self.context.tasks_dir_name.clone();
         let is_sub_agent = self.context.is_sub_agent;
         let mode_context = self.context.mode_context.clone();
-        let has_approved_task_write_authority =
-            matches!(
-                self.context.resource_authority,
-                crate::work_scope::ResourceAuthority::Work
-            ) && matches!(mode_context, Some(ModeContext::Explore { .. }));
         let llm_language = self.context.llm_language;
         let persona = self.context.persona.clone();
         let is_coordinator = self.context.is_coordinator;
@@ -6928,14 +6950,15 @@ where
         // Freeze the complete provider request before any provider or forwarding
         // task is spawned. Tool definitions, AGENTS-backed system prompt, and the
         // optional Coordinator capsule are request authority, not task-local inputs.
-        let available_tools = tool_executor.definitions_for_language(llm_language).await;
-        let explore_bash_capability =
-            if matches!(mode_context.as_ref(), Some(ModeContext::Explore { .. })) {
-                explore_bash
-            } else {
-                phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable
-            };
-        let mut system_prompt = if is_coordinator {
+        let available_tools = tool_executor
+            .definitions_for_generation(capability_generation, llm_language)
+            .await?;
+        let explore_bash_capability = crate::system_prompt::explore_bash_prompt_capability(
+            capability.authority,
+            mode_context.as_ref(),
+            explore_bash,
+        );
+        let system_prompt = if is_coordinator {
             crate::system_prompt::build_coordinator_system_prompt(llm_language)
         } else {
             build_system_prompt(
@@ -6950,11 +6973,6 @@ where
                 explore_bash_capability,
             )
         };
-        if has_approved_task_write_authority {
-            system_prompt.push_str(
-                "\n\nThe conversation mode remains Explore, but the approved-task objective on its attached WorkScope grants full write authority. Execute that approved task with the available write tools; do not propose another plan merely because the mode label is Explore.",
-            );
-        }
         let tools = request_tool_surface.callable_tools(available_tools);
         let callable_tool_names: std::collections::HashSet<&str> =
             tools.iter().map(|tool| tool.name.as_str()).collect();
@@ -7203,6 +7221,7 @@ where
         tokio::spawn(forward_llm_outcome(
             llm_rx,
             dispatch_generation,
+            capability_generation,
             llm_outcome_tx,
         ));
 
@@ -7353,6 +7372,8 @@ where
         // dispatch or an intentional `Effect::AbortTool` / backstop teardown.
         self.tool_request_generation = self.tool_request_generation.wrapping_add(1);
         let dispatch_generation = self.tool_request_generation;
+        let capability = self.tool_executor.capability_snapshot();
+        let capability_generation = capability.generation;
         let tool_outcome_tx = self.tool_outcome_tx.clone();
 
         // Create cancellation token for this tool execution
@@ -7400,7 +7421,7 @@ where
                 self.tmux_registry.clone(),
                 scope_worktree,
                 self.context.resource_scope.clone(),
-                self.context.resource_authority,
+                capability.authority,
             ),
             phoenix_core::domain::sm_state::ConversationExecutionEnvironment::NoFilesystem => {
                 ToolContext::new_without_filesystem(
@@ -7464,6 +7485,7 @@ where
             let tool_outcome = execute_tool_to_outcome(
                 storage,
                 tool_executor,
+                capability_generation,
                 checked,
                 tool_ctx,
                 &cancel_token_check,
@@ -8122,6 +8144,7 @@ where
         let mut continuation_prompt = policy.instruction(&rejected_tool_calls);
         continuation_prompt.push_str(&history.selection_notice(&conv_id));
         let system_prompt = policy.system_prompt();
+        let capability = self.tool_executor.capability_snapshot();
         let frozen_messages = assemble_cleared_messages(
             &self.storage,
             &conv_id,
@@ -8130,7 +8153,7 @@ where
                 .handoff
                 .as_ref()
                 .map(|handoff| handoff.message_id.as_str()),
-            &self.clearable_names,
+            &capability.clearable_names,
             context_window,
             &self.clear_watermark_cache,
         )
@@ -8403,6 +8426,11 @@ where
         plan: String,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<(), String> {
+        let proposed_state = self
+            .proposed_authoritative_state
+            .as_ref()
+            .map(|proposed| proposed.state.clone())
+            .ok_or_else(|| "task approval missing proposed state".to_string())?;
         if matches!(
             self.context.mode_context.as_ref(),
             Some(ModeContext::DetachedApprovedTask { .. })
@@ -8424,24 +8452,53 @@ where
                 priority,
                 plan,
             );
-            let msg_id = uuid::Uuid::new_v4().to_string();
-            let content = MessageContent::User(crate::db::UserContent::meta(&approval_msg));
-            let seq = self.broadcast_tx.next_seq();
-            let msg = self
+            let approval_message = Message {
+                message_id: uuid::Uuid::new_v4().to_string(),
+                conversation_id: self.context.conversation_id.clone(),
+                sequence_id: self.broadcast_tx.next_seq(),
+                message_type: MessageType::User,
+                content: MessageContent::User(crate::db::UserContent::meta(&approval_msg)),
+                display_data: None,
+                usage_data: None,
+                created_at: chrono::Utc::now(),
+            };
+            let adopted_at = Utc::now();
+            let establishment = self
                 .storage
-                .add_message_with_seq(
-                    &msg_id,
+                .persist_approved_task_authority(
                     &self.context.conversation_id,
-                    seq,
-                    &content,
-                    None,
-                    None,
+                    &TaskApprovalHandoffData {
+                        task_id: reviewed.task_id,
+                        task_title: reviewed.task_title,
+                        title,
+                        priority,
+                        plan,
+                        task_file: reviewed.task_file,
+                        artifact_body: reviewed.artifact_body,
+                    },
+                    &approval_message,
+                    &proposed_state,
+                    adopted_at,
                 )
-                .await?;
+                .await
+                .inspect_err(|_| {
+                    self.recovery_disposition = RuntimeRecoveryDisposition::RecreateFromDatabase;
+                })?;
+            if matches!(
+                establishment,
+                crate::db::LocalAuthorityResult::DurableFactUnclassified
+            ) {
+                admitted.close("task_approval_authority_establishment");
+                self.recovery_disposition = RuntimeRecoveryDisposition::RecreateFromDatabase;
+                return Err("approval authority establishment is unclassified".to_string());
+            }
             let _ = self
                 .broadcast_tx
                 .admitted_publication(admitted)
-                .persisted_message(msg);
+                .persisted_message(approval_message);
+            self.state = proposed_state;
+            self.state_updated_at = adopted_at;
+            self.publish_live_state_admitted();
             return Ok(());
         }
         let cwd = self.context.filesystem_root().to_path_buf();
@@ -8460,8 +8517,9 @@ where
 
         // Run blocking git/fs operations on a blocking thread.
         let blocking_admission = admitted.reborrow();
-        let result =
-            crate::runtime::creation_worker::run_admitted_blocking(blocking_admission, move || {
+        let result = match crate::runtime::creation_worker::run_admitted_blocking(
+            blocking_admission,
+            move || {
                 execute_approve_task_blocking_reviewed(
                     &cwd,
                     &repo_root,
@@ -8473,13 +8531,42 @@ where
                     &plan,
                     desired_base_branch.as_deref(),
                 )
-            })
-            .await
-            .map_err(|e| format!("Task approval join error: {e}"))?;
+            },
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                self.recovery_disposition = RuntimeRecoveryDisposition::RecreateFromDatabase;
+                return Err(format!("Task approval join error: {error}"));
+            }
+        };
 
         match result {
             Ok(approval_result) => {
-                storage
+                let branch_msg = format!(
+                    "Task approved. You are on branch {} in {}.\n\n\
+                     ## Approved plan: {}\n\n\
+                     Priority: {}\n\n\
+                     {}",
+                    approval_result.branch_name,
+                    approval_result.worktree_path,
+                    title_backup,
+                    priority_backup,
+                    plan_backup,
+                );
+                let approval_message = Message {
+                    message_id: uuid::Uuid::new_v4().to_string(),
+                    conversation_id: self.context.conversation_id.clone(),
+                    sequence_id: self.broadcast_tx.next_seq(),
+                    message_type: MessageType::User,
+                    content: MessageContent::User(crate::db::UserContent::meta(&branch_msg)),
+                    display_data: None,
+                    usage_data: None,
+                    created_at: chrono::Utc::now(),
+                };
+                let adopted_at = Utc::now();
+                let persist_result = storage
                     .persist_approved_task_authority(
                         &self.context.conversation_id,
                         &TaskApprovalHandoffData {
@@ -8491,15 +8578,43 @@ where
                             task_file: task_file_backup.clone(),
                             artifact_body: approval_result.artifact_body.clone(),
                         },
+                        &approval_message,
+                        &proposed_state,
+                        adopted_at,
                     )
-                    .await?;
-                self.context.resource_authority = crate::work_scope::ResourceAuthority::Work;
-
-                // Upgrade tool registry from Explore to Work mode so the agent
-                // gets bash, patch, etc. for the rest of this conversation.
-                self.tool_executor.upgrade_to_work_mode();
-                // The tool set changed, so refresh the cached clearable-tool set.
-                self.clearable_names = Arc::new(self.tool_executor.clearable_tool_names());
+                    .await;
+                match persist_result {
+                    Ok(crate::db::LocalAuthorityResult::DurableFactEstablished(())) => {}
+                    Ok(crate::db::LocalAuthorityResult::DurableFactUnclassified) => {
+                        admitted.close("task_approval_authority_establishment");
+                        self.recovery_disposition =
+                            RuntimeRecoveryDisposition::RecreateFromDatabase;
+                        return Err("approval authority establishment is unclassified".to_string());
+                    }
+                    Err(error) => {
+                        self.recovery_disposition =
+                            RuntimeRecoveryDisposition::RecreateFromDatabase;
+                        return Err(error);
+                    }
+                }
+                // Build the fallible Work tool surface before publishing Work to
+                // the actor context. A failed rebuild leaves every live consumer
+                // Restricted and stops the post-approval turn.
+                let tool_capability = match self.tool_executor.upgrade_to_work_mode().await {
+                    Ok(tool_capability) => tool_capability,
+                    Err(error) => {
+                        self.recovery_disposition =
+                            RuntimeRecoveryDisposition::RecreateFromDatabase;
+                        return Err(error);
+                    }
+                };
+                tracing::info!(
+                    conv_id = %self.context.conversation_id,
+                    work_scope = %self.context.resource_scope,
+                    authority = "work",
+                    capability_generation = tool_capability.generation.value(),
+                    "Published approved WorkScope capability projection"
+                );
 
                 tracing::info!(
                     task_id = %approval_result.task_id,
@@ -8514,35 +8629,10 @@ where
                 // Work registry), so this message carries the plan forward. Must be the
                 // last message before the next LLM call to avoid ending on an assistant
                 // message (Anthropic rejects trailing assistant as "prefill").
-                let branch_msg = format!(
-                    "Task approved. You are on branch {} in {}.\n\n\
-                     ## Approved plan: {}\n\n\
-                     Priority: {}\n\n\
-                     {}",
-                    approval_result.branch_name,
-                    approval_result.worktree_path,
-                    title_backup,
-                    priority_backup,
-                    plan_backup,
-                );
-                let msg_id = uuid::Uuid::new_v4().to_string();
-                let content = MessageContent::User(crate::db::UserContent::meta(&branch_msg));
-                let seq = self.broadcast_tx.next_seq();
-                let msg = self
-                    .storage
-                    .add_message_with_seq(
-                        &msg_id,
-                        &self.context.conversation_id,
-                        seq,
-                        &content,
-                        None,
-                        None,
-                    )
-                    .await?;
                 let _ = self
                     .broadcast_tx
                     .admitted_publication(admitted)
-                    .persisted_message(msg);
+                    .persisted_message(approval_message);
 
                 // Approval changes write authority, not the conversation mode.
                 let (branch_name, conv_mode_label) = match self.context.mode_context.as_ref() {
@@ -8553,6 +8643,7 @@ where
                         (Some(branch_name.clone()), "Branch")
                     }
                     Some(ModeContext::Explore { .. }) => (None, "Explore"),
+                    Some(ModeContext::AttachedWorkChild { .. }) => (None, "Work Child"),
                     Some(ModeContext::DetachedApprovedTask { .. }) => (None, "Approved Task"),
                     Some(ModeContext::Direct) | None => (None, "Direct"),
                 };
@@ -8579,6 +8670,9 @@ where
                         },
                     });
 
+                self.state = proposed_state;
+                self.state_updated_at = adopted_at;
+                self.publish_live_state_admitted();
                 Ok(())
             }
             Err(e) => {
@@ -12273,7 +12367,7 @@ mod authoritative_user_message_effect_tests {
             },
         );
 
-        rt.proposed_direct_turn_state = Some(ProposedDirectTurnState {
+        rt.proposed_authoritative_state = Some(ProposedAuthoritativeState {
             state: ConvState::LlmRequesting { attempt: 1 },
             updated_at: Utc::now(),
         });
@@ -13814,6 +13908,7 @@ mod authoritative_user_message_effect_tests {
 
         rt.process_generation_tagged_llm_outcome(
             0,
+            rt.tool_executor.capability_snapshot().generation,
             LlmOutcome::TimedOut {
                 message: "provider attempt deadline elapsed".to_string(),
             },
@@ -13865,7 +13960,12 @@ mod authoritative_user_message_effect_tests {
             request_id: "parent-terminal-retry-response".to_string(),
         };
 
-        rt.process_generation_tagged_llm_outcome(0, outcome).await;
+        rt.process_generation_tagged_llm_outcome(
+            0,
+            rt.tool_executor.capability_snapshot().generation,
+            outcome,
+        )
+        .await;
 
         assert!(matches!(rt.state, ConvState::LlmRequesting { attempt: 1 }));
         assert!(rt.llm_task_handle.is_none());
@@ -14002,7 +14102,12 @@ mod authoritative_user_message_effect_tests {
             request_id: "pre-establishment-retry".to_string(),
         };
 
-        rt.process_generation_tagged_llm_outcome(0, outcome).await;
+        rt.process_generation_tagged_llm_outcome(
+            0,
+            rt.tool_executor.capability_snapshot().generation,
+            outcome,
+        )
+        .await;
         for _ in 0..(DIRECT_TURN_TERMINAL_SETTLEMENT_RETRIES + 2) {
             tokio::time::advance(TERMINAL_SETTLEMENT_RETRY_DELAY).await;
             rt.retry_terminal_transition().await;
@@ -14262,7 +14367,7 @@ mod authoritative_user_message_effect_tests {
     }
 
     #[tokio::test]
-    async fn proposed_direct_turn_state_is_not_observable_before_materialization_returns() {
+    async fn proposed_authoritative_state_is_not_observable_before_materialization_returns() {
         let (mut rt, storage, mut broadcast_rx) = runtime(
             DirectTurnMaterializationEligibility::Fresh,
             AuthoritativeUserMessageMaterialization::Materialized {
@@ -15125,7 +15230,7 @@ mod authoritative_user_message_effect_tests {
             let (mut rt, storage, mut rx) =
                 runtime(DirectTurnMaterializationEligibility::Fresh, materialize);
 
-            rt.proposed_direct_turn_state = Some(ProposedDirectTurnState {
+            rt.proposed_authoritative_state = Some(ProposedAuthoritativeState {
                 state: ConvState::LlmRequesting { attempt: 1 },
                 updated_at: Utc::now(),
             });
@@ -16211,6 +16316,344 @@ mod approve_task_failure_effect_tests {
     }
 
     #[tokio::test]
+    async fn detached_approval_persists_state_and_message_without_generic_write() {
+        let (repo, repo_root) = init_repo();
+        let conv_id = "detached-approved-persistence";
+        let tasks_dir = repo_root.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        let task_filename = "12345-p0-in-progress--detached-approved.md";
+        std::fs::write(tasks_dir.join(task_filename), "Plan").unwrap();
+
+        let mut context = ConvContext::new(conv_id, repo_root.clone(), "test-model", 200_000);
+        context.mode_context = Some(ModeContext::DetachedApprovedTask {
+            base_branch: "main".to_string(),
+            worktree_path: repo_root.to_string_lossy().into_owned(),
+            task_id: "12345".to_string(),
+            task_title: "Detached approved".to_string(),
+        });
+        let (_event_tx, event_rx) = mpsc::channel(32);
+        let event_tx_dup = mpsc::channel::<Event>(1).0;
+        let storage = Arc::new(InMemoryStorage::new());
+        storage.set_fail_state_update(true);
+        let mut rt = ConversationRuntime::new(
+            context,
+            ConvState::AwaitingTaskApproval {
+                task_file: format!("tasks/{task_filename}"),
+                title: "Detached approved".to_string(),
+                priority: crate::task_source::Priority::P0,
+                plan: "Plan".to_string(),
+            },
+            storage.clone(),
+            Arc::new(MockLlmClient::new("test-model")),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx_dup,
+            SseBroadcaster::new(128, 0),
+        )
+        .with_fatal_local_authority_fence(crate::runtime::FatalLocalAuthorityFence::new());
+
+        rt.process_event(Event::TaskApprovalDecided {
+            outcome: TaskApprovalOutcome::Approved {
+                handoff: TaskApprovalHandoff::ContinueInCurrentConversation,
+            },
+        })
+        .await
+        .expect("detached approval persists atomically");
+
+        assert!(matches!(rt.state, ConvState::LlmRequesting { attempt: 1 }));
+        assert!(matches!(
+            storage.get_current_state(conv_id),
+            Some(ConvState::LlmRequesting { attempt: 1 })
+        ));
+        assert_eq!(storage.get_all_messages(conv_id).len(), 1);
+        drop(repo);
+    }
+
+    #[tokio::test]
+    async fn failed_approval_never_publishes_destination_state() {
+        let (_repo, repo_root) = init_repo();
+        let conv_id = "private-approval-proposal";
+        let tasks_dir = repo_root.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        let task_filename = "12345-p0-in-progress--private-approval.md";
+        std::fs::write(tasks_dir.join(task_filename), "Plan").unwrap();
+
+        let mut context = ConvContext::new(conv_id, repo_root.clone(), "test-model", 200_000);
+        context.mode_context = Some(ModeContext::DetachedApprovedTask {
+            base_branch: "main".to_string(),
+            worktree_path: repo_root.to_string_lossy().into_owned(),
+            task_id: "12345".to_string(),
+            task_title: "Private approval".to_string(),
+        });
+        let (_event_tx, event_rx) = mpsc::channel(32);
+        let storage = Arc::new(InMemoryStorage::new());
+        storage.set_fail_approved_task_authority(true);
+        let mut rt = ConversationRuntime::new(
+            context,
+            ConvState::AwaitingTaskApproval {
+                task_file: format!("tasks/{task_filename}"),
+                title: "Private approval".to_string(),
+                priority: crate::task_source::Priority::P0,
+                plan: "Plan".to_string(),
+            },
+            storage,
+            Arc::new(MockLlmClient::new("test-model")),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            mpsc::channel(1).0,
+            SseBroadcaster::new(128, 0),
+        )
+        .with_fatal_local_authority_fence(crate::runtime::FatalLocalAuthorityFence::new());
+        let (state_tx, state_rx) = watch::channel(rt.state.clone());
+        rt = rt.with_state_watcher(state_tx);
+
+        assert!(rt
+            .process_event(Event::TaskApprovalDecided {
+                outcome: TaskApprovalOutcome::Approved {
+                    handoff: TaskApprovalHandoff::ContinueInCurrentConversation,
+                },
+            })
+            .await
+            .is_err());
+        assert!(matches!(rt.state, ConvState::AwaitingTaskApproval { .. }));
+        assert!(matches!(
+            *state_rx.borrow(),
+            ConvState::AwaitingTaskApproval { .. }
+        ));
+        assert!(!state_rx.has_changed().unwrap());
+    }
+
+    #[tokio::test]
+    async fn same_conversation_approval_publishes_one_work_capability() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "atomic-capability-approval";
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, "main");
+        std::fs::create_dir_all(explore_wt.join("tasks")).unwrap();
+        let task_filename = "12345-p0-ready--atomic-capability.md";
+        std::fs::write(explore_wt.join("tasks").join(task_filename), "Plan").unwrap();
+
+        let mut context = ConvContext::new(conv_id, explore_wt, "test-model", 200_000);
+        context.desired_base_branch = Some("main".to_string());
+        context.mode_context = Some(ModeContext::Explore {
+            next_taskmd_id_hint: Some("12345".to_string()),
+        });
+        let (_event_tx, event_rx) = mpsc::channel(32);
+        let event_tx_dup = mpsc::channel::<Event>(1).0;
+        let tool_executor = Arc::new(crate::runtime::traits::ToolRegistryExecutor::builtin_only(
+            crate::work_scope::ResourceAuthority::Restricted,
+            crate::tools::ToolRegistry::explore(
+                "tasks",
+                Vec::new(),
+                Vec::new(),
+                crate::tools::ExploreToolPolicy::from_platform(
+                    &crate::platform::PlatformCapability::detect(),
+                ),
+            ),
+            Arc::from(Vec::new()),
+        ));
+        let storage = Arc::new(InMemoryStorage::new());
+        storage.set_fail_state_update(true);
+        let mut rt = ConversationRuntime::new(
+            context,
+            ConvState::AwaitingTaskApproval {
+                task_file: format!("tasks/{task_filename}"),
+                title: "Atomic capability".to_string(),
+                priority: crate::task_source::Priority::P0,
+                plan: "Plan".to_string(),
+            },
+            storage.clone(),
+            Arc::new(MockLlmClient::new("test-model")),
+            tool_executor.clone(),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx_dup,
+            SseBroadcaster::new(128, 0),
+        )
+        .with_fatal_local_authority_fence(crate::runtime::FatalLocalAuthorityFence::new());
+
+        rt.process_event(Event::TaskApprovalDecided {
+            outcome: TaskApprovalOutcome::Approved {
+                handoff: TaskApprovalHandoff::ContinueInCurrentConversation,
+            },
+        })
+        .await
+        .unwrap();
+
+        let published = tool_executor.capability_snapshot();
+        assert_eq!(
+            published.authority,
+            crate::work_scope::ResourceAuthority::Work
+        );
+        assert_eq!(published.generation.value(), 1);
+        let definitions = tool_executor.definitions().await;
+        assert!(definitions
+            .iter()
+            .any(|definition| definition.name == "bash"));
+        assert!(definitions
+            .iter()
+            .any(|definition| definition.name == "spawn_agents"));
+        assert!(matches!(
+            rt.context.mode_context,
+            Some(ModeContext::Explore { .. })
+        ));
+        assert!(matches!(rt.state, ConvState::LlmRequesting { attempt: 1 }));
+        assert!(matches!(
+            storage.get_current_state(conv_id),
+            Some(ConvState::LlmRequesting { attempt: 1 })
+        ));
+        assert_eq!(storage.get_all_messages(conv_id).len(), 1);
+
+        rt.process_event(Event::TaskApprovalDecided {
+            outcome: TaskApprovalOutcome::Approved {
+                handoff: TaskApprovalHandoff::ContinueInCurrentConversation,
+            },
+        })
+        .await
+        .expect("duplicate approval decision is stale and absorbed");
+        assert_eq!(storage.get_all_messages(conv_id).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unclassified_approval_establishment_fails_closed() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "approval-establishment-unclassified";
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, "main");
+        std::fs::create_dir_all(explore_wt.join("tasks")).unwrap();
+        let task_filename = "12346-p0-ready--unclassified.md";
+        std::fs::write(explore_wt.join("tasks").join(task_filename), "Plan").unwrap();
+
+        let mut context = ConvContext::new(conv_id, explore_wt, "test-model", 200_000);
+        context.desired_base_branch = Some("main".to_string());
+        context.mode_context = Some(ModeContext::Explore {
+            next_taskmd_id_hint: Some("12346".to_string()),
+        });
+        let (_event_tx, event_rx) = mpsc::channel(32);
+        let event_tx_dup = mpsc::channel::<Event>(1).0;
+        let storage = Arc::new(InMemoryStorage::new());
+        storage.set_unclassify_approved_task_authority(true);
+        let llm = Arc::new(MockLlmClient::new("test-model"));
+        let tool_executor = Arc::new(MockToolExecutor::new());
+        let mut rt = ConversationRuntime::new(
+            context,
+            ConvState::AwaitingTaskApproval {
+                task_file: format!("tasks/{task_filename}"),
+                title: "Unclassified approval".to_string(),
+                priority: crate::task_source::Priority::P0,
+                plan: "Plan".to_string(),
+            },
+            storage,
+            llm.clone(),
+            tool_executor.clone(),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx_dup,
+            SseBroadcaster::new(128, 0),
+        )
+        .with_fatal_local_authority_fence(crate::runtime::FatalLocalAuthorityFence::new());
+
+        let result = rt
+            .process_event(Event::TaskApprovalDecided {
+                outcome: TaskApprovalOutcome::Approved {
+                    handoff: TaskApprovalHandoff::ContinueInCurrentConversation,
+                },
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            tool_executor.capability_snapshot().authority,
+            crate::work_scope::ResourceAuthority::Restricted
+        );
+        assert!(matches!(
+            rt.recovery_disposition,
+            RuntimeRecoveryDisposition::RecreateFromDatabase
+        ));
+        assert!(rt.fatal_local_authority_fence.is_closed());
+        assert!(llm.recorded_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn capability_publication_failure_after_persistence_fails_closed() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "capability-publish-failure";
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, "main");
+        std::fs::create_dir_all(explore_wt.join("tasks")).unwrap();
+        let task_filename = "12346-p0-ready--publish-failure.md";
+        std::fs::write(explore_wt.join("tasks").join(task_filename), "Plan").unwrap();
+
+        let mut context = ConvContext::new(conv_id, explore_wt, "test-model", 200_000);
+        context.desired_base_branch = Some("main".to_string());
+        context.mode_context = Some(ModeContext::Explore {
+            next_taskmd_id_hint: Some("12346".to_string()),
+        });
+        let (_event_tx, event_rx) = mpsc::channel(32);
+        let event_tx_dup = mpsc::channel::<Event>(1).0;
+        let storage = Arc::new(InMemoryStorage::new());
+        let llm = Arc::new(MockLlmClient::new("test-model"));
+        let tool_executor = Arc::new(MockToolExecutor::new().with_failed_capability_upgrade());
+        let mut rt = ConversationRuntime::new(
+            context,
+            ConvState::AwaitingTaskApproval {
+                task_file: format!("tasks/{task_filename}"),
+                title: "Publish failure".to_string(),
+                priority: crate::task_source::Priority::P0,
+                plan: "Plan".to_string(),
+            },
+            storage.clone(),
+            llm.clone(),
+            tool_executor.clone(),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx_dup,
+            SseBroadcaster::new(128, 0),
+        )
+        .with_fatal_local_authority_fence(crate::runtime::FatalLocalAuthorityFence::new());
+
+        let result = rt
+            .process_event(Event::TaskApprovalDecided {
+                outcome: TaskApprovalOutcome::Approved {
+                    handoff: TaskApprovalHandoff::ContinueInCurrentConversation,
+                },
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert!(storage.approved_task_authority_persisted(conv_id));
+        assert_eq!(
+            rt.tool_executor.capability_snapshot().authority,
+            crate::work_scope::ResourceAuthority::Restricted
+        );
+        assert_eq!(tool_executor.capability_snapshot().generation.value(), 0);
+        assert!(matches!(
+            rt.recovery_disposition,
+            RuntimeRecoveryDisposition::RecreateFromDatabase
+        ));
+        assert!(llm.recorded_requests().is_empty());
+    }
+
+    #[tokio::test]
     async fn approval_failure_does_not_dispatch_llm() {
         let (_tmp, repo_root) = init_repo();
         let conv_id = "collision-effect-1";
@@ -16490,17 +16933,21 @@ mod explore_prompt_cache_shape_tests {
 
     #[async_trait]
     impl ToolExecutor for TaskCreatingPatchExecutor {
-        async fn execute(
+        async fn execute_at_generation(
             &self,
+            expected: crate::runtime::traits::ToolCapabilityGeneration,
             call: crate::runtime::deny_gate::CheckedToolCall,
             _ctx: ToolContext,
-        ) -> Option<ToolOutput> {
+        ) -> Result<Option<ToolOutput>, String> {
+            if self.capability_snapshot().generation != expected {
+                return Err("stale tool capability generation".to_string());
+            }
             let (name, _input) = call.into_parts();
             if name != "patch" {
-                return None;
+                return Ok(None);
             }
             std::fs::write(&self.task_path, "# Draft\n").unwrap();
-            Some(ToolOutput::success("created task draft"))
+            Ok(Some(ToolOutput::success("created task draft")))
         }
 
         async fn definitions(&self) -> Vec<ToolDefinition> {
@@ -16783,7 +17230,12 @@ mod steer_drain_detector_tests {
             request_id: "terminal-retry-response".to_string(),
         };
 
-        rt.process_generation_tagged_llm_outcome(0, outcome).await;
+        rt.process_generation_tagged_llm_outcome(
+            0,
+            rt.tool_executor.capability_snapshot().generation,
+            outcome,
+        )
+        .await;
         assert!(matches!(rt.state, ConvState::LlmRequesting { attempt: 1 }));
         assert!(rt.terminal_transition_retry.is_some());
         assert!(rt.parent_event_tx.is_some());
@@ -18809,8 +19261,21 @@ mod work_subagent_cwd_guard_tests {
             "test-model",
             200_000,
         );
+        context.work_scope_worktree = match &mode_context {
+            ModeContext::Work { worktree_path, .. }
+            | ModeContext::DetachedApprovedTask { worktree_path, .. }
+            | ModeContext::AttachedWorkChild { worktree_path }
+            | ModeContext::Branch { worktree_path, .. } => {
+                Some(std::path::PathBuf::from(worktree_path))
+            }
+            ModeContext::Explore { .. } | ModeContext::Direct => None,
+        };
         context.mode_context = Some(mode_context);
         context.mode = crate::state_machine::state::ModeKind::Managed;
+        let authority = match context.mode_context.as_ref() {
+            Some(ModeContext::Explore { .. }) => crate::work_scope::ResourceAuthority::Restricted,
+            _ => crate::work_scope::ResourceAuthority::Work,
+        };
 
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx_dup = mpsc::channel::<Event>(1).0;
@@ -18821,7 +19286,11 @@ mod work_subagent_cwd_guard_tests {
             ConvState::Idle,
             storage,
             Arc::new(MockLlmClient::new("test-model")),
-            Arc::new(MockToolExecutor::new().with_subagent_models(vec!["test-model".to_string()])),
+            Arc::new(
+                MockToolExecutor::new()
+                    .with_authority(authority)
+                    .with_subagent_models(vec!["test-model".to_string()]),
+            ),
             Arc::new(BrowserSessionManager::default()),
             Arc::new(crate::tools::BashHandleRegistry::new()),
             Arc::new(crate::tools::TmuxRegistry::new()),
@@ -18850,6 +19319,24 @@ mod work_subagent_cwd_guard_tests {
         working_dir: &std::path::Path,
     ) -> ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>> {
         runtime_in_mode(working_dir, ModeContext::Direct)
+    }
+
+    async fn approved_explore_runtime(
+        worktree_path: &std::path::Path,
+    ) -> ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>> {
+        let mut runtime = runtime_in_mode(
+            worktree_path,
+            ModeContext::Explore {
+                next_taskmd_id_hint: Some("12345".to_string()),
+            },
+        );
+        let snapshot = runtime.tool_executor.upgrade_to_work_mode().await.unwrap();
+        runtime.context.work_scope_worktree = Some(worktree_path.to_path_buf());
+        assert_eq!(
+            runtime.tool_executor.capability_snapshot().generation,
+            snapshot.generation
+        );
+        runtime
     }
 
     fn spawn_tool(input: SpawnAgentsInput) -> ToolCall {
@@ -19000,6 +19487,61 @@ mod work_subagent_cwd_guard_tests {
             rt.active_work_subagents, 0,
             "rejected spawn must not increment active_work_subagents"
         );
+    }
+
+    #[tokio::test]
+    async fn approved_explore_origin_admits_work_subagent() {
+        let worktree = TempDir::new().expect("worktree tempdir");
+        let mut rt = approved_explore_runtime(worktree.path()).await;
+
+        let result = rt
+            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                tasks: vec![SubAgentTask {
+                    task: "perform approved work".to_string(),
+                    cwd: None,
+                    mode: Some(SubAgentMode::Work),
+                    model: Some("test-model".to_string()),
+                    max_turns: Some(1),
+                    agent_type: None,
+                }],
+            }))
+            .await
+            .expect("authority admission should succeed");
+
+        if let Some(Event::ToolComplete { result, .. }) = result {
+            let text = tool_result_text(&result);
+            assert!(
+                !text.contains("require Work authority"),
+                "Explore provenance must not override WorkScope authority: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn approved_explore_work_subagent_cannot_escape_workscope() {
+        let worktree = TempDir::new().expect("worktree tempdir");
+        let outside = TempDir::new().expect("outside tempdir");
+        let mut rt = approved_explore_runtime(worktree.path()).await;
+
+        let result = rt
+            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                tasks: vec![SubAgentTask {
+                    task: "escape scope".to_string(),
+                    cwd: Some(outside.path().to_string_lossy().into_owned()),
+                    mode: Some(SubAgentMode::Work),
+                    model: Some("test-model".to_string()),
+                    max_turns: Some(1),
+                    agent_type: None,
+                }],
+            }))
+            .await
+            .unwrap()
+            .expect("scope escape must return an error event");
+
+        let Event::ToolComplete { result, .. } = result else {
+            panic!("expected ToolComplete rejection");
+        };
+        assert!(tool_result_text(&result).contains("must be inside the parent's worktree"));
     }
 
     #[tokio::test]
@@ -19593,14 +20135,28 @@ mod sender_drop_forwarder_tests {
     #[tokio::test]
     async fn llm_sender_drop_yields_network_error_outcome() {
         let (llm_tx, llm_rx) = oneshot::channel::<LlmOutcome>();
-        let (llm_outcome_tx, mut llm_outcome_rx) = mpsc::channel::<(u64, LlmOutcome)>(4);
+        let (llm_outcome_tx, mut llm_outcome_rx) = mpsc::channel::<(
+            u64,
+            crate::runtime::traits::ToolCapabilityGeneration,
+            LlmOutcome,
+        )>(4);
 
         drop(llm_tx);
 
-        forward_llm_outcome(llm_rx, 7, llm_outcome_tx).await;
+        forward_llm_outcome(
+            llm_rx,
+            7,
+            crate::runtime::traits::ToolCapabilityGeneration::INITIAL,
+            llm_outcome_tx,
+        )
+        .await;
 
         match llm_outcome_rx.try_recv() {
-            Ok((generation, LlmOutcome::NetworkError { message })) => {
+            Ok((generation, capability_generation, LlmOutcome::NetworkError { message })) => {
+                assert_eq!(
+                    capability_generation,
+                    crate::runtime::traits::ToolCapabilityGeneration::INITIAL
+                );
                 assert_eq!(
                     generation, 7,
                     "forwarder must stamp the dispatch generation"
@@ -20385,22 +20941,14 @@ mod stale_tool_result_clearing_tests {
         assert!(plan.cleared_sequence_ids.is_empty());
     }
 
-    /// Production wraps the tool registry in `Arc`, and the runtime caches the
-    /// clearable set from it. The `Arc<T>` blanket impl must forward
-    /// `clearable_tool_names` — falling back to the empty default would silently
-    /// make nothing clearable, disabling the whole feature in production while
-    /// the planner unit tests (which pass the set directly) stay green.
     #[tokio::test]
-    async fn arc_tool_executor_forwards_clearable_tool_names() {
+    async fn arc_tool_executor_forwards_capability_snapshot() {
         use crate::runtime::testing::MockToolExecutor;
         use crate::runtime::traits::ToolExecutor;
 
         let arc: Arc<MockToolExecutor> =
             Arc::new(MockToolExecutor::new().with_clearable_tool("bash"));
-        assert!(
-            arc.clearable_tool_names().contains("bash"),
-            "Arc<T> must forward clearable_tool_names, not use the empty default",
-        );
+        assert!(arc.capability_snapshot().clearable_names.contains("bash"));
     }
 
     /// True if `tool_use_id` is rendered as a cleared placeholder (no images).
@@ -20740,12 +21288,54 @@ mod llm_generation_guard_tests {
             request_id: "late-response".to_string(),
         };
 
-        rt.process_generation_tagged_llm_outcome(1, late_response)
-            .await;
+        rt.process_generation_tagged_llm_outcome(
+            1,
+            rt.tool_executor.capability_snapshot().generation,
+            late_response,
+        )
+        .await;
         tokio::task::yield_now().await;
 
         assert_eq!(rt.state, state_before);
         assert!(rt.llm_outcome_is_stale(1));
+        assert!(storage.recorded_messages().is_empty());
+        assert!(tools.recorded_executions().is_empty());
+        assert!(rt.tool_task_handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_capability_generation_cannot_persist_response_or_execute_tools() {
+        let mut rt = runtime_requesting();
+        let stale_capability = rt.tool_executor.capability_snapshot().generation;
+        rt.tool_executor.advance_capability_generation_for_test();
+        let state_before = rt.state.clone();
+        let storage = rt.storage.clone();
+        let tools = rt.tool_executor.clone();
+
+        rt.process_generation_tagged_llm_outcome(
+            rt.llm_request_generation,
+            stale_capability,
+            LlmOutcome::Response {
+                content: vec![ContentBlock::Text {
+                    text: "stale capability response".to_string(),
+                }],
+                tool_calls: vec![ToolCall {
+                    id: "stale-capability-tool".to_string(),
+                    input: phoenix_core::domain::sm_state::ToolInput::Bash(
+                        phoenix_core::domain::bash_types::BashInvocation::from_context(
+                            phoenix_core::domain::bash_types::BashToolInput::run("echo stale"),
+                        )
+                        .unwrap(),
+                    ),
+                }],
+                end_turn: false,
+                usage: phoenix_llm::Usage::default(),
+                request_id: "stale-capability-response".to_string(),
+            },
+        )
+        .await;
+
+        assert_eq!(rt.state, state_before);
         assert!(storage.recorded_messages().is_empty());
         assert!(tools.recorded_executions().is_empty());
         assert!(rt.tool_task_handle.is_none());
@@ -20760,6 +21350,7 @@ mod llm_generation_guard_tests {
 
         rt.process_generation_tagged_llm_outcome(
             1,
+            rt.tool_executor.capability_snapshot().generation,
             LlmOutcome::NetworkError {
                 message: "stale aborted request".to_string(),
             },

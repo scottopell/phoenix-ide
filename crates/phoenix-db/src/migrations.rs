@@ -500,6 +500,21 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_llm_request_timed_out_outcome",
         sql: MIGRATION_096,
     },
+    Migration {
+        version: 99,
+        name: "restore_direct_conversation_authority",
+        sql: MIGRATION_099,
+    },
+    Migration {
+        version: 100,
+        name: "add_approval_request_obligations",
+        sql: MIGRATION_100,
+    },
+    Migration {
+        version: 101,
+        name: "normalize_approval_message_identity",
+        sql: MIGRATION_101,
+    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -10106,6 +10121,80 @@ WHERE type = 'table'
   AND instr(sql, '''timed_out''') = 0
 ";
 
+const MIGRATION_099: &str = r"
+UPDATE work_scopes
+SET authority_kind = 'direct'
+WHERE id IN (
+    SELECT work_scope_id
+    FROM conversations
+    WHERE cm_kind = 'direct'
+)
+  AND authority_kind = 'restricted_explore';
+";
+
+const MIGRATION_100: &str = r"
+CREATE TABLE approval_request_obligations (
+    conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+    approval_message_id TEXT NOT NULL UNIQUE REFERENCES messages(message_id) ON DELETE CASCADE,
+    approval_sequence_id INTEGER NOT NULL CHECK (approval_sequence_id >= 0),
+    created_at_us INTEGER NOT NULL CHECK (created_at_us >= 0)
+);
+CREATE TRIGGER approval_request_obligation_after_agent_response
+AFTER INSERT ON messages
+WHEN NEW.message_type = 'agent'
+BEGIN
+    DELETE FROM approval_request_obligations
+    WHERE conversation_id = NEW.conversation_id
+      AND approval_sequence_id < NEW.sequence_id;
+END;
+CREATE TRIGGER approval_request_obligation_after_state_progress
+AFTER UPDATE OF state_kind ON conversations
+WHEN NEW.state_kind <> 'llm_requesting'
+BEGIN
+    DELETE FROM approval_request_obligations WHERE conversation_id = NEW.id;
+END;
+";
+
+const MIGRATION_101: &str = r"
+DROP TRIGGER approval_request_obligation_after_agent_response;
+DROP TRIGGER approval_request_obligation_after_state_progress;
+CREATE UNIQUE INDEX IF NOT EXISTS messages_identity
+ON messages(message_id, conversation_id);
+CREATE TABLE approval_request_obligations_v2 (
+    conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+    approval_message_id TEXT NOT NULL UNIQUE,
+    created_at_us INTEGER NOT NULL CHECK (created_at_us >= 0),
+    FOREIGN KEY (approval_message_id, conversation_id)
+        REFERENCES messages(message_id, conversation_id) ON DELETE CASCADE
+);
+INSERT INTO approval_request_obligations_v2 (
+    conversation_id, approval_message_id, created_at_us
+)
+SELECT conversation_id, approval_message_id, created_at_us
+FROM approval_request_obligations;
+DROP TABLE approval_request_obligations;
+ALTER TABLE approval_request_obligations_v2 RENAME TO approval_request_obligations;
+CREATE TRIGGER approval_request_obligation_after_agent_response
+AFTER INSERT ON messages
+WHEN NEW.message_type = 'agent'
+BEGIN
+    DELETE FROM approval_request_obligations
+    WHERE conversation_id = NEW.conversation_id
+      AND EXISTS (
+          SELECT 1 FROM messages approval
+          WHERE approval.message_id = approval_message_id
+            AND approval.conversation_id = conversation_id
+            AND approval.sequence_id < NEW.sequence_id
+      );
+END;
+CREATE TRIGGER approval_request_obligation_after_state_progress
+AFTER UPDATE OF state_kind ON conversations
+WHEN NEW.state_kind <> 'llm_requesting'
+BEGIN
+    DELETE FROM approval_request_obligations WHERE conversation_id = NEW.id;
+END;
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10166,6 +10255,174 @@ mod tests {
             .connect_with(opts)
             .await
             .unwrap()
+    }
+
+    #[test]
+    fn compiled_migration_ledger_is_strictly_ordered_and_unique() {
+        let ledger = compiled_migration_ledger();
+        assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        let names: HashSet<_> = ledger.iter().map(|(_, name)| *name).collect();
+        assert_eq!(names.len(), ledger.len());
+    }
+
+    #[tokio::test]
+    async fn migration_100_creates_operation_scoped_approval_obligations() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE conversations (id TEXT PRIMARY KEY, state_kind TEXT NOT NULL);
+             CREATE TABLE messages (
+                 message_id TEXT PRIMARY KEY,
+                 conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                 sequence_id INTEGER NOT NULL,
+                 message_type TEXT NOT NULL
+             );",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(MIGRATION_100).execute(&pool).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO conversations VALUES ('conv', 'llm_requesting');
+             INSERT INTO messages VALUES ('approval', 'conv', 1, 'user');
+             INSERT INTO approval_request_obligations VALUES ('conv', 'approval', 1, 1);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query("INSERT INTO messages VALUES ('queued', 'conv', 2, 'user')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM approval_request_obligations WHERE conversation_id = 'conv'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(pending, 1);
+
+        sqlx::query("INSERT INTO messages VALUES ('response', 'conv', 3, 'agent')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let pending: i64 = sqlx::query_scalar("SELECT count(*) FROM approval_request_obligations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(pending, 0);
+    }
+
+    #[tokio::test]
+    async fn migration_101_normalizes_approval_message_identity() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE conversations (id TEXT PRIMARY KEY, state_kind TEXT NOT NULL);
+             CREATE TABLE messages (
+                 message_id TEXT PRIMARY KEY,
+                 conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                 sequence_id INTEGER NOT NULL,
+                 message_type TEXT NOT NULL
+             );",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(MIGRATION_100).execute(&pool).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO conversations VALUES ('conv', 'llm_requesting');
+             INSERT INTO conversations VALUES ('other', 'llm_requesting');
+             INSERT INTO messages VALUES ('approval', 'conv', 7, 'user');
+             INSERT INTO approval_request_obligations VALUES ('conv', 'approval', 999, 1);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(MIGRATION_101).execute(&pool).await.unwrap();
+
+        let columns = sqlx::query_scalar::<_, String>(
+            "SELECT name FROM pragma_table_info('approval_request_obligations') ORDER BY cid",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            columns,
+            vec![
+                "conversation_id".to_string(),
+                "approval_message_id".to_string(),
+                "created_at_us".to_string(),
+            ]
+        );
+        let mismatched = sqlx::query(
+            "INSERT INTO approval_request_obligations
+             (conversation_id, approval_message_id, created_at_us)
+             VALUES ('other', 'approval', 2)",
+        )
+        .execute(&pool)
+        .await;
+        assert!(mismatched.is_err());
+
+        sqlx::query("INSERT INTO messages VALUES ('response', 'conv', 8, 'agent')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let pending: i64 = sqlx::query_scalar("SELECT count(*) FROM approval_request_obligations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(pending, 0);
+    }
+
+    #[tokio::test]
+    async fn migration_099_restores_direct_conversation_authority() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE work_scopes (
+                 id TEXT PRIMARY KEY,
+                 authority_kind TEXT NOT NULL CHECK (authority_kind IN ('restricted_explore', 'work', 'direct'))
+             );
+             CREATE TABLE conversations (
+                 id TEXT PRIMARY KEY,
+                 cm_kind TEXT NOT NULL,
+                 work_scope_id TEXT NOT NULL REFERENCES work_scopes(id)
+             );
+             INSERT INTO work_scopes (id, authority_kind) VALUES
+                 ('direct-scope', 'restricted_explore'),
+                 ('explore-scope', 'restricted_explore');
+             INSERT INTO conversations (id, cm_kind, work_scope_id) VALUES
+                 ('direct-conv', 'direct', 'direct-scope'),
+                 ('explore-conv', 'detached_product_creation', 'explore-scope');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(MIGRATION_099).execute(&pool).await.unwrap();
+
+        let authorities = sqlx::query("SELECT id, authority_kind FROM work_scopes ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("id"),
+                    row.get::<String, _>("authority_kind"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            authorities,
+            vec![
+                ("direct-scope".to_string(), "direct".to_string()),
+                (
+                    "explore-scope".to_string(),
+                    "restricted_explore".to_string(),
+                ),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -10467,6 +10724,43 @@ mod tests {
 
     async fn setup_conversations_table(pool: &SqlitePool) {
         setup_legacy_conversations_table(pool).await;
+    }
+
+    async fn run_legacy_conversation_migration_with_triggers_suspended(
+        pool: &SqlitePool,
+        migration_sql: &str,
+    ) {
+        let triggers: Vec<(String, String)> = sqlx::query_as(
+            "SELECT name, sql
+             FROM sqlite_schema
+             WHERE type = 'trigger'
+               AND sql IS NOT NULL
+             ORDER BY name",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        for (name, _) in &triggers {
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "DROP TRIGGER IF EXISTS {name}"
+            )))
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        let migration_result = sqlx::raw_sql(sqlx::AssertSqlSafe(migration_sql.to_string()))
+            .execute(pool)
+            .await;
+
+        for (_, sql) in triggers {
+            sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+
+        migration_result.unwrap();
     }
 
     type ConversationTopologyRow = (
@@ -14696,6 +14990,52 @@ mod tests {
         assert_eq!(row.get::<i64, _>("chain_messages_at_answer"), 17);
     }
 
+    #[tokio::test]
+    async fn direct_legacy_conversation_migration_suspends_later_schema_triggers() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE conversations (
+                 id TEXT PRIMARY KEY,
+                 continued_in_conv_id TEXT,
+                 archived BOOLEAN NOT NULL DEFAULT 0
+             );
+             INSERT INTO conversations (id, continued_in_conv_id, archived) VALUES
+                 ('root', 'leaf', 0),
+                 ('leaf', NULL, 1);
+             CREATE TRIGGER test_later_conversation_shape_trigger
+             BEFORE UPDATE ON conversations
+             FOR EACH ROW
+             WHEN NEW.archived = 1
+             BEGIN
+                 SELECT later.product_conversation_id
+                 FROM conversations later
+                 WHERE later.id = NEW.id;
+             END;",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(sqlx::raw_sql(MIGRATION_006).execute(&pool).await.is_err());
+
+        run_legacy_conversation_migration_with_triggers_suspended(&pool, MIGRATION_006).await;
+
+        let archived: bool =
+            sqlx::query_scalar("SELECT archived FROM conversations WHERE id = 'root'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(archived);
+        let trigger_sql: Option<String> = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_schema
+             WHERE type = 'trigger' AND name = 'test_later_conversation_shape_trigger'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert!(trigger_sql.is_some());
+    }
+
     /// Migration 006: a chain with mixed `archived` state has every member
     /// flipped to archived; fully-archived and fully-unarchived chains are
     /// untouched; standalones are untouched.
@@ -14775,7 +15115,7 @@ mod tests {
 
         // Re-run the partial-archive cleanup directly so we exercise it on
         // the now-wired chain (the migration table thinks 006 is done).
-        sqlx::raw_sql(MIGRATION_006).execute(&pool).await.unwrap();
+        run_legacy_conversation_migration_with_triggers_suspended(&pool, MIGRATION_006).await;
 
         let archived_for = |id: &'static str| {
             let pool = pool.clone();
