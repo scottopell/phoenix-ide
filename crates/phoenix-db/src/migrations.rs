@@ -505,6 +505,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "restore_direct_conversation_authority",
         sql: MIGRATION_097,
     },
+    Migration {
+        version: 98,
+        name: "add_approval_request_obligations",
+        sql: MIGRATION_098,
+    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -10122,6 +10127,29 @@ WHERE id IN (
   AND authority_kind = 'restricted_explore';
 ";
 
+const MIGRATION_098: &str = r"
+CREATE TABLE approval_request_obligations (
+    conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+    approval_message_id TEXT NOT NULL UNIQUE REFERENCES messages(message_id) ON DELETE CASCADE,
+    approval_sequence_id INTEGER NOT NULL CHECK (approval_sequence_id >= 0),
+    created_at_us INTEGER NOT NULL CHECK (created_at_us >= 0)
+);
+CREATE TRIGGER approval_request_obligation_after_agent_response
+AFTER INSERT ON messages
+WHEN NEW.message_type = 'agent'
+BEGIN
+    DELETE FROM approval_request_obligations
+    WHERE conversation_id = NEW.conversation_id
+      AND approval_sequence_id < NEW.sequence_id;
+END;
+CREATE TRIGGER approval_request_obligation_after_state_progress
+AFTER UPDATE OF state_kind ON conversations
+WHEN NEW.state_kind <> 'llm_requesting'
+BEGIN
+    DELETE FROM approval_request_obligations WHERE conversation_id = NEW.id;
+END;
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10182,6 +10210,54 @@ mod tests {
             .connect_with(opts)
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn migration_098_creates_operation_scoped_approval_obligations() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE conversations (id TEXT PRIMARY KEY, state_kind TEXT NOT NULL);
+             CREATE TABLE messages (
+                 message_id TEXT PRIMARY KEY,
+                 conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                 sequence_id INTEGER NOT NULL,
+                 message_type TEXT NOT NULL
+             );",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(MIGRATION_098).execute(&pool).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO conversations VALUES ('conv', 'llm_requesting');
+             INSERT INTO messages VALUES ('approval', 'conv', 1, 'user');
+             INSERT INTO approval_request_obligations VALUES ('conv', 'approval', 1, 1);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query("INSERT INTO messages VALUES ('queued', 'conv', 2, 'user')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM approval_request_obligations WHERE conversation_id = 'conv'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(pending, 1);
+
+        sqlx::query("INSERT INTO messages VALUES ('response', 'conv', 3, 'agent')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let pending: i64 = sqlx::query_scalar("SELECT count(*) FROM approval_request_obligations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(pending, 0);
     }
 
     #[tokio::test]
