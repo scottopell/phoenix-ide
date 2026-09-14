@@ -21,6 +21,7 @@ import {
 import { ConversationNavStack } from '../components/ConversationNavStack';
 import {
   historyResponseMatchesCurrentRequest,
+  historyHasAuthoritativeTranscriptGeneration,
   initialHistoryExpansionState,
   reduceHistoryExpansion,
   type HistoryIntent,
@@ -1048,6 +1049,16 @@ function ConversationPageContent({
       const currentView = historyViewRef.current;
       const authoritativeTranscriptGeneration = atomRef.current.transcriptGeneration;
       const responseTranscriptGeneration = result.conversation.transcript_generation ?? 1;
+      if (!historyHasAuthoritativeTranscriptGeneration(authoritativeTranscriptGeneration)) {
+        dispatchHistoryExpansion({
+          type: 'history_failed',
+          requestToken: activeRequest.token,
+          view: activeRequest.view,
+          transcriptGeneration: requestTranscriptGeneration,
+          message: 'Conversation changed while loading earlier history',
+        });
+        return;
+      }
       const requestIsCurrent = historyResponseMatchesCurrentRequest(
         activeRequest,
         historyRequestTokenRef.current,

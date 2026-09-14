@@ -31,6 +31,10 @@ export function historyRequestHasCursor(request: PendingHistoryRequest): request
   return request.snapshotStartedAtEventSeq !== null;
 }
 
+export function historyHasAuthoritativeTranscriptGeneration(transcriptGeneration: number | null): transcriptGeneration is number {
+  return transcriptGeneration !== null;
+}
+
 export function historyMergeEventCursorFloor(request: ActiveHistoryRequest): number {
   return request.snapshotStartedAtEventSeq;
 }
