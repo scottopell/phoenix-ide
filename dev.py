@@ -10319,9 +10319,22 @@ def _print_launchd_restart_entry(label: str, restart: dict) -> None:
             )
 
 
+def _print_unresolved_launchd_restart_claim(owner: str | None) -> None:
+    print(f"  Active restart: status unavailable ({owner or 'unknown'})")
+    print(
+        "    UNRESOLVED: the active restart claim has no readable matching status; "
+        "inspect ~/.phoenix-ide/restart/restart.log and confirm no helper is running "
+        "before clearing the restart marker"
+    )
+
+
 def _print_launchd_restart_status() -> None:
     statuses = _read_launchd_restart_statuses()
+    owner = _restart_claim_owner()
+    marker_exists = owner is not None or LAUNCHD_RESTART_ACTIVE_PATH.exists()
     if not statuses:
+        if marker_exists:
+            _print_unresolved_launchd_restart_claim(owner)
         return
     latest = max(
         statuses,
@@ -10331,12 +10344,13 @@ def _print_launchd_restart_status() -> None:
             str(status.get("transaction_id", "")),
         ),
     )
-    owner = _restart_claim_owner()
     active = next(
         (status for status in statuses if status.get("transaction_id") == owner),
         None,
     )
-    if active is not None and active is not latest:
+    if marker_exists and active is None:
+        _print_unresolved_launchd_restart_claim(owner)
+    elif active is not None and active is not latest:
         _print_launchd_restart_entry("Active restart", active)
     _print_launchd_restart_entry("Last restart", latest)
 

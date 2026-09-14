@@ -726,6 +726,23 @@ class RestartCommandTests(unittest.TestCase):
             rendered = " ".join(str(call) for call in output.call_args_list)
             self.assertIn("Last restart: committed (owner)", rendered)
 
+    def test_restart_status_surfaces_active_claim_with_unreadable_status(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            transaction = root / "restart" / "transactions" / "owner"
+            transaction.mkdir(parents=True)
+            (transaction / "status.json").write_text("not-json\n")
+            (root / "restart" / "active").write_text("owner\n")
+
+            with self._isolated_operation_paths(root), \
+                 mock.patch("builtins.print") as output:
+                self.dev._print_launchd_restart_status()
+
+            rendered = " ".join(str(call) for call in output.call_args_list)
+            self.assertIn("Active restart: status unavailable (owner)", rendered)
+            self.assertIn("UNRESOLVED", rendered)
+            self.assertIn("confirm no helper is running", rendered)
+
     def test_launchctl_failure_is_not_reported_as_not_loaded(self):
         failure = subprocess.CompletedProcess(
             [],
