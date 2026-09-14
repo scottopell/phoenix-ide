@@ -2737,6 +2737,7 @@ pub(crate) enum AmbientWriterDiagnosticOperation {
     ObserveAmbientWriter,
     ReadProcessIncarnation,
     ReadProcessExecutable,
+    ReadWorkingDirectory,
     ReadMappings,
     EnumerateDescriptors,
     EnumerateDescriptor,
@@ -7808,6 +7809,17 @@ mod tests {
         )
         .unwrap_err()
         .contains("identity changed"));
+    }
+
+    #[test]
+    fn ambient_writer_working_directory_diagnostic_serializes_stably() {
+        let diagnostic = super::AmbientWriterIndeterminateDiagnostic {
+            detector: super::AmbientWriterDiagnosticDetector::LinuxProcfs,
+            operation: super::AmbientWriterDiagnosticOperation::ReadWorkingDirectory,
+            error_kind: super::AmbientWriterDiagnosticErrorKind::PermissionDenied,
+        };
+        let json = serde_json::to_value(diagnostic).unwrap();
+        assert_eq!(json["operation"], "read_working_directory");
     }
 
     #[cfg(target_os = "linux")]
