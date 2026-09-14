@@ -651,8 +651,8 @@ fn close_retirement_conflict_for_phase(
             relation,
         } => (
             "Close retirement evidence is inconsistent; retry cannot continue safely.".to_string(),
-            Some(invariant.to_string()),
-            Some(relation.to_string()),
+            Some(invariant.clone()),
+            Some(relation.clone()),
         ),
         CloseRetirementError::Message(message) => (message, None, None),
     };

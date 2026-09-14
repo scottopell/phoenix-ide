@@ -9957,6 +9957,7 @@ mod tests {
         assert!(matches!(divergent, DbError::CloseFoundationPrecondition(_)));
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn complete_ambient_writer_evidence_is_normalized_and_identity_bound() {
         let db = Database::open_in_memory().await.unwrap();
