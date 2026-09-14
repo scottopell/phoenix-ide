@@ -6,7 +6,11 @@ After deploying `ce66022db`, successful `GET /api/product-conversations/:referen
 requests from 12:12–12:51Z had 100 samples: median 3,735 ms, p95 7,603 ms,
 and maximum 8,453 ms. The immutable source files are
 `/tmp/phoenix-open-perf.ikefq5/http-samples.json` and `errors.json`; their
-SHA-256 digests were recorded before diagnosis. No production load test,
+SHA-256 digests were recorded before diagnosis:
+`a623926f389bb0850c0486f771aad0e571607a03765ff6f55196798cfbf74f0d` for
+`http-samples.json` and
+`39bd1be8f064ba6fb5b8a097b5398350463e342bda4042f5bcf85041961be0d6` for
+`errors.json`. No production load test,
 restart, or deployment was performed.
 
 The same capture contains 147 detail 404 responses, all for a coordinator
@@ -73,8 +77,9 @@ Baseline raw samples in microseconds:
 ```
 
 Each tuple is `(resolve, aggregate, page, rollback)`. The baseline cold total is
-105.828 ms. Warm p50/p95 are 0.070/0.090 ms resolve, 14.779/15.221 ms aggregate,
-89.140/89.457 ms page, and 103.987/104.602 ms total.
+105.828 ms. Warm p50/nearest-rank p95 are 0.070/0.090 ms resolve,
+14.779/15.221 ms aggregate, 89.140/89.457 ms page, and 103.987/104.602 ms
+total.
 
 After forcing transcript-first indexed probes, identical-shape raw samples are:
 
@@ -85,8 +90,9 @@ After forcing transcript-first indexed probes, identical-shape raw samples are:
  (67,15788,34123,43),(232,16754,26473,45)]
 ```
 
-The candidate cold total is 41.006 ms. Warm p50/p95 are 0.063/0.232 ms resolve,
-14.848/16.754 ms aggregate, 25.455/34.123 ms page, and 40.391/50.021 ms total.
+The candidate cold total is 41.006 ms. Warm p50/nearest-rank p95 are
+0.063/0.232 ms resolve, 14.848/16.754 ms aggregate, 25.455/34.123 ms page, and
+40.391/50.021 ms total.
 The page p50 falls 71%, and total p50 falls 61%, while aggregate hydration is
 unchanged within run noise. The production multi-second scale is consistent
 with the globally scanning plan under a 3.8 GiB, concurrently used database;
@@ -99,8 +105,8 @@ successful GET duration.
    probe the current-schema `messages_conversation_sequence` index, retaining
    the same predicates, ordering, segment ceilings, and `LIMIT` inside the same
    read transaction.
-2. Keep the representative diagnostic fixture and query-plan assertion as
-   regressions for the bounded hot path.
+2. Keep the representative diagnostic fixture and a structural assertion on
+   the transcript-first indexed join as regressions for the bounded hot path.
 3. Reassess aggregate hydration only after the page fix; batch per-segment
    metadata/handoffs only if it remains a measured dominant stage.
 4. Trace coordinator 404 request ownership separately. Do not mix route-churn

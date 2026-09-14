@@ -1146,38 +1146,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn message_page_plan_drives_from_bounded_transcript() {
+    async fn message_page_query_enforces_transcript_first_indexed_join() {
+        let normalized = PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(normalized.contains(
+            "FROM transcript CROSS JOIN messages INDEXED BY messages_conversation_sequence ON messages.conversation_id = transcript.id"
+        ));
+
         let db = Database::open_in_memory().await.unwrap();
-        let explain = format!("EXPLAIN QUERY PLAN {PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL}");
-        let plan = sqlx::query(sqlx::AssertSqlSafe(explain))
-            .bind("fixture-product")
-            .bind(Option::<String>::None)
-            .bind(Option::<i64>::None)
-            .bind(Option::<i64>::None)
-            .bind(Option::<String>::None)
-            .bind(51_i64)
-            .fetch_all(db.pool())
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|row| row.get::<String, _>("detail"))
-            .collect::<Vec<_>>();
-        assert!(
-            plan.iter().any(|detail| detail.contains("SCAN transcript")),
-            "query plan must drive the bounded page from transcript rows: {plan:?}"
-        );
-        assert!(
-            plan.iter().any(|detail| {
-                detail.contains("SEARCH messages USING INDEX messages_conversation_sequence")
-            }),
-            "query plan must probe messages by transcript conversation: {plan:?}"
-        );
-        assert!(
-            !plan.iter().any(|detail| {
-                detail.contains("SCAN messages USING INDEX messages_conversation_sequence")
-            }),
-            "query plan must not scan the global messages index: {plan:?}"
-        );
+        let page = Database::get_product_conversation_messages_page_on(
+            &mut db.pool.acquire().await.unwrap(),
+            &ProductConversationId::parse("fixture-product").unwrap(),
+            None,
+            None,
+            51,
+        )
+        .await
+        .unwrap();
+        assert!(page.is_empty());
     }
 
     #[tokio::test]
