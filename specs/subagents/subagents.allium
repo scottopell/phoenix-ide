@@ -445,14 +445,15 @@ rule SubAgentRegistryOnResume {
         --     ConvMode::Explore { worktree_path: None }
         --   Work sub-agents inherit a Work-capable parent `conv_mode`.
         --     When a write-capable parent retains Explore provenance after
-        --     approval, its Work child is persisted as Direct so recovery can
-        --     distinguish it from a genuinely read-only Explore child.
+        --     approval, its Work child is persisted as AttachedWorkChild with
+        --     the inherited worktree path so recovery preserves both authority
+        --     and filesystem identity while distinguishing it from Explore.
         --
         -- So the resume mapping is: Explore variant -> subagent_read_only;
-        -- Direct / Work / Branch / DetachedApprovedTask ->
+        -- Direct / Work / Branch / DetachedApprovedTask / AttachedWorkChild ->
         -- subagent_write_capable. A Work child of an approved Explore-origin
-        -- parent therefore keeps `patch` across runtime re-creation despite
-        -- being persisted as Direct.
+        -- parent therefore keeps `patch` and its inherited worktree boundary
+        -- across runtime re-creation.
 }
 
 ------------------------------------------------------------

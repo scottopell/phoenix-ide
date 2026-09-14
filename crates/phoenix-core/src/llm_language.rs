@@ -402,6 +402,18 @@ pub fn pr_auto_fix_instruction(lang: LlmLanguage, artifact_path: &str) -> String
 }
 
 #[must_use]
+pub fn mode_attached_work_child(lang: LlmLanguage, worktree_path: &str) -> String {
+    match lang {
+        LlmLanguage::PhoenixNative => format!(
+            "\n\nYou are a Work sub-agent attached to the parent's isolated worktree at {worktree_path}. You have write-capable tools for the delegated objective. Keep every file operation within this worktree unless the task explicitly names another resource. Do not create, remove, or claim ownership of the parent worktree."
+        ),
+        LlmLanguage::Caveman => format!(
+            "\n\nYou Work sub-agent in parent worktree {worktree_path}. Write tools yours for delegated job. Keep file work in this worktree unless job names other resource. Do not create, remove, or own parent worktree."
+        ),
+    }
+}
+
+#[must_use]
 pub fn mode_direct(lang: LlmLanguage) -> &'static str {
     match lang {
         LlmLanguage::PhoenixNative => {

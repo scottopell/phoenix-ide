@@ -1852,6 +1852,14 @@ impl Database {
                     base_branch: Some(base_branch.to_string()),
                 }
             }
+            ("attached_work_child", Some(worktree_path), _, _) => {
+                EnvironmentContext::AllocatedWorktree {
+                    cwd: cwd.to_string(),
+                    worktree_path: worktree_path.to_string(),
+                    branch_name: None,
+                    base_branch: None,
+                }
+            }
             ("explore", Some(worktree_path), _, _) => EnvironmentContext::AllocatedWorktree {
                 cwd: worktree_path.to_string(),
                 worktree_path: worktree_path.to_string(),
@@ -1878,7 +1886,9 @@ impl Database {
     fn authority_for_mode(cm: &ConvModeCols<'_>) -> AuthorityKind {
         match cm.kind {
             "direct" => AuthorityKind::Direct,
-            "work" | "branch" | "detached_approved_task" => AuthorityKind::Work,
+            "work" | "branch" | "attached_work_child" | "detached_approved_task" => {
+                AuthorityKind::Work
+            }
             _ => AuthorityKind::RestrictedExplore,
         }
     }
@@ -7276,6 +7286,7 @@ impl Database {
     ///
     /// # Errors
     /// Returns [`DbError`] if the conversation has no attached scope or the snapshot conflicts.
+    #[allow(clippy::too_many_lines)]
     pub async fn persist_approved_task_authority(
         &self,
         conversation_id: &str,
@@ -7283,7 +7294,7 @@ impl Database {
         approval_message: &Message,
         approved_state: &ConvState,
         state_updated_at: DateTime<Utc>,
-    ) -> DbResult<()> {
+    ) -> DbResult<LocalAuthorityResult<()>> {
         let snapshot = phoenix_core::task_handoff::ApprovedTaskSnapshot::from(approval);
         let priority = serde_json::to_string(&snapshot.priority)
             .map_err(|error| DbError::Serialization(error.to_string()))?;
@@ -7319,7 +7330,7 @@ impl Database {
         .bind(&snapshot.task_id)
         .bind(&snapshot.task_title)
         .bind(&snapshot.title)
-        .bind(priority)
+        .bind(&priority)
         .bind(&snapshot.plan)
         .bind(&snapshot.task_file)
         .bind(&snapshot.artifact_body)
@@ -7367,7 +7378,7 @@ impl Database {
              SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4
              WHERE id = ?5",
         )
-        .bind(state_json)
+        .bind(&state_json)
         .bind(conv_state_kind(approved_state))
         .bind(state_updated_at.to_rfc3339())
         .bind(Utc::now().to_rfc3339())
@@ -7377,11 +7388,89 @@ impl Database {
         if state_result.rows_affected() == 0 {
             return Err(DbError::ConversationNotFound(conversation_id.to_string()));
         }
-        tx.commit().await?;
-        Ok(())
+        match tx.commit().await {
+            Ok(()) => Ok(LocalAuthorityResult::DurableFactEstablished(())),
+            Err(commit_error) => {
+                let established = self
+                    .classify_approved_task_authority(
+                        conversation_id,
+                        &approval_message.message_id,
+                        &state_json,
+                        approved_state,
+                        state_updated_at,
+                        &snapshot,
+                        &priority,
+                    )
+                    .await;
+                match established {
+                    Ok(true) => Ok(LocalAuthorityResult::DurableFactEstablished(())),
+                    Ok(false) => Err(commit_error.into()),
+                    Err(_) => Ok(LocalAuthorityResult::DurableFactUnclassified),
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn classify_approved_task_authority(
+        &self,
+        conversation_id: &str,
+        approval_message_id: &str,
+        state_json: &str,
+        approved_state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+        snapshot: &phoenix_core::task_handoff::ApprovedTaskSnapshot,
+        priority: &str,
+    ) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                 SELECT 1
+                 FROM conversations conversation
+                 JOIN conversation_approved_task_objectives objective
+                   ON objective.conversation_id = conversation.id
+                 JOIN work_scope_approved_task_authorities authority
+                   ON authority.objective_conversation_id = conversation.id
+                  AND authority.work_scope_id = conversation.work_scope_id
+                 JOIN work_scopes scope
+                   ON scope.id = authority.work_scope_id
+                  AND scope.authority_kind = 'work'
+                 JOIN messages approval_message
+                   ON approval_message.message_id = ?2
+                  AND approval_message.conversation_id = conversation.id
+                 JOIN approval_request_obligations obligation
+                   ON obligation.conversation_id = conversation.id
+                  AND obligation.approval_message_id = approval_message.message_id
+                 WHERE conversation.id = ?1
+                   AND conversation.state = ?3
+                   AND conversation.state_kind = ?4
+                   AND conversation.state_updated_at = ?5
+                   AND objective.task_id = ?6
+                   AND objective.task_title = ?7
+                   AND objective.approved_title = ?8
+                   AND objective.approved_priority = ?9
+                   AND objective.approved_plan = ?10
+                   AND objective.approved_task_file = ?11
+                   AND objective.approved_artifact_body = ?12
+             )",
+        )
+        .bind(conversation_id)
+        .bind(approval_message_id)
+        .bind(state_json)
+        .bind(conv_state_kind(approved_state))
+        .bind(state_updated_at.to_rfc3339())
+        .bind(&snapshot.task_id)
+        .bind(&snapshot.task_title)
+        .bind(&snapshot.title)
+        .bind(priority)
+        .bind(&snapshot.plan)
+        .bind(&snapshot.task_file)
+        .bind(&snapshot.artifact_body)
+        .fetch_one(&self.pool)
+        .await
     }
 
     /// Create a fresh Work conversation and `ProductConversation` for an approved task.
+    /// Load the typed approved-task objective    /// Create a fresh Work conversation and `ProductConversation` for an approved task.
     /// Load the typed approved-task objective that currently grants this conversation write authority.
     ///
     /// # Errors
@@ -12150,6 +12239,15 @@ fn conv_mode_columns(mode: &ConvMode) -> ConvModeCols<'_> {
             task_title: None,
             next_taskmd_id_hint: None,
         },
+        ConvMode::AttachedWorkChild { worktree_path } => ConvModeCols {
+            kind: "attached_work_child",
+            branch_name: None,
+            worktree_path: Some(worktree_path.as_str()),
+            base_branch: None,
+            task_id: None,
+            task_title: None,
+            next_taskmd_id_hint: None,
+        },
         ConvMode::DetachedProductCreation {
             worktree_path,
             base_branch,
@@ -12230,6 +12328,14 @@ fn conv_mode_from_row(row: &SqliteRow, conv_id: &str) -> ConvMode {
                 }
             } else {
                 tracing::warn!(conv_id = %conv_id, "branch conv_mode row missing required fields, defaulting to Explore");
+                ConvMode::default()
+            }
+        }
+        Some("attached_work_child") => {
+            if let Some(worktree_path) = ne_env("env_worktree_path") {
+                ConvMode::AttachedWorkChild { worktree_path }
+            } else {
+                tracing::warn!(conv_id = %conv_id, "attached Work child row missing worktree, defaulting to Explore");
                 ConvMode::default()
             }
         }
