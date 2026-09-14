@@ -4013,6 +4013,89 @@ fn linux_mapping_writer_evidence(
 }
 
 #[cfg(target_os = "linux")]
+fn linux_mapping_writer_evidence_if_stable(
+    process: &std::fs::DirEntry,
+    before_incarnation: &str,
+    canonical: &Path,
+    mapped_path: String,
+) -> Result<Option<ExternalWriterEvidence>, String> {
+    let process_path = process.path();
+    let Some(executable) = linux_read_leaf_after_capture(
+        &process_path,
+        before_incarnation,
+        AmbientWriterDiagnosticOperation::ReadProcessExecutable,
+        || std::fs::read_link(process_path.join("exe")),
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(identity_incarnation) =
+        linux_process_incarnation_after_capture(&process_path, before_incarnation)?
+    else {
+        return Ok(None);
+    };
+    if identity_incarnation != before_incarnation {
+        return Err("matching writer identity changed during inspection".to_string());
+    }
+    let Some(current_mappings) = linux_read_leaf_after_capture(
+        &process_path,
+        before_incarnation,
+        AmbientWriterDiagnosticOperation::ReadMappings,
+        || std::fs::read_to_string(process_path.join("maps")),
+    )?
+    else {
+        return Ok(None);
+    };
+    let mut mapping_still_matches = false;
+    for current_mapping in current_mappings.lines() {
+        if linux_writable_shared_mapping_path(current_mapping, canonical)?.as_deref()
+            == Some(mapped_path.as_str())
+        {
+            mapping_still_matches = true;
+            break;
+        }
+    }
+    let Some(after_incarnation) =
+        linux_process_incarnation_after_capture(&process_path, before_incarnation)?
+    else {
+        return Ok(None);
+    };
+    let Some(after_executable) = linux_read_leaf_after_capture(
+        &process_path,
+        before_incarnation,
+        AmbientWriterDiagnosticOperation::ReadProcessExecutable,
+        || std::fs::read_link(process_path.join("exe")),
+    )?
+    else {
+        return Ok(None);
+    };
+    if !linux_revalidated_writer_identity(
+        before_incarnation,
+        &executable,
+        mapping_still_matches,
+        &after_incarnation,
+        &after_executable,
+    )? {
+        return Ok(None);
+    }
+    let Some(final_incarnation) =
+        linux_process_incarnation_after_capture(&process_path, &after_incarnation)?
+    else {
+        return Ok(None);
+    };
+    if final_incarnation != after_incarnation {
+        return Err("matching writer identity changed during inspection".to_string());
+    }
+    linux_mapping_writer_evidence(
+        process,
+        before_incarnation.to_string(),
+        &executable,
+        mapped_path,
+    )
+    .map(Some)
+}
+
+#[cfg(target_os = "linux")]
 fn quarantine_has_writable_mappings_in(
     path: &Path,
     proc_root: &Path,
@@ -4049,78 +4132,14 @@ fn quarantine_has_writable_mappings_in(
             let Some(mapped_path) = linux_writable_shared_mapping_path(mapping, &canonical)? else {
                 continue;
             };
-            let Some(executable) = linux_read_leaf_after_capture(
-                &process_path,
-                &before_incarnation,
-                AmbientWriterDiagnosticOperation::ReadProcessExecutable,
-                || std::fs::read_link(process_path.join("exe")),
-            )?
-            else {
-                continue;
-            };
-            let Some(identity_incarnation) =
-                linux_process_incarnation_after_capture(&process_path, &before_incarnation)?
-            else {
-                continue;
-            };
-            if identity_incarnation != before_incarnation {
-                return Err("matching writer identity changed during inspection".to_string());
-            }
-            let Some(current_mappings) = linux_read_leaf_after_capture(
-                &process_path,
-                &before_incarnation,
-                AmbientWriterDiagnosticOperation::ReadMappings,
-                || std::fs::read_to_string(process_path.join("maps")),
-            )?
-            else {
-                continue;
-            };
-            let mut mapping_still_matches = false;
-            for current_mapping in current_mappings.lines() {
-                if linux_writable_shared_mapping_path(current_mapping, &canonical)?.as_deref()
-                    == Some(mapped_path.as_str())
-                {
-                    mapping_still_matches = true;
-                    break;
-                }
-            }
-            let Some(after_incarnation) =
-                linux_process_incarnation_after_capture(&process_path, &before_incarnation)?
-            else {
-                continue;
-            };
-            let Some(after_executable) = linux_read_leaf_after_capture(
-                &process_path,
-                &before_incarnation,
-                AmbientWriterDiagnosticOperation::ReadProcessExecutable,
-                || std::fs::read_link(process_path.join("exe")),
-            )?
-            else {
-                continue;
-            };
-            if !linux_revalidated_writer_identity(
-                &before_incarnation,
-                &executable,
-                mapping_still_matches,
-                &after_incarnation,
-                &after_executable,
-            )? {
-                continue;
-            }
-            let Some(final_incarnation) =
-                linux_process_incarnation_after_capture(&process_path, &after_incarnation)?
-            else {
-                continue;
-            };
-            if final_incarnation != after_incarnation {
-                return Err("matching writer identity changed during inspection".to_string());
-            }
-            return linux_mapping_writer_evidence(
+            if let Some(evidence) = linux_mapping_writer_evidence_if_stable(
                 &process,
-                before_incarnation,
-                &executable,
+                &before_incarnation,
+                &canonical,
                 mapped_path,
-            );
+            )? {
+                return Ok(evidence);
+            }
         }
     }
     Ok(ExternalWriterEvidence::NoPositiveEvidence)
@@ -4581,11 +4600,19 @@ fn linux_read_leaf_after_capture<T>(
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LinuxDescriptorAccess {
+    Disappeared,
+    NoWrite,
+    Mode(AmbientWriterAccessMode),
+}
+
+#[cfg(target_os = "linux")]
 fn linux_descriptor_access_mode(
     process: &Path,
     captured_incarnation: &str,
     path: &Path,
-) -> Result<Option<Option<AmbientWriterAccessMode>>, String> {
+) -> Result<LinuxDescriptorAccess, String> {
     let Some(fdinfo) = linux_read_leaf_after_capture(
         process,
         captured_incarnation,
@@ -4593,7 +4620,7 @@ fn linux_descriptor_access_mode(
         || std::fs::read_to_string(path),
     )?
     else {
-        return Ok(None);
+        return Ok(LinuxDescriptorAccess::Disappeared);
     };
     let flags = fdinfo
         .lines()
@@ -4610,7 +4637,10 @@ fn linux_descriptor_access_mode(
             AmbientWriterDiagnosticErrorKind::InvalidData,
         )
     })?;
-    Ok(Some(linux_descriptor_access_mode_from_flags(flags)))
+    Ok(match linux_descriptor_access_mode_from_flags(flags) {
+        Some(access_mode) => LinuxDescriptorAccess::Mode(access_mode),
+        None => LinuxDescriptorAccess::NoWrite,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -4657,16 +4687,17 @@ fn linux_descriptor_writer_evidence(
     else {
         return Ok(None);
     };
-    let Some(current_access_mode) = linux_descriptor_access_mode(
+    let current_access_mode = match linux_descriptor_access_mode(
         &process_path,
         before_incarnation,
         &process_path.join("fdinfo").join(descriptor.file_name()),
-    )?
-    else {
-        return Ok(None);
+    )? {
+        LinuxDescriptorAccess::Disappeared => return Ok(None),
+        LinuxDescriptorAccess::NoWrite => None,
+        LinuxDescriptorAccess::Mode(access_mode) => {
+            classify_descriptor_access_mode(Some(access_mode), target_is_directory)
+        }
     };
-    let current_access_mode =
-        classify_descriptor_access_mode(current_access_mode, target_is_directory);
     let resource_still_matches = current_target == target
         && current_access_mode == Some(access_mode)
         && linux_descriptor_target_is_within(Ok(current_target), canonical);
@@ -4821,15 +4852,16 @@ fn quarantine_has_open_descriptors_in(
                 &before_incarnation,
                 &process_path.join("fdinfo").join(descriptor.file_name()),
             )? {
-                Some(access_mode) => {
-                    let Some(access_mode) =
-                        classify_descriptor_access_mode(access_mode, target_metadata.is_dir())
-                    else {
+                LinuxDescriptorAccess::Disappeared | LinuxDescriptorAccess::NoWrite => continue,
+                LinuxDescriptorAccess::Mode(access_mode) => {
+                    let Some(access_mode) = classify_descriptor_access_mode(
+                        Some(access_mode),
+                        target_metadata.is_dir(),
+                    ) else {
                         continue;
                     };
                     access_mode
                 }
-                None => continue,
             };
             if let Some(evidence) = linux_descriptor_writer_evidence(
                 &process,
