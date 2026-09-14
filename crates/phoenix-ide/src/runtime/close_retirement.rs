@@ -3830,6 +3830,33 @@ fn linux_revalidated_writer_identity(
 }
 
 #[cfg(target_os = "linux")]
+fn linux_mapping_writer_evidence(
+    process: &std::fs::DirEntry,
+    before_incarnation: String,
+    executable: &Path,
+    mapped_path: String,
+) -> Result<ExternalWriterEvidence, String> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let process_id = process
+        .file_name()
+        .to_string_lossy()
+        .parse::<i64>()
+        .map_err(|error| format!("process id is malformed: {error}"))?;
+    Ok(ExternalWriterEvidence::PositiveWriterFound(
+        AmbientWriterEvidence {
+            detector: AmbientWriterDetector::LinuxProcfs,
+            process_id,
+            process_incarnation: before_incarnation,
+            executable: GitPathIdentity::from_bytes(executable.as_os_str().as_bytes().to_vec()),
+            matched_path: GitPathIdentity::from_bytes(mapped_path.into_bytes()),
+            match_kind: AmbientWriterMatchKind::Mapping,
+            access_mode: AmbientWriterAccessMode::WritableSharedMapping,
+        },
+    ))
+}
+
+#[cfg(target_os = "linux")]
 fn quarantine_has_writable_mappings_in(
     path: &Path,
     proc_root: &Path,
@@ -3917,24 +3944,12 @@ fn quarantine_has_writable_mappings_in(
             if final_incarnation != after_incarnation {
                 return Err("matching writer identity changed during inspection".to_string());
             }
-            let process_id = process
-                .file_name()
-                .to_string_lossy()
-                .parse::<i64>()
-                .map_err(|error| format!("process id is malformed: {error}"))?;
-            return Ok(ExternalWriterEvidence::PositiveWriterFound(
-                AmbientWriterEvidence {
-                    detector: AmbientWriterDetector::LinuxProcfs,
-                    process_id,
-                    process_incarnation: before_incarnation.clone(),
-                    executable: GitPathIdentity::from_bytes(
-                        executable.as_os_str().as_bytes().to_vec(),
-                    ),
-                    matched_path: GitPathIdentity::from_bytes(mapped_path.into_bytes()),
-                    match_kind: AmbientWriterMatchKind::Mapping,
-                    access_mode: AmbientWriterAccessMode::WritableSharedMapping,
-                },
-            ));
+            return linux_mapping_writer_evidence(
+                &process,
+                before_incarnation,
+                &executable,
+                mapped_path,
+            );
         }
     }
     Ok(ExternalWriterEvidence::NoPositiveEvidence)
@@ -4319,6 +4334,91 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence
 }
 
 #[cfg(target_os = "linux")]
+fn linux_descriptor_writer_evidence(
+    process: &std::fs::DirEntry,
+    descriptor: &std::fs::DirEntry,
+    canonical: &Path,
+    before_incarnation: &str,
+    target: PathBuf,
+    target_is_directory: bool,
+    access_mode: AmbientWriterAccessMode,
+) -> Result<Option<ExternalWriterEvidence>, String> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let executable = match std::fs::read_link(process.path().join("exe")) {
+        Ok(executable) => executable,
+        Err(_) if !process.path().exists() => return Ok(None),
+        Err(error) => return Err(format!("cannot inspect process executable: {error}")),
+    };
+    let identity_incarnation = match linux_process_incarnation(&process.path()) {
+        Ok(incarnation) => incarnation,
+        Err(_) if !process.path().exists() => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if identity_incarnation != before_incarnation {
+        return Err("matching writer identity changed during inspection".to_string());
+    }
+    let current_target = match std::fs::read_link(descriptor.path()) {
+        Ok(target) => target,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("cannot inspect descriptor target: {error}")),
+    };
+    let current_access_mode = match linux_descriptor_access_mode(
+        &process.path().join("fdinfo").join(descriptor.file_name()),
+    ) {
+        Ok(mode) => classify_descriptor_access_mode(mode, target_is_directory),
+        Err(_) if !process.path().exists() => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let resource_still_matches = current_target == target
+        && current_access_mode == Some(access_mode)
+        && linux_descriptor_target_is_within(Ok(current_target), canonical);
+    let after_incarnation = match linux_process_incarnation(&process.path()) {
+        Ok(incarnation) => incarnation,
+        Err(_) if !process.path().exists() => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let after_executable = match std::fs::read_link(process.path().join("exe")) {
+        Ok(executable) => executable,
+        Err(_) if !process.path().exists() => return Ok(None),
+        Err(error) => return Err(format!("cannot inspect process executable: {error}")),
+    };
+    if !linux_revalidated_writer_identity(
+        before_incarnation,
+        &executable,
+        resource_still_matches,
+        &after_incarnation,
+        &after_executable,
+    )? {
+        return Ok(None);
+    }
+    let final_incarnation = match linux_process_incarnation(&process.path()) {
+        Ok(incarnation) => incarnation,
+        Err(_) if !process.path().exists() => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if final_incarnation != after_incarnation {
+        return Err("matching writer identity changed during inspection".to_string());
+    }
+    let process_id = process
+        .file_name()
+        .to_string_lossy()
+        .parse::<i64>()
+        .map_err(|error| format!("process id is malformed: {error}"))?;
+    Ok(Some(ExternalWriterEvidence::PositiveWriterFound(
+        AmbientWriterEvidence {
+            detector: AmbientWriterDetector::LinuxProcfs,
+            process_id,
+            process_incarnation: before_incarnation.to_string(),
+            executable: GitPathIdentity::from_bytes(executable.as_os_str().as_bytes().to_vec()),
+            matched_path: GitPathIdentity::from_bytes(target.as_os_str().as_bytes().to_vec()),
+            match_kind: AmbientWriterMatchKind::Descriptor,
+            access_mode,
+        },
+    )))
+}
+
+#[cfg(target_os = "linux")]
 fn quarantine_has_open_descriptors_in(
     path: &Path,
     proc_root: &Path,
@@ -4381,81 +4481,17 @@ fn quarantine_has_open_descriptors_in(
                 Err(_) if !process.path().exists() => continue,
                 Err(error) => return Err(error),
             };
-            let executable = match std::fs::read_link(process.path().join("exe")) {
-                Ok(executable) => executable,
-                Err(_) if !process.path().exists() => continue,
-                Err(error) => return Err(format!("cannot inspect process executable: {error}")),
-            };
-            let identity_incarnation = match linux_process_incarnation(&process.path()) {
-                Ok(incarnation) => incarnation,
-                Err(_) if !process.path().exists() => continue,
-                Err(error) => return Err(error),
-            };
-            if identity_incarnation != before_incarnation {
-                return Err("matching writer identity changed during inspection".to_string());
-            }
-            let current_target = match std::fs::read_link(descriptor.path()) {
-                Ok(target) => target,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(format!("cannot inspect descriptor target: {error}")),
-            };
-            let current_access_mode = match linux_descriptor_access_mode(
-                &process.path().join("fdinfo").join(descriptor.file_name()),
-            ) {
-                Ok(mode) => classify_descriptor_access_mode(mode, target_metadata.is_dir()),
-                Err(_) if !process.path().exists() => continue,
-                Err(error) => return Err(error),
-            };
-            let resource_still_matches = current_target == target
-                && current_access_mode == Some(access_mode)
-                && linux_descriptor_target_is_within(Ok(current_target), &canonical);
-            let after_incarnation = match linux_process_incarnation(&process.path()) {
-                Ok(incarnation) => incarnation,
-                Err(_) if !process.path().exists() => continue,
-                Err(error) => return Err(error),
-            };
-            let after_executable = match std::fs::read_link(process.path().join("exe")) {
-                Ok(executable) => executable,
-                Err(_) if !process.path().exists() => continue,
-                Err(error) => return Err(format!("cannot inspect process executable: {error}")),
-            };
-            if !linux_revalidated_writer_identity(
+            if let Some(evidence) = linux_descriptor_writer_evidence(
+                &process,
+                &descriptor,
+                &canonical,
                 &before_incarnation,
-                &executable,
-                resource_still_matches,
-                &after_incarnation,
-                &after_executable,
+                target,
+                target_metadata.is_dir(),
+                access_mode,
             )? {
-                continue;
+                return Ok(evidence);
             }
-            let final_incarnation = match linux_process_incarnation(&process.path()) {
-                Ok(incarnation) => incarnation,
-                Err(_) if !process.path().exists() => continue,
-                Err(error) => return Err(error),
-            };
-            if final_incarnation != after_incarnation {
-                return Err("matching writer identity changed during inspection".to_string());
-            }
-            let process_id = process
-                .file_name()
-                .to_string_lossy()
-                .parse::<i64>()
-                .map_err(|error| format!("process id is malformed: {error}"))?;
-            return Ok(ExternalWriterEvidence::PositiveWriterFound(
-                AmbientWriterEvidence {
-                    detector: AmbientWriterDetector::LinuxProcfs,
-                    process_id,
-                    process_incarnation: before_incarnation.clone(),
-                    executable: GitPathIdentity::from_bytes(
-                        executable.as_os_str().as_bytes().to_vec(),
-                    ),
-                    matched_path: GitPathIdentity::from_bytes(
-                        target.as_os_str().as_bytes().to_vec(),
-                    ),
-                    match_kind: AmbientWriterMatchKind::Descriptor,
-                    access_mode,
-                },
-            ));
         }
     }
     Ok(ExternalWriterEvidence::NoPositiveEvidence)
