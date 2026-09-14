@@ -3938,7 +3938,7 @@ fn macos_descriptor_inventory_count(bytes: usize, record_size: usize) -> Result<
 fn quarantine_has_writable_mappings(path: &Path) -> Result<ExternalWriterEvidence, String> {
     // SAFETY: `geteuid` has no preconditions.
     let effective_uid = unsafe { libc::geteuid() };
-    quarantine_has_writable_mappings_in(path, Path::new("/proc"), effective_uid)
+    quarantine_has_writable_mappings_in(path, production_proc_root(), effective_uid)
 }
 
 #[cfg(target_os = "linux")]
@@ -4320,11 +4320,16 @@ fn quarantine_has_writable_mappings(_path: &Path) -> Result<ExternalWriterEviden
     Err("writable memory-mapping inspection is unsupported on this platform".to_string())
 }
 
+#[cfg(target_os = "linux")]
+fn production_proc_root() -> &'static Path {
+    Path::new("/proc")
+}
+
 #[cfg(all(test, target_os = "linux"))]
 fn quarantine_has_process_cwd(path: &Path) -> Result<bool, String> {
     // SAFETY: `geteuid` has no preconditions.
     let effective_uid = unsafe { libc::geteuid() };
-    quarantine_has_process_cwd_in(path, Path::new("/proc"), effective_uid)
+    quarantine_has_process_cwd_in(path, production_proc_root(), effective_uid)
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -4687,7 +4692,7 @@ fn linux_descriptor_access_mode(
 
 #[cfg(target_os = "linux")]
 fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence, String> {
-    quarantine_has_open_descriptors_in(path, Path::new("/proc"))
+    quarantine_has_open_descriptors_in(path, production_proc_root())
 }
 
 #[cfg(target_os = "linux")]
@@ -4897,7 +4902,7 @@ fn linux_namespace_cwd_writer_evidence_if_stable(
 fn quarantine_has_namespace_cwd(path: &Path) -> Result<ExternalWriterEvidence, String> {
     // SAFETY: `geteuid` has no preconditions.
     let effective_uid = unsafe { libc::geteuid() };
-    quarantine_has_namespace_cwd_in(path, Path::new("/proc"), effective_uid)
+    quarantine_has_namespace_cwd_in(path, production_proc_root(), effective_uid)
 }
 
 #[cfg(target_os = "linux")]
@@ -5036,7 +5041,15 @@ fn quarantine_has_open_descriptors_in(
                 &before_incarnation,
                 &process_path.join("fdinfo").join(descriptor.file_name()),
             )? {
-                LinuxDescriptorAccess::Disappeared | LinuxDescriptorAccess::NoWrite => continue,
+                LinuxDescriptorAccess::Disappeared => continue,
+                LinuxDescriptorAccess::NoWrite => {
+                    let Some(access_mode) =
+                        classify_descriptor_access_mode(None, target_metadata.is_dir())
+                    else {
+                        continue;
+                    };
+                    access_mode
+                }
                 LinuxDescriptorAccess::Mode(access_mode) => {
                     let Some(access_mode) = classify_descriptor_access_mode(
                         Some(access_mode),
@@ -8131,6 +8144,26 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn proc_root_for_process(parent: &Path, pid: u32) -> PathBuf {
+        let proc_root = parent.join("proc");
+        std::fs::create_dir(&proc_root).unwrap();
+        std::os::unix::fs::symlink(format!("/proc/{pid}"), proc_root.join(pid.to_string()))
+            .unwrap();
+        proc_root
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn injected_proc_universe_is_separate_from_production_proc_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let proc_root = proc_root_for_process(temp.path(), std::process::id());
+
+        assert_ne!(proc_root, super::production_proc_root());
+        assert_eq!(super::production_proc_root(), Path::new("/proc"));
+        assert_eq!(std::fs::read_dir(&proc_root).unwrap().count(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
     fn write_synthetic_process_credentials(process: &Path, pid: i64) {
         // SAFETY: `geteuid` has no preconditions.
         let effective_uid = unsafe { libc::geteuid() };
@@ -8650,6 +8683,19 @@ mod tests {
             .current_dir(temp.path())
             .spawn()
             .unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            let pid = child.id();
+            let proc_root = proc_root_for_process(temp.path(), pid);
+            assert!(matches!(
+                super::quarantine_has_namespace_cwd_in(temp.path(), &proc_root, unsafe {
+                    libc::geteuid()
+                },)
+                .unwrap(),
+                super::ExternalWriterEvidence::PositiveWriterFound(_)
+            ));
+        }
+        #[cfg(target_os = "macos")]
         assert!(super::quarantine_has_process_cwd(temp.path()).unwrap());
         child.kill().unwrap();
         child.wait().unwrap();
@@ -8669,7 +8715,11 @@ mod tests {
         let marker = temp.path().join("writer-ready");
         let quarantine = worktree_quarantine_path(&identity).unwrap();
         let child = std::sync::Arc::new(std::sync::Mutex::new(None));
+        #[cfg(target_os = "linux")]
+        let proc_root = std::sync::Arc::new(std::sync::Mutex::new(None::<std::path::PathBuf>));
         let callback_child = child.clone();
+        #[cfg(target_os = "linux")]
+        let callback_proc_root = proc_root.clone();
         let callback_marker = marker.clone();
         let callback_quarantine = quarantine.clone();
 
@@ -8690,6 +8740,11 @@ mod tests {
                     .env("MARKER", &callback_marker)
                     .spawn()
                     .unwrap();
+                #[cfg(target_os = "linux")]
+                {
+                    *callback_proc_root.lock().unwrap() =
+                        Some(proc_root_for_process(callback_quarantine.parent().unwrap(), spawned.id()));
+                }
                 *callback_child.lock().unwrap() = Some(spawned);
                 for _ in 0..100 {
                     if callback_marker.exists() {
@@ -8700,7 +8755,32 @@ mod tests {
                 }
                 panic!("external writer did not become ready");
             },
-            quarantine_has_external_writer,
+            move |path| {
+                #[cfg(target_os = "linux")]
+                {
+                    let proc_root = proc_root
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .expect("writer process universe is initialized");
+                    inspect_ambient_writer_until_quiescent(
+                        AmbientWriterObservationPolicy::production(),
+                        || match quarantine_has_open_descriptors_in(path, &proc_root)? {
+                            positive @ ExternalWriterEvidence::PositiveWriterFound(_) => {
+                                Ok(positive)
+                            }
+                            ExternalWriterEvidence::NoPositiveEvidence => {
+                                Ok(ExternalWriterEvidence::NoPositiveEvidence)
+                            }
+                        },
+                        std::thread::sleep,
+                    )
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    quarantine_has_external_writer(path)
+                }
+            },
         )
         .await
         .unwrap();
