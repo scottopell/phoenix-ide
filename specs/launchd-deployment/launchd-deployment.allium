@@ -89,8 +89,9 @@ external entity TargetService {
 --   Local source is exact checked HEAD, or release source is one resolved tag
 --   and commit with matching host asset, checksum and embedded git SHA.
 -- restart_preparation_complete(restart) -> Boolean
---   The target job is loaded with KeepAlive and the launchd-owned listener,
---   the running process reports that it adopted the listener, its running and
+--   The loaded target job reports the installed plist and binary program,
+--   KeepAlive, and the sole listener service used by its health endpoint; the
+--   running process reports that it adopted the listener, its running and
 --   installed binary identities match the deployed source identity, and the
 --   secret-free handoff contains hashes of the installed binary, plist, and
 --   deployed SHA without environment values.

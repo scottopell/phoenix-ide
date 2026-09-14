@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 
-HANDOFF_PROTOCOL_VERSION = 1
+HANDOFF_PROTOCOL_VERSION = 2
 TERMINAL_STATES = {
     "committed",
     "precondition_failed",
@@ -47,6 +47,7 @@ class Manifest:
     binary_sha256: str
     plist_path: str
     plist_sha256: str
+    socket_service: int
     deployed_sha_path: str
     deployed_sha256: str
     label: str
@@ -76,6 +77,8 @@ class Manifest:
             raise RestartError("restart manifest has incomplete job identity")
         if manifest.previous_pid <= 0:
             raise RestartError("restart manifest has an invalid previous PID")
+        if not 1 <= manifest.socket_service <= 65535:
+            raise RestartError("restart manifest has an invalid socket service")
         if not manifest.expected.version or not manifest.expected.git_sha:
             raise RestartError("restart manifest has an incomplete runtime identity")
         for value, description in (
@@ -103,6 +106,9 @@ class LoadedJob:
     state: str
     pid: Optional[int]
     keep_alive: Optional[bool]
+    plist_path: Optional[str]
+    program_path: Optional[str]
+    socket_services: tuple[str, ...]
 
 
 def utc_now() -> str:
@@ -215,7 +221,7 @@ class Launchctl:
         )
         output = result.stdout + "\n" + result.stderr
         if "Could not find service" in output:
-            return LoadedJob("not_loaded", None, None)
+            return LoadedJob("not_loaded", None, None, None, None, ())
         if result.returncode != 0:
             detail = (result.stderr or result.stdout).strip()
             suffix = f": {detail}" if detail else ""
@@ -226,10 +232,17 @@ class Launchctl:
         state = "unknown"
         pid = None
         keep_alive = None
+        plist_path = None
+        program_path = None
+        socket_services = []
         for raw in result.stdout.splitlines():
             line = raw.strip()
             if line.startswith("state = "):
                 state = line.split(" = ", 1)[1]
+            elif line.startswith("path = "):
+                plist_path = line.split(" = ", 1)[1]
+            elif line.startswith("program = "):
+                program_path = line.split(" = ", 1)[1]
             elif line.startswith("pid = "):
                 try:
                     pid = int(line.split(" = ", 1)[1])
@@ -240,19 +253,58 @@ class Launchctl:
                     value.strip() for value in line.split(" = ", 1)[1].split("|")
                 }
                 keep_alive = "keepalive" in properties
-        return LoadedJob(state, pid, keep_alive)
+            elif line.startswith("service name = "):
+                socket_services.append(line.split(" = ", 1)[1])
+        return LoadedJob(
+            state,
+            pid,
+            keep_alive,
+            plist_path,
+            program_path,
+            tuple(socket_services),
+        )
+
+    def configuration_matches(self, job: LoadedJob) -> bool:
+        try:
+            plist_matches = (
+                job.plist_path is not None
+                and Path(job.plist_path).samefile(self.manifest.plist_path)
+            )
+            program_matches = (
+                job.program_path is not None
+                and Path(job.program_path).samefile(self.manifest.binary_path)
+            )
+        except OSError:
+            return False
+        return (
+            job.keep_alive is True
+            and plist_matches
+            and program_matches
+            and job.socket_services == (str(self.manifest.socket_service),)
+        )
+
+    def require_configuration(self, job: LoadedJob, context: str) -> None:
+        if not self.configuration_matches(job):
+            raise RestartError(
+                f"{context}; observed keepalive={job.keep_alive} "
+                f"plist={job.plist_path!r} program={job.program_path!r} "
+                f"socket_services={job.socket_services!r}"
+            )
 
     def signal_hup(self) -> int:
         job = self.inspect()
         if (
             job.state not in {"running", "active"}
             or job.pid is None
-            or job.keep_alive is not True
         ):
             raise RestartError(
                 "installed service changed immediately before restart; "
                 f"observed state={job.state} pid={job.pid} keepalive={job.keep_alive}"
             )
+        self.require_configuration(
+            job,
+            "loaded service configuration changed immediately before restart",
+        )
         try:
             self.kill(job.pid, signal.SIGHUP)
         except OSError as exc:
@@ -263,14 +315,17 @@ class Launchctl:
 
     def wait_for_new_pid(self, previous_pid: int) -> int:
         deadline = self.monotonic() + self.manifest.transition_timeout_secs
-        observed = LoadedJob("unknown", None, None)
+        observed = LoadedJob("unknown", None, None, None, None, ())
         while self.monotonic() < deadline:
             observed = self.inspect()
             if (
                 observed.state in {"running", "active"}
                 and observed.pid not in {None, previous_pid}
-                and observed.keep_alive is True
             ):
+                self.require_configuration(
+                    observed,
+                    "replacement service configuration does not match the handoff",
+                )
                 return observed.pid
             self.sleep(0.1)
         raise RestartError(
@@ -333,13 +388,16 @@ def restart(manifest: Manifest) -> str:
             if (
                 job.state not in {"running", "active"}
                 or job.pid != manifest.previous_pid
-                or job.keep_alive is not True
             ):
                 raise RestartError(
                     "installed service changed before restart; "
                     f"expected running PID {manifest.previous_pid}, "
                     f"observed state={job.state} pid={job.pid} keepalive={job.keep_alive}"
                 )
+            launchctl.require_configuration(
+                job,
+                "loaded service configuration does not match the restart handoff",
+            )
             observed = fetch_identity(
                 manifest.health_url,
                 timeout=2.0,
@@ -359,7 +417,6 @@ def restart(manifest: Manifest) -> str:
             if (
                 verified_job.state not in {"running", "active"}
                 or verified_job.pid != running_pid
-                or verified_job.keep_alive is not True
             ):
                 raise RestartError(
                     "runtime PID changed during identity verification; "
@@ -367,6 +424,10 @@ def restart(manifest: Manifest) -> str:
                     f"state={verified_job.state} pid={verified_job.pid} "
                     f"keepalive={verified_job.keep_alive}"
                 )
+            launchctl.require_configuration(
+                verified_job,
+                "verified service configuration does not match the restart handoff",
+            )
             verify_installed_artifacts(manifest)
             write_status(
                 manifest,

@@ -33,6 +33,7 @@ import time
 import traceback
 from collections.abc import Mapping
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 ROOT = Path(__file__).parent.resolve()
@@ -902,7 +903,7 @@ LAUNCHD_TRANSITION_TIMEOUT_SECS = 30.0
 LAUNCHD_HEALTH_TIMEOUT_SECS = 120.0
 LAUNCHD_STALE_HANDOFF_ALLOWANCE_SECS = 30.0
 LAUNCHD_HANDOFF_PROTOCOL_VERSION = 1
-LAUNCHD_RESTART_HANDOFF_PROTOCOL_VERSION = 1
+LAUNCHD_RESTART_HANDOFF_PROTOCOL_VERSION = 2
 NEWSYSLOG_CONF_PATH = Path("/etc/newsyslog.d") / f"{LAUNCHD_LABEL}.conf"
 
 # Dev ports are assigned deterministically from the worktree path hash. Keep
@@ -8959,6 +8960,9 @@ class LoadedLaunchdJob:
     state: str
     pid: int | None
     keep_alive: bool | None
+    plist_path: str | None
+    program_path: str | None
+    socket_services: tuple[str, ...]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -9167,10 +9171,17 @@ def _inspect_launchd_job() -> LaunchdJobInspection:
     state = "unknown"
     pid = None
     keep_alive = None
+    plist_path = None
+    program_path = None
+    socket_services = []
     for raw in result.stdout.splitlines():
         line = raw.strip()
         if line.startswith("state = "):
             state = line.split(" = ", 1)[1]
+        elif line.startswith("path = "):
+            plist_path = line.split(" = ", 1)[1]
+        elif line.startswith("program = "):
+            program_path = line.split(" = ", 1)[1]
         elif line.startswith("pid = "):
             try:
                 pid = int(line.split(" = ", 1)[1])
@@ -9181,7 +9192,25 @@ def _inspect_launchd_job() -> LaunchdJobInspection:
                 value.strip() for value in line.split(" = ", 1)[1].split("|")
             }
             keep_alive = "keepalive" in properties
-    return LoadedLaunchdJob(state=state, pid=pid, keep_alive=keep_alive)
+        elif line.startswith("service name = "):
+            socket_services.append(line.split(" = ", 1)[1])
+    return LoadedLaunchdJob(
+        state=state,
+        pid=pid,
+        keep_alive=keep_alive,
+        plist_path=plist_path,
+        program_path=program_path,
+        socket_services=tuple(socket_services),
+    )
+
+
+def _same_file(first: str | None, second: Path) -> bool:
+    if first is None:
+        return False
+    try:
+        return Path(first).samefile(second)
+    except OSError:
+        return False
 
 
 def _installed_launchd_runtime_for_restart() -> InstalledLaunchdRuntime:
@@ -9241,6 +9270,15 @@ def _installed_launchd_runtime_for_restart() -> InstalledLaunchdRuntime:
     if inspection.keep_alive is not True:
         raise SystemExit(
             "loaded launchd service does not report KeepAlive; "
+            "run './dev.py prod deploy' to reload its installed configuration"
+        )
+    if (
+        not _same_file(inspection.plist_path, LAUNCHD_PLIST_PATH)
+        or not _same_file(inspection.program_path, binary)
+        or inspection.socket_services != (socket_port,)
+    ):
+        raise SystemExit(
+            "loaded launchd program or listener does not match the installed plist; "
             "run './dev.py prod deploy' to reload its installed configuration"
         )
 
@@ -10161,6 +10199,7 @@ def launchd_prod_restart() -> None:
             "binary_sha256": _file_sha256(installed.binary),
             "plist_path": str(installed.plist),
             "plist_sha256": _file_sha256(installed.plist),
+            "socket_service": urlsplit(installed.health_url).port,
             "deployed_sha_path": str(installed.deployed_sha),
             "deployed_sha256": _file_sha256(installed.deployed_sha),
             "label": LAUNCHD_LABEL,

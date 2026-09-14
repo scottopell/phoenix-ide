@@ -1,3 +1,4 @@
+import dataclasses
 import importlib.util
 import io
 import json
@@ -45,6 +46,7 @@ def make_manifest(root: Path) -> helper.Manifest:
         binary_sha256=helper.sha256(binary),
         plist_path=str(plist),
         plist_sha256=helper.sha256(plist),
+        socket_service=1,
         deployed_sha_path=str(deployed_sha),
         deployed_sha256=helper.sha256(deployed_sha),
         label="test.phoenix.server",
@@ -63,13 +65,23 @@ def make_manifest(root: Path) -> helper.Manifest:
 
 
 class FakeLaunchctl:
+    configuration_matches = helper.Launchctl.configuration_matches
+    require_configuration = helper.Launchctl.require_configuration
+
     def __init__(self, manifest):
         self.manifest = manifest
         self.signals = []
 
     def inspect(self):
         pid = 100 if not self.signals else 101
-        return helper.LoadedJob("running", pid, True)
+        return helper.LoadedJob(
+            "running",
+            pid,
+            True,
+            self.manifest.plist_path,
+            self.manifest.binary_path,
+            (str(self.manifest.socket_service),),
+        )
 
     def signal_hup(self):
         self.signals.append("HUP")
@@ -88,7 +100,14 @@ class RestartHelperTests(unittest.TestCase):
             run = mock.Mock(return_value=subprocess.CompletedProcess(
                 [],
                 0,
-                "state = running\npid = 100\nproperties = keepalive | runatload\n",
+                (
+                    f"path = {manifest.plist_path}\n"
+                    "state = running\n"
+                    f"program = {manifest.binary_path}\n"
+                    "pid = 100\n"
+                    "service name = 1\n"
+                    "properties = keepalive | runatload\n"
+                ),
                 "",
             ))
             kill = mock.Mock()
@@ -157,7 +176,7 @@ class RestartHelperTests(unittest.TestCase):
         class ReboundLaunchctl(FakeLaunchctl):
             def inspect(self):
                 pid = 100 if not self.signals else 102
-                return helper.LoadedJob("running", pid, True)
+                return dataclasses.replace(super().inspect(), pid=pid)
 
             def signal_hup(self):
                 self.signals.append("HUP")
@@ -186,7 +205,7 @@ class RestartHelperTests(unittest.TestCase):
         class ReplacedDuringHealthCheck(FakeLaunchctl):
             def inspect(self):
                 pid = 100 if not self.signals else 102
-                return helper.LoadedJob("running", pid, True)
+                return dataclasses.replace(super().inspect(), pid=pid)
 
         with tempfile.TemporaryDirectory() as td:
             manifest = make_manifest(Path(td))
@@ -219,7 +238,7 @@ class RestartHelperTests(unittest.TestCase):
     def test_loaded_job_without_keepalive_is_rejected_before_signal(self):
         class NoKeepAliveLaunchctl(FakeLaunchctl):
             def inspect(self):
-                return helper.LoadedJob("running", 100, False)
+                return dataclasses.replace(super().inspect(), keep_alive=False)
 
         with tempfile.TemporaryDirectory() as td:
             manifest = make_manifest(Path(td))
@@ -227,6 +246,23 @@ class RestartHelperTests(unittest.TestCase):
 
             with mock.patch.object(helper, "Launchctl", return_value=launchctl):
                 with self.assertRaisesRegex(helper.RestartError, "keepalive=False"):
+                    helper.restart(manifest)
+
+            self.assertEqual([], launchctl.signals)
+            status = json.loads(Path(manifest.status_path).read_text())
+            self.assertEqual("precondition_failed", status["state"])
+
+    def test_loaded_listener_mismatch_is_rejected_before_signal(self):
+        class WrongListenerLaunchctl(FakeLaunchctl):
+            def inspect(self):
+                return dataclasses.replace(super().inspect(), socket_services=("2",))
+
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            launchctl = WrongListenerLaunchctl(manifest)
+
+            with mock.patch.object(helper, "Launchctl", return_value=launchctl):
+                with self.assertRaisesRegex(helper.RestartError, "socket_services"):
                     helper.restart(manifest)
 
             self.assertEqual([], launchctl.signals)
@@ -357,11 +393,18 @@ class RestartCommandTests(unittest.TestCase):
                     return subprocess.CompletedProcess(
                         command,
                         0,
-                        "state = running\npid = 100\nproperties = keepalive | runatload\n",
+                        (
+                            f"path = {plist}\n"
+                            "state = running\n"
+                            f"program = {binary}\n"
+                            "pid = 100\n"
+                            "service name = 9555\n"
+                            "properties = keepalive | runatload\n"
+                        ),
                         "",
                     )
                 if "--protocol-version" in command:
-                    return subprocess.CompletedProcess(command, 0, "1\n", "")
+                    return subprocess.CompletedProcess(command, 0, "2\n", "")
                 return subprocess.CompletedProcess(command, 0, "", "")
 
             with self._isolated_operation_paths(root), \
@@ -421,7 +464,7 @@ class RestartCommandTests(unittest.TestCase):
 
             def run(command, **_kwargs):
                 if "--protocol-version" in command:
-                    return subprocess.CompletedProcess(command, 0, "1\n", "")
+                    return subprocess.CompletedProcess(command, 0, "2\n", "")
                 if command[:2] == ["launchctl", "bootstrap"]:
                     status_path = next(
                         (root / "restart" / "transactions").glob("*/status.json")
@@ -485,6 +528,9 @@ class RestartCommandTests(unittest.TestCase):
                 state="running",
                 pid=100,
                 keep_alive=False,
+                plist_path=str(plist),
+                program_path=str(binary),
+                socket_services=("9555",),
             )
 
             with self._isolated_operation_paths(root), \
@@ -494,6 +540,32 @@ class RestartCommandTests(unittest.TestCase):
                      return_value=inspection,
                  ):
                 with self.assertRaisesRegex(SystemExit, "does not report KeepAlive"):
+                    self.dev.launchd_prod_restart()
+
+    def test_restart_rejects_loaded_listener_different_from_installed_plist(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            binary = root / "install" / "phoenix-ide"
+            binary.parent.mkdir()
+            binary.write_bytes(b"installed")
+            plist = root / "service.plist"
+            plist.write_bytes(self._installed_plist(binary))
+            inspection = self.dev.LoadedLaunchdJob(
+                state="running",
+                pid=100,
+                keep_alive=True,
+                plist_path=str(plist),
+                program_path=str(binary),
+                socket_services=("9444",),
+            )
+
+            with self._isolated_operation_paths(root), \
+                 mock.patch.object(
+                     self.dev,
+                     "_inspect_launchd_job",
+                     return_value=inspection,
+                 ):
+                with self.assertRaisesRegex(SystemExit, "listener does not match"):
                     self.dev.launchd_prod_restart()
 
     def test_deploy_and_restart_claims_are_mutually_exclusive(self):

@@ -328,7 +328,7 @@ def run_restart_scenario(root, domain):
         wait_identity(url, runtime, time.monotonic() + 10)
         previous_pid = launchd_pid(domain, target_label)
         manifest = {
-            "manifest_version": 1,
+            "manifest_version": 2,
             "transaction_id": suffix,
             "expected": identity,
             "previous_pid": previous_pid,
@@ -336,6 +336,7 @@ def run_restart_scenario(root, domain):
             "binary_sha256": original_hashes[target_binary],
             "plist_path": str(target_plist_path),
             "plist_sha256": original_hashes[target_plist_path],
+            "socket_service": port,
             "deployed_sha_path": str(deployed_sha),
             "deployed_sha256": original_hashes[deployed_sha],
             "label": target_label,
