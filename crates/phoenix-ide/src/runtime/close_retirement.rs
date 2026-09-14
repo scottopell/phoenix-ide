@@ -6190,9 +6190,8 @@ mod tests {
         observe_administrative_dir_incarnation, observe_worktree_fingerprint, parse_status_losses,
         planned_administrative_dir_is_absent,
         quarantine_and_remove_exact_worktree_with_writer_inspection,
-        quarantine_has_external_writer, remove_directory_contents_at_with_hook,
-        remove_exact_worktree_administrative_dir_with_hook, remove_identity_bound_directory,
-        remove_quarantine_then_administrative_dir,
+        remove_directory_contents_at_with_hook, remove_exact_worktree_administrative_dir_with_hook,
+        remove_identity_bound_directory, remove_quarantine_then_administrative_dir,
         remove_quarantine_then_administrative_dir_with_hooks, resume_final_worktree_tombstone,
         rotate_inspection_generation, run_bounded_git_status_until, snapshot_for,
         staged_index_entries_by_path, staged_index_entries_for_paths, worktree_quarantine_path,
@@ -6205,6 +6204,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     use std::io::{BufRead as _, Read as _, Write as _};
     use std::path::Path;
+    #[cfg(target_os = "linux")]
+    use std::path::PathBuf;
 
     #[cfg(target_os = "macos")]
     #[test]
@@ -8763,14 +8764,14 @@ mod tests {
                         .unwrap()
                         .clone()
                         .expect("writer process universe is initialized");
-                    inspect_ambient_writer_until_quiescent(
-                        AmbientWriterObservationPolicy::production(),
-                        || match quarantine_has_open_descriptors_in(path, &proc_root)? {
-                            positive @ ExternalWriterEvidence::PositiveWriterFound(_) => {
+                    super::inspect_ambient_writer_until_quiescent(
+                        super::AmbientWriterObservationPolicy::production(),
+                        || match super::quarantine_has_open_descriptors_in(path, &proc_root)? {
+                            positive @ super::ExternalWriterEvidence::PositiveWriterFound(_) => {
                                 Ok(positive)
                             }
-                            ExternalWriterEvidence::NoPositiveEvidence => {
-                                Ok(ExternalWriterEvidence::NoPositiveEvidence)
+                            super::ExternalWriterEvidence::NoPositiveEvidence => {
+                                Ok(super::ExternalWriterEvidence::NoPositiveEvidence)
                             }
                         },
                         std::thread::sleep,
@@ -8778,7 +8779,7 @@ mod tests {
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
-                    quarantine_has_external_writer(path)
+                    super::quarantine_has_external_writer(path)
                 }
             },
         )
