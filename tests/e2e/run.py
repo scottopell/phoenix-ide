@@ -1139,7 +1139,7 @@ def scenario_continuation(base_url: str) -> None:
     )
 
 
-def scenario_product_conversation_context_continuation(base_url: str) -> None:
+def scenario_product_conversation_context_continuation(base_url: str) -> dict[str, str]:
     worktrees_before = _git_worktree_inventory()
     with tempfile.TemporaryDirectory(prefix="phoenix-e2e-product-cwd-") as temp_cwd:
         create = httpx.post(
@@ -1288,12 +1288,20 @@ def scenario_product_conversation_context_continuation(base_url: str) -> None:
             "accepted ownership probe response",
             timeout=SCENARIO_TIMEOUT_SECONDS,
         )
+        result = {
+            "product_conversation_id": product_conversation_id,
+            "canonical_route": canonical_route,
+            "root_transcript_row_id": root_conv_id,
+            "successor_transcript_row_id": successor_id,
+            "objective": "[[scenario:context_window_exceeded]] exhaust naturally",
+        }
     worktrees_after = _git_worktree_inventory()
     _assert_git_worktrees_unchanged(
         worktrees_before,
         worktrees_after,
         "product_conversation_context_continuation",
     )
+    return result
 
 
 def scenario_mid_stream_cancel(base_url: str) -> None:
