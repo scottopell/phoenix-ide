@@ -590,6 +590,68 @@ class RestartCommandTests(unittest.TestCase):
             self.assertNotIn("bootout", flattened)
             self.assertNotIn("kill", flattened)
 
+    def test_install_change_after_validation_is_rejected_before_handoff(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            install = root / "install"
+            install.mkdir()
+            binary = install / "phoenix-ide"
+            binary.write_bytes(b"installed")
+            plist = root / "service.plist"
+            plist.write_bytes(self._installed_plist(binary))
+            deployed_sha = root / "deployed.sha"
+            deployed_sha.write_text("a" * 40 + "\n")
+            identity = self.dev.RuntimeIdentity("2.0.0", "aaaaaaaaaaaa")
+            commands = []
+
+            def run(command, **_kwargs):
+                commands.append([str(part) for part in command])
+                if command[:2] == ["launchctl", "print"]:
+                    return subprocess.CompletedProcess(
+                        command,
+                        0,
+                        (
+                            f"path = {plist}\n"
+                            "state = running\n"
+                            f"program = {binary}\n"
+                            "pid = 100\n"
+                            "service name = 9555\n"
+                            "properties = keepalive | runatload\n"
+                        ),
+                        "",
+                    )
+                if "--protocol-version" in command:
+                    binary.write_bytes(b"replaced after validation")
+                    return subprocess.CompletedProcess(command, 0, "2\n", "")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with self._isolated_operation_paths(root), \
+                 mock.patch.object(
+                     self.dev,
+                     "LAUNCHD_RESTART_HELPER_SOURCE",
+                     ROOT / "scripts" / "launchd_restart_helper.py",
+                 ), \
+                 mock.patch.object(self.dev, "_binary_identity", return_value=identity), \
+                 mock.patch.object(self.dev, "_current_prod_identity", return_value=identity), \
+                 mock.patch.object(self.dev.subprocess, "run", side_effect=run):
+                with self.assertRaisesRegex(
+                    SystemExit,
+                    "binary changed during restart preparation",
+                ):
+                    self.dev.launchd_prod_restart()
+
+            self.assertFalse(
+                any(command[:2] == ["launchctl", "bootstrap"] for command in commands)
+            )
+            status_path = next(
+                (root / "restart" / "transactions").glob("*/status.json")
+            )
+            self.assertEqual(
+                "precondition_failed",
+                json.loads(status_path.read_text())["state"],
+            )
+            self.assertFalse((root / "restart" / "active").exists())
+
     def test_interrupted_bootstrap_does_not_overwrite_helper_terminal_status(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -603,9 +665,18 @@ class RestartCommandTests(unittest.TestCase):
             deployed_sha.write_text("a" * 40 + "\n")
             identity = self.dev.RuntimeIdentity("2.0.0", "aaaaaaaaaaaa")
             installed = self.dev.InstalledLaunchdRuntime(
-                binary=binary,
-                plist=plist,
-                deployed_sha=deployed_sha,
+                binary=self.dev.ValidatedLaunchdArtifact(
+                    binary,
+                    self.dev._file_sha256(binary),
+                ),
+                plist=self.dev.ValidatedLaunchdArtifact(
+                    plist,
+                    self.dev._file_sha256(plist),
+                ),
+                deployed_sha=self.dev.ValidatedLaunchdArtifact(
+                    deployed_sha,
+                    self.dev._file_sha256(deployed_sha),
+                ),
                 identity=identity,
                 pid=100,
                 health_url="http://localhost:9555/api/version",

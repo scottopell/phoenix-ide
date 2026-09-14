@@ -8946,14 +8946,40 @@ class RuntimeIdentity:
 
 
 @dataclasses.dataclass(frozen=True)
+class ValidatedLaunchdArtifact:
+    path: Path
+    sha256: str
+
+    def is_unchanged(self) -> bool:
+        try:
+            return self.path.is_file() and _file_sha256(self.path) == self.sha256
+        except OSError:
+            return False
+
+
+@dataclasses.dataclass(frozen=True)
 class InstalledLaunchdRuntime:
-    binary: Path
-    plist: Path
-    deployed_sha: Path
+    binary: ValidatedLaunchdArtifact
+    plist: ValidatedLaunchdArtifact
+    deployed_sha: ValidatedLaunchdArtifact
     identity: RuntimeIdentity
     pid: int
     health_url: str
     health_insecure_tls: bool
+
+
+def _require_installed_launchd_artifacts_unchanged(
+    installed: InstalledLaunchdRuntime,
+) -> None:
+    for description, artifact in (
+        ("binary", installed.binary),
+        ("plist", installed.plist),
+        ("deployed SHA", installed.deployed_sha),
+    ):
+        if not artifact.is_unchanged():
+            raise SystemExit(
+                f"installed launchd {description} changed during restart preparation"
+            )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -9225,6 +9251,11 @@ def _installed_launchd_runtime_for_restart() -> InstalledLaunchdRuntime:
             "no complete launchd production installation to restart; "
             "run './dev.py prod deploy' first"
         )
+    binary_artifact = ValidatedLaunchdArtifact(binary, _file_sha256(binary))
+    plist_artifact = ValidatedLaunchdArtifact(
+        LAUNCHD_PLIST_PATH,
+        _file_sha256(LAUNCHD_PLIST_PATH),
+    )
     try:
         with LAUNCHD_PLIST_PATH.open("rb") as stream:
             plist = plistlib.load(stream)
@@ -9309,6 +9340,10 @@ def _installed_launchd_runtime_for_restart() -> InstalledLaunchdRuntime:
             "installed launchd runtime has no recorded source commit; "
             "run './dev.py prod deploy' first"
         )
+    deployed_sha_artifact = ValidatedLaunchdArtifact(
+        PROD_SHA_PATH,
+        _file_sha256(PROD_SHA_PATH),
+    )
     source_commit = PROD_SHA_PATH.read_text().strip()
     if re.fullmatch(r"[0-9a-f]{40}", source_commit) is None:
         raise SystemExit(
@@ -9321,15 +9356,17 @@ def _installed_launchd_runtime_for_restart() -> InstalledLaunchdRuntime:
             "run './dev.py prod deploy' first"
         )
     health_url, health_insecure_tls = _launchd_health_probe(env)
-    return InstalledLaunchdRuntime(
-        binary=binary,
-        plist=LAUNCHD_PLIST_PATH,
-        deployed_sha=PROD_SHA_PATH,
+    installed = InstalledLaunchdRuntime(
+        binary=binary_artifact,
+        plist=plist_artifact,
+        deployed_sha=deployed_sha_artifact,
         identity=identity,
         pid=inspection.pid,
         health_url=health_url,
         health_insecure_tls=health_insecure_tls,
     )
+    _require_installed_launchd_artifacts_unchanged(installed)
+    return installed
 
 
 def _resolve_rollback_identity(
@@ -10214,13 +10251,13 @@ def launchd_prod_restart() -> None:
             "transaction_id": transaction_id,
             "expected": installed.identity.as_dict(),
             "previous_pid": installed.pid,
-            "binary_path": str(installed.binary),
-            "binary_sha256": _file_sha256(installed.binary),
-            "plist_path": str(installed.plist),
-            "plist_sha256": _file_sha256(installed.plist),
+            "binary_path": str(installed.binary.path),
+            "binary_sha256": installed.binary.sha256,
+            "plist_path": str(installed.plist.path),
+            "plist_sha256": installed.plist.sha256,
             "socket_service": urlsplit(installed.health_url).port,
-            "deployed_sha_path": str(installed.deployed_sha),
-            "deployed_sha256": _file_sha256(installed.deployed_sha),
+            "deployed_sha_path": str(installed.deployed_sha.path),
+            "deployed_sha256": installed.deployed_sha.sha256,
             "label": LAUNCHD_LABEL,
             "helper_label": helper_label,
             "uid": os.getuid(),
@@ -10238,6 +10275,7 @@ def launchd_prod_restart() -> None:
         _write_json_atomic(staging / "manifest.json", manifest)
         (staging / "manifest.json").chmod(0o400)
         helper.chmod(0o400)
+        _require_installed_launchd_artifacts_unchanged(installed)
         _write_json_atomic(status_path, {
             "transaction_id": transaction_id,
             "state": "prepared",
