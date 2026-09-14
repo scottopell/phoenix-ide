@@ -634,6 +634,7 @@ pub struct InMemoryStorage {
     approved_task_authorities:
         Mutex<HashMap<String, phoenix_core::task_handoff::ApprovedTaskSnapshot>>,
     fail_approved_task_authority: Mutex<bool>,
+    unclassify_approved_task_authority: Mutex<bool>,
     next_msg_id: Mutex<u64>,
     accepted_continuation_handoff_message_ids: Mutex<HashMap<String, String>>,
     fail_continuation_handoff_provenance: Mutex<bool>,
@@ -704,6 +705,7 @@ impl InMemoryStorage {
             cwds: Mutex::new(HashMap::new()),
             approved_task_authorities: Mutex::new(HashMap::new()),
             fail_approved_task_authority: Mutex::new(false),
+            unclassify_approved_task_authority: Mutex::new(false),
             next_msg_id: Mutex::new(1),
             accepted_continuation_handoff_message_ids: Mutex::new(HashMap::new()),
             fail_continuation_handoff_provenance: Mutex::new(false),
@@ -767,6 +769,10 @@ impl InMemoryStorage {
 
     pub fn set_fail_approved_task_authority(&self, fail: bool) {
         *self.fail_approved_task_authority.lock().unwrap() = fail;
+    }
+
+    pub fn set_unclassify_approved_task_authority(&self, unclassify: bool) {
+        *self.unclassify_approved_task_authority.lock().unwrap() = unclassify;
     }
 
     pub fn set_fail_continuation_commit(&self, fail: bool) {
@@ -2109,10 +2115,13 @@ impl StateStore for InMemoryStorage {
         approval_message: &Message,
         approved_state: &ConvState,
         _state_updated_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), String> {
+    ) -> Result<crate::db::LocalAuthorityResult<()>, String> {
         let snapshot = phoenix_core::task_handoff::ApprovedTaskSnapshot::from(approval);
         if *self.fail_approved_task_authority.lock().unwrap() {
             return Err("injected approved authority failure".to_string());
+        }
+        if *self.unclassify_approved_task_authority.lock().unwrap() {
+            return Ok(crate::db::LocalAuthorityResult::DurableFactUnclassified);
         }
         self.states
             .lock()
@@ -2127,14 +2136,14 @@ impl StateStore for InMemoryStorage {
         let mut authorities = self.approved_task_authorities.lock().unwrap();
         match authorities.get(conv_id) {
             Some(existing) if existing != &snapshot => {
-                Err("approved task conflicts with the committed objective".to_string())
+                return Err("approved task conflicts with the committed objective".to_string());
             }
-            Some(_) => Ok(()),
+            Some(_) => {}
             None => {
                 authorities.insert(conv_id.to_string(), snapshot);
-                Ok(())
             }
         }
+        Ok(crate::db::LocalAuthorityResult::DurableFactEstablished(()))
     }
 
     async fn get_conversation_mode(&self, conv_id: &str) -> Result<crate::db::ConvMode, String> {
