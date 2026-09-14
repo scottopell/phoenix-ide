@@ -1021,6 +1021,104 @@ mod tests {
         ContinuationContent, ContinueOutcome, ConvState, MessageContent,
         NewContinuationDispatchIntent,
     };
+    use std::time::Instant;
+
+    async fn performance_fixture(
+        segment_count: usize,
+        messages_per_segment: usize,
+    ) -> (Database, crate::Conversation) {
+        let db = Database::open_in_memory().await.unwrap();
+        let root = db
+            .create_conversation("perf-root", "perf-root", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let mut segment = root.clone();
+        let content = serde_json::to_string(&MessageContent::user("fixture payload")).unwrap();
+        for segment_index in 0..segment_count {
+            sqlx::query(
+                "WITH RECURSIVE ordinal(value) AS (
+                     VALUES(1) UNION ALL SELECT value + 1 FROM ordinal WHERE value < ?1
+                 ) INSERT INTO messages (
+                     message_id, conversation_id, sequence_id, message_type, content, created_at
+                 ) SELECT printf('perf-%d-%d', ?2, value), ?3, value, 'user', ?4,
+                          '2026-01-01T00:00:00Z'
+                   FROM ordinal",
+            )
+            .bind(i64::try_from(messages_per_segment).unwrap())
+            .bind(i64::try_from(segment_index).unwrap())
+            .bind(&segment.id)
+            .bind(&content)
+            .execute(db.pool())
+            .await
+            .unwrap();
+            if segment_index + 1 < segment_count {
+                db.update_conversation_state(
+                    &segment.id,
+                    &ConvState::ContextExhausted {
+                        summary: "fixture continuation".to_string(),
+                    },
+                )
+                .await
+                .unwrap();
+                segment = match db.continue_conversation(&segment.id).await.unwrap() {
+                    ContinueOutcome::Created(successor) => successor,
+                    other => panic!("expected fixture continuation, got {other:?}"),
+                };
+            }
+        }
+        (db, root)
+    }
+
+    async fn measure_snapshot_stages(db: &Database, reference: &str) -> (u128, u128, u128, u128) {
+        let mut connection = db.pool.acquire().await.unwrap();
+        connection.execute("BEGIN").await.unwrap();
+        let started = Instant::now();
+        let resolved =
+            Database::resolve_ordinary_product_conversation_on(&mut connection, reference)
+                .await
+                .unwrap();
+        let resolve_micros = started.elapsed().as_micros();
+        let started = Instant::now();
+        let aggregate = Database::get_ordinary_product_conversation_on(
+            &mut connection,
+            &resolved.product_conversation_id,
+        )
+        .await
+        .unwrap();
+        let aggregate_micros = started.elapsed().as_micros();
+        let started = Instant::now();
+        let messages = Database::get_product_conversation_messages_page_on(
+            &mut connection,
+            aggregate.product_conversation.id(),
+            None,
+            None,
+            51,
+        )
+        .await
+        .unwrap();
+        assert_eq!(messages.len(), 51);
+        let page_micros = started.elapsed().as_micros();
+        let started = Instant::now();
+        connection.execute("ROLLBACK").await.unwrap();
+        let rollback_micros = started.elapsed().as_micros();
+        (
+            resolve_micros,
+            aggregate_micros,
+            page_micros,
+            rollback_micros,
+        )
+    }
+
+    #[tokio::test]
+    #[ignore = "diagnostic scale fixture; run explicitly and retain raw samples"]
+    async fn product_conversation_snapshot_scale_diagnostic() {
+        let (db, root) = performance_fixture(23, 1_020).await;
+        let mut samples = Vec::new();
+        for _ in 0..11 {
+            samples.push(measure_snapshot_stages(&db, &root.id).await);
+        }
+        eprintln!("product_conversation_snapshot_stage_micros={samples:?}");
+    }
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
