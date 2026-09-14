@@ -3517,7 +3517,13 @@ impl Database {
                  matched_path_codec, matched_path_value, match_kind, access_mode,
                  observed_at_unix_micros
              ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
-             ON CONFLICT DO NOTHING",
+             ON CONFLICT (
+                 attempt_id, scope, inspection_generation, inspection_fingerprint,
+                 resource_kind, identity_kind, identity_codec, identity_value,
+                 detector, process_id, process_incarnation,
+                 executable_codec, executable_value,
+                 matched_path_codec, matched_path_value, match_kind, access_mode
+             ) DO NOTHING",
         )
         .bind(request.attempt_id.as_str())
         .bind(request.scope.as_str())
@@ -3544,6 +3550,45 @@ impl Database {
             relation: "close_ambient_writer_evidence",
             detail: error.to_string(),
         })?;
+        let exact_evidence_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM close_ambient_writer_evidence
+                 WHERE attempt_id=?1 AND scope=?2
+                   AND inspection_generation=?3 AND inspection_fingerprint=?4
+                   AND resource_kind=?5 AND identity_kind=?6
+                   AND identity_codec=?7 AND identity_value=?8
+                   AND detector=?9 AND process_id=?10 AND process_incarnation=?11
+                   AND executable_codec=?12 AND executable_value=?13
+                   AND matched_path_codec=?14 AND matched_path_value=?15
+                   AND match_kind=?16 AND access_mode=?17
+             )",
+        )
+        .bind(request.attempt_id.as_str())
+        .bind(request.scope.as_str())
+        .bind(request.snapshot.generation())
+        .bind(request.snapshot.fingerprint())
+        .bind(request.resource.kind().as_str())
+        .bind(identity.identity_kind())
+        .bind(identity.codec())
+        .bind(identity.value())
+        .bind(request.evidence.detector.as_str())
+        .bind(request.evidence.process_id)
+        .bind(&request.evidence.process_incarnation)
+        .bind(request.evidence.executable.codec())
+        .bind(request.evidence.executable.encode())
+        .bind(request.evidence.matched_path.codec())
+        .bind(request.evidence.matched_path.encode())
+        .bind(request.evidence.match_kind.as_str())
+        .bind(request.evidence.access_mode.as_str())
+        .fetch_one(&self.pool)
+        .await?;
+        if !exact_evidence_exists {
+            return Err(DbError::CloseEvidenceInvariant {
+                invariant: "idempotent_positive_writer_evidence_matches_exact_authority",
+                relation: "close_ambient_writer_evidence",
+                detail: "ambient-writer insert did not produce the exact authority row".to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -9735,12 +9780,26 @@ mod tests {
         db.record_close_ambient_writer_evidence(request.clone())
             .await
             .unwrap();
-        db.record_close_ambient_writer_evidence(request)
+        db.record_close_ambient_writer_evidence(request.clone())
             .await
             .unwrap();
-        let row: (String, i64, String, String, String, String, String) = sqlx::query_as(
-            "SELECT detector, process_id, process_incarnation, executable_value,
-                    matched_path_value, match_kind, access_mode
+        let row: (
+            String,
+            i64,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+        ) = sqlx::query_as(
+            "SELECT detector, process_id, process_incarnation,
+                    identity_codec, identity_value,
+                    executable_codec, executable_value,
+                    matched_path_codec, matched_path_value, match_kind, access_mode
              FROM close_ambient_writer_evidence WHERE attempt_id=?1",
         )
         .bind(attempt_id.as_str())
@@ -9750,16 +9809,27 @@ mod tests {
         assert_eq!(row.0, "macos_proc_pidinfo");
         assert_eq!(row.1, 4242);
         assert_eq!(row.2, "1234:5678");
+        assert_eq!(row.3, resource.identity().codec());
+        assert_eq!(row.4, resource.identity().value());
+        assert_eq!(row.5, request.evidence.executable.codec());
         assert_eq!(
-            GitPathIdentity::decode_exact(&row.3).unwrap().as_bytes(),
+            GitPathIdentity::decode_exact(&row.6).unwrap().as_bytes(),
             b"/bin/writer"
         );
+        assert_eq!(row.7, request.evidence.matched_path.codec());
         assert_eq!(
-            GitPathIdentity::decode_exact(&row.4).unwrap().as_bytes(),
+            GitPathIdentity::decode_exact(&row.8).unwrap().as_bytes(),
             b"/tmp/quarantine/open"
         );
-        assert_eq!(row.5, "descriptor");
-        assert_eq!(row.6, "read_write");
+        assert_eq!(row.9, "descriptor");
+        assert_eq!(row.10, "read_write");
+
+        let mut changed_executable = request;
+        changed_executable.evidence.executable =
+            GitPathIdentity::from_bytes(b"/bin/replacement-writer".to_vec());
+        db.record_close_ambient_writer_evidence(changed_executable)
+            .await
+            .unwrap();
         let rows: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM close_ambient_writer_evidence WHERE attempt_id=?1",
         )
@@ -9767,7 +9837,7 @@ mod tests {
         .fetch_one(db.pool())
         .await
         .unwrap();
-        assert_eq!(rows, 1);
+        assert_eq!(rows, 2);
     }
 
     #[allow(clippy::too_many_lines)]
