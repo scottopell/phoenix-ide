@@ -98,6 +98,13 @@ class ConcurrentRestart(RestartError):
     pass
 
 
+@dataclasses.dataclass(frozen=True)
+class LoadedJob:
+    state: str
+    pid: Optional[int]
+    keep_alive: Optional[bool]
+
+
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
@@ -200,7 +207,7 @@ class Launchctl:
         self.sleep = sleep
         self.target = f"gui/{manifest.uid}/{manifest.label}"
 
-    def inspect(self) -> tuple[str, Optional[int]]:
+    def inspect(self) -> LoadedJob:
         result = self.run(
             ["launchctl", "print", self.target],
             capture_output=True,
@@ -208,7 +215,7 @@ class Launchctl:
         )
         output = result.stdout + "\n" + result.stderr
         if "Could not find service" in output:
-            return "not_loaded", None
+            return LoadedJob("not_loaded", None, None)
         if result.returncode != 0:
             detail = (result.stderr or result.stdout).strip()
             suffix = f": {detail}" if detail else ""
@@ -218,6 +225,7 @@ class Launchctl:
             )
         state = "unknown"
         pid = None
+        keep_alive = None
         for raw in result.stdout.splitlines():
             line = raw.strip()
             if line.startswith("state = "):
@@ -227,34 +235,48 @@ class Launchctl:
                     pid = int(line.split(" = ", 1)[1])
                 except ValueError:
                     pass
-        return state, pid
+            elif line.startswith("properties = "):
+                properties = {
+                    value.strip() for value in line.split(" = ", 1)[1].split("|")
+                }
+                keep_alive = "keepalive" in properties
+        return LoadedJob(state, pid, keep_alive)
 
     def signal_hup(self) -> int:
-        state, pid = self.inspect()
-        if state not in {"running", "active"} or pid is None:
+        job = self.inspect()
+        if (
+            job.state not in {"running", "active"}
+            or job.pid is None
+            or job.keep_alive is not True
+        ):
             raise RestartError(
                 "installed service changed immediately before restart; "
-                f"observed state={state} pid={pid}"
+                f"observed state={job.state} pid={job.pid} keepalive={job.keep_alive}"
             )
         try:
-            self.kill(pid, signal.SIGHUP)
+            self.kill(job.pid, signal.SIGHUP)
         except OSError as exc:
             raise RestartError(
-                f"could not signal inspected service PID {pid}: {exc}"
+                f"could not signal inspected service PID {job.pid}: {exc}"
             ) from exc
-        return pid
+        return job.pid
 
     def wait_for_new_pid(self, previous_pid: int) -> int:
         deadline = self.monotonic() + self.manifest.transition_timeout_secs
-        observed: tuple[str, Optional[int]] = ("unknown", None)
+        observed = LoadedJob("unknown", None, None)
         while self.monotonic() < deadline:
             observed = self.inspect()
-            if observed[0] in {"running", "active"} and observed[1] not in {None, previous_pid}:
-                return observed[1]
+            if (
+                observed.state in {"running", "active"}
+                and observed.pid not in {None, previous_pid}
+                and observed.keep_alive is True
+            ):
+                return observed.pid
             self.sleep(0.1)
         raise RestartError(
             "timed out waiting for launchd to replace PID "
-            f"{previous_pid}; state={observed[0]} pid={observed[1]}"
+            f"{previous_pid}; state={observed.state} pid={observed.pid} "
+            f"keepalive={observed.keep_alive}"
         )
 
 
@@ -307,11 +329,16 @@ def restart(manifest: Manifest) -> str:
         try:
             verify_claim(manifest)
             verify_installed_artifacts(manifest)
-            state, pid = launchctl.inspect()
-            if state not in {"running", "active"} or pid != manifest.previous_pid:
+            job = launchctl.inspect()
+            if (
+                job.state not in {"running", "active"}
+                or job.pid != manifest.previous_pid
+                or job.keep_alive is not True
+            ):
                 raise RestartError(
                     "installed service changed before restart; "
-                    f"expected running PID {manifest.previous_pid}, observed state={state} pid={pid}"
+                    f"expected running PID {manifest.previous_pid}, "
+                    f"observed state={job.state} pid={job.pid} keepalive={job.keep_alive}"
                 )
             observed = fetch_identity(
                 manifest.health_url,
@@ -328,11 +355,17 @@ def restart(manifest: Manifest) -> str:
             write_status(manifest, "restarting", previous_pid=signal_pid)
             running_pid = launchctl.wait_for_new_pid(signal_pid)
             wait_for_identity(manifest, manifest.expected)
-            state, verified_pid = launchctl.inspect()
-            if state not in {"running", "active"} or verified_pid != running_pid:
+            verified_job = launchctl.inspect()
+            if (
+                verified_job.state not in {"running", "active"}
+                or verified_job.pid != running_pid
+                or verified_job.keep_alive is not True
+            ):
                 raise RestartError(
                     "runtime PID changed during identity verification; "
-                    f"expected running PID {running_pid}, observed state={state} pid={verified_pid}"
+                    f"expected running PID {running_pid}, observed "
+                    f"state={verified_job.state} pid={verified_job.pid} "
+                    f"keepalive={verified_job.keep_alive}"
                 )
             verify_installed_artifacts(manifest)
             write_status(

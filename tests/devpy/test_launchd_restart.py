@@ -68,7 +68,8 @@ class FakeLaunchctl:
         self.signals = []
 
     def inspect(self):
-        return ("running", 100) if not self.signals else ("running", 101)
+        pid = 100 if not self.signals else 101
+        return helper.LoadedJob("running", pid, True)
 
     def signal_hup(self):
         self.signals.append("HUP")
@@ -87,7 +88,7 @@ class RestartHelperTests(unittest.TestCase):
             run = mock.Mock(return_value=subprocess.CompletedProcess(
                 [],
                 0,
-                "state = running\npid = 100\n",
+                "state = running\npid = 100\nproperties = keepalive | runatload\n",
                 "",
             ))
             kill = mock.Mock()
@@ -155,7 +156,8 @@ class RestartHelperTests(unittest.TestCase):
     def test_restart_waits_for_replacement_of_pid_signaled_after_rebind(self):
         class ReboundLaunchctl(FakeLaunchctl):
             def inspect(self):
-                return ("running", 100) if not self.signals else ("running", 102)
+                pid = 100 if not self.signals else 102
+                return helper.LoadedJob("running", pid, True)
 
             def signal_hup(self):
                 self.signals.append("HUP")
@@ -183,7 +185,8 @@ class RestartHelperTests(unittest.TestCase):
     def test_restart_rejects_identity_verified_against_a_later_pid(self):
         class ReplacedDuringHealthCheck(FakeLaunchctl):
             def inspect(self):
-                return ("running", 100) if not self.signals else ("running", 102)
+                pid = 100 if not self.signals else 102
+                return helper.LoadedJob("running", pid, True)
 
         with tempfile.TemporaryDirectory() as td:
             manifest = make_manifest(Path(td))
@@ -207,6 +210,23 @@ class RestartHelperTests(unittest.TestCase):
 
             with mock.patch.object(helper, "Launchctl", return_value=launchctl):
                 with self.assertRaisesRegex(helper.RestartError, "plist checksum mismatch"):
+                    helper.restart(manifest)
+
+            self.assertEqual([], launchctl.signals)
+            status = json.loads(Path(manifest.status_path).read_text())
+            self.assertEqual("precondition_failed", status["state"])
+
+    def test_loaded_job_without_keepalive_is_rejected_before_signal(self):
+        class NoKeepAliveLaunchctl(FakeLaunchctl):
+            def inspect(self):
+                return helper.LoadedJob("running", 100, False)
+
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            launchctl = NoKeepAliveLaunchctl(manifest)
+
+            with mock.patch.object(helper, "Launchctl", return_value=launchctl):
+                with self.assertRaisesRegex(helper.RestartError, "keepalive=False"):
                     helper.restart(manifest)
 
             self.assertEqual([], launchctl.signals)
@@ -334,7 +354,12 @@ class RestartCommandTests(unittest.TestCase):
             def run(command, **_kwargs):
                 commands.append([str(part) for part in command])
                 if command[:2] == ["launchctl", "print"]:
-                    return subprocess.CompletedProcess(command, 0, "state = running\npid = 100\n", "")
+                    return subprocess.CompletedProcess(
+                        command,
+                        0,
+                        "state = running\npid = 100\nproperties = keepalive | runatload\n",
+                        "",
+                    )
                 if "--protocol-version" in command:
                     return subprocess.CompletedProcess(command, 0, "1\n", "")
                 return subprocess.CompletedProcess(command, 0, "", "")
@@ -446,6 +471,29 @@ class RestartCommandTests(unittest.TestCase):
             with self._isolated_operation_paths(root), \
                  mock.patch.object(self.dev, "LAUNCHD_INSTALL_DIR", root):
                 with self.assertRaisesRegex(SystemExit, "socket-activated"):
+                    self.dev.launchd_prod_restart()
+
+    def test_restart_rejects_loaded_job_without_keepalive(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            binary = root / "install" / "phoenix-ide"
+            binary.parent.mkdir()
+            binary.write_bytes(b"installed")
+            plist = root / "service.plist"
+            plist.write_bytes(self._installed_plist(binary))
+            inspection = self.dev.LoadedLaunchdJob(
+                state="running",
+                pid=100,
+                keep_alive=False,
+            )
+
+            with self._isolated_operation_paths(root), \
+                 mock.patch.object(
+                     self.dev,
+                     "_inspect_launchd_job",
+                     return_value=inspection,
+                 ):
+                with self.assertRaisesRegex(SystemExit, "does not report KeepAlive"):
                     self.dev.launchd_prod_restart()
 
     def test_deploy_and_restart_claims_are_mutually_exclusive(self):

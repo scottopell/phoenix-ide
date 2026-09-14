@@ -8958,6 +8958,7 @@ class InstalledLaunchdRuntime:
 class LoadedLaunchdJob:
     state: str
     pid: int | None
+    keep_alive: bool | None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -9165,6 +9166,7 @@ def _inspect_launchd_job() -> LaunchdJobInspection:
         )
     state = "unknown"
     pid = None
+    keep_alive = None
     for raw in result.stdout.splitlines():
         line = raw.strip()
         if line.startswith("state = "):
@@ -9174,7 +9176,12 @@ def _inspect_launchd_job() -> LaunchdJobInspection:
                 pid = int(line.split(" = ", 1)[1])
             except ValueError:
                 pass
-    return LoadedLaunchdJob(state=state, pid=pid)
+        elif line.startswith("properties = "):
+            properties = {
+                value.strip() for value in line.split(" = ", 1)[1].split("|")
+            }
+            keep_alive = "keepalive" in properties
+    return LoadedLaunchdJob(state=state, pid=pid, keep_alive=keep_alive)
 
 
 def _installed_launchd_runtime_for_restart() -> InstalledLaunchdRuntime:
@@ -9230,6 +9237,11 @@ def _installed_launchd_runtime_for_restart() -> InstalledLaunchdRuntime:
             f"launchd production is not running (state={inspection.state}, "
             f"pid={inspection.pid}); "
             "run './dev.py prod deploy' first"
+        )
+    if inspection.keep_alive is not True:
+        raise SystemExit(
+            "loaded launchd service does not report KeepAlive; "
+            "run './dev.py prod deploy' to reload its installed configuration"
         )
 
     env = {
