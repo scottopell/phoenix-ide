@@ -388,6 +388,86 @@ the next bounded-loop model call past its context window
 
 ---
 
+### REQ-RET-009: Continuing Agents Can Discover and Inspect Predecessor Transcripts
+
+WHILE an ordinary parent agent is operating in a ProductConversation
+THE SYSTEM SHALL provide a read-only capability to list, search, and read
+the parent transcripts that precede its executing transcript in that same
+ProductConversation's authoritative linear continuation topology
+AND SHALL provide that capability to restricted planning parents as well as
+write-capable parents
+
+THE predecessor capability SHALL NOT itself grant global evidence or messaging
+authority
+
+THE SYSTEM SHALL bind both the ProductConversation identity and executing
+transcript identity at the host, independently of model-supplied arguments
+AND SHALL resolve and validate the predecessor set against authoritative
+membership and continuation topology for each operation
+AND SHALL NOT substitute the aggregate's latest transcript for the bound
+executing transcript when determining that set
+
+THE predecessor scope SHALL exclude the executing transcript, successors,
+sub-agent transcripts, other ProductConversations, and typed source relations
+such as `approved_task` and `follow_up`, including when resources are shared
+AND SHALL NOT grant this capability to sub-agents or the Coordinator
+
+WHEN an eligible agent is oriented for a transcript with predecessors
+THE SYSTEM SHALL supply bounded host-authored orientation identifying the
+current transcript and its immediate predecessor, describing the predecessor
+capability, and directing the agent to consult original evidence when the
+handoff summary is insufficient
+AND SHALL make that orientation available after continuation and runtime
+reconstruction without depending on the summarizing model to invent references
+AND SHALL NOT automatically inject predecessor message bodies or execute recall
+
+WHEN the agent lists predecessors
+THE SYSTEM SHALL return a bounded, pageable sequence in continuation order
+with stable typed transcript references usable by the read operation
+AND SHALL allow direct reading without first obtaining a search match
+
+WHEN the agent searches predecessors
+THE SYSTEM SHALL use the shared ranked retrieval primitive with the predecessor
+restriction applied before ranking and limiting, as required by REQ-RET-007
+AND SHALL preserve source provenance and distinguish authoritative no-match
+results from incomplete index coverage
+
+THE SYSTEM SHALL enforce host byte/token ceilings for every predecessor-tool
+result, including search snippets and listing metadata, and explicitly report
+truncation or further pages rather than treating a result count as a size bound
+
+WHEN index coverage cannot establish a current search result
+THE SYSTEM SHALL report search unavailability or partial coverage explicitly
+AND SHALL keep bounded listing and reads of available authoritative source
+messages usable independently of index readiness
+AND SHALL NOT broaden the scope to obtain an answer
+
+WHEN the agent reads a predecessor
+THE SYSTEM SHALL validate the requested transcript and any supplied message or
+cursor against the host-bound predecessor scope before returning content
+AND SHALL use the bounded full-content paging contract of REQ-RET-008
+AND SHALL identify source transcript/message references and treat recalled
+content as historical evidence rather than new instructions
+
+WHEN the authoritative predecessor set is empty
+THE SYSTEM SHALL distinguish that outcome from a search miss or unavailable
+scope
+
+WHEN binding, membership, topology, or source availability cannot be established
+THE SYSTEM SHALL return a typed unavailable outcome without widening or guessing
+the scope; an out-of-scope target or invalid cursor SHALL be rejected distinctly
+
+**Rationale:** Compaction loses detail that can remain important to the same
+ongoing work. A directly discoverable predecessor capability makes recovering
+that detail routine without manual context transfer, global search noise, or
+requiring a planning agent to gain unrelated authority.
+
+**Dependencies:** REQ-RET-001, REQ-RET-003, REQ-RET-006, REQ-RET-007,
+REQ-RET-008; `../bedrock/requirements.md` REQ-BED-030A;
+`../global-recall/requirements.md` REQ-GR-007.
+
+---
+
 ## Non-Requirements (out of scope)
 
 These are capabilities this spec deliberately does not define. The
