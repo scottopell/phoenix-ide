@@ -6,6 +6,7 @@ use phoenix_core::domain::product_conversation::{
 use phoenix_core::work_scope::RuntimeRole;
 use serde::Serialize;
 use sqlx::{Executor, Row, SqliteConnection};
+use tracing::Instrument;
 
 use crate::{Database, DbError, DbResult, MessageContent, MessageType};
 
@@ -218,6 +219,24 @@ fn continuation_summary(row: &sqlx::sqlite::SqliteRow, content_column: &str) -> 
     };
     Ok(content.summary)
 }
+
+const PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL: &str = "WITH RECURSIVE transcript(id, ordinal) AS (
+     SELECT root.id, 0 FROM conversations root WHERE root.product_conversation_id = ?1 AND root.runtime_role = 'user' AND root.parent_conversation_id IS NULL
+     AND NOT EXISTS (SELECT 1 FROM conversations predecessor WHERE predecessor.product_conversation_id = root.product_conversation_id AND predecessor.continued_in_conv_id = root.id)
+     UNION ALL SELECT successor.id, transcript.ordinal + 1 FROM transcript JOIN conversations predecessor ON predecessor.id = transcript.id JOIN conversations successor ON successor.id = predecessor.continued_in_conv_id
+     WHERE successor.product_conversation_id = ?1 AND successor.runtime_role = 'user' AND successor.parent_conversation_id IS NULL
+ ), snapshot_ceiling AS (
+     SELECT json_extract(value, '$.transcript_row_id') AS transcript_row_id,
+            json_extract(value, '$.tail_sequence_id') AS tail_sequence_id,
+            json_extract(value, '$.tail_message_id') AS tail_message_id
+     FROM json_each(?2)
+ ) SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, transcript.ordinal
+ FROM transcript
+ CROSS JOIN messages INDEXED BY messages_conversation_sequence
+   ON messages.conversation_id = transcript.id
+ WHERE (?2 IS NULL OR EXISTS (SELECT 1 FROM snapshot_ceiling ceiling WHERE ceiling.transcript_row_id = transcript.id AND (messages.sequence_id < ceiling.tail_sequence_id OR (messages.sequence_id = ceiling.tail_sequence_id AND messages.message_id <= ceiling.tail_message_id))))
+   AND (?3 IS NULL OR transcript.ordinal < ?3 OR (transcript.ordinal = ?3 AND (messages.sequence_id < ?4 OR (messages.sequence_id = ?4 AND messages.message_id < ?5))))
+ ORDER BY transcript.ordinal DESC, messages.sequence_id DESC, messages.message_id DESC LIMIT ?6";
 
 impl Database {
     /// Returns the accepted opening message ID for a completed continuation edge.
@@ -532,15 +551,29 @@ impl Database {
         segment_ceilings: Option<&[ProductConversationSegmentCeiling]>,
         limit: usize,
     ) -> DbResult<ProductConversationSnapshotRead> {
-        let mut connection = self.pool.acquire().await?;
-        connection.execute("BEGIN").await?;
+        let mut connection = self
+            .pool
+            .acquire()
+            .instrument(tracing::info_span!("product_conversation.pool_wait"))
+            .await?;
+        connection
+            .execute("BEGIN")
+            .instrument(tracing::info_span!("product_conversation.begin_read"))
+            .await?;
         let result = async {
             let resolved =
-                Self::resolve_ordinary_product_conversation_on(&mut connection, reference).await?;
+                Self::resolve_ordinary_product_conversation_on(&mut connection, reference)
+                    .instrument(tracing::info_span!("product_conversation.resolve"))
+                    .await?;
+            tracing::Span::current().record(
+                "product.reference",
+                resolved.product_conversation_id.as_str(),
+            );
             let aggregate = Self::get_ordinary_product_conversation_on(
                 &mut connection,
                 &resolved.product_conversation_id,
             )
+            .instrument(tracing::info_span!("product_conversation.aggregate"))
             .await?;
             let messages = Self::get_product_conversation_messages_page_on(
                 &mut connection,
@@ -549,6 +582,7 @@ impl Database {
                 segment_ceilings,
                 limit,
             )
+            .instrument(tracing::info_span!("product_conversation.message_page"))
             .await?;
             Ok(ProductConversationSnapshotRead {
                 aggregate,
@@ -556,8 +590,15 @@ impl Database {
                 requested_transcript_row_id: resolved.requested_transcript_row_id,
             })
         }
+        .instrument(tracing::info_span!(
+            "product_conversation.snapshot_read",
+            "product.reference" = tracing::field::Empty,
+        ))
         .await;
-        connection.execute("ROLLBACK").await?;
+        connection
+            .execute("ROLLBACK")
+            .instrument(tracing::info_span!("product_conversation.rollback_read"))
+            .await?;
         result
     }
 
@@ -865,20 +906,13 @@ impl Database {
         let before_ordinal = before.as_ref().map(|(ordinal, _, _)| *ordinal);
         let before_sequence_id = before.as_ref().map(|(_, sequence_id, _)| *sequence_id);
         let before_message_id = before.map(|(_, _, message_id)| message_id);
-        sqlx::query("WITH RECURSIVE transcript(id, ordinal) AS (
-             SELECT root.id, 0 FROM conversations root WHERE root.product_conversation_id = ?1 AND root.runtime_role = 'user' AND root.parent_conversation_id IS NULL
-             AND NOT EXISTS (SELECT 1 FROM conversations predecessor WHERE predecessor.product_conversation_id = root.product_conversation_id AND predecessor.continued_in_conv_id = root.id)
-             UNION ALL SELECT successor.id, transcript.ordinal + 1 FROM transcript JOIN conversations predecessor ON predecessor.id = transcript.id JOIN conversations successor ON successor.id = predecessor.continued_in_conv_id
-             WHERE successor.product_conversation_id = ?1 AND successor.runtime_role = 'user' AND successor.parent_conversation_id IS NULL
-         ), snapshot_ceiling AS (
-             SELECT json_extract(value, '$.transcript_row_id') AS transcript_row_id,
-                    json_extract(value, '$.tail_sequence_id') AS tail_sequence_id,
-                    json_extract(value, '$.tail_message_id') AS tail_message_id
-             FROM json_each(?2)
-         ) SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, transcript.ordinal FROM transcript JOIN messages ON messages.conversation_id = transcript.id
-         WHERE (?2 IS NULL OR EXISTS (SELECT 1 FROM snapshot_ceiling ceiling WHERE ceiling.transcript_row_id = transcript.id AND (messages.sequence_id < ceiling.tail_sequence_id OR (messages.sequence_id = ceiling.tail_sequence_id AND messages.message_id <= ceiling.tail_message_id))))
-           AND (?3 IS NULL OR transcript.ordinal < ?3 OR (transcript.ordinal = ?3 AND (messages.sequence_id < ?4 OR (messages.sequence_id = ?4 AND messages.message_id < ?5)))) ORDER BY transcript.ordinal DESC, messages.sequence_id DESC, messages.message_id DESC LIMIT ?6")
-        .bind(product_conversation_id.as_str().to_string()).bind(segment_ceilings).bind(before_ordinal).bind(before_sequence_id).bind(before_message_id).bind(i64::try_from(limit).expect("page limit fits i64"))
+        sqlx::query(PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL)
+            .bind(product_conversation_id.as_str().to_string())
+            .bind(segment_ceilings)
+            .bind(before_ordinal)
+            .bind(before_sequence_id)
+            .bind(before_message_id)
+            .bind(i64::try_from(limit).expect("page limit fits i64"))
     }
 
     /// Fetches one bounded, newest-first page across the ordered aggregate transcript.
@@ -1021,6 +1055,152 @@ mod tests {
         ContinuationContent, ContinueOutcome, ConvState, MessageContent,
         NewContinuationDispatchIntent,
     };
+    use std::time::Instant;
+
+    async fn performance_fixture(
+        segment_count: usize,
+        messages_per_segment: usize,
+    ) -> (Database, crate::Conversation) {
+        let db = Database::open_in_memory().await.unwrap();
+        let root = db
+            .create_conversation("perf-root", "perf-root", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let mut segment = root.clone();
+        let content = serde_json::to_string(&MessageContent::user("fixture payload")).unwrap();
+        for segment_index in 0..segment_count {
+            sqlx::query(
+                "WITH RECURSIVE ordinal(value) AS (
+                     VALUES(1) UNION ALL SELECT value + 1 FROM ordinal WHERE value < ?1
+                 ) INSERT INTO messages (
+                     message_id, conversation_id, sequence_id, message_type, content, created_at
+                 ) SELECT printf('perf-%d-%d', ?2, value), ?3, value, 'user', ?4,
+                          '2026-01-01T00:00:00Z'
+                   FROM ordinal",
+            )
+            .bind(i64::try_from(messages_per_segment).unwrap())
+            .bind(i64::try_from(segment_index).unwrap())
+            .bind(&segment.id)
+            .bind(&content)
+            .execute(db.pool())
+            .await
+            .unwrap();
+            if segment_index + 1 < segment_count {
+                db.update_conversation_state(
+                    &segment.id,
+                    &ConvState::ContextExhausted {
+                        summary: "fixture continuation".to_string(),
+                    },
+                )
+                .await
+                .unwrap();
+                segment = match db.continue_conversation(&segment.id).await.unwrap() {
+                    ContinueOutcome::Created(successor) => successor,
+                    other @ (ContinueOutcome::AlreadyContinued(_)
+                    | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                        panic!("expected fixture continuation, got {other:?}")
+                    }
+                };
+            }
+        }
+        let distractor = db
+            .create_conversation("perf-noise", "perf-noise", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let noise_content = serde_json::to_string(&MessageContent::user("noise")).unwrap();
+        for chunk in 0..200 {
+            sqlx::query(
+                "WITH RECURSIVE ordinal(value) AS (
+                     VALUES(1) UNION ALL SELECT value + 1 FROM ordinal WHERE value < 1000
+                 ) INSERT INTO messages (
+                     message_id, conversation_id, sequence_id, message_type, content, created_at
+                 ) SELECT printf('noise-%d-%d', ?1, value), ?2, (?1 * 1000) + value,
+                          'user', ?3, '2026-01-01T00:00:00Z'
+                   FROM ordinal",
+            )
+            .bind(chunk)
+            .bind(&distractor.id)
+            .bind(&noise_content)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+        (db, root)
+    }
+
+    async fn measure_snapshot_stages(db: &Database, reference: &str) -> (u128, u128, u128, u128) {
+        let mut connection = db.pool.acquire().await.unwrap();
+        connection.execute("BEGIN").await.unwrap();
+        let started = Instant::now();
+        let resolved =
+            Database::resolve_ordinary_product_conversation_on(&mut connection, reference)
+                .await
+                .unwrap();
+        let resolve_micros = started.elapsed().as_micros();
+        let started = Instant::now();
+        let aggregate = Database::get_ordinary_product_conversation_on(
+            &mut connection,
+            &resolved.product_conversation_id,
+        )
+        .await
+        .unwrap();
+        let aggregate_micros = started.elapsed().as_micros();
+        let started = Instant::now();
+        let messages = Database::get_product_conversation_messages_page_on(
+            &mut connection,
+            aggregate.product_conversation.id(),
+            None,
+            None,
+            51,
+        )
+        .await
+        .unwrap();
+        assert_eq!(messages.len(), 51);
+        let page_micros = started.elapsed().as_micros();
+        let started = Instant::now();
+        connection.execute("ROLLBACK").await.unwrap();
+        let rollback_micros = started.elapsed().as_micros();
+        (
+            resolve_micros,
+            aggregate_micros,
+            page_micros,
+            rollback_micros,
+        )
+    }
+
+    #[tokio::test]
+    async fn message_page_query_enforces_transcript_first_indexed_join() {
+        let normalized = PRODUCT_CONVERSATION_MESSAGE_PAGE_SQL
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(normalized.contains(
+            "FROM transcript CROSS JOIN messages INDEXED BY messages_conversation_sequence ON messages.conversation_id = transcript.id"
+        ));
+
+        let db = Database::open_in_memory().await.unwrap();
+        let page = Database::get_product_conversation_messages_page_on(
+            &mut db.pool.acquire().await.unwrap(),
+            &ProductConversationId::parse("fixture-product").unwrap(),
+            None,
+            None,
+            51,
+        )
+        .await
+        .unwrap();
+        assert!(page.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "diagnostic scale fixture; run explicitly and retain raw samples"]
+    async fn product_conversation_snapshot_scale_diagnostic() {
+        let (db, root) = performance_fixture(23, 1_020).await;
+        let mut samples = Vec::new();
+        for _ in 0..11 {
+            samples.push(measure_snapshot_stages(&db, &root.id).await);
+        }
+        eprintln!("product_conversation_snapshot_stage_micros={samples:?}");
+    }
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
