@@ -4330,6 +4330,14 @@ impl RuntimeManager {
         })
     }
 
+    async fn release_failed_rematerialization_stream(&self, conversation_id: &str) -> bool {
+        self.evicted_broadcasters
+            .write()
+            .await
+            .remove(conversation_id)
+            .is_some()
+    }
+
     /// Get or materialize the in-memory runtime for a durable conversation.
     ///
     /// Materialization is single-flight per conversation. Unrelated conversations
@@ -5540,9 +5548,13 @@ impl RuntimeManager {
                     .recreate_runtime_from_database(conv_id.clone())
                     .await
                 {
+                    let released = manager_for_cleanup
+                        .release_failed_rematerialization_stream(&conv_id)
+                        .await;
                     tracing::error!(
                         conv_id = %conv_id,
                         %error,
+                        stream_released = released,
                         "Exhausted durable authority rematerialization attempts after ambiguous commit"
                     );
                 }
@@ -10885,6 +10897,29 @@ mod scope_liveness_tests {
             state_rx.changed().await.expect("replacement remains live");
         }
         assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn exhausted_rematerialization_releases_reserved_stream() {
+        let mgr = Arc::new(test_manager().await);
+        let conversation_id = "failed-rematerialization-stream";
+        let reserved = mgr.conversation_broadcaster(conversation_id).await;
+        let mut receiver = reserved.subscribe();
+        drop(reserved);
+
+        assert!(
+            mgr.release_failed_rematerialization_stream(conversation_id)
+                .await
+        );
+        assert!(!mgr
+            .evicted_broadcasters
+            .read()
+            .await
+            .contains_key(conversation_id));
+        assert!(matches!(
+            receiver.recv().await,
+            Err(tokio::sync::broadcast::error::RecvError::Closed)
+        ));
     }
 
     #[tokio::test]

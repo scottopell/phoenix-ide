@@ -510,6 +510,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_approval_request_obligations",
         sql: MIGRATION_098,
     },
+    Migration {
+        version: 99,
+        name: "normalize_approval_request_identity",
+        sql: MIGRATION_099,
+    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -10150,6 +10155,46 @@ BEGIN
 END;
 ";
 
+const MIGRATION_099: &str = r"
+DROP TRIGGER approval_request_obligation_after_agent_response;
+DROP TRIGGER approval_request_obligation_after_state_progress;
+CREATE UNIQUE INDEX IF NOT EXISTS messages_identity
+ON messages(message_id, conversation_id);
+CREATE TABLE approval_request_obligations_v2 (
+    conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+    approval_message_id TEXT NOT NULL UNIQUE,
+    created_at_us INTEGER NOT NULL CHECK (created_at_us >= 0),
+    FOREIGN KEY (approval_message_id, conversation_id)
+        REFERENCES messages(message_id, conversation_id) ON DELETE CASCADE
+);
+INSERT INTO approval_request_obligations_v2 (
+    conversation_id, approval_message_id, created_at_us
+)
+SELECT conversation_id, approval_message_id, created_at_us
+FROM approval_request_obligations;
+DROP TABLE approval_request_obligations;
+ALTER TABLE approval_request_obligations_v2 RENAME TO approval_request_obligations;
+CREATE TRIGGER approval_request_obligation_after_agent_response
+AFTER INSERT ON messages
+WHEN NEW.message_type = 'agent'
+BEGIN
+    DELETE FROM approval_request_obligations
+    WHERE conversation_id = NEW.conversation_id
+      AND EXISTS (
+          SELECT 1 FROM messages approval
+          WHERE approval.message_id = approval_message_id
+            AND approval.conversation_id = conversation_id
+            AND approval.sequence_id < NEW.sequence_id
+      );
+END;
+CREATE TRIGGER approval_request_obligation_after_state_progress
+AFTER UPDATE OF state_kind ON conversations
+WHEN NEW.state_kind <> 'llm_requesting'
+BEGIN
+    DELETE FROM approval_request_obligations WHERE conversation_id = NEW.id;
+END;
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10250,6 +10295,68 @@ mod tests {
         assert_eq!(pending, 1);
 
         sqlx::query("INSERT INTO messages VALUES ('response', 'conv', 3, 'agent')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let pending: i64 = sqlx::query_scalar("SELECT count(*) FROM approval_request_obligations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(pending, 0);
+    }
+
+    #[tokio::test]
+    async fn migration_099_derives_approval_sequence_from_referenced_message() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE conversations (id TEXT PRIMARY KEY, state_kind TEXT NOT NULL);
+             CREATE TABLE messages (
+                 message_id TEXT PRIMARY KEY,
+                 conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                 sequence_id INTEGER NOT NULL,
+                 message_type TEXT NOT NULL
+             );",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(MIGRATION_098).execute(&pool).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO conversations VALUES ('conv', 'llm_requesting');
+             INSERT INTO conversations VALUES ('other', 'llm_requesting');
+             INSERT INTO messages VALUES ('approval', 'conv', 7, 'user');
+             INSERT INTO approval_request_obligations VALUES ('conv', 'approval', 999, 1);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(MIGRATION_099).execute(&pool).await.unwrap();
+
+        let columns = sqlx::query_scalar::<_, String>(
+            "SELECT name FROM pragma_table_info('approval_request_obligations') ORDER BY cid",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            columns,
+            vec![
+                "conversation_id".to_string(),
+                "approval_message_id".to_string(),
+                "created_at_us".to_string(),
+            ]
+        );
+        let mismatched = sqlx::query(
+            "INSERT INTO approval_request_obligations
+             (conversation_id, approval_message_id, created_at_us)
+             VALUES ('other', 'approval', 2)",
+        )
+        .execute(&pool)
+        .await;
+        assert!(mismatched.is_err());
+
+        sqlx::query("INSERT INTO messages VALUES ('response', 'conv', 8, 'agent')")
             .execute(&pool)
             .await
             .unwrap();

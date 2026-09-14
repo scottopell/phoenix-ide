@@ -6386,12 +6386,17 @@ impl Database {
                  SELECT 1
                  FROM approval_request_obligations obligation
                  WHERE obligation.conversation_id = ?1
-                   AND NOT EXISTS (
-                       SELECT 1 FROM messages later
-                       WHERE later.conversation_id = obligation.conversation_id
-                         AND later.message_type = 'agent'
-                         AND later.sequence_id > obligation.approval_sequence_id
-                   )
+                         AND NOT EXISTS (
+                             SELECT 1
+                             FROM messages approval
+                             JOIN messages later
+                               ON later.conversation_id = approval.conversation_id
+                              AND later.message_type = 'agent'
+                              AND later.sequence_id > approval.sequence_id
+                             WHERE approval.message_id = obligation.approval_message_id
+                               AND approval.conversation_id = obligation.conversation_id
+                         )
+
              )",
         )
         .bind(conversation_id)
@@ -7344,16 +7349,14 @@ impl Database {
         insert_message_tx(&mut tx, approval_message).await?;
         sqlx::query(
             "INSERT INTO approval_request_obligations
-             (conversation_id, approval_message_id, approval_sequence_id, created_at_us)
-             VALUES (?1, ?2, ?3, ?4)
+             (conversation_id, approval_message_id, created_at_us)
+             VALUES (?1, ?2, ?3)
              ON CONFLICT(conversation_id) DO UPDATE SET
                  approval_message_id = excluded.approval_message_id,
-                 approval_sequence_id = excluded.approval_sequence_id,
                  created_at_us = excluded.created_at_us",
         )
         .bind(conversation_id)
         .bind(&approval_message.message_id)
-        .bind(approval_message.sequence_id)
         .bind(approval_message.created_at.timestamp_micros())
         .execute(&mut *tx)
         .await?;
@@ -9696,10 +9699,14 @@ impl Database {
                            FROM approval_request_obligations approval
                            WHERE approval.conversation_id = conversations.id
                              AND NOT EXISTS (
-                                 SELECT 1 FROM messages later
-                                 WHERE later.conversation_id = approval.conversation_id
-                                   AND later.message_type = 'agent'
-                                   AND later.sequence_id > approval.approval_sequence_id
+                                 SELECT 1
+                                 FROM messages approval_message
+                                 JOIN messages later
+                                   ON later.conversation_id = approval_message.conversation_id
+                                  AND later.message_type = 'agent'
+                                  AND later.sequence_id > approval_message.sequence_id
+                                 WHERE approval_message.message_id = approval.approval_message_id
+                                   AND approval_message.conversation_id = approval.conversation_id
                              )
                        )
                        OR EXISTS (

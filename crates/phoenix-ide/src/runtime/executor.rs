@@ -6916,11 +6916,6 @@ where
         let tasks_dir_name = self.context.tasks_dir_name.clone();
         let is_sub_agent = self.context.is_sub_agent;
         let mode_context = self.context.mode_context.clone();
-        let has_approved_task_write_authority =
-            matches!(
-                capability.authority,
-                crate::work_scope::ResourceAuthority::Work
-            ) && matches!(mode_context, Some(ModeContext::Explore { .. }));
         let llm_language = self.context.llm_language;
         let persona = self.context.persona.clone();
         let is_coordinator = self.context.is_coordinator;
@@ -6953,17 +6948,12 @@ where
         let available_tools = tool_executor
             .definitions_for_generation(capability_generation, llm_language)
             .await?;
-        let explore_bash_capability = match (capability.authority, mode_context.as_ref()) {
-            (
-                crate::work_scope::ResourceAuthority::Restricted,
-                Some(ModeContext::Explore { .. }),
-            ) => explore_bash.into(),
-            (crate::work_scope::ResourceAuthority::Work, Some(ModeContext::Explore { .. })) => {
-                phoenix_core::llm_language::ExploreBashPromptCapability::Unsandboxed
-            }
-            _ => phoenix_core::llm_language::ExploreBashPromptCapability::Unavailable,
-        };
-        let mut system_prompt = if is_coordinator {
+        let explore_bash_capability = crate::system_prompt::explore_bash_prompt_capability(
+            capability.authority,
+            mode_context.as_ref(),
+            explore_bash,
+        );
+        let system_prompt = if is_coordinator {
             crate::system_prompt::build_coordinator_system_prompt(llm_language)
         } else {
             build_system_prompt(
@@ -6978,11 +6968,6 @@ where
                 explore_bash_capability,
             )
         };
-        if has_approved_task_write_authority {
-            system_prompt.push_str(
-                "\n\nThe conversation mode remains Explore, but the approved-task objective on its attached WorkScope grants full write authority. Execute that approved task with the available write tools; do not propose another plan merely because the mode label is Explore.",
-            );
-        }
         let tools = request_tool_surface.callable_tools(available_tools);
         let callable_tool_names: std::collections::HashSet<&str> =
             tools.iter().map(|tool| tool.name.as_str()).collect();

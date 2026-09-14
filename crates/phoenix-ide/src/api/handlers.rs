@@ -4093,15 +4093,15 @@ async fn get_system_prompt(
     // Mirror the mode context the live request uses (worktree boundaries,
     // Explore guidance) so the inspected prompt matches what the model sees.
     let mode_context = crate::runtime::conv_mode_to_context(&conversation.conv_mode);
-    let explore_bash = if matches!(
-        mode_context,
-        crate::system_prompt::ModeContext::Explore { .. }
-    ) && state.platform.has_sandbox()
-    {
-        phoenix_core::domain::sm_state::ExploreBashCapability::Sandboxed
-    } else {
-        phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable
-    };
+    let resource_authority =
+        crate::resource_authority::resolve_resource_authority(state.runtime.db(), &conversation)
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+    let explore_bash = crate::system_prompt::explore_bash_prompt_capability(
+        resource_authority.authority,
+        Some(&mode_context),
+        crate::tools::ExploreToolPolicy::from_platform(&state.platform).bash(),
+    );
     let system_prompt = if is_coordinator {
         crate::system_prompt::build_coordinator_system_prompt(conversation.llm_language)
     } else {
