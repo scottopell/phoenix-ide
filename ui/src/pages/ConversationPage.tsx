@@ -20,7 +20,6 @@ import {
 } from './conversationRouteFocus';
 import { ConversationNavStack } from '../components/ConversationNavStack';
 import {
-  historyRequestHasCursor,
   historyResponseMatchesCurrentRequest,
   initialHistoryExpansionState,
   reduceHistoryExpansion,
@@ -1027,7 +1026,8 @@ function ConversationPageContent({
       snapshotStartedAtPhase: atomRef.current.phase,
       intent,
     };
-    if (!historyRequestHasCursor(request)) {
+    const maybeRequestStartedAtEventSeq = request.snapshotStartedAtEventSeq;
+    if (maybeRequestStartedAtEventSeq === null) {
       dispatchHistoryExpansion({
         type: 'history_failed',
         requestToken: request.token,
@@ -1037,10 +1037,11 @@ function ConversationPageContent({
       });
       return;
     }
-    const requestStartedAtEventSeq = request.snapshotStartedAtEventSeq;
-    const requestTranscriptGeneration = request.view.transcriptGeneration;
+    const requestStartedAtEventSeq: number = maybeRequestStartedAtEventSeq;
+    const activeRequest = { ...request, snapshotStartedAtEventSeq: requestStartedAtEventSeq };
+    const requestTranscriptGeneration = activeRequest.view.transcriptGeneration;
 
-    dispatchHistoryExpansion({ type: 'request_started', request });
+    dispatchHistoryExpansion({ type: 'request_started', request: activeRequest });
     try {
       const route = await resolveConversationRoute(slug);
       const result = await getConversationByResolvedId(route);
@@ -1048,7 +1049,7 @@ function ConversationPageContent({
       const authoritativeTranscriptGeneration = atomRef.current.transcriptGeneration;
       const responseTranscriptGeneration = result.conversation.transcript_generation ?? 1;
       const requestIsCurrent = historyResponseMatchesCurrentRequest(
-        request,
+        activeRequest,
         historyRequestTokenRef.current,
         currentView,
         authoritativeTranscriptGeneration,
@@ -1058,8 +1059,8 @@ function ConversationPageContent({
       if (!requestIsCurrent) {
         dispatchHistoryExpansion({
           type: 'history_failed',
-          requestToken: request.token,
-          view: request.view,
+          requestToken: activeRequest.token,
+          view: activeRequest.view,
           transcriptGeneration: requestTranscriptGeneration,
           message: 'Conversation changed while loading earlier history',
         });
@@ -1067,7 +1068,7 @@ function ConversationPageContent({
       }
       dispatch({
         type: 'merge_conversation_data',
-        conversationId: request.view.conversationId,
+        conversationId: activeRequest.view.conversationId,
         conversation: result.conversation,
         messages: result.messages,
         phase: result.conversation.state
@@ -1080,16 +1081,16 @@ function ConversationPageContent({
         transcriptCoverage: 'complete',
         eventCursorFloor: requestStartedAtEventSeq,
         snapshotStartedAtEventSeq: requestStartedAtEventSeq,
-        snapshotStartedAtPhase: request.snapshotStartedAtPhase,
+        snapshotStartedAtPhase: activeRequest.snapshotStartedAtPhase,
       });
       dispatchHistoryExpansion({
         type: 'history_loaded',
-        requestToken: request.token,
-        view: request.view,
-        targetPresent: request.intent.kind !== 'deep_link'
+        requestToken: activeRequest.token,
+        view: activeRequest.view,
+        targetPresent: activeRequest.intent.kind !== 'deep_link'
           || findHistoricalUnitIndexByMessageId(
             buildHistoricalUnits({ messages: result.messages, pendingMessages: [] }).historicalUnits,
-            request.intent.targetMessageId,
+            activeRequest.intent.targetMessageId,
           ) >= 0,
         commandToken: ++historyCommandTokenRef.current,
       });
@@ -1097,8 +1098,8 @@ function ConversationPageContent({
       console.warn('Failed to load earlier conversation history:', err);
       dispatchHistoryExpansion({
         type: 'history_failed',
-        requestToken: request.token,
-        view: request.view,
+        requestToken: activeRequest.token,
+        view: activeRequest.view,
         transcriptGeneration: requestTranscriptGeneration,
         message: err instanceof Error ? err.message : 'Failed to load earlier history',
       });
