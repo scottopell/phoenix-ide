@@ -79,6 +79,7 @@ export interface ConversationAtom {
   conversation: Conversation | null;
   phase: ConversationState;
   phaseLastAppliedEventSeq: number;
+  questionStatusPhaseFenceEventSeq: number;
   conversationLastAppliedEventSeq: number;
   messages: Message[];
   /** Durable server-authoritative messages awaiting steering delivery. */
@@ -407,6 +408,7 @@ export function createInitialAtom(): ConversationAtom {
     conversation: null,
     phase: { type: 'idle' },
     phaseLastAppliedEventSeq: 0,
+    questionStatusPhaseFenceEventSeq: 0,
     conversationLastAppliedEventSeq: 0,
     messages: [],
     steeringMessages: [],
@@ -1329,6 +1331,7 @@ export function conversationReducer(
         conversation: p.conversation,
         phase: p.phase,
         phaseLastAppliedEventSeq: initPhaseAuthoritySeq,
+        questionStatusPhaseFenceEventSeq: 0,
         conversationLastAppliedEventSeq: 0,
         contextWindow: p.contextWindow,
         streamIncarnation: p.streamIncarnation,
@@ -1484,7 +1487,7 @@ export function conversationReducer(
         ...atom,
         phase: action.phase,
         phaseStateUpdatedAt: action.stateUpdatedAt,
-        phaseLastAppliedEventSeq: Math.max(atom.phaseLastAppliedEventSeq, action.phaseFreshnessEventSeq),
+        questionStatusPhaseFenceEventSeq: Math.max(atom.questionStatusPhaseFenceEventSeq, action.phaseFreshnessEventSeq),
       };
 
     case 'local_phase_change':
@@ -1552,8 +1555,12 @@ export function conversationReducer(
         conversationId: action.conversationId,
         conversation,
         messages,
-        phase: atom.phase !== action.snapshotStartedAtPhase || atom.phaseLastAppliedEventSeq >= action.snapshotStartedAtEventSeq ? atom.phase : action.phase,
+        phase:
+          atom.phaseLastAppliedEventSeq > action.snapshotStartedAtEventSeq || (atom.phase !== action.snapshotStartedAtPhase && atom.questionStatusPhaseFenceEventSeq >= action.snapshotStartedAtEventSeq)
+            ? atom.phase
+            : action.phase,
         phaseLastAppliedEventSeq: atom.phaseLastAppliedEventSeq,
+        questionStatusPhaseFenceEventSeq: atom.questionStatusPhaseFenceEventSeq,
         pendingMessagePatches: Object.fromEntries(
           Object.entries(atom.pendingMessagePatches).filter(
             ([, pending]) => latestMessagePatchEventSeq(pending) > action.snapshotStartedAtEventSeq,
