@@ -338,6 +338,32 @@ def scenario_recovery_after_restart(cwd: Path) -> None:
 
 
 
+def confirm_exact_loss_retirement(base_url: str, transcript_id: str, product_id: str) -> None:
+    deadline = time.monotonic() + TIMEOUT
+    while True:
+        close = product_snapshot(base_url, product_id)["close"]
+        confirmation = close["confirmation_snapshot"]
+        response = httpx.post(f"{base_url}/api/conversations/{transcript_id}/close/confirm-loss-retirement", json={
+            "attempt_id": close["attempt_id"],
+            "inspection_generation": confirmation["generation"],
+            "inspection_fingerprint": confirmation["fingerprint"],
+        }, timeout=30.0)
+        if response.status_code == 200:
+            return
+        payload = response.json()
+        if payload.get("error_type") == "close_retirement_needs_repair":
+            retry = httpx.post(f"{base_url}/api/conversations/{transcript_id}/close/retry-retirement", json={"attempt_id": close["attempt_id"]}, timeout=30.0)
+            if retry.status_code == 200:
+                return
+            retry_payload = retry.json()
+            if retry_payload.get("error_type") != "close_loss_confirmation_required":
+                raise AssertionError(f"dirty Close repair failed: {retry.status_code}: {retry.text}")
+        elif payload.get("error_type") != "close_loss_confirmation_required":
+            raise AssertionError(f"dirty Close confirmation failed: {response.status_code}: {response.text}")
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"dirty Close did not complete: {product_snapshot(base_url, product_id)!r}")
+
+
 def scenario_dirty_exact_loss(base_url: str, cwd: Path) -> None:
     created = scenario_create_objective_one_row_reload(base_url, cwd)
     transcript_id = created["transcript_row_id"]
@@ -355,16 +381,7 @@ def scenario_dirty_exact_loss(base_url: str, cwd: Path) -> None:
     expected_identity = "git_path_bytes_hex_v1:" + "qa-exact-loss.txt".encode().hex()
     identities = {loss.get("identity") for loss in losses}
     assert identities == {expected_identity}, losses
-    confirmation = close["confirmation_snapshot"]
-    confirm = httpx.post(f"{base_url}/api/conversations/{transcript_id}/close/confirm-loss-retirement", json={
-        "attempt_id": close["attempt_id"],
-        "inspection_generation": confirmation["generation"],
-        "inspection_fingerprint": confirmation["fingerprint"],
-    }, timeout=30.0)
-    if confirm.status_code != 200:
-        assert confirm.status_code == 409 and confirm.json().get("error_type") == "close_retirement_needs_repair", confirm.text
-        repaired = product_snapshot(base_url, created["product_conversation_id"])["close"]
-        request(base_url, "POST", f"/api/conversations/{transcript_id}/close/retry-retirement", body={"attempt_id": repaired["attempt_id"]})
+    confirm_exact_loss_retirement(base_url, transcript_id, created["product_conversation_id"])
     history = poll(
         "dirty Close to History",
         lambda: product_snapshot(base_url, created["product_conversation_id"]),
