@@ -512,7 +512,7 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 99,
-        name: "normalize_approval_request_identity",
+        name: "normalize_approval_message_identity",
         sql: MIGRATION_099,
     },
 ];
@@ -10306,7 +10306,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_099_derives_approval_sequence_from_referenced_message() {
+    async fn migration_099_normalizes_approval_message_identity() {
         let pool = test_pool().await;
         sqlx::raw_sql(
             "CREATE TABLE conversations (id TEXT PRIMARY KEY, state_kind TEXT NOT NULL);
