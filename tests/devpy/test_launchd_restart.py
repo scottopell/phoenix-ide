@@ -3,6 +3,7 @@ import io
 import json
 import os
 import plistlib
+import signal
 import subprocess
 import sys
 import tempfile
@@ -80,34 +81,26 @@ class FakeLaunchctl:
 
 
 class RestartHelperTests(unittest.TestCase):
-    def test_signal_uses_launchctl_hup_without_unloading_target(self):
+    def test_signal_targets_inspected_pid_without_unloading_target(self):
         with tempfile.TemporaryDirectory() as td:
             manifest = make_manifest(Path(td))
-            run = mock.Mock(side_effect=[
-                subprocess.CompletedProcess([], 0, "state = running\npid = 100\n", ""),
-                subprocess.CompletedProcess([], 0, "", ""),
-            ])
+            run = mock.Mock(return_value=subprocess.CompletedProcess(
+                [],
+                0,
+                "state = running\npid = 100\n",
+                "",
+            ))
+            kill = mock.Mock()
 
-            signal_pid = helper.Launchctl(manifest, run=run).signal_hup()
+            signal_pid = helper.Launchctl(manifest, run=run, kill=kill).signal_hup()
 
             self.assertEqual(100, signal_pid)
-            self.assertEqual(run.call_args_list, [
-                mock.call(
-                    ["launchctl", "print", f"gui/{manifest.uid}/{manifest.label}"],
-                    capture_output=True,
-                    text=True,
-                ),
-                mock.call(
-                    [
-                        "launchctl",
-                        "kill",
-                        "HUP",
-                        f"gui/{manifest.uid}/{manifest.label}",
-                    ],
-                    capture_output=True,
-                    text=True,
-                ),
-            ])
+            run.assert_called_once_with(
+                ["launchctl", "print", f"gui/{manifest.uid}/{manifest.label}"],
+                capture_output=True,
+                text=True,
+            )
+            kill.assert_called_once_with(100, signal.SIGHUP)
 
     def test_inspection_failure_preserves_launchctl_diagnostic(self):
         with tempfile.TemporaryDirectory() as td:
@@ -285,6 +278,17 @@ class RestartCommandTests(unittest.TestCase):
             "KeepAlive": True,
             "RunAtLoad": True,
         })
+
+    def test_atomic_json_write_fsyncs_file_and_containing_directory(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "status.json"
+            real_fsync = os.fsync
+
+            with mock.patch.object(self.dev.os, "fsync", wraps=real_fsync) as fsync:
+                self.dev._write_json_atomic(path, {"state": "committed"})
+
+            self.assertEqual(2, fsync.call_count)
+            self.assertEqual({"state": "committed"}, json.loads(path.read_text()))
 
     def test_launchd_restart_hands_off_installed_state_without_build_or_env_reload(self):
         with tempfile.TemporaryDirectory() as td:

@@ -9636,6 +9636,11 @@ def _write_json_atomic(path: Path, value: dict, mode: int = 0o600) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise

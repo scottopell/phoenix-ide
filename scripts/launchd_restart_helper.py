@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import ssl
 import subprocess
 import sys
@@ -188,11 +189,13 @@ class Launchctl:
         self,
         manifest: Manifest,
         run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+        kill: Callable[[int, int], None] = os.kill,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
     ):
         self.manifest = manifest
         self.run = run
+        self.kill = kill
         self.monotonic = monotonic
         self.sleep = sleep
         self.target = f"gui/{manifest.uid}/{manifest.label}"
@@ -233,15 +236,12 @@ class Launchctl:
                 "installed service changed immediately before restart; "
                 f"observed state={state} pid={pid}"
             )
-        result = self.run(
-            ["launchctl", "kill", "HUP", self.target],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            detail = (result.stderr or result.stdout).strip()
-            suffix = f": {detail}" if detail else ""
-            raise RestartError(f"launchctl could not signal the installed service{suffix}")
+        try:
+            self.kill(pid, signal.SIGHUP)
+        except OSError as exc:
+            raise RestartError(
+                f"could not signal inspected service PID {pid}: {exc}"
+            ) from exc
         return pid
 
     def wait_for_new_pid(self, previous_pid: int) -> int:
