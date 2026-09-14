@@ -688,10 +688,27 @@ impl RuntimeManager {
 
     /// Retires exactly the unresolved inventory targets. The coordinator never
     /// advances Close to `Completed`; it only creates per-resource evidence.
-    #[allow(clippy::too_many_lines)]
     pub(crate) async fn retire_close_runtime_resources(
         &self,
         attempt_id: CloseAttemptId,
+    ) -> Result<(), CloseRetirementError> {
+        self.retire_close_runtime_resources_with_adoption_routing(attempt_id, false)
+            .await
+    }
+
+    pub(super) async fn resume_close_runtime_resources_on_startup(
+        &self,
+        attempt_id: CloseAttemptId,
+    ) -> Result<(), CloseRetirementError> {
+        self.retire_close_runtime_resources_with_adoption_routing(attempt_id, true)
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn retire_close_runtime_resources_with_adoption_routing(
+        &self,
+        attempt_id: CloseAttemptId,
+        route_adoption_invariant_to_repair: bool,
     ) -> Result<(), CloseRetirementError> {
         let _execution = self
             .close_retirement_execution
@@ -1020,8 +1037,12 @@ impl RuntimeManager {
                 }
             }
         }
-        self.retire_close_worktrees_and_scopes(&attempt_id, &snapshot)
-            .await?;
+        self.retire_close_worktrees_and_scopes(
+            &attempt_id,
+            &snapshot,
+            route_adoption_invariant_to_repair,
+        )
+        .await?;
         self.complete_close_retirement_and_publish(&attempt_id)
             .await?;
         self.discard_close_resource_leases(&attempt_id).await;
@@ -1145,6 +1166,7 @@ impl RuntimeManager {
         &self,
         attempt_id: &CloseAttemptId,
         snapshot: &CloseRetirementSnapshot,
+        route_adoption_invariant_to_repair: bool,
     ) -> Result<(), CloseRetirementError> {
         let targets = self
             .db()
@@ -1251,21 +1273,39 @@ impl RuntimeManager {
                     } else if quarantine_path
                         .try_exists()
                         .map_err(|error| error.to_string())?
-                        && existing_cleanup_plan.is_none()
+                        && (existing_cleanup_plan.is_none() || route_adoption_invariant_to_repair)
                     {
-                        Some(
-                            self.db()
-                                .adopt_close_worktree_cleanup_plan(
-                                    AdoptCloseWorktreeCleanupPlanRequest {
-                                        attempt_id: attempt_id.clone(),
-                                        scope: scope.clone(),
-                                        target_snapshot: snapshot.clone(),
-                                        resource: target.resource.clone(),
-                                    },
-                                )
+                        let adopted = self
+                            .db()
+                            .adopt_close_worktree_cleanup_plan(
+                                AdoptCloseWorktreeCleanupPlanRequest {
+                                    attempt_id: attempt_id.clone(),
+                                    scope: scope.clone(),
+                                    target_snapshot: snapshot.clone(),
+                                    resource: target.resource.clone(),
+                                },
+                            )
+                            .await
+                            .map_err(map_close_retirement_db_error);
+                        match adopted {
+                            Ok(plan) => Some(plan),
+                            Err(CloseRetirementError::EvidenceInvariant {
+                                invariant,
+                                relation,
+                            }) if route_adoption_invariant_to_repair => {
+                                self.route_close_evidence_invariant_to_repair::<
+                                    (),
+                                    CloseRetirementError,
+                                >(attempt_id, &scope, &invariant, &relation)
                                 .await
-                                .map_err(map_close_retirement_db_error)?,
-                        )
+                                .expect_err("repair routing returns a typed failure");
+                                return Err(CloseRetirementError::EvidenceInvariant {
+                                    invariant,
+                                    relation,
+                                });
+                            }
+                            Err(error) => return Err(error),
+                        }
                     } else {
                         existing_cleanup_plan
                     };
@@ -2658,7 +2698,7 @@ fn path_buf_from_git_bytes(bytes: &[u8]) -> PathBuf {
     }
 }
 
-fn worktree_quarantine_path(identity: &WorktreeIdentity) -> Result<PathBuf, String> {
+pub(super) fn worktree_quarantine_path(identity: &WorktreeIdentity) -> Result<PathBuf, String> {
     let path = worktree_path(identity);
     let parent = path
         .parent()

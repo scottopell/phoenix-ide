@@ -3254,7 +3254,7 @@ impl RuntimeManager {
                     return Ok(false);
                 }
                 match manager
-                    .retire_close_runtime_resources(obligation.attempt_id().clone())
+                    .resume_close_runtime_resources_on_startup(obligation.attempt_id().clone())
                     .await
                 {
                     Ok(()) => Ok(true),
@@ -7619,6 +7619,369 @@ mod scope_liveness_tests {
     }
 
     #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn startup_adoption_conflict_routes_exact_worktree_to_repair_once() {
+        use phoenix_core::domain::close::{
+            ClosePhase, LossItemIdentity, RetiredResourceIdentity, RetiredResourceKind,
+            RetirementOutcome,
+        };
+        use phoenix_db::{
+            CloseNeedsRepairCause, RecordCloseRetirementDispatchRequest,
+            RecordCloseWorktreeCleanupPlanRequest,
+        };
+
+        let manager = Arc::new(test_manager().await);
+        let repository = tempfile::tempdir().unwrap();
+        let git = |arguments: &[&str]| {
+            let output = phoenix_core::git::command()
+                .args(arguments)
+                .current_dir(repository.path())
+                .env("GIT_AUTHOR_NAME", "Close Test")
+                .env("GIT_AUTHOR_EMAIL", "close@example.invalid")
+                .env("GIT_COMMITTER_NAME", "Close Test")
+                .env("GIT_COMMITTER_EMAIL", "close@example.invalid")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {arguments:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--quiet"]);
+        std::fs::write(repository.path().join("tracked"), "initial\n").unwrap();
+        git(&["add", "tracked"]);
+        git(&["commit", "--quiet", "-m", "initial"]);
+        let worktree = repository.path().join("worktree");
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "startup-adoption-conflict",
+            worktree.to_str().unwrap(),
+        ]);
+
+        let ResourceScopeKey::Work(scope) = create_handleless_work_conv(
+            &manager,
+            "startup-adoption-conflict",
+            worktree.to_str().unwrap(),
+            None,
+        )
+        .await
+        else {
+            unreachable!()
+        };
+        sqlx::query("UPDATE conversations SET user_initiated = 1 WHERE id = ?1")
+            .bind("startup-adoption-conflict")
+            .execute(manager.db().pool())
+            .await
+            .unwrap();
+        let conversation = manager
+            .db()
+            .get_conversation("startup-adoption-conflict")
+            .await
+            .unwrap();
+        let attempt_id = CloseAttemptId::parse("startup-adoption-conflict-attempt").unwrap();
+        manager
+            .db()
+            .begin_close_foundation(
+                &conversation.product_conversation_id,
+                &TranscriptConversationId::parse(&conversation.id).unwrap(),
+                attempt_id.as_str(),
+            )
+            .await
+            .unwrap();
+        manager
+            .db()
+            .confirm_close_stop_work(attempt_id.as_str())
+            .await
+            .unwrap();
+        manager
+            .db()
+            .begin_close_active_work_settlement(attempt_id.as_str())
+            .await
+            .unwrap();
+        manager
+            .db()
+            .advance_close_settlement_when_quiescent(attempt_id.as_str())
+            .await
+            .unwrap();
+        let source_snapshot = manager
+            .inspect_close_retirement_only(attempt_id.clone())
+            .await
+            .unwrap();
+        manager
+            .capture_close_retirement_inventory(attempt_id.clone(), source_snapshot.clone())
+            .await
+            .unwrap();
+        let captured = manager
+            .db()
+            .list_close_attempt_scopes(attempt_id.as_str())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.scope == scope)
+            .unwrap();
+        let CapturedWorktreeIdentity::Resolved(worktree_identity) =
+            captured.captured_worktree.unwrap()
+        else {
+            panic!("test worktree identity must resolve");
+        };
+        let resource = RetiredResourceIdentity::parse(
+            RetiredResourceKind::Worktree,
+            LossItemIdentity::Worktree(worktree_identity.clone()),
+        )
+        .unwrap();
+        manager
+            .db()
+            .record_close_retirement_dispatch(RecordCloseRetirementDispatchRequest {
+                attempt_id: attempt_id.clone(),
+                scope: scope.clone(),
+                snapshot: source_snapshot.clone(),
+                resource: resource.clone(),
+            })
+            .await
+            .unwrap();
+        let source_admin = repository.path().join("source-admin");
+        std::fs::create_dir(&source_admin).unwrap();
+        manager
+            .db()
+            .record_close_worktree_cleanup_plan(RecordCloseWorktreeCleanupPlanRequest {
+                attempt_id: attempt_id.clone(),
+                scope: scope.clone(),
+                snapshot: source_snapshot.clone(),
+                resource: resource.clone(),
+                administrative_dir: source_admin,
+                administrative_dir_incarnation: "source-admin-incarnation".to_string(),
+            })
+            .await
+            .unwrap();
+        std::fs::write(worktree.join("tracked"), "current inspection differs\n").unwrap();
+        let output = phoenix_core::git::command()
+            .args(["add", "tracked"])
+            .current_dir(&worktree)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git add in worktree failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = phoenix_core::git::command()
+            .args(["commit", "--quiet", "-m", "current inspection"])
+            .current_dir(&worktree)
+            .env("GIT_AUTHOR_NAME", "Close Test")
+            .env("GIT_AUTHOR_EMAIL", "close@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Close Test")
+            .env("GIT_COMMITTER_EMAIL", "close@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git commit in worktree failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        manager
+            .db()
+            .return_close_attempt_to_reinspection(&attempt_id)
+            .await
+            .unwrap();
+        manager
+            .inspect_close_retirement_only(attempt_id.clone())
+            .await
+            .unwrap();
+        let target_snapshot = manager
+            .db()
+            .get_close_obligation(attempt_id.as_str())
+            .await
+            .unwrap()
+            .snapshot()
+            .cloned()
+            .unwrap();
+        assert_ne!(source_snapshot, target_snapshot);
+        manager
+            .capture_close_retirement_inventory(attempt_id.clone(), target_snapshot.clone())
+            .await
+            .unwrap();
+        manager
+            .db()
+            .record_close_retirement_dispatch(RecordCloseRetirementDispatchRequest {
+                attempt_id: attempt_id.clone(),
+                scope: scope.clone(),
+                snapshot: target_snapshot.clone(),
+                resource: resource.clone(),
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT OR REPLACE INTO close_worktree_cleanup_plans (
+                 attempt_id, scope, inspection_generation, inspection_fingerprint,
+                 resource_kind, identity_kind, identity_codec, identity_value,
+                 administrative_dir_codec, administrative_dir_value,
+                 administrative_dir_incarnation, planned_at_us,
+                 final_tombstone_root_codec, final_tombstone_root_value,
+                 final_tombstone_root_device, final_tombstone_root_inode,
+                 final_tombstone_object_device, final_tombstone_object_inode
+             )
+             SELECT attempt_id, scope, ?3, ?4,
+                    resource_kind, identity_kind, identity_codec, identity_value,
+                    administrative_dir_codec, administrative_dir_value,
+                    'conflicting-admin-incarnation', planned_at_us + 1,
+                    final_tombstone_root_codec, final_tombstone_root_value,
+                    final_tombstone_root_device, final_tombstone_root_inode,
+                    final_tombstone_object_device, final_tombstone_object_inode
+             FROM close_worktree_cleanup_plans
+             WHERE attempt_id=?1 AND scope=?2 AND inspection_generation=?5",
+        )
+        .bind(attempt_id.as_str())
+        .bind(scope.as_str())
+        .bind(target_snapshot.generation())
+        .bind(target_snapshot.fingerprint())
+        .bind(source_snapshot.generation())
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+        let quarantine = close_retirement::worktree_quarantine_path(&worktree_identity).unwrap();
+        std::fs::rename(&worktree, &quarantine).unwrap();
+        let observer_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut manager = match Arc::try_unwrap(manager) {
+            Ok(manager) => manager,
+            Err(_) => panic!("test manager has one owner"),
+        };
+        manager = manager.with_test_no_ambient_writers(Arc::clone(&observer_calls));
+        let manager = Arc::new(manager);
+
+        let error = manager
+            .resume_close_runtime_resources_on_startup(attempt_id.clone())
+            .await
+            .expect_err("conflicting retained cleanup authority must fail startup resume");
+        assert!(
+            matches!(
+                error,
+                close_retirement::CloseRetirementError::EvidenceInvariant {
+                    ref invariant,
+                    ref relation,
+                } if invariant == "idempotent_target_cleanup_plan_matches_source"
+                    && relation == "close_worktree_cleanup_plans"
+            ),
+            "unexpected startup resume error: {error:?}"
+        );
+        let obligation = manager
+            .db()
+            .get_close_obligation(attempt_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(obligation.phase(), ClosePhase::NeedsRepair);
+        assert_eq!(obligation.snapshot(), Some(&target_snapshot));
+        assert_eq!(
+            manager
+                .db()
+                .close_needs_repair_cause(&attempt_id)
+                .await
+                .unwrap(),
+            Some(
+                CloseNeedsRepairCause::evidence_invariant(
+                    "idempotent_target_cleanup_plan_matches_source",
+                    "close_worktree_cleanup_plans",
+                )
+                .unwrap()
+            )
+        );
+        let evidence = manager
+            .db()
+            .list_close_retirement_evidence(attempt_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].scope, scope);
+        assert_eq!(evidence[0].resource, resource);
+        assert_eq!(
+            evidence[0].outcome,
+            RetirementOutcome::Residual {
+                residual_reason:
+                    phoenix_core::domain::close::RetirementFailureReason::ManualRepairRequired,
+            }
+        );
+        assert_eq!(
+            evidence[0].detail.as_deref(),
+            Some(
+                "Close evidence invariant idempotent_target_cleanup_plan_matches_source failed in close_worktree_cleanup_plans"
+            )
+        );
+        let mutation_counts = || async {
+            sqlx::query_as::<_, (i64, i64, i64, i64)>(
+                "SELECT
+                     (SELECT COUNT(*) FROM close_worktree_cleanup_adoptions WHERE attempt_id=?1),
+                     (SELECT COUNT(*) FROM close_retirement_resource_history WHERE attempt_id=?1),
+                     (SELECT COUNT(*) FROM close_retirement_resources WHERE attempt_id=?1),
+                     (SELECT COUNT(*) FROM close_needs_repair_causes WHERE attempt_id=?1)",
+            )
+            .bind(attempt_id.as_str())
+            .fetch_one(manager.db().pool())
+            .await
+            .unwrap()
+        };
+        let after_first = mutation_counts().await;
+        assert_eq!(after_first, (0, 1, 1, 1));
+        assert!(quarantine.exists());
+        assert!(!worktree.exists());
+        assert!(
+            !manager
+                .db()
+                .get_conversation(&conversation.id)
+                .await
+                .unwrap()
+                .archived
+        );
+        let scope_lifecycle: String =
+            sqlx::query_scalar("SELECT lifecycle FROM work_scopes WHERE id=?1")
+                .bind(scope.as_str())
+                .fetch_one(manager.db().pool())
+                .await
+                .unwrap();
+        assert_eq!(scope_lifecycle, "active");
+        assert_eq!(observer_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let retained_plan: (String, String) = sqlx::query_as(
+            "SELECT administrative_dir_value, administrative_dir_incarnation
+             FROM close_worktree_cleanup_plans
+             WHERE attempt_id=?1 AND scope=?2 AND inspection_generation=?3",
+        )
+        .bind(attempt_id.as_str())
+        .bind(scope.as_str())
+        .bind(target_snapshot.generation())
+        .fetch_one(manager.db().pool())
+        .await
+        .unwrap();
+        assert_eq!(retained_plan.1, "conflicting-admin-incarnation");
+
+        assert_eq!(
+            manager
+                .resume_pending_close_runtime_retirements()
+                .await
+                .unwrap(),
+            0,
+            "NeedsRepair must not be startup-admitted"
+        );
+        assert_eq!(mutation_counts().await, after_first);
+        assert_eq!(
+            manager
+                .db()
+                .close_needs_repair_cause(&attempt_id)
+                .await
+                .unwrap(),
+            Some(
+                CloseNeedsRepairCause::evidence_invariant(
+                    "idempotent_target_cleanup_plan_matches_source",
+                    "close_worktree_cleanup_plans",
+                )
+                .unwrap()
+            )
+        );
+        assert!(quarantine.exists());
+        assert_eq!(observer_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn exact_attempt_retry_adopts_retained_cleanup_and_finalizes_history() {
         use phoenix_core::domain::close::ClosePhase;
