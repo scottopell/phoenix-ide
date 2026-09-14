@@ -8456,7 +8456,8 @@ where
                 usage_data: None,
                 created_at: chrono::Utc::now(),
             };
-            self.storage
+            let establishment = self
+                .storage
                 .persist_approved_task_authority(
                     &self.context.conversation_id,
                     &TaskApprovalHandoffData {
@@ -8476,6 +8477,13 @@ where
                 .inspect_err(|_| {
                     self.recovery_disposition = RuntimeRecoveryDisposition::RecreateFromDatabase;
                 })?;
+            if matches!(
+                establishment,
+                crate::db::LocalAuthorityResult::DurableFactUnclassified
+            ) {
+                self.recovery_disposition = RuntimeRecoveryDisposition::RecreateFromDatabase;
+                return Err("approval authority establishment is unclassified".to_string());
+            }
             let _ = self
                 .broadcast_tx
                 .admitted_publication(admitted)
@@ -8566,9 +8574,18 @@ where
                         proposed.updated_at,
                     )
                     .await;
-                if let Err(error) = persist_result {
-                    self.recovery_disposition = RuntimeRecoveryDisposition::RecreateFromDatabase;
-                    return Err(error);
+                match persist_result {
+                    Ok(crate::db::LocalAuthorityResult::DurableFactEstablished(())) => {}
+                    Ok(crate::db::LocalAuthorityResult::DurableFactUnclassified) => {
+                        self.recovery_disposition =
+                            RuntimeRecoveryDisposition::RecreateFromDatabase;
+                        return Err("approval authority establishment is unclassified".to_string());
+                    }
+                    Err(error) => {
+                        self.recovery_disposition =
+                            RuntimeRecoveryDisposition::RecreateFromDatabase;
+                        return Err(error);
+                    }
                 }
                 // Build the fallible Work tool surface before publishing Work to
                 // the actor context. A failed rebuild leaves every live consumer
@@ -16497,6 +16514,68 @@ mod approve_task_failure_effect_tests {
         .await
         .expect("duplicate approval decision is stale and absorbed");
         assert_eq!(storage.get_all_messages(conv_id).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unclassified_approval_establishment_fails_closed() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "approval-establishment-unclassified";
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, "main");
+        std::fs::create_dir_all(explore_wt.join("tasks")).unwrap();
+        let task_filename = "12346-p0-ready--unclassified.md";
+        std::fs::write(explore_wt.join("tasks").join(task_filename), "Plan").unwrap();
+
+        let mut context = ConvContext::new(conv_id, explore_wt, "test-model", 200_000);
+        context.desired_base_branch = Some("main".to_string());
+        context.mode_context = Some(ModeContext::Explore {
+            next_taskmd_id_hint: Some("12346".to_string()),
+        });
+        let (_event_tx, event_rx) = mpsc::channel(32);
+        let event_tx_dup = mpsc::channel::<Event>(1).0;
+        let storage = Arc::new(InMemoryStorage::new());
+        storage.set_unclassify_approved_task_authority(true);
+        let llm = Arc::new(MockLlmClient::new("test-model"));
+        let tool_executor = Arc::new(MockToolExecutor::new());
+        let mut rt = ConversationRuntime::new(
+            context,
+            ConvState::AwaitingTaskApproval {
+                task_file: format!("tasks/{task_filename}"),
+                title: "Unclassified approval".to_string(),
+                priority: crate::task_source::Priority::P0,
+                plan: "Plan".to_string(),
+            },
+            storage,
+            llm.clone(),
+            tool_executor.clone(),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx_dup,
+            SseBroadcaster::new(128, 0),
+        )
+        .with_fatal_local_authority_fence(crate::runtime::FatalLocalAuthorityFence::new());
+
+        let result = rt
+            .process_event(Event::TaskApprovalDecided {
+                outcome: TaskApprovalOutcome::Approved {
+                    handoff: TaskApprovalHandoff::ContinueInCurrentConversation,
+                },
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            tool_executor.capability_snapshot().authority,
+            crate::work_scope::ResourceAuthority::Restricted
+        );
+        assert!(matches!(
+            rt.recovery_disposition,
+            RuntimeRecoveryDisposition::RecreateFromDatabase
+        ));
+        assert!(llm.recorded_requests().is_empty());
     }
 
     #[tokio::test]
