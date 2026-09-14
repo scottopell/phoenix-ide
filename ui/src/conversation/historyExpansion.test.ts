@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   historyMergeEventCursorFloor,
+  historyRequestHasCursor,
   historyResponseMatchesCurrentRequest,
   initialHistoryExpansionState,
   reduceHistoryExpansion,
@@ -35,6 +36,12 @@ describe('history expansion reducer', () => {
     const request = { ...manualRequest(view('a', 1)), snapshotStartedAtEventSeq: 17 };
 
     expect(historyMergeEventCursorFloor(request)).toBe(17);
+  });
+
+  it('requires a live cursor before a history response can participate in phase adoption', () => {
+    const request = { ...manualRequest(view('a', 1)), snapshotStartedAtEventSeq: null };
+
+    expect(historyRequestHasCursor(request)).toBe(false);
   });
 
   it('rejects a superseded equal-cursor history response by request token', () => {

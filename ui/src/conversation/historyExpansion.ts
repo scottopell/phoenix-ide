@@ -23,6 +23,14 @@ export type ActiveHistoryRequest = {
   intent: HistoryIntent;
 };
 
+export type PendingHistoryRequest = Omit<ActiveHistoryRequest, 'snapshotStartedAtEventSeq'> & {
+  snapshotStartedAtEventSeq: number | null;
+};
+
+export function historyRequestHasCursor(request: PendingHistoryRequest): request is ActiveHistoryRequest {
+  return request.snapshotStartedAtEventSeq !== null;
+}
+
 export function historyMergeEventCursorFloor(request: ActiveHistoryRequest): number {
   return request.snapshotStartedAtEventSeq;
 }
