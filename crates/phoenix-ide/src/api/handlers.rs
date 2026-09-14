@@ -14120,6 +14120,105 @@ pub(crate) mod hard_delete_cascade_tests {
     }
 
     #[tokio::test]
+    async fn compatibility_archive_repeatedly_reports_persisted_typed_repair_cause() {
+        use phoenix_core::domain::close::{
+            CloseAttemptId, ClosePhase, LossItemIdentity, OpaqueIdentity, RetiredResourceIdentity,
+            RetiredResourceKind, RetirementFailureReason,
+        };
+        use phoenix_db::{CloseNeedsRepairCause, RouteCloseAttemptToRepairRequest};
+
+        let state = make_test_state().await;
+        let root = state
+            .db
+            .create_conversation(
+                "compat-typed-repair",
+                "compat-typed-repair",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let attempt_id = CloseAttemptId::parse("compat-typed-repair-attempt").unwrap();
+        state
+            .db
+            .begin_close_foundation(
+                &root.product_conversation_id,
+                &phoenix_core::domain::close::TranscriptConversationId::parse(root.id.clone())
+                    .unwrap(),
+                attempt_id.as_str(),
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .begin_close_idle_settlement(attempt_id.as_str())
+            .await
+            .unwrap();
+        let obligation = state
+            .db
+            .advance_close_settlement_when_quiescent(attempt_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(obligation.phase(), ClosePhase::AwaitingRetirementInspection);
+        let captured = state
+            .db
+            .list_close_attempt_scopes(attempt_id.as_str())
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let scope = captured.scope;
+        state
+            .db
+            .route_close_attempt_to_repair(RouteCloseAttemptToRepairRequest {
+                attempt_id: attempt_id.clone(),
+                scope: scope.clone(),
+                residual: RetiredResourceIdentity::parse(
+                    RetiredResourceKind::WorkScope,
+                    LossItemIdentity::Opaque(OpaqueIdentity::parse(scope.to_string()).unwrap()),
+                )
+                .unwrap(),
+                reason: RetirementFailureReason::ManualRepairRequired,
+                detail: "stored diagnostic text is not the response contract".to_string(),
+                cause: Some(
+                    CloseNeedsRepairCause::evidence_invariant(
+                        "target_dispatch_must_match_sealed_inventory",
+                        "close_retirement_resource_dispatches",
+                    )
+                    .unwrap(),
+                ),
+            })
+            .await
+            .unwrap();
+
+        for _ in 0..2 {
+            let AppError::Conflict(conflict) =
+                archive_conversation(State(state.clone()), Path(root.id.clone()))
+                    .await
+                    .expect_err("NeedsRepair remains a compatibility archive conflict")
+            else {
+                panic!("archive must return a structured conflict");
+            };
+            assert_eq!(conflict.attempt_id.as_deref(), Some(attempt_id.as_str()));
+            assert_eq!(
+                conflict.active_transcript_id.as_deref(),
+                Some(root.id.as_str())
+            );
+            assert_eq!(
+                conflict.failed_invariant.as_deref(),
+                Some("target_dispatch_must_match_sealed_inventory")
+            );
+            assert_eq!(
+                conflict.failed_relation.as_deref(),
+                Some("close_retirement_resource_dispatches")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn compatibility_archive_retry_does_not_restart_close_for_history() {
         let state = make_test_state().await;
         let root = state
