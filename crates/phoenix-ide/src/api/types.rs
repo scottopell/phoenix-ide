@@ -1142,6 +1142,9 @@ pub struct ConflictErrorResponse {
     pub failed_invariant: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failed_relation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ambient_writer_indeterminate:
+        Option<crate::runtime::close_retirement::AmbientWriterIndeterminateDiagnostic>,
 }
 
 impl ConflictErrorResponse {
@@ -1158,6 +1161,7 @@ impl ConflictErrorResponse {
             recovery_action: None,
             failed_invariant: None,
             failed_relation: None,
+            ambient_writer_indeterminate: None,
         }
     }
 

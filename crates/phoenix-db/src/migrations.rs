@@ -8977,6 +8977,7 @@ CREATE TABLE close_ambient_writer_evidence (
         attempt_id, scope, inspection_generation, inspection_fingerprint,
         resource_kind, identity_kind, identity_codec, identity_value,
         detector, process_id, process_incarnation,
+        executable_codec, executable_value,
         matched_path_codec, matched_path_value, match_kind, access_mode
     ),
     FOREIGN KEY (
