@@ -900,6 +900,7 @@ LAUNCHD_RESTART_ACTIVE_PATH = LAUNCHD_RESTART_DIR / "active"
 LAUNCHD_RESTART_HELPER_PREFIX = "com.phoenix-ide.restart"
 LAUNCHD_RESTART_HELPER_SOURCE = ROOT / "scripts" / "launchd_restart_helper.py"
 LAUNCHD_TRANSITION_TIMEOUT_SECS = 30.0
+LAUNCHD_RESTART_SHUTDOWN_TIMEOUT_SECS = 35.0
 LAUNCHD_HEALTH_TIMEOUT_SECS = 120.0
 LAUNCHD_STALE_HANDOFF_ALLOWANCE_SECS = 30.0
 LAUNCHD_HANDOFF_PROTOCOL_VERSION = 1
@@ -10211,6 +10212,7 @@ def launchd_prod_restart() -> None:
             "status_path": str(status_path),
             "lock_path": str(LAUNCHD_DEPLOY_LOCK_PATH),
             "claim_lock_path": str(LAUNCHD_DEPLOY_CLAIM_LOCK_PATH),
+            "shutdown_timeout_secs": LAUNCHD_RESTART_SHUTDOWN_TIMEOUT_SECS,
             "transition_timeout_secs": LAUNCHD_TRANSITION_TIMEOUT_SECS,
             "health_timeout_secs": LAUNCHD_HEALTH_TIMEOUT_SECS,
             "created_at": created_at,
@@ -10308,7 +10310,8 @@ def _print_launchd_restart_entry(label: str, restart: dict) -> None:
             restart["updated_at"]
         )
         stale_after = (
-            LAUNCHD_TRANSITION_TIMEOUT_SECS
+            LAUNCHD_RESTART_SHUTDOWN_TIMEOUT_SECS
+            + LAUNCHD_TRANSITION_TIMEOUT_SECS
             + LAUNCHD_HEALTH_TIMEOUT_SECS
             + LAUNCHD_STALE_HANDOFF_ALLOWANCE_SECS
         )

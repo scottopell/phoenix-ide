@@ -60,6 +60,7 @@ class Manifest:
     lock_path: str
     claim_lock_path: str
     created_at: str
+    shutdown_timeout_secs: float = 35.0
     transition_timeout_secs: float = 30.0
     health_timeout_secs: float = 120.0
 
@@ -314,7 +315,11 @@ class Launchctl:
         return job.pid
 
     def wait_for_new_pid(self, previous_pid: int) -> int:
-        deadline = self.monotonic() + self.manifest.transition_timeout_secs
+        deadline = (
+            self.monotonic()
+            + self.manifest.shutdown_timeout_secs
+            + self.manifest.transition_timeout_secs
+        )
         observed = LoadedJob("unknown", None, None, None, None, ())
         while self.monotonic() < deadline:
             observed = self.inspect()

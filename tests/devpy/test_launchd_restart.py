@@ -59,6 +59,7 @@ def make_manifest(root: Path) -> helper.Manifest:
         lock_path=str(root / "activation.lock"),
         claim_lock_path=str(root / "claim.lock"),
         created_at="2026-01-01T00:00:00+00:00",
+        shutdown_timeout_secs=0.1,
         transition_timeout_secs=0.1,
         health_timeout_secs=0.1,
     )
@@ -200,6 +201,31 @@ class RestartHelperTests(unittest.TestCase):
             status = json.loads(Path(manifest.status_path).read_text())
             self.assertEqual(101, status["previous_pid"])
             self.assertEqual(102, status["running_pid"])
+
+    def test_replacement_deadline_includes_bounded_shutdown_budget(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = dataclasses.replace(
+                make_manifest(Path(td)),
+                shutdown_timeout_secs=0.2,
+                transition_timeout_secs=0.1,
+            )
+            replacement = helper.LoadedJob(
+                "running",
+                101,
+                True,
+                manifest.plist_path,
+                manifest.binary_path,
+                (str(manifest.socket_service),),
+            )
+            monotonic = mock.Mock(side_effect=[0.0, 0.15])
+            launchctl = helper.Launchctl(
+                manifest,
+                monotonic=monotonic,
+                sleep=mock.Mock(),
+            )
+
+            with mock.patch.object(launchctl, "inspect", return_value=replacement):
+                self.assertEqual(101, launchctl.wait_for_new_pid(100))
 
     def test_restart_rejects_identity_verified_against_a_later_pid(self):
         class ReplacedDuringHealthCheck(FakeLaunchctl):
@@ -519,6 +545,10 @@ class RestartCommandTests(unittest.TestCase):
             self.assertEqual(str(binary), manifest["binary_path"])
             self.assertEqual(str(plist), manifest["plist_path"])
             self.assertEqual("http://localhost:9555/api/version", manifest["health_url"])
+            self.assertEqual(
+                self.dev.LAUNCHD_RESTART_SHUTDOWN_TIMEOUT_SECS,
+                manifest["shutdown_timeout_secs"],
+            )
             self.assertNotIn("installed-secret", json.dumps(manifest))
             self.assertEqual(
                 '{"state":"committed","source_kind":"published_release"}\n',
