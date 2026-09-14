@@ -4267,6 +4267,37 @@ impl RuntimeManager {
         }
     }
 
+    async fn remove_finished_runtime(
+        &self,
+        conversation_id: &str,
+        identity: &Arc<()>,
+        disposition: executor::RuntimeExitDisposition,
+    ) -> bool {
+        let mut runtimes = self.runtimes.write().await;
+        let mut reservations = self.evicted_broadcasters.write().await;
+        let Some(handle) = runtimes.get(conversation_id) else {
+            return false;
+        };
+        if !Arc::ptr_eq(&handle.identity, identity) {
+            return false;
+        }
+        let handle = runtimes
+            .remove(conversation_id)
+            .expect("identity-checked runtime remains present");
+        if disposition == executor::RuntimeExitDisposition::RecreateFromDatabase {
+            reservations.insert(conversation_id.to_string(), handle.broadcast_tx);
+        }
+        true
+    }
+
+    fn recreate_runtime_from_database(
+        self: &Arc<Self>,
+        conversation_id: String,
+    ) -> futures::future::BoxFuture<'static, Result<(), String>> {
+        let manager = Arc::clone(self);
+        Box::pin(async move { manager.get_or_create(&conversation_id).await.map(drop) })
+    }
+
     /// Get or materialize the in-memory runtime for a durable conversation.
     ///
     /// Materialization is single-flight per conversation. Unrelated conversations
@@ -5443,18 +5474,9 @@ impl RuntimeManager {
             // Only remove this runtime's HashMap entry. After evict_runtime()
             // a new runtime may have been inserted under the same key; we must
             // not evict that replacement.
-            let removed = {
-                let mut runtimes = manager_for_cleanup.runtimes.write().await;
-                if runtimes
-                    .get(&conv_id)
-                    .is_some_and(|h| Arc::ptr_eq(&h.identity, &cleanup_identity))
-                {
-                    runtimes.remove(&conv_id);
-                    true
-                } else {
-                    false
-                }
-            };
+            let removed = manager_for_cleanup
+                .remove_finished_runtime(&conv_id, &cleanup_identity, disposition)
+                .await;
             if removed {
                 tracing::info!(conv_id = %conv_id, "Conversation runtime finished and cleaned up");
             } else {
@@ -5471,7 +5493,16 @@ impl RuntimeManager {
                 }
             }
             if removed && disposition == executor::RuntimeExitDisposition::RecreateFromDatabase {
-                manager_for_cleanup.kick_direct_turn_worker();
+                if let Err(error) = manager_for_cleanup
+                    .recreate_runtime_from_database(conv_id.clone())
+                    .await
+                {
+                    tracing::error!(
+                        conv_id = %conv_id,
+                        %error,
+                        "Failed to rematerialize runtime from durable authority after ambiguous commit"
+                    );
+                }
             }
         });
 
@@ -10681,6 +10712,65 @@ mod scope_liveness_tests {
             .expect("materialization joins")
             .expect("inherited materialization succeeds");
         assert_eq!(handle.state_rx.borrow().presentation_mode(), "idle");
+    }
+
+    #[tokio::test]
+    async fn recreate_from_database_replaces_finished_actor_and_preserves_stream() {
+        let mgr = Arc::new(test_manager().await);
+        let conversation_id = "recreate-finished-runtime";
+        mgr.db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        mgr.db()
+            .update_conversation_state(conversation_id, &ConvState::LlmRequesting { attempt: 1 })
+            .await
+            .expect("persist committed approval state");
+        let _stale_events = mgr
+            .inject_handle_with_event_capture_for_test(
+                conversation_id,
+                ConvState::AwaitingTaskApproval {
+                    task_file: "tasks/12345-p0-ready--recreate.md".to_string(),
+                    title: "Recreate".to_string(),
+                    priority: crate::task_source::Priority::P0,
+                    plan: "Plan".to_string(),
+                },
+            )
+            .await;
+        let stale = mgr
+            .try_get_handle(conversation_id)
+            .await
+            .expect("stale handle");
+        let stale_identity = Arc::clone(&stale.identity);
+        let reserved_stream = stale.broadcast_tx.clone();
+
+        assert!(
+            mgr.remove_finished_runtime(
+                conversation_id,
+                &stale_identity,
+                executor::RuntimeExitDisposition::RecreateFromDatabase,
+            )
+            .await
+        );
+        mgr.recreate_runtime_from_database(conversation_id.to_string())
+            .await
+            .expect("rematerialize from durable state");
+
+        let replacement = mgr
+            .try_get_handle(conversation_id)
+            .await
+            .expect("replacement handle");
+        assert!(!Arc::ptr_eq(&stale_identity, &replacement.identity));
+        assert!(reserved_stream.same_channel(&replacement.broadcast_tx));
+        assert_ne!(
+            *replacement.state_rx.borrow(),
+            ConvState::AwaitingTaskApproval {
+                task_file: "tasks/12345-p0-ready--recreate.md".to_string(),
+                title: "Recreate".to_string(),
+                priority: crate::task_source::Priority::P0,
+                plan: "Plan".to_string(),
+            }
+        );
     }
 
     #[tokio::test]
