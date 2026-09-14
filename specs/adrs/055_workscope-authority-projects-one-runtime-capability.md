@@ -1,4 +1,10 @@
+<<<<<<<< HEAD:specs/adrs/055_workscope-authority-projects-one-runtime-capability.md
 # ADR-055: WorkScope authority projects one runtime capability
+|||||||| parent of 07af41155 (fix: reserve capability migration chronology):specs/adrs/051_workscope-authority-projects-one-runtime-capability.md
+# ADR-051: WorkScope authority projects one runtime capability
+========
+# ADR-053: WorkScope authority projects one runtime capability
+>>>>>>>> 07af41155 (fix: reserve capability migration chronology):specs/adrs/053_workscope-authority-projects-one-runtime-capability.md
 
 - **Status:** Accepted
 - **Date:** 2026-09-13
@@ -40,7 +46,7 @@ Rejected as the primary structure. Repeated checks can support defense, but they
 
 ## Compatibility
 
-The authority projection change is forward-only. Migration 097 repairs legacy Direct WorkScopes that were incorrectly classified as Restricted Explore; rollback requires the ordinary offline paired database restore governed by `specs/compatibility/requirements.md` and is not otherwise guaranteed.
+The authority projection change is forward-only. Migration 099 repairs legacy Direct WorkScopes that were incorrectly classified as Restricted Explore; rollback requires the ordinary offline paired database restore governed by `specs/compatibility/requirements.md` and is not otherwise guaranteed.
 
 ## Consequences
 
