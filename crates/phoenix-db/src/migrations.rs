@@ -501,19 +501,19 @@ const MIGRATIONS: &[Migration] = &[
         sql: MIGRATION_096,
     },
     Migration {
-        version: 97,
-        name: "restore_direct_conversation_authority",
-        sql: MIGRATION_097,
-    },
-    Migration {
-        version: 98,
-        name: "add_approval_request_obligations",
-        sql: MIGRATION_098,
-    },
-    Migration {
         version: 99,
-        name: "normalize_approval_message_identity",
+        name: "restore_direct_conversation_authority",
         sql: MIGRATION_099,
+    },
+    Migration {
+        version: 100,
+        name: "add_approval_request_obligations",
+        sql: MIGRATION_100,
+    },
+    Migration {
+        version: 101,
+        name: "normalize_approval_message_identity",
+        sql: MIGRATION_101,
     },
 ];
 
@@ -10121,7 +10121,7 @@ WHERE type = 'table'
   AND instr(sql, '''timed_out''') = 0
 ";
 
-const MIGRATION_097: &str = r"
+const MIGRATION_099: &str = r"
 UPDATE work_scopes
 SET authority_kind = 'direct'
 WHERE id IN (
@@ -10132,7 +10132,7 @@ WHERE id IN (
   AND authority_kind = 'restricted_explore';
 ";
 
-const MIGRATION_098: &str = r"
+const MIGRATION_100: &str = r"
 CREATE TABLE approval_request_obligations (
     conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
     approval_message_id TEXT NOT NULL UNIQUE REFERENCES messages(message_id) ON DELETE CASCADE,
@@ -10155,7 +10155,7 @@ BEGIN
 END;
 ";
 
-const MIGRATION_099: &str = r"
+const MIGRATION_101: &str = r"
 DROP TRIGGER approval_request_obligation_after_agent_response;
 DROP TRIGGER approval_request_obligation_after_state_progress;
 CREATE UNIQUE INDEX IF NOT EXISTS messages_identity
@@ -10257,8 +10257,16 @@ mod tests {
             .unwrap()
     }
 
+    #[test]
+    fn compiled_migration_ledger_is_strictly_ordered_and_unique() {
+        let ledger = compiled_migration_ledger();
+        assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        let names: HashSet<_> = ledger.iter().map(|(_, name)| *name).collect();
+        assert_eq!(names.len(), ledger.len());
+    }
+
     #[tokio::test]
-    async fn migration_098_creates_operation_scoped_approval_obligations() {
+    async fn migration_100_creates_operation_scoped_approval_obligations() {
         let pool = test_pool().await;
         sqlx::raw_sql(
             "CREATE TABLE conversations (id TEXT PRIMARY KEY, state_kind TEXT NOT NULL);
@@ -10272,7 +10280,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::raw_sql(MIGRATION_098).execute(&pool).await.unwrap();
+        sqlx::raw_sql(MIGRATION_100).execute(&pool).await.unwrap();
         sqlx::raw_sql(
             "INSERT INTO conversations VALUES ('conv', 'llm_requesting');
              INSERT INTO messages VALUES ('approval', 'conv', 1, 'user');
@@ -10306,7 +10314,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_099_normalizes_approval_message_identity() {
+    async fn migration_101_normalizes_approval_message_identity() {
         let pool = test_pool().await;
         sqlx::raw_sql(
             "CREATE TABLE conversations (id TEXT PRIMARY KEY, state_kind TEXT NOT NULL);
@@ -10320,7 +10328,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::raw_sql(MIGRATION_098).execute(&pool).await.unwrap();
+        sqlx::raw_sql(MIGRATION_100).execute(&pool).await.unwrap();
         sqlx::raw_sql(
             "INSERT INTO conversations VALUES ('conv', 'llm_requesting');
              INSERT INTO conversations VALUES ('other', 'llm_requesting');
@@ -10331,7 +10339,7 @@ mod tests {
         .await
         .unwrap();
 
-        sqlx::raw_sql(MIGRATION_099).execute(&pool).await.unwrap();
+        sqlx::raw_sql(MIGRATION_101).execute(&pool).await.unwrap();
 
         let columns = sqlx::query_scalar::<_, String>(
             "SELECT name FROM pragma_table_info('approval_request_obligations') ORDER BY cid",
@@ -10368,7 +10376,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_097_restores_direct_conversation_authority() {
+    async fn migration_099_restores_direct_conversation_authority() {
         let pool = test_pool().await;
         sqlx::raw_sql(
             "CREATE TABLE work_scopes (
@@ -10391,7 +10399,7 @@ mod tests {
         .await
         .unwrap();
 
-        sqlx::raw_sql(MIGRATION_097).execute(&pool).await.unwrap();
+        sqlx::raw_sql(MIGRATION_099).execute(&pool).await.unwrap();
 
         let authorities = sqlx::query("SELECT id, authority_kind FROM work_scopes ORDER BY id")
             .fetch_all(&pool)
