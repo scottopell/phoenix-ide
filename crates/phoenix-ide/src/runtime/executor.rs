@@ -12537,7 +12537,7 @@ mod authoritative_user_message_effect_tests {
                     .add_message(
                         &format!("old-{i}"),
                         &conv,
-                        &MessageContent::user(&"completed detail ".repeat(200)),
+                        &MessageContent::user("completed detail ".repeat(200)),
                         None,
                         None,
                     )
@@ -12603,7 +12603,7 @@ mod authoritative_user_message_effect_tests {
             .add_message(
                 "accepted",
                 &conv,
-                &MessageContent::user(&"seed ".repeat(20_000)),
+                &MessageContent::user("seed ".repeat(20_000)),
                 None,
                 None,
             )

@@ -28,6 +28,18 @@ A PR with relevant tests and repository checks passing, actionable review findin
 - Compare current instructions/retention, Coordinator instructions alone, and Coordinator instructions with protection across three successive compactions. Assess unresolved commitments, ownership, corrections, and resumption behavior, not just summary headings. Keep any live-model exercise bounded and separate from CI.
 - Update bedrock and global-recall contracts and executive verification, plus ADR-049. Run focused tests, Allium/spec checks, and dev.py check.
 
+## Repeated-compaction evidence
+
+The opt-in `live_three_compaction_comparison` uses native provider requests with `gpt-5.5`, default effort, standard service tier, a 20,000-token simulated input window, and a 4,096-token output allowance. Each arm runs three compactions with enough completed fixture history to force trimming, followed by a no-tools resumption probe after each summary. The fixture mixes a paused Crick audit, Phoenix ownership succession, a canceled workstream, an explicit deployment ban, and unverified delegate reports.
+
+| Arm | Observed behavior |
+|---|---|
+| Generic instructions and original trimming | Lost the paused Crick obligation and deployment ban at the first compaction, cancellation at the second, and exact Phoenix owner reference at the third. Later resumption starts repository inspection. |
+| Coordinator instructions and original trimming | Better owner-first verification behavior, but the same earlier obligations and references disappear when the incoming handoff is trimmed away. |
+| Coordinator instructions and protected handoff | All three handoffs retain the Crick owner, reproduction condition and promised follow-up, docs cancellation, deployment ban, and Phoenix owner succession. Delegate reports remain unverified and queued delivery is not promoted to acknowledgement or completion. |
+
+This is one synthetic sample per arm, not a statistical benchmark, production-transcript replay, or guarantee of lossless summaries. The no-tools probes describe intended next actions; they do not verify tool execution. Input retention has deterministic regression coverage separately.
+
 ## Investigation and panel conclusions
 
 Investigation began on local main 19fe992c7; production transcripts were not inspected. Roadmap #651 was read for coordination context.

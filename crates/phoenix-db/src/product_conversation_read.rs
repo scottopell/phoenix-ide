@@ -1023,6 +1023,7 @@ mod tests {
     };
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn resolves_member_identity_and_reads_typed_handoff() {
         let db = Database::open_in_memory().await.unwrap();
         let root = db
