@@ -10825,6 +10825,43 @@ mod tests {
         setup_legacy_conversations_table(pool).await;
     }
 
+    async fn run_legacy_conversation_migration_with_triggers_suspended(
+        pool: &SqlitePool,
+        migration_sql: &str,
+    ) {
+        let triggers: Vec<(String, String)> = sqlx::query_as(
+            "SELECT name, sql
+             FROM sqlite_schema
+             WHERE type = 'trigger'
+               AND sql IS NOT NULL
+             ORDER BY name",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        for (name, _) in &triggers {
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "DROP TRIGGER IF EXISTS {name}"
+            )))
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        let migration_result = sqlx::raw_sql(sqlx::AssertSqlSafe(migration_sql.to_string()))
+            .execute(pool)
+            .await;
+
+        for (_, sql) in triggers {
+            sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+
+        migration_result.unwrap();
+    }
+
     type ConversationTopologyRow = (
         String,
         Option<String>,
@@ -15052,6 +15089,52 @@ mod tests {
         assert_eq!(row.get::<i64, _>("chain_messages_at_answer"), 17);
     }
 
+    #[tokio::test]
+    async fn direct_legacy_conversation_migration_suspends_later_schema_triggers() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE conversations (
+                 id TEXT PRIMARY KEY,
+                 continued_in_conv_id TEXT,
+                 archived BOOLEAN NOT NULL DEFAULT 0
+             );
+             INSERT INTO conversations (id, continued_in_conv_id, archived) VALUES
+                 ('root', 'leaf', 0),
+                 ('leaf', NULL, 1);
+             CREATE TRIGGER test_later_conversation_shape_trigger
+             BEFORE UPDATE ON conversations
+             FOR EACH ROW
+             WHEN NEW.archived = 1
+             BEGIN
+                 SELECT later.product_conversation_id
+                 FROM conversations later
+                 WHERE later.id = NEW.id;
+             END;",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(sqlx::raw_sql(MIGRATION_006).execute(&pool).await.is_err());
+
+        run_legacy_conversation_migration_with_triggers_suspended(&pool, MIGRATION_006).await;
+
+        let archived: bool =
+            sqlx::query_scalar("SELECT archived FROM conversations WHERE id = 'root'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(archived);
+        let trigger_sql: Option<String> = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_schema
+             WHERE type = 'trigger' AND name = 'test_later_conversation_shape_trigger'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert!(trigger_sql.is_some());
+    }
+
     /// Migration 006: a chain with mixed `archived` state has every member
     /// flipped to archived; fully-archived and fully-unarchived chains are
     /// untouched; standalones are untouched.
@@ -15131,7 +15214,7 @@ mod tests {
 
         // Re-run the partial-archive cleanup directly so we exercise it on
         // the now-wired chain (the migration table thinks 006 is done).
-        sqlx::raw_sql(MIGRATION_006).execute(&pool).await.unwrap();
+        run_legacy_conversation_migration_with_triggers_suspended(&pool, MIGRATION_006).await;
 
         let archived_for = |id: &'static str| {
             let pool = pool.clone();
