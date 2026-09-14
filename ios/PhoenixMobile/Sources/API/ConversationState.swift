@@ -52,7 +52,8 @@ enum ConversationState: Equatable {
     case toolExecuting(toolName: String, remainingCount: Int, completedCount: Int)
     case awaitingSubAgents(pendingCount: Int, completedCount: Int)
     case awaitingContinuation
-    case awaitingUserResponse(questions: [UserQuestion])
+    case awaitingUserResponse(toolUseId: String, questions: [UserQuestion])
+    case questionIdentityUnavailable
     case awaitingTaskApproval(title: String, priority: String, plan: String)
     case awaitingRecovery(message: String)
     case provisioning
@@ -95,9 +96,12 @@ enum ConversationState: Equatable {
         case "awaiting_continuation":
             return .awaitingContinuation
         case "awaiting_user_response":
+            guard let toolUseId = json["tool_use_id"]?.stringValue,
+                  !toolUseId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else { return .questionIdentityUnavailable }
             let questions = (json["questions"]?.arrayValue ?? [])
                 .compactMap(UserQuestion.parse)
-            return .awaitingUserResponse(questions: questions)
+            return .awaitingUserResponse(toolUseId: toolUseId, questions: questions)
         case "awaiting_task_approval":
             guard let title = json["title"]?.stringValue,
                   let priority = json["priority"]?.stringValue,
@@ -148,7 +152,7 @@ enum ConversationState: Equatable {
         case .error(_, let kind):
             return kind.isUserResumable
         case .awaitingLlm, .awaitingContinuation, .cancelling,
-             .awaitingUserResponse, .awaitingTaskApproval,
+             .awaitingUserResponse, .questionIdentityUnavailable, .awaitingTaskApproval,
              .awaitingRecovery, .provisioning,
              .contextExhausted,
              .creationFailed, .terminal, .handedOff, .other, .unknown:
@@ -163,7 +167,7 @@ enum ConversationState: Equatable {
              .awaitingRecovery, .provisioning:
             return true
         case .idle, .awaitingLlm, .awaitingContinuation,
-             .awaitingUserResponse, .error, .creationFailed, .contextExhausted, .cancelling,
+             .awaitingUserResponse, .questionIdentityUnavailable, .error, .creationFailed, .contextExhausted, .cancelling,
              .cancellingTool, .cancellingSubAgents, .terminal, .handedOff,
              .other, .unknown:
             return false

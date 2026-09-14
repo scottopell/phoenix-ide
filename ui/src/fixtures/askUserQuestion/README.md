@@ -1,26 +1,25 @@
 # AskUserQuestion interaction fixtures
 
-These scenarios render the real `QuestionPanel`, intercept only its response
-and dismissal API methods, and display submitted arguments in a fixture
-transcript. They require no model, database, or running Phoenix backend.
+The scenarios render the real `QuestionPanel`, intercept response/dismissal API
+methods, and display submitted arguments. The product-layout story also renders
+the actual ProductConversationPage with its deterministic API fixture. No model,
+database, or running Phoenix backend is required.
 
-Run `LADLE_PORT=61137 ./dev.py qa ask-user-question` from the repository root
-to capture all six scenarios at desktop and mobile sizes. Output is under
-`ui/qa-artifacts/ask-user-question/`.
+Run `LADLE_PORT=61137 ./dev.py qa ask-user-question` from the repository root.
+Set `PLAYWRIGHT_BROWSER=webkit` to run the same journey in WebKit. Nine scenarios
+run at eight viewport sizes, including the 839/840 column boundary and 320 px
+usable height. Output defaults to `ui/qa-artifacts/ask-user-question/`.
 
-For interaction, run `pnpm ladle` from `ui/` and open the Ask user question
-stories. The scenarios cover ordinary choices, long descriptions with mixed
-preview availability, three-question navigation, multi-select, failed response,
-and read-only presentation. Submission replaces the panel with captured answer
-arguments; reload the story to reset it. The failure fixture deliberately fails
-every submission so retained state can be inspected.
+The capture command asserts native keyboard behavior, retained custom drafts,
+collapsed notes, selected previews, stationary choices, 44 px navigation targets,
+long-preview disclosure, expanded footer placement, modal isolation, and viewport
+bounds before taking screenshots. For manual interaction, run `pnpm ladle` in
+`ui/` and open the Ask user question stories. Reload resets each scenario.
 
-The September 13, 2026 bug hunt found custom multi-select answer loss, stale
-previews, offscreen keyboard focus, missing ordinary-question notes, unnamed
-choice controls, and inefficient long-option layout. Reproduction steps and
-acceptance criteria are tracked in task 10005. Local screenshot/video evidence
-is in `ui/dogfood-output/report.md` in the bug-hunt worktree.
+The proven-rejection fixture fails each submission without mutation, allowing
+continued editing. Unknown outcomes, request replacement, and late callbacks are
+covered by QuestionPanel tests; database/runtime tests cover actual consumption.
 
-These fixtures validate the component-to-API boundary. They do not prove runtime
-acceptance, SSE/reconnect behavior, full conversation-shell layout, or mobile
-software-keyboard behavior.
+The initial bug hunt and all corrections are summarized in
+`docs/proposals/ask-user-question-validation.md`. Fixture checks do not establish
+physical software-keyboard or screen-reader usability.

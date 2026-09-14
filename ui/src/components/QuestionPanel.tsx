@@ -1,1055 +1,331 @@
-/**
- * QuestionPanel Component
- *
- * Renders when the conversation is in `awaiting_user_response` state.
- * Step-by-step wizard showing one question at a time with full keyboard
- * navigation (arrow keys, space, enter, tab, escape).
- *
- * Submit calls api.respondToQuestion; Dismiss calls api.dismissQuestion.
- */
-
-import { useState, useCallback, useEffect, useRef } from 'react';
-import { api } from '../api';
-import type { UserQuestion } from '../api';
-import {
-  ArrowLeft,
-  ArrowRight,
-  Check,
-  ChevronDown,
-  ChevronRight,
-} from 'lucide-react';
+import { useState, useEffect, useLayoutEffect, useRef, useId, type KeyboardEvent, type CSSProperties } from 'react';
 import ReactMarkdown from 'react-markdown';
-import { ConfirmDialog } from './ConfirmDialog';
-import { useRegisterFocusScope } from '../hooks/useFocusScope';
+import { api, QuestionMutationError, type UserQuestion, type ConversationState } from '../api';
+import { useRegisterFocusScope, useFocusScope } from '../hooks/useFocusScope';
 import { formatShortcut } from '../utils';
+import { createQuestionDraft, choose, selected, isAnswered, answerPayload, type QuestionDraft } from './questionDraft';
 import './QuestionPanel.css';
 
 export interface QuestionPanelProps {
   questions: UserQuestion[];
   conversationId: string;
+  toolUseId: string;
   showToast: (message: string, duration?: number) => void;
-  /** Called after a successful respond/dismiss POST. The parent uses this to
-   *  optimistically advance the local phase out of awaiting_user_response so
-   *  the wizard dismisses immediately, instead of waiting for the SSE state
-   *  echo (which can lag or be missed entirely on a flaky connection). The
-   *  authoritative server-side phase change arrives via sse_state_change and
-   *  reconciles. Mirrors handleSend in ConversationPage.tsx. */
   onAnswered: () => void;
   onDismissed: () => void;
+  onResolved: (state: ConversationState) => void;
   readOnly?: boolean;
 }
+type Operation = { kind: 'answer'; payload: ReturnType<typeof answerPayload> } | { kind: 'dismiss' };
+type Submission = { kind: 'editing' } | { kind: 'sending'; operation: Operation }
+  | { kind: 'uncertain'; operation: Operation; checked: boolean; message: string };
 
-const OTHER_SENTINEL = '__other__';
-
-function hasPreviewOptions(q: UserQuestion): boolean {
-  return !q.multiSelect && q.options.some((o) => o.preview);
+export function QuestionPanel(props: QuestionPanelProps) {
+  if (props.readOnly) return <section className="question-panel question-panel--readonly" aria-label="Questions (read only)">
+    {props.questions.map(question => <section key={question.question}><h3>{question.header}</h3>
+      <ReactMarkdown>{question.question}</ReactMarkdown><ul>{question.options.map(option => <li key={option.label}>
+        <strong>{option.label}</strong>{option.description && <p>{option.description}</p>}{option.preview && !question.multiSelect && <pre>{option.preview}</pre>}
+      </li>)}</ul></section>)}
+  </section>;
+  return <ActiveQuestionPanel key={`${props.conversationId}:${props.toolUseId}`} {...props} />;
 }
 
-/** Total number of focusable options for a question (predefined + Other) */
-function optionCount(q: UserQuestion): number {
-  return q.options.length + 1; // +1 for "Other"
-}
-
-export function QuestionPanel({
-  questions,
-  conversationId,
-  showToast,
-  onAnswered,
-  onDismissed,
-  readOnly = false,
-}: QuestionPanelProps) {
+function ActiveQuestionPanel({ questions, conversationId, toolUseId, showToast, onAnswered, onDismissed, onResolved }: QuestionPanelProps) {
   useRegisterFocusScope('question-panel');
-
-  // --- Wizard step state ---
-  const [currentStep, setCurrentStep] = useState(0);
-  const [focusedIndex, setFocusedIndex] = useState(0);
-  const [enterPressedOnLast, setEnterPressedOnLast] = useState(false);
-
-  // --- Existing answer state ---
-  const [answers, setAnswers] = useState<Record<string, string>>(() => {
-    if (readOnly) return {};
-    const initial: Record<string, string> = {};
-    for (const q of questions) {
-      if (!q.multiSelect && hasPreviewOptions(q) && q.options.length > 0) {
-        initial[q.question] = q.options[0]!.label;
-      }
-    }
-    return initial;
-  });
-  const [otherTexts, setOtherTexts] = useState<Record<string, string>>({});
-  const [annotations, setAnnotations] = useState<
-    Record<string, { notes?: string; preview?: string }>
-  >({});
-  const [submitting, setSubmitting] = useState(false);
-  const [focusedPreviews, setFocusedPreviews] = useState<
-    Record<string, string>
-  >({});
-  const [expandedNotes, setExpandedNotes] = useState<Record<string, boolean>>(
-    {}
-  );
-  const [feedback, setFeedback] = useState<{
-    message: string;
-    isError: boolean;
-  } | null>(null);
-  const [showConfirmDismiss, setShowConfirmDismiss] = useState(false);
-  const [multiSelections, setMultiSelections] = useState<
-    Record<string, Set<string>>
-  >({});
-
-  const otherInputRef = useRef<HTMLTextAreaElement>(null);
-
-  const currentQuestion = questions[currentStep];
-  const isLastStep = currentStep === questions.length - 1;
-  const isFirstStep = currentStep === 0;
-  const totalSteps = questions.length;
-
-  // --- Answer callbacks ---
-  const setAnswer = useCallback(
-    (questionText: string, value: string) => {
-      setAnswers((prev) => ({ ...prev, [questionText]: value }));
-      setFeedback(null);
-      setEnterPressedOnLast(false);
-    },
-    []
-  );
-
-  const setOtherText = useCallback((questionText: string, value: string) => {
-    setOtherTexts((prev) => ({ ...prev, [questionText]: value }));
-    setEnterPressedOnLast(false);
-  }, []);
-
-  const toggleMultiSelect = useCallback(
-    (questionText: string, label: string) => {
-      setMultiSelections((prev) => {
-        const current = new Set(prev[questionText] ?? []);
-        if (current.has(label)) {
-          current.delete(label);
-        } else {
-          current.add(label);
-        }
-        return { ...prev, [questionText]: current };
-      });
-      setFeedback(null);
-      setEnterPressedOnLast(false);
-    },
-    []
-  );
-
-  const toggleNotes = useCallback((questionText: string) => {
-    setExpandedNotes((prev) => ({
-      ...prev,
-      [questionText]: !prev[questionText],
-    }));
-  }, []);
-
-  const setNotes = useCallback((questionText: string, notes: string) => {
-    setAnnotations((prev) => {
-      const next = { ...prev[questionText] };
-      if (notes) {
-        next.notes = notes;
-      } else {
-        delete next.notes;
-      }
-      return { ...prev, [questionText]: next };
-    });
-  }, []);
-
-  // --- allAnswered check ---
-  const allAnswered = questions.every((q) => {
-    if (q.multiSelect) {
-      const sel = multiSelections[q.question];
-      if (!sel || sel.size === 0) {
-        return (
-          answers[q.question] === OTHER_SENTINEL &&
-          (otherTexts[q.question] ?? '').trim().length > 0
-        );
-      }
-      if (sel.has(OTHER_SENTINEL)) {
-        return (otherTexts[q.question] ?? '').trim().length > 0;
-      }
-      return true;
-    }
-    const answer = answers[q.question];
-    if (!answer) return false;
-    if (answer === OTHER_SENTINEL) {
-      return (otherTexts[q.question] ?? '').trim().length > 0;
-    }
-    return true;
-  });
-
-  // --- Build answer map & annotations ---
-  const buildAnswerMap = useCallback((): Record<string, string> => {
-    const result: Record<string, string> = {};
-    for (const q of questions) {
-      if (q.multiSelect) {
-        const sel = multiSelections[q.question] ?? new Set();
-        const labels = Array.from(sel).filter((l) => l !== OTHER_SENTINEL);
-        if (sel.has(OTHER_SENTINEL) && (otherTexts[q.question] ?? '').trim()) {
-          labels.push(otherTexts[q.question]!.trim());
-        }
-        result[q.question] = labels.join(', ');
-      } else {
-        const answer = answers[q.question];
-        if (answer === OTHER_SENTINEL) {
-          result[q.question] = (otherTexts[q.question] ?? '').trim();
-        } else {
-          result[q.question] = answer ?? '';
-        }
-      }
-    }
-    return result;
-  }, [questions, answers, otherTexts, multiSelections]);
-
-  const buildAnnotations = useCallback(():
-    | Record<string, { notes?: string; preview?: string }>
-    | undefined => {
-    const result: Record<string, { notes?: string; preview?: string }> = {};
-    let hasAny = false;
-
-    for (const q of questions) {
-      const notes = annotations[q.question]?.notes;
-      let preview: string | undefined;
-
-      if (!q.multiSelect) {
-        const selectedLabel = answers[q.question];
-        if (selectedLabel && selectedLabel !== OTHER_SENTINEL) {
-          const opt = q.options.find((o) => o.label === selectedLabel);
-          if (opt?.preview) {
-            preview = opt.preview;
-          }
-        }
-      }
-
-      if (notes || preview) {
-        result[q.question] = {
-          ...(notes ? { notes } : {}),
-          ...(preview ? { preview } : {}),
-        };
-        hasAny = true;
-      }
-    }
-
-    return hasAny ? result : undefined;
-  }, [questions, answers, annotations]);
-
-  // --- Submit / Dismiss ---
-  const handleSubmit = useCallback(async () => {
-    if (readOnly || !allAnswered || submitting) return;
-    setSubmitting(true);
-    setFeedback(null);
-    try {
-      await api.respondToQuestion(
-        conversationId,
-        buildAnswerMap(),
-        buildAnnotations()
-      );
-      onAnswered();
-      showToast('Response sent', 3000);
-    } catch (err) {
-      const msg =
-        err instanceof Error ? err.message : 'Failed to submit response';
-      setFeedback({ message: msg, isError: true });
-    } finally {
-      setSubmitting(false);
-    }
-  }, [
-    readOnly,
-    allAnswered,
-    submitting,
-    conversationId,
-    buildAnswerMap,
-    buildAnnotations,
-    onAnswered,
-    showToast,
-  ]);
-
-  const handleDismissClick = useCallback(() => {
-    if (readOnly || submitting) return;
-    setShowConfirmDismiss(true);
-  }, [readOnly, submitting]);
-
-  const handleConfirmDismiss = useCallback(async () => {
-    setShowConfirmDismiss(false);
-    if (readOnly || submitting) return;
-    setSubmitting(true);
-    setFeedback(null);
-    try {
-      await api.dismissQuestion(conversationId);
-      onDismissed();
-      showToast('Question dismissed. Type a message to continue.', 3000);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Failed to dismiss';
-      setFeedback({ message: msg, isError: true });
-    } finally {
-      setSubmitting(false);
-    }
-  }, [readOnly, submitting, conversationId, onDismissed, showToast]);
-
-  // --- Navigation ---
-  const goToStep = useCallback(
-    (step: number) => {
-      if (step < 0 || step >= totalSteps) return;
-      const targetQ = questions[step];
-      if (!targetQ) return;
-      // Determine initial focus: previously selected option, or first option
-      let initialFocus = 0;
-      const ans = answers[targetQ.question];
-      if (ans) {
-        if (ans === OTHER_SENTINEL) {
-          initialFocus = targetQ.options.length; // "Other" is last
-        } else {
-          const idx = targetQ.options.findIndex((o) => o.label === ans);
-          if (idx >= 0) initialFocus = idx;
-        }
-      } else if (targetQ.multiSelect) {
-        const sel = multiSelections[targetQ.question];
-        if (sel && sel.size > 0) {
-          // Focus the first selected option
-          const firstSelected = targetQ.options.findIndex((o) =>
-            sel.has(o.label)
-          );
-          if (firstSelected >= 0) initialFocus = firstSelected;
-        }
-      }
-      setCurrentStep(step);
-      setFocusedIndex(initialFocus);
-      setEnterPressedOnLast(false);
-    },
-    [totalSteps, questions, answers, multiSelections]
-  );
-
-  const goNext = useCallback(() => {
-    if (!isLastStep) {
-      goToStep(currentStep + 1);
-    }
-  }, [isLastStep, currentStep, goToStep]);
-
-  const goBack = useCallback(() => {
-    if (!isFirstStep) {
-      goToStep(currentStep - 1);
-    }
-  }, [isFirstStep, currentStep, goToStep]);
-
-  const panelRef = useRef<HTMLDivElement>(null);
-
-  // --- Focus management: auto-focus on mount and step change (REQ-KB-004) ---
+  const { activeScope } = useFocusScope();
+  const id = useId();
+  const root = useRef<HTMLElement>(null);
+  const body = useRef<HTMLDivElement>(null);
+  const previewRef = useRef<HTMLElement>(null);
+  const otherChoiceRef = useRef<HTMLInputElement>(null);
+  const previewTextRef = useRef<HTMLPreElement>(null);
+  const [previewOverflow, setPreviewOverflow] = useState(false);
+  const otherRef = useRef<HTMLTextAreaElement>(null);
+  const notesRef = useRef<HTMLTextAreaElement>(null);
+  const notesButton = useRef<HTMLButtonElement>(null);
+  const dismissButton = useRef<HTMLButtonElement>(null);
+  const mounted = useRef(true);
+  const inFlight = useRef(false);
+  const focusIntent = useRef<'notes' | 'other' | null>(null);
+  const uncertain = useRef(false);
+  const [drafts, setDrafts] = useState(() => questions.map(createQuestionDraft));
+  const [step, setStep] = useState(0);
+  const [submission, setSubmission] = useState<Submission>({ kind: 'editing' });
+  const [error, setError] = useState('');
+  const [confirmDismiss, setConfirmDismiss] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+  const [bounds, setBounds] = useState({ width: 1000, height: 700, previewFits: true });
+  const question = questions[step];
+  const draft = drafts[step];
+  const locked = submission.kind !== 'editing';
+  const allAnswered = questions.every((q, i) => isAnswered(q, drafts[i]!));
+  const last = step === questions.length - 1;
+  const update = (change: (value: QuestionDraft) => QuestionDraft) => {
+    if (locked) return;
+    setDrafts(values => values.map((value, i) => i === step ? change(value) : value));
+    setError('');
+  };
+  const focusChoice = () => {
+    const target = root.current?.querySelector<HTMLInputElement>('input:checked') ?? root.current?.querySelector<HTMLInputElement>('input[type="radio"], input[type="checkbox"]');
+    target?.focus();
+    target?.scrollIntoView?.({ block: 'nearest' });
+  };
   useEffect(() => {
-    if (!currentQuestion) return;
-    // Focus the panel root so it receives keyboard events
-    requestAnimationFrame(() => {
-      panelRef.current?.focus();
-    });
-  }, [currentStep, currentQuestion]);
-
-  // --- Update focused preview when focusedIndex changes ---
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
+  useLayoutEffect(focusChoice, [step]);
+  useLayoutEffect(() => {
+    if (focusIntent.current === 'notes') notesRef.current?.focus();
+    if (focusIntent.current === 'other') otherRef.current?.focus();
+    focusIntent.current = null;
+  });
   useEffect(() => {
-    if (!currentQuestion) return;
-    const isPreviewMode = hasPreviewOptions(currentQuestion);
-    if (!isPreviewMode) return;
-
-    if (focusedIndex < currentQuestion.options.length) {
-      const opt = currentQuestion.options[focusedIndex];
-      if (opt?.preview) {
-        setFocusedPreviews((prev) => ({
-          ...prev,
-          [currentQuestion.question]: opt.preview!,
-        }));
+    const panel = root.current;
+    const container = panel?.closest('.product-conversation-page') ?? panel?.closest('.conversation-column') ?? panel?.parentElement;
+    if (!panel || !container) return;
+    const measure = () => {
+      const viewport = window.visualViewport;
+      const rect = container.getBoundingClientRect();
+      const viewportTop = viewport?.offsetTop ?? 0;
+      let chrome = 0;
+      let child: Element = panel;
+      while (child !== container && child.parentElement) {
+        for (const sibling of child.parentElement.children) {
+          if (sibling === child || sibling.matches('.view, .question-fixture-transcript')) continue;
+          const style = getComputedStyle(sibling);
+          if (style.position === 'absolute' || style.position === 'fixed') continue;
+          chrome += sibling.getBoundingClientRect().height;
+        }
+        child = child.parentElement;
       }
-    }
-  }, [focusedIndex, currentStep, currentQuestion]);
+      const height = Math.max(120, Math.min(rect.bottom, viewportTop + (viewport?.height ?? window.innerHeight)) - Math.max(rect.top, viewportTop) - chrome);
+      setBounds({ width: panel.clientWidth, height,
+        previewFits: (previewRef.current?.offsetHeight ?? 0) < (body.current?.clientHeight ?? height) - 16 });
+    };
+    const observer = new ResizeObserver(measure);
+    const observeChrome = () => {
+      let child: Element = panel;
+      while (child !== container && child.parentElement) {
+        for (const sibling of child.parentElement.children) {
+          if (sibling !== child && !sibling.matches('.view, .question-fixture-transcript')) observer.observe(sibling);
+        }
+        child = child.parentElement;
+      }
+    };
+    observer.observe(container); observer.observe(panel); observeChrome();
+    const mutations = new MutationObserver(() => { observeChrome(); measure(); });
+    mutations.observe(container, { childList: true, subtree: true });
+    if (previewRef.current) observer.observe(previewRef.current);
+    window.visualViewport?.addEventListener('resize', measure);
+    window.visualViewport?.addEventListener('scroll', measure);
+    measure();
+    return () => { observer.disconnect(); mutations.disconnect(); window.visualViewport?.removeEventListener('resize', measure); window.visualViewport?.removeEventListener('scroll', measure); };
+  }, [step]);
 
-  // --- Select/toggle the focused option ---
-  const selectFocusedOption = useCallback(() => {
-    if (!currentQuestion) return;
-    const isOther = focusedIndex >= currentQuestion.options.length;
+  useLayoutEffect(() => {
+    const active = document.activeElement;
+    if (active instanceof HTMLElement && root.current?.contains(active)) active.scrollIntoView?.({ block: 'nearest' });
+  }, [bounds.width, bounds.height]);
 
-    if (isOther) {
-      if (currentQuestion.multiSelect) {
-        toggleMultiSelect(currentQuestion.question, OTHER_SENTINEL);
-        // Focus the text input
-        setTimeout(() => otherInputRef.current?.focus(), 0);
+  const reconcile = async (operation: Operation) => {
+    if (!mounted.current || inFlight.current) return;
+    inFlight.current = true;
+    try {
+      const result = await api.getConversation(conversationId);
+      if (!mounted.current) return;
+      if (!result.conversation.state || (result.conversation.state.type === 'awaiting_user_response' && (typeof result.conversation.state.tool_use_id !== 'string' || !result.conversation.state.tool_use_id))) throw new Error('Question status unavailable');
+      if (result.conversation.state.type !== 'awaiting_user_response' || result.conversation.state.tool_use_id !== toolUseId) {
+        showToast('This question is no longer awaiting an answer');
+        onResolved(result.conversation.state);
+      } else setSubmission({ kind: 'uncertain', operation, checked: true,
+        message: operation.kind === 'answer' ? 'Your original answer may still be processing. Retry sends the same answer.' : 'The dismissal may still be processing. Retry dismisses the same question.' });
+    } catch {
+      if (mounted.current) setSubmission({ kind: 'uncertain', operation, checked: false, message: 'Could not check question status. Your original response remains unchanged.' });
+    } finally { inFlight.current = false; }
+  };
+  const perform = async (operation: Operation) => {
+    if (inFlight.current || !mounted.current) return;
+    inFlight.current = true;
+    setSubmission({ kind: 'sending', operation }); setError('');
+    try {
+      if (operation.kind === 'answer') await api.respondToQuestion(conversationId, toolUseId, operation.payload.answers, operation.payload.annotations);
+      else await api.dismissQuestion(conversationId, toolUseId);
+      if (!mounted.current) return;
+      if (operation.kind === 'answer') { onAnswered(); showToast('Answers sent'); }
+      else { onDismissed(); showToast('Questions dismissed. Send a message to continue.'); }
+    } catch (err) {
+      if (!mounted.current) return;
+      if (err instanceof QuestionMutationError && err.code === 'question_request_invalid' && !uncertain.current) {
+        setSubmission({ kind: 'editing' }); setError(err.message);
       } else {
-        setAnswer(currentQuestion.question, OTHER_SENTINEL);
-        setTimeout(() => otherInputRef.current?.focus(), 0);
+        uncertain.current = true;
+        setSubmission({ kind: 'uncertain', operation, checked: false, message: 'Could not confirm the response. Checking status…' });
+        inFlight.current = false;
+        await reconcile(operation);
       }
-    } else {
-      const opt = currentQuestion.options[focusedIndex];
-      if (!opt) return;
-      if (currentQuestion.multiSelect) {
-        toggleMultiSelect(currentQuestion.question, opt.label);
-      } else {
-        setAnswer(currentQuestion.question, opt.label);
-      }
+    } finally { inFlight.current = false; }
+  };
+  const send = () => {
+    if (locked) return;
+    if (!allAnswered) {
+      const missing = questions.findIndex((q, i) => !isAnswered(q, drafts[i]!));
+      setStep(missing); setError(`Answer ${questions[missing]!.header} before sending.`);
+      if (missing === step) focusChoice();
+      return;
     }
-  }, [currentQuestion, focusedIndex, toggleMultiSelect, setAnswer]);
-
-  // Per-question answered check (used by keyboard handler + breadcrumbs)
-  const isQuestionAnswered = useCallback(
-    (q: UserQuestion): boolean => {
-      if (q.multiSelect) {
-        const sel = multiSelections[q.question];
-        if (!sel || sel.size === 0) {
-          return (
-            answers[q.question] === OTHER_SENTINEL &&
-            (otherTexts[q.question] ?? '').trim().length > 0
-          );
-        }
-        if (sel.has(OTHER_SENTINEL)) {
-          return (otherTexts[q.question] ?? '').trim().length > 0;
-        }
-        return true;
+    void perform({ kind: 'answer', payload: answerPayload(questions, drafts) });
+  };
+  const openNotes = () => {
+    if (locked) return;
+    focusIntent.current = 'notes';
+    update(value => ({ ...value, notesOpen: true }));
+  };
+  const keyboard = (event: KeyboardEvent<HTMLElement>) => {
+    if (confirmDismiss || (activeScope !== null && activeScope !== 'question-panel')) return;
+    if (event.nativeEvent.isComposing) return;
+    const editor = event.target instanceof HTMLTextAreaElement || event.target instanceof HTMLInputElement && !['radio', 'checkbox'].includes(event.target.type);
+    if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+      event.preventDefault(); event.stopPropagation(); send(); return;
+    }
+    if (event.key === 'Escape') {
+      event.preventDefault(); event.stopPropagation();
+      if (editor) {
+        if (event.target === notesRef.current) notesButton.current?.focus(); else otherChoiceRef.current?.focus();
+      } else if (!locked) {
+        if (draft?.notesOpen && event.target === notesButton.current) update(value => ({ ...value, notesOpen: false }));
+        else if (draft?.previewOpen) update(value => ({ ...value, previewOpen: false }));
+        else setConfirmDismiss(true);
       }
-      const answer = answers[q.question];
-      if (!answer) return false;
-      if (answer === OTHER_SENTINEL) {
-        return (otherTexts[q.question] ?? '').trim().length > 0;
-      }
-      return true;
-    },
-    [answers, otherTexts, multiSelections]
-  );
+      return;
+    }
+    if (event.key === 'n' && !editor && !event.ctrlKey && !event.metaKey && !event.altKey) { event.preventDefault(); event.stopPropagation(); openNotes(); return; }
+    if (['Tab', 'ArrowDown', 'ArrowUp', 'ArrowLeft', 'ArrowRight', ' ', 'Enter'].includes(event.key)) event.stopPropagation();
+  };
+  useEffect(() => {
+    const text = previewTextRef.current;
+    if (!text) { setPreviewOverflow(false); return; }
+    const measure = () => setPreviewOverflow(text.scrollHeight > 8 * 21 + 1);
+    const observer = new ResizeObserver(measure);
+    observer.observe(text); measure();
+    return () => observer.disconnect();
+  }, [step, draft]);
+  if (!question || !draft) return null;
+  const otherIndex = question.options.length;
+  const otherSelected = selected(draft, otherIndex);
+  const previewMode = !question.multiSelect && question.options.some(option => option.preview);
+  const choice = draft.selection.kind === 'single' && draft.selection.value !== null ? question.options[draft.selection.value] : undefined;
+  const preview = choice?.preview;
 
-  // --- Keyboard handler (component-level, not document) ---
-  const handleKeyDown = useCallback(
-    (e: React.KeyboardEvent<HTMLDivElement>) => {
-      if (readOnly) return;
-      if (!currentQuestion) return;
+  const hasDraft = drafts.some(value => value.other || value.notes || (value.selection.kind === 'single' ? value.selection.value !== null : value.selection.values.length > 0));
+  const narrow = bounds.width < 840;
+  const short = bounds.height < 360;
+  const expand = expanded || bounds.width < 480;
+  const onOtherEntry = () => {
+    if (otherRef.current) otherRef.current.focus();
+    else focusIntent.current = 'other';
+  };
+  const idFor = (suffix: string) => `${id}-${step}-${suffix}`;
 
-      // If confirm dialog is open, don't handle
-      if (showConfirmDismiss) return;
+  return <section ref={root} className={`question-panel${expand ? ' question-panel--expanded' : ''}${short ? ' question-panel--short' : ''}`}
+    style={{ '--question-available-height': `${bounds.height}px` } as CSSProperties}
+    aria-label="Answer agent questions" onKeyDown={keyboard} onFocus={event => {
+      if (event.target instanceof HTMLElement) event.target.scrollIntoView?.({ block: 'nearest' });
+    }}>
+    <header className="question-context"><strong>{questions.length > 1 ? `Question ${step + 1} of ${questions.length} · ` : ''}{question.header}</strong>
+      {bounds.width >= 480 && <button type="button" disabled={locked} onClick={() => setExpanded(value => !value)}>{expanded ? 'Restore conversation' : 'Expand questions'}</button>}
+      {questions.length > 1 && !short && <nav aria-label="Questions">{questions.map((q, i) => <button type="button" key={q.question} disabled={locked}
+        aria-current={step === i ? 'step' : undefined} aria-label={`${q.header}, ${isAnswered(q, drafts[i]!) ? 'answered' : 'unanswered'}`} onClick={() => setStep(i)}>
+        {isAnswered(q, drafts[i]!) ? '✓ ' : ''}{q.header}</button>)}</nav>}
+    </header>
+    <div className="question-scroll" ref={body}>
+      <div className="question-content">
+        <div className="question-text" id={idFor('question')}><ReactMarkdown>{question.question}</ReactMarkdown></div>
+        <p className="question-instruction">{question.multiSelect ? 'Choose one or more.' : 'Choose one.'} Answers are sent only when you send the completed form.</p>
+        <div className={previewMode ? 'question-preview-layout' : 'question-standard-layout'}>
+          <fieldset disabled={locked} aria-labelledby={idFor('question')}><legend className="sr-only">{question.header}</legend>
+            {question.options.map((option, i) => <div className="question-choice-block" key={option.label}>
+              <label className={`question-option${selected(draft, i) ? ' selected' : ''}`}>
+                <input type={question.multiSelect ? 'checkbox' : 'radio'} name={idFor('choice')} checked={selected(draft, i)}
+                  aria-labelledby={idFor(`label-${i}`)} aria-describedby={option.description ? idFor(`description-${i}`) : undefined}
+                  onChange={event => update(value => choose(value, i, event.target.checked))} />
+                <span className="question-option-content"><span id={idFor(`label-${i}`)} className="question-option-label">{option.label}</span>
+                  {option.description && <span id={idFor(`description-${i}`)} className="question-option-description">{option.description}</span>}</span>
+              </label>
 
-      const isInInput =
-        e.target instanceof HTMLInputElement ||
-        e.target instanceof HTMLTextAreaElement;
-
-      // Always handle Ctrl/Cmd+Enter for submit, even in text inputs
-      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
-        e.preventDefault();
-        e.stopPropagation();
-        handleSubmit();
-        return;
-      }
-
-      // Always handle Escape, with context-dependent behavior
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        e.stopPropagation();
-        if (isInInput) {
-          // Blur the notes textarea or other input
-          (e.target as HTMLElement).blur();
-          // Re-focus the panel so keyboard nav continues
-          panelRef.current?.focus();
-        } else {
-          setShowConfirmDismiss(true);
-        }
-        return;
-      }
-
-      // If typing in a text input (Other field), handle Enter for single-select.
-      // Scope to HTMLInputElement only — textareas (notes, preview-Other) need
-      // Enter to insert newlines, not navigate.
-      if (isInInput) {
-        if (e.target instanceof HTMLInputElement && e.key === 'Enter' && !e.shiftKey && !currentQuestion.multiSelect) {
-          e.preventDefault();
-          e.stopPropagation();
-          if (!isLastStep) {
-            setTimeout(() => goNext(), 200);
-          } else {
-            // Same double-enter-to-submit logic as regular Enter on last step
-            const focusedIsOther =
-              focusedIndex >= currentQuestion.options.length;
-            const thisWillBeAnswered = focusedIsOther
-              ? (otherTexts[currentQuestion.question] ?? '').trim().length > 0
-              : true;
-            const othersAnswered = questions.every((q, i) =>
-              i === currentStep ? true : isQuestionAnswered(q)
-            );
-            const willAllBeAnswered = thisWillBeAnswered && othersAnswered;
-
-            if (willAllBeAnswered) {
-              if (enterPressedOnLast) {
-                handleSubmit();
-              } else {
-                setEnterPressedOnLast(true);
-                showToast(
-                  'Press Enter again to submit, or Ctrl+Enter',
-                  3000
-                );
+            </div>)}
+            <label className={`question-option${otherSelected ? ' selected' : ''}`} onClick={event => {
+              if (event.detail > 0) {
+                if (question.multiSelect && otherSelected) otherChoiceRef.current?.focus();
+                else onOtherEntry();
               }
-            }
-          }
-        }
-        return;
-      }
-
-      const count = optionCount(currentQuestion);
-      const isMulti = currentQuestion.multiSelect;
-
-      switch (e.key) {
-        case 'ArrowDown': {
-          e.preventDefault();
-          e.stopPropagation();
-          setFocusedIndex((prev) => Math.min(prev + 1, count - 1));
-          break;
-        }
-        case 'ArrowUp': {
-          e.preventDefault();
-          e.stopPropagation();
-          setFocusedIndex((prev) => Math.max(prev - 1, 0));
-          break;
-        }
-        case ' ': {
-          // Space: select/toggle focused option. Never auto-advances.
-          e.preventDefault();
-          e.stopPropagation();
-          selectFocusedOption();
-          break;
-        }
-        case 'Enter': {
-          e.preventDefault();
-          e.stopPropagation();
-
-          if (isMulti) {
-            // Multi-select: Enter toggles, no auto-advance
-            selectFocusedOption();
-          } else {
-            // Single-select: Enter selects, then conditionally advances
-            selectFocusedOption();
-
-            if (isLastStep) {
-              // Compute whether all questions will be answered after
-              // this selection (current state doesn't reflect the
-              // selection yet since setState is async).
-              const focusedIsOther =
-                focusedIndex >= currentQuestion.options.length;
-              const thisWillBeAnswered = focusedIsOther
-                ? (otherTexts[currentQuestion.question] ?? '').trim().length > 0
-                : true;
-              const othersAnswered = questions.every((q, i) =>
-                i === currentStep ? true : isQuestionAnswered(q)
-              );
-              const willAllBeAnswered = thisWillBeAnswered && othersAnswered;
-
-              if (willAllBeAnswered) {
-                if (enterPressedOnLast) {
-                  // Second press on last step: submit
-                  handleSubmit();
-                } else {
-                  // First press on last step with all answered: toast
-                  setEnterPressedOnLast(true);
-                  showToast(
-                    'Press Enter again to submit, or Ctrl+Enter',
-                    3000
-                  );
-                }
-              }
-              // Last step but not all answered: just select, no submit attempt
-            } else {
-              // Not last step: auto-advance after 200ms delay
-              setTimeout(() => goNext(), 200);
-            }
-          }
-          break;
-        }
-        case 'Tab': {
-          e.preventDefault();
-          e.stopPropagation();
-          if (e.shiftKey) {
-            goBack();
-          } else {
-            goNext();
-          }
-          break;
-        }
-        case 'n': {
-          // Toggle notes panel (preview questions only, not when Other is selected)
-          if (
-            hasPreviewOptions(currentQuestion) &&
-            answers[currentQuestion.question] !== OTHER_SENTINEL
-          ) {
-            e.preventDefault();
-            e.stopPropagation();
-            toggleNotes(currentQuestion.question);
-            // If opening notes, focus the textarea after render
-            if (!expandedNotes[currentQuestion.question]) {
-              setTimeout(() => {
-                const textarea = panelRef.current?.querySelector(
-                  '.question-notes textarea'
-                ) as HTMLTextAreaElement | null;
-                textarea?.focus();
-              }, 0);
-            }
-          }
-          break;
-        }
-        default:
-          // Don't consume keys we don't handle -- let them bubble
-          return;
-      }
-    },
-    [
-      currentQuestion,
-      currentStep,
-      focusedIndex,
-      showConfirmDismiss,
-      isLastStep,
-      enterPressedOnLast,
-      expandedNotes,
-      otherTexts,
-      answers,
-      questions,
-      handleSubmit,
-      selectFocusedOption,
-      isQuestionAnswered,
-      goNext,
-      goBack,
-      readOnly,
-      showToast,
-      toggleNotes,
-    ]
-  );
-
-  if (!currentQuestion) return null;
-
-  return (
-    <div
-      className="question-panel"
-      ref={panelRef}
-      tabIndex={0}
-      onKeyDown={handleKeyDown}
-    >
-      {/* Breadcrumb navigation: each question's header as a clickable tab */}
-      {totalSteps > 1 && (
-        <div className="question-breadcrumbs">
-          <span className="question-step-counter" aria-label="Question progress">
-            {currentStep + 1} of {totalSteps}
-          </span>
-          {questions.map((q, i) => {
-            const isCurrent = i === currentStep;
-            const answered = isQuestionAnswered(q);
-            return (
-              <span key={q.question} className="question-breadcrumb-item">
-                {i > 0 && (
-                  <ChevronRight
-                    size={12}
-                    className="question-breadcrumb-separator"
-                  />
-                )}
-                <button
-                  className={`question-breadcrumb${isCurrent ? ' current' : ''}${answered && !isCurrent ? ' answered' : ''}${!answered && !isCurrent ? ' unanswered' : ''}`}
-                  onClick={() => goToStep(i)}
-                  disabled={submitting}
-                  title={isCurrent ? q.question : `Go to question ${i + 1}: ${q.header}`}
-                >
-                  {answered && !isCurrent && (
-                    <Check size={12} className="question-breadcrumb-check" />
-                  )}
-                  {q.header}
-                </button>
-              </span>
-            );
-          })}
+            }}>
+              <input type={question.multiSelect ? 'checkbox' : 'radio'} ref={otherChoiceRef} name={idFor('choice')} checked={otherSelected}
+                onChange={event => update(value => choose(value, otherIndex, event.target.checked))} />
+              <span className="question-option-label">Other</span>
+            </label>
+            {otherSelected ? <label className="question-editor">Custom answer<textarea ref={otherRef} value={draft.other} rows={3}
+              aria-invalid={!draft.other.trim()} aria-describedby={!draft.other.trim() ? idFor('other-help') : undefined}
+              onChange={event => update(value => ({ ...choose(value, otherIndex, true), other: event.target.value }))} /></label> : draft.other && <p className="question-draft-note">
+                {question.multiSelect ? 'Custom answer not included.' : 'Saved custom draft — not included.'} <button type="button" onClick={() => { update(value => choose(value, otherIndex)); onOtherEntry(); }}>Edit custom answer</button></p>}
+            {otherSelected && !draft.other.trim() && <p id={idFor('other-help')}>Write a custom answer to include Other.</p>}
+            {narrow && previewMode && <button className="question-preview-link" type="button" disabled={!choice} onClick={() => {
+              previewRef.current?.querySelector<HTMLElement>('h3')?.focus(); previewRef.current?.scrollIntoView?.({ block: 'nearest' });
+            }}>Preview below</button>}
+          </fieldset>
+          {previewMode && <section ref={previewRef} className={`question-preview-pane${bounds.previewFits ? ' question-preview-pane--sticky' : ''}`} aria-label="Selected option preview">
+            <h3 tabIndex={-1}>Preview{choice ? ` — ${choice.label}` : otherSelected ? ' — Other' : ''}</h3>
+            {preview ? <><pre ref={previewTextRef} className={draft.previewOpen ? undefined : 'question-preview-text--collapsed'}>{preview}</pre>
+              {previewOverflow && <button type="button" disabled={locked} onClick={() => update(value => ({ ...value, previewOpen: !value.previewOpen }))} aria-expanded={draft.previewOpen}>{draft.previewOpen ? 'Show less' : 'Show full preview'}</button>}</>
+              : <p>{otherSelected ? 'Your custom answer will be sent.' : choice ? 'No preview for this option.' : 'Choose an option to view its preview.'}</p>}
+          </section>}
         </div>
-      )}
-
-      <div className="question-wizard-content">
-        <QuestionItem
-          key={currentQuestion.question}
-          question={currentQuestion}
-          answer={answers[currentQuestion.question]}
-          otherText={otherTexts[currentQuestion.question] ?? ''}
-          multiSelected={multiSelections[currentQuestion.question] ?? new Set()}
-          focusedPreview={focusedPreviews[currentQuestion.question]}
-          notesExpanded={expandedNotes[currentQuestion.question] ?? false}
-          notesText={annotations[currentQuestion.question]?.notes ?? ''}
-          focusedIndex={focusedIndex}
-          otherInputRef={otherInputRef}
-          readOnly={readOnly}
-          onSelect={readOnly ? () => {} : setAnswer}
-          onOtherText={readOnly ? () => {} : setOtherText}
-          onMultiToggle={readOnly ? () => {} : toggleMultiSelect}
-          onFocusPreview={(questionText, preview) =>
-            setFocusedPreviews((prev) => ({
-              ...prev,
-              [questionText]: preview,
-            }))
-          }
-          onToggleNotes={readOnly ? () => {} : toggleNotes}
-          onSetNotes={readOnly ? () => {} : setNotes}
-          onFocusIndex={setFocusedIndex}
-        />
-      </div>
-
-      <div className="question-actions">
-        {!readOnly && (
-          <button
-            className="question-btn question-btn--dismiss-small"
-            onClick={handleDismissClick}
-            disabled={submitting}
-            title="Dismiss questions without sending an answer"
-          >
-            Dismiss
-          </button>
-        )}
-
-        <ConfirmDialog
-          visible={showConfirmDismiss}
-          title="Dismiss structured questions?"
-          message="The question panel will close. No answer will be sent, and the agent will not continue until you type a message."
-          confirmText="Dismiss"
-          cancelText="Cancel"
-          danger
-          onConfirm={handleConfirmDismiss}
-          onCancel={() => setShowConfirmDismiss(false)}
-        />
-
-        <div className="question-actions-right">
-          {feedback && (
-            <span
-              className={`question-feedback${feedback.isError ? ' question-feedback--error' : ''}`}
-            >
-              {feedback.message}
-            </span>
-          )}
-          {totalSteps > 1 && (
-            <button
-              className="question-btn question-btn--nav"
-              onClick={goBack}
-              disabled={isFirstStep || submitting}
-              title={formatShortcut('Shift+Tab for previous')}
-            >
-              <ArrowLeft size={16} />
-              Back
-            </button>
-          )}
-          {totalSteps > 1 && readOnly ? (
-            <button
-              className="question-btn question-btn--next"
-              onClick={goNext}
-              disabled={isLastStep || submitting}
-              title={formatShortcut('Tab for next')}
-            >
-              Next
-              <ArrowRight size={16} />
-            </button>
-          ) : !readOnly && !isLastStep ? (
-            <button
-              className="question-btn question-btn--next"
-              onClick={goNext}
-              disabled={submitting}
-              title={formatShortcut('Tab for next')}
-            >
-              Next
-              <ArrowRight size={16} />
-            </button>
-          ) : !readOnly ? (
-            <button
-              className="question-btn question-btn--submit"
-              onClick={handleSubmit}
-              disabled={!allAnswered || submitting}
-              title={
-                !allAnswered
-                  ? 'Answer all questions before submitting'
-                  : formatShortcut('Ctrl+Enter to submit')
-              }
-            >
-              <Check size={16} />
-              {submitting ? 'Sending...' : 'Submit'}
-            </button>
-          ) : null}
+        <div className="question-notes"><button ref={notesButton} type="button" disabled={locked} aria-expanded={draft.notesOpen} aria-controls={idFor('notes')}
+          title={`Notes (${formatShortcut('n')})`} onClick={() => { if (draft.notesOpen) update(value => ({ ...value, notesOpen: false })); else openNotes(); }}>
+          {draft.notes ? 'Edit notes · included' : 'Add notes (optional)'}</button>
+          {draft.notesOpen && <label className="question-editor" id={idFor('notes')}>Notes for the agent<textarea ref={notesRef} disabled={locked} rows={3} value={draft.notes} onChange={event => update(value => ({ ...value, notes: event.target.value }))} /></label>}
         </div>
+        {hasDraft && <p className="question-draft-note">Unsent answers stay here while you answer. Refreshing or leaving this conversation may discard it.</p>}
+        {error && <p role="alert" className="question-feedback--error">{error}</p>}
+        <p className="question-status" role="status">{submission.kind === 'sending' ? (submission.operation.kind === 'answer' ? 'Sending…' : 'Dismissing…') : submission.kind === 'uncertain' ? submission.message : ''}</p>
       </div>
+      {short && actions()}
     </div>
-  );
+    {!short && actions()}
+    {confirmDismiss && <DismissDialog onCancel={() => { setConfirmDismiss(false); dismissButton.current?.focus(); }} onConfirm={() => { setConfirmDismiss(false); void perform({ kind: 'dismiss' }); }} />}
+  </section>;
+
+  function actions() {
+    return <footer className="question-actions">
+      <button ref={dismissButton} className="question-dismiss" type="button" disabled={locked} onClick={() => setConfirmDismiss(true)}>Use chat instead</button>
+      {submission.kind === 'uncertain' ? <div className="question-actions-right">
+        <button type="button" onClick={() => void reconcile(submission.operation)}>Check status again</button>
+        {submission.checked && <button type="button" className="question-primary" onClick={() => void perform(submission.operation)}>{submission.operation.kind === 'answer' ? 'Retry same answer' : 'Retry dismissal'}</button>}
+      </div> : <div className="question-actions-right">
+        {!last && !isAnswered(question!, draft!) && <span>Choose an answer to continue.</span>}
+        {last && !allAnswered && <span>Still needed: {questions.filter((q, i) => !isAnswered(q, drafts[i]!)).map(q => q.header).join(', ')}</span>}
+        {step > 0 && <button type="button" disabled={locked} onClick={() => setStep(value => value - 1)}>Back</button>}
+        {last ? <button type="button" className="question-primary" title={formatShortcut('Ctrl+Enter')} disabled={locked || !allAnswered} onClick={send}>{questions.length > 1 ? 'Send answers' : 'Send answer'}</button>
+          : <button type="button" className="question-primary" disabled={locked || !isAnswered(question!, draft!)} onClick={() => setStep(value => value + 1)}>Next</button>}
+      </div>}
+    </footer>;
+  }
 }
 
-// --- Individual Question ---
-
-interface QuestionItemProps {
-  question: UserQuestion;
-  answer: string | undefined;
-  otherText: string;
-  multiSelected: Set<string>;
-  focusedPreview: string | undefined;
-  notesExpanded: boolean;
-  notesText: string;
-  focusedIndex: number;
-  otherInputRef: React.RefObject<HTMLTextAreaElement | null>;
-  readOnly: boolean;
-  onSelect: (questionText: string, value: string) => void;
-  onOtherText: (questionText: string, value: string) => void;
-  onMultiToggle: (questionText: string, label: string) => void;
-  onFocusPreview: (questionText: string, preview: string) => void;
-  onToggleNotes: (questionText: string) => void;
-  onSetNotes: (questionText: string, notes: string) => void;
-  onFocusIndex: (index: number) => void;
-}
-
-function QuestionItem({
-  question: q,
-  answer,
-  otherText,
-  multiSelected,
-  focusedPreview,
-  notesExpanded,
-  notesText,
-  focusedIndex,
-  otherInputRef,
-  readOnly,
-  onSelect,
-  onOtherText,
-  onMultiToggle,
-  onFocusPreview,
-  onToggleNotes,
-  onSetNotes,
-  onFocusIndex,
-}: QuestionItemProps) {
-  const isPreviewMode = hasPreviewOptions(q);
-  const isMulti = q.multiSelect;
-
-  // Determine which preview to show: focused option's preview takes priority
-  const activePreview = (() => {
-    if (!isPreviewMode) return undefined;
-    // Show preview for the focused option (keyboard navigation)
-    if (focusedIndex < q.options.length) {
-      const focusedOpt = q.options[focusedIndex];
-      if (focusedOpt?.preview) return focusedOpt.preview;
-    }
-    // Fall back to hover-focused preview
-    if (focusedPreview) return focusedPreview;
-    // Fall back to selected option's preview
-    if (answer && answer !== OTHER_SENTINEL) {
-      const opt = q.options.find((o) => o.label === answer);
-      return opt?.preview;
-    }
-    // Default: first option with a preview
-    return q.options.find((o) => o.preview)?.preview;
-  })();
-
-  /** Render the "Other" element. In preview mode, it's a plain radio (no inline input). */
-  const renderOtherOption = () => {
-    const otherIndex = q.options.length;
-    const isOtherFocused = focusedIndex === otherIndex;
-    const otherSelected = isMulti
-      ? multiSelected.has(OTHER_SENTINEL)
-      : answer === OTHER_SENTINEL;
-
-    // In preview mode: "Other" is a plain radio option (text input lives in the preview pane)
-    if (isPreviewMode) {
-      return (
-        <div
-          key="__other__"
-          className={`question-option${otherSelected ? ' selected' : ''}${isOtherFocused ? ' focused' : ''}`}
-          onClick={() => onSelect(q.question, OTHER_SENTINEL)}
-          onMouseEnter={() => onFocusIndex(otherIndex)}
-          title="Select Other"
-        >
-          <input
-            type="radio"
-            name={q.question}
-            checked={otherSelected}
-            onChange={() => onSelect(q.question, OTHER_SENTINEL)}
-            tabIndex={-1}
-          />
-          <span className="question-option-label">Other</span>
-        </div>
-      );
-    }
-
-    // Non-preview mode: "Other" with inline text input
-    return (
-      <div
-        key="__other__"
-        className={`question-other${otherSelected ? ' selected' : ''}${isOtherFocused ? ' focused' : ''}`}
-        onClick={() => {
-          if (isMulti) {
-            onMultiToggle(q.question, OTHER_SENTINEL);
-          } else {
-            onSelect(q.question, OTHER_SENTINEL);
-          }
-          setTimeout(() => otherInputRef.current?.focus(), 0);
-        }}
-        onMouseEnter={() => onFocusIndex(otherIndex)}
-        title={isMulti ? 'Toggle Other answer' : 'Select Other and write an answer'}
-      >
-        <input
-          type={isMulti ? 'checkbox' : 'radio'}
-          name={q.question}
-          checked={otherSelected}
-          onChange={() => {
-            if (isMulti) {
-              onMultiToggle(q.question, OTHER_SENTINEL);
-            } else {
-              onSelect(q.question, OTHER_SENTINEL);
-            }
-          }}
-          onClick={(e) => {
-            e.stopPropagation();
-            setTimeout(() => otherInputRef.current?.focus(), 0);
-          }}
-          tabIndex={-1}
-          title={isMulti ? 'Toggle Other answer' : 'Select Other answer'}
-          aria-label={isMulti ? 'Toggle Other answer' : 'Select Other answer'}
-        />
-        <textarea
-          ref={otherInputRef as React.RefObject<HTMLTextAreaElement>}
-          className="question-other-input"
-          placeholder="Other..."
-          value={otherText}
-          onChange={(e) => onOtherText(q.question, e.target.value)}
-          onFocus={() => {
-            onFocusIndex(otherIndex);
-            if (isMulti) {
-              if (!multiSelected.has(OTHER_SENTINEL)) {
-                onMultiToggle(q.question, OTHER_SENTINEL);
-              }
-            } else {
-              onSelect(q.question, OTHER_SENTINEL);
-            }
-          }}
-          rows={1}
-          tabIndex={-1}
-          title="Write a custom answer"
-          aria-label="Write a custom answer"
-        />
-      </div>
-    );
-  };
-
-  const renderOptions = () => {
-    const optionElements = q.options.map((opt, index) => {
-      const isFocused = focusedIndex === index;
-
-      if (isMulti) {
-        const checked = multiSelected.has(opt.label);
-        return (
-          <div
-            key={opt.label}
-            className={`question-option${checked ? ' selected' : ''}${isFocused ? ' focused' : ''}`}
-            onClick={() => onMultiToggle(q.question, opt.label)}
-            onMouseEnter={() => onFocusIndex(index)}
-            title={`${checked ? 'Remove' : 'Select'} ${opt.label}`}
-          >
-            <input
-              type="checkbox"
-              checked={checked}
-              onChange={() => onMultiToggle(q.question, opt.label)}
-              onClick={(e) => e.stopPropagation()}
-              tabIndex={-1}
-            />
-            <div className="question-option-content">
-              <span className="question-option-label">{opt.label}</span>
-              {opt.description && (
-                <span className="question-option-description">
-                  {opt.description}
-                </span>
-              )}
-            </div>
-          </div>
-        );
-      }
-
-      const selected = answer === opt.label;
-      return (
-        <div
-          key={opt.label}
-          className={`question-option${selected ? ' selected' : ''}${isFocused ? ' focused' : ''}`}
-          onClick={() => onSelect(q.question, opt.label)}
-          onMouseEnter={() => {
-            onFocusIndex(index);
-            if (isPreviewMode && opt.preview) {
-              onFocusPreview(q.question, opt.preview);
-            }
-          }}
-          title={`Select ${opt.label}`}
-        >
-          <input
-            type="radio"
-            name={q.question}
-            checked={selected}
-            onChange={() => onSelect(q.question, opt.label)}
-            tabIndex={-1}
-          />
-          <div className="question-option-content">
-            <span className="question-option-label">{opt.label}</span>
-            {opt.description && (
-              <span className="question-option-description">
-                {opt.description}
-              </span>
-            )}
-          </div>
-        </div>
-      );
-    });
-
-    return [...optionElements, renderOtherOption()];
-  };
-
-  return (
-    <div className="question-item" aria-readonly={readOnly}>
-      <span className="question-header">{q.header}</span>
-      <div className="question-text">
-        <ReactMarkdown>{q.question}</ReactMarkdown>
-      </div>
-
-      {isPreviewMode ? (
-        <div className="question-preview-layout">
-          <div className="question-options">
-            {renderOptions()}
-            {answer !== OTHER_SENTINEL && (
-              <span className="question-notes-hint">Press n to add notes</span>
-            )}
-          </div>
-          <div
-            className={`question-preview-pane${answer !== OTHER_SENTINEL && !activePreview ? ' question-preview-pane--empty' : ''}`}
-          >
-            {answer === OTHER_SENTINEL ? (
-              <textarea
-                className="question-preview-other-input"
-                placeholder="Describe your preferred approach..."
-                value={otherText}
-                onChange={(e) => onOtherText(q.question, e.target.value)}
-                autoFocus
-                title="Describe your preferred approach"
-                aria-label="Describe your preferred approach"
-              />
-            ) : (
-              activePreview || 'Select an option to preview'
-            )}
-          </div>
-        </div>
-      ) : (
-        <div className="question-options">{renderOptions()}</div>
-      )}
-
-      {/* Notes only for single-select with previews, not when Other is selected */}
-      {isPreviewMode && answer !== OTHER_SENTINEL && (
-        <div className="question-notes">
-          <button
-            className="question-notes-toggle"
-            onClick={() => onToggleNotes(q.question)}
-            tabIndex={-1}
-            title={notesExpanded ? 'Hide optional notes' : 'Add optional notes for the agent'}
-          >
-            {notesExpanded ? (
-              <ChevronDown size={14} />
-            ) : (
-              <ChevronRight size={14} />
-            )}
-            Add notes
-          </button>
-          {notesExpanded && (
-            <textarea
-              placeholder="Optional notes for the agent..."
-              value={notesText}
-              onChange={(e) => onSetNotes(q.question, e.target.value)}
-              rows={2}
-              title="Optional notes for the agent"
-              aria-label="Optional notes for the agent"
-            />
-          )}
-        </div>
-      )}
+function DismissDialog({ onCancel, onConfirm }: { onCancel: () => void; onConfirm: () => void }) {
+  useRegisterFocusScope('question-dismiss');
+  const dialog = useRef<HTMLDialogElement>(null);
+  const cancel = useRef<HTMLButtonElement>(null);
+  const title = useId();
+  useEffect(() => { dialog.current?.showModal(); cancel.current?.focus(); }, []);
+  useEffect(() => {
+    window.addEventListener('command-palette-opening', onCancel);
+    return () => window.removeEventListener('command-palette-opening', onCancel);
+  }, [onCancel]);
+  return <dialog ref={dialog} aria-labelledby={title} className="question-dismiss-dialog" onCancel={event => { event.preventDefault(); onCancel(); }}
+    onKeyDown={event => { if (event.key === '?' && !event.ctrlKey && !event.metaKey) { event.preventDefault(); event.stopPropagation(); onCancel(); requestAnimationFrame(() => window.dispatchEvent(new CustomEvent('toggle-shortcut-help'))); } else if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); onCancel(); } }}>
+    <h3 id={title}>Use chat instead?</h3><p>No answer will be sent. The agent will wait for your message.</p><div className="question-dialog-actions">
+      <button type="button" ref={cancel} onClick={onCancel}>Keep answering</button><button type="button" onClick={onConfirm}>Use chat instead</button>
     </div>
-  );
+  </dialog>;
 }

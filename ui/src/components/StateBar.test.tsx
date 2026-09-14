@@ -814,7 +814,7 @@ describe('StateBar model picker enablement (task 02713)', () => {
   it('explains response-gated model locks without implying background work', () => {
     setMobileViewport(true);
     renderStateBar({
-      convState: { type: 'awaiting_user_response', questions: [] },
+      convState: { type: 'awaiting_user_response', tool_use_id: 'test-question', questions: [] },
       availableModels: pickerModels,
       onUpgradeModel: vi.fn(),
     });
@@ -1108,8 +1108,7 @@ describe('StateBar working-phase indicators', () => {
   it('renders "awaiting your reply" for awaiting_user_response', () => {
     renderStateBar({
       convState: {
-        type: 'awaiting_user_response',
-        questions: [
+        type: 'awaiting_user_response', tool_use_id: 'test-question', questions: [
           {
             question: 'Which option?',
             header: 'Pick one',

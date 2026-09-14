@@ -155,6 +155,7 @@ pub(crate) enum SteeringWakeOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AcknowledgedEventOutcome {
+    QuestionRejected,
     Settled,
     StaleAuthority,
     SteeringWake(SteeringWakeOutcome),
@@ -5574,7 +5575,7 @@ impl RuntimeManager {
             .map(|_| ())
     }
 
-    async fn send_acknowledged_event(
+    pub(crate) async fn send_acknowledged_event(
         self: &Arc<Self>,
         conversation_id: &str,
         event: Event,

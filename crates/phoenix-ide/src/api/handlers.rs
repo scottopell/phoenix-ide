@@ -5631,89 +5631,110 @@ async fn continue_conversation(
 
 #[derive(Deserialize)]
 struct RespondToQuestionPayload {
+    tool_use_id: String,
     answers: std::collections::HashMap<String, String>,
     #[serde(default)]
     annotations:
         Option<std::collections::HashMap<String, crate::state_machine::state::QuestionAnnotation>>,
 }
 
-async fn respond_to_question(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(req): Json<RespondToQuestionPayload>,
+#[derive(Deserialize)]
+struct DismissQuestionPayload {
+    tool_use_id: String,
+}
+
+fn invalid_question_payload(error: &axum::extract::rejection::JsonRejection) -> AppError {
+    AppError::TypedBadRequest {
+        message: format!("Question request was not accepted. Reload or update your client and try again: {error}"),
+        error_type: "question_request_invalid".to_string(),
+    }
+}
+
+fn question_request_rejected() -> AppError {
+    AppError::Conflict(Box::new(ConflictErrorResponse::new(
+        "This question is no longer awaiting an answer. Refresh the conversation.",
+        "question_request_stale",
+    )))
+}
+
+async fn apply_question_mutation(
+    state: &AppState,
+    id: &str,
+    event: Event,
 ) -> Result<Json<SuccessResponse>, AppError> {
+    let (Event::UserQuestionResponse { tool_use_id, .. }
+    | Event::UserQuestionDismissed { tool_use_id }) = &event
+    else {
+        return Err(AppError::Internal(
+            "Expected a question operation".to_string(),
+        ));
+    };
     let admission = state
         .runtime
-        .mutation_admission(&id)
+        .mutation_admission(id)
         .await
         .map_err(map_admission_db_error)?;
     let _admission_guard = admission.lock().await;
-
     let conv = state
         .runtime
         .db()
-        .get_conversation(&id)
+        .get_conversation(id)
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
-
-    if !matches!(conv.state, ConvState::AwaitingUserResponse { .. }) {
-        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-            "Conversation is not awaiting a user response",
-            "wrong_state",
-        ))));
+    if !crate::state_machine::transition::accepts_question_request(&conv.state, tool_use_id) {
+        return Err(question_request_rejected());
     }
-
-    require_ordinary_mutation_admission(&state, &id, "question response").await?;
-
-    state
+    require_ordinary_mutation_admission(state, id, "question response or dismissal").await?;
+    match state
         .runtime
-        .send_event(
-            &id,
-            Event::UserQuestionResponse {
-                answers: req.answers,
-                annotations: req.annotations,
-            },
-        )
+        .send_acknowledged_event(id, event)
         .await
-        .map_err(AppError::BadRequest)?;
+        .map_err(AppError::Internal)?
+    {
+        crate::runtime::AcknowledgedEventOutcome::Settled => {
+            Ok(Json(SuccessResponse { success: true }))
+        }
+        crate::runtime::AcknowledgedEventOutcome::QuestionRejected => {
+            Err(question_request_rejected())
+        }
+        _ => Err(AppError::Internal(
+            "Could not confirm the question operation. Check conversation status.".to_string(),
+        )),
+    }
+}
 
-    Ok(Json(SuccessResponse { success: true }))
+async fn respond_to_question(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    payload: Result<Json<RespondToQuestionPayload>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    let Json(req) = payload.map_err(|error| invalid_question_payload(&error))?;
+    apply_question_mutation(
+        &state,
+        &id,
+        Event::UserQuestionResponse {
+            tool_use_id: req.tool_use_id,
+            answers: req.answers,
+            annotations: req.annotations,
+        },
+    )
+    .await
 }
 
 async fn dismiss_question(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    payload: Result<Json<DismissQuestionPayload>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<SuccessResponse>, AppError> {
-    let admission = state
-        .runtime
-        .mutation_admission(&id)
-        .await
-        .map_err(map_admission_db_error)?;
-    let _admission_guard = admission.lock().await;
-
-    let conv = state
-        .runtime
-        .db()
-        .get_conversation(&id)
-        .await
-        .map_err(|e| AppError::NotFound(e.to_string()))?;
-
-    if !matches!(conv.state, ConvState::AwaitingUserResponse { .. }) {
-        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-            "Conversation is not awaiting a user response",
-            "wrong_state",
-        ))));
-    }
-
-    require_ordinary_mutation_admission(&state, &id, "question dismissal").await?;
-
-    state
-        .runtime
-        .send_event(&id, Event::UserQuestionDismissed)
-        .await
-        .map_err(AppError::BadRequest)?;
-
-    Ok(Json(SuccessResponse { success: true }))
+    let Json(req) = payload.map_err(|error| invalid_question_payload(&error))?;
+    apply_question_mutation(
+        &state,
+        &id,
+        Event::UserQuestionDismissed {
+            tool_use_id: req.tool_use_id,
+        },
+    )
+    .await
 }
 
 /// Dismiss a persisted, user-resumable `Error` state, returning the
@@ -12902,6 +12923,229 @@ pub(crate) mod hard_delete_cascade_tests {
             conv.state,
             ConvState::AwaitingContinuation { request } if request.attempt == 1
         ));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn question_mutations_live_chat_model_roundtrip_settles_active_turn() {
+        use crate::runtime::traits::{DatabaseStorage, MessageStore};
+        use crate::runtime::SseEvent;
+        use axum::{body::Body, http::Request};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tower::ServiceExt;
+        struct QuestionLlm(AtomicUsize);
+        #[async_trait::async_trait]
+        impl phoenix_llm::LlmService for QuestionLlm {
+            async fn complete(
+                &self,
+                _: &phoenix_llm::LlmRequest,
+            ) -> Result<phoenix_llm::LlmResponse, phoenix_llm::LlmError> {
+                let first = self.0.fetch_add(1, Ordering::SeqCst) == 0;
+                Ok(phoenix_llm::LlmResponse {
+                    content: if first {
+                        vec![phoenix_llm::ContentBlock::ToolUse {
+                            id: "live-question".into(),
+                            name: "ask_user_question".into(),
+                            input: serde_json::json!({ "questions": [{ "question": "Choice?", "header": "Choice", "options": [{"label":"A"},{"label":"B"}], "multiSelect": false }] }),
+                        }]
+                    } else {
+                        vec![phoenix_llm::ContentBlock::text("Completed.")]
+                    },
+                    end_turn: !first,
+                    usage: phoenix_llm::Usage::default(),
+                    stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+                })
+            }
+            #[allow(clippy::unnecessary_literal_bound)]
+            fn model_id(&self) -> &str {
+                "claude-sonnet-5"
+            }
+        }
+        for dismiss in [false, true] {
+            let mut state = make_test_state().await;
+            let llm = Arc::new(QuestionLlm(AtomicUsize::new(0)));
+            state.llm_registry = Arc::new(ModelRegistry::for_test_with_sonnet(llm.clone()));
+            state.runtime = Arc::new(RuntimeManager::new(
+                state.db.clone(),
+                state.llm_registry.clone(),
+                state.platform.clone(),
+                state.mcp_manager.clone(),
+                None,
+            ));
+            state.runtime.start_direct_turn_worker().await.unwrap();
+            state.terminals = state.runtime.terminals.clone();
+            let id = "question-live-chat";
+            state
+                .db
+                .create_conversation(id, id, "/tmp", true, None, None)
+                .await
+                .unwrap();
+            let handle = state.runtime.get_or_create(id).await.unwrap();
+            let mut events = handle.broadcast_tx.subscribe();
+            let _ = send_chat(
+                State(state.clone()),
+                Path(id.into()),
+                Json(ChatRequest {
+                    text: "Ask a question".into(),
+                    message_id: "initial-message".into(),
+                    images: vec![],
+                    files: vec![],
+                    user_agent: None,
+                }),
+            )
+            .await
+            .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let event = events.recv().await.unwrap();
+                    if matches!(
+                        event,
+                        SseEvent::StateChange {
+                            state: ConvState::AwaitingUserResponse { .. },
+                            ..
+                        }
+                    ) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("mock model must reach its question");
+            let storage = DatabaseStorage::new(state.db.clone());
+            assert!(storage.load_active_direct_turn(id).await.unwrap().is_some());
+            let (route, payload) = if dismiss {
+                (
+                    "dismiss-question",
+                    serde_json::json!({"tool_use_id":"live-question"}),
+                )
+            } else {
+                (
+                    "respond",
+                    serde_json::json!({"tool_use_id":"live-question", "answers":{"Choice?":"A"}}),
+                )
+            };
+            let response = create_router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/conversations/{id}/{route}"))
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(payload.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            if dismiss {
+                assert_eq!(llm.0.load(Ordering::SeqCst), 1);
+                assert!(storage.load_active_direct_turn(id).await.unwrap().is_none());
+                events = handle.broadcast_tx.subscribe();
+                let _ = send_chat(
+                    State(state.clone()),
+                    Path(id.into()),
+                    Json(ChatRequest {
+                        text: "Continue explicitly".into(),
+                        message_id: "explicit-message".into(),
+                        images: vec![],
+                        files: vec![],
+                        user_agent: None,
+                    }),
+                )
+                .await
+                .unwrap();
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    if let SseEvent::StateChange {
+                        state: ConvState::Idle,
+                        ..
+                    } = events.recv().await.unwrap()
+                    {
+                        if llm.0.load(Ordering::SeqCst) == 2 {
+                            break;
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("mock model continuation must finish");
+            assert!(storage.load_active_direct_turn(id).await.unwrap().is_none());
+            assert_eq!(llm.0.load(Ordering::SeqCst), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn question_mutations_reject_missing_and_stale_identity_without_mutation() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation("question-contract", "question", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let pending = ConvState::AwaitingUserResponse {
+            questions: vec![],
+            tool_use_id: "current".into(),
+        };
+        state
+            .db
+            .update_conversation_state("question-contract", &pending)
+            .await
+            .unwrap();
+        for (route, payload, status, code) in [
+            (
+                "respond",
+                serde_json::json!({"answers": {}}),
+                StatusCode::BAD_REQUEST,
+                "question_request_invalid",
+            ),
+            (
+                "dismiss-question",
+                serde_json::json!({}),
+                StatusCode::BAD_REQUEST,
+                "question_request_invalid",
+            ),
+            (
+                "respond",
+                serde_json::json!({"tool_use_id": "old", "answers": {}}),
+                StatusCode::CONFLICT,
+                "question_request_stale",
+            ),
+            (
+                "dismiss-question",
+                serde_json::json!({"tool_use_id": "old"}),
+                StatusCode::CONFLICT,
+                "question_request_stale",
+            ),
+        ] {
+            let response = create_router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/conversations/question-contract/{route}"))
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(payload.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error_type"], code);
+            assert_eq!(
+                state
+                    .db
+                    .get_conversation("question-contract")
+                    .await
+                    .unwrap()
+                    .state,
+                pending
+            );
+        }
     }
 
     #[tokio::test]

@@ -29,6 +29,10 @@ Local evidence: ui/dogfood-output/report.md, screenshots/, videos/ in the dedica
 
 Scope: AUQ user interaction and fixtures. No provider changes, production edits/deploy, or conversation lifecycle redesign.
 
-## Design proposal awaiting approval
+## Approved implementation
 
-See [revision 3 design proposal](../docs/proposals/ask-user-question.md). This is the complete implementation brief, including the cross-client request-identity contract and uncertain/late-response rules. Independent design review found no remaining design-consistency blockers after two revision rounds. User approval is still required before product implementation; task remains ready.
+The user approved the [revision 3 design proposal](../docs/proposals/ask-user-question.md) for full implementation on September 14, 2026. The redesigned browser panel and cross-client request contract are implemented. Independent audits also closed partial persistence, queued dismissal, active-turn settlement, restart, modal, focus, and responsive-layout gaps.
+
+[Validation record](../docs/proposals/ask-user-question-validation.md) contains the correction matrix and reproducible checks. Physical-device keyboards, screen readers, and manual browser zoom remain the release qualification gate in [task 10006](10006-p1-ready--qualify-auq-physical-keyboards-and-scree.md). Merge and deployment are not authorized.
+
+Implementation complete. Every repository check passed, with final lint, frontend, and runtime reruns after audit corrections. Browser validation passed 144 matrix journeys plus two final focus journeys; 39 native iOS simulator tests passed. Manual release qualification remains explicitly tracked separately.

@@ -1768,6 +1768,8 @@ function ConversationPageContent({
   }, [parentConvSlugForCallback, navigate]);
 
   const convStateForChildren = atom.phase;
+  const pendingQuestionRef = useRef<string | null>(null);
+  pendingQuestionRef.current = atom.phase.type === 'awaiting_user_response' ? `${conversation?.id}:${atom.phase.tool_use_id}` : null;
   const ordinaryComposerEligible = !isArchived
     && convStateForChildren.type !== 'provisioning'
     && convStateForChildren.type !== 'creation_failed'
@@ -1781,6 +1783,16 @@ function ConversationPageContent({
     && ordinaryComposerEligible
     && (convStateForChildren.type !== 'error'
       || (convStateForChildren.error?.can_user_resume ?? false));
+
+  const previousQuestionOwner = useRef<string | null>(null);
+  useEffect(() => {
+    const previous = previousQuestionOwner.current;
+    previousQuestionOwner.current = convStateForChildren.type === 'awaiting_user_response' ? conversation?.id ?? null : null;
+    if (previous && previous === conversation?.id && convStateForChildren.type !== 'awaiting_user_response'
+      && writableComposerMounted && (activeScope === null || activeScope === 'question-panel' || activeScope === 'question-dismiss')) {
+      setFocusToken(value => value + 1);
+    }
+  }, [conversation?.id, convStateForChildren.type, writableComposerMounted, activeScope]);
 
   useEffect(() => {
     if (!onProjectionChange) return;
@@ -2539,12 +2551,20 @@ function ConversationPageContent({
         </>
       ) : convStateForChildren.type === 'awaiting_user_response' ? (
         <QuestionPanel
+          toolUseId={convStateForChildren.tool_use_id}
           questions={convStateForChildren.questions}
           conversationId={conversation.id}
           showToast={showInfo}
           readOnly={readOnly || isArchived}
-          onAnswered={() => dispatch({ type: 'local_phase_change', phase: { type: 'llm_requesting', attempt: 1 }, expectedConversationId: conversation.id })}
-          onDismissed={() => dispatch({ type: 'local_phase_change', phase: { type: 'idle' }, expectedConversationId: conversation.id })}
+          onAnswered={() => {
+            if (pendingQuestionRef.current !== `${conversation.id}:${convStateForChildren.tool_use_id}`) return;
+            dispatch({ type: 'question_phase_change', phase: { type: 'llm_requesting', attempt: 1 }, expectedConversationId: conversation.id, toolUseId: convStateForChildren.tool_use_id });
+          }}
+          onDismissed={() => {
+            if (pendingQuestionRef.current !== `${conversation.id}:${convStateForChildren.tool_use_id}`) return;
+            dispatch({ type: 'question_phase_change', phase: { type: 'idle' }, expectedConversationId: conversation.id, toolUseId: convStateForChildren.tool_use_id });
+          }}
+          onResolved={phase => dispatch({ type: 'question_phase_change', phase, expectedConversationId: conversation.id, toolUseId: convStateForChildren.tool_use_id })}
         />
       ) : mutationEnabled && ordinaryComposerEligible ? (
         <>

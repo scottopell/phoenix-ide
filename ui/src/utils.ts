@@ -261,8 +261,10 @@ export function parseConversationState(raw: unknown): ConversationState {
         plan: (obj['plan'] as string) ?? '',
       };
     case 'awaiting_user_response':
+      if (typeof obj['tool_use_id'] !== 'string' || !obj['tool_use_id']) return serverError('Question identity is missing. Reload after updating Phoenix.');
       return {
         type: 'awaiting_user_response',
+        tool_use_id: obj['tool_use_id'],
         questions: (obj['questions'] as UserQuestion[]) ?? [],
       };
     case 'context_exhausted':

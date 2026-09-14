@@ -155,6 +155,17 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     if (url.endsWith('/api/telemetry/conversation-open')) {
       return new Response(null, { status: 204 });
     }
+    const questionResponse = url.endsWith(`/api/conversations/${conversation.id}/respond`);
+    const questionDismissal = url.endsWith(`/api/conversations/${conversation.id}/dismiss-question`);
+    if ((questionResponse || questionDismissal) && init?.method === 'POST') {
+      const body = JSON.parse(String(init.body)) as { tool_use_id?: string };
+      if (conversation.state?.type !== 'awaiting_user_response' || body.tool_use_id !== conversation.state.tool_use_id) {
+        return Response.json({error:'This fixture question is no longer pending.',error_type:'question_request_stale'}, {status:409});
+      }
+      record('QuestionResponse', String(init.body));
+      conversation.state = questionDismissal ? {type:'idle'} : {type:'llm_requesting',attempt:1};
+      return Response.json({success:true});
+    }
     if (url.endsWith(`/api/conversations/${conversation.id}/chat`) && init?.method === 'POST') {
       const body = JSON.parse(String(init.body)) as { text?: string };
       sendCount += 1;

@@ -12,6 +12,24 @@ This specification does not provide backup retention, disaster recovery, point-i
 
 ## Requirements
 
+### REQ-COMP-006 — Question Mutations Require Request Identity
+
+WHEN a client responds to or dismisses a pending structured question
+THE SYSTEM SHALL require the conversation and originating tool_use_id identity
+defined by [Ask User Question](../ask-user-question/requirements.md)
+AND reject a missing identity without mutation with an actionable reload/update
+error rather than accepting an optional identity fallback
+
+THE SYSTEM SHALL apply this protocol contract across web, CLI, and native iOS
+callers
+AND SHALL NOT promise identity-free question mutation compatibility
+
+**Rationale:** A client unable to name the request it is answering cannot safely
+act on a later question set. Explicit refusal protects user intent across client
+versions without adding an alternate mutation path.
+
+---
+
 ### REQ-COMP-001 — Compatibility Is Explicit
 
 THE SYSTEM SHALL treat a compatibility, downgrade, rollback, recovery, or live-resource-replacement behavior as guaranteed only when a normative Phoenix requirement states that guarantee

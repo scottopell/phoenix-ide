@@ -56,7 +56,7 @@ final class ConversationStateTests: XCTestCase {
 
     func testAwaitingUserResponseCarriesTypedQuestions() {
         let raw = """
-        {"type":"awaiting_user_response",
+        {"type":"awaiting_user_response","tool_use_id":"question-1",
          "questions":[{"question":"Which db?","header":"DB",
                        "options":[{"label":"sqlite","description":"file-backed"},
                                   {"label":"postgres","description":""}],
@@ -65,7 +65,7 @@ final class ConversationStateTests: XCTestCase {
         """
         XCTAssertEqual(
             parse(raw),
-            .awaitingUserResponse(questions: [
+            .awaitingUserResponse(toolUseId: "question-1", questions: [
                 UserQuestion(
                     question: "Which db?", header: "DB",
                     options: [
@@ -249,19 +249,43 @@ final class ConversationStateTests: XCTestCase {
         XCTAssertEqual(TaskFeedback("  revise this  ")?.text, "revise this")
     }
 
+    func testQuestionRejectionRequiresExactNoMutationProof() {
+        let invalid = APIError.http(status: 400, body: "{\"error_type\":\"question_request_invalid\"}")
+        let stale = APIError.http(status: 409, body: "{\"error_type\":\"question_request_stale\"}")
+        XCTAssertFalse(ConversationSession.questionFailureRemainsUncertain(invalid, previouslyUncertain: false))
+        XCTAssertFalse(ConversationSession.questionFailureRemainsUncertain(stale, previouslyUncertain: false))
+        XCTAssertTrue(ConversationSession.questionFailureRemainsUncertain(stale, previouslyUncertain: true))
+        for error in [APIError.http(status: 500, body: "{\"error_type\":\"question_request_stale\"}"),
+                      APIError.http(status: 409, body: "conflict"),
+                      APIError.transport(underlying: URLError(.timedOut))] {
+            XCTAssertTrue(ConversationSession.questionFailureRemainsUncertain(error, previouslyUncertain: false))
+        }
+    }
+
+    func testPendingQuestionWithoutIdentityCannotBeAnswered() throws {
+        for identity in ["", ",\"tool_use_id\":\" \""] {
+            let data = Data("{\"type\":\"awaiting_user_response\",\"questions\":[]\(identity)}".utf8)
+            let state = ConversationState.parse(try JSONDecoder().decode(JSONValue.self, from: data))
+            XCTAssertEqual(state, .questionIdentityUnavailable)
+            XCTAssertFalse(state.acceptsChatMessage)
+        }
+    }
+
     func testQuestionActionUnlocksWhenPromptIdentityChanges() {
-        let original = ConversationState.awaitingUserResponse(questions: [
+        let original = ConversationState.awaitingUserResponse(toolUseId: "question-1", questions: [
             UserQuestion(question: "First?", header: "One", options: [], multiSelect: false),
         ])
-        let followUp = ConversationState.awaitingUserResponse(questions: [
-            UserQuestion(question: "Next?", header: "Two", options: [], multiSelect: false),
+        let followUp = ConversationState.awaitingUserResponse(toolUseId: "question-2", questions: [
+            UserQuestion(question: "First?", header: "One", options: [], multiSelect: false),
         ])
-        let action = ConversationAction.respondToQuestions(answers: ["First?": "yes"])
+        let action = ConversationAction.respondToQuestions(toolUseId: "question-1", answers: ["First?": "yes"])
 
         XCTAssertTrue(ConversationSession.actionStillAwaitsOriginalState(
             action: action, origin: original, current: original))
         XCTAssertFalse(ConversationSession.actionStillAwaitsOriginalState(
             action: action, origin: original, current: followUp))
+        XCTAssertTrue(ConversationSession.actionStillAwaitsOriginalState(
+            action: action, origin: original, current: .questionIdentityUnavailable))
     }
 
     func testChatEligibilityMatchesInteractiveStateFamilies() {
@@ -277,7 +301,7 @@ final class ConversationStateTests: XCTestCase {
                 .acceptsChatMessage)
         XCTAssertTrue(ConversationState.llmRequesting(attempt: 1).acceptsChatMessage)
         XCTAssertFalse(
-            ConversationState.awaitingUserResponse(questions: []).acceptsChatMessage)
+            ConversationState.awaitingUserResponse(toolUseId: "question-1", questions: []).acceptsChatMessage)
         XCTAssertFalse(
             ConversationState.awaitingTaskApproval(title: "", priority: "", plan: "")
                 .acceptsChatMessage)

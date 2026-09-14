@@ -37,7 +37,7 @@ describe('decideRouteFocus', () => {
     ['viewer-owned preserves owner', { viewerOwnsFocus: true }, 'preserve-owner'],
     ['recovery preserves owner', { phase: { type: 'awaiting_recovery', message: 'recover', recovery_kind: 'resume', resume: { type: 'conversation_turn' } } }, 'preserve-owner'],
     ['continuation recovery preserves owner', { phase: { type: 'recoverable_continuation_failure', message: 'recover', error_kind: 'server_error', operation_id: 'op-1', attempt: 1 } }, 'preserve-owner'],
-    ['question panel / no composer preserves owner', { composerRenders: false, phase: { type: 'awaiting_user_response', questions: [] } }, 'preserve-owner'],
+    ['question panel / no composer preserves owner', { composerRenders: false, phase: { type: 'awaiting_user_response', tool_use_id: 'test-question', questions: [] } }, 'preserve-owner'],
     ['provisioning defers', { composerRenders: false, phase: { type: 'provisioning', prompt: null } }, 'pending'],
     ['awaiting llm defers even with a mounted textarea', { phase: { type: 'awaiting_llm' } }, 'pending'],
     ['awaiting continuation defers', { phase: { type: 'awaiting_continuation', attempt: 2 } }, 'pending'],
