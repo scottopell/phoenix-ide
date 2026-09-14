@@ -3812,6 +3812,22 @@ impl RuntimeManager {
         }
     }
 
+    #[must_use]
+    fn persisted_subagent_mode(parent_mode: &ConvMode, execution_mode: SubAgentMode) -> ConvMode {
+        match execution_mode {
+            SubAgentMode::Explore => ConvMode::Explore {
+                worktree_path: None,
+                next_taskmd_id_hint: None,
+            },
+            SubAgentMode::Work => match parent_mode {
+                ConvMode::Explore { .. } | ConvMode::DetachedProductCreation { .. } => {
+                    ConvMode::Direct
+                }
+                mode => mode.clone(),
+            },
+        }
+    }
+
     /// Handle a sub-agent spawn request
     #[allow(clippy::too_many_lines)]
     async fn handle_spawn_request(self: &Arc<Self>, req: SubAgentSpawnRequest) {
@@ -3880,16 +3896,7 @@ impl RuntimeManager {
             }
         }
 
-        // Derive sub-agent conv_mode from spec.mode + parent's mode.
-        // Explore sub-agents are always Explore. Work sub-agents inherit
-        // the parent's Work mode (branch, base_branch, worktree_path).
-        let sub_conv_mode = match spec.mode {
-            SubAgentMode::Explore => ConvMode::Explore {
-                worktree_path: None,
-                next_taskmd_id_hint: None,
-            },
-            SubAgentMode::Work => parent_conv.conv_mode.clone(),
-        };
+        let sub_conv_mode = Self::persisted_subagent_mode(&parent_conv.conv_mode, spec.mode);
 
         let spec_cwd = match crate::conversation_cwd::validate_conversation_cwd(&spec.cwd) {
             Ok(cwd) => cwd,
@@ -6444,6 +6451,30 @@ pub(crate) fn conv_mode_to_context(mode: &ConvMode) -> ModeContext {
             worktree_path: worktree_path.to_string(),
         },
         ConvMode::Direct => ModeContext::Direct,
+    }
+}
+
+#[cfg(test)]
+mod persisted_subagent_mode_tests {
+    use super::RuntimeManager;
+    use phoenix_core::domain::db_schema::{ConvMode, NonEmptyString};
+    use phoenix_core::domain::sm_state::SubAgentMode;
+
+    #[test]
+    fn approved_explore_parent_persists_distinct_child_execution_modes() {
+        let parent = ConvMode::Explore {
+            worktree_path: Some(NonEmptyString::new("/tmp/approved-worktree").unwrap()),
+            next_taskmd_id_hint: None,
+        };
+
+        assert!(matches!(
+            RuntimeManager::persisted_subagent_mode(&parent, SubAgentMode::Explore),
+            ConvMode::Explore { .. }
+        ));
+        assert_eq!(
+            RuntimeManager::persisted_subagent_mode(&parent, SubAgentMode::Work),
+            ConvMode::Direct
+        );
     }
 }
 

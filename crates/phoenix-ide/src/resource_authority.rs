@@ -210,7 +210,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn attached_explore_subagent_stays_restricted_on_work_scope() {
+    async fn persisted_child_mode_distinguishes_work_from_explore_authority() {
         let db = Database::open_in_memory().await.unwrap();
         let parent_id = uuid::Uuid::new_v4().to_string();
         db.create_conversation(&parent_id, "parent", "/tmp", true, None, None)
@@ -227,7 +227,7 @@ pub(crate) mod tests {
         .unwrap();
         let parent = db.get_conversation(&parent_id).await.unwrap();
         let scope = parent.attached_work_scope_id.clone().unwrap();
-        let child = db
+        let explore_child = db
             .create_subagent_conversation(
                 "attached-explore-child",
                 "attached-explore-child",
@@ -248,10 +248,29 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
+        let work_child = db
+            .create_subagent_conversation(
+                "attached-work-child",
+                "attached-work-child",
+                "/tmp",
+                &parent_id,
+                "gpt-5.4",
+                &ConvMode::Direct,
+                phoenix_core::llm_language::LlmLanguage::default(),
+                Some(&scope),
+            )
+            .await
+            .unwrap();
 
-        let resolved = resolve_resource_authority(&db, &child).await.unwrap();
-        assert_eq!(resolved.scope, ResourceScopeKey::Work(scope));
-        assert_eq!(resolved.authority, ResourceAuthority::Restricted);
+        let explore = resolve_resource_authority(&db, &explore_child)
+            .await
+            .unwrap();
+        assert_eq!(explore.scope, ResourceScopeKey::Work(scope.clone()));
+        assert_eq!(explore.authority, ResourceAuthority::Restricted);
+
+        let work = resolve_resource_authority(&db, &work_child).await.unwrap();
+        assert_eq!(work.scope, ResourceScopeKey::Work(scope));
+        assert_eq!(work.authority, ResourceAuthority::Work);
     }
 
     #[tokio::test]
