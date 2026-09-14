@@ -136,6 +136,36 @@ that state remains unclassifiable; recognized error and working states reproduce
 the metadata defect. The corrections passed 48 native simulator tests and 234
 focused web tests, including a refreshed working clock advancing without SSE.
 
+## PR review follow-up: status and history reconciliation
+
+Codex reviewed `90b6a992aeed051e255c1d6fbbacf5c2fbb57a63` and found three
+further defects. A history request begun before question consumption could
+restore its old phase without intervening SSE. History merges now carry their
+request-start phase reference and preserve any newer phase, while still merging
+messages. A regression also verifies that a fresh history request at the same
+SSE cursor remains eligible to update state.
+
+Web and native reconciliation now call a dedicated metadata-only status endpoint.
+The endpoint shares the full conversation response's metadata projection, but
+does not load, enrich, or transfer transcript contents. Its regression makes
+transcript content columns unavailable while preserving the message-count query;
+status still succeeds and full transcript retrieval fails.
+
+Native reconciliation now recognizes well-formed nonquestion states as
+resolved, including continuation recovery failure. The earlier local rejection
+of that trigger only described the parser restriction; Codex correctly challenged
+that restriction itself. Malformed states and pending questions lacking identity
+remain frozen. GET and SSE regressions cover both resolved and unverifiable cases.
+
+Focused frontend unit tests, type checking, lint, formatting, and diff checks
+passed after integration. A local focused Rust status-endpoint test could not
+complete because the host filesystem was full before assertions ran. Final-commit
+CI and Codex approval remain the PR completion criteria.
+
+Review moves added: interleave every asynchronous history producer with a local
+phase update without SSE; inspect the actual HTTP payload rather than its decoded
+client type; and compare all server state discriminants with client classifiers.
+
 ## Qualification limits
 
 Browser automation and the native iOS simulator suite do not establish physical

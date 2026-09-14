@@ -2558,7 +2558,7 @@ function ConversationPageContent({
           conversationId={conversation.id}
           showToast={showInfo}
           readOnly={readOnly || isArchived}
-          onResolved={(phase, stateUpdatedAt) => dispatch({ type: 'question_phase_change', phase, stateUpdatedAt, expectedConversationId: conversation.id, requestId: convStateForChildren.request_id })}
+          onResolved={(phase, stateUpdatedAt) => dispatch({ type: 'question_phase_change', phase, stateUpdatedAt, expectedConversationId: conversation.id, requestId: convStateForChildren.request_id, phaseFreshnessEventSeq: atomRef.current.lastAppliedEventSeq })}
         />
       ) : mutationEnabled && ordinaryComposerEligible ? (
         <>

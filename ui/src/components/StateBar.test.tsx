@@ -933,7 +933,7 @@ describe('StateBar working-phase indicators', () => {
     const initial = createInitialAtom();
     const refreshed = conversationReducer({...initial, conversationId:'conv', phase:{type:'awaiting_user_response',request_id:'request',tool_use_id:'tool',questions:[]}}, {
       type:'question_phase_change', expectedConversationId:'conv', requestId:'request',
-      phase:{type:'llm_requesting',attempt:1}, stateUpdatedAt:T_NOW-7_000,
+      phase:{type:'llm_requesting',attempt:1}, stateUpdatedAt:T_NOW-7_000, phaseFreshnessEventSeq:0,
     });
     renderStateBar({convState:refreshed.phase,phaseStateUpdatedAt:refreshed.phaseStateUpdatedAt,lastSseEventAt:T_NOW});
     expect(screen.getByText(/awaiting LLM response.*7s/i)).toBeInTheDocument();

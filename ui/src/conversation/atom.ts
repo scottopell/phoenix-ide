@@ -358,7 +358,7 @@ export type SSEAction =
       phase: ConversationState;
       expectedConversationId: string;
     }
-  | { type: 'question_phase_change'; phase: ConversationState; stateUpdatedAt: number | null; expectedConversationId: string; requestId: string }
+  | { type: 'question_phase_change'; phase: ConversationState; stateUpdatedAt: number | null; expectedConversationId: string; requestId: string; phaseFreshnessEventSeq: number }
   // Client-originated optimistic conversation update (e.g. model swap confirmation).
   | {
       type: 'local_conversation_update';
@@ -1484,6 +1484,7 @@ export function conversationReducer(
         ...atom,
         phase: action.phase,
         phaseStateUpdatedAt: action.stateUpdatedAt,
+        phaseLastAppliedEventSeq: Math.max(atom.phaseLastAppliedEventSeq, action.phaseFreshnessEventSeq),
       };
 
     case 'local_phase_change':
@@ -1551,7 +1552,7 @@ export function conversationReducer(
         conversationId: action.conversationId,
         conversation,
         messages,
-        phase: atom.phase !== action.snapshotStartedAtPhase || atom.phaseLastAppliedEventSeq > action.snapshotStartedAtEventSeq ? atom.phase : action.phase,
+        phase: atom.phase !== action.snapshotStartedAtPhase || atom.phaseLastAppliedEventSeq >= action.snapshotStartedAtEventSeq ? atom.phase : action.phase,
         phaseLastAppliedEventSeq: atom.phaseLastAppliedEventSeq,
         pendingMessagePatches: Object.fromEntries(
           Object.entries(atom.pendingMessagePatches).filter(

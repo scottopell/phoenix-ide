@@ -199,7 +199,7 @@ final class QuestionRequestTests: XCTestCase {
         for (state, resolved) in [
             (#"{"type":"recoverable_continuation_failure","failure":{"message":"Recovery failed"}}"#, true),
             (#"{"type":"creation_cancelled","message":"Cancelled"}"#, true),
-            (#"{"type":"future_nonquestion_state","message":"Future failure"}"#, false),
+            (#"{"type":"future_nonquestion_state","message":"Future failure"}"#, true),
             (#"{}"#, false), (#"{"type":""}"#, false),
             (#"{"type":"awaiting_user_response"}"#, false)
         ] {
