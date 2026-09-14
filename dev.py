@@ -3342,6 +3342,12 @@ def cmd_seed(
         conn.commit()
 
 
+def cmd_qa_ask_user_question() -> None:
+    """Capture deterministic AskUserQuestion interaction fixtures."""
+    ensure_ui_deps()
+    subprocess.run(["pnpm", "qa:ask-user-question"], cwd=ROOT / "ui", check=True, env=node_env())
+
+
 def cmd_qa_grounding_panel() -> None:
     """Capture grounding panel Ladle screenshots into ignored local artifacts."""
     subprocess.run(
@@ -10800,6 +10806,7 @@ def main():
     qa_sub.add_parser("conversation-panel", help="Capture conversation side panel Ladle screenshots")
     qa_sub.add_parser("sidebar", help="Capture sidebar Ladle screenshots")
     qa_sub.add_parser("task-approval", help="Capture task approval Ladle screenshots")
+    qa_sub.add_parser("ask-user-question", help="Capture AskUserQuestion Ladle screenshots")
     qa_sub.add_parser("mobile-conversation-list", help="Capture mobile conversation list Ladle screenshots")
     qa_sub.add_parser("coordinator", help="Capture Coordinator screenshots across responsive viewports")
     qa_sub.add_parser("mobile-multi-pr-conversation", help="Capture a mobile conversation with two open PRs")
@@ -10968,6 +10975,8 @@ def main():
             cmd_qa_conversation_panel()
         elif args.qa_command == "sidebar":
             cmd_qa_sidebar()
+        elif args.qa_command == "ask-user-question":
+            cmd_qa_ask_user_question()
         elif args.qa_command == "task-approval":
             cmd_qa_task_approval()
         elif args.qa_command == "mobile-conversation-list":
