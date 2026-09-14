@@ -4,6 +4,7 @@ import type { ComponentProps } from 'react';
 import { MemoryRouter } from 'react-router-dom';
 import type { ConversationPrStatusHandle } from '../hooks/useConversationPrStatus';
 import { StateBar } from './StateBar';
+import { conversationReducer, createInitialAtom } from '../conversation/atom';
 import { api, type AssociatedPrStatusEnvelope, type Conversation, type ConversationState, type ModelInfo, type PrStatusResponse } from '../api';
 
 vi.mock('../api', async (importOriginal) => {
@@ -926,6 +927,18 @@ describe('StateBar working-phase indicators', () => {
 
   afterEach(() => {
     vi.useRealTimers();
+  });
+
+  it('keeps the refreshed question phase clock advancing without SSE', () => {
+    const initial = createInitialAtom();
+    const refreshed = conversationReducer({...initial, conversationId:'conv', phase:{type:'awaiting_user_response',request_id:'request',tool_use_id:'tool',questions:[]}}, {
+      type:'question_phase_change', expectedConversationId:'conv', requestId:'request',
+      phase:{type:'llm_requesting',attempt:1}, stateUpdatedAt:T_NOW-7_000,
+    });
+    renderStateBar({convState:refreshed.phase,phaseStateUpdatedAt:refreshed.phaseStateUpdatedAt,lastSseEventAt:T_NOW});
+    expect(screen.getByText(/awaiting LLM response.*7s/i)).toBeInTheDocument();
+    act(()=>vi.advanceTimersByTime(2_000));
+    expect(screen.getByText(/awaiting LLM response.*9s/i)).toBeInTheDocument();
   });
 
   it('renders the live elapsed counter for llm_requesting (REQ-WPV-001/003)', () => {

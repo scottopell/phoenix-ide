@@ -142,6 +142,53 @@ final class QuestionRequestTests: XCTestCase {
         XCTAssertFalse(session.acceptsChatMessage)
     }
 
+    @MainActor
+    func testStatusRefreshProjectsErrorAndWorkingMetadataToSessionAndList() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [QuestionRequestProtocol.self]
+        let api = PhoenixAPI(baseURL: URL(string: "https://auq-protocol.invalid")!,
+                             password: nil, allowSelfSigned: false, configuration: configuration)!
+        defer { QuestionRequestProtocol.onGet = nil }
+        for (state, mode, working) in [
+            (#"{"type":"error","message":"Recovery failed","error_kind":"server_error"}"#, "error", false),
+            (#"{"type":"awaiting_continuation"}"#, "working", true)
+        ] {
+            var updates: [Conversation] = []
+            let session = ConversationSession(conversationId: "conversation-a", api: api,
+                                               connectivity: ConnectivityMonitor(),
+                                               onConversationUpdate: { updates.append($0) })
+            try seed(session, requestId: "original")
+            updates.removeAll()
+            QuestionRequestProtocol.onGet = { request in
+                request.succeed(body: """
+                {"conversation":{"id":"conversation-a","slug":"refreshed","state":\(state),
+                "state_updated_at":"2026-09-14T15:00:00Z","presentation_mode":"needs_action",
+                "requires_action":true,"transcript_generation":99},
+                "agent_working":\(working),"presentation_mode":"\(mode)","messages":["not a transcript projection"]}
+                """)
+            }
+            try await XCTUnwrap(session.perform(.dismissQuestion(requestId: "original"))).value
+            XCTAssertNil(session.actionInFlight)
+            XCTAssertEqual(session.presentationMode, mode)
+            XCTAssertEqual(session.agentWorking, working)
+            XCTAssertEqual(session.conversation?.presentation_mode, mode)
+            XCTAssertEqual(session.conversation?.requires_action, false)
+            XCTAssertEqual(session.conversation?.state_updated_at, "2026-09-14T15:00:00Z")
+            XCTAssertEqual(session.conversation?.slug, "refreshed")
+            XCTAssertNotEqual(session.conversation?.transcript_generation, 99)
+            XCTAssertTrue(session.messages.isEmpty)
+            let listed = try XCTUnwrap(updates.last)
+            XCTAssertEqual(listed.presentation_mode, mode)
+            XCTAssertEqual(listed.requires_action, false)
+            XCTAssertEqual(listed.state_updated_at, "2026-09-14T15:00:00Z")
+            if mode == "error" {
+                XCTAssertEqual(session.typedState, .error(message: "Recovery failed", kind: .serverError))
+            } else {
+                XCTAssertEqual(session.typedState, .awaitingContinuation)
+            }
+        }
+    }
+
     func testBothMutationsCarryOriginatingRequestIdentity() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [QuestionRequestProtocol.self]

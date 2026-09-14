@@ -127,6 +127,15 @@ before designing a migration predicate; follow a successful mutation through the
 next required control without SSE; and test every selected-state variant of
 secondary navigation actions.
 
+A bounded local follow-up found two display projections omitted by status
+refresh: native presentation/activity/list metadata and the web phase timestamp.
+Native status refresh now adopts a typed status-only snapshot without claiming
+transcript coverage; web refresh carries the server timestamp into the phase
+owner. The native unsupported continuation-failure example was disproved because
+that state remains unclassifiable; recognized error and working states reproduce
+the metadata defect. The corrections passed 48 native simulator tests and 234
+focused web tests, including a refreshed working clock advancing without SSE.
+
 ## Qualification limits
 
 Browser automation and the native iOS simulator suite do not establish physical

@@ -526,19 +526,17 @@ final class ConversationSession {
 
     private func reconcileQuestionOperation(_ attempt: ActionAttempt, knownResolved: Bool) async {
         guard let requestId = attempt.action.questionRequestId else { return }
-        let result: Result<Conversation, Error>
+        let result: Result<ConversationStatusResponse, Error>
         do {
-            result = .success(try await api.getConversation(id: conversationId).conversation)
+            result = .success(try await api.getConversationStatus(id: conversationId))
         } catch {
             result = .failure(error)
         }
         guard actionAttempt?.token == attempt.token else { return }
         let phase = QuestionAttemptPhase.reconcile(
-            conversationId: conversationId, requestId: requestId, result: result)
+            conversationId: conversationId, requestId: requestId, result: result.map(\.conversation))
         if phase == .resolvedWaitingForStream, case .success(let snapshot) = result {
-            conversation?.state = snapshot.state
-            clearResolvedActionIfStateAdvanced(currentState: typedState)
-            persistSnapshot()
+            adoptQuestionStatus(snapshot)
         } else if knownResolved {
             actionAttempt?.phase = .resolvedNeedsStatusCheck(
                 "This question is no longer awaiting an answer. Could not refresh conversation status. Check status again.")
@@ -549,6 +547,21 @@ final class ConversationSession {
         streamTask = nil
         connection = .idle
         resumeLiveTasks()
+    }
+
+    private func adoptQuestionStatus(_ snapshot: ConversationStatusResponse) {
+        let mode = snapshot.presentation_mode ?? snapshot.conversation.presentation_mode
+        var updated = snapshot.conversation
+        // Transcript generation changes only when its corresponding transcript is applied.
+        updated.transcript_generation = transcriptGeneration
+        updated.presentation_mode = mode
+        if let mode { updated.requires_action = mode == "needs_action" }
+        conversation = updated
+        presentationMode = mode
+        agentWorking = snapshot.agent_working ?? (mode == "working")
+        clearResolvedActionIfStateAdvanced(currentState: typedState)
+        persistSnapshot()
+        onConversationUpdate?(updated)
     }
 
     private func resolveQuestionOperation(token: UUID) async {

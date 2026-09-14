@@ -299,6 +299,10 @@ struct PhoenixAPI: Sendable {
         try await get("api/product-conversations", as: ProductConversationListResponse.self)
     }
 
+    func getConversationStatus(id: String) async throws -> ConversationStatusResponse {
+        try await get("api/conversations/\(id)", as: ConversationStatusResponse.self)
+    }
+
     func getConversation(id: String, afterSequence: Int64 = 0) async throws
         -> ConversationWithMessagesResponse
     {

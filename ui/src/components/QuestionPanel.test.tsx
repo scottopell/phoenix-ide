@@ -26,7 +26,7 @@ describe('QuestionPanel request and draft contract', () => {
     render(<QuestionPanel {...defaults} />);
     fireEvent.click(screen.getByRole('radio',{name:'Current'}));
     fireEvent.click(screen.getByRole('button',{name:'Send answer'}));
-    await waitFor(()=>expect(defaults.onResolved).toHaveBeenCalledWith({type:'recoverable_continuation_failure',message:'Summary failed',error_kind:'server_error',operation_id:'continue-1',attempt:2}));
+    await waitFor(()=>expect(defaults.onResolved).toHaveBeenCalledWith({type:'recoverable_continuation_failure',message:'Summary failed',error_kind:'server_error',operation_id:'continue-1',attempt:2}, null));
   });
   it('renders preview code as a separate block while sending the original preview', async () => {
     const preview = 'Compare this code:\n\n```ts\nconst value = "long code";\n```';
@@ -136,13 +136,21 @@ describe('AUQ failure and shortcut boundaries', () => {
     fireEvent.click(link);
     expect(screen.getByRole('heading', {name:'Preview — Other'})).toHaveFocus();
   });
+  it('carries the server phase timestamp after successful answer refresh', async () => {
+    vi.spyOn(api,'respondToQuestion').mockResolvedValue({success:true});
+    vi.spyOn(api,'getConversation').mockResolvedValue({conversation:{state:{type:'llm_requesting',attempt:1},state_updated_at:'2026-09-14T15:00:00Z'}} as Awaited<ReturnType<typeof api.getConversation>>);
+    render(<QuestionPanel {...defaults} />);
+    fireEvent.click(screen.getByRole('radio',{name:'Current'}));
+    fireEvent.click(screen.getByRole('button',{name:'Send answer'}));
+    await waitFor(()=>expect(defaults.onResolved).toHaveBeenCalledWith({type:'llm_requesting',attempt:1}, Date.parse('2026-09-14T15:00:00Z')));
+  });
   it('adopts authoritative recovery state after successful answer without SSE', async () => {
     vi.spyOn(api,'respondToQuestion').mockResolvedValue({success:true});
     vi.spyOn(api,'getConversation').mockResolvedValue({conversation:{state:{type:'recoverable_continuation_failure', failure:{message:'Projection failed',error_kind:'server_error',request:{operation_id:'op-1',attempt:1}}}}} as unknown as Awaited<ReturnType<typeof api.getConversation>>);
     render(<QuestionPanel {...defaults} />);
     fireEvent.click(screen.getByRole('radio',{name:'Current'}));
     fireEvent.click(screen.getByRole('button',{name:'Send answer'}));
-    await waitFor(()=>expect(defaults.onResolved).toHaveBeenCalledWith({type:'recoverable_continuation_failure',message:'Projection failed',error_kind:'server_error',operation_id:'op-1',attempt:1}));
+    await waitFor(()=>expect(defaults.onResolved).toHaveBeenCalledWith({type:'recoverable_continuation_failure',message:'Projection failed',error_kind:'server_error',operation_id:'op-1',attempt:1}, null));
     expect(defaults.showToast).toHaveBeenCalledWith('Answers sent');
   });
   it.each(['success','stale'] as const)('keeps %s closed when refresh fails, then checks without resending', async outcome => {
@@ -157,7 +165,7 @@ describe('AUQ failure and shortcut boundaries', () => {
     expect(screen.queryByRole('radio')).not.toBeInTheDocument();
     expect(screen.queryByRole('button',{name:'Retry same answer'})).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button',{name:'Check status again'}));
-    await waitFor(()=>expect(defaults.onResolved).toHaveBeenCalledWith({type:'idle'}));
+    await waitFor(()=>expect(defaults.onResolved).toHaveBeenCalledWith({type:'idle'}, null));
     expect(send).toHaveBeenCalledTimes(1);
   });
   it('ignores a late successful refresh after a newer request appears', async () => {
@@ -180,7 +188,7 @@ describe('AUQ failure and shortcut boundaries', () => {
     render(<QuestionPanel {...defaults} />);
     fireEvent.click(screen.getByRole('radio',{name:'Current'}));
     fireEvent.click(screen.getByRole('button',{name:'Send answer'}));
-    await waitFor(()=>expect(defaults.onResolved).toHaveBeenCalledWith({type:'awaiting_user_response',request_id: 'request-2', tool_use_id:'request-2',questions:[question]}));
+    await waitFor(()=>expect(defaults.onResolved).toHaveBeenCalledWith({type:'awaiting_user_response',request_id: 'request-2', tool_use_id:'request-2',questions:[question]}, null));
     expect(screen.queryByRole('radio')).not.toBeInTheDocument();
   });
   it.each([

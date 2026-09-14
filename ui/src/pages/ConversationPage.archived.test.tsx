@@ -365,7 +365,7 @@ describe('ConversationPage route focus', () => {
     act(() => store.dispatch(slug,{type:'sse_state_change',sequenceId:1,phase:{type:'awaiting_user_response',request_id: 'first-question', tool_use_id:'first-question',questions},stateUpdatedAt:Date.now()+1}));
     await screen.findByRole('radio',{name:'A'});
     act(() => store.dispatch(slug,{type:'sse_state_change',sequenceId:2,phase:{type:'awaiting_user_response',request_id: 'second-question', tool_use_id:'second-question',questions},stateUpdatedAt:Date.now()+2}));
-    act(() => store.dispatch(slug,{type:'question_phase_change',expectedConversationId:slug,requestId:'first-question',phase:{type:'idle'}}));
+    act(() => store.dispatch(slug,{type:'question_phase_change',stateUpdatedAt:1234,expectedConversationId:slug,requestId:'first-question',phase:{type:'idle'}}));
     expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
     expect(screen.getByRole('radio',{name:'A'})).toHaveFocus();
   });

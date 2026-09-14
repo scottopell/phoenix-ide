@@ -11,7 +11,7 @@ export interface QuestionPanelProps {
   conversationId: string;
   requestId: string;
   showToast: (message: string, duration?: number) => void;
-  onResolved: (state: ConversationState) => void;
+  onResolved: (state: ConversationState, stateUpdatedAt: number | null) => void;
   readOnly?: boolean;
 }
 type Operation = { kind: 'answer'; payload: ReturnType<typeof answerPayload> } | { kind: 'dismiss' };
@@ -148,7 +148,8 @@ function ActiveQuestionPanel({ questions, conversationId, requestId, showToast, 
       if (!rawState || rawState.type !== state.type) throw new Error('Question status unavailable');
       if (state.type !== 'awaiting_user_response' || state.request_id !== requestId) {
         if (knowledge === 'unknown') showToast('This question is no longer awaiting an answer');
-        onResolved(state);
+        const stateUpdatedAt = Date.parse(result.conversation.state_updated_at ?? '');
+        onResolved(state, Number.isFinite(stateUpdatedAt) ? stateUpdatedAt : null);
       } else if (knowledge === 'consumed') setSubmission({ kind: 'resolved', operation, message: 'This question has closed. Waiting for updated conversation status.' });
       else setSubmission({ kind: 'uncertain', operation, checked: true,
         message: operation.kind === 'answer' ? 'Your original answer may still be processing. Retry sends the same answer.' : 'The dismissal may still be processing. Retry dismisses the same question.' });
