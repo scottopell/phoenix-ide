@@ -795,7 +795,6 @@ function ProductConversationPageInner() {
     setOlderError(null);
     setLoadingOlder(false);
     observedMemberProjectionRef.current = null;
-    setOpenSnapshotGeneration(0);
   }, [productConversationId]);
 
   useEffect(() => {

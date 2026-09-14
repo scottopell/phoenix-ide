@@ -426,6 +426,10 @@ describe('ProductConversationPage', () => {
     renderPage('/product-conversations/pc-1', true);
     await waitForPageReady();
     const firstOpenId = vi.mocked(api.getProductConversationSnapshot).mock.calls[0]?.[1]?.open_id;
+    await waitFor(() => expect(api.reportProductConversationOpen).toHaveBeenCalledTimes(1));
+    expect(api.reportProductConversationOpen).toHaveBeenLastCalledWith(
+      expect.objectContaining({ open_id: firstOpenId }),
+    );
     fireEvent.click(screen.getByRole('button', { name: 'open second product' }));
     await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
     const secondOpenId = vi.mocked(api.getProductConversationSnapshot).mock.calls[1]?.[1]?.open_id;
