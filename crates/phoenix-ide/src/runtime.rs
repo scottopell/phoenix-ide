@@ -5687,6 +5687,7 @@ impl RuntimeManager {
         conversation_id: &str,
         event: Event,
         request_fingerprint: &str,
+        source: crate::db::SteeringAdmissionSource,
     ) -> Result<(), SteeringAdmissionError> {
         let Event::SteerMessage {
             ref text,
@@ -5747,7 +5748,7 @@ impl RuntimeManager {
 
             let queue_position = self
                 .db()
-                .append_steering_entry(conversation_id, &new_entry, request_fingerprint)
+                .append_steering_entry(conversation_id, &new_entry, request_fingerprint, source)
                 .await
                 .map_err(|error| match error {
                     crate::db::DbError::CloseAdmissionFenced(_) => {
@@ -9308,6 +9309,7 @@ mod scope_liveness_tests {
                     skill_invocation: None,
                 },
                 "empty-reload-fingerprint",
+                crate::db::SteeringAdmissionSource::ExplicitUserMessage,
             )
             .await
             .expect("seed queue");
@@ -9405,6 +9407,7 @@ mod scope_liveness_tests {
                             skill_invocation: None,
                         },
                         "fenced-steer-fingerprint",
+                        crate::db::SteeringAdmissionSource::ExplicitUserMessage,
                     )
                     .await
             })
@@ -9478,6 +9481,7 @@ mod scope_liveness_tests {
                             skill_invocation: None,
                         },
                         "handle-revalidation-fingerprint",
+                        crate::db::SteeringAdmissionSource::ExplicitUserMessage,
                     )
                     .await
             })
@@ -9562,6 +9566,7 @@ mod scope_liveness_tests {
                             skill_invocation: None,
                         },
                         "reconstruction-failure-fingerprint",
+                        crate::db::SteeringAdmissionSource::ExplicitUserMessage,
                     )
                     .await
             })
@@ -9700,6 +9705,7 @@ mod scope_liveness_tests {
                     skill_invocation: None,
                 },
                 "post-commit-fingerprint",
+                crate::db::SteeringAdmissionSource::ExplicitUserMessage,
             )
             .await
             .expect("seed queue");
@@ -9784,6 +9790,7 @@ mod scope_liveness_tests {
                     skill_invocation: None,
                 },
                 "pending-steer-fingerprint",
+                crate::db::SteeringAdmissionSource::ExplicitUserMessage,
             )
             .await
             .expect("seed queue after runtime startup");
@@ -10623,6 +10630,7 @@ mod scope_liveness_tests {
                     skill_invocation: None,
                 },
                 "startup-test-fingerprint",
+                crate::db::SteeringAdmissionSource::ExplicitUserMessage,
             )
             .await
             .expect("seed queue");
@@ -10922,6 +10930,7 @@ mod scope_liveness_tests {
                     skill_invocation: None,
                 },
                 "committed-steer-fingerprint",
+                crate::db::SteeringAdmissionSource::ExplicitUserMessage,
             )
             .await
             .expect("accept steer");
@@ -11020,6 +11029,7 @@ mod scope_liveness_tests {
                     }),
                 },
                 "committed-skill-steer-fingerprint",
+                crate::db::SteeringAdmissionSource::ExplicitUserMessage,
             )
             .await
             .expect("accept skill steer");

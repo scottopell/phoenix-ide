@@ -15,7 +15,7 @@ This specification does not provide backup retention, disaster recovery, point-i
 ### REQ-COMP-006 — Question Mutations Require Request Identity
 
 WHEN a client responds to or dismisses a pending structured question
-THE SYSTEM SHALL require the conversation and originating tool_use_id identity
+THE SYSTEM SHALL require the conversation and server-generated request_id identity
 defined by [Ask User Question](../ask-user-question/requirements.md)
 AND reject a missing identity without mutation with an actionable reload/update
 error rather than accepting an optional identity fallback

@@ -844,7 +844,8 @@ mod random_walk {
 
             ConvState::AwaitingUserResponse {
                 questions,
-                tool_use_id,
+                request_id,
+                ..
             } => {
                 match rng.random_range(0..2) {
                     0 => {
@@ -863,13 +864,13 @@ mod random_walk {
                             })
                             .collect();
                         Event::UserQuestionResponse {
-                            tool_use_id: tool_use_id.clone(),
+                            request_id: request_id.clone(),
                             answers,
                             annotations: None,
                         }
                     }
                     _ => Event::UserQuestionDismissed {
-                        tool_use_id: tool_use_id.clone(),
+                        request_id: request_id.clone(),
                     },
                 }
             }

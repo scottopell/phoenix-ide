@@ -234,20 +234,20 @@ class PhoenixClient:
         return resp.json().get('hits', [])
 
 
-    def respond_to_question(self, conv_id: str, tool_use_id: str, answers: dict[str, str]) -> dict:
+    def respond_to_question(self, conv_id: str, request_id: str, answers: dict[str, str]) -> dict:
         """Answer a pending user question (AwaitingUserResponse state)."""
         resp = self.http.post(
             f"{self.base_url}/api/conversations/{conv_id}/respond",
-            json={"tool_use_id": tool_use_id, "answers": answers},
+            json={"request_id": request_id, "answers": answers},
         )
         resp.raise_for_status()
         return resp.json()
 
-    def dismiss_question(self, conv_id: str, tool_use_id: str) -> dict:
+    def dismiss_question(self, conv_id: str, request_id: str) -> dict:
         """Dismiss a pending user question without answering."""
         resp = self.http.post(
             f"{self.base_url}/api/conversations/{conv_id}/dismiss-question",
-            json={"tool_use_id": tool_use_id},
+            json={"request_id": request_id},
         )
         resp.raise_for_status()
         return resp.json()
@@ -934,7 +934,7 @@ def pending_question_identity(conversation: dict) -> str:
     state = conversation.get("state")
     if not isinstance(state, dict) or state.get("type", state.get("kind")) != "awaiting_user_response":
         raise click.UsageError("This conversation is no longer awaiting an answer. Reload it before responding.")
-    identity = state.get("tool_use_id")
+    identity = state.get("request_id")
     if not isinstance(identity, str) or not identity.strip():
         raise click.UsageError("Pending question identity is missing. Update Phoenix and reload the conversation; no answer or dismissal was sent.")
     return identity

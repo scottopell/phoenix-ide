@@ -5631,7 +5631,7 @@ async fn continue_conversation(
 
 #[derive(Deserialize)]
 struct RespondToQuestionPayload {
-    tool_use_id: String,
+    request_id: String,
     answers: std::collections::HashMap<String, String>,
     #[serde(default)]
     annotations:
@@ -5640,7 +5640,7 @@ struct RespondToQuestionPayload {
 
 #[derive(Deserialize)]
 struct DismissQuestionPayload {
-    tool_use_id: String,
+    request_id: String,
 }
 
 fn invalid_question_payload(error: &axum::extract::rejection::JsonRejection) -> AppError {
@@ -5662,8 +5662,8 @@ async fn apply_question_mutation(
     id: &str,
     event: Event,
 ) -> Result<Json<SuccessResponse>, AppError> {
-    let (Event::UserQuestionResponse { tool_use_id, .. }
-    | Event::UserQuestionDismissed { tool_use_id }) = &event
+    let (Event::UserQuestionResponse { request_id, .. }
+    | Event::UserQuestionDismissed { request_id }) = &event
     else {
         return Err(AppError::Internal(
             "Expected a question operation".to_string(),
@@ -5681,7 +5681,7 @@ async fn apply_question_mutation(
         .get_conversation(id)
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
-    if !crate::state_machine::transition::accepts_question_request(&conv.state, tool_use_id) {
+    if !crate::state_machine::transition::accepts_question_request(&conv.state, request_id) {
         return Err(question_request_rejected());
     }
     require_ordinary_mutation_admission(state, id, "question response or dismissal").await?;
@@ -5713,7 +5713,7 @@ async fn respond_to_question(
         &state,
         &id,
         Event::UserQuestionResponse {
-            tool_use_id: req.tool_use_id,
+            request_id: req.request_id,
             answers: req.answers,
             annotations: req.annotations,
         },
@@ -5731,7 +5731,7 @@ async fn dismiss_question(
         &state,
         &id,
         Event::UserQuestionDismissed {
-            tool_use_id: req.tool_use_id,
+            request_id: req.request_id,
         },
     )
     .await
@@ -12933,13 +12933,14 @@ pub(crate) mod hard_delete_cascade_tests {
         use axum::{body::Body, http::Request};
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tower::ServiceExt;
-        struct QuestionLlm(AtomicUsize);
+        struct QuestionLlm(AtomicUsize, std::sync::Mutex<Vec<String>>);
         #[async_trait::async_trait]
         impl phoenix_llm::LlmService for QuestionLlm {
             async fn complete(
                 &self,
-                _: &phoenix_llm::LlmRequest,
+                request: &phoenix_llm::LlmRequest,
             ) -> Result<phoenix_llm::LlmResponse, phoenix_llm::LlmError> {
+                self.1.lock().unwrap().push(format!("{request:?}"));
                 let first = self.0.fetch_add(1, Ordering::SeqCst) == 0;
                 Ok(phoenix_llm::LlmResponse {
                     content: if first {
@@ -12963,7 +12964,10 @@ pub(crate) mod hard_delete_cascade_tests {
         }
         for dismiss in [false, true] {
             let mut state = make_test_state().await;
-            let llm = Arc::new(QuestionLlm(AtomicUsize::new(0)));
+            let llm = Arc::new(QuestionLlm(
+                AtomicUsize::new(0),
+                std::sync::Mutex::new(Vec::new()),
+            ));
             state.llm_registry = Arc::new(ModelRegistry::for_test_with_sonnet(llm.clone()));
             state.runtime = Arc::new(RuntimeManager::new(
                 state.db.clone(),
@@ -12980,7 +12984,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 .create_conversation(id, id, "/tmp", true, None, None)
                 .await
                 .unwrap();
-            let handle = state.runtime.get_or_create(id).await.unwrap();
+            let mut handle = state.runtime.get_or_create(id).await.unwrap();
             let mut events = handle.broadcast_tx.subscribe();
             let _ = send_chat(
                 State(state.clone()),
@@ -13013,15 +13017,40 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("mock model must reach its question");
             let storage = DatabaseStorage::new(state.db.clone());
             assert!(storage.load_active_direct_turn(id).await.unwrap().is_some());
+            let ConvState::AwaitingUserResponse { request_id, .. } =
+                state.db.get_conversation(id).await.unwrap().state
+            else {
+                panic!("pending request")
+            };
+            if dismiss {
+                state
+                    .db
+                    .append_steering_entry(
+                        id,
+                        &crate::state_machine::event::SteerEntry {
+                            text: "Earlier queued instruction".into(),
+                            llm_text: None,
+                            images: vec![],
+                            files: vec![],
+                            message_id: "older-steer".into(),
+                            user_agent: None,
+                            skill_invocation: None,
+                        },
+                        "older-fingerprint",
+                        crate::db::SteeringAdmissionSource::DeferredObjective,
+                    )
+                    .await
+                    .unwrap();
+            }
             let (route, payload) = if dismiss {
                 (
                     "dismiss-question",
-                    serde_json::json!({"tool_use_id":"live-question"}),
+                    serde_json::json!({"request_id":request_id}),
                 )
             } else {
                 (
                     "respond",
-                    serde_json::json!({"tool_use_id":"live-question", "answers":{"Choice?":"A"}}),
+                    serde_json::json!({"request_id":request_id, "answers":{"Choice?":"A"}}),
                 )
             };
             let response = create_router(state.clone())
@@ -13039,6 +13068,14 @@ pub(crate) mod hard_delete_cascade_tests {
             if dismiss {
                 assert_eq!(llm.0.load(Ordering::SeqCst), 1);
                 assert!(storage.load_active_direct_turn(id).await.unwrap().is_none());
+                assert!(state.db.question_dismissal_paused(id).await.unwrap());
+                state
+                    .runtime
+                    .evict_runtime(id, crate::runtime::EvictionReason::SteeringReconciliation)
+                    .await;
+                handle = state.runtime.get_or_create(id).await.unwrap();
+                assert_eq!(state.db.get_steering_queue(id).await.unwrap().len(), 1);
+                assert_eq!(llm.0.load(Ordering::SeqCst), 1);
                 events = handle.broadcast_tx.subscribe();
                 let _ = send_chat(
                     State(state.clone()),
@@ -13071,6 +13108,26 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("mock model continuation must finish");
             assert!(storage.load_active_direct_turn(id).await.unwrap().is_none());
             assert_eq!(llm.0.load(Ordering::SeqCst), 2);
+            if dismiss {
+                assert!(!state.db.question_dismissal_paused(id).await.unwrap());
+                assert!(state.db.get_steering_queue(id).await.unwrap().is_empty());
+                let messages = state.db.get_messages(id).await.unwrap();
+                assert!(
+                    messages
+                        .iter()
+                        .position(|m| m.message_id == "older-steer")
+                        .unwrap()
+                        < messages
+                            .iter()
+                            .position(|m| m.message_id == "explicit-message")
+                            .unwrap()
+                );
+                let requests = llm.1.lock().unwrap();
+                assert!(
+                    requests[1].find("Earlier queued instruction").unwrap()
+                        < requests[1].find("Continue explicitly").unwrap()
+                );
+            }
         }
     }
 
@@ -13087,6 +13144,7 @@ pub(crate) mod hard_delete_cascade_tests {
         let pending = ConvState::AwaitingUserResponse {
             questions: vec![],
             tool_use_id: "current".into(),
+            request_id: "current".into(),
         };
         state
             .db
@@ -13108,13 +13166,13 @@ pub(crate) mod hard_delete_cascade_tests {
             ),
             (
                 "respond",
-                serde_json::json!({"tool_use_id": "old", "answers": {}}),
+                serde_json::json!({"request_id": "old", "answers": {}}),
                 StatusCode::CONFLICT,
                 "question_request_stale",
             ),
             (
                 "dismiss-question",
-                serde_json::json!({"tool_use_id": "old"}),
+                serde_json::json!({"request_id": "old"}),
                 StatusCode::CONFLICT,
                 "question_request_stale",
             ),
@@ -13163,6 +13221,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 &ConvState::AwaitingUserResponse {
                     questions: vec![],
                     tool_use_id: "tool-question".to_string(),
+                    request_id: "tool-question".to_string(),
                 },
             )
             .await

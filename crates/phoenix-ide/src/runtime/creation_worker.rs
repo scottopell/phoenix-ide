@@ -501,7 +501,12 @@ async fn enqueue_product_creation_objective(
     request_fingerprint: String,
 ) -> Result<(), String> {
     manager
-        .enqueue_steer_message(conversation_id, event, &request_fingerprint)
+        .enqueue_steer_message(
+            conversation_id,
+            event,
+            &request_fingerprint,
+            crate::db::SteeringAdmissionSource::DeferredObjective,
+        )
         .await
         .map_err(|error| error.to_string())
 }
@@ -3080,6 +3085,7 @@ mod product_creation_delivery_replay_tests {
                     skill_invocation: None,
                 },
                 "product-create:non-target",
+                crate::db::SteeringAdmissionSource::DeferredObjective,
             )
             .await
             .unwrap();
@@ -3236,6 +3242,7 @@ mod product_creation_delivery_replay_tests {
                 skill_invocation: None,
             },
             "product-create:req-stale-delivery",
+            crate::db::SteeringAdmissionSource::DeferredObjective,
         )
         .await
         .unwrap();

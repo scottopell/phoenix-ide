@@ -34,7 +34,7 @@ describe('AUQ product layout mutation fixture', () => {
     const {installProductConversationFixtureApi} = await import('../productConversation/mockApi');
     const {productConversationScenarios} = await import('../productConversation/scenarios');
     const base = productConversationScenarios[0]!;
-    const restore = installProductConversationFixtureApi({...base,latestConversationState:{type:'awaiting_user_response',tool_use_id:'fixture-request',questions:askUserQuestionScenarios[0]!.questions}});
+    const restore = installProductConversationFixtureApi({...base,latestConversationState:{type:'awaiting_user_response',request_id: 'fixture-request', tool_use_id:'fixture-request',questions:askUserQuestionScenarios[0]!.questions}});
     try {
       const id=base.snapshot!.latest_transcript_row_id!;
       await expect(api.respondToQuestion(id,'wrong',{'Scope':'A'})).rejects.toThrow(/no longer pending/);

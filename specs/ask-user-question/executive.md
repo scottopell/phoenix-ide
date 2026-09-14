@@ -11,13 +11,19 @@ submitted operation without silently substituting another draft.
 
 ## Technical Summary
 
-The approved redesign reuses the persisted `tool_use_id` in
-`AwaitingUserResponse`, threads it through web, CLI, native iOS, API payloads,
-and consuming runtime events, and scopes asynchronous completion to that
-identity. Browser layout and answer semantics are implemented against
-[ADR-053](../adrs/053_question-interactions-bind-explicit-answers-to-request-identity.md).
-Native iOS receives protocol adaptation, not the browser visual redesign.
-The legacy `design.md` remains historical and is not the redesign authority.
+Pending questions now carry a server-generated `request_id` independently of
+provider `tool_use_id`. Web, CLI, native iOS, API admission, runtime events, and
+atomic SQLite consumption use the incarnation identity. Migration 097 preserves
+pending questions while assigning missing identities and preserves historical
+dismissal pauses. A durable pause row holds queued steering until acceptance of
+a new explicit user message; deferred objective delivery cannot release it.
+The next drain delivers queued inputs FIFO with one LLM dispatch. Local SQLite
+question commands use exact outcome classification and the existing fail-stop
+boundary. Browser behavior follows [ADR-053](../adrs/053_question-interactions-bind-explicit-answers-to-request-identity.md);
+[ADR-054](../adrs/054_question-incarnations-and-durable-dismissal-resumption.md)
+refines request identity and dismissal resumption ownership. Native iOS receives
+protocol adaptation, not the browser visual redesign. The legacy `design.md`
+remains historical and is not the redesign authority.
 
 ## Status Summary
 
@@ -26,14 +32,14 @@ The legacy `design.md` remains historical and is not the redesign authority.
 | REQ-AUQ-001: Structured Question Presentation | Implemented | Unanswered initialization; explicit native selection, navigation, and send |
 | REQ-AUQ-002: Rich Option Previews | Implemented | Selected-only preview, absent/Other states, rendered-line disclosure, stationary narrow choices |
 | REQ-AUQ-003: Flexible Response Collection | Implemented | Retained custom drafts, explicit inclusion, universal notes, exact payload tests |
-| REQ-AUQ-004: Response Delivery to Agent | Implemented | Atomic response consumption; dismissal settles without queued resume |
+| REQ-AUQ-004: Response Delivery to Agent | Implemented | Atomic response consumption; durable dismissal pause; explicit resumption drains FIFO |
 | REQ-AUQ-005: Prevent Ambiguous Question Responses | Complete | Tool question/option count and uniqueness validation exists |
 | REQ-AUQ-006: Parent Conversation Availability | Complete | Tool registry excludes sub-agent invocation |
 | REQ-AUQ-007: Real-Time Waiting Feedback | Implemented | Pending identity across web, CLI, iOS; status and errors reflect operation outcome |
 | REQ-AUQ-008: Low-Overhead Tool Availability | Complete | Tool supports deferred discovery |
-| REQ-AUQ-009: Responsive Reading and Reachable Actions | Implemented; device qualification pending | 144 Chromium/WebKit journeys; real product shell, eight viewport sizes, 2×/4× equivalent reflow; physical keyboard/manual zoom gate in task 10006 |
+| REQ-AUQ-009: Responsive Reading and Reachable Actions | Implemented; device qualification pending | 160 Chromium/WebKit journeys; real product shell, eight viewport sizes, 2×/4× equivalent reflow; physical keyboard/manual zoom gate in task 10006 |
 | REQ-AUQ-010: Accessible Native Interaction | Implemented; AT qualification pending | Native controls, concise accessible names, scoped shortcuts, modal isolation; VoiceOver/TalkBack gate in task 10006 |
-| REQ-AUQ-011: Request-Bound Responses and Dismissal | Implemented | Admission/transition checks, atomic persisted identity, request-scoped callbacks, all-client tests |
+| REQ-AUQ-011: Request-Bound Responses and Dismissal | Implemented | Admission/transition checks, fresh incarnation identity, forward migration, request-scoped callbacks, all-client tests |
 | REQ-AUQ-012: Truthful Sending and Uncertain Outcomes | Implemented | Frozen retries, malformed-status protection, duplicate/partial-persistence regressions |
 | REQ-AUQ-013: Draft Lifetime and Request Isolation | Implemented | Mounted same-request draft retention; different identity resets, including identical text |
 

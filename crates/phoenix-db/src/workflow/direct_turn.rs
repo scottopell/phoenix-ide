@@ -277,7 +277,7 @@ pub struct AtomicContinuationSettlementInput {
 #[derive(Debug, Clone)]
 pub struct AtomicQuestionSettlementInput {
     pub conversation_id: String,
-    pub tool_use_id: String,
+    pub request_id: String,
     pub message: Message,
     pub completed_state: ConvState,
     pub state_updated_at: DateTime<Utc>,
@@ -1586,7 +1586,34 @@ impl WorkflowRepository {
         Ok(Some(summary))
     }
 
-    pub async fn settle_question_direct_turn_atomically(
+    pub async fn establish_question_direct_turn(
+        &self,
+        input: &AtomicQuestionSettlementInput,
+    ) -> crate::QuestionCommitResult {
+        self.establish_question_direct_turn_at_cut(input, TransactionCut::None)
+            .await
+    }
+
+    async fn establish_question_direct_turn_at_cut(
+        &self,
+        input: &AtomicQuestionSettlementInput,
+        cut: TransactionCut,
+    ) -> crate::QuestionCommitResult {
+        let result = self.settle_question_direct_turn_at_cut(input, cut).await;
+        crate::question_response::establish_question_commit(
+            &self.pool,
+            result,
+            &input.request_id,
+            &input.message,
+            &input.completed_state,
+            input.state_updated_at,
+            Some(&input.command),
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    async fn settle_question_direct_turn_atomically(
         &self,
         input: &AtomicQuestionSettlementInput,
     ) -> DbResult<bool> {
@@ -1634,7 +1661,7 @@ impl WorkflowRepository {
                 if !crate::commit_question_response_tx(
                     &mut tx.tx,
                     &input.conversation_id,
-                    &input.tool_use_id,
+                    &input.request_id,
                     &input.message,
                     &input.completed_state,
                     input.state_updated_at,
@@ -2474,7 +2501,9 @@ fn terminal_from_sql(
     }
 }
 
-fn terminal_command_parts(command: &TurnCommand) -> DbResult<(TurnAuthorityId, u64, TurnTerminal)> {
+pub(crate) fn terminal_command_parts(
+    command: &TurnCommand,
+) -> DbResult<(TurnAuthorityId, u64, TurnTerminal)> {
     match command {
         TurnCommand::Complete {
             turn_id,
@@ -2894,6 +2923,10 @@ async fn update_conversation_state_for_adoption_tx(
     if updated != 1 {
         return Err(DbError::ConversationNotFound(conversation.0.clone()));
     }
+    sqlx::query("DELETE FROM question_dismissal_pauses WHERE conversation_id = ?1")
+        .bind(&conversation.0)
+        .execute(&mut *tx.tx)
+        .await?;
     Ok(())
 }
 
@@ -3373,7 +3406,7 @@ fn disposition_sql(disposition: AcceptedDisposition) -> &'static str {
     }
 }
 
-fn terminal_sql(terminal: &TurnTerminal) -> (&'static str, Option<&str>) {
+pub(crate) fn terminal_sql(terminal: &TurnTerminal) -> (&'static str, Option<&str>) {
     match terminal {
         TurnTerminal::Completed => ("Completed", None),
         TurnTerminal::Cancelled => ("Cancelled", None),
@@ -4911,13 +4944,14 @@ mod tests {
             let pending = ConvState::AwaitingUserResponse {
                 questions: vec![],
                 tool_use_id: "pending".into(),
+                request_id: "pending".into(),
             };
             sqlx::query("UPDATE conversations SET state = ?1, state_kind = 'awaiting_user_response' WHERE id = 'conv-a'")
                 .bind(serde_json::to_string(&pending).unwrap()).execute(&repo.pool).await.unwrap();
             let content = crate::MessageContent::system("[ask-user-question-dismissed]");
             let settlement = AtomicQuestionSettlementInput {
                 conversation_id: "conv-a".into(),
-                tool_use_id: "pending".into(),
+                request_id: "pending".into(),
                 message: crate::Message {
                     message_id: "dismissal".into(),
                     conversation_id: "conv-a".into(),
@@ -4936,14 +4970,24 @@ mod tests {
                 },
             };
             let result = repo
-                .settle_question_direct_turn_at_cut(&settlement, cut)
+                .establish_question_direct_turn_at_cut(&settlement, cut)
                 .await;
-            if cut == TransactionCut::None {
-                assert!(result.unwrap());
-            } else {
-                assert!(result.is_err());
-            }
             let committed = cut != TransactionCut::BeforeCommit;
+            if committed {
+                assert!(matches!(
+                    result,
+                    super::super::LocalAuthorityResult::DurableFactEstablished(
+                        crate::QuestionCommitOutcome::Committed
+                    )
+                ));
+            } else {
+                assert!(matches!(
+                    result,
+                    super::super::LocalAuthorityResult::DurableFactEstablished(
+                        crate::QuestionCommitOutcome::NotCommitted(_)
+                    )
+                ));
+            }
             let turn = repo
                 .load_authoritative_turn(turn_id)
                 .await
@@ -4983,6 +5027,11 @@ mod tests {
                 .unwrap();
             assert_eq!(turn.generation, 1);
             assert!(!turn.owns_conversation());
+            repo.pool.close().await;
+            assert!(matches!(
+                repo.establish_question_direct_turn(&settlement).await,
+                super::super::LocalAuthorityResult::DurableFactUnclassified
+            ));
         }
     }
 
@@ -4999,13 +5048,14 @@ mod tests {
         let pending = ConvState::AwaitingUserResponse {
             questions: vec![],
             tool_use_id: "pending".into(),
+            request_id: "pending".into(),
         };
         sqlx::query("UPDATE conversations SET state = ?1, state_kind = 'awaiting_user_response' WHERE id = 'conv-a'")
             .bind(serde_json::to_string(&pending).unwrap()).execute(&repo.pool).await.unwrap();
         let content = crate::MessageContent::system("[ask-user-question-dismissed]");
         let settlement = AtomicQuestionSettlementInput {
             conversation_id: "conv-a".into(),
-            tool_use_id: "pending".into(),
+            request_id: "pending".into(),
             message: crate::Message {
                 message_id: "stale-dismissal".into(),
                 conversation_id: "conv-a".into(),

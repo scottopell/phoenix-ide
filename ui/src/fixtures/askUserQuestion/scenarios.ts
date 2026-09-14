@@ -22,6 +22,7 @@ export const askUserQuestionScenarios = [
   { id: 'multi-select', questions: [{ ...plain, multiSelect: true }] },
   { id: 'submit-error', questions: [plain], fail: true },
   { id: 'long-preview', questions: [{ ...plain, options: [{label:'Long preview', preview: 'A long wrapped preview must disclose its full content. '.repeat(70)}, {label:'No preview'}] }] },
+  { id: 'code-preview', questions: [{ ...plain, options: [{label:'Code preview', preview: `Compare this code:\n\n\`\`\`ts\nconst value = "${'long-unbroken-code-'.repeat(40)}";\n\`\`\``}, {label:'No preview'}] }] },
   { id: 'compact-headers', questions: ['A','B','C','D'].map(header => ({...plain,header,question:`Question ${header}?`})) },
   { id: 'read-only', questions: [preview], readOnly: true },
 ] satisfies { id: string; questions: UserQuestion[]; fail?: boolean; readOnly?: boolean }[];

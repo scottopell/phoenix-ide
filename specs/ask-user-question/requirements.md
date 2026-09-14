@@ -159,6 +159,23 @@ THE SYSTEM SHALL close the panel without recording an answer
 AND SHALL NOT indicate any refusal to the agent
 AND SHALL NOT authorize the agent to proceed autonomously
 AND SHALL NOT resume agent execution until the user sends an explicit message
+AND SHALL durably pause pre-existing queued steering until a newly accepted
+explicit user message authorizes resumption
+
+WHEN a new explicit user message is accepted after dismissal
+THE SYSTEM SHALL preserve FIFO order by delivering older queued steering before
+that message and dispatch the combined input once
+AND commit resumption authorization with acceptance of the explicit message
+AND SHALL NOT treat background objective delivery as user authorization
+
+WHEN restarting with a dismissed request
+THE SYSTEM SHALL reconstruct its pause or authorized FIFO resumption from durable
+rows without requiring a process-local event
+
+WHEN upgrading an idle conversation whose latest transcript entry is a question
+dismissal marker
+THE SYSTEM SHALL preserve its paused meaning in durable pause ownership
+AND SHALL NOT infer a pause when a later user message exists
 
 **Rationale:** The agent needs structured response data to continue the task.
 Including preview content and notes in the result gives the agent full context
@@ -205,7 +222,8 @@ user session.
 
 WHEN agent is waiting for user response
 THE SYSTEM SHALL indicate the waiting state to connected clients
-AND include the questions and originating tool_use_id in the state data
+AND include the questions, server-generated request_id, and originating
+tool_use_id in the state data
 
 WHEN user responds or dismisses
 THE SYSTEM SHALL transition state and notify all connected clients
@@ -249,8 +267,8 @@ AND cap centered content at 1200 px and ordinary answer text at 80ch
 WHERE the panel is narrower than 840 CSS px
 THE SYSTEM SHALL use one column with the selected preview after all choices
 and before notes
-AND provide Preview below on the selected option to scroll to and focus its
-preview heading without moving the choice rows
+AND provide a stable Preview below action after the choice list to scroll to
+and focus the selected option's preview heading without moving the choice rows
 
 THE SYSTEM SHALL use 16 px outer padding below 480 CSS px and 24 px otherwise
 AND show complete wrapping option descriptions without ellipsis
@@ -347,8 +365,10 @@ to answer predictably without accidental sending or hidden focus.
 
 ### REQ-AUQ-011: Request-Bound Responses and Dismissal
 
-THE SYSTEM SHALL identify a pending question request by its conversation ID and
-originating tool_use_id
+THE SYSTEM SHALL assign a fresh server-generated request_id to every pending
+question incarnation and identify it by conversation ID and request_id
+AND retain the originating tool_use_id only as provider provenance
+AND SHALL NOT reuse request identity when a provider repeats tool_use_id
 AND require that identity in response and dismissal payloads across supported
 web, CLI, and native iOS callers
 AND carry the identity through runtime events
@@ -371,6 +391,12 @@ AND leave a newer request's panel, draft, and focus intact
 
 **Rationale:** Identical question text does not authorize a stale client to
 answer a different request. Late responses must not erase the next question.
+
+WHEN upgrading persisted pending questions that predate request_id
+THE SYSTEM SHALL preserve their questions and provider tool_use_id
+AND assign each a fresh durable request_id before loading conversation state
+AND SHALL preserve an already-present valid request_id
+AND SHALL NOT synthesize a missing request identity while decoding live state
 
 **Dependencies:** [Compatibility Guarantees](../compatibility/requirements.md).
 

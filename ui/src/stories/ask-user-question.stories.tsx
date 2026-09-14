@@ -13,6 +13,7 @@ export const Multiple = storyFor('multiple');
 export const MultiSelect = storyFor('multi-select');
 export const SubmitError = storyFor('submit-error');
 export const LongPreview = storyFor('long-preview');
+export const CodePreview = storyFor('code-preview');
 export const CompactHeaders = storyFor('compact-headers');
 export const ReadOnly = storyFor('read-only');
 
@@ -21,6 +22,6 @@ import { productConversationScenarios } from '../fixtures/productConversation/sc
 import type { ProductConversationScenario } from '../fixtures/productConversation/types';
 const productScenario: ProductConversationScenario = {
   ...productConversationScenarios[0]!,
-  latestConversationState: {type:'awaiting_user_response', tool_use_id:'product-question', questions:askUserQuestionScenarios[1]!.questions},
+  latestConversationState: {type:'awaiting_user_response', request_id: 'product-question', tool_use_id:'product-question', questions:askUserQuestionScenarios[1]!.questions},
 };
 export const ProductLayout: Story = () => <div data-ask-user-question-fixture="product-layout"><ProductConversationFixture scenario={productScenario} /></div>;

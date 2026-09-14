@@ -27,14 +27,14 @@ enum ConversationAction: Equatable {
     case provideTaskFeedback(TaskFeedback)
     /// Answer the agent's questions (awaiting_user_response). Answers are
     /// keyed by question text, encoded per QuestionAnswers.
-    case respondToQuestions(toolUseId: String, answers: [String: String])
+    case respondToQuestions(requestId: String, answers: [String: String])
     /// Dismiss the questions without answering and return the conversation to idle.
-    case dismissQuestion(toolUseId: String)
+    case dismissQuestion(requestId: String)
 
-    var questionToolUseId: String? {
+    var questionRequestId: String? {
         switch self {
-        case .respondToQuestions(let toolUseId, _), .dismissQuestion(let toolUseId):
-            return toolUseId
+        case .respondToQuestions(let requestId, _), .dismissQuestion(let requestId):
+            return requestId
         default:
             return nil
         }

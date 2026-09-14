@@ -52,7 +52,7 @@ enum ConversationState: Equatable {
     case toolExecuting(toolName: String, remainingCount: Int, completedCount: Int)
     case awaitingSubAgents(pendingCount: Int, completedCount: Int)
     case awaitingContinuation
-    case awaitingUserResponse(toolUseId: String, questions: [UserQuestion])
+    case awaitingUserResponse(requestId: String, questions: [UserQuestion])
     case questionIdentityUnavailable
     case awaitingTaskApproval(title: String, priority: String, plan: String)
     case awaitingRecovery(message: String)
@@ -96,12 +96,12 @@ enum ConversationState: Equatable {
         case "awaiting_continuation":
             return .awaitingContinuation
         case "awaiting_user_response":
-            guard let toolUseId = json["tool_use_id"]?.stringValue,
-                  !toolUseId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            guard let requestId = json["request_id"]?.stringValue,
+                  !requestId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             else { return .questionIdentityUnavailable }
             let questions = (json["questions"]?.arrayValue ?? [])
                 .compactMap(UserQuestion.parse)
-            return .awaitingUserResponse(toolUseId: toolUseId, questions: questions)
+            return .awaitingUserResponse(requestId: requestId, questions: questions)
         case "awaiting_task_approval":
             guard let title = json["title"]?.stringValue,
                   let priority = json["priority"]?.stringValue,
@@ -141,6 +141,13 @@ enum ConversationState: Equatable {
             return .other(type: type)
         }
     }
+    var questionStatusIsUnverifiable: Bool {
+        switch self {
+        case .questionIdentityUnavailable, .unknown, .other: return true
+        default: return false
+        }
+    }
+
     /// Mirrors the server's chat/steering acceptance families. Plain
     /// cancellation rejects chat, while tool and sub-agent cancellation
     /// still accept a follow-up for after the current turn.

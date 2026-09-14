@@ -2,9 +2,11 @@
 
 ## Current reality
 
-The approved AskUserQuestion protocol adaptation is in progress. Web, CLI, and
-native iOS callers must send the pending tool identity; missing identity must
-receive an actionable no-mutation error. Cross-client qualification is pending.
+AskUserQuestion callers require the server-generated pending `request_id`;
+provider `tool_use_id` does not authorize mutation. Missing identity receives an
+actionable no-mutation error. Migration 097 preserves pending questions while
+assigning missing durable incarnations; browser, CLI, and native protocol checks
+cover the coordinated change.
 
 Phoenix supports forward SQLite migrations, but compatibility guarantees have not previously had one project-wide authority. Some feature tests and implementations therefore provide stronger cross-version behavior than a named product requirement demands.
 

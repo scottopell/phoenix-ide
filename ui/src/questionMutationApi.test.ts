@@ -11,8 +11,8 @@ describe('request-bound question API', () => {
     const annotations = { Choice: { notes: '  keep spacing  ' } };
     await api.respondToQuestion('conversation', 'original-request', answers, annotations);
     await api.dismissQuestion('conversation', 'original-request');
-    expect(JSON.parse(fetchMock.mock.calls[0]![1].body)).toEqual({ tool_use_id: 'original-request', answers, annotations });
-    expect(JSON.parse(fetchMock.mock.calls[1]![1].body)).toEqual({ tool_use_id: 'original-request' });
+    expect(JSON.parse(fetchMock.mock.calls[0]![1].body)).toEqual({ request_id: 'original-request', answers, annotations });
+    expect(JSON.parse(fetchMock.mock.calls[1]![1].body)).toEqual({ request_id: 'original-request' });
   });
 
   it.each([

@@ -502,7 +502,7 @@ describe('InputArea cancellation affordance', () => {
 
   it.each([
     { type: 'awaiting_task_approval', title: 'Plan', priority: 'p1', plan: 'Do it' },
-    { type: 'awaiting_user_response', tool_use_id: 'test-question', questions: [] },
+    { type: 'awaiting_user_response', request_id: 'test-question', tool_use_id: 'test-question', questions: [] },
     { type: 'awaiting_recovery', message: 'Recover', recovery_kind: 'credential', resume: { type: 'conversation_turn' } },
     { type: 'context_exhausted', summary: 'Done' },
     { type: 'handed_off', successor_conv_id: 'next' },

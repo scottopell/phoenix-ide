@@ -65,19 +65,21 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [051](051_predecessor-recall-is-bound-to-the-executing-transcript.md) | Predecessor recall is bound to the executing transcript | Accepted | REQ-RET-009, REQ-GR-007 |
 | [052](052_workers-and-tiers-resolve-usable-model-routes.md) | Workers and tiers resolve usable model routes | Accepted | REQ-AG-001–012, REQ-SA-007, REQ-SA-011 |
 | [053](053_question-interactions-bind-explicit-answers-to-request-identity.md) | Question interactions bind explicit answers to request identity | Accepted | REQ-AUQ-001–004/007/009–013, REQ-KB-001/004/008, REQ-COMP-006 |
+| [054](054_question-incarnations-and-durable-dismissal-resumption.md) | Question incarnations and durable dismissal resumption | Accepted | REQ-AUQ-004/007/011/012, REQ-COMP-006 |
 
 ## For agents: which decisions bind your task
 
 Question answer semantics, responsive question layout, native AUQ keyboard
 navigation, and question mutation protocol changes are governed by
-[ADR-053](053_question-interactions-bind-explicit-answers-to-request-identity.md).
+[ADR-053](053_question-interactions-bind-explicit-answers-to-request-identity.md)
+and [ADR-054](054_question-incarnations-and-durable-dismissal-resumption.md).
 
 Consult the relevant ADRs before starting work of each kind.
 
 | Task type | Relevant ADRs |
 | --- | --- |
 | Configuring named workers, tiers, or sub-agent model routes | 052, within 034's compatibility scope |
-| Changing question answer UX, responsive layout, or request mutation identity | 053, 050, 034 |
+| Changing question answer UX, responsive layout, or request mutation identity | 054, 053, 050, 034 |
 | Creating or restructuring Phoenix spec artifacts | 000 |
 | Deciding whether to create a new `design.md` | 000 |
 | Migrating legacy `specs/*/design.md` content | 000, 001, 002, 003, 004, 005, 006 |

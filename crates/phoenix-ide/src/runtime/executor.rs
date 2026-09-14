@@ -95,7 +95,7 @@ enum AuthoritativeEffect {
         results: Vec<ToolResult>,
     },
     CommitQuestionRequest {
-        tool_use_id: String,
+        request_id: String,
         message_id: String,
         resolution: crate::state_machine::effect::QuestionResolution,
     },
@@ -262,11 +262,11 @@ impl ClassifiedEffect {
                 }))
             }
             Effect::CommitQuestionRequest {
-                tool_use_id,
+                request_id,
                 message_id,
                 resolution,
             } => Self::Authoritative(Box::new(AuthoritativeEffect::CommitQuestionRequest {
-                tool_use_id,
+                request_id,
                 message_id,
                 resolution,
             })),
@@ -2852,10 +2852,10 @@ where
         &mut self,
         event: Event,
     ) -> Result<AcknowledgedEventOutcome, String> {
-        if let Event::UserQuestionResponse { tool_use_id, .. }
-        | Event::UserQuestionDismissed { tool_use_id } = &event
+        if let Event::UserQuestionResponse { request_id, .. }
+        | Event::UserQuestionDismissed { request_id } = &event
         {
-            if !crate::state_machine::transition::accepts_question_request(&self.state, tool_use_id)
+            if !crate::state_machine::transition::accepts_question_request(&self.state, request_id)
             {
                 return Ok(AcknowledgedEventOutcome::QuestionRejected);
             }
@@ -3931,9 +3931,10 @@ where
         &mut self,
     ) -> Result<Option<(Event, Option<tokio::sync::OwnedMutexGuard<()>>)>, String> {
         if matches!(self.state, ConvState::Idle)
-            && self.storage.get_latest_message(&self.context.conversation_id).await?
-                .is_some_and(|message| matches!(message.content, MessageContent::System(system)
-                    if system.text == crate::state_machine::transition::USER_QUESTION_DISMISSED_MARKER))
+            && self
+                .storage
+                .question_dismissal_paused(&self.context.conversation_id)
+                .await?
         {
             return Ok(None);
         }
@@ -6196,17 +6197,12 @@ where
             }
 
             AuthoritativeEffect::CommitQuestionRequest {
-                tool_use_id,
+                request_id,
                 message_id,
                 resolution,
             } => {
-                Box::pin(self.commit_question_request(
-                    tool_use_id,
-                    message_id,
-                    resolution,
-                    admitted,
-                ))
-                .await
+                Box::pin(self.commit_question_request(request_id, message_id, resolution, admitted))
+                    .await
             }
 
             AuthoritativeEffect::PersistHiddenSystemMarker { marker, message_id } => {
@@ -6352,9 +6348,10 @@ where
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn commit_question_request(
         &mut self,
-        tool_use_id: String,
+        request_id: String,
         message_id: String,
         resolution: crate::state_machine::effect::QuestionResolution,
         admitted: &mut crate::runtime::AdmittedOperation,
@@ -6398,24 +6395,60 @@ where
                     state_updated_at: updated_at,
                 },
             );
-        let committed = if let Some(settlement) = &terminal {
-            self.storage
-                .settle_question_direct_turn(settlement, &tool_use_id, &message)
-                .await?
-        } else {
-            self.storage
-                .commit_question_response(
-                    &self.context.conversation_id,
-                    &tool_use_id,
-                    &message,
-                    &completed_state,
-                    updated_at,
-                )
-                .await?
+        let storage = self.storage.clone();
+        let command_message = message.clone();
+        let command_state = completed_state.clone();
+        let command_terminal = terminal.clone();
+        let boundary_admission = admitted.transfer();
+        let boundary_owner = tokio::spawn(async move {
+            let outcome = if let Some(settlement) = &command_terminal {
+                storage
+                    .settle_question_direct_turn(settlement, &request_id, &command_message)
+                    .await
+            } else {
+                storage
+                    .commit_question_response(
+                        &command_message.conversation_id,
+                        &request_id,
+                        &command_message,
+                        &command_state,
+                        updated_at,
+                    )
+                    .await
+            };
+            if matches!(
+                outcome,
+                phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified
+            ) {
+                boundary_admission.close("question_commit");
+            }
+            (outcome, boundary_admission)
+        });
+        let mut owner_guard = AuthorityBoundaryConsumerGuard {
+            fence: Some(self.fatal_local_authority_fence.clone()),
         };
-        if !committed {
-            self.creation_settlement_disposition = CreationSettlementDisposition::StaleAuthority;
-            return Ok(None);
+        let (outcome, mut boundary_admission) = boundary_owner.await.map_err(|error| {
+            tracing::error!(?error, "question authority boundary owner disappeared");
+            "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:question_boundary_disappeared".to_string()
+        })?;
+        owner_guard.disarm();
+        match outcome {
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(
+                phoenix_db::QuestionCommitOutcome::Committed,
+            ) => {}
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(
+                phoenix_db::QuestionCommitOutcome::Rejected,
+            ) => {
+                self.creation_settlement_disposition =
+                    CreationSettlementDisposition::StaleAuthority;
+                return Ok(None);
+            }
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(
+                phoenix_db::QuestionCommitOutcome::NotCommitted(error),
+            ) => return Err(error),
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                return Err("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:question_commit".to_string());
+            }
         }
         if terminal.is_some() {
             self.active_direct_turn = None;
@@ -6429,7 +6462,7 @@ where
         self.settle_turn_span();
         let _ = self
             .broadcast_tx
-            .admitted_publication(admitted)
+            .admitted_publication(&mut boundary_admission)
             .persisted_message(message);
         Ok(None)
     }
@@ -18185,15 +18218,76 @@ mod steer_drain_detector_tests {
     }
 
     #[tokio::test]
+    async fn question_mutations_unclassified_authority_closes_admission_without_retry_or_publication(
+    ) {
+        for dismiss in [false, true] {
+            let id = "question-unclassified";
+            let pending = ConvState::AwaitingUserResponse {
+                questions: vec![],
+                tool_use_id: "pending".into(),
+                request_id: "pending".into(),
+            };
+            let (mut rt, storage) = build_runtime_with_state_and_queue(id, pending.clone(), vec![]);
+            storage
+                .update_state(id, &pending, Utc::now())
+                .await
+                .unwrap();
+            let turn = crate::runtime::traits::ActiveDirectTurn {
+                turn_id: phoenix_workflow::TurnAuthorityId(77),
+                generation: 0,
+            };
+            storage.set_active_direct_turn(Some(turn.clone()));
+            rt.active_direct_turn = Some(Box::new(turn));
+            storage.set_question_commit_unclassified(true);
+            let mut published = rt.broadcast_tx.subscribe();
+            let event = if dismiss {
+                Event::UserQuestionDismissed {
+                    request_id: "pending".into(),
+                }
+            } else {
+                Event::UserQuestionResponse {
+                    request_id: "pending".into(),
+                    answers: std::collections::HashMap::new(),
+                    annotations: None,
+                }
+            };
+            let error = rt.process_acknowledged_event(event).await.unwrap_err();
+            assert!(error.starts_with("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:"));
+            assert!(rt.fatal_local_authority_fence.is_closed());
+            assert!(rt.admit_authoritative_effect().is_err());
+            assert!(rt.terminal_transition_retry.is_none());
+            assert!(rt.llm_task_handle.is_none());
+            assert_eq!(rt.state, pending);
+            assert!(storage.get_all_messages(id).is_empty());
+            while let Ok(event) = published.try_recv() {
+                assert!(!matches!(
+                    event,
+                    SseEvent::StateChange { .. } | SseEvent::Message { .. }
+                ));
+            }
+            storage.set_question_commit_unclassified(false);
+            assert!(rt
+                .process_acknowledged_event(Event::UserQuestionDismissed {
+                    request_id: "pending".into()
+                })
+                .await
+                .is_err());
+            assert!(storage.get_all_messages(id).is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn question_mutations_stale_persisted_identity_retires_without_effects() {
         let id = "question-persisted-race";
         let old = ConvState::AwaitingUserResponse {
             questions: vec![],
             tool_use_id: "old".into(),
+            request_id: "old".into(),
         };
         let current = ConvState::AwaitingUserResponse {
             questions: vec![],
             tool_use_id: "new".into(),
+            request_id: "new".into(),
         };
         let (mut rt, storage) = build_runtime_with_state_and_queue(id, old, vec![]);
         storage
@@ -18202,7 +18296,7 @@ mod steer_drain_detector_tests {
             .unwrap();
         assert_eq!(
             rt.process_acknowledged_event(Event::UserQuestionResponse {
-                tool_use_id: "old".into(),
+                request_id: "old".into(),
                 answers: std::collections::HashMap::new(),
                 annotations: None,
             })
@@ -18222,6 +18316,7 @@ mod steer_drain_detector_tests {
             let pending = ConvState::AwaitingUserResponse {
                 questions: vec![],
                 tool_use_id: "original".into(),
+                request_id: "original".into(),
             };
             let (mut rt, storage) = build_runtime_with_state_and_queue(id, pending.clone(), vec![]);
             storage
@@ -18232,7 +18327,7 @@ mod steer_drain_detector_tests {
             storage.set_fail_message_add(!fail_state);
             storage.set_fail_state_update(fail_state);
             let answer = Event::UserQuestionResponse {
-                tool_use_id: "original".into(),
+                request_id: "original".into(),
                 answers: std::collections::HashMap::new(),
                 annotations: None,
             };
@@ -18267,6 +18362,7 @@ mod steer_drain_detector_tests {
         let pending = ConvState::AwaitingUserResponse {
             questions: vec![],
             tool_use_id: "original".into(),
+            request_id: "original".into(),
         };
         let (mut rt, storage) = build_runtime_with_state_and_queue(
             id,
@@ -18284,7 +18380,7 @@ mod steer_drain_detector_tests {
             .await
             .unwrap();
         let dismiss = Event::UserQuestionDismissed {
-            tool_use_id: "original".into(),
+            request_id: "original".into(),
         };
         assert_eq!(
             rt.process_acknowledged_event(dismiss).await.unwrap(),
@@ -18340,6 +18436,7 @@ mod steer_drain_detector_tests {
                 multi_select: false,
             }],
             tool_use_id: "original".into(),
+            request_id: "original".into(),
         };
         let (mut rt, storage) = build_runtime_with_state_and_queue(id, pending.clone(), vec![]);
         storage
@@ -18348,7 +18445,7 @@ mod steer_drain_detector_tests {
             .unwrap();
         let mut requests = rt.llm_client.subscribe_request_count();
         let answer = Event::UserQuestionResponse {
-            tool_use_id: "original".into(),
+            request_id: "original".into(),
             answers: [("Choice?".to_string(), "custom\nanswer".to_string())].into(),
             annotations: None,
         };
@@ -18386,6 +18483,7 @@ mod steer_drain_detector_tests {
         let pending = ConvState::AwaitingUserResponse {
             questions: vec![],
             tool_use_id: "next-question".into(),
+            request_id: "next-question".into(),
         };
         let (mut rt, storage) = build_runtime_with_state_and_queue(id, pending.clone(), vec![]);
         storage
@@ -18394,12 +18492,12 @@ mod steer_drain_detector_tests {
             .unwrap();
         for event in [
             Event::UserQuestionResponse {
-                tool_use_id: "old-question".into(),
+                request_id: "old-question".into(),
                 answers: std::collections::HashMap::new(),
                 annotations: None,
             },
             Event::UserQuestionDismissed {
-                tool_use_id: "old-question".into(),
+                request_id: "old-question".into(),
             },
         ] {
             assert_eq!(
@@ -18412,7 +18510,7 @@ mod steer_drain_detector_tests {
             assert!(rt.llm_task_handle.is_none());
         }
         let dismiss = Event::UserQuestionDismissed {
-            tool_use_id: "next-question".into(),
+            request_id: "next-question".into(),
         };
         assert_eq!(
             rt.process_acknowledged_event(dismiss.clone())

@@ -248,11 +248,15 @@ fn arb_awaiting_user_response_state() -> impl Strategy<Value = ConvState> {
     (
         proptest::collection::vec(arb_user_question(), 1..=4),
         "[a-z]{8}",
+        "[a-z]{8}",
     )
-        .prop_map(|(questions, tool_use_id)| ConvState::AwaitingUserResponse {
-            questions,
-            tool_use_id,
-        })
+        .prop_map(
+            |(questions, tool_use_id, request_id)| ConvState::AwaitingUserResponse {
+                questions,
+                tool_use_id,
+                request_id,
+            },
+        )
 }
 
 fn arb_awaiting_recovery_state() -> impl Strategy<Value = ConvState> {
@@ -367,7 +371,7 @@ fn arb_user_question_response_event() -> impl Strategy<Value = Event> {
             .into_iter()
             .collect::<std::collections::HashMap<String, String>>();
         Event::UserQuestionResponse {
-            tool_use_id: "tool-auq-1".to_string(),
+            request_id: "tool-auq-1".to_string(),
             answers,
             annotations: None,
         }
@@ -397,7 +401,7 @@ pub(crate) fn arb_event() -> impl Strategy<Value = Event> {
         arb_task_approval_event(),
         arb_user_question_response_event(),
         Just(Event::UserQuestionDismissed {
-            tool_use_id: "tool-auq-1".to_string()
+            request_id: "tool-auq-1".to_string()
         }),
         arb_grace_turn_exhausted_event(),
     ]

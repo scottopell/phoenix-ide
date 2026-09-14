@@ -11,6 +11,7 @@ use phoenix_core::work_scope::WorkScopeId;
 
 use super::{DbError, DbResult, ProjectSeedId};
 
+mod question_request_identity;
 mod retire_commission_review;
 
 struct Migration {
@@ -504,6 +505,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 97,
         name: "persist_sub_agent_execution_connection",
         sql: MIGRATION_097,
+    },
+    Migration {
+        version: 98,
+        name: "assign_question_request_incarnations",
+        sql: "CREATE TABLE IF NOT EXISTS question_dismissal_pauses (conversation_id TEXT PRIMARY KEY NOT NULL REFERENCES conversations(id) ON DELETE CASCADE);",
     },
 ];
 
@@ -9331,6 +9337,7 @@ async fn run_migration_096(pool: &SqlitePool, migration: &Migration) -> DbResult
 /// # Errors
 ///
 /// Returns a [`DbError`] if the underlying database operation fails.
+#[allow(clippy::too_many_lines)]
 pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
     // Ensure the tracking table exists
     sqlx::raw_sql(
@@ -9439,6 +9446,9 @@ pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
         }
 
         sqlx::raw_sql(migration.sql).execute(&mut *tx).await?;
+        if migration.version == 98 {
+            question_request_identity::run(&mut tx).await?;
+        }
 
         sqlx::query("INSERT INTO _migrations (version, name) VALUES (?, ?)")
             .bind(migration.version)

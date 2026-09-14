@@ -1,15 +1,15 @@
-import { useState, useEffect, useLayoutEffect, useRef, useId, type KeyboardEvent, type CSSProperties } from 'react';
+import { useState, useEffect, useLayoutEffect, useRef, useId, type KeyboardEvent, type CSSProperties, type ReactNode } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { api, QuestionMutationError, type UserQuestion, type ConversationState } from '../api';
 import { useRegisterFocusScope, useFocusScope } from '../hooks/useFocusScope';
-import { formatShortcut } from '../utils';
+import { formatShortcut, parseConversationState } from '../utils';
 import { createQuestionDraft, choose, selected, isAnswered, answerPayload, type QuestionDraft } from './questionDraft';
 import './QuestionPanel.css';
 
 export interface QuestionPanelProps {
   questions: UserQuestion[];
   conversationId: string;
-  toolUseId: string;
+  requestId: string;
   showToast: (message: string, duration?: number) => void;
   onAnswered: () => void;
   onDismissed: () => void;
@@ -19,6 +19,16 @@ export interface QuestionPanelProps {
 type Operation = { kind: 'answer'; payload: ReturnType<typeof answerPayload> } | { kind: 'dismiss' };
 type Submission = { kind: 'editing' } | { kind: 'sending'; operation: Operation }
   | { kind: 'uncertain'; operation: Operation; checked: boolean; message: string };
+const previewComponents = {
+  pre: ({children}: {children?: ReactNode}) => <pre tabIndex={0} role="region" aria-label="Preview code" onKeyDown={event => {
+    if (event.altKey || event.ctrlKey || event.metaKey || event.currentTarget.scrollWidth <= event.currentTarget.clientWidth) return;
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+    event.preventDefault(); event.stopPropagation();
+    const element = event.currentTarget;
+    if (event.key === 'Home' || event.key === 'End') element.scrollTo({left: event.key === 'Home' ? 0 : element.scrollWidth});
+    else element.scrollBy({left: event.key === 'ArrowRight' ? 40 : -40});
+  }}>{children}</pre>,
+};
 
 export function QuestionPanel(props: QuestionPanelProps) {
   if (props.readOnly) return <section className="question-panel question-panel--readonly" aria-label="Questions (read only)">
@@ -27,10 +37,10 @@ export function QuestionPanel(props: QuestionPanelProps) {
         <strong>{option.label}</strong>{option.description && <p>{option.description}</p>}{option.preview && !question.multiSelect && <pre>{option.preview}</pre>}
       </li>)}</ul></section>)}
   </section>;
-  return <ActiveQuestionPanel key={`${props.conversationId}:${props.toolUseId}`} {...props} />;
+  return <ActiveQuestionPanel key={`${props.conversationId}:${props.requestId}`} {...props} />;
 }
 
-function ActiveQuestionPanel({ questions, conversationId, toolUseId, showToast, onAnswered, onDismissed, onResolved }: QuestionPanelProps) {
+function ActiveQuestionPanel({ questions, conversationId, requestId, showToast, onAnswered, onDismissed, onResolved }: QuestionPanelProps) {
   useRegisterFocusScope('question-panel');
   const { activeScope } = useFocusScope();
   const id = useId();
@@ -38,7 +48,7 @@ function ActiveQuestionPanel({ questions, conversationId, toolUseId, showToast, 
   const body = useRef<HTMLDivElement>(null);
   const previewRef = useRef<HTMLElement>(null);
   const otherChoiceRef = useRef<HTMLInputElement>(null);
-  const previewTextRef = useRef<HTMLPreElement>(null);
+  const previewTextRef = useRef<HTMLDivElement>(null);
   const [previewOverflow, setPreviewOverflow] = useState(false);
   const otherRef = useRef<HTMLTextAreaElement>(null);
   const notesRef = useRef<HTMLTextAreaElement>(null);
@@ -134,10 +144,12 @@ function ActiveQuestionPanel({ questions, conversationId, toolUseId, showToast, 
     try {
       const result = await api.getConversation(conversationId);
       if (!mounted.current) return;
-      if (!result.conversation.state || (result.conversation.state.type === 'awaiting_user_response' && (typeof result.conversation.state.tool_use_id !== 'string' || !result.conversation.state.tool_use_id))) throw new Error('Question status unavailable');
-      if (result.conversation.state.type !== 'awaiting_user_response' || result.conversation.state.tool_use_id !== toolUseId) {
+      const rawState = result.conversation.state;
+      const state = parseConversationState(rawState);
+      if (!rawState || rawState.type !== state.type) throw new Error('Question status unavailable');
+      if (state.type !== 'awaiting_user_response' || state.request_id !== requestId) {
         showToast('This question is no longer awaiting an answer');
-        onResolved(result.conversation.state);
+        onResolved(state);
       } else setSubmission({ kind: 'uncertain', operation, checked: true,
         message: operation.kind === 'answer' ? 'Your original answer may still be processing. Retry sends the same answer.' : 'The dismissal may still be processing. Retry dismisses the same question.' });
     } catch {
@@ -149,8 +161,8 @@ function ActiveQuestionPanel({ questions, conversationId, toolUseId, showToast, 
     inFlight.current = true;
     setSubmission({ kind: 'sending', operation }); setError('');
     try {
-      if (operation.kind === 'answer') await api.respondToQuestion(conversationId, toolUseId, operation.payload.answers, operation.payload.annotations);
-      else await api.dismissQuestion(conversationId, toolUseId);
+      if (operation.kind === 'answer') await api.respondToQuestion(conversationId, requestId, operation.payload.answers, operation.payload.annotations);
+      else await api.dismissQuestion(conversationId, requestId);
       if (!mounted.current) return;
       if (operation.kind === 'answer') { onAnswered(); showToast('Answers sent'); }
       else { onDismissed(); showToast('Questions dismissed. Send a message to continue.'); }
@@ -193,7 +205,7 @@ function ActiveQuestionPanel({ questions, conversationId, toolUseId, showToast, 
       if (editor) {
         if (event.target === notesRef.current) notesButton.current?.focus(); else otherChoiceRef.current?.focus();
       } else if (!locked) {
-        if (draft?.notesOpen && event.target === notesButton.current) update(value => ({ ...value, notesOpen: false }));
+        if (draft?.notesOpen) { update(value => ({ ...value, notesOpen: false })); notesButton.current?.focus(); }
         else if (draft?.previewOpen) update(value => ({ ...value, previewOpen: false }));
         else setConfirmDismiss(true);
       }
@@ -275,7 +287,7 @@ function ActiveQuestionPanel({ questions, conversationId, toolUseId, showToast, 
           </fieldset>
           {previewMode && <section ref={previewRef} className={`question-preview-pane${bounds.previewFits ? ' question-preview-pane--sticky' : ''}`} aria-label="Selected option preview">
             <h3 tabIndex={-1}>Preview{choice ? ` — ${choice.label}` : otherSelected ? ' — Other' : ''}</h3>
-            {preview ? <><pre ref={previewTextRef} className={draft.previewOpen ? undefined : 'question-preview-text--collapsed'}>{preview}</pre>
+            {preview ? <><div ref={previewTextRef} className={`question-preview-text${draft.previewOpen ? '' : ' question-preview-text--collapsed'}`}><ReactMarkdown components={previewComponents}>{preview}</ReactMarkdown></div>
               {previewOverflow && <button type="button" disabled={locked} onClick={() => update(value => ({ ...value, previewOpen: !value.previewOpen }))} aria-expanded={draft.previewOpen}>{draft.previewOpen ? 'Show less' : 'Show full preview'}</button>}</>
               : <p>{otherSelected ? 'Your custom answer will be sent.' : choice ? 'No preview for this option.' : 'Choose an option to view its preview.'}</p>}
           </section>}

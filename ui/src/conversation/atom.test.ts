@@ -2815,15 +2815,15 @@ it('applies replaceable bash progress without advancing the replay sequence floo
 });
 
 describe('request-bound question callbacks', () => {
-  const pending: ConversationAtom = { ...createInitialAtom(), conversationId: 'conv-1', phase: {type: 'awaiting_user_response', tool_use_id: 'new-request', questions: []}, lastAppliedEventSeq: 12 };
+  const pending: ConversationAtom = { ...createInitialAtom(), conversationId: 'conv-1', phase: {type: 'awaiting_user_response', request_id: 'new-request', tool_use_id: 'new-request', questions: []}, lastAppliedEventSeq: 12 };
   it('ignores an old callback after the next question arrives', () => {
-    expect(conversationReducer(pending, {type:'question_phase_change',expectedConversationId:'conv-1',toolUseId:'old-request',phase:{type:'idle'}})).toBe(pending);
+    expect(conversationReducer(pending, {type:'question_phase_change',expectedConversationId:'conv-1',requestId:'old-request',phase:{type:'idle'}})).toBe(pending);
   });
   it('ignores a callback from a different conversation', () => {
-    expect(conversationReducer(pending, {type:'question_phase_change',expectedConversationId:'other-conv',toolUseId:'new-request',phase:{type:'idle'}})).toBe(pending);
+    expect(conversationReducer(pending, {type:'question_phase_change',expectedConversationId:'other-conv',requestId:'new-request',phase:{type:'idle'}})).toBe(pending);
   });
   it('updates only the matching pending request without advancing stream sequence', () => {
-    const next = conversationReducer(pending, {type:'question_phase_change',expectedConversationId:'conv-1',toolUseId:'new-request',phase:{type:'idle'}});
+    const next = conversationReducer(pending, {type:'question_phase_change',expectedConversationId:'conv-1',requestId:'new-request',phase:{type:'idle'}});
     expect(next.phase.type).toBe('idle'); expect(next.lastAppliedEventSeq).toBe(12);
   });
 });

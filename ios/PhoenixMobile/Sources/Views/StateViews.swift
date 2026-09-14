@@ -119,11 +119,12 @@ struct StateDetailView: View {
                 Text(message).font(.callout)
                 HStack {
                     Button("Check status again") { session.checkQuestionStatus() }
+                        .disabled(!session.canCheckQuestionStatus)
                     Button(session.actionInFlight?.questionRetryLabel ?? "Retry same answer") {
                         session.retryQuestionOperation()
                     }
+                    .disabled(!session.canRetryQuestionOperation)
                 }
-                .disabled(!session.canRetryQuestionOperation)
             }
             .padding(.horizontal, 12)
         }
@@ -173,18 +174,18 @@ struct StateDetailBody: View {
         case .questionIdentityUnavailable:
             Text("Question identity is missing. Update Phoenix and reload this conversation before answering.")
                 .font(.callout)
-        case .awaitingUserResponse(let toolUseId, let questions):
+        case .awaitingUserResponse(let requestId, let questions):
             if questions.isEmpty {
-                emptyQuestionCard(toolUseId: toolUseId)
+                emptyQuestionCard(requestId: requestId)
             } else {
                 QuestionCardBody(
                     questions: questions,
                     isOnline: isOnline,
                     acceptsActions: acceptsActions,
                     busy: busy,
-                    onAnswer: { onAction(.respondToQuestions(toolUseId: toolUseId, answers: $0)) },
-                    onDismiss: { onAction(.dismissQuestion(toolUseId: toolUseId)) })
-                    .id(toolUseId)
+                    onAnswer: { onAction(.respondToQuestions(requestId: requestId, answers: $0)) },
+                    onDismiss: { onAction(.dismissQuestion(requestId: requestId)) })
+                    .id(requestId)
             }
 
         case .awaitingTaskApproval(let title, let priority, let plan):
@@ -321,7 +322,7 @@ struct StateDetailBody: View {
             onDismiss: { onAction(.dismissError) })
     }
 
-    private func emptyQuestionCard(toolUseId: String) -> some View {
+    private func emptyQuestionCard(requestId: String) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             Label("The agent is waiting for a response", systemImage: "questionmark.bubble")
                 .font(.callout.bold())
@@ -357,7 +358,7 @@ struct StateDetailBody: View {
             titleVisibility: .visible
         ) {
             Button("Dismiss question", role: .destructive) {
-                onAction(.dismissQuestion(toolUseId: toolUseId))
+                onAction(.dismissQuestion(requestId: requestId))
             }
         }
     }
