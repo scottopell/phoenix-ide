@@ -74,7 +74,8 @@ enum ConversationState: Equatable {
     /// `{ "type": ..., ...fields }` object.
     static func parse(_ json: JSONValue?) -> ConversationState {
         guard let json else { return .unknown }
-        guard let type = json.stringValue ?? json["type"]?.stringValue else {
+        guard let type = json.stringValue ?? json["type"]?.stringValue,
+              !type.isEmpty, type == type.trimmingCharacters(in: .whitespacesAndNewlines) else {
             return .unknown
         }
         switch type {
@@ -137,13 +138,15 @@ enum ConversationState: Equatable {
             return .terminal
         case "handed_off":
             return .handedOff(successorConversationId: json["successor_conv_id"]?.stringValue)
-        default:
+        case "recoverable_continuation_failure", "completed", "failed", "creation_cancelled":
             return .other(type: type)
+        default:
+            return .unknown
         }
     }
     var questionStatusIsUnverifiable: Bool {
         switch self {
-        case .questionIdentityUnavailable, .unknown, .other: return true
+        case .questionIdentityUnavailable, .unknown: return true
         default: return false
         }
     }

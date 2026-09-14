@@ -393,6 +393,7 @@ export type SSEAction =
       transcriptCoverage?: 'tail' | 'complete';
       eventCursorFloor?: number;
       snapshotStartedAtEventSeq: number;
+      snapshotStartedAtPhase: ConversationState;
     }
   | {
       type: 'set_system_prompt';
@@ -1479,7 +1480,11 @@ export function conversationReducer(
 
     case 'question_phase_change':
       if (action.expectedConversationId !== atom.conversationId || atom.phase.type !== 'awaiting_user_response' || atom.phase.request_id !== action.requestId) return atom;
-      return { ...atom, phase: action.phase, phaseStateUpdatedAt: action.stateUpdatedAt };
+      return {
+        ...atom,
+        phase: action.phase,
+        phaseStateUpdatedAt: action.stateUpdatedAt,
+      };
 
     case 'local_phase_change':
       if (action.expectedConversationId !== atom.conversationId) return atom;
@@ -1546,7 +1551,7 @@ export function conversationReducer(
         conversationId: action.conversationId,
         conversation,
         messages,
-        phase: atom.phaseLastAppliedEventSeq > action.snapshotStartedAtEventSeq ? atom.phase : action.phase,
+        phase: atom.phase !== action.snapshotStartedAtPhase || atom.phaseLastAppliedEventSeq > action.snapshotStartedAtEventSeq ? atom.phase : action.phase,
         phaseLastAppliedEventSeq: atom.phaseLastAppliedEventSeq,
         pendingMessagePatches: Object.fromEntries(
           Object.entries(atom.pendingMessagePatches).filter(

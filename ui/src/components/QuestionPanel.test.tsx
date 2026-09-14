@@ -6,7 +6,7 @@ import { QuestionPanel } from './QuestionPanel';
 const question: UserQuestion = { header: 'Scope', question: 'Where to search?', multiSelect: false, options: [{label: 'Current', preview: 'current preview'}, {label: 'Family'}] };
 const defaults = { questions: [question], conversationId: 'conv', requestId: 'request-1', showToast: vi.fn(), onResolved: vi.fn() };
 const deferred = () => { let resolve!: (value: {success:boolean}) => void; let reject!: (error: Error) => void; const promise = new Promise<{success:boolean}>((yes,no) => { resolve=yes; reject=no; }); return {promise,resolve,reject}; };
-beforeEach(() => { vi.spyOn(api,'getConversation').mockResolvedValue({conversation:{state:{type:'idle'}}} as Awaited<ReturnType<typeof api.getConversation>>); });
+beforeEach(() => { vi.spyOn(api,'getConversationStatus').mockResolvedValue({conversation:{state:{type:'idle'}}} as Awaited<ReturnType<typeof api.getConversationStatus>>); });
 afterEach(() => { vi.restoreAllMocks(); vi.clearAllMocks(); });
 
 describe('QuestionPanel request and draft contract', () => {
@@ -22,7 +22,7 @@ describe('QuestionPanel request and draft contract', () => {
   });
   it('normalizes nested REST state before resolving uncertainty', async () => {
     vi.spyOn(api,'respondToQuestion').mockRejectedValue(new Error('network'));
-    vi.spyOn(api,'getConversation').mockResolvedValue({conversation:{state:{type:'recoverable_continuation_failure', failure:{message:'Summary failed',error_kind:'server_error',request:{operation_id:'continue-1',attempt:2}}}}} as unknown as Awaited<ReturnType<typeof api.getConversation>>);
+    vi.spyOn(api,'getConversationStatus').mockResolvedValue({conversation:{state:{type:'recoverable_continuation_failure', failure:{message:'Summary failed',error_kind:'server_error',request:{operation_id:'continue-1',attempt:2}}}}} as unknown as Awaited<ReturnType<typeof api.getConversationStatus>>);
     render(<QuestionPanel {...defaults} />);
     fireEvent.click(screen.getByRole('radio',{name:'Current'}));
     fireEvent.click(screen.getByRole('button',{name:'Send answer'}));
@@ -99,7 +99,7 @@ describe('QuestionPanel request and draft contract', () => {
   });
   it('freezes an uncertain operation and retries the identical snapshot even after a later rejection', async () => {
     const send = vi.spyOn(api,'respondToQuestion').mockRejectedValueOnce(new Error('network')).mockRejectedValue(new QuestionMutationError('Rejected','question_request_invalid'));
-    vi.spyOn(api,'getConversation').mockResolvedValue({conversation:{state:{type:'awaiting_user_response',request_id: 'request-1', tool_use_id:'request-1',questions:[question]}}} as Awaited<ReturnType<typeof api.getConversation>>);
+    vi.spyOn(api,'getConversationStatus').mockResolvedValue({conversation:{state:{type:'awaiting_user_response',request_id: 'request-1', tool_use_id:'request-1',questions:[question]}}} as Awaited<ReturnType<typeof api.getConversationStatus>>);
     render(<QuestionPanel {...defaults} />);
     fireEvent.click(screen.getByRole('radio',{name:'Current'}));
     fireEvent.click(screen.getByRole('button',{name:'Send answer'}));
@@ -138,7 +138,7 @@ describe('AUQ failure and shortcut boundaries', () => {
   });
   it('carries the server phase timestamp after successful answer refresh', async () => {
     vi.spyOn(api,'respondToQuestion').mockResolvedValue({success:true});
-    vi.spyOn(api,'getConversation').mockResolvedValue({conversation:{state:{type:'llm_requesting',attempt:1},state_updated_at:'2026-09-14T15:00:00Z'}} as Awaited<ReturnType<typeof api.getConversation>>);
+    vi.spyOn(api,'getConversationStatus').mockResolvedValue({conversation:{state:{type:'llm_requesting',attempt:1},state_updated_at:'2026-09-14T15:00:00Z'}} as Awaited<ReturnType<typeof api.getConversationStatus>>);
     render(<QuestionPanel {...defaults} />);
     fireEvent.click(screen.getByRole('radio',{name:'Current'}));
     fireEvent.click(screen.getByRole('button',{name:'Send answer'}));
@@ -146,7 +146,7 @@ describe('AUQ failure and shortcut boundaries', () => {
   });
   it('adopts authoritative recovery state after successful answer without SSE', async () => {
     vi.spyOn(api,'respondToQuestion').mockResolvedValue({success:true});
-    vi.spyOn(api,'getConversation').mockResolvedValue({conversation:{state:{type:'recoverable_continuation_failure', failure:{message:'Projection failed',error_kind:'server_error',request:{operation_id:'op-1',attempt:1}}}}} as unknown as Awaited<ReturnType<typeof api.getConversation>>);
+    vi.spyOn(api,'getConversationStatus').mockResolvedValue({conversation:{state:{type:'recoverable_continuation_failure', failure:{message:'Projection failed',error_kind:'server_error',request:{operation_id:'op-1',attempt:1}}}}} as unknown as Awaited<ReturnType<typeof api.getConversationStatus>>);
     render(<QuestionPanel {...defaults} />);
     fireEvent.click(screen.getByRole('radio',{name:'Current'}));
     fireEvent.click(screen.getByRole('button',{name:'Send answer'}));
@@ -157,7 +157,7 @@ describe('AUQ failure and shortcut boundaries', () => {
     const send = vi.spyOn(api,'respondToQuestion');
     if (outcome === 'success') send.mockResolvedValue({success:true});
     else send.mockRejectedValue(new QuestionMutationError('Stale','question_request_stale'));
-    vi.spyOn(api,'getConversation').mockRejectedValueOnce(new Error('offline')).mockResolvedValue({conversation:{state:{type:'idle'}}} as Awaited<ReturnType<typeof api.getConversation>>);
+    vi.spyOn(api,'getConversationStatus').mockRejectedValueOnce(new Error('offline')).mockResolvedValue({conversation:{state:{type:'idle'}}} as Awaited<ReturnType<typeof api.getConversationStatus>>);
     render(<QuestionPanel {...defaults} />);
     fireEvent.click(screen.getByRole('radio',{name:'Current'}));
     fireEvent.click(screen.getByRole('button',{name:'Send answer'}));
@@ -170,21 +170,21 @@ describe('AUQ failure and shortcut boundaries', () => {
   });
   it('ignores a late successful refresh after a newer request appears', async () => {
     vi.spyOn(api,'respondToQuestion').mockResolvedValue({success:true});
-    let resolve!: (value: Awaited<ReturnType<typeof api.getConversation>>) => void;
-    const get = vi.spyOn(api,'getConversation').mockReturnValue(new Promise(yes => {resolve=yes;}));
+    let resolve!: (value: Awaited<ReturnType<typeof api.getConversationStatus>>) => void;
+    const get = vi.spyOn(api,'getConversationStatus').mockReturnValue(new Promise(yes => {resolve=yes;}));
     const {rerender}=render(<QuestionPanel {...defaults} />);
     fireEvent.click(screen.getByRole('radio',{name:'Current'}));
     fireEvent.click(screen.getByRole('button',{name:'Send answer'}));
     await waitFor(()=>expect(get).toHaveBeenCalled());
     rerender(<QuestionPanel {...defaults} requestId="request-2" />);
-    await act(async()=>resolve({conversation:{state:{type:'idle'}}} as Awaited<ReturnType<typeof api.getConversation>>));
+    await act(async()=>resolve({conversation:{state:{type:'idle'}}} as Awaited<ReturnType<typeof api.getConversationStatus>>));
     expect(defaults.onResolved).not.toHaveBeenCalled();
     expect(screen.getByRole('radio',{name:'Current'})).not.toBeChecked();
   });
 
   it('reconciles a proven stale request without reopening editing', async () => {
     vi.spyOn(api,'respondToQuestion').mockRejectedValue(new QuestionMutationError('Stale','question_request_stale'));
-    vi.spyOn(api,'getConversation').mockResolvedValue({conversation:{state:{type:'awaiting_user_response',request_id: 'request-2', tool_use_id:'request-2',questions:[question]}}} as Awaited<ReturnType<typeof api.getConversation>>);
+    vi.spyOn(api,'getConversationStatus').mockResolvedValue({conversation:{state:{type:'awaiting_user_response',request_id: 'request-2', tool_use_id:'request-2',questions:[question]}}} as Awaited<ReturnType<typeof api.getConversationStatus>>);
     render(<QuestionPanel {...defaults} />);
     fireEvent.click(screen.getByRole('radio',{name:'Current'}));
     fireEvent.click(screen.getByRole('button',{name:'Send answer'}));
@@ -197,7 +197,7 @@ describe('AUQ failure and shortcut boundaries', () => {
     {type:'unrecognized_future_state'},
   ])('does not resolve uncertainty from malformed or unknown state %j', async state => {
     vi.spyOn(api,'respondToQuestion').mockRejectedValue(new Error('network'));
-    vi.spyOn(api,'getConversation').mockResolvedValue({conversation:{state}} as Awaited<ReturnType<typeof api.getConversation>>);
+    vi.spyOn(api,'getConversationStatus').mockResolvedValue({conversation:{state}} as Awaited<ReturnType<typeof api.getConversationStatus>>);
     render(<QuestionPanel {...defaults} />);
     fireEvent.click(screen.getByRole('radio',{name:'Current'}));
     fireEvent.click(screen.getByRole('button',{name:'Send answer'}));

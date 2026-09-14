@@ -397,6 +397,31 @@ describe('api.regenerateConversationName', () => {
   });
 });
 
+describe('api.getConversationStatus', () => {
+  beforeEach(() => vi.stubGlobal('fetch', vi.fn()));
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('uses the metadata-only status endpoint and does not require transcript fields', async () => {
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        conversation: { id: 'conv-id', slug: 'conv-id', state: { type: 'idle' } },
+        agent_working: false,
+        presentation_mode: 'idle',
+      }),
+    } as unknown as Response);
+
+    const result = await api.getConversationStatus('conv-id');
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/conversations/conv-id/status');
+    expect(result.conversation.state).toEqual({ type: 'idle' });
+    expect('messages' in result).toBe(false);
+    expect('context_window_size' in result).toBe(false);
+  });
+});
+
 describe('canCancelConversationState', () => {
   const cases: ReadonlyArray<readonly [ConversationState, boolean]> = [
     [{ type: 'idle' }, false],

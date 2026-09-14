@@ -1,3 +1,5 @@
+import type { ConversationState } from '../api';
+
 export type HistoryView = {
   conversationId: string;
   generation: number;
@@ -17,6 +19,7 @@ export type ActiveHistoryRequest = {
   token: number;
   view: HistoryView;
   snapshotStartedAtEventSeq: number;
+  snapshotStartedAtPhase: ConversationState;
   intent: HistoryIntent;
 };
 
