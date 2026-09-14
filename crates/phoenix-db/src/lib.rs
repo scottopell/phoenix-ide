@@ -6371,6 +6371,35 @@ impl Database {
         Ok(outcome)
     }
 
+    /// Return whether an approval-triggered request is still owed.
+    ///
+    /// The approval message's sequence binds the obligation to one request. A
+    /// later durable agent message proves the request produced output even if
+    /// its following state write was interrupted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] when the obligation query fails.
+    pub async fn has_pending_approval_request(&self, conversation_id: &str) -> DbResult<bool> {
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1
+                 FROM approval_request_obligations obligation
+                 WHERE obligation.conversation_id = ?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM messages later
+                       WHERE later.conversation_id = obligation.conversation_id
+                         AND later.message_type = 'agent'
+                         AND later.sequence_id > obligation.approval_sequence_id
+                   )
+             )",
+        )
+        .bind(conversation_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(pending != 0)
+    }
+
     /// Update conversation state, stamping `state_updated_at = now()`.
     /// Callers that own the authoritative entry timestamp (the runtime
     /// executor) should use [`Self::update_conversation_state_at`] so the
@@ -7313,6 +7342,21 @@ impl Database {
         .execute(&mut *tx)
         .await?;
         insert_message_tx(&mut tx, approval_message).await?;
+        sqlx::query(
+            "INSERT INTO approval_request_obligations
+             (conversation_id, approval_message_id, approval_sequence_id, created_at_us)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(conversation_id) DO UPDATE SET
+                 approval_message_id = excluded.approval_message_id,
+                 approval_sequence_id = excluded.approval_sequence_id,
+                 created_at_us = excluded.created_at_us",
+        )
+        .bind(conversation_id)
+        .bind(&approval_message.message_id)
+        .bind(approval_message.sequence_id)
+        .bind(approval_message.created_at.timestamp_micros())
+        .execute(&mut *tx)
+        .await?;
         let state_json = serde_json::to_string(approved_state)
             .map_err(|error| DbError::Serialization(error.to_string()))?;
         let state_result = sqlx::query(
@@ -9556,6 +9600,7 @@ impl Database {
     /// # Panics
     ///
     /// Panics if persisted JSON columns cannot be (de)serialized.
+    #[allow(clippy::too_many_lines)]
     pub async fn reset_all_to_idle(&self) -> DbResult<()> {
         let now = Utc::now();
         let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
@@ -9645,6 +9690,17 @@ impl Database {
                              AND t.owns_conversation = 1
                              AND t.canonical_message_id IS NOT NULL
                              AND t.terminal_kind IS NULL
+                       )
+                       OR EXISTS (
+                           SELECT 1
+                           FROM approval_request_obligations approval
+                           WHERE approval.conversation_id = conversations.id
+                             AND NOT EXISTS (
+                                 SELECT 1 FROM messages later
+                                 WHERE later.conversation_id = approval.conversation_id
+                                   AND later.message_type = 'agent'
+                                   AND later.sequence_id > approval.approval_sequence_id
+                             )
                        )
                        OR EXISTS (
                            SELECT 1
@@ -21558,6 +21614,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn approval_request_obligation_survives_restart_only_until_progress() {
+        let db = Database::open_in_memory().await.unwrap();
+        let conversation_id = "approval-request-obligation";
+        db.create_conversation(conversation_id, conversation_id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let approval_message = Message {
+            message_id: "approval-request-message".to_string(),
+            conversation_id: conversation_id.to_string(),
+            sequence_id: 1,
+            message_type: MessageType::User,
+            content: MessageContent::User(UserContent::meta("approved")),
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+        let approval = phoenix_core::task_handoff::TaskApprovalHandoffData {
+            task_id: "12345".to_string(),
+            task_title: "Approval obligation".to_string(),
+            title: "Approval obligation".to_string(),
+            priority: phoenix_core::task_source::Priority::P0,
+            plan: "Plan".to_string(),
+            task_file: "tasks/12345-p0-ready--approval-obligation.md".to_string(),
+            artifact_body: "# Approval obligation\n".to_string(),
+        };
+        db.persist_approved_task_authority(
+            conversation_id,
+            &approval,
+            &approval_message,
+            &ConvState::LlmRequesting { attempt: 1 },
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+
+        db.reset_all_to_idle().await.unwrap();
+        assert!(matches!(
+            db.get_conversation(conversation_id).await.unwrap().state,
+            ConvState::LlmRequesting { attempt: 1 }
+        ));
+        assert!(db
+            .has_pending_approval_request(conversation_id)
+            .await
+            .unwrap());
+
+        db.add_message_with_seq(
+            "queued-user-message",
+            conversation_id,
+            2,
+            &MessageContent::User(UserContent::new("queued")),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.has_pending_approval_request(conversation_id)
+                .await
+                .unwrap(),
+            "a queued user message cannot settle the approval request"
+        );
+
+        db.add_message_with_seq(
+            "approval-response",
+            conversation_id,
+            3,
+            &MessageContent::agent(vec![phoenix_core::domain::llm_types::ContentBlock::text(
+                "done",
+            )]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!db
+            .has_pending_approval_request(conversation_id)
+            .await
+            .unwrap());
+        db.reset_all_to_idle().await.unwrap();
+        assert_eq!(
+            db.get_conversation(conversation_id).await.unwrap().state,
+            ConvState::Idle
+        );
+
+        db.update_conversation_state(conversation_id, &ConvState::LlmRequesting { attempt: 2 })
+            .await
+            .unwrap();
+        db.reset_all_to_idle().await.unwrap();
+        assert_eq!(
+            db.get_conversation(conversation_id).await.unwrap().state,
+            ConvState::Idle,
+            "the lifetime approved objective cannot own later requests"
+        );
+    }
+
+    #[tokio::test]
     async fn reset_all_to_idle_preserves_completed_and_failed_states() {
         let db = Database::open_in_memory().await.unwrap();
         db.create_conversation("completed", "completed", "/tmp", false, None, None)
@@ -25912,6 +26064,7 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+        assert!(db.has_pending_approval_request(conv_id).await.unwrap());
     }
 
     /// Task 02667: a fresh DB's `conversations` table must not carry the

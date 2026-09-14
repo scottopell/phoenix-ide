@@ -501,6 +501,8 @@ pub struct RuntimeManager {
     #[cfg(test)]
     runtime_materialization_panics: AsyncMutex<HashSet<String>>,
     #[cfg(test)]
+    runtime_materialization_failures: AsyncMutex<HashMap<String, usize>>,
+    #[cfg(test)]
     runtime_materialization_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
     steering_enqueue_handle_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
@@ -2268,6 +2270,8 @@ impl RuntimeManager {
             conversation_admissions: AsyncMutex::new(HashMap::new()),
             #[cfg(test)]
             runtime_materialization_panics: AsyncMutex::new(HashSet::new()),
+            #[cfg(test)]
+            runtime_materialization_failures: AsyncMutex::new(HashMap::new()),
             #[cfg(test)]
             runtime_materialization_barriers: AsyncMutex::new(HashMap::new()),
             #[cfg(test)]
@@ -4296,11 +4300,26 @@ impl RuntimeManager {
     ) -> futures::future::BoxFuture<'static, Result<(), String>> {
         let manager = Arc::clone(self);
         Box::pin(async move {
+            const ATTEMPTS: usize = 3;
             manager.require_local_authority_admission()?;
-            manager
-                .get_or_create_inner(&conversation_id, None)
-                .await
-                .map(drop)
+            let mut last_error = None;
+            for attempt in 1..=ATTEMPTS {
+                match manager.get_or_create_inner(&conversation_id, None).await {
+                    Ok(_) => return Ok(()),
+                    Err(error) => {
+                        tracing::warn!(
+                            conv_id = %conversation_id,
+                            attempt,
+                            max_attempts = ATTEMPTS,
+                            %error,
+                            "Durable authority rematerialization attempt failed"
+                        );
+                        last_error = Some(error);
+                        tokio::task::yield_now().await;
+                    }
+                }
+            }
+            Err(last_error.expect("at least one rematerialization attempt"))
         })
     }
 
@@ -4941,6 +4960,17 @@ impl RuntimeManager {
         }
 
         #[cfg(test)]
+        {
+            let mut failures = self.runtime_materialization_failures.lock().await;
+            if let Some(remaining) = failures.get_mut(conversation_id) {
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    return Err("injected runtime materialization failure".to_string());
+                }
+            }
+        }
+
+        #[cfg(test)]
         if self
             .runtime_materialization_panics
             .lock()
@@ -5506,7 +5536,7 @@ impl RuntimeManager {
                     tracing::error!(
                         conv_id = %conv_id,
                         %error,
-                        "Failed to rematerialize runtime from durable authority after ambiguous commit"
+                        "Exhausted durable authority rematerialization attempts after ambiguous commit"
                     );
                 }
             }
@@ -5547,6 +5577,18 @@ impl RuntimeManager {
 
     /// Inject a fake live handle and return its event receiver so a handler
     /// test can assert executor notifications directly.
+    #[cfg(test)]
+    async fn fail_next_runtime_materializations_for_test(
+        &self,
+        conversation_id: &str,
+        count: usize,
+    ) {
+        self.runtime_materialization_failures
+            .lock()
+            .await
+            .insert(conversation_id.to_string(), count);
+    }
+
     #[cfg(test)]
     pub(crate) async fn inject_handle_with_event_capture_for_test(
         &self,
@@ -6112,10 +6154,9 @@ impl RuntimeManager {
                 .await?
                 || self
                     .db
-                    .get_approved_task_objective(conversation_id)
+                    .has_pending_approval_request(conversation_id)
                     .await
-                    .map_err(|error| error.to_string())?
-                    .is_some())
+                    .map_err(|error| error.to_string())?)
         {
             return Ok((conv.state, row_state_updated_at, false));
         }
@@ -10792,6 +10833,8 @@ mod scope_liveness_tests {
             )
             .await
         );
+        mgr.fail_next_runtime_materializations_for_test(conversation_id, 2)
+            .await;
         mgr.recreate_runtime_from_database(conversation_id.to_string())
             .await
             .expect("rematerialize from durable state");

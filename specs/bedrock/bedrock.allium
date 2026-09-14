@@ -1167,6 +1167,11 @@ rule UserApprovesTaskCurrentConversation {
         -- stream reservation and directly rematerializes the conversation from durable
         -- state; unfinished-turn discovery is not the recovery owner.
         --
+        -- An operation-scoped obligation, bound to the approval context message,
+        -- preserves the first post-approval request across restart. A later durable
+        -- agent message or any state progression out of LlmRequesting retires it;
+        -- the lifetime approved objective never owns later requests.
+        --
         -- ApprovalRereadSnapshot / ApprovalMatchesReviewedSnapshot bind approval to
         -- the reviewed repo-relative path, task kind, and content digest. The
         -- reread body may only be approved when all three still match the reviewed
