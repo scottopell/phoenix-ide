@@ -2832,7 +2832,7 @@ describe('request-bound question callbacks', () => {
   it('keeps a consumed question closed when pre-answer history returns without SSE', () => {
     const pending: ConversationAtom = {...createInitialAtom(),conversationId:'conv-1',conversation:testConversation,phase:{type:'awaiting_user_response',request_id:'question-1',tool_use_id:'tool',questions:[]},lastAppliedEventSeq:12};
     const phaseAtRequestStart = pending.phase;
-    const resolved = conversationReducer(pending,{type:'question_phase_change',expectedConversationId:'conv-1',requestId:'question-1',phase:{type:'llm_requesting',attempt:1},stateUpdatedAt:1234});
+    const resolved = conversationReducer(pending,{type:'question_phase_change',expectedConversationId:'conv-1',requestId:'question-1',phase:{type:'llm_requesting',attempt:1},stateUpdatedAt:1234,phaseFreshnessEventSeq:pending.lastAppliedEventSeq});
     const merged = conversationReducer(resolved,{
       type:'merge_conversation_data',conversationId:'conv-1',conversation:testConversation,
       messages:[makeMessage(1)],phase:phaseAtRequestStart,contextWindow:{used:0},
@@ -2853,13 +2853,13 @@ describe('request-bound question callbacks', () => {
 
   const pending: ConversationAtom = { ...createInitialAtom(), conversationId: 'conv-1', phase: {type: 'awaiting_user_response', request_id: 'new-request', tool_use_id: 'new-request', questions: []}, lastAppliedEventSeq: 12 };
   it('ignores an old callback after the next question arrives', () => {
-    expect(conversationReducer(pending, {type:'question_phase_change',stateUpdatedAt:1234,expectedConversationId:'conv-1',requestId:'old-request',phase:{type:'idle'}})).toBe(pending);
+    expect(conversationReducer(pending, {type:'question_phase_change',stateUpdatedAt:1234,expectedConversationId:'conv-1',requestId:'old-request',phase:{type:'idle'},phaseFreshnessEventSeq:pending.lastAppliedEventSeq})).toBe(pending);
   });
   it('ignores a callback from a different conversation', () => {
-    expect(conversationReducer(pending, {type:'question_phase_change',stateUpdatedAt:1234,expectedConversationId:'other-conv',requestId:'new-request',phase:{type:'idle'}})).toBe(pending);
+    expect(conversationReducer(pending, {type:'question_phase_change',stateUpdatedAt:1234,expectedConversationId:'other-conv',requestId:'new-request',phase:{type:'idle'},phaseFreshnessEventSeq:pending.lastAppliedEventSeq})).toBe(pending);
   });
   it('updates only the matching pending request without advancing stream sequence', () => {
-    const next = conversationReducer(pending, {type:'question_phase_change',stateUpdatedAt:1234,expectedConversationId:'conv-1',requestId:'new-request',phase:{type:'idle'}});
+    const next = conversationReducer(pending, {type:'question_phase_change',stateUpdatedAt:1234,expectedConversationId:'conv-1',requestId:'new-request',phase:{type:'idle'},phaseFreshnessEventSeq:pending.lastAppliedEventSeq});
     expect(next.phase.type).toBe('idle'); expect(next.lastAppliedEventSeq).toBe(12);
     expect(next.phaseStateUpdatedAt).toBe(1234);
   });

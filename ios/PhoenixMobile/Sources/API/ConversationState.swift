@@ -138,10 +138,8 @@ enum ConversationState: Equatable {
             return .terminal
         case "handed_off":
             return .handedOff(successorConversationId: json["successor_conv_id"]?.stringValue)
-        case "recoverable_continuation_failure", "completed", "failed", "creation_cancelled":
-            return .other(type: type)
         default:
-            return .unknown
+            return .other(type: type)
         }
     }
     var questionStatusIsUnverifiable: Bool {
