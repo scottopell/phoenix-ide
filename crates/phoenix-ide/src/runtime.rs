@@ -7873,9 +7873,8 @@ mod scope_liveness_tests {
         let quarantine = close_retirement::worktree_quarantine_path(&worktree_identity).unwrap();
         std::fs::rename(&worktree, &quarantine).unwrap();
         let observer_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut manager = match Arc::try_unwrap(manager) {
-            Ok(manager) => manager,
-            Err(_) => panic!("test manager has one owner"),
+        let Ok(mut manager) = Arc::try_unwrap(manager) else {
+            panic!("test manager has one owner");
         };
         manager = manager.with_test_no_ambient_writers(Arc::clone(&observer_calls));
         let manager = Arc::new(manager);
@@ -8010,6 +8009,7 @@ mod scope_liveness_tests {
         assert_eq!(observer_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn exact_attempt_retry_adopts_retained_cleanup_and_finalizes_history() {
         use phoenix_core::domain::close::ClosePhase;
