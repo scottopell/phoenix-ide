@@ -8199,19 +8199,46 @@ mod tests {
         std::os::unix::fs::symlink(&matched, process.join("fd/3")).unwrap();
         std::fs::write(process.join("fdinfo/3"), "flags:\t00000001\n").unwrap();
 
-        assert!(super::quarantine_has_open_descriptors_in(
+        let descriptor_error = super::quarantine_has_open_descriptors_in(
             &quarantine,
             temp.path().join("proc").as_path(),
         )
-        .unwrap_err()
-        .contains("process executable"));
-        assert!(super::quarantine_has_writable_mappings_in(
+        .unwrap_err();
+        let descriptor_diagnostic =
+            super::AmbientWriterIndeterminateDiagnostic::from_marker(&descriptor_error).unwrap();
+        assert_eq!(
+            descriptor_diagnostic.detector,
+            super::AmbientWriterDiagnosticDetector::LinuxProcfs
+        );
+        assert_eq!(
+            descriptor_diagnostic.operation,
+            super::AmbientWriterDiagnosticOperation::ReadProcessExecutable
+        );
+        assert_eq!(
+            descriptor_diagnostic.error_kind,
+            super::AmbientWriterDiagnosticErrorKind::NotFound
+        );
+
+        let mapping_error = super::quarantine_has_writable_mappings_in(
             &quarantine,
             temp.path().join("proc").as_path(),
             unsafe { libc::geteuid() },
         )
-        .unwrap_err()
-        .contains("process executable"));
+        .unwrap_err();
+        let mapping_diagnostic =
+            super::AmbientWriterIndeterminateDiagnostic::from_marker(&mapping_error).unwrap();
+        assert_eq!(
+            mapping_diagnostic.detector,
+            super::AmbientWriterDiagnosticDetector::LinuxProcfs
+        );
+        assert_eq!(
+            mapping_diagnostic.operation,
+            super::AmbientWriterDiagnosticOperation::ReadProcessExecutable
+        );
+        assert_eq!(
+            mapping_diagnostic.error_kind,
+            super::AmbientWriterDiagnosticErrorKind::NotFound
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -8587,12 +8614,20 @@ mod tests {
         assert_ne!(mapping, libc::MAP_FAILED);
         drop(file);
 
+        let proc_root = temp.path().join("proc");
+        std::fs::create_dir(&proc_root).unwrap();
+        let pid = std::process::id().to_string();
+        std::os::unix::fs::symlink("/proc/self", proc_root.join(pid)).unwrap();
+
         assert_eq!(
-            super::quarantine_has_open_descriptors(temp.path()).unwrap(),
+            super::quarantine_has_open_descriptors_in(temp.path(), &proc_root).unwrap(),
             super::ExternalWriterEvidence::NoPositiveEvidence,
         );
         let super::ExternalWriterEvidence::PositiveWriterFound(evidence) =
-            super::quarantine_has_writable_mappings(temp.path()).unwrap()
+            super::quarantine_has_writable_mappings_in(temp.path(), &proc_root, unsafe {
+                libc::geteuid()
+            })
+            .unwrap()
         else {
             panic!("live writable shared mapping must produce complete evidence");
         };
