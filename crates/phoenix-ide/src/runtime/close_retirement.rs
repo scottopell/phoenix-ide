@@ -1513,6 +1513,8 @@ impl RuntimeManager {
                         let snapshot_for_tombstone = snapshot.clone();
                         let runtime = tokio::runtime::Handle::current();
                         let persistence_runtime = runtime.clone();
+                        let ambient_writer_observer =
+                            std::sync::Arc::clone(&self.ambient_writer_observer);
                         let final_removal =
                             tokio::task::spawn_blocking(move || {
                                 inspect_and_remove_exact_worktree(
@@ -1556,6 +1558,7 @@ impl RuntimeManager {
                                                 .map_err(|error| error.to_string())
                                         }
                                     },
+                                    ambient_writer_observer,
                                 )
                             })
                             .await
@@ -2641,6 +2644,60 @@ fn worktree_quarantine_path(identity: &WorktreeIdentity) -> Result<PathBuf, Stri
     Ok(parent.join(name))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AmbientWriterDiagnosticDetector {
+    NativeProcessInventory,
+    MacosProcPidinfo,
+    LinuxProcfs,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AmbientWriterDiagnosticOperation {
+    ObserveAmbientWriter,
+    ReadProcessIncarnation,
+    ReadProcessExecutable,
+    ReadMappings,
+    EnumerateDescriptors,
+    EnumerateDescriptor,
+    ReadDescriptorTarget,
+    ReadDescriptorMetadata,
+    ReadDescriptorAccessMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AmbientWriterDiagnosticErrorKind {
+    PermissionDenied,
+    NotFound,
+    InvalidData,
+    Indeterminate,
+    Other,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub(crate) struct AmbientWriterIndeterminateDiagnostic {
+    pub detector: AmbientWriterDiagnosticDetector,
+    pub operation: AmbientWriterDiagnosticOperation,
+    pub error_kind: AmbientWriterDiagnosticErrorKind,
+}
+
+impl AmbientWriterIndeterminateDiagnostic {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn marker(&self) -> String {
+        format!(
+            "ambient_writer_indeterminate:{}",
+            serde_json::to_string(self).expect("diagnostic serialization is total"),
+        )
+    }
+
+    pub(crate) fn from_marker(message: &str) -> Option<Self> {
+        let marker = "ambient_writer_indeterminate:";
+        serde_json::from_str(message.get(message.find(marker)? + marker.len()..)?).ok()
+    }
+}
+
 #[derive(Clone, Debug, thiserror::Error)]
 pub(crate) enum CloseRetirementError {
     #[error("{0}")]
@@ -2696,6 +2753,7 @@ enum FinalTombstoneRecovery {
     Residual(String),
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inspect_and_remove_exact_worktree<B>(
     runtime: &tokio::runtime::Handle,
     identity: &WorktreeIdentity,
@@ -2704,6 +2762,7 @@ fn inspect_and_remove_exact_worktree<B>(
     administrative_dir_incarnation: &str,
     final_tombstone: Option<&CloseWorktreeFinalTombstone>,
     bind_tombstone: B,
+    inspect_external_writer: AmbientWriterObserver,
 ) -> Result<ExactWorktreeRemoval, String>
 where
     B: FnMut(&Path, (u64, u64), Option<(u64, u64)>) -> Result<(), String> + Send + 'static,
@@ -2717,7 +2776,7 @@ where
         final_tombstone,
         bind_tombstone,
         |_| {},
-        quarantine_has_external_writer,
+        move |path| inspect_external_writer(path),
     )
 }
 
@@ -3624,9 +3683,30 @@ fn exact_worktree_administrative_dir(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum ExternalWriterEvidence {
+pub(super) enum ExternalWriterEvidence {
     PositiveWriterFound(AmbientWriterEvidence),
     NoPositiveEvidence,
+}
+
+pub(super) type AmbientWriterObserver = std::sync::Arc<
+    dyn Fn(&Path) -> Result<Option<AmbientWriterEvidence>, String> + Send + Sync + 'static,
+>;
+
+pub(super) fn production_ambient_writer_observer() -> AmbientWriterObserver {
+    std::sync::Arc::new(|path| {
+        quarantine_has_external_writer(path).map_err(|error| {
+            if AmbientWriterIndeterminateDiagnostic::from_marker(&error).is_some() {
+                error
+            } else {
+                AmbientWriterIndeterminateDiagnostic {
+                    detector: AmbientWriterDiagnosticDetector::NativeProcessInventory,
+                    operation: AmbientWriterDiagnosticOperation::ObserveAmbientWriter,
+                    error_kind: AmbientWriterDiagnosticErrorKind::Indeterminate,
+                }
+                .marker()
+            }
+        })
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3874,37 +3954,50 @@ fn quarantine_has_writable_mappings_in(
         if !linux_process_is_relevant(&process, effective_uid, "mapping")? {
             continue;
         }
-        let before_incarnation = match linux_process_incarnation(&process.path()) {
+        let process_path = process.path();
+        let before_incarnation = match linux_process_incarnation(&process_path) {
             Ok(incarnation) => incarnation,
-            Err(_) if !process.path().exists() => continue,
-            Err(error) => return Err(error),
+            Err(LinuxScannerError::ProcessDisappeared) => continue,
+            Err(error) => return Err(error.into_marker()),
         };
-        let mappings = match std::fs::read_to_string(process.path().join("maps")) {
-            Ok(mappings) => mappings,
-            Err(_) if !process.path().exists() => continue,
-            Err(error) => return Err(format!("cannot inspect process mappings: {error}")),
+        let Some(mappings) = linux_read_leaf_after_capture(
+            &process_path,
+            &before_incarnation,
+            AmbientWriterDiagnosticOperation::ReadMappings,
+            || std::fs::read_to_string(process_path.join("maps")),
+        )?
+        else {
+            continue;
         };
         for mapping in mappings.lines() {
             let Some(mapped_path) = linux_writable_shared_mapping_path(mapping, &canonical)? else {
                 continue;
             };
-            let executable = match std::fs::read_link(process.path().join("exe")) {
-                Ok(executable) => executable,
-                Err(_) if !process.path().exists() => continue,
-                Err(error) => return Err(format!("cannot inspect process executable: {error}")),
+            let Some(executable) = linux_read_leaf_after_capture(
+                &process_path,
+                &before_incarnation,
+                AmbientWriterDiagnosticOperation::ReadProcessExecutable,
+                || std::fs::read_link(process_path.join("exe")),
+            )?
+            else {
+                continue;
             };
-            let identity_incarnation = match linux_process_incarnation(&process.path()) {
-                Ok(incarnation) => incarnation,
-                Err(_) if !process.path().exists() => continue,
-                Err(error) => return Err(error),
+            let Some(identity_incarnation) =
+                linux_process_incarnation_after_capture(&process_path, &before_incarnation)?
+            else {
+                continue;
             };
             if identity_incarnation != before_incarnation {
                 return Err("matching writer identity changed during inspection".to_string());
             }
-            let current_mappings = match std::fs::read_to_string(process.path().join("maps")) {
-                Ok(mappings) => mappings,
-                Err(_) if !process.path().exists() => continue,
-                Err(error) => return Err(format!("cannot inspect process mappings: {error}")),
+            let Some(current_mappings) = linux_read_leaf_after_capture(
+                &process_path,
+                &before_incarnation,
+                AmbientWriterDiagnosticOperation::ReadMappings,
+                || std::fs::read_to_string(process_path.join("maps")),
+            )?
+            else {
+                continue;
             };
             let mut mapping_still_matches = false;
             for current_mapping in current_mappings.lines() {
@@ -3915,15 +4008,19 @@ fn quarantine_has_writable_mappings_in(
                     break;
                 }
             }
-            let after_incarnation = match linux_process_incarnation(&process.path()) {
-                Ok(incarnation) => incarnation,
-                Err(_) if !process.path().exists() => continue,
-                Err(error) => return Err(error),
+            let Some(after_incarnation) =
+                linux_process_incarnation_after_capture(&process_path, &before_incarnation)?
+            else {
+                continue;
             };
-            let after_executable = match std::fs::read_link(process.path().join("exe")) {
-                Ok(executable) => executable,
-                Err(_) if !process.path().exists() => continue,
-                Err(error) => return Err(format!("cannot inspect process executable: {error}")),
+            let Some(after_executable) = linux_read_leaf_after_capture(
+                &process_path,
+                &before_incarnation,
+                AmbientWriterDiagnosticOperation::ReadProcessExecutable,
+                || std::fs::read_link(process_path.join("exe")),
+            )?
+            else {
+                continue;
             };
             if !linux_revalidated_writer_identity(
                 &before_incarnation,
@@ -3934,10 +4031,10 @@ fn quarantine_has_writable_mappings_in(
             )? {
                 continue;
             }
-            let final_incarnation = match linux_process_incarnation(&process.path()) {
-                Ok(incarnation) => incarnation,
-                Err(_) if !process.path().exists() => continue,
-                Err(error) => return Err(error),
+            let Some(final_incarnation) =
+                linux_process_incarnation_after_capture(&process_path, &after_incarnation)?
+            else {
+                continue;
             };
             if final_incarnation != after_incarnation {
                 return Err("matching writer identity changed during inspection".to_string());
@@ -4298,32 +4395,146 @@ fn linux_descriptor_target_is_within(
 }
 
 #[cfg(target_os = "linux")]
-fn linux_process_incarnation(process: &Path) -> Result<String, String> {
-    let stat = std::fs::read_to_string(process.join("stat"))
-        .map_err(|error| format!("cannot inspect process incarnation: {error}"))?;
+#[derive(Debug)]
+enum LinuxScannerError {
+    ProcessDisappeared,
+    Indeterminate {
+        operation: AmbientWriterDiagnosticOperation,
+        error_kind: AmbientWriterDiagnosticErrorKind,
+    },
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxScannerError {
+    fn from_process_io(
+        process: &Path,
+        operation: AmbientWriterDiagnosticOperation,
+        error: &std::io::Error,
+    ) -> Self {
+        if error.kind() == std::io::ErrorKind::NotFound
+            && matches!(
+                std::fs::metadata(process),
+                Err(root_error) if root_error.kind() == std::io::ErrorKind::NotFound
+            )
+        {
+            Self::ProcessDisappeared
+        } else {
+            Self::Indeterminate {
+                operation,
+                error_kind: diagnostic_error_kind(error),
+            }
+        }
+    }
+
+    fn invalid(operation: AmbientWriterDiagnosticOperation) -> Self {
+        Self::Indeterminate {
+            operation,
+            error_kind: AmbientWriterDiagnosticErrorKind::InvalidData,
+        }
+    }
+
+    fn into_marker(self) -> String {
+        match self {
+            Self::ProcessDisappeared => linux_indeterminate(
+                AmbientWriterDiagnosticOperation::ReadProcessIncarnation,
+                AmbientWriterDiagnosticErrorKind::NotFound,
+            ),
+            Self::Indeterminate {
+                operation,
+                error_kind,
+            } => linux_indeterminate(operation, error_kind),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_incarnation(process: &Path) -> Result<String, LinuxScannerError> {
+    let stat = std::fs::read_to_string(process.join("stat")).map_err(|error| {
+        LinuxScannerError::from_process_io(
+            process,
+            AmbientWriterDiagnosticOperation::ReadProcessIncarnation,
+            &error,
+        )
+    })?;
     let after_command = stat
         .rfind(") ")
         .and_then(|index| stat.get(index + 2..))
-        .ok_or_else(|| "process stat command is malformed".to_string())?;
+        .ok_or_else(|| {
+            LinuxScannerError::invalid(AmbientWriterDiagnosticOperation::ReadProcessIncarnation)
+        })?;
     after_command
         .split_ascii_whitespace()
         .nth(19)
         .filter(|start_time| !start_time.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| "process stat has no start-time incarnation".to_string())
+        .ok_or_else(|| {
+            LinuxScannerError::invalid(AmbientWriterDiagnosticOperation::ReadProcessIncarnation)
+        })
 }
 
 #[cfg(target_os = "linux")]
-fn linux_descriptor_access_mode(path: &Path) -> Result<Option<AmbientWriterAccessMode>, String> {
-    let fdinfo = std::fs::read_to_string(path)
-        .map_err(|error| format!("cannot inspect descriptor access mode: {error}"))?;
+fn linux_process_incarnation_after_capture(
+    process: &Path,
+    captured_incarnation: &str,
+) -> Result<Option<String>, String> {
+    match linux_process_incarnation(process) {
+        Ok(current) if current == captured_incarnation => Ok(Some(current)),
+        Ok(_) | Err(LinuxScannerError::ProcessDisappeared) => Ok(None),
+        Err(error) => Err(error.into_marker()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_read_leaf_after_capture<T>(
+    process: &Path,
+    captured_incarnation: &str,
+    operation: AmbientWriterDiagnosticOperation,
+    read: impl FnOnce() -> std::io::Result<T>,
+) -> Result<Option<T>, String> {
+    match read() {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if linux_process_incarnation_after_capture(process, captured_incarnation)?.is_some() {
+                Err(linux_inventory_diagnostic(operation, &error))
+            } else {
+                Ok(None)
+            }
+        }
+        Err(error) => Err(linux_inventory_diagnostic(operation, &error)),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_descriptor_access_mode(
+    process: &Path,
+    captured_incarnation: &str,
+    path: &Path,
+) -> Result<Option<Option<AmbientWriterAccessMode>>, String> {
+    let Some(fdinfo) = linux_read_leaf_after_capture(
+        process,
+        captured_incarnation,
+        AmbientWriterDiagnosticOperation::ReadDescriptorAccessMode,
+        || std::fs::read_to_string(path),
+    )?
+    else {
+        return Ok(None);
+    };
     let flags = fdinfo
         .lines()
         .find_map(|line| line.strip_prefix("flags:\t"))
-        .ok_or_else(|| "descriptor inventory has no flags".to_string())?;
-    let flags = i32::from_str_radix(flags, 8)
-        .map_err(|error| format!("descriptor flags are malformed: {error}"))?;
-    Ok(linux_descriptor_access_mode_from_flags(flags))
+        .ok_or_else(|| {
+            linux_indeterminate(
+                AmbientWriterDiagnosticOperation::ReadDescriptorAccessMode,
+                AmbientWriterDiagnosticErrorKind::InvalidData,
+            )
+        })?;
+    let flags = i32::from_str_radix(flags, 8).map_err(|_| {
+        linux_indeterminate(
+            AmbientWriterDiagnosticOperation::ReadDescriptorAccessMode,
+            AmbientWriterDiagnosticErrorKind::InvalidData,
+        )
+    })?;
+    Ok(Some(linux_descriptor_access_mode_from_flags(flags)))
 }
 
 #[cfg(target_os = "linux")]
@@ -4343,43 +4554,59 @@ fn linux_descriptor_writer_evidence(
 ) -> Result<Option<ExternalWriterEvidence>, String> {
     use std::os::unix::ffi::OsStrExt as _;
 
-    let executable = match std::fs::read_link(process.path().join("exe")) {
-        Ok(executable) => executable,
-        Err(_) if !process.path().exists() => return Ok(None),
-        Err(error) => return Err(format!("cannot inspect process executable: {error}")),
+    let process_path = process.path();
+    let Some(executable) = linux_read_leaf_after_capture(
+        &process_path,
+        before_incarnation,
+        AmbientWriterDiagnosticOperation::ReadProcessExecutable,
+        || std::fs::read_link(process_path.join("exe")),
+    )?
+    else {
+        return Ok(None);
     };
-    let identity_incarnation = match linux_process_incarnation(&process.path()) {
-        Ok(incarnation) => incarnation,
-        Err(_) if !process.path().exists() => return Ok(None),
-        Err(error) => return Err(error),
+    let Some(identity_incarnation) =
+        linux_process_incarnation_after_capture(&process_path, before_incarnation)?
+    else {
+        return Ok(None);
     };
     if identity_incarnation != before_incarnation {
         return Err("matching writer identity changed during inspection".to_string());
     }
-    let current_target = match std::fs::read_link(descriptor.path()) {
-        Ok(target) => target,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("cannot inspect descriptor target: {error}")),
+    let Some(current_target) = linux_read_leaf_after_capture(
+        &process_path,
+        before_incarnation,
+        AmbientWriterDiagnosticOperation::ReadDescriptorTarget,
+        || std::fs::read_link(descriptor.path()),
+    )?
+    else {
+        return Ok(None);
     };
-    let current_access_mode = match linux_descriptor_access_mode(
-        &process.path().join("fdinfo").join(descriptor.file_name()),
-    ) {
-        Ok(mode) => classify_descriptor_access_mode(mode, target_is_directory),
-        Err(_) if !process.path().exists() => return Ok(None),
-        Err(error) => return Err(error),
+    let Some(current_access_mode) = linux_descriptor_access_mode(
+        &process_path,
+        before_incarnation,
+        &process_path.join("fdinfo").join(descriptor.file_name()),
+    )?
+    else {
+        return Ok(None);
     };
+    let current_access_mode =
+        classify_descriptor_access_mode(current_access_mode, target_is_directory);
     let resource_still_matches = current_target == target
         && current_access_mode == Some(access_mode)
         && linux_descriptor_target_is_within(Ok(current_target), canonical);
-    let after_incarnation = match linux_process_incarnation(&process.path()) {
-        Ok(incarnation) => incarnation,
-        Err(_) if !process.path().exists() => return Ok(None),
-        Err(error) => return Err(error),
+    let Some(after_incarnation) =
+        linux_process_incarnation_after_capture(&process_path, before_incarnation)?
+    else {
+        return Ok(None);
     };
-    let after_executable = match std::fs::read_link(process.path().join("exe")) {
-        Ok(executable) => executable,
-        Err(_) if !process.path().exists() => return Ok(None),
-        Err(error) => return Err(format!("cannot inspect process executable: {error}")),
+    let Some(after_executable) = linux_read_leaf_after_capture(
+        &process_path,
+        before_incarnation,
+        AmbientWriterDiagnosticOperation::ReadProcessExecutable,
+        || std::fs::read_link(process_path.join("exe")),
+    )?
+    else {
+        return Ok(None);
     };
     if !linux_revalidated_writer_identity(
         before_incarnation,
@@ -4390,10 +4617,10 @@ fn linux_descriptor_writer_evidence(
     )? {
         return Ok(None);
     }
-    let final_incarnation = match linux_process_incarnation(&process.path()) {
-        Ok(incarnation) => incarnation,
-        Err(_) if !process.path().exists() => return Ok(None),
-        Err(error) => return Err(error),
+    let Some(final_incarnation) =
+        linux_process_incarnation_after_capture(&process_path, &after_incarnation)?
+    else {
+        return Ok(None);
     };
     if final_incarnation != after_incarnation {
         return Err("matching writer identity changed during inspection".to_string());
@@ -4417,6 +4644,37 @@ fn linux_descriptor_writer_evidence(
 }
 
 #[cfg(target_os = "linux")]
+fn linux_indeterminate(
+    operation: AmbientWriterDiagnosticOperation,
+    error_kind: AmbientWriterDiagnosticErrorKind,
+) -> String {
+    AmbientWriterIndeterminateDiagnostic {
+        detector: AmbientWriterDiagnosticDetector::LinuxProcfs,
+        operation,
+        error_kind,
+    }
+    .marker()
+}
+
+#[cfg(target_os = "linux")]
+fn diagnostic_error_kind(error: &std::io::Error) -> AmbientWriterDiagnosticErrorKind {
+    match error.kind() {
+        std::io::ErrorKind::PermissionDenied => AmbientWriterDiagnosticErrorKind::PermissionDenied,
+        std::io::ErrorKind::NotFound => AmbientWriterDiagnosticErrorKind::NotFound,
+        std::io::ErrorKind::InvalidData => AmbientWriterDiagnosticErrorKind::InvalidData,
+        _ => AmbientWriterDiagnosticErrorKind::Other,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_inventory_diagnostic(
+    operation: AmbientWriterDiagnosticOperation,
+    error: &std::io::Error,
+) -> String {
+    linux_indeterminate(operation, diagnostic_error_kind(error))
+}
+
+#[cfg(target_os = "linux")]
 fn quarantine_has_open_descriptors_in(
     path: &Path,
     proc_root: &Path,
@@ -4435,38 +4693,59 @@ fn quarantine_has_open_descriptors_in(
         if !linux_process_is_relevant(&process, effective_uid, "descriptor")? {
             continue;
         }
-        let before_incarnation = match linux_process_incarnation(&process.path()) {
+        let process_path = process.path();
+        let before_incarnation = match linux_process_incarnation(&process_path) {
             Ok(incarnation) => incarnation,
-            Err(_) if !process.path().exists() => continue,
-            Err(error) => return Err(error),
+            Err(LinuxScannerError::ProcessDisappeared) => continue,
+            Err(error) => return Err(error.into_marker()),
         };
-        let descriptors = match std::fs::read_dir(process.path().join("fd")) {
-            Ok(descriptors) => descriptors,
-            Err(_) if !process.path().exists() => continue,
-            Err(error) => return Err(format!("cannot inspect process descriptors: {error}")),
+        let descriptor_path = process_path.join("fd");
+        let Some(descriptors) = linux_read_leaf_after_capture(
+            &process_path,
+            &before_incarnation,
+            AmbientWriterDiagnosticOperation::EnumerateDescriptors,
+            || std::fs::read_dir(&descriptor_path),
+        )?
+        else {
+            continue;
         };
         for descriptor in descriptors {
-            let descriptor = descriptor
-                .map_err(|error| format!("cannot enumerate a process descriptor: {error}"))?;
-            let target = match std::fs::read_link(descriptor.path()) {
-                Ok(target) => target,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(format!("cannot inspect descriptor target: {error}")),
+            let Some(descriptor) = linux_read_leaf_after_capture(
+                &process_path,
+                &before_incarnation,
+                AmbientWriterDiagnosticOperation::EnumerateDescriptor,
+                || descriptor,
+            )?
+            else {
+                continue;
+            };
+            let Some(target) = linux_read_leaf_after_capture(
+                &process_path,
+                &before_incarnation,
+                AmbientWriterDiagnosticOperation::ReadDescriptorTarget,
+                || std::fs::read_link(descriptor.path()),
+            )?
+            else {
+                continue;
             };
             if !linux_descriptor_target_is_within(Ok(target.clone()), &canonical) {
                 continue;
             }
-            let target_metadata = match std::fs::metadata(descriptor.path()) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => {
-                    return Err(format!("cannot inspect descriptor object type: {error}"))
-                }
+            let Some(target_metadata) = linux_read_leaf_after_capture(
+                &process_path,
+                &before_incarnation,
+                AmbientWriterDiagnosticOperation::ReadDescriptorMetadata,
+                || std::fs::metadata(descriptor.path()),
+            )?
+            else {
+                continue;
             };
             let access_mode = match linux_descriptor_access_mode(
-                &process.path().join("fdinfo").join(descriptor.file_name()),
-            ) {
-                Ok(access_mode) => {
+                &process_path,
+                &before_incarnation,
+                &process_path.join("fdinfo").join(descriptor.file_name()),
+            )? {
+                Some(access_mode) => {
                     let Some(access_mode) =
                         classify_descriptor_access_mode(access_mode, target_metadata.is_dir())
                     else {
@@ -4474,8 +4753,7 @@ fn quarantine_has_open_descriptors_in(
                     };
                     access_mode
                 }
-                Err(_) if !process.path().exists() => continue,
-                Err(error) => return Err(error),
+                None => continue,
             };
             if let Some(evidence) = linux_descriptor_writer_evidence(
                 &process,
@@ -4634,9 +4912,7 @@ fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence
                     .expect("vnode info size fits i32")
             {
                 let error = std::io::Error::last_os_error();
-                if macos_descriptor_inspection_is_transient_disappearance(error.raw_os_error())
-                    || error.raw_os_error() == Some(libc::EPERM)
-                {
+                if macos_descriptor_inspection_is_transient_disappearance(error.raw_os_error()) {
                     continue;
                 }
                 return Err(format!(
@@ -7503,8 +7779,14 @@ mod tests {
         drop(child.stdin.take());
         child.wait().unwrap();
         assert!(cwd_scan.is_err());
-        assert!(mapping_scan.is_err());
-        assert!(descriptor_scan.is_err());
+        assert!(super::AmbientWriterIndeterminateDiagnostic::from_marker(
+            &mapping_scan.unwrap_err()
+        )
+        .is_some());
+        assert!(super::AmbientWriterIndeterminateDiagnostic::from_marker(
+            &descriptor_scan.unwrap_err()
+        )
+        .is_some());
     }
 
     #[cfg(target_os = "linux")]
@@ -7720,6 +8002,35 @@ mod tests {
 
         let error = super::quarantine_has_open_descriptors_in(&quarantine, &proc_root).unwrap_err();
         assert!(error.contains("descriptor inventory"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_directory_descriptor_inventory_emits_safe_indeterminate_diagnostic() {
+        let temp = tempfile::tempdir().unwrap();
+        let quarantine = temp.path().join("quarantine");
+        let proc_root = temp.path().join("proc");
+        let process = proc_root.join("1278");
+        std::fs::create_dir_all(&process).unwrap();
+        std::fs::create_dir(&quarantine).unwrap();
+        write_synthetic_process_credentials(&process, 1278);
+        std::fs::write(process.join("fd"), b"not a descriptor directory").unwrap();
+
+        let error = super::quarantine_has_open_descriptors_in(&quarantine, &proc_root)
+            .expect_err("protected live inventory must be indeterminate");
+        let diagnostic = super::AmbientWriterIndeterminateDiagnostic::from_marker(&error).unwrap();
+        assert_eq!(
+            diagnostic.detector,
+            super::AmbientWriterDiagnosticDetector::LinuxProcfs
+        );
+        assert_eq!(
+            diagnostic.operation,
+            super::AmbientWriterDiagnosticOperation::EnumerateDescriptors
+        );
+        assert_eq!(
+            diagnostic.error_kind,
+            super::AmbientWriterDiagnosticErrorKind::Other
+        );
     }
 
     #[cfg(target_os = "linux")]

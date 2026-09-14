@@ -9309,19 +9309,29 @@ pub(crate) mod hard_delete_cascade_tests {
     /// works when the test wants to verify SSE events; conversations
     /// are otherwise inert (no LLM calls fire).
     pub(crate) async fn make_test_state() -> AppState {
+        make_test_state_with_no_ambient_writers(None).await
+    }
+
+    pub(crate) async fn make_test_state_with_no_ambient_writers(
+        observer_calls: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    ) -> AppState {
         let db = Database::open_in_memory().await.expect("open db");
         let llm_registry = Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(TestLlm)));
         let platform = PlatformCapability::None {
             details: "test".into(),
         };
         let mcp_manager = Arc::new(McpClientManager::new());
-        let runtime = Arc::new(RuntimeManager::new(
+        let runtime = RuntimeManager::new(
             db.clone(),
             llm_registry.clone(),
             platform.clone(),
             mcp_manager.clone(),
             None,
-        ));
+        );
+        let runtime = Arc::new(match observer_calls {
+            Some(calls) => runtime.with_test_no_ambient_writers(calls),
+            None => runtime,
+        });
         let terminals = runtime.terminals.clone();
         let message_retriever: std::sync::Arc<dyn crate::db::MessageRetriever> =
             std::sync::Arc::new(db.fts_retriever());
@@ -14521,7 +14531,9 @@ pub(crate) mod hard_delete_cascade_tests {
     /// A first-pass Work-mode Close captures its inventory before retirement.
     #[tokio::test]
     async fn archive_chain_captures_first_pass_close_inventory() {
-        let state = make_test_state().await;
+        let observer_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let state =
+            make_test_state_with_no_ambient_writers(Some(Arc::clone(&observer_calls))).await;
         let ids = ["sc-a", "sc-a2", "sc-a3"];
         let (_tmp, repo, worktree, branch) =
             build_workmode_chain_with_shared_worktree(&state, &ids).await;
@@ -14544,6 +14556,7 @@ pub(crate) mod hard_delete_cascade_tests {
             crate::git_ops::run_git(&repo, &["rev-parse", "--verify", &branch]).is_ok(),
             "archive preserves the shared task branch"
         );
+        assert_eq!(observer_calls.load(std::sync::atomic::Ordering::SeqCst), 1,);
         for id in ids {
             let conv = state
                 .db

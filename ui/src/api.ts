@@ -943,6 +943,20 @@ export interface ConflictErrorDetail {
   };
   failed_invariant?: string;
   failed_relation?: string;
+  ambient_writer_indeterminate?: {
+    detector: "native_process_inventory" | "macos_proc_pidinfo" | "linux_procfs";
+    operation:
+      | "observe_ambient_writer"
+      | "read_process_incarnation"
+      | "read_process_executable"
+      | "read_mappings"
+      | "enumerate_descriptors"
+      | "enumerate_descriptor"
+      | "read_descriptor_target"
+      | "read_descriptor_metadata"
+      | "read_descriptor_access_mode";
+    error_kind: "permission_denied" | "not_found" | "invalid_data" | "indeterminate" | "other";
+  };
   error: string;
   error_type: string;
   conflict_slug?: string;

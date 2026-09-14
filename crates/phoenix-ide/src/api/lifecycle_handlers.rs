@@ -656,12 +656,22 @@ fn close_retirement_conflict_for_phase(
         ),
         CloseRetirementError::Message(message) => (message, None, None),
     };
-    let mut response = ConflictErrorResponse::new(message, "close_retirement_needs_repair");
+    let diagnostic =
+        crate::runtime::close_retirement::AmbientWriterIndeterminateDiagnostic::from_marker(
+            &message,
+        );
+    let safe_message = if diagnostic.is_some() {
+        "Close could not prove that the quarantined worktree has no ambient writer.".to_string()
+    } else {
+        message
+    };
+    let mut response = ConflictErrorResponse::new(safe_message, "close_retirement_needs_repair");
     if close_phase_allows_retry_guidance(phase) {
         response = response.with_close_recovery(attempt_id, active_transcript_id);
     }
     response.failed_invariant = invariant;
     response.failed_relation = relation;
+    response.ambient_writer_indeterminate = diagnostic;
     response
 }
 
@@ -1104,6 +1114,46 @@ mod tests {
     use crate::db::{ConvMode, Conversation, NonEmptyString};
     use crate::state_machine::state::ConvState;
     use chrono::{TimeZone, Utc};
+
+    #[test]
+    fn ambient_writer_indeterminate_conflict_is_structured_and_safe() {
+        let diagnostic = crate::runtime::close_retirement::AmbientWriterIndeterminateDiagnostic {
+            detector: crate::runtime::close_retirement::AmbientWriterDiagnosticDetector::LinuxProcfs,
+            operation: crate::runtime::close_retirement::AmbientWriterDiagnosticOperation::EnumerateDescriptors,
+            error_kind: crate::runtime::close_retirement::AmbientWriterDiagnosticErrorKind::PermissionDenied,
+        };
+        let response = close_retirement_conflict_for_phase(
+            CloseRetirementError::Message(format!(
+                "worktree cannot be reinspected: {}",
+                diagnostic.marker(),
+            )),
+            "attempt-1",
+            "active-1",
+            Some(ClosePhase::NeedsRepair),
+        );
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(
+            json["ambient_writer_indeterminate"]["detector"],
+            "linux_procfs"
+        );
+        assert_eq!(
+            json["ambient_writer_indeterminate"]["operation"],
+            "enumerate_descriptors"
+        );
+        assert_eq!(
+            json["ambient_writer_indeterminate"]["error_kind"],
+            "permission_denied"
+        );
+        assert_eq!(
+            json["error"],
+            "Close could not prove that the quarantined worktree has no ambient writer."
+        );
+        assert!(!json.to_string().contains("argv"));
+        assert!(!json.to_string().contains("environment"));
+        assert!(!json.to_string().contains("/proc"));
+        assert!(!json.to_string().contains("process_id"));
+        assert!(!json.to_string().contains("uid"));
+    }
 
     #[test]
     fn evidence_invariant_conflict_advertises_retry_only_from_needs_repair() {

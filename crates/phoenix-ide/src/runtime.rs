@@ -491,6 +491,7 @@ pub struct RuntimeManager {
     pub(crate) close_retirement_leases:
         AsyncMutex<HashMap<(String, WorkScopeId), close_retirement::CloseResourceLease>>,
     close_retirement_execution: ConversationMutexGates,
+    pub(crate) ambient_writer_observer: close_retirement::AmbientWriterObserver,
     runtimes: RwLock<HashMap<String, ConversationHandle>>,
     /// Per-conversation single-flight results for slow runtime materialization.
     /// The mutex protects only map admission/removal; unrelated conversations
@@ -2117,6 +2118,18 @@ impl RuntimeManager {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_test_no_ambient_writers(
+        mut self,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        self.ambient_writer_observer = Arc::new(move |_| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(None)
+        });
+        self
+    }
+
     pub fn new_with_message_retriever(
         db: Database,
         llm_registry: Arc<ModelRegistry>,
@@ -2195,6 +2208,7 @@ impl RuntimeManager {
             terminals: crate::terminal::ActiveTerminals::new(),
             close_retirement_leases: AsyncMutex::new(HashMap::new()),
             close_retirement_execution: ConversationMutexGates::default(),
+            ambient_writer_observer: close_retirement::production_ambient_writer_observer(),
             runtimes: RwLock::new(HashMap::new()),
             runtime_creations: AsyncMutex::new(HashMap::new()),
             conversation_admissions: AsyncMutex::new(HashMap::new()),
