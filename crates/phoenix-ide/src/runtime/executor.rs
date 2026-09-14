@@ -16300,6 +16300,8 @@ mod approve_task_failure_effect_tests {
             ),
             Arc::from(Vec::new()),
         ));
+        let storage = Arc::new(InMemoryStorage::new());
+        storage.set_fail_state_update(true);
         let mut rt = ConversationRuntime::new(
             context,
             ConvState::AwaitingTaskApproval {
@@ -16308,7 +16310,7 @@ mod approve_task_failure_effect_tests {
                 priority: crate::task_source::Priority::P0,
                 plan: "Plan".to_string(),
             },
-            Arc::new(InMemoryStorage::new()),
+            storage.clone(),
             Arc::new(MockLlmClient::new("test-model")),
             tool_executor.clone(),
             Arc::new(BrowserSessionManager::default()),
@@ -16347,6 +16349,21 @@ mod approve_task_failure_effect_tests {
             rt.context.mode_context,
             Some(ModeContext::Explore { .. })
         ));
+        assert!(matches!(rt.state, ConvState::LlmRequesting { attempt: 1 }));
+        assert!(matches!(
+            storage.get_current_state(conv_id),
+            Some(ConvState::LlmRequesting { attempt: 1 })
+        ));
+        assert_eq!(storage.get_all_messages(conv_id).len(), 1);
+
+        rt.process_event(Event::TaskApprovalDecided {
+            outcome: TaskApprovalOutcome::Approved {
+                handoff: TaskApprovalHandoff::ContinueInCurrentConversation,
+            },
+        })
+        .await
+        .expect("duplicate approval decision is stale and absorbed");
+        assert_eq!(storage.get_all_messages(conv_id).len(), 1);
     }
 
     #[tokio::test]
