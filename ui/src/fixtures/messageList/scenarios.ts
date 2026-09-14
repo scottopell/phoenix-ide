@@ -43,6 +43,104 @@ const baseMessages: Message[] = [
     display_data: {},
   },
 ];
+export const compactChronologyInitialMessages: Message[] = [
+  {
+    message_id: 'chronology-user-1',
+    conversation_id: 'fixture-message-list-compact-chronology',
+    sequence_id: 1,
+    type: 'user',
+    message_type: 'user',
+    created_at: '2025-01-01T10:00:00.000Z',
+    content: { text: 'Run the compact chronology sequence.' },
+    display_data: {},
+  },
+  {
+    message_id: 'chronology-agent-a',
+    conversation_id: 'fixture-message-list-compact-chronology',
+    sequence_id: 2,
+    type: 'agent',
+    message_type: 'agent',
+    created_at: '2025-01-01T10:01:00.000Z',
+    content: [
+      { type: 'tool_use', id: 'chronology-tool-a', name: 'read_file', input: { path: 'older-a.md' } },
+    ],
+    display_data: {},
+  },
+  {
+    message_id: 'chronology-result-a',
+    conversation_id: 'fixture-message-list-compact-chronology',
+    sequence_id: 3,
+    type: 'tool',
+    message_type: 'tool',
+    created_at: '2025-01-01T10:01:30.000Z',
+    content: { tool_use_id: 'chronology-tool-a', content: 'Older A result\n'.repeat(20), is_error: false },
+    display_data: {},
+  },
+];
+
+export const compactChronologyAppendMessages: Message[] = [
+  {
+    message_id: 'chronology-agent-b',
+    conversation_id: 'fixture-message-list-compact-chronology',
+    sequence_id: 4,
+    type: 'agent',
+    message_type: 'agent',
+    created_at: '2025-01-01T10:02:00.000Z',
+    content: [
+      { type: 'tool_use', id: 'chronology-tool-b', name: 'search', input: { pattern: 'newer B' } },
+    ],
+    display_data: {},
+  },
+  {
+    message_id: 'chronology-agent-c',
+    conversation_id: 'fixture-message-list-compact-chronology',
+    sequence_id: 5,
+    type: 'agent',
+    message_type: 'agent',
+    created_at: '2025-01-01T10:03:00.000Z',
+    content: [
+      { type: 'tool_use', id: 'chronology-tool-c', name: 'bash', input: { op: 'run', cmd: 'echo newer C' } },
+    ],
+    display_data: {},
+  },
+];
+
+export const compactChronologyCompletionMessages: Message[] = [
+  {
+    message_id: 'chronology-result-b',
+    conversation_id: 'fixture-message-list-compact-chronology',
+    sequence_id: 6,
+    type: 'tool',
+    message_type: 'tool',
+    created_at: '2025-01-01T10:03:30.000Z',
+    content: { tool_use_id: 'chronology-tool-b', content: 'newer B result', is_error: false },
+    display_data: {},
+  },
+  {
+    message_id: 'chronology-result-c',
+    conversation_id: 'fixture-message-list-compact-chronology',
+    sequence_id: 7,
+    type: 'tool',
+    message_type: 'tool',
+    created_at: '2025-01-01T10:04:00.000Z',
+    content: { tool_use_id: 'chronology-tool-c', content: JSON.stringify({ status: 'exited', exit_code: 0, lines: [{ offset: 0, bytes: 'newer C result' }] }), is_error: false },
+    display_data: {},
+  },
+];
+
+export const compactChronologyFinalMessages: Message[] = [
+  {
+    message_id: 'chronology-agent-final',
+    conversation_id: 'fixture-message-list-compact-chronology',
+    sequence_id: 8,
+    type: 'agent',
+    message_type: 'agent',
+    created_at: '2025-01-01T10:05:00.000Z',
+    content: [{ type: 'text', text: 'Final prose after B and C completed. The latest message must remain reachable without losing the older expanded A detail.' }],
+    display_data: {},
+  },
+];
+
 const toolStripMessages: Message[] = [
   {
     message_id: 'user-tool-1',
@@ -208,6 +306,42 @@ const markdownImageMessages: Message[] = [
   },
 ];
 
+export const narrowWebKitMarkdownTableMessages: Message[] = [
+  {
+    message_id: 'user-narrow-webkit-table-1',
+    conversation_id: 'fixture-message-list-narrow-webkit-markdown-table',
+    sequence_id: 1,
+    type: 'user',
+    message_type: 'user',
+    created_at: '2025-01-01T10:00:00.000Z',
+    content: { text: 'Show the merge plan table.' },
+    display_data: {},
+  },
+  {
+    message_id: 'agent-narrow-webkit-table-1',
+    conversation_id: 'fixture-message-list-narrow-webkit-markdown-table',
+    sequence_id: 2,
+    type: 'agent',
+    message_type: 'agent',
+    created_at: '2025-01-01T10:01:00.000Z',
+    content: [{
+      type: 'text',
+      text: [
+        'Exact incident table fixture:',
+        '',
+        '| Merge | What it unblocks |',
+        '| --- | --- |',
+        '| **#760 specification** | Preserves the `conversation-ui` transcript requirements while follow-up implementation work proceeds. |',
+        '| **#760 implementation follow-up** | Keeps ordinary conversation polish moving without conflating this table symptom with prior inline-code sizing work. |',
+        '| **#769 performance** | Confirms the WebKit readability fix independently from the compact chronology incident. |',
+        '',
+        'Text after the table confirms the message column recovers after the scroll wrapper.',
+      ].join('\n'),
+    }],
+    display_data: {},
+  },
+];
+
 const wideMarkdownTableMessages: Message[] = [
   {
     message_id: 'user-wide-table-1',
@@ -310,6 +444,12 @@ export const messageListScenarios = [
     theme: 'dark',
   },
   {
+    id: 'compact-expanded-tool-chronology',
+    title: 'Compact expanded-tool chronology',
+    description: 'Interactive compact-mode sequence: expand older A, append B/C, complete, then final prose.',
+    theme: 'dark',
+  },
+  {
     id: 'scroll-policy-long',
     title: 'Scroll policy long conversation',
     description: 'Long deterministic conversation with controls for real VirtualTranscript tail-follow QA.',
@@ -320,6 +460,18 @@ export const messageListScenarios = [
     title: 'Prefix continuity offset bug',
     description: 'Interactive real-VirtualTranscript reproduction of identity-only restoration jumping within a tall row.',
     theme: 'dark',
+  },
+  {
+    id: 'narrow-webkit-markdown-table',
+    title: 'Narrow WebKit Markdown table / dark',
+    description: 'Exact two-column Merge / What it unblocks incident table in dark theme.',
+    theme: 'dark',
+  },
+  {
+    id: 'narrow-webkit-markdown-table-light',
+    title: 'Narrow WebKit Markdown table / light',
+    description: 'Exact two-column Merge / What it unblocks incident table in light theme.',
+    theme: 'light',
   },
   {
     id: 'wide-markdown-table',
@@ -352,10 +504,14 @@ export function getMessageListScenario(id: MessageListScenarioId): MessageListSc
 export function messageListFixtureData(scenario: MessageListScenario): MessageListFixtureData {
   const messages = scenario.id === 'compact-tool-strip'
     ? toolStripMessages
-    : scenario.id === 'markdown-image-dark'
+    : scenario.id === 'compact-expanded-tool-chronology'
+      ? compactChronologyInitialMessages
+      : scenario.id === 'markdown-image-dark'
       ? markdownImageMessages
-      : scenario.id === 'wide-markdown-table' || scenario.id === 'wide-markdown-table-light'
-        ? wideMarkdownTableMessages
+      : scenario.id === 'narrow-webkit-markdown-table' || scenario.id === 'narrow-webkit-markdown-table-light'
+        ? narrowWebKitMarkdownTableMessages
+        : scenario.id === 'wide-markdown-table' || scenario.id === 'wide-markdown-table-light'
+          ? wideMarkdownTableMessages
         : scenario.id === 'scroll-policy-long'
           ? scrollPolicyMessages
           : scenario.id === 'prefix-continuity-offset-bug'

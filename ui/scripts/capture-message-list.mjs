@@ -4,6 +4,7 @@ import path from 'node:path';
 
 const width = Number(process.env.MESSAGE_LIST_QA_WIDTH ?? 960);
 const height = Number(process.env.MESSAGE_LIST_QA_HEIGHT ?? 900);
+const narrowMarkdownTableMetrics = [];
 
 async function verifyWideTable({ page, id, viewport }) {
   if (id !== 'wide-markdown-table' && id !== 'wide-markdown-table-light') return false;
@@ -43,8 +44,8 @@ async function verifyWideTable({ page, id, viewport }) {
   if (desktop.wrapperLeft < desktop.chatLeft || desktop.wrapperRight > desktop.chatRight) {
     throw new Error(`Wide table escaped chat bounds: ${JSON.stringify(desktop)}`);
   }
-  if (desktop.wrapperLeft >= desktop.messageLeft || desktop.wrapperRight <= desktop.messageRight) {
-    throw new Error(`Wide table did not break out on both sides: ${JSON.stringify(desktop)}`);
+  if (desktop.wrapperClientWidth < Math.min(desktop.messageRight - desktop.messageLeft, 784)) {
+    throw new Error(`Wide table wrapper is narrower than its owned table boundary: ${JSON.stringify(desktop)}`);
   }
   if (desktop.wrapperOverflowX !== 'auto' || desktop.wrapperScrollWidth <= desktop.wrapperClientWidth) {
     throw new Error(`Wide table wrapper does not own local overflow: ${JSON.stringify(desktop)}`);
@@ -95,6 +96,121 @@ async function verifyWideTable({ page, id, viewport }) {
   return false;
 }
 
+function collectTableMetrics(label) {
+  const wrapper = document.querySelector('.conversation-markdown-table-scroll');
+  const table = wrapper?.querySelector('table');
+  const prose = document.querySelector('.agent-text-block');
+  const th = table?.querySelector('th');
+  const td = table?.querySelector('td');
+  const strong = table?.querySelector('strong');
+  const code = table?.querySelector('code');
+  if (!(wrapper instanceof HTMLElement)
+    || !(table instanceof HTMLTableElement)
+    || !(prose instanceof HTMLElement)
+    || !(th instanceof HTMLTableCellElement)
+    || !(td instanceof HTMLTableCellElement)
+    || !(strong instanceof HTMLElement)
+    || !(code instanceof HTMLElement)) {
+    throw new Error('narrow markdown table fixture is missing expected measurement elements');
+  }
+  const sizes = (element) => {
+    const style = getComputedStyle(element);
+    return { fontSize: style.fontSize, lineHeight: style.lineHeight };
+  };
+  const rect = wrapper.getBoundingClientRect();
+  const rootStyle = getComputedStyle(document.documentElement);
+  return {
+    label,
+    viewportWidth: window.innerWidth,
+    colorScheme: document.documentElement.classList.contains('dark') ? 'dark' : 'light',
+    prose: sizes(prose),
+    th: sizes(th),
+    td: sizes(td),
+    strong: sizes(strong),
+    code: sizes(code),
+    textSizeAdjust: rootStyle.webkitTextSizeAdjust || rootStyle.textSizeAdjust || '',
+    tableClientWidth: table.clientWidth,
+    tableScrollWidth: table.scrollWidth,
+    wrapperClientWidth: wrapper.clientWidth,
+    wrapperScrollWidth: wrapper.scrollWidth,
+    wrapperInitialScrollLeft: wrapper.scrollLeft,
+    wrapperLeft: rect.left,
+    wrapperRight: rect.right,
+    wrapperOverflowX: getComputedStyle(wrapper).overflowX,
+    tableLayout: getComputedStyle(table).tableLayout,
+    tableWidth: getComputedStyle(table).width,
+    cellOverflowWrap: getComputedStyle(td).overflowWrap,
+    documentClientWidth: document.documentElement.clientWidth,
+    documentScrollWidth: document.documentElement.scrollWidth,
+    documentOverflowX: rootStyle.overflowX,
+    bodyClientWidth: document.body.clientWidth,
+    bodyScrollWidth: document.body.scrollWidth,
+    selectorHasSupported: CSS.supports('selector(:has(*))'),
+  };
+}
+
+async function collectNarrowMarkdownTableMetrics(page, viewport, label) {
+  await page.setViewportSize(viewport);
+  await page.waitForSelector('.conversation-markdown-table-scroll table');
+  const patched = await page.evaluate(collectTableMetrics, `${label}:post`);
+  await page.addStyleTag({
+    content: `
+      .agent-text-block .conversation-markdown-table-scroll > table {
+        width: max-content !important;
+        table-layout: auto !important;
+      }
+      .agent-text-block .conversation-markdown-table-scroll :where(th, td) {
+        overflow-wrap: normal !important;
+      }
+    `,
+  });
+  const baseline = await page.evaluate(collectTableMetrics, `${label}:pre-simulated`);
+  return { baseline, patched };
+}
+
+async function verifyNarrowMarkdownTable({ page, id, outDir }) {
+  if (id !== 'narrow-webkit-markdown-table' && id !== 'narrow-webkit-markdown-table-light') return false;
+
+  const theme = id.endsWith('-light') ? 'light' : 'dark';
+  await page.evaluate((scenarioTheme) => {
+    document.documentElement.classList.toggle('dark', scenarioTheme === 'dark');
+  }, theme);
+  const desktop = await collectNarrowMarkdownTableMetrics(page, { width: 960, height: 900 }, `${theme}:desktop`);
+  await page.reload({ waitUntil: 'networkidle' });
+  await page.waitForSelector(`[data-message-list-fixture-ready="${id}"]`, { timeout: 10_000 });
+  await page.evaluate((scenarioTheme) => {
+    document.documentElement.classList.toggle('dark', scenarioTheme === 'dark');
+  }, theme);
+  const narrow = await collectNarrowMarkdownTableMetrics(page, { width: 375, height: 900 }, `${theme}:narrow`);
+  narrowMarkdownTableMetrics.push(desktop.baseline, desktop.patched, narrow.baseline, narrow.patched);
+
+  for (const sample of [desktop.patched, narrow.patched]) {
+    if (sample.th.fontSize !== sample.td.fontSize
+      || sample.strong.fontSize !== sample.td.fontSize
+      || sample.code.fontSize !== sample.td.fontSize) {
+      throw new Error(`Markdown table relative sizing is incoherent: ${JSON.stringify(sample)}`);
+    }
+    if (sample.th.lineHeight !== sample.td.lineHeight || sample.code.lineHeight !== sample.td.lineHeight) {
+      throw new Error(`Markdown table line heights diverged: ${JSON.stringify(sample)}`);
+    }
+    if (sample.wrapperInitialScrollLeft !== 0 || sample.wrapperLeft < -0.5) {
+      throw new Error(`Markdown table initial left edge is inaccessible: ${JSON.stringify(sample)}`);
+    }
+    if (sample.documentScrollWidth !== sample.documentClientWidth || sample.bodyScrollWidth !== sample.bodyClientWidth) {
+      throw new Error(`Markdown table created document overflow: ${JSON.stringify(sample)}`);
+    }
+    if (sample.wrapperOverflowX !== 'auto') {
+      throw new Error(`Markdown table wrapper does not own horizontal overflow: ${JSON.stringify(sample)}`);
+    }
+  }
+  if (narrow.patched.tableLayout !== 'fixed' || narrow.patched.cellOverflowWrap !== 'anywhere') {
+    throw new Error(`Narrow table did not receive the narrow readability rule: ${JSON.stringify(narrow.patched)}`);
+  }
+  await page.screenshot({ path: path.join(outDir, `${id}--narrow-table.png`), fullPage: true });
+  console.log(`  verified narrow markdown table metrics (${id})`);
+  return true;
+}
+
 async function captureContinuityReproduction({ page, id, outDir }) {
   if (id !== 'prefix-continuity-offset-bug') return false;
 
@@ -139,6 +255,14 @@ runSurfaceCapture({
   outDir: process.env.MESSAGE_LIST_QA_OUT ?? 'qa-artifacts/message-list',
   viewport: { width, height },
   captureStory: async (context) => (
-    await verifyWideTable(context) || await captureContinuityReproduction(context)
+    await verifyWideTable(context) || await verifyNarrowMarkdownTable(context) || await captureContinuityReproduction(context)
   ),
+  onComplete: async (outDir) => {
+    if (narrowMarkdownTableMetrics.length > 0) {
+      await writeFile(
+        path.join(outDir, 'narrow-webkit-markdown-table-metrics.json'),
+        `${JSON.stringify(narrowMarkdownTableMetrics, null, 2)}\n`,
+      );
+    }
+  },
 });

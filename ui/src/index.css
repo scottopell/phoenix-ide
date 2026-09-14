@@ -570,6 +570,29 @@ body.app-viewport-active #root {
   border-radius: 5px;
 }
 
+.compact-tool-selected-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.compact-tool-detail-collapse {
+  align-self: flex-end;
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+  line-height: 1.2;
+  padding: 0.2rem 0.55rem;
+}
+
+.compact-tool-detail-collapse:hover,
+.compact-tool-detail-collapse:focus-visible {
+  color: var(--text-primary);
+  border-color: var(--accent-blue);
+}
+
 .compact-tool-card:hover {
   background: var(--border-color);
 }
@@ -1250,6 +1273,17 @@ body.app-viewport-active #root {
   width: max-content;
   margin: 0;
   background: var(--bg-secondary);
+}
+
+@media (width <= 600px) {
+  .agent-text-block .conversation-markdown-table-scroll > table {
+    width: 100%;
+    table-layout: fixed;
+  }
+
+  .agent-text-block .conversation-markdown-table-scroll :where(th, td) {
+    overflow-wrap: anywhere;
+  }
 }
 
 .agent-text-block th,

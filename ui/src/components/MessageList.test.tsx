@@ -873,6 +873,8 @@ describe('MessageList', () => {
     const markdownTableRule = appCss.match(/\.agent-text-block\s+\.markdown-table-scroll\s+table\s*{([^}]*)}/s)?.[1];
     const transcriptRule = appCss.match(/\.message-virtual-transcript\s*{[^}]*}/s)?.[0];
     const tableCodeRule = appCss.match(/\.message-content\s+\.agent-text-block\s+:where\(th,\s*td\)\s+code\s*{([^}]*)}/s)?.[1];
+    const narrowConversationTableRule = appCss.match(/\.agent-text-block\s+\.conversation-markdown-table-scroll\s*>\s*table\s*{([^}]*)}/s)?.[1];
+    const narrowConversationCellRule = appCss.match(/\.agent-text-block\s+\.conversation-markdown-table-scroll\s+:where\(th,\s*td\)\s*{([^}]*)}/s)?.[1];
 
     expect(chatViewRule).toMatch(/container-type:\s*inline-size/);
     expect(tableFallbackRule).toMatch(/max-width:\s*100%/);
@@ -886,6 +888,11 @@ describe('MessageList', () => {
     expect(markdownTableRule).toMatch(/background:\s*var\(--bg-secondary\)/);
     expect(tableFallbackRule).not.toMatch(/background/);
     expect(tableCodeRule).toMatch(/font-size:\s*inherit/);
+    expect(narrowConversationTableRule).toMatch(/width:\s*100%/);
+    expect(narrowConversationTableRule).toMatch(/table-layout:\s*fixed/);
+    expect(narrowConversationCellRule).toMatch(/overflow-wrap:\s*anywhere/);
+    expect(appCss).not.toMatch(/markdown-table-scroll:has/);
+    expect(appCss).not.toMatch(/th:nth-child\(2\):last-child/);
     expect(transcriptRule).not.toMatch(/container-type/);
     expect(transcriptRule).not.toMatch(/overflow-x/);
   });
