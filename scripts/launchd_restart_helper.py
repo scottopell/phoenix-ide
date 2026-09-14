@@ -371,12 +371,31 @@ def wait_for_identity(manifest: Manifest, expected: Identity) -> None:
 
 def restart(manifest: Manifest) -> str:
     lock_path = Path(manifest.lock_path)
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+") as lock:
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock = lock_path.open("a+")
+    except OSError as exc:
+        write_status(
+            manifest,
+            "precondition_failed",
+            failure=str(exc),
+            previous_pid=manifest.previous_pid,
+        )
+        raise
+
+    with lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise ConcurrentRestart("another production operation is activating") from exc
+        except OSError as exc:
+            write_status(
+                manifest,
+                "precondition_failed",
+                failure=str(exc),
+                previous_pid=manifest.previous_pid,
+            )
+            raise
 
         launchctl = Launchctl(manifest)
         disrupted = False

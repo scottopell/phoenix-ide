@@ -269,6 +269,96 @@ class RestartHelperTests(unittest.TestCase):
             status = json.loads(Path(manifest.status_path).read_text())
             self.assertEqual("precondition_failed", status["state"])
 
+    def test_lock_open_failure_terminalizes_and_releases_claim(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = make_manifest(root)
+            Path(manifest.lock_path).mkdir()
+            manifest_path = root / "manifest.json"
+            manifest_path.write_text(json.dumps(dataclasses.asdict(manifest)))
+            argv = [
+                "launchd_restart_helper.py",
+                "restart",
+                "--manifest",
+                str(manifest_path),
+                "--helper-label",
+                manifest.helper_label,
+                "--uid",
+                str(manifest.uid),
+            ]
+
+            with mock.patch.object(sys, "argv", argv), \
+                 mock.patch.object(helper, "request_helper_bootout") as bootout, \
+                 mock.patch.object(sys, "stderr", new_callable=io.StringIO):
+                self.assertEqual(1, helper.main())
+
+            status = json.loads(Path(manifest.status_path).read_text())
+            self.assertEqual("precondition_failed", status["state"])
+            self.assertIn("directory", status["failure"])
+            self.assertFalse(Path(manifest.active_path).exists())
+            bootout.assert_called_once_with(manifest.uid, manifest.helper_label)
+
+    def test_lock_acquisition_failure_terminalizes_and_releases_claim(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = make_manifest(root)
+            real_flock = helper.fcntl.flock
+
+            def fail_activation_lock(lock, operation):
+                if operation & helper.fcntl.LOCK_NB:
+                    raise OSError("lock unavailable")
+                return real_flock(lock, operation)
+
+            manifest_path = root / "manifest.json"
+            manifest_path.write_text(json.dumps(dataclasses.asdict(manifest)))
+            argv = [
+                "launchd_restart_helper.py",
+                "restart",
+                "--manifest",
+                str(manifest_path),
+                "--helper-label",
+                manifest.helper_label,
+                "--uid",
+                str(manifest.uid),
+            ]
+
+            with mock.patch.object(sys, "argv", argv), \
+                 mock.patch.object(helper.fcntl, "flock", side_effect=fail_activation_lock), \
+                 mock.patch.object(helper, "request_helper_bootout"), \
+                 mock.patch.object(sys, "stderr", new_callable=io.StringIO):
+                self.assertEqual(1, helper.main())
+
+            status = json.loads(Path(manifest.status_path).read_text())
+            self.assertEqual("precondition_failed", status["state"])
+            self.assertIn("lock unavailable", status["failure"])
+            self.assertFalse(Path(manifest.active_path).exists())
+
+    def test_lock_failure_retains_claim_when_terminal_status_is_not_durable(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = make_manifest(root)
+            Path(manifest.lock_path).mkdir()
+            manifest_path = root / "manifest.json"
+            manifest_path.write_text(json.dumps(dataclasses.asdict(manifest)))
+            argv = [
+                "launchd_restart_helper.py",
+                "restart",
+                "--manifest",
+                str(manifest_path),
+                "--helper-label",
+                manifest.helper_label,
+                "--uid",
+                str(manifest.uid),
+            ]
+
+            with mock.patch.object(sys, "argv", argv), \
+                 mock.patch.object(helper, "write_status", side_effect=OSError("disk full")), \
+                 mock.patch.object(helper, "request_helper_bootout"), \
+                 mock.patch.object(sys, "stderr", new_callable=io.StringIO):
+                self.assertEqual(1, helper.main())
+
+            self.assertTrue(Path(manifest.active_path).exists())
+
     def test_failed_recovery_is_truthful_and_does_not_claim_rollback(self):
         with tempfile.TemporaryDirectory() as td:
             manifest = make_manifest(Path(td))
