@@ -78,6 +78,7 @@ mod tests {
                 ConvMode::Explore { .. }
                 | ConvMode::Direct
                 | ConvMode::Branch { .. }
+                | ConvMode::AttachedWorkChild { .. }
                 | ConvMode::DetachedProductCreation { .. }
                 | ConvMode::DetachedApprovedTask { .. } => {
                     prop_assert!(false, "Expected Work mode");
@@ -96,6 +97,7 @@ mod tests {
                 ConvMode::Explore { .. }
                 | ConvMode::Direct
                 | ConvMode::Branch { .. }
+                | ConvMode::AttachedWorkChild { .. }
                 | ConvMode::DetachedProductCreation { .. }
                 | ConvMode::DetachedApprovedTask { .. } => {
                     prop_assert!(false, "Expected Work mode");
@@ -114,6 +116,7 @@ mod tests {
                 ConvMode::Explore { .. }
                 | ConvMode::Direct
                 | ConvMode::Branch { .. }
+                | ConvMode::AttachedWorkChild { .. }
                 | ConvMode::DetachedProductCreation { .. }
                 | ConvMode::DetachedApprovedTask { .. } => {
                     prop_assert!(false, "Expected Work mode");
@@ -141,6 +144,7 @@ mod tests {
                 ConvMode::Explore { .. }
                 | ConvMode::Direct
                 | ConvMode::Work { .. }
+                | ConvMode::AttachedWorkChild { .. }
                 | ConvMode::DetachedProductCreation { .. }
                 | ConvMode::DetachedApprovedTask { .. } => {
                     prop_assert!(false, "Expected Branch mode");
@@ -159,11 +163,55 @@ mod tests {
                 ConvMode::Explore { .. }
                 | ConvMode::Direct
                 | ConvMode::Work { .. }
+                | ConvMode::AttachedWorkChild { .. }
                 | ConvMode::DetachedProductCreation { .. }
                 | ConvMode::DetachedApprovedTask { .. } => {
                     prop_assert!(false, "Expected Branch mode");
                 }
             }
+        }
+    }
+
+    fn arb_attached_work_child_mode() -> impl Strategy<Value = ConvMode> {
+        "/tmp/[a-z]{8}".prop_map(|worktree_path| ConvMode::AttachedWorkChild {
+            worktree_path: NonEmptyString::new(worktree_path).unwrap(),
+        })
+    }
+
+    proptest! {
+        /// An attached Work child retains a non-empty inherited worktree while
+        /// remaining structurally distinct from task-owning Work and Branch.
+        #[test]
+        fn prop_attached_work_child_has_only_inherited_worktree(
+            mode in arb_attached_work_child_mode()
+        ) {
+            match &mode {
+                ConvMode::AttachedWorkChild { worktree_path } => {
+                    prop_assert!(!worktree_path.as_str().is_empty());
+                    prop_assert_eq!(mode.worktree_path(), Some(worktree_path.as_str()));
+                    prop_assert_eq!(mode.task_title(), None);
+                    prop_assert_eq!(mode.base_branch(), None);
+                }
+                ConvMode::Explore { .. }
+                | ConvMode::Direct
+                | ConvMode::Work { .. }
+                | ConvMode::Branch { .. }
+                | ConvMode::DetachedProductCreation { .. }
+                | ConvMode::DetachedApprovedTask { .. } => {
+                    prop_assert!(false, "Expected AttachedWorkChild mode");
+                }
+            }
+        }
+
+        /// Persistence roundtrip retains both the typed Work-child discriminator
+        /// and its inherited worktree identity.
+        #[test]
+        fn prop_attached_work_child_serde_roundtrip(
+            mode in arb_attached_work_child_mode()
+        ) {
+            let json = serde_json::to_string(&mode).unwrap();
+            let deserialized: ConvMode = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(mode, deserialized);
         }
     }
 
