@@ -4326,13 +4326,6 @@ fn production_proc_root() -> &'static Path {
 }
 
 #[cfg(all(test, target_os = "linux"))]
-fn quarantine_has_process_cwd(path: &Path) -> Result<bool, String> {
-    // SAFETY: `geteuid` has no preconditions.
-    let effective_uid = unsafe { libc::geteuid() };
-    quarantine_has_process_cwd_in(path, production_proc_root(), effective_uid)
-}
-
-#[cfg(all(test, target_os = "linux"))]
 fn quarantine_has_process_cwd_in(
     path: &Path,
     proc_root: &Path,
