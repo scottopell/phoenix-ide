@@ -4,6 +4,8 @@
 
 Native macOS production deployment prepares either local `HEAD` or a checksummed published release, stages rollback inputs and a redacted manifest, and transfers activation to a distinct one-shot LaunchAgent. The helper serializes activation, performs atomic replacement, requires exact `/api/version` identity, and attempts verified rollback on failure. Durable status is reported by `./dev.py prod status`.
 
+Installed-runtime restart is a separate launchd-owned transaction. It sends SIGHUP without unloading the socket-activated target, verifies a new PID with the same exact identity, preserves the binary, plist, environment, listener, and deployed SHA, and reports its own durable status without replacing deployment status.
+
 Live production deployment remains an explicitly gated operator action; automated validation uses disposable resources.
 
 ## Requirement coverage
@@ -23,6 +25,9 @@ Live production deployment remains an explicitly gated operator action; automate
 | REQ-LDD-011 | `_prepare_release_candidate`, `prod_build`; release preparation tests |
 | REQ-LDD-012 | `main` prod parser; positional rejection test |
 | REQ-LDD-013 | `tests/integration/launchd_deploy_harness.py`; macOS-gated harness |
+| REQ-LDD-014 | `launchd_prod_restart`, `launchd_restart_helper.restart`; unit tests and disposable launchd restart journey |
+| REQ-LDD-015 | `_claim_launchd_restart`, `/api/version` socket-activation report, restart helper LaunchAgent handoff; runtime-activation, mutual-exclusion, and secret-redaction tests |
+| REQ-LDD-016 | `launchd_restart_helper.wait_for_identity`, restart status; exact-identity and failure-state tests |
 
 ## Operator surfaces
 
@@ -30,3 +35,4 @@ Live production deployment remains an explicitly gated operator action; automate
 - `./dev.py prod deploy --release vX.Y.Z` — exact published release.
 - `./dev.py prod deploy --release latest` — latest stable release resolved once.
 - `./dev.py prod status` — launchd PID/runtime identity and durable transaction result.
+- `./dev.py prod restart` — restart the installed process in place without rebuilding or changing installed configuration.

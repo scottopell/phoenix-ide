@@ -40,3 +40,5 @@ The target surface for each backend is:
 - `./dev.py prod status` — selected backend, runtime identity, and durable transaction result.
 - `./dev.py prod stop` — backend-owned runtime stop.
 - `./dev.py prod set` / `prod unset` — rejected with guidance to edit `.phoenix-ide.env` directly.
+
+Backend-specific restart surfaces preserve their owning runtime contract: launchd restarts the installed process without changing installed state, while bare Linux re-snapshots `.phoenix-ide.env` through the supervisor transaction. Systemd does not expose `prod restart`.

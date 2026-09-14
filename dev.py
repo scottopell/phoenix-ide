@@ -33,6 +33,7 @@ import time
 import traceback
 from collections.abc import Mapping
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 ROOT = Path(__file__).parent.resolve()
@@ -893,10 +894,17 @@ LAUNCHD_DEPLOY_LOCK_PATH = LAUNCHD_DEPLOY_DIR / "activate.lock"
 LAUNCHD_DEPLOY_CLAIM_LOCK_PATH = LAUNCHD_DEPLOY_DIR / "claim.lock"
 LAUNCHD_DEPLOY_ACTIVE_PATH = LAUNCHD_DEPLOY_DIR / "active"
 LAUNCHD_DEPLOY_HELPER_PREFIX = "com.phoenix-ide.deploy"
+LAUNCHD_RESTART_DIR = Path.home() / ".phoenix-ide" / "restart"
+LAUNCHD_RESTART_TRANSACTIONS_DIR = LAUNCHD_RESTART_DIR / "transactions"
+LAUNCHD_RESTART_ACTIVE_PATH = LAUNCHD_RESTART_DIR / "active"
+LAUNCHD_RESTART_HELPER_PREFIX = "com.phoenix-ide.restart"
+LAUNCHD_RESTART_HELPER_SOURCE = ROOT / "scripts" / "launchd_restart_helper.py"
 LAUNCHD_TRANSITION_TIMEOUT_SECS = 30.0
+LAUNCHD_RESTART_SHUTDOWN_TIMEOUT_SECS = 35.0
 LAUNCHD_HEALTH_TIMEOUT_SECS = 120.0
 LAUNCHD_STALE_HANDOFF_ALLOWANCE_SECS = 30.0
 LAUNCHD_HANDOFF_PROTOCOL_VERSION = 1
+LAUNCHD_RESTART_HANDOFF_PROTOCOL_VERSION = 2
 NEWSYSLOG_CONF_PATH = Path("/etc/newsyslog.d") / f"{LAUNCHD_LABEL}.conf"
 
 # Dev ports are assigned deterministically from the worktree path hash. Keep
@@ -8909,8 +8917,8 @@ def _file_sha256(path: Path) -> str:
 class ProdSourceKind(enum.Enum):
     LOCAL_HEAD = "local_head"
     PUBLISHED_RELEASE = "published_release"
-    # A restart reuses the already-installed binary verbatim; no source is
-    # materialized or rebuilt, only the environment snapshot is refreshed.
+    # A restart reuses the already-installed binary verbatim; the backend owns
+    # whether installed configuration is preserved or refreshed.
     INSTALLED_RESTART = "installed_restart"
 
 
@@ -8935,6 +8943,79 @@ class RuntimeIdentity:
         if self.version is None or self.git_sha is None:
             raise ValueError("exact runtime identity requires both version and git SHA")
         return {"version": self.version, "git_sha": self.git_sha}
+
+
+@dataclasses.dataclass(frozen=True)
+class ValidatedLaunchdArtifact:
+    path: Path
+    sha256: str
+
+    def is_unchanged(self) -> bool:
+        try:
+            return self.path.is_file() and _file_sha256(self.path) == self.sha256
+        except OSError:
+            return False
+
+
+@dataclasses.dataclass(frozen=True)
+class InstalledLaunchdRuntime:
+    binary: ValidatedLaunchdArtifact
+    plist: ValidatedLaunchdArtifact
+    deployed_sha: ValidatedLaunchdArtifact
+    identity: RuntimeIdentity
+    pid: int
+    health_url: str
+    health_insecure_tls: bool
+
+
+def _require_installed_launchd_artifacts_unchanged(
+    installed: InstalledLaunchdRuntime,
+) -> None:
+    for description, artifact in (
+        ("binary", installed.binary),
+        ("plist", installed.plist),
+        ("deployed SHA", installed.deployed_sha),
+    ):
+        if not artifact.is_unchanged():
+            raise SystemExit(
+                f"installed launchd {description} changed during restart preparation"
+            )
+
+
+@dataclasses.dataclass(frozen=True)
+class LoadedLaunchdJob:
+    state: str
+    pid: int | None
+    keep_alive: bool | None
+    plist_path: str | None
+    program_path: str | None
+    socket_services: tuple[str, ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class LaunchdJobNotLoaded:
+    pass
+
+
+@dataclasses.dataclass(frozen=True)
+class LaunchdJobInspectionFailed:
+    exit_code: int
+    detail: str
+
+
+LaunchdJobInspection = LoadedLaunchdJob | LaunchdJobNotLoaded | LaunchdJobInspectionFailed
+
+
+class ConcurrentLaunchdOperation(SystemExit):
+    pass
+
+
+class ActiveLaunchdRestart(ConcurrentLaunchdOperation):
+    pass
+
+
+class LaunchdClaimAcquisitionFailed(SystemExit):
+    pass
 
 
 @dataclasses.dataclass(frozen=True)
@@ -9082,7 +9163,11 @@ def _legacy_prod_identity(env: dict[str, str]) -> tuple[RuntimeIdentity, str, bo
         return None
 
 
-def _current_prod_identity(env: dict[str, str]) -> RuntimeIdentity | None:
+def _current_prod_identity(
+    env: dict[str, str],
+    *,
+    require_socket_activated: bool = False,
+) -> RuntimeIdentity | None:
     import ssl
     import urllib.request
     try:
@@ -9090,10 +9175,198 @@ def _current_prod_identity(env: dict[str, str]) -> RuntimeIdentity | None:
         context = ssl._create_unverified_context() if insecure_tls else None
         with urllib.request.urlopen(url, timeout=2, context=context) as response:
             value = json.load(response)
+        if require_socket_activated and value.get("socket_activated") is not True:
+            return None
         identity = RuntimeIdentity(version=str(value["version"]), git_sha=str(value["git_sha"]))
         return identity if identity.is_exact() else None
     except Exception:
         return None
+
+
+def _inspect_launchd_job() -> LaunchdJobInspection:
+    target = f"gui/{os.getuid()}/{LAUNCHD_LABEL}"
+    result = subprocess.run(
+        ["launchctl", "print", target],
+        capture_output=True,
+        text=True,
+    )
+    output = result.stdout + "\n" + result.stderr
+    if "Could not find service" in output:
+        return LaunchdJobNotLoaded()
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        return LaunchdJobInspectionFailed(
+            exit_code=result.returncode,
+            detail=detail or "launchctl returned no diagnostic output",
+        )
+    state = "unknown"
+    pid = None
+    keep_alive = None
+    plist_path = None
+    program_path = None
+    socket_services = []
+    for raw in result.stdout.splitlines():
+        line = raw.strip()
+        if line.startswith("state = "):
+            state = line.split(" = ", 1)[1]
+        elif line.startswith("path = "):
+            plist_path = line.split(" = ", 1)[1]
+        elif line.startswith("program = "):
+            program_path = line.split(" = ", 1)[1]
+        elif line.startswith("pid = "):
+            try:
+                pid = int(line.split(" = ", 1)[1])
+            except ValueError:
+                pass
+        elif line.startswith("properties = "):
+            properties = {
+                value.strip() for value in line.split(" = ", 1)[1].split("|")
+            }
+            keep_alive = "keepalive" in properties
+        elif line.startswith("service name = "):
+            socket_services.append(line.split(" = ", 1)[1])
+    return LoadedLaunchdJob(
+        state=state,
+        pid=pid,
+        keep_alive=keep_alive,
+        plist_path=plist_path,
+        program_path=program_path,
+        socket_services=tuple(socket_services),
+    )
+
+
+def _same_file(first: str | None, second: Path) -> bool:
+    if first is None:
+        return False
+    try:
+        return Path(first).samefile(second)
+    except OSError:
+        return False
+
+
+def _installed_launchd_runtime_for_restart() -> InstalledLaunchdRuntime:
+    binary = LAUNCHD_INSTALL_DIR / "phoenix-ide"
+    if not binary.is_file() or not LAUNCHD_PLIST_PATH.is_file():
+        raise SystemExit(
+            "no complete launchd production installation to restart; "
+            "run './dev.py prod deploy' first"
+        )
+    binary_artifact = ValidatedLaunchdArtifact(binary, _file_sha256(binary))
+    plist_artifact = ValidatedLaunchdArtifact(
+        LAUNCHD_PLIST_PATH,
+        _file_sha256(LAUNCHD_PLIST_PATH),
+    )
+    try:
+        with LAUNCHD_PLIST_PATH.open("rb") as stream:
+            plist = plistlib.load(stream)
+    except (OSError, plistlib.InvalidFileException, ValueError) as exc:
+        raise SystemExit(
+            "installed launchd plist is unreadable; run './dev.py prod deploy' first"
+        ) from exc
+
+    if plist.get("Label") != LAUNCHD_LABEL:
+        raise SystemExit("installed launchd plist has the wrong service label")
+    if plist.get("ProgramArguments") != [str(binary)]:
+        raise SystemExit("installed launchd plist does not target the installed Phoenix binary")
+    if plist.get("KeepAlive") is not True:
+        raise SystemExit(
+            "installed launchd service is not restartable in place; "
+            "run './dev.py prod deploy' first"
+        )
+    try:
+        listener = plist["Sockets"]["Listeners"]
+        socket_port = str(listener["SockServiceName"])
+    except (KeyError, TypeError) as exc:
+        raise SystemExit(
+            "installed launchd service is not socket-activated; "
+            "run './dev.py prod deploy' first"
+        ) from exc
+    if not isinstance(listener, dict) or listener.get("SockType") != "stream":
+        raise SystemExit(
+            "installed launchd service is not socket-activated with a stream listener; "
+            "run './dev.py prod deploy' first"
+        )
+
+    inspection = _inspect_launchd_job()
+    if isinstance(inspection, LaunchdJobInspectionFailed):
+        raise SystemExit(
+            f"could not inspect launchd production (exit {inspection.exit_code}): "
+            f"{inspection.detail}"
+        )
+    if isinstance(inspection, LaunchdJobNotLoaded):
+        raise SystemExit(
+            "launchd production is not loaded; run './dev.py prod deploy' first"
+        )
+    if inspection.state not in {"running", "active"} or inspection.pid is None:
+        raise SystemExit(
+            f"launchd production is not running (state={inspection.state}, "
+            f"pid={inspection.pid}); "
+            "run './dev.py prod deploy' first"
+        )
+    if inspection.keep_alive is not True:
+        raise SystemExit(
+            "loaded launchd service does not report KeepAlive; "
+            "run './dev.py prod deploy' to reload its installed configuration"
+        )
+    if (
+        not _same_file(inspection.plist_path, LAUNCHD_PLIST_PATH)
+        or not _same_file(inspection.program_path, binary)
+        or inspection.socket_services != (socket_port,)
+    ):
+        raise SystemExit(
+            "loaded launchd program or listener does not match the installed plist; "
+            "run './dev.py prod deploy' to reload its installed configuration"
+        )
+
+    env = {
+        str(key): str(value)
+        for key, value in plist.get("EnvironmentVariables", {}).items()
+    }
+    env["PHOENIX_PORT"] = socket_port
+    identity = _current_prod_identity(env, require_socket_activated=True)
+    if identity is None:
+        raise SystemExit(
+            "installed launchd runtime has no exact socket-activated /api/version identity; "
+            "refusing an unverifiable restart"
+        )
+    binary_identity = RuntimeIdentity.from_value(_binary_identity(binary))
+    if binary_identity != identity:
+        raise SystemExit(
+            "installed binary identity does not match the running launchd runtime; "
+            "refusing restart"
+        )
+    if not PROD_SHA_PATH.is_file():
+        raise SystemExit(
+            "installed launchd runtime has no recorded source commit; "
+            "run './dev.py prod deploy' first"
+        )
+    deployed_sha_artifact = ValidatedLaunchdArtifact(
+        PROD_SHA_PATH,
+        _file_sha256(PROD_SHA_PATH),
+    )
+    source_commit = PROD_SHA_PATH.read_text().strip()
+    if re.fullmatch(r"[0-9a-f]{40}", source_commit) is None:
+        raise SystemExit(
+            "installed launchd runtime has a malformed source commit; "
+            "run './dev.py prod deploy' first"
+        )
+    if not source_commit.startswith(identity.git_sha.removesuffix("-dirty")):
+        raise SystemExit(
+            "installed launchd runtime identity does not match its recorded source commit; "
+            "run './dev.py prod deploy' first"
+        )
+    health_url, health_insecure_tls = _launchd_health_probe(env)
+    installed = InstalledLaunchdRuntime(
+        binary=binary_artifact,
+        plist=plist_artifact,
+        deployed_sha=deployed_sha_artifact,
+        identity=identity,
+        pid=inspection.pid,
+        health_url=health_url,
+        health_insecure_tls=health_insecure_tls,
+    )
+    _require_installed_launchd_artifacts_unchanged(installed)
+    return installed
 
 
 def _resolve_rollback_identity(
@@ -9299,6 +9572,9 @@ _DEPLOY_TERMINAL_STATES = {
     "committed", "precondition_failed", "activation_failed_rolled_back",
     "activation_failed_rollback_failed", "rejected_concurrent",
 }
+_RESTART_TERMINAL_STATES = {
+    "committed", "precondition_failed", "restart_failed", "rejected_concurrent",
+}
 
 
 @contextlib.contextmanager
@@ -9318,6 +9594,29 @@ def _deploy_claim_owner() -> str | None:
         return None
 
 
+def _restart_claim_owner() -> str | None:
+    try:
+        return LAUNCHD_RESTART_ACTIVE_PATH.read_text().strip() or None
+    except OSError:
+        return None
+
+
+def _restart_transaction_status_path(transaction_id: str) -> Path:
+    return LAUNCHD_RESTART_TRANSACTIONS_DIR / transaction_id / "status.json"
+
+
+def _status_is_terminal_for_owner(
+    status_path: Path,
+    owner: str,
+    terminal_states: set[str],
+) -> bool:
+    try:
+        status = json.loads(status_path.read_text())
+        return status.get("transaction_id") == owner and status.get("state") in terminal_states
+    except (OSError, json.JSONDecodeError):
+        return False
+
+
 def _release_launchd_deploy_claim_unlocked(transaction_id: str) -> bool:
     if _deploy_claim_owner() != transaction_id:
         return False
@@ -9333,21 +9632,48 @@ def _release_launchd_deploy_claim(transaction_id: str) -> bool:
         return _release_launchd_deploy_claim_unlocked(transaction_id)
 
 
+def _release_launchd_restart_claim_unlocked(transaction_id: str) -> bool:
+    if _restart_claim_owner() != transaction_id:
+        return False
+    try:
+        LAUNCHD_RESTART_ACTIVE_PATH.unlink()
+        _fsync_directory(LAUNCHD_RESTART_ACTIVE_PATH.parent)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def _release_launchd_restart_claim(transaction_id: str) -> bool:
+    with _launchd_claim_lock():
+        return _release_launchd_restart_claim_unlocked(transaction_id)
+
+
 def _claim_launchd_deploy(transaction_id: str) -> None:
     LAUNCHD_DEPLOY_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     LAUNCHD_DEPLOY_DIR.chmod(0o700)
     with _launchd_claim_lock():
         owner = _deploy_claim_owner()
         if owner and LAUNCHD_DEPLOY_STATUS_PATH.exists():
-            try:
-                status = json.loads(LAUNCHD_DEPLOY_STATUS_PATH.read_text())
-                if status.get("transaction_id") == owner and status.get("state") in _DEPLOY_TERMINAL_STATES:
-                    _release_launchd_deploy_claim_unlocked(owner)
-                    owner = None
-            except (OSError, json.JSONDecodeError):
-                pass
+            if _status_is_terminal_for_owner(
+                LAUNCHD_DEPLOY_STATUS_PATH, owner, _DEPLOY_TERMINAL_STATES
+            ):
+                _release_launchd_deploy_claim_unlocked(owner)
+                owner = None
+        restart_owner = _restart_claim_owner()
+        if restart_owner and _status_is_terminal_for_owner(
+            _restart_transaction_status_path(restart_owner),
+            restart_owner,
+            _RESTART_TERMINAL_STATES,
+        ):
+            _release_launchd_restart_claim_unlocked(restart_owner)
+            restart_owner = None
+        if restart_owner is not None or LAUNCHD_RESTART_ACTIVE_PATH.exists():
+            raise ActiveLaunchdRestart(
+                f"another launchd restart ({restart_owner or 'unknown'}) is active or needs recovery. "
+                "Run './dev.py prod status'; remove the restart marker only after confirming no helper is running."
+            )
         if owner is not None or LAUNCHD_DEPLOY_ACTIVE_PATH.exists():
-            raise SystemExit(
+            raise ConcurrentLaunchdOperation(
                 f"another launchd deployment ({owner or 'unknown'}) is active or needs recovery. "
                 "Run './dev.py prod status'; remove the active marker only after confirming no helper is running."
             )
@@ -9358,8 +9684,85 @@ def _claim_launchd_deploy(transaction_id: str) -> None:
             os.fsync(stream.fileno())
 
 
+def _claim_launchd_restart(transaction_id: str) -> None:
+    claim_fd: int | None = None
+    try:
+        LAUNCHD_RESTART_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        LAUNCHD_RESTART_DIR.chmod(0o700)
+        with _launchd_claim_lock():
+            deploy_owner = _deploy_claim_owner()
+            if deploy_owner and _status_is_terminal_for_owner(
+                LAUNCHD_DEPLOY_STATUS_PATH, deploy_owner, _DEPLOY_TERMINAL_STATES
+            ):
+                _release_launchd_deploy_claim_unlocked(deploy_owner)
+                deploy_owner = None
+            if deploy_owner is not None or LAUNCHD_DEPLOY_ACTIVE_PATH.exists():
+                raise ConcurrentLaunchdOperation(
+                    f"another launchd deployment ({deploy_owner or 'unknown'}) is active or needs recovery. "
+                    "Run './dev.py prod status'; remove the deploy marker only after confirming no helper is running."
+                )
+
+            owner = _restart_claim_owner()
+            if owner and _status_is_terminal_for_owner(
+                _restart_transaction_status_path(owner), owner, _RESTART_TERMINAL_STATES
+            ):
+                _release_launchd_restart_claim_unlocked(owner)
+                owner = None
+            if owner is not None or LAUNCHD_RESTART_ACTIVE_PATH.exists():
+                raise ConcurrentLaunchdOperation(
+                    f"another launchd restart ({owner or 'unknown'}) is active or needs recovery. "
+                    "Run './dev.py prod status'; remove the restart marker only after confirming no helper is running."
+                )
+            try:
+                claim_fd = os.open(
+                    LAUNCHD_RESTART_ACTIVE_PATH,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+            except FileExistsError as exc:
+                raise ConcurrentLaunchdOperation(
+                    "another launchd restart (unknown) acquired the claim concurrently. "
+                    "Run './dev.py prod status'; remove the restart marker only after confirming no helper is running."
+                ) from exc
+            with os.fdopen(claim_fd, "w") as stream:
+                stream.write(transaction_id + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            _fsync_directory(LAUNCHD_RESTART_ACTIVE_PATH.parent)
+    except (ConcurrentLaunchdOperation, LaunchdClaimAcquisitionFailed):
+        raise
+    except OSError as exc:
+        if claim_fd is not None:
+            raise
+        raise LaunchdClaimAcquisitionFailed(
+            f"could not acquire the launchd operation claim: {exc}"
+        ) from exc
+
+
+def _fsync_directory(path: Path) -> None:
+    directory = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def _mkdir_durable(path: Path, mode: int = 0o777) -> None:
+    missing = []
+    cursor = path
+    while not cursor.exists():
+        missing.append(cursor)
+        cursor = cursor.parent
+    path.mkdir(parents=True, exist_ok=True, mode=mode)
+    if not missing:
+        return
+    for directory in missing:
+        _fsync_directory(directory)
+    _fsync_directory(cursor)
+
+
 def _write_json_atomic(path: Path, value: dict, mode: int = 0o600) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _mkdir_durable(path.parent)
     temporary = path.with_name(f".{path.name}.{os.getpid()}")
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
     try:
@@ -9369,6 +9772,7 @@ def _write_json_atomic(path: Path, value: dict, mode: int = 0o600) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+        _fsync_directory(path.parent)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
@@ -9425,6 +9829,25 @@ def _helper_plist(
     }, fmt=plistlib.FMT_XML)
 
 
+def _restart_helper_plist(
+    label: str,
+    helper: Path,
+    manifest: Path,
+    log_path: Path,
+    python_executable: Path,
+) -> bytes:
+    return plistlib.dumps({
+        "Label": label,
+        "ProgramArguments": [
+            str(python_executable), str(helper), "restart", "--manifest", str(manifest),
+            "--helper-label", label, "--uid", str(os.getuid()),
+        ],
+        "RunAtLoad": True,
+        "StandardOutPath": str(log_path),
+        "StandardErrorPath": str(log_path),
+    }, fmt=plistlib.FMT_XML)
+
+
 def _report_launchd_handoff(transaction_id: str, identity: RuntimeIdentity) -> None:
     try:
         print("\n✓ Activation handed to an independent launchd helper")
@@ -9466,7 +9889,6 @@ def launchd_prod_deploy(
     _preflight_prod_bind_auth(launchd_env, socket_activated=True)
 
     transaction_id = controller.transaction_id or f"{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
-    _claim_launchd_deploy(transaction_id)
     claimed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     staging = LAUNCHD_DEPLOY_DIR / "transactions" / transaction_id
     source_kind = "published_release" if release else "local_head"
@@ -9474,6 +9896,21 @@ def launchd_prod_deploy(
     release_commit = None
     release_tag = release
     selected_identity: RuntimeIdentity | None = None
+    try:
+        _claim_launchd_deploy(transaction_id)
+    except ActiveLaunchdRestart as exc:
+        rejected_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
+            "transaction_id": transaction_id, "state": "rejected_concurrent",
+            "source_kind": source_kind,
+            "source_commit": source_commit,
+            "release_commit": release_commit,
+            "release_tag": release_tag,
+            "expected_version": None, "expected_git_sha": None,
+            "created_at": claimed_at, "updated_at": rejected_at,
+            "failure": str(exc), "rollback_failure": None,
+        })
+        raise
     try:
         _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
             "transaction_id": transaction_id, "state": "preparing",
@@ -9663,6 +10100,320 @@ def launchd_prod_deploy(
     _report_launchd_handoff(transaction_id, selected_identity)
 
 
+def _report_launchd_restart_handoff(
+    transaction_id: str,
+    identity: RuntimeIdentity,
+) -> None:
+    try:
+        print("\n✓ Restart handed to an independent launchd helper")
+        print(f"  Transaction: {transaction_id}")
+        print(f"  Installed runtime: {identity.version} ({identity.git_sha})")
+        print("  Binary, configuration, deployed SHA, and listener remain installed in place.")
+        print("  The Phoenix connection may close while the process is restarted.")
+        print("  After reconnecting, run: ./dev.py prod status")
+    except BrokenPipeError:
+        pass
+
+
+def _prune_launchd_restart_transactions(current_transaction_id: str) -> None:
+    preserved = {current_transaction_id}
+    owner = _restart_claim_owner()
+    if owner is not None:
+        preserved.add(owner)
+    old_transactions = sorted(
+        (
+            path
+            for path in LAUNCHD_RESTART_TRANSACTIONS_DIR.iterdir()
+            if path.is_dir() and path.name not in preserved
+        ),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for old in old_transactions[5:]:
+        shutil.rmtree(old, ignore_errors=True)
+
+
+def launchd_prod_restart() -> None:
+    """Restart the installed LaunchAgent without replacing installed state."""
+    import uuid
+
+    transaction_id = (
+        f"{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-"
+        f"{uuid.uuid4().hex[:8]}"
+    )
+    created_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    staging = LAUNCHD_RESTART_TRANSACTIONS_DIR / transaction_id
+    status_path = _restart_transaction_status_path(transaction_id)
+    _mkdir_durable(staging, mode=0o700)
+    staging.chmod(0o700)
+    _write_json_atomic(status_path, {
+        "transaction_id": transaction_id,
+        "state": "preparing",
+        "source_kind": ProdSourceKind.INSTALLED_RESTART.value,
+        "expected_version": None,
+        "expected_git_sha": None,
+        "previous_pid": None,
+        "running_pid": None,
+        "created_at": created_at,
+        "updated_at": created_at,
+        "failure": None,
+    })
+    try:
+        _claim_launchd_restart(transaction_id)
+    except ConcurrentLaunchdOperation as exc:
+        _write_json_atomic(status_path, {
+            "transaction_id": transaction_id,
+            "state": "rejected_concurrent",
+            "source_kind": ProdSourceKind.INSTALLED_RESTART.value,
+            "expected_version": None,
+            "expected_git_sha": None,
+            "previous_pid": None,
+            "running_pid": None,
+            "created_at": created_at,
+            "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "failure": str(exc),
+        })
+        raise
+    except LaunchdClaimAcquisitionFailed as exc:
+        _write_json_atomic(status_path, {
+            "transaction_id": transaction_id,
+            "state": "precondition_failed",
+            "source_kind": ProdSourceKind.INSTALLED_RESTART.value,
+            "expected_version": None,
+            "expected_git_sha": None,
+            "previous_pid": None,
+            "running_pid": None,
+            "created_at": created_at,
+            "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "failure": str(exc),
+        })
+        raise
+
+    installed: InstalledLaunchdRuntime | None = None
+    bootstrap_attempted = False
+    bootstrap_rejected = False
+    try:
+        installed = _installed_launchd_runtime_for_restart()
+
+        _prune_launchd_restart_transactions(transaction_id)
+
+        helper = staging / "restart.py"
+        shutil.copy2(LAUNCHD_RESTART_HELPER_SOURCE, helper)
+        helper.chmod(0o700)
+        python_executable = Path(sys.executable).resolve()
+        protocol = subprocess.run(
+            [str(python_executable), str(helper), "--protocol-version"],
+            capture_output=True,
+            text=True,
+        )
+        if (
+            protocol.returncode != 0
+            or protocol.stdout.strip() != str(LAUNCHD_RESTART_HANDOFF_PROTOCOL_VERSION)
+        ):
+            raise SystemExit(
+                f"restart helper uses incompatible handoff protocol {protocol.stdout.strip()!r}; "
+                f"expected {LAUNCHD_RESTART_HANDOFF_PROTOCOL_VERSION}"
+            )
+        interpreter_check = subprocess.run(
+            [
+                str(python_executable),
+                "-c",
+                "import fcntl, hashlib, json, plistlib, ssl, urllib.request",
+            ],
+            capture_output=True,
+        )
+        if interpreter_check.returncode != 0:
+            raise SystemExit(
+                f"active Python interpreter cannot run the launchd restart helper: {python_executable}"
+            )
+
+        helper_label = f"{LAUNCHD_RESTART_HELPER_PREFIX}.{transaction_id}"
+        helper_log = LAUNCHD_RESTART_DIR / "restart.log"
+        helper_plist = staging / "helper.plist"
+        helper_plist.write_bytes(
+            _restart_helper_plist(
+                helper_label,
+                helper,
+                staging / "manifest.json",
+                helper_log,
+                python_executable,
+            )
+        )
+        helper_plist.chmod(0o600)
+        subprocess.run(
+            ["plutil", "-lint", str(helper_plist)],
+            check=True,
+            capture_output=True,
+        )
+
+        manifest = {
+            "manifest_version": LAUNCHD_RESTART_HANDOFF_PROTOCOL_VERSION,
+            "transaction_id": transaction_id,
+            "expected": installed.identity.as_dict(),
+            "previous_pid": installed.pid,
+            "binary_path": str(installed.binary.path),
+            "binary_sha256": installed.binary.sha256,
+            "plist_path": str(installed.plist.path),
+            "plist_sha256": installed.plist.sha256,
+            "socket_service": urlsplit(installed.health_url).port,
+            "deployed_sha_path": str(installed.deployed_sha.path),
+            "deployed_sha256": installed.deployed_sha.sha256,
+            "label": LAUNCHD_LABEL,
+            "helper_label": helper_label,
+            "uid": os.getuid(),
+            "health_url": installed.health_url,
+            "health_insecure_tls": installed.health_insecure_tls,
+            "active_path": str(LAUNCHD_RESTART_ACTIVE_PATH),
+            "status_path": str(status_path),
+            "lock_path": str(LAUNCHD_DEPLOY_LOCK_PATH),
+            "claim_lock_path": str(LAUNCHD_DEPLOY_CLAIM_LOCK_PATH),
+            "shutdown_timeout_secs": LAUNCHD_RESTART_SHUTDOWN_TIMEOUT_SECS,
+            "transition_timeout_secs": LAUNCHD_TRANSITION_TIMEOUT_SECS,
+            "health_timeout_secs": LAUNCHD_HEALTH_TIMEOUT_SECS,
+            "created_at": created_at,
+        }
+        _write_json_atomic(staging / "manifest.json", manifest)
+        (staging / "manifest.json").chmod(0o400)
+        helper.chmod(0o400)
+        _require_installed_launchd_artifacts_unchanged(installed)
+        _write_json_atomic(status_path, {
+            "transaction_id": transaction_id,
+            "state": "prepared",
+            "source_kind": ProdSourceKind.INSTALLED_RESTART.value,
+            "expected_version": installed.identity.version,
+            "expected_git_sha": installed.identity.git_sha,
+            "previous_pid": installed.pid,
+            "running_pid": None,
+            "created_at": created_at,
+            "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "failure": None,
+        })
+        bootstrap_attempted = True
+        result = subprocess.run(
+            ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(helper_plist)],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            bootstrap_rejected = True
+            detail = (result.stderr or result.stdout).strip()
+            suffix = f": {detail}" if detail else ""
+            raise SystemExit(f"could not hand restart to launchd{suffix}")
+    except BaseException as exc:
+        if bootstrap_attempted and not bootstrap_rejected:
+            raise
+        failed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        _write_json_atomic(status_path, {
+            "transaction_id": transaction_id,
+            "state": "precondition_failed",
+            "source_kind": ProdSourceKind.INSTALLED_RESTART.value,
+            "expected_version": installed.identity.version if installed else None,
+            "expected_git_sha": installed.identity.git_sha if installed else None,
+            "previous_pid": installed.pid if installed else None,
+            "running_pid": None,
+            "created_at": created_at,
+            "updated_at": failed_at,
+            "failure": f"{type(exc).__name__}: preparation failed before handoff",
+        })
+        if not _status_is_terminal_for_owner(
+            status_path,
+            transaction_id,
+            _RESTART_TERMINAL_STATES,
+        ):
+            raise RuntimeError(
+                "restart failure status was not durably persisted; retaining active claim"
+            ) from exc
+        _release_launchd_restart_claim(transaction_id)
+        raise
+
+    _report_launchd_restart_handoff(transaction_id, installed.identity)
+
+
+def _read_launchd_restart_statuses() -> list[dict]:
+    try:
+        paths = list(LAUNCHD_RESTART_TRANSACTIONS_DIR.glob("*/status.json"))
+    except OSError:
+        return []
+    statuses = []
+    for path in paths:
+        try:
+            status = json.loads(path.read_text())
+            if isinstance(status, dict):
+                statuses.append(status)
+        except (OSError, json.JSONDecodeError):
+            continue
+    return statuses
+
+
+def _print_launchd_restart_entry(label: str, restart: dict) -> None:
+    print(
+        f"  {label}: {restart.get('state', 'unknown')} "
+        f"({restart.get('transaction_id', 'unknown')})"
+    )
+    print(
+        f"    Expected: {restart.get('expected_version', 'unknown')} "
+        f"({restart.get('expected_git_sha', 'unknown')})"
+    )
+    previous_pid = restart.get("previous_pid")
+    running_pid = restart.get("running_pid")
+    if previous_pid is not None or running_pid is not None:
+        print(f"    PID: {previous_pid or 'unknown'} → {running_pid or 'pending'}")
+    print(f"    Updated: {restart.get('updated_at', 'unknown')}")
+    if restart.get("failure"):
+        print(f"    Failure: {restart['failure']}")
+    if restart.get("state") in {"preparing", "prepared", "restarting"}:
+        age = datetime.datetime.now(datetime.timezone.utc) - datetime.datetime.fromisoformat(
+            restart["updated_at"]
+        )
+        stale_after = (
+            LAUNCHD_RESTART_SHUTDOWN_TIMEOUT_SECS
+            + LAUNCHD_TRANSITION_TIMEOUT_SECS
+            + LAUNCHD_HEALTH_TIMEOUT_SECS
+            + LAUNCHD_STALE_HANDOFF_ALLOWANCE_SECS
+        )
+        if age.total_seconds() > stale_after:
+            print(
+                "    STALE: inspect ~/.phoenix-ide/restart/restart.log and confirm no helper "
+                "is running before clearing the restart marker"
+            )
+
+
+def _print_unresolved_launchd_restart_claim(owner: str | None) -> None:
+    print(f"  Active restart: status unavailable ({owner or 'unknown'})")
+    print(
+        "    UNRESOLVED: the active restart claim has no readable matching status; "
+        "inspect ~/.phoenix-ide/restart/restart.log and confirm no helper is running "
+        "before clearing the restart marker"
+    )
+
+
+def _print_launchd_restart_status() -> None:
+    statuses = _read_launchd_restart_statuses()
+    owner = _restart_claim_owner()
+    marker_exists = owner is not None or LAUNCHD_RESTART_ACTIVE_PATH.exists()
+    if not statuses:
+        if marker_exists:
+            _print_unresolved_launchd_restart_claim(owner)
+        return
+    latest = max(
+        statuses,
+        key=lambda status: (
+            str(status.get("updated_at") or status.get("created_at", "")),
+            str(status.get("created_at", "")),
+            str(status.get("transaction_id", "")),
+        ),
+    )
+    active = next(
+        (status for status in statuses if status.get("transaction_id") == owner),
+        None,
+    )
+    if marker_exists and active is None:
+        _print_unresolved_launchd_restart_claim(owner)
+    elif active is not None and active is not latest:
+        _print_launchd_restart_entry("Active restart", active)
+    _print_launchd_restart_entry("Last restart", latest)
+
+
 
 def _print_launchd_deploy_status() -> None:
     if not LAUNCHD_DEPLOY_STATUS_PATH.exists():
@@ -9697,32 +10448,27 @@ def _print_launchd_deploy_status() -> None:
 
 def launchd_prod_status():
     """Show launchd service status."""
-    uid = os.getuid()
-    domain_target = f"gui/{uid}/{LAUNCHD_LABEL}"
-    result = subprocess.run(
-        ["launchctl", "print", domain_target],
-        capture_output=True, text=True,
-    )
-    if "Could not find service" in result.stderr or "Could not find service" in result.stdout:
+    inspection = _inspect_launchd_job()
+    if isinstance(inspection, LaunchdJobNotLoaded):
         print("Production: not loaded")
         print(f"  Run './dev.py prod deploy' to start")
         _print_launchd_deploy_status()
+        _print_launchd_restart_status()
+        return
+    if isinstance(inspection, LaunchdJobInspectionFailed):
+        print("Production: status unavailable")
+        print(
+            f"  launchctl print failed (exit {inspection.exit_code}): "
+            f"{inspection.detail}"
+        )
+        _print_launchd_deploy_status()
+        _print_launchd_restart_status()
         return
 
-    # Parse state and pid from launchctl print output
-    state = "unknown"
-    pid = None
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if line.startswith("state = "):
-            state = line.split("= ", 1)[1]
-        elif line.startswith("pid = "):
-            try:
-                pid = int(line.split("= ", 1)[1])
-            except ValueError:
-                pass
-
-    print(f"Production: {state}" + (f" (PID {pid})" if pid else ""))
+    print(
+        f"Production: {inspection.state}"
+        + (f" (PID {inspection.pid})" if inspection.pid else "")
+    )
 
     try:
         status_env = _launchd_env_from_plist(LAUNCHD_PLIST_PATH)
@@ -9739,6 +10485,7 @@ def launchd_prod_status():
         print("  Health: not responding")
 
     _print_launchd_deploy_status()
+    _print_launchd_restart_status()
 
     if sha := read_deployed_sha():
         print(f"  Commit: {sha}")
@@ -9838,15 +10585,17 @@ def cmd_prod_stop():
 
 
 def cmd_prod_restart():
-    """Restart production, re-snapshotting the environment (auto-detects environment)."""
+    """Restart production on the installed binary (auto-detects environment)."""
     env = detect_prod_env()
 
     if env == "daemon":
         prod_daemon_restart()
-    elif env in {"launchd", "native"}:
+    elif env == "launchd":
+        launchd_prod_restart()
+    elif env == "native":
         raise SystemExit(
-            f"'prod restart' is only implemented for the bare-Linux supervisor backend; "
-            f"on the {env} backend, run './dev.py prod deploy' to pick up .phoenix-ide.env changes"
+            "'prod restart' is not implemented for the systemd backend; "
+            "run './dev.py prod deploy' to pick up .phoenix-ide.env changes"
         )
     else:
         print(f"ERROR: Unknown environment: {env}", file=sys.stderr)
@@ -10110,7 +10859,7 @@ def main():
     prod_sub.add_parser("stop", help="Stop production service")
     prod_sub.add_parser(
         "restart",
-        help="Restart production on the installed binary, re-snapshotting .phoenix-ide.env (bare-Linux backend)",
+        help="Restart production on the installed binary (macOS preserves installed config; bare Linux re-snapshots it)",
     )
     # Override management
     override_set_parser = prod_sub.add_parser("set", help="Set environment override")

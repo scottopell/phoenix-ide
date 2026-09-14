@@ -57,3 +57,15 @@ The deployment command shall accept `prod deploy` for local `HEAD` and `prod dep
 ### REQ-LDD-013 — Disposable integration safety
 
 A launchd integration harness shall use disposable labels, paths, database, and port and shall structurally refuse the production label and production resources.
+
+### REQ-LDD-014 — Installed-state-preserving restart
+
+When the operator requests a production restart, the system shall restart the loaded socket-activated LaunchAgent with a new PID while preserving the installed binary, plist, environment, listener, and deployed source identity byte-for-byte; it shall not build, run repository checks, read `.phoenix-ide.env`, replace installation artifacts, or unload the target job.
+
+### REQ-LDD-015 — Independent restart ownership and fencing
+
+Before signaling Phoenix, the system shall validate that the running process reports adoption of the launchd-owned socket and transfer restart ownership to a distinct one-shot LaunchAgent whose immutable, secret-free handoff records the expected runtime identity, previous PID, installed artifact hashes, endpoint, and target job identity. Restart and deployment shall share one mutually exclusive host-operation fence.
+
+### REQ-LDD-016 — Exact, truthful restart result
+
+A restart shall commit only after launchd reports a new target PID and `/api/version` reports the same exact runtime identity, with the installed artifact hashes unchanged. The system shall durably distinguish preparation failure, concurrent rejection, verified success, and failure after signaling; it shall not claim rollback when no installation artifact changed.

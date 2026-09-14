@@ -16,10 +16,18 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 HELPER = ROOT / "scripts/launchd_deploy_helper.py"
+RESTART_HELPER = ROOT / "scripts/launchd_restart_helper.py"
 LIVE_LABEL = "com.phoenix-ide.server"
 LIVE_PORT = 8031
 LIVE_HOME = Path.home() / ".phoenix-ide"
-TERMINAL = {"committed", "activation_failed_rolled_back", "activation_failed_rollback_failed"}
+TERMINAL = {
+    "committed",
+    "activation_failed_rolled_back",
+    "activation_failed_rollback_failed",
+    "precondition_failed",
+    "restart_failed",
+    "rejected_concurrent",
+}
 
 
 def refuse_live(label, root, port):
@@ -108,6 +116,80 @@ def target_plist(label, binary, port, log):
         "RunAtLoad": True, "KeepAlive": True,
         "StandardOutPath": str(log), "StandardErrorPath": str(log),
     })
+
+
+def socket_activated_server_script(identity):
+    payload = json.dumps({**identity, "socket_activated": True})
+    return f'''#!/usr/bin/python3
+import ctypes
+import json
+import os
+import socket
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+libc = ctypes.CDLL(None)
+libc.launch_activate_socket.argtypes = [
+    ctypes.c_char_p,
+    ctypes.POINTER(ctypes.POINTER(ctypes.c_int)),
+    ctypes.POINTER(ctypes.c_size_t),
+]
+libc.launch_activate_socket.restype = ctypes.c_int
+libc.free.argtypes = [ctypes.c_void_p]
+fds = ctypes.POINTER(ctypes.c_int)()
+count = ctypes.c_size_t()
+rc = libc.launch_activate_socket(b"Listeners", ctypes.byref(fds), ctypes.byref(count))
+if rc != 0 or count.value != 1:
+    raise SystemExit(f"launch_activate_socket failed: rc={{rc}} count={{count.value}}")
+listener = socket.fromfd(fds[0], socket.AF_INET, socket.SOCK_STREAM)
+os.close(fds[0])
+libc.free(fds)
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path != "/api/version":
+            self.send_response(404); self.end_headers(); return
+        body = {payload!r}.encode()
+        self.send_response(200); self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    def log_message(self, *args): pass
+
+server = HTTPServer(("127.0.0.1", 0), Handler, bind_and_activate=False)
+server.socket.close()
+server.socket = listener
+server.server_address = listener.getsockname()
+server.serve_forever()
+'''
+
+
+def socket_activated_target_plist(label, binary, port, log):
+    return plistlib.dumps({
+        "Label": label,
+        "ProgramArguments": [str(binary)],
+        "Sockets": {"Listeners": {
+            "SockFamily": "IPv4",
+            "SockProtocol": "TCP",
+            "SockServiceName": str(port),
+            "SockType": "stream",
+        }},
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "StandardOutPath": str(log),
+        "StandardErrorPath": str(log),
+    })
+
+
+def launchd_pid(domain, label):
+    result = subprocess.run(
+        ["launchctl", "print", f"{domain}/{label}"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    for raw in result.stdout.splitlines():
+        line = raw.strip()
+        if line.startswith("pid = "):
+            return int(line.split(" = ", 1)[1])
+    raise RuntimeError(f"launchd job has no PID: {label}")
 
 
 def run_scenario(root, domain, *, healthy_candidate, expected_state):
@@ -203,6 +285,117 @@ def run_scenario(root, domain, *, healthy_candidate, expected_state):
         subprocess.run(["launchctl", "bootout", f"{domain}/{target_label}"], capture_output=True)
 
 
+def run_restart_scenario(root, domain):
+    suffix = uuid.uuid4().hex
+    target_label = f"test.phoenix-ide.restart-target.{suffix}"
+    helper_label = f"test.phoenix-ide.restart-helper.{suffix}"
+    port = allocate_port()
+    refuse_live(target_label, root, port)
+    identity = {"version": "2.0.0", "git_sha": "a" * 12}
+    runtime = {**identity, "socket_activated": True}
+    target_binary = root / f"restart-phoenix-{suffix}"
+    target_binary.write_text(socket_activated_server_script(identity))
+    target_binary.chmod(0o755)
+    target_plist_path = root / f"restart-target-{suffix}.plist"
+    target_plist_path.write_bytes(socket_activated_target_plist(
+        target_label,
+        target_binary,
+        port,
+        root / f"restart-target-{suffix}.log",
+    ))
+    deployed_sha = root / f"restart-deployed-{suffix}.sha"
+    deployed_sha.write_text("a" * 40 + "\n")
+    original_hashes = {
+        target_binary: digest(target_binary),
+        target_plist_path: digest(target_plist_path),
+        deployed_sha: digest(deployed_sha),
+    }
+    url = f"http://127.0.0.1:{port}/api/version"
+    status = root / f"restart-status-{suffix}.json"
+    log = root / f"restart-helper-{suffix}.log"
+    active = root / f"restart-active-{suffix}"
+    active.write_text(suffix + "\n")
+    manifest_path = root / f"restart-manifest-{suffix}.json"
+    helper = root / f"restart-helper-{suffix}.py"
+    helper.write_bytes(RESTART_HELPER.read_bytes())
+    helper.chmod(0o500)
+    helper_plist = root / f"restart-helper-{suffix}.plist"
+    handoff = root / f"restart-handoff-{suffix}"
+    initiator = root / f"restart-initiator-{suffix}.py"
+
+    try:
+        subprocess.run(["launchctl", "bootstrap", domain, str(target_plist_path)], check=True)
+        wait_identity(url, runtime, time.monotonic() + 10)
+        previous_pid = launchd_pid(domain, target_label)
+        manifest = {
+            "manifest_version": 2,
+            "transaction_id": suffix,
+            "expected": identity,
+            "previous_pid": previous_pid,
+            "binary_path": str(target_binary),
+            "binary_sha256": original_hashes[target_binary],
+            "plist_path": str(target_plist_path),
+            "plist_sha256": original_hashes[target_plist_path],
+            "socket_service": port,
+            "deployed_sha_path": str(deployed_sha),
+            "deployed_sha256": original_hashes[deployed_sha],
+            "label": target_label,
+            "helper_label": helper_label,
+            "uid": os.getuid(),
+            "health_url": url,
+            "health_insecure_tls": False,
+            "active_path": str(active),
+            "status_path": str(status),
+            "lock_path": str(root / f"restart-lock-{suffix}"),
+            "claim_lock_path": str(root / f"restart-claim-lock-{suffix}"),
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "transition_timeout_secs": 30,
+            "health_timeout_secs": 10,
+        }
+        manifest_path.write_text(json.dumps(manifest))
+        helper_plist.write_bytes(plistlib.dumps({
+            "Label": helper_label,
+            "ProgramArguments": [
+                "/usr/bin/python3", str(helper), "restart",
+                "--manifest", str(manifest_path),
+                "--helper-label", helper_label,
+                "--uid", str(os.getuid()),
+            ],
+            "RunAtLoad": True,
+            "StandardOutPath": str(log),
+            "StandardErrorPath": str(log),
+        }))
+        initiator.write_text(
+            "import pathlib,subprocess,time\n"
+            f"subprocess.run(['launchctl','bootstrap',{domain!r},{str(helper_plist)!r}],check=True)\n"
+            f"pathlib.Path({str(handoff)!r}).write_text('handed-off')\n"
+            "time.sleep(60)\n"
+        )
+        process = subprocess.Popen([sys.executable, str(initiator)], start_new_session=True)
+        deadline = time.monotonic() + 10
+        while not handoff.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if not handoff.exists():
+            process.kill()
+            raise RuntimeError("restart initiator did not report launchd handoff")
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait(timeout=5)
+        result = wait_terminal(status, log, time.monotonic() + 40)
+        if result["state"] != "committed":
+            raise RuntimeError(f"unexpected restart terminal status: {result}")
+        if result["previous_pid"] != previous_pid or result["running_pid"] == previous_pid:
+            raise RuntimeError(f"restart did not record a new PID: {result}")
+        wait_identity(url, runtime, time.monotonic() + 3)
+        for path, expected_hash in original_hashes.items():
+            if digest(path) != expected_hash:
+                raise RuntimeError(f"restart changed installed artifact: {path}")
+        wait_unloaded(domain, helper_label, time.monotonic() + 5)
+        print("PASS: installed-state-preserving restart after initiator exit")
+    finally:
+        subprocess.run(["launchctl", "bootout", f"{domain}/{helper_label}"], capture_output=True)
+        subprocess.run(["launchctl", "bootout", f"{domain}/{target_label}"], capture_output=True)
+
+
 def main():
     if sys.platform != "darwin":
         print("SKIP: launchd disposable harness requires macOS")
@@ -212,6 +405,7 @@ def main():
         domain = f"gui/{os.getuid()}"
         run_scenario(root, domain, healthy_candidate=True, expected_state="committed")
         run_scenario(root, domain, healthy_candidate=False, expected_state="activation_failed_rolled_back")
+        run_restart_scenario(root, domain)
     return 0
 
 

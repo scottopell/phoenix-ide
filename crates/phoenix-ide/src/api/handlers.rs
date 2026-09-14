@@ -8078,11 +8078,28 @@ async fn get_version() -> &'static str {
     concat!("phoenix-ide ", env!("CARGO_PKG_VERSION"))
 }
 
-async fn get_version_json() -> impl IntoResponse {
-    Json(serde_json::json!({
+fn version_json_payload(socket_activated: bool) -> serde_json::Value {
+    serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "git_sha": env!("PHOENIX_GIT_SHA"),
-    }))
+        "socket_activated": socket_activated,
+    })
+}
+
+async fn get_version_json() -> impl IntoResponse {
+    Json(version_json_payload(
+        crate::hot_restart::is_socket_activated(),
+    ))
+}
+
+#[cfg(test)]
+#[test]
+fn version_json_reports_runtime_socket_activation() {
+    let socket_activated = crate::hot_restart::is_socket_activated();
+    assert_eq!(
+        version_json_payload(socket_activated).get("socket_activated"),
+        Some(&serde_json::Value::Bool(socket_activated))
+    );
 }
 
 /// Return status of all connected MCP servers.

@@ -604,7 +604,11 @@ function LlmLanguageSection({ onCloseMenu }: { onCloseMenu: () => void }) {
 }
 
 function VersionFooter() {
-  const [info, setInfo] = useState<{ version: string; git_sha: string } | null>(null);
+  const [info, setInfo] = useState<{
+    version: string;
+    git_sha: string;
+    socket_activated: boolean;
+  } | null>(null);
   useEffect(() => {
     let cancelled = false;
     api.getVersion()

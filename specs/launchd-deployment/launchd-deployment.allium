@@ -1,6 +1,6 @@
 -- allium: 3
 -- Native macOS launchd deployment lifecycle
--- Requirement traceability: REQ-LDD-001 through REQ-LDD-012
+-- Requirement traceability: REQ-LDD-001 through REQ-LDD-016
 
 config {
     transition_timeout_seconds: Integer = 30
@@ -13,6 +13,10 @@ enum TransactionState {
     preparing | prepared | activating | committed |
     precondition_failed | activation_failed_rolled_back |
     activation_failed_rollback_failed | rejected_concurrent
+}
+enum RestartState {
+    preparing | prepared | restarting | committed |
+    precondition_failed | restart_failed | rejected_concurrent
 }
 
 value RuntimeIdentity {
@@ -34,6 +38,30 @@ entity DeployTransaction {
     rollback_failure: String?
 }
 
+entity RestartTransaction {
+    id: String
+    expected: RuntimeIdentity?
+    previous_pid: Integer?
+    running_pid: Integer?
+    state: RestartState
+    created_at: Timestamp
+    updated_at: Timestamp
+    failure: String?
+
+    transitions state {
+        preparing -> prepared
+        preparing -> precondition_failed
+        preparing -> rejected_concurrent
+        prepared -> restarting
+        prepared -> precondition_failed
+        prepared -> rejected_concurrent
+        restarting -> committed
+        restarting -> restart_failed
+        terminal: committed, precondition_failed, restart_failed,
+                  rejected_concurrent
+    }
+}
+
 external entity TargetService {
     label: String
     loaded: Boolean
@@ -48,7 +76,7 @@ external entity TargetService {
 --   embedded identity are valid and host-resident; persisted metadata contains
 --   no plist environment values.
 -- activation_claim_available() -> Boolean
---   No active or unresolved deployment owns the host-level claim.
+--   No active or unresolved deployment or restart owns the host-level claim.
 -- helper_is_launchd_owned(transaction) -> Boolean
 --   A distinct one-shot LaunchAgent owns activation independently of Phoenix.
 -- atomic_candidate_install(transaction) -> Boolean
@@ -60,6 +88,22 @@ external entity TargetService {
 -- selected_source_is_valid(transaction) -> Boolean
 --   Local source is exact checked HEAD, or release source is one resolved tag
 --   and commit with matching host asset, checksum and embedded git SHA.
+-- restart_preparation_complete(restart) -> Boolean
+--   The loaded target job reports the installed plist and binary program,
+--   KeepAlive, and the sole listener service used by its health endpoint; the
+--   running process reports that it adopted the listener, its running and
+--   installed binary identities match the deployed source identity, and the
+--   secret-free handoff contains hashes of the installed binary, plist, and
+--   deployed SHA without environment values.
+-- restart_helper_is_launchd_owned(restart) -> Boolean
+--   A distinct one-shot LaunchAgent owns signaling and verification
+--   independently of Phoenix and the initiating shell.
+-- exact_restarted_identity_running(restart, service) -> Boolean
+--   The target job has a PID distinct from restart.previous_pid and
+--   /api/version equals restart.expected and reports socket activation.
+-- installed_state_unchanged(restart) -> Boolean
+--   Binary, plist, environment, listener definition, and deployed SHA match
+--   their preparation hashes and no installation path was replaced.
 
 rule PrepareCandidate {
     when: DeploymentRequested(transaction)
@@ -138,6 +182,56 @@ rule ReportStaleTransaction {
     ensures: not transaction.state = committed
 }
 
+rule PrepareInstalledRestart {
+    when: RestartRequested(restart)
+    requires: activation_claim_available()
+    ensures: restart.state = prepared
+    ensures: restart_preparation_complete(restart)
+}
+
+rule RejectConcurrentRestart {
+    when: RestartRequested(restart)
+    requires: not activation_claim_available()
+    ensures: restart.state = rejected_concurrent
+    ensures: installed_state_unchanged(restart)
+    ensures: TargetServiceUnchanged(restart)
+}
+
+rule HandoffRestart {
+    when: restart: RestartTransaction.state transitions_to prepared
+    requires: restart_preparation_complete(restart)
+    ensures: restart_helper_is_launchd_owned(restart)
+    ensures: RestartHandedOff(restart)
+}
+
+rule RestartInstalledRuntime {
+    when: RestartHelperStarted(restart)
+    requires: restart.state = prepared
+    requires: restart_helper_is_launchd_owned(restart)
+    requires: restart_preparation_complete(restart)
+    ensures: RestartSignalSentWithoutTargetUnload(restart)
+    ensures: restart.state = restarting
+}
+
+rule CommitVerifiedRestart {
+    when: RestartRuntimeObserved(restart, service)
+    requires: restart.state = restarting
+    requires: exact_restarted_identity_running(restart, service)
+    requires: installed_state_unchanged(restart)
+    ensures: restart.running_pid = service.running_pid
+    ensures: restart.state = committed
+    ensures: DurableRestartStatusWritten(restart)
+}
+
+rule PreserveRestartFailure {
+    when: RestartVerificationFailed(restart, failure)
+    requires: restart.state = restarting
+    ensures: restart.failure = failure
+    ensures: restart.state = restart_failed
+    ensures: DurableRestartStatusWritten(restart)
+    ensures: not RollbackClaimed(restart)
+}
+
 invariant CommitRequiresExactIdentity {
     for transaction in DeployTransactions:
         transaction.state = committed implies CandidateIdentityVerified(transaction)
@@ -147,4 +241,22 @@ invariant DisruptionRequiresPreparedHandoff {
     for transaction in DeployTransactions:
         TargetStopRequested(transaction) implies
             preparation_complete(transaction) and helper_is_launchd_owned(transaction)
+}
+
+invariant CommittedRestartPreservesInstalledState {
+    for restart in RestartTransactions:
+        restart.state = committed implies installed_state_unchanged(restart)
+}
+
+invariant ProductionOperationsAreMutuallyExclusive {
+    for restart in RestartTransactions:
+        RestartOwnsActivationClaim(restart) implies not DeploymentOwnsActivationClaim()
+}
+
+invariant RestartClaimsAreMutuallyExclusive {
+    for a in RestartTransactions:
+        for b in RestartTransactions:
+            a != b implies not (
+                RestartOwnsActivationClaim(a) and RestartOwnsActivationClaim(b)
+            )
 }

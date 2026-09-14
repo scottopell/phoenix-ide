@@ -311,11 +311,10 @@ class BareDeployCommandTests(unittest.TestCase):
             self.dev.cmd_prod_restart()
         restart.assert_called_once_with()
 
-    def test_prod_restart_rejects_non_daemon_backend_with_deploy_hint(self):
-        for backend in ("launchd", "native"):
-            with mock.patch.object(self.dev, "detect_prod_env", return_value=backend):
-                with self.assertRaisesRegex(SystemExit, "prod deploy"):
-                    self.dev.cmd_prod_restart()
+    def test_prod_restart_rejects_systemd_backend_with_deploy_hint(self):
+        with mock.patch.object(self.dev, "detect_prod_env", return_value="native"):
+            with self.assertRaisesRegex(SystemExit, "prod deploy"):
+                self.dev.cmd_prod_restart()
 
     def test_prepare_installed_candidate_reuses_binary_and_recorded_commit(self):
         with tempfile.TemporaryDirectory() as td:

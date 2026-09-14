@@ -4,7 +4,8 @@
 //!
 //! 1. **Socket activation** (recommended for production):
 //!    - systemd or launchd owns the socket
-//!    - On SIGHUP, we exit cleanly; the service manager restarts us with the same socket
+//!    - On SIGHUP, bounded shutdown cleanup runs before the service manager restarts us
+//!      with the same socket
 //!    - Zero-downtime: socket never closes during upgrade
 //!
 //! 2. **Dev mode** (normal binding):
@@ -240,9 +241,7 @@ pub fn is_socket_activated() -> bool {
 /// Signal handler that triggers shutdown.
 /// Returns when the server should shut down.
 ///
-/// - SIGHUP: For socket-activated mode, exits immediately (systemd restarts with same socket).
-///   For non-socket mode, triggers graceful shutdown.
-/// - SIGTERM/SIGINT: Triggers graceful shutdown.
+/// Every signal returns through the caller's bounded drain and child-process cleanup path.
 pub async fn shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};
 
@@ -250,21 +249,52 @@ pub async fn shutdown_signal() {
     let mut sigterm = signal(SignalKind::terminate()).expect("Failed to install SIGTERM handler");
     let mut sigint = signal(SignalKind::interrupt()).expect("Failed to install SIGINT handler");
 
-    tokio::select! {
-        _ = sighup.recv() => {
+    let received = tokio::select! {
+        _ = sighup.recv() => ShutdownSignal::Hangup,
+        _ = sigterm.recv() => ShutdownSignal::Terminate,
+        _ = sigint.recv() => ShutdownSignal::Interrupt,
+    };
+
+    handle_shutdown_signal(received, activation());
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShutdownSignal {
+    Hangup,
+    Terminate,
+    Interrupt,
+}
+
+fn handle_shutdown_signal(signal: ShutdownSignal, activation: Activation) {
+    match signal {
+        ShutdownSignal::Hangup => {
             HOT_RESTART_REQUESTED.store(true, Ordering::SeqCst);
-            if is_socket_activated() {
-                tracing::info!(uptime_secs = uptime_secs(), "Received SIGHUP (socket-activated) - exiting immediately");
-                std::process::exit(0);
+            if activation == Activation::None {
+                tracing::info!(
+                    uptime_secs = uptime_secs(),
+                    "Received SIGHUP (non-socket-activated) - graceful shutdown"
+                );
             } else {
-                tracing::info!(uptime_secs = uptime_secs(), "Received SIGHUP (non-socket-activated) - graceful shutdown");
+                tracing::info!(
+                    uptime_secs = uptime_secs(),
+                    ?activation,
+                    "Received SIGHUP (socket-activated) - draining before service-manager restart"
+                );
             }
         }
-        _ = sigterm.recv() => {
-            tracing::info!(uptime_secs = uptime_secs(), signal = "SIGTERM", "Shutting down (likely deploy or manual stop)");
+        ShutdownSignal::Terminate => {
+            tracing::info!(
+                uptime_secs = uptime_secs(),
+                signal = "SIGTERM",
+                "Shutting down (likely deploy or manual stop)"
+            );
         }
-        _ = sigint.recv() => {
-            tracing::info!(uptime_secs = uptime_secs(), signal = "SIGINT", "Shutting down (interactive interrupt)");
+        ShutdownSignal::Interrupt => {
+            tracing::info!(
+                uptime_secs = uptime_secs(),
+                signal = "SIGINT",
+                "Shutting down (interactive interrupt)"
+            );
         }
     }
 }
@@ -272,8 +302,6 @@ pub async fn shutdown_signal() {
 /// Called after graceful shutdown completes.
 /// Just logs the shutdown reason.
 pub fn maybe_perform_hot_restart() {
-    // Note: For socket-activated SIGHUP, we exit immediately in shutdown_signal(),
-    // so this function is only reached for SIGTERM/SIGINT or non-socket SIGHUP.
     tracing::info!("Graceful shutdown complete");
 }
 
@@ -304,6 +332,16 @@ mod tests {
         assert!(is_socket_activated());
 
         ACTIVATION.store(Activation::None.as_u8(), Ordering::SeqCst);
+    }
+
+    #[test]
+    fn socket_activated_hangup_returns_for_bounded_shutdown_cleanup() {
+        HOT_RESTART_REQUESTED.store(false, Ordering::SeqCst);
+
+        handle_shutdown_signal(ShutdownSignal::Hangup, Activation::Launchd);
+
+        assert!(HOT_RESTART_REQUESTED.load(Ordering::SeqCst));
+        HOT_RESTART_REQUESTED.store(false, Ordering::SeqCst);
     }
 
     #[tokio::test]
