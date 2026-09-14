@@ -520,6 +520,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "persist_automatic_continuation_admission",
         sql: MIGRATION_100,
     },
+    Migration {
+        version: 101,
+        name: "persist_typed_close_repair_cause",
+        sql: MIGRATION_101,
+    },
 ];
 
 const MIGRATION_100: &str = r"
@@ -8990,6 +8995,36 @@ CREATE TABLE close_ambient_writer_evidence (
 );
 ";
 
+const MIGRATION_101: &str = r"
+CREATE TABLE close_needs_repair_causes (
+    attempt_id TEXT PRIMARY KEY NOT NULL
+        REFERENCES close_obligations(attempt_id) ON DELETE CASCADE,
+    cause_kind TEXT NOT NULL CHECK (cause_kind = 'evidence_invariant'),
+    invariant TEXT NOT NULL CHECK (length(trim(invariant)) > 0),
+    relation TEXT NOT NULL CHECK (length(trim(relation)) > 0),
+    recorded_at_unix_micros INTEGER NOT NULL
+        CHECK (typeof(recorded_at_unix_micros) = 'integer' AND recorded_at_unix_micros >= 0)
+);
+
+CREATE TRIGGER close_needs_repair_cause_phase_changed
+AFTER UPDATE OF phase ON close_obligations
+WHEN OLD.phase <> NEW.phase
+BEGIN
+    DELETE FROM close_needs_repair_causes WHERE attempt_id = NEW.attempt_id;
+END;
+
+CREATE TRIGGER close_needs_repair_cause_requires_phase
+BEFORE INSERT ON close_needs_repair_causes
+WHEN NOT EXISTS (
+    SELECT 1 FROM close_obligations obligation
+    WHERE obligation.attempt_id = NEW.attempt_id
+      AND obligation.phase = 'needs_repair'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'typed close repair cause requires needs_repair phase');
+END;
+";
+
 const MIGRATION_095: &str = r"
 CREATE UNIQUE INDEX close_obligations_attempt_product_identity
 ON close_obligations(attempt_id, product_conversation_id);
@@ -17044,6 +17079,118 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap());
+    }
+
+    #[tokio::test]
+    async fn migration_098_normalizes_typed_close_repair_causes() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "CREATE TABLE close_obligations (
+                 attempt_id TEXT PRIMARY KEY NOT NULL,
+                 phase TEXT NOT NULL
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(MIGRATION_098).execute(&pool).await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO close_obligations (attempt_id, phase)
+             VALUES ('cascade-parent', 'needs_repair')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO close_needs_repair_causes (
+                 attempt_id, cause_kind, invariant, relation, recorded_at_unix_micros
+             ) VALUES (
+                 'cascade-parent', 'evidence_invariant',
+                 'target_dispatch_must_match_sealed_inventory',
+                 'close_retirement_resource_dispatches', 1
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM close_obligations WHERE attempt_id = 'cascade-parent'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let cascaded_causes: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_needs_repair_causes
+             WHERE attempt_id = 'cascade-parent'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(cascaded_causes, 0);
+        let violations: Vec<(String, i64, String, i64)> =
+            sqlx::query_as("PRAGMA foreign_key_check")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(violations.is_empty());
+
+        let columns: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT name, \"notnull\", pk
+             FROM pragma_table_info('close_needs_repair_causes') ORDER BY cid",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            columns,
+            vec![
+                ("attempt_id".to_string(), 1, 1),
+                ("cause_kind".to_string(), 1, 0),
+                ("invariant".to_string(), 1, 0),
+                ("relation".to_string(), 1, 0),
+                ("recorded_at_unix_micros".to_string(), 1, 0),
+            ]
+        );
+        let foreign_keys: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT \"table\", \"from\", on_delete
+             FROM pragma_foreign_key_list('close_needs_repair_causes')",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            foreign_keys,
+            vec![(
+                "close_obligations".to_string(),
+                "attempt_id".to_string(),
+                "CASCADE".to_string(),
+            )]
+        );
+        let table_sql: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'table' AND name = 'close_needs_repair_causes'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(table_sql.contains("CHECK (cause_kind = 'evidence_invariant')"));
+        assert!(table_sql.contains("CHECK (length(trim(invariant)) > 0)"));
+        assert!(table_sql.contains("CHECK (length(trim(relation)) > 0)"));
+        let phase_trigger: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'trigger' AND name = 'close_needs_repair_cause_phase_changed'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(phase_trigger.contains("OLD.phase <> NEW.phase"));
+        let phase_guard: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'trigger' AND name = 'close_needs_repair_cause_requires_phase'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(phase_guard.contains("obligation.phase = 'needs_repair'"));
     }
 
     #[tokio::test]
