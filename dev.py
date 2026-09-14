@@ -10129,21 +10129,27 @@ def launchd_prod_restart() -> None:
             raise SystemExit(f"could not hand restart to launchd{suffix}")
     except BaseException as exc:
         failed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        try:
-            _write_json_atomic(status_path, {
-                "transaction_id": transaction_id,
-                "state": "precondition_failed",
-                "source_kind": ProdSourceKind.INSTALLED_RESTART.value,
-                "expected_version": installed.identity.version if installed else None,
-                "expected_git_sha": installed.identity.git_sha if installed else None,
-                "previous_pid": installed.pid if installed else None,
-                "running_pid": None,
-                "created_at": created_at,
-                "updated_at": failed_at,
-                "failure": f"{type(exc).__name__}: preparation failed before handoff",
-            })
-        finally:
-            _release_launchd_restart_claim(transaction_id)
+        _write_json_atomic(status_path, {
+            "transaction_id": transaction_id,
+            "state": "precondition_failed",
+            "source_kind": ProdSourceKind.INSTALLED_RESTART.value,
+            "expected_version": installed.identity.version if installed else None,
+            "expected_git_sha": installed.identity.git_sha if installed else None,
+            "previous_pid": installed.pid if installed else None,
+            "running_pid": None,
+            "created_at": created_at,
+            "updated_at": failed_at,
+            "failure": f"{type(exc).__name__}: preparation failed before handoff",
+        })
+        if not _status_is_terminal_for_owner(
+            status_path,
+            transaction_id,
+            _RESTART_TERMINAL_STATES,
+        ):
+            raise RuntimeError(
+                "restart failure status was not durably persisted; retaining active claim"
+            ) from exc
+        _release_launchd_restart_claim(transaction_id)
         raise
 
     _report_launchd_restart_handoff(transaction_id, installed.identity)

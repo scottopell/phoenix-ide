@@ -161,6 +161,9 @@ class RestartHelperTests(unittest.TestCase):
 
     def test_restart_waits_for_replacement_of_pid_signaled_after_rebind(self):
         class ReboundLaunchctl(FakeLaunchctl):
+            def inspect(self):
+                return ("running", 100) if not self.signals else ("running", 102)
+
             def signal_hup(self):
                 self.signals.append("HUP")
                 return 101
@@ -183,6 +186,25 @@ class RestartHelperTests(unittest.TestCase):
             status = json.loads(Path(manifest.status_path).read_text())
             self.assertEqual(101, status["previous_pid"])
             self.assertEqual(102, status["running_pid"])
+
+    def test_restart_rejects_identity_verified_against_a_later_pid(self):
+        class ReplacedDuringHealthCheck(FakeLaunchctl):
+            def inspect(self):
+                return ("running", 100) if not self.signals else ("running", 102)
+
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            launchctl = ReplacedDuringHealthCheck(manifest)
+
+            with mock.patch.object(helper, "Launchctl", return_value=launchctl), \
+                 mock.patch.object(helper, "fetch_identity", return_value=manifest.expected), \
+                 mock.patch.object(helper, "wait_for_identity"):
+                state = helper.restart(manifest)
+
+            self.assertEqual("restart_failed", state)
+            status = json.loads(Path(manifest.status_path).read_text())
+            self.assertEqual("restart_failed", status["state"])
+            self.assertIn("PID changed during identity verification", status["failure"])
 
     def test_artifact_change_is_rejected_before_signal(self):
         with tempfile.TemporaryDirectory() as td:
@@ -367,6 +389,38 @@ class RestartCommandTests(unittest.TestCase):
             self.assertIn("deploy-owner", rejection["failure"])
             self.assertEqual("deploy-owner\n", (deploy / "active").read_text())
             self.assertFalse((root / "restart" / "active").exists())
+
+    def test_precondition_status_write_failure_retains_restart_claim(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            real_write = self.dev._write_json_atomic
+
+            def write_status(path, value, mode=0o600):
+                if value.get("state") == "precondition_failed":
+                    raise OSError("disk full")
+                return real_write(path, value, mode)
+
+            with self._isolated_operation_paths(root), \
+                 mock.patch.object(
+                     self.dev,
+                     "_installed_launchd_runtime_for_restart",
+                     side_effect=SystemExit("invalid install"),
+                 ), \
+                 mock.patch.object(
+                     self.dev,
+                     "_write_json_atomic",
+                     side_effect=write_status,
+                 ):
+                with self.assertRaisesRegex(OSError, "disk full"):
+                    self.dev.launchd_prod_restart()
+
+            active = root / "restart" / "active"
+            self.assertTrue(active.is_file())
+            transaction_id = active.read_text().strip()
+            status = json.loads(
+                (root / "restart" / "transactions" / transaction_id / "status.json").read_text()
+            )
+            self.assertEqual("preparing", status["state"])
 
     def test_restart_retention_preserves_current_and_active_transactions(self):
         with tempfile.TemporaryDirectory() as td:

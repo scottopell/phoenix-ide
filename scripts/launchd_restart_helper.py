@@ -328,6 +328,12 @@ def restart(manifest: Manifest) -> str:
             write_status(manifest, "restarting", previous_pid=signal_pid)
             running_pid = launchctl.wait_for_new_pid(signal_pid)
             wait_for_identity(manifest, manifest.expected)
+            state, verified_pid = launchctl.inspect()
+            if state not in {"running", "active"} or verified_pid != running_pid:
+                raise RestartError(
+                    "runtime PID changed during identity verification; "
+                    f"expected running PID {running_pid}, observed state={state} pid={verified_pid}"
+                )
             verify_installed_artifacts(manifest)
             write_status(
                 manifest,
