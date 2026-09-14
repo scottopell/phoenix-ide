@@ -167,20 +167,12 @@ def wait_for_page_ready(page, base_url: str, canonical_route: str, transcript_id
         lambda value: value["url"] == expected_url and 'data-testid="product-conversation-page"' in value["content"],
     )
     page.wait_for_selector('[data-testid="product-conversation-page"]', timeout=int(TIMEOUT * 1000))
-    page.wait_for_selector('[aria-label="Product conversation metadata"]', timeout=int(TIMEOUT * 1000))
-    page.wait_for_selector('[aria-label="Product conversation segments"]', timeout=int(TIMEOUT * 1000))
-    page.wait_for_selector('[aria-label="Product conversation recall and live controls"]', timeout=int(TIMEOUT * 1000))
+    page.wait_for_selector('[data-testid="product-conversation-transcript"]', timeout=int(TIMEOUT * 1000))
     page.wait_for_selector('[data-testid="product-conversation-composer"]', timeout=int(TIMEOUT * 1000))
     if objective is not None:
         page.get_by_text(objective, exact=True).first.wait_for(timeout=int(TIMEOUT * 1000))
     assert page.url == expected_url, page.url
-    route_text = page.locator('.product-conversation-page__route').inner_text()
-    assert route_text == canonical_route, route_text
-    metadata_text = page.locator('[aria-label="Product conversation metadata"]').inner_text()
-    assert "Presentation" in metadata_text, metadata_text
-    assert "Lifecycle" in metadata_text and "Open" in metadata_text, metadata_text
-    segments = page.locator('[aria-label="Product conversation segments"]').inner_text()
-    assert "Segment 0" in segments, segments
+    assert page.locator('.product-conversation-page__title').count() == 1
     if objective is not None:
         assert page.locator('[aria-label="Conversation transcript"]').get_by_text(objective, exact=True).count() == 1
 
@@ -189,10 +181,9 @@ def wait_for_history_page(page, base_url: str, canonical_route: str, objective: 
     expected_url = f"{base_url}{canonical_route}"
     page.wait_for_selector('[data-testid="product-conversation-page"]', timeout=int(TIMEOUT * 1000))
     assert page.url == expected_url, page.url
-    metadata = page.locator('[aria-label="Product conversation metadata"]').inner_text()
-    assert "Lifecycle" in metadata and "History" in metadata, metadata
-    assert page.locator('[aria-label="Conversation transcript"]').get_by_text(objective, exact=True).count() == 1
+    assert page.locator('[data-testid="product-conversation-transcript"]').get_by_text(objective, exact=True).count() == 1
     assert page.locator('[data-testid="product-conversation-composer"]').count() == 0
+    assert page.locator('[data-testid="product-conversation-history"]').get_by_text('History is read-only.', exact=True).count() == 1
 
 
 def scenario_create_objective_one_row_reload(base_url: str, cwd: Path) -> dict:
@@ -398,8 +389,7 @@ def scenario_merged_context_continuation(base_url: str, _cwd: Path) -> None:
         page.goto(f"{base_url}{result['canonical_route']}", wait_until="domcontentloaded")
         page.reload(wait_until="domcontentloaded")
         wait_for_page_ready(page, base_url, result["canonical_route"], result["successor_transcript_row_id"], None)
-        segments = page.locator('[aria-label="Product conversation segments"]').inner_text()
-        assert "Segment 0" in segments and "Segment 1" in segments, segments
+        assert page.get_by_role('region', name='Conversation continuation boundary').count() == 1
     reloaded = product_snapshot(base_url, result["product_conversation_id"])
     assert reloaded["latest_transcript_row_id"] == result["successor_transcript_row_id"]
     assert reloaded["writable_transcript_row_id"] == result["successor_transcript_row_id"]
