@@ -250,6 +250,22 @@ def init_git_repo(path: Path) -> None:
     subprocess.run(["git", "-C", str(path), "commit", "-qm", "baseline"], check=True)
 
 
+def finish_clean_close(base_url: str, transcript_id: str, product_id: str) -> None:
+    deadline = time.monotonic() + TIMEOUT
+    while True:
+        response = httpx.post(f"{base_url}/api/conversations/{transcript_id}/abandon-task", timeout=30.0)
+        if response.status_code == 200:
+            return
+        payload = response.json()
+        if payload.get("error_type") == "close_already_history":
+            return
+        if payload.get("error_type") != "close_settlement_in_progress":
+            raise AssertionError(f"clean Close failed: {response.status_code}: {response.text}")
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"clean Close settlement did not complete: {product_snapshot(base_url, product_id)!r}")
+        time.sleep(0.1)
+
+
 def scenario_clean_close_history(base_url: str, cwd: Path) -> None:
     created = scenario_create_objective_one_row_reload(base_url, cwd)
     transcript_id = created["transcript_row_id"]
@@ -257,11 +273,7 @@ def scenario_clean_close_history(base_url: str, cwd: Path) -> None:
     open_snapshot = product_snapshot(base_url, created["product_conversation_id"])
     worktree = Path(open_snapshot["work_identity"]["worktree_path"])
     assert worktree.exists(), worktree
-    close_response = httpx.post(f"{base_url}/api/conversations/{transcript_id}/abandon-task", timeout=30.0)
-    if close_response.status_code != 200:
-        assert close_response.status_code == 409 and close_response.json().get("error_type") == "close_settlement_in_progress", close_response.text
-        close = product_snapshot(base_url, created["product_conversation_id"])["close"]
-        request(base_url, "POST", f"/api/conversations/{transcript_id}/close/retry-retirement", body={"attempt_id": close["attempt_id"]})
+    finish_clean_close(base_url, transcript_id, created["product_conversation_id"])
     history = poll(
         "clean Close to History",
         lambda: product_snapshot(base_url, created["product_conversation_id"]),
