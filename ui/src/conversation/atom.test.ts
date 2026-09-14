@@ -2840,7 +2840,8 @@ describe('request-bound question callbacks', () => {
     });
     expect(merged.phase).toBe(resolved.phase);
     expect(merged.phaseStateUpdatedAt).toBe(1234);
-    expect(merged.phaseLastAppliedEventSeq).toBe(pending.lastAppliedEventSeq);
+    expect(merged.phaseLastAppliedEventSeq).toBe(pending.phaseLastAppliedEventSeq);
+    expect(merged.questionStatusPhaseFenceEventSeq).toBe(pending.lastAppliedEventSeq);
     expect(merged.lastAppliedEventSeq).toBe(12);
     expect(merged.messages).toHaveLength(1);
     const newer = conversationReducer(merged,{
@@ -2849,6 +2850,32 @@ describe('request-bound question callbacks', () => {
       snapshotStartedAtEventSeq:13,snapshotStartedAtPhase:merged.phase,
     });
     expect(newer.phase.type).toBe('idle');
+  });
+
+  it('adopts authoritative history phase when the snapshot cursor equals the phase event cursor', () => {
+    const phaseAtRequestStart = { type: 'idle' } as const;
+    const equalCursor: ConversationAtom = {
+      ...createInitialAtom(),
+      conversationId: 'conv-1',
+      conversation: testConversation,
+      phase: phaseAtRequestStart,
+      phaseLastAppliedEventSeq: 12,
+      lastAppliedEventSeq: 12,
+    };
+
+    const merged = conversationReducer(equalCursor, {
+      type: 'merge_conversation_data',
+      conversationId: 'conv-1',
+      conversation: testConversation,
+      messages: [makeMessage(1)],
+      phase: { type: 'llm_requesting', attempt: 1 },
+      contextWindow: { used: 0 },
+      snapshotStartedAtEventSeq: 12,
+      snapshotStartedAtPhase: phaseAtRequestStart,
+    });
+
+    expect(merged.phase).toEqual({ type: 'llm_requesting', attempt: 1 });
+    expect(merged.phaseLastAppliedEventSeq).toBe(12);
   });
 
   const pending: ConversationAtom = { ...createInitialAtom(), conversationId: 'conv-1', phase: {type: 'awaiting_user_response', request_id: 'new-request', tool_use_id: 'new-request', questions: []}, lastAppliedEventSeq: 12 };
