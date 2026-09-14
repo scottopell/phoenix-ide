@@ -306,6 +306,42 @@ const markdownImageMessages: Message[] = [
   },
 ];
 
+export const narrowWebKitMarkdownTableMessages: Message[] = [
+  {
+    message_id: 'user-narrow-webkit-table-1',
+    conversation_id: 'fixture-message-list-narrow-webkit-markdown-table',
+    sequence_id: 1,
+    type: 'user',
+    message_type: 'user',
+    created_at: '2025-01-01T10:00:00.000Z',
+    content: { text: 'Show the merge plan table.' },
+    display_data: {},
+  },
+  {
+    message_id: 'agent-narrow-webkit-table-1',
+    conversation_id: 'fixture-message-list-narrow-webkit-markdown-table',
+    sequence_id: 2,
+    type: 'agent',
+    message_type: 'agent',
+    created_at: '2025-01-01T10:01:00.000Z',
+    content: [{
+      type: 'text',
+      text: [
+        'Exact incident table fixture:',
+        '',
+        '| Merge | What it unblocks |',
+        '| --- | --- |',
+        '| **#760 specification** | Preserves the `conversation-ui` transcript requirements while follow-up implementation work proceeds. |',
+        '| **#760 implementation follow-up** | Keeps ordinary conversation polish moving without conflating this table symptom with prior inline-code sizing work. |',
+        '| **#769 performance** | Confirms the WebKit readability fix independently from the compact chronology incident. |',
+        '',
+        'Text after the table confirms the message column recovers after the scroll wrapper.',
+      ].join('\n'),
+    }],
+    display_data: {},
+  },
+];
+
 const wideMarkdownTableMessages: Message[] = [
   {
     message_id: 'user-wide-table-1',
@@ -426,6 +462,18 @@ export const messageListScenarios = [
     theme: 'dark',
   },
   {
+    id: 'narrow-webkit-markdown-table',
+    title: 'Narrow WebKit Markdown table / dark',
+    description: 'Exact two-column Merge / What it unblocks incident table in dark theme.',
+    theme: 'dark',
+  },
+  {
+    id: 'narrow-webkit-markdown-table-light',
+    title: 'Narrow WebKit Markdown table / light',
+    description: 'Exact two-column Merge / What it unblocks incident table in light theme.',
+    theme: 'light',
+  },
+  {
     id: 'wide-markdown-table',
     title: 'Wide Markdown table / dark',
     description: 'Wide assistant tables keep continuous row surfaces beyond the prose card in dark theme.',
@@ -460,8 +508,10 @@ export function messageListFixtureData(scenario: MessageListScenario): MessageLi
       ? compactChronologyInitialMessages
       : scenario.id === 'markdown-image-dark'
       ? markdownImageMessages
-      : scenario.id === 'wide-markdown-table' || scenario.id === 'wide-markdown-table-light'
-        ? wideMarkdownTableMessages
+      : scenario.id === 'narrow-webkit-markdown-table' || scenario.id === 'narrow-webkit-markdown-table-light'
+        ? narrowWebKitMarkdownTableMessages
+        : scenario.id === 'wide-markdown-table' || scenario.id === 'wide-markdown-table-light'
+          ? wideMarkdownTableMessages
         : scenario.id === 'scroll-policy-long'
           ? scrollPolicyMessages
           : scenario.id === 'prefix-continuity-offset-bug'

@@ -1275,6 +1275,17 @@ body.app-viewport-active #root {
   background: var(--bg-secondary);
 }
 
+@media (max-width: 600px) {
+  .agent-text-block .conversation-markdown-table-scroll > table {
+    width: 100%;
+    table-layout: fixed;
+  }
+
+  .agent-text-block .conversation-markdown-table-scroll :where(th, td) {
+    overflow-wrap: anywhere;
+  }
+}
+
 .agent-text-block th,
 .agent-text-block td {
   border: 1px solid var(--border-color);

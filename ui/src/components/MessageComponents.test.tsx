@@ -1948,6 +1948,7 @@ describe('markdown table rendering', () => {
     const table = screen.getByRole('table');
     const wrapper = table.parentElement;
     expect(wrapper).toHaveClass('markdown-table-scroll');
+    expect(wrapper).toHaveClass('conversation-markdown-table-scroll');
     expect(wrapper?.parentElement).toHaveClass('agent-text-block');
 
     const inlineCode = screen.getByText('direct_turn_id');
@@ -2019,6 +2020,7 @@ describe('markdown table rendering', () => {
       const table = screen.getByRole('table');
       const wrapper = table.parentElement;
       expect(wrapper).toHaveClass('markdown-table-scroll');
+      expect(wrapper).toHaveClass('conversation-markdown-table-scroll');
       expect(wrapper?.parentElement).toHaveClass('agent-text-block');
     });
 

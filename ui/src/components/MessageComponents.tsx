@@ -123,7 +123,7 @@ type MarkdownTableProps = React.ComponentPropsWithoutRef<'table'> & { node?: unk
 function MarkdownTable({ node, children, ...props }: MarkdownTableProps) {
   void node;
   return (
-    <div className="markdown-table-scroll">
+    <div className="markdown-table-scroll conversation-markdown-table-scroll">
       <table {...props}>{children}</table>
     </div>
   );
