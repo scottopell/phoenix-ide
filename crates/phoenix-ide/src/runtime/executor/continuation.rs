@@ -74,35 +74,37 @@ impl CompactionPolicy {
 }
 
 pub(super) struct ContinuationHistory {
-    pub(super) handoff: Option<LlmMessage>,
-    pub(super) recent: Vec<Message>,
+    pub(super) handoff: Option<ProtectedHandoff>,
+}
+
+pub(super) struct ProtectedHandoff {
+    pub(super) message_id: String,
+    pub(super) message: LlmMessage,
 }
 
 impl ContinuationHistory {
     pub(super) fn from_projection(
-        mut messages: Vec<Message>,
+        messages: &[Message],
         accepted_message_id: Option<&str>,
     ) -> Result<Self, String> {
-        let position = accepted_message_id
-            .and_then(|id| messages.iter().position(|message| message.message_id == id));
-        let handoff = if let Some(position) = position {
-            let message = messages.remove(position);
+        let accepted = accepted_message_id
+            .and_then(|id| messages.iter().find(|message| message.message_id == id));
+        let handoff = if let Some(message) = accepted {
             if !matches!(message.content, MessageContent::User(_)) {
                 return Err("Accepted continuation handoff is not a user message".to_string());
             }
-            let mut rendered = render_messages(&[message], &std::collections::HashSet::new());
-            Some(
-                rendered
+            let mut rendered =
+                render_messages(std::iter::once(message), &std::collections::HashSet::new());
+            Some(ProtectedHandoff {
+                message_id: message.message_id.clone(),
+                message: rendered
                     .pop()
                     .ok_or("Accepted continuation handoff is not in the visible prompt")?,
-            )
+            })
         } else {
             None
         };
-        Ok(Self {
-            handoff,
-            recent: messages,
-        })
+        Ok(Self { handoff })
     }
 
     pub(super) fn selection_notice(&self, conversation_id: &str) -> String {
@@ -190,7 +192,7 @@ mod tests {
     #[test]
     fn accepted_seed_is_selected_by_id_not_first_message_or_equal_text() {
         let history = ContinuationHistory::from_projection(
-            vec![
+            &[
                 persisted("unrelated", "edited"),
                 persisted("accepted", "edited"),
                 persisted("new", "cancel Crick"),
@@ -198,27 +200,20 @@ mod tests {
             Some("accepted"),
         )
         .unwrap();
-        assert_eq!(history.handoff.unwrap().content, user("edited").content);
-        assert_eq!(
-            history
-                .recent
-                .iter()
-                .map(|m| m.message_id.as_str())
-                .collect::<Vec<_>>(),
-            ["unrelated", "new"]
-        );
+        let handoff = history.handoff.unwrap();
+        assert_eq!(handoff.message.content, user("edited").content);
+        assert_eq!(handoff.message_id, "accepted");
     }
 
     #[test]
     fn absent_or_reset_seed_does_not_guess_from_existing_text() {
         for accepted in [None, Some("removed")] {
             let history = ContinuationHistory::from_projection(
-                vec![persisted("other", "original generated summary")],
+                &[persisted("other", "original generated summary")],
                 accepted,
             )
             .unwrap();
             assert!(history.handoff.is_none());
-            assert_eq!(history.recent.len(), 1);
             assert!(history
                 .selection_notice("current")
                 .contains("No accepted previous handoff"));

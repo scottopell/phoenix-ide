@@ -141,8 +141,10 @@ async fn live_three_compaction_comparison() {
             if arm == "C_coordinator_protected" {
                 instruction.push_str(
                     &ContinuationHistory {
-                        handoff: Some(user(&seed)),
-                        recent: vec![],
+                        handoff: Some(super::ProtectedHandoff {
+                            message_id: "accepted".to_string(),
+                            message: user(&seed),
+                        }),
                     }
                     .selection_notice(&format!("eval-{round}")),
                 );

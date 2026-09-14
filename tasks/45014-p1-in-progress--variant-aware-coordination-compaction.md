@@ -17,7 +17,8 @@ A PR with relevant tests and repository checks passing, actionable review findin
 
 - Existing runtime Coordinator identity selects one of two instruction policies.
 - A narrow storage lookup returns only the incoming accepted handoff's message ID.
-- Select that message from the frozen projection by ID and remove it from the trimmable history. Budget its full content plus request overhead first; fill the remainder with the existing suffix planner.
+- Select and render that message by reference from the frozen projection, then exclude only its ID when rendering trimmable history. Budget its full content plus request overhead first; fill the remainder with the existing suffix planner. Do not deep-copy the hydrated transcript.
+- An unclassifiable provenance read closes the existing local-authority admission fence and propagates through the fatal exit path without recording a recoverable conversation failure. Established absence and known unusable input remain distinct.
 - Missing/historical/reset acceptance input is reported explicitly without guessing or rereading removed text.
 - Existing operation identity, retry, projection invalidation, and atomic summary commit remain shared. No new persisted policy or snapshot.
 

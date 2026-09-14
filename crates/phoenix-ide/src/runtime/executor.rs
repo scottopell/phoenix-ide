@@ -1161,10 +1161,16 @@ async fn assemble_cleared_messages<S: StateStore>(
     storage: &S,
     conv_id: &str,
     db_messages: &[crate::db::Message],
+    excluded_message_id: Option<&str>,
     clearable_names: &std::collections::HashSet<String>,
     context_window: usize,
     watermark_cache: &std::sync::Mutex<Option<i64>>,
 ) -> Vec<LlmMessage> {
+    let included_messages = || {
+        db_messages
+            .iter()
+            .filter(|message| Some(message.message_id.as_str()) != excluded_message_id)
+    };
     let prior_watermark = match storage.get_clear_watermark(conv_id).await {
         Ok(w) => {
             *watermark_cache.lock().unwrap() = Some(w);
@@ -1179,13 +1185,13 @@ async fn assemble_cleared_messages<S: StateStore>(
                 );
                 let cleared =
                     clearable_sequence_ids_through_watermark(db_messages, clearable_names, w);
-                render_messages(db_messages, &cleared)
+                render_messages(included_messages(), &cleared)
             } else {
                 tracing::warn!(
                     conv_id = %conv_id, error = %e,
                     "failed to read clear watermark with none cached; sending uncleared history",
                 );
-                render_messages(db_messages, &std::collections::HashSet::new())
+                render_messages(included_messages(), &std::collections::HashSet::new())
             };
         }
     };
@@ -1241,7 +1247,7 @@ async fn assemble_cleared_messages<S: StateStore>(
         }
     };
 
-    render_messages(db_messages, &cleared)
+    render_messages(included_messages(), &cleared)
 }
 
 /// Fold persisted messages into the provider-agnostic LLM message list.
@@ -1252,8 +1258,8 @@ async fn assemble_cleared_messages<S: StateStore>(
 /// intact, so a cleared result is never a silent gap. Every other tool result is
 /// sent verbatim with its images. The persisted messages are never mutated — the
 /// cleared form exists only in the returned list for this one request.
-fn render_messages(
-    db_messages: &[crate::db::Message],
+fn render_messages<'a>(
+    db_messages: impl IntoIterator<Item = &'a crate::db::Message>,
     cleared_sequence_ids: &std::collections::HashSet<i64>,
 ) -> Vec<LlmMessage> {
     use crate::db::{MessageContent, ToolContent};
@@ -3637,6 +3643,9 @@ where
                     Ok(effect_result) => {
                         state_committed |= is_state_persist;
                         effect_result
+                    }
+                    Err(error) if error.starts_with("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:") => {
+                        return Err(error);
                     }
                     Err(error)
                         if is_state_persist
@@ -6819,6 +6828,7 @@ where
                 .as_ref()
                 .expect("projection refreshed above")
                 .messages,
+            None,
             &self.clearable_names,
             self.context.context_window,
             &self.clear_watermark_cache,
@@ -8077,20 +8087,28 @@ where
                 error_kind: crate::db::ErrorKind::InvalidRequest,
             }));
         }
-        let history = match self
+        let accepted_id = match self
             .storage
             .accepted_continuation_handoff_message_id(&conv_id)
             .await
-            .and_then(|accepted_id| {
-                ContinuationHistory::from_projection(
-                    self.active_prompt_projection
-                        .as_ref()
-                        .expect("projection refreshed above")
-                        .messages
-                        .clone(),
-                    accepted_id.as_deref(),
-                )
-            }) {
+        {
+            Ok(accepted_id) => accepted_id,
+            Err(error) => {
+                admitted.close("continuation_handoff_provenance");
+                tracing::error!(%conv_id, %operation_id, %error, "continuation handoff provenance could not be established");
+                return Err(
+                    "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:continuation_handoff_provenance"
+                        .to_string(),
+                );
+            }
+        };
+        let projection = &self
+            .active_prompt_projection
+            .as_ref()
+            .expect("projection refreshed above")
+            .messages;
+        let history = match ContinuationHistory::from_projection(projection, accepted_id.as_deref())
+        {
             Ok(history) => history,
             Err(error) => {
                 return Ok(Some(Event::ContinuationFailed {
@@ -8107,7 +8125,11 @@ where
         let frozen_messages = assemble_cleared_messages(
             &self.storage,
             &conv_id,
-            &history.recent,
+            projection,
+            history
+                .handoff
+                .as_ref()
+                .map(|handoff| handoff.message_id.as_str()),
             &self.clearable_names,
             context_window,
             &self.clear_watermark_cache,
@@ -8131,7 +8153,7 @@ where
         let history_item_cap = continuation_limits.max_history_messages(1);
         let budget = match plan_with_handoff(
             messages,
-            history.handoff,
+            history.handoff.map(|handoff| handoff.message),
             context_window,
             fixed_tokens,
             history_item_cap,
@@ -12627,6 +12649,56 @@ mod authoritative_user_message_effect_tests {
         assert!(
             matches!(generated, Some(Event::ContinuationFailed { operation_id, .. }) if operation_id == "oversized")
         );
+    }
+
+    #[tokio::test]
+    async fn continuation_provenance_failure_closes_admission_without_semantic_failure() {
+        let (mut rt, storage, mut broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+            operation_id: "provenance-failure".to_string(),
+            rejected_tool_calls: Vec::new(),
+            attempt: 1,
+        };
+        let awaiting = ConvState::AwaitingContinuation {
+            request: request.clone(),
+        };
+        rt.state = awaiting.clone();
+        let (watch_tx, watch_rx) = watch::channel(awaiting.clone());
+        let fence = crate::runtime::FatalLocalAuthorityFence::new();
+        rt = rt
+            .with_state_watcher(watch_tx)
+            .with_fatal_local_authority_fence(Arc::clone(&fence));
+        storage.set_fail_continuation_handoff_provenance(true);
+
+        let error = rt
+            .apply_transition_result(
+                crate::state_machine::transition::TransitionResult::new(awaiting.clone())
+                    .with_effect(Effect::RequestContinuation { request })
+                    .with_effect(Effect::PersistState)
+                    .with_effect(Effect::notify_state_change()),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.starts_with("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:"));
+        assert_eq!(fence.owners_at_first_close(), Some(1));
+        assert!(fence.is_closed());
+        assert!(fence.try_acquire().is_err());
+        assert_eq!(rt.state, awaiting);
+        assert_eq!(*watch_rx.borrow(), awaiting);
+        assert!(storage
+            .get_current_state(&rt.context.conversation_id)
+            .is_none());
+        assert!(storage.recorded_messages().is_empty());
+        assert!(storage
+            .recorded_settle_active_direct_turn_calls()
+            .is_empty());
+        assert!(rt.llm_task_handle.is_none());
+        assert!(rt.llm_client.recorded_requests().is_empty());
+        assert_no_broadcast(&mut broadcast_rx);
     }
 
     #[tokio::test]
@@ -20344,7 +20416,43 @@ mod stale_tool_result_clearing_tests {
         })
     }
 
-    /// assemble path, happy case: over pressure → sweep applied and persisted.
+    #[tokio::test]
+    async fn continuation_assembly_excludes_only_accepted_message_id() {
+        let storage = InMemoryStorage::new();
+        let conv = "continuation-exclusion";
+        for (id, text) in [
+            ("unrelated", "same handoff text"),
+            ("accepted", "same handoff text"),
+            ("correction", "cancel Crick"),
+        ] {
+            storage
+                .add_message(id, conv, &MessageContent::user(text), None, None)
+                .await
+                .unwrap();
+        }
+        let projection = storage.get_messages(conv).await.unwrap();
+        let names = clearable(&[]);
+        for (read_failure, watermark) in [(false, None), (true, None), (true, Some(0))] {
+            storage.set_fail_watermark_read(read_failure);
+            let cache = std::sync::Mutex::new(watermark);
+            let messages = assemble_cleared_messages(
+                &storage,
+                conv,
+                &projection,
+                Some("accepted"),
+                &names,
+                20_000,
+                &cache,
+            )
+            .await;
+            assert_eq!(messages.len(), 2);
+            assert_eq!(messages[0].content[0].render_text(), "same handoff text");
+            assert_eq!(messages[1].content[0].render_text(), "cancel Crick");
+        }
+        assert_eq!(projection.len(), 3);
+        assert_eq!(projection[1].message_id, "accepted");
+    }
+
     #[tokio::test]
     async fn assemble_sweeps_and_persists_under_pressure() {
         let storage = Arc::new(InMemoryStorage::new());
@@ -20358,7 +20466,8 @@ mod stale_tool_result_clearing_tests {
         let db = storage.get_messages(conv).await.unwrap();
         let cache = std::sync::Mutex::new(None);
 
-        let messages = assemble_cleared_messages(&*storage, conv, &db, &names, 1_000, &cache).await;
+        let messages =
+            assemble_cleared_messages(&*storage, conv, &db, None, &names, 1_000, &cache).await;
         assert!(
             is_rendered_cleared(&messages, "old-tool"),
             "old round rendered as placeholder"
@@ -20385,7 +20494,8 @@ mod stale_tool_result_clearing_tests {
         let db = storage.get_messages(conv).await.unwrap();
         let cache = std::sync::Mutex::new(None);
 
-        let messages = assemble_cleared_messages(&*storage, conv, &db, &names, 1_000, &cache).await;
+        let messages =
+            assemble_cleared_messages(&*storage, conv, &db, None, &names, 1_000, &cache).await;
         assert!(
             !is_rendered_cleared(&messages, "old-tool"),
             "read failure with empty cache → nothing cleared this turn",
@@ -20409,13 +20519,15 @@ mod stale_tool_result_clearing_tests {
         let cache = std::sync::Mutex::new(None);
 
         // Turn 1: a real sweep advances and caches the watermark; `old` is cleared.
-        let first = assemble_cleared_messages(&*storage, conv, &db, &names, 1_000, &cache).await;
+        let first =
+            assemble_cleared_messages(&*storage, conv, &db, None, &names, 1_000, &cache).await;
         assert!(is_rendered_cleared(&first, "old-tool"));
 
         // Turn 2: the watermark read fails, but the cache holds the advanced
         // value, so the previously-cleared result stays cleared.
         storage.set_fail_watermark_read(true);
-        let second = assemble_cleared_messages(&*storage, conv, &db, &names, 1_000, &cache).await;
+        let second =
+            assemble_cleared_messages(&*storage, conv, &db, None, &names, 1_000, &cache).await;
         assert!(
             is_rendered_cleared(&second, "old-tool"),
             "read failure must preserve the cached cleared set, not un-clear it",
@@ -20438,7 +20550,8 @@ mod stale_tool_result_clearing_tests {
         let db = storage.get_messages(conv).await.unwrap();
         let cache = std::sync::Mutex::new(None);
 
-        let messages = assemble_cleared_messages(&*storage, conv, &db, &names, 1_000, &cache).await;
+        let messages =
+            assemble_cleared_messages(&*storage, conv, &db, None, &names, 1_000, &cache).await;
         assert!(
             !is_rendered_cleared(&messages, "old-tool"),
             "write failure → prior (empty) cleared set rendered, not the failed advance",
