@@ -900,14 +900,30 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
 
   if (density === 'compact') {
     const first = members[0];
-    const compactItems = expandedToolId
-      ? items.filter((item) => item.toolId !== expandedToolId)
-      : items;
+    const expandedItemIndex = expandedToolId
+      ? items.findIndex((item) => item.toolId === expandedToolId)
+      : -1;
     const expandedMemberIndex = expandedToolId
       ? members.findIndex((member) => Array.isArray(member.agent.content)
         && member.agent.content.some((block) => block.type === 'tool_use' && block.id === expandedToolId))
       : -1;
     const expandedMember = expandedMemberIndex >= 0 ? members[expandedMemberIndex] : undefined;
+    const compactRuns: Array<{ key: string; items: ToolStripItem[] } | { key: string; expanded: true }> = [];
+    let currentRun: ToolStripItem[] = [];
+    const flushRun = (key: string) => {
+      if (currentRun.length === 0) return;
+      compactRuns.push({ key, items: currentRun });
+      currentRun = [];
+    };
+    items.forEach((item, index) => {
+      if (expandedToolId && index === expandedItemIndex) {
+        flushRun(`before-${item.toolId || index}`);
+        compactRuns.push({ key: `expanded-${item.toolId || index}`, expanded: true });
+      } else {
+        currentRun.push(item);
+      }
+    });
+    flushRun('tail');
     return (
       <div
         id={first ? `message-${first.agent.message_id}` : undefined}
@@ -926,33 +942,44 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
           </div>
         )}
         <div className="message-content">
-          {compactItems.length > 0 && <CompactToolStrip items={compactItems} onExpand={expand} />}
+          {compactRuns.map((run) => 'expanded' in run ? (
+            expandedMember && expandedToolId ? (
+              <div className="compact-tool-selected-detail" key={run.key}>
+                <button
+                  type="button"
+                  className="compact-tool-detail-collapse"
+                  onClick={() => setExpandedToolId(null)}
+                  aria-label="Collapse expanded tool detail"
+                >
+                  Collapse
+                </button>
+                <AgentMessage
+                  message={expandedMember.agent}
+                  toolResults={expandedMember.toolResultsByUseId}
+                  liveBashProgress={liveBashProgress}
+                  onOpenFile={onOpenFile}
+                  filePathRootDir={filePathRootDir}
+                  workScopeKey={workScopeKey}
+                  activeToolUseId={activeToolUseId}
+                  forceExpandedTools
+                  visibleToolUseId={expandedToolId}
+                  isFirstInTurn={false}
+                  isLatestAgentMessage={isLatestAgentMessage && expandedMemberIndex === members.length - 1}
+                  {...(unitKey !== undefined ? { unitKey } : {})}
+                  {...(revealRequest ? { revealRequest } : {})}
+                  {...(activeHighlight ? { activeHighlight } : {})}
+                  {...(onRevealHandled ? { onRevealHandled } : {})}
+                />
+              </div>
+            ) : null
+          ) : (
+            <CompactToolStrip key={run.key} items={run.items} onExpand={expand} />
+          ))}
           {members.some((member) => hasAgentRetries(member.agent)) && (
             <div className="compact-tool-group-audit" aria-label="Response retry audit">
               {members.filter((member) => hasAgentRetries(member.agent)).map((member) => (
                 <AgentRetryBadge key={member.key} message={member.agent} />
               ))}
-            </div>
-          )}
-          {expandedMember && expandedToolId && (
-            <div className="compact-tool-selected-detail">
-              <AgentMessage
-                message={expandedMember.agent}
-                toolResults={expandedMember.toolResultsByUseId}
-                liveBashProgress={liveBashProgress}
-                onOpenFile={onOpenFile}
-                filePathRootDir={filePathRootDir}
-                workScopeKey={workScopeKey}
-                activeToolUseId={activeToolUseId}
-                forceExpandedTools
-                visibleToolUseId={expandedToolId}
-                isFirstInTurn={false}
-                isLatestAgentMessage={isLatestAgentMessage && expandedMemberIndex === members.length - 1}
-                {...(unitKey !== undefined ? { unitKey } : {})}
-                {...(revealRequest ? { revealRequest } : {})}
-                {...(activeHighlight ? { activeHighlight } : {})}
-                {...(onRevealHandled ? { onRevealHandled } : {})}
-              />
             </div>
           )}
         </div>

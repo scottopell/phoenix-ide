@@ -437,6 +437,38 @@ describe('inline tool timers', () => {
     expect(Element.prototype.scrollIntoView).toHaveBeenCalled();
   });
 
+  it('keeps an expanded older compact tool before newer appended tools in DOM chronology', () => {
+    mockDensity = 'compact';
+    const first = agentMessage('agent-chronology-a', [
+      { type: 'tool_use', id: 'chronology-a', name: 'read_file', input: { path: 'a.md' } },
+    ], 2);
+    const second = agentMessage('agent-chronology-b', [
+      { type: 'tool_use', id: 'chronology-b', name: 'search', input: { pattern: 'B' } },
+    ], 3);
+    const third = agentMessage('agent-chronology-c', [
+      { type: 'tool_use', id: 'chronology-c', name: 'bash', input: { op: 'run', cmd: 'echo C' } },
+    ], 4);
+    Element.prototype.scrollIntoView = vi.fn();
+
+    render(<MemoryRouter><ToolOnlyAgentTurnGroup members={[
+      { kind: 'agent_turn', key: first.message_id, agent: first, toolResultsByUseId: new Map(), isFirstInTurn: true },
+      { kind: 'agent_turn', key: second.message_id, agent: second, toolResultsByUseId: new Map(), isFirstInTurn: false },
+      { kind: 'agent_turn', key: third.message_id, agent: third, toolResultsByUseId: new Map(), isFirstInTurn: false },
+    ]} /></MemoryRouter>);
+
+    fireEvent.click(screen.getByRole('button', { name: /read_file:.*expand tool detail/i }));
+
+    const group = document.querySelector('.compact-tool-group');
+    const chronology = Array.from(document.querySelectorAll<HTMLElement>('[data-tool-id]'))
+      .map((node) => node.dataset['toolId']);
+    expect(chronology).toEqual(['chronology-a', 'chronology-b', 'chronology-c']);
+
+    fireEvent.click(screen.getByRole('button', { name: /collapse expanded tool detail/i }));
+
+    expect(document.querySelector('.compact-tool-selected-detail')).toBeNull();
+    expect(document.querySelector('.compact-tool-group')).toBe(group);
+  });
+
   it('renders response-level retry metadata once when one message owns multiple tools', () => {
     mockDensity = 'compact';
     const owner = { ...agentMessage('agent-retry-multi', [
