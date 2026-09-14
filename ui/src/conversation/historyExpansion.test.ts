@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   historyMergeEventCursorFloor,
+  historyHasAuthoritativeTranscriptGeneration,
   historyRequestHasCursor,
   historyResponseMatchesCurrentRequest,
   initialHistoryExpansionState,
@@ -42,6 +43,11 @@ describe('history expansion reducer', () => {
     const request = { ...manualRequest(view('a', 1)), snapshotStartedAtEventSeq: null };
 
     expect(historyRequestHasCursor(request)).toBe(false);
+  });
+
+  it('requires authoritative transcript generation before checking history response currency', () => {
+    expect(historyHasAuthoritativeTranscriptGeneration(null)).toBe(false);
+    expect(historyHasAuthoritativeTranscriptGeneration(3)).toBe(true);
   });
 
   it('rejects a superseded equal-cursor history response by request token', () => {
