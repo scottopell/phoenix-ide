@@ -156,7 +156,7 @@ def wait_for_server_exit(proc: subprocess.Popen[bytes] | subprocess.Popen[str]) 
     poll("phoenix exit", proc.poll, lambda code: code is not None)
 
 
-def wait_for_page_ready(page, base_url: str, canonical_route: str, transcript_id: str, objective: str) -> None:
+def wait_for_page_ready(page, base_url: str, canonical_route: str, transcript_id: str, objective: str | None) -> None:
     expected_url = f"{base_url}{canonical_route}"
     poll(
         "product page DOM",
@@ -171,16 +171,28 @@ def wait_for_page_ready(page, base_url: str, canonical_route: str, transcript_id
     page.wait_for_selector('[aria-label="Product conversation segments"]', timeout=int(TIMEOUT * 1000))
     page.wait_for_selector('[aria-label="Product conversation recall and live controls"]', timeout=int(TIMEOUT * 1000))
     page.wait_for_selector('[data-testid="product-conversation-composer"]', timeout=int(TIMEOUT * 1000))
-    page.wait_for_selector(f'text={objective}', timeout=int(TIMEOUT * 1000))
+    if objective is not None:
+        page.get_by_text(objective, exact=True).first.wait_for(timeout=int(TIMEOUT * 1000))
     assert page.url == expected_url, page.url
     route_text = page.locator('.product-conversation-page__route').inner_text()
     assert route_text == canonical_route, route_text
     metadata_text = page.locator('[aria-label="Product conversation metadata"]').inner_text()
     assert "Presentation" in metadata_text, metadata_text
-    assert "Lifecycle" in metadata_text and "open" in metadata_text, metadata_text
+    assert "Lifecycle" in metadata_text and "Open" in metadata_text, metadata_text
     segments = page.locator('[aria-label="Product conversation segments"]').inner_text()
     assert "Segment 0" in segments, segments
+    if objective is not None:
+        assert page.locator('[aria-label="Conversation transcript"]').get_by_text(objective, exact=True).count() == 1
+
+
+def wait_for_history_page(page, base_url: str, canonical_route: str, objective: str) -> None:
+    expected_url = f"{base_url}{canonical_route}"
+    page.wait_for_selector('[data-testid="product-conversation-page"]', timeout=int(TIMEOUT * 1000))
+    assert page.url == expected_url, page.url
+    metadata = page.locator('[aria-label="Product conversation metadata"]').inner_text()
+    assert "Lifecycle" in metadata and "History" in metadata, metadata
     assert page.locator('[aria-label="Conversation transcript"]').get_by_text(objective, exact=True).count() == 1
+    assert page.locator('[data-testid="product-conversation-composer"]').count() == 0
 
 
 def scenario_create_objective_one_row_reload(base_url: str, cwd: Path) -> dict:
@@ -251,6 +263,9 @@ def scenario_clean_close_history(base_url: str, cwd: Path) -> None:
     created = scenario_create_objective_one_row_reload(base_url, cwd)
     transcript_id = created["transcript_row_id"]
     poll("idle before Close", lambda: conversation(base_url, transcript_id), run._init_has_completed_turn)
+    open_snapshot = product_snapshot(base_url, created["product_conversation_id"])
+    worktree = Path(open_snapshot["work_identity"]["worktree_path"])
+    assert worktree.exists(), worktree
     close_response = httpx.post(f"{base_url}/api/conversations/{transcript_id}/abandon-task", timeout=30.0)
     if close_response.status_code != 200:
         assert close_response.status_code == 409 and close_response.json().get("error_type") == "close_settlement_in_progress", close_response.text
@@ -262,6 +277,13 @@ def scenario_clean_close_history(base_url: str, cwd: Path) -> None:
         lambda value: value.get("ordinary_lifecycle") == "history",
     )
     assert history["writable_transcript_row_id"] is None
+    assert history.get("close") is None, history
+    assert not worktree.exists(), f"retired worktree still exists: {worktree}"
+    archived = conversation(base_url, transcript_id)
+    assert any(message.get("content", {}).get("text") == "[[scenario:plain_text]] PRODUCT-JOURNEY-INITIAL-OBJECTIVE" for message in archived["messages"])
+    with browser_session(base_url) as page:
+        page.goto(f"{base_url}{created['canonical_route']}", wait_until="domcontentloaded")
+        wait_for_history_page(page, base_url, created["canonical_route"], "[[scenario:plain_text]] PRODUCT-JOURNEY-INITIAL-OBJECTIVE")
     assert_one_row(product_rows(base_url), created["product_conversation_id"])
 
 
@@ -371,7 +393,16 @@ def scenario_merged_creation_recovery() -> None:
 
 
 def scenario_merged_context_continuation(base_url: str, _cwd: Path) -> None:
-    run.scenario_product_conversation_context_continuation(base_url)
+    result = run.scenario_product_conversation_context_continuation(base_url)
+    with browser_session(base_url) as page:
+        page.goto(f"{base_url}{result['canonical_route']}", wait_until="domcontentloaded")
+        page.reload(wait_until="domcontentloaded")
+        wait_for_page_ready(page, base_url, result["canonical_route"], result["successor_transcript_row_id"], None)
+        segments = page.locator('[aria-label="Product conversation segments"]').inner_text()
+        assert "Segment 0" in segments and "Segment 1" in segments, segments
+    reloaded = product_snapshot(base_url, result["product_conversation_id"])
+    assert reloaded["latest_transcript_row_id"] == result["successor_transcript_row_id"]
+    assert reloaded["writable_transcript_row_id"] == result["successor_transcript_row_id"]
 
 
 def is_retryable_creation_response(error: Exception) -> bool:
