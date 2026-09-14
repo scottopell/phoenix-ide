@@ -744,6 +744,7 @@ function ProductConversationPageInner() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [snapshotRetry, setSnapshotRetry] = useState(0);
+  const [openSnapshotGeneration, setOpenSnapshotGeneration] = useState(0);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [olderError, setOlderError] = useState<string | null>(null);
   const [latestProjection, setLatestProjection] = useState<EmbeddedConversationProjection | null>(null);
@@ -794,6 +795,7 @@ function ProductConversationPageInner() {
     setOlderError(null);
     setLoadingOlder(false);
     observedMemberProjectionRef.current = null;
+    setOpenSnapshotGeneration(0);
   }, [productConversationId]);
 
   useEffect(() => {
@@ -819,6 +821,7 @@ function ProductConversationPageInner() {
       .then((next) => {
         if (cancelled) return;
         if (measurement) measurement.snapshotReceivedAt = performance.now();
+        if (measurement) setOpenSnapshotGeneration((generation) => generation + 1);
         setOwnedSnapshot((current) => ({
           productConversationId,
           value: current?.productConversationId === productConversationId
@@ -1005,7 +1008,12 @@ function ProductConversationPageInner() {
 
   useEffect(() => {
     const measurement = openMeasurementRef.current;
-    if (!measurement || measurement.reported || !initialSnapshotReady) return;
+    if (
+      !measurement
+      || measurement.reported
+      || measurement.snapshotReceivedAt === undefined
+      || !initialSnapshotReady
+    ) return;
     measurement.storeReadyAt ??= performance.now();
     if (!measurement.initiallyVisible) {
       reportProductConversationOpen(measurement, null);
@@ -1023,7 +1031,7 @@ function ProductConversationPageInner() {
       cancelAnimationFrame(paintFrame);
       cancelAnimationFrame(reportFrame);
     };
-  }, [initialSnapshotReady, productConversationId]);
+  }, [initialSnapshotReady, openSnapshotGeneration, productConversationId]);
 
   useEffect(() => {
     if (!hashTargetMessageId || hashTargetLoaded || !snapshot?.has_older || loadingOlder || olderError) return;

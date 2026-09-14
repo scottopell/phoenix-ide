@@ -432,6 +432,10 @@ describe('ProductConversationPage', () => {
     fireEvent.click(screen.getByRole('button', { name: 'open first product' }));
     await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(3));
     const revisitOpenId = vi.mocked(api.getProductConversationSnapshot).mock.calls[2]?.[1]?.open_id;
+    await waitFor(() => expect(api.reportProductConversationOpen).toHaveBeenCalledTimes(2));
+    expect(api.reportProductConversationOpen).toHaveBeenLastCalledWith(
+      expect.objectContaining({ open_id: revisitOpenId }),
+    );
     expect(firstOpenId).toMatch(/^[0-9a-f-]{36}$/);
     expect(secondOpenId).toMatch(/^[0-9a-f-]{36}$/);
     expect(revisitOpenId).toMatch(/^[0-9a-f-]{36}$/);
