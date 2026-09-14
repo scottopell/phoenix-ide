@@ -946,9 +946,11 @@ THE SYSTEM SHALL persist the approved objective, `WorkScope` authority, post-app
 IF any post-mutation approval step fails
 THEN THE SYSTEM SHALL retire the live actor for reconstruction from durable authority
 AND SHALL immediately rematerialize the retired conversation from its persisted state without relying on unfinished-turn discovery
+AND IF bounded rematerialization attempts are exhausted THE SYSTEM SHALL release the reserved event stream so clients reconnect and can initiate reconstruction
 
 WHEN same-conversation approval commits a transition to `LlmRequesting`
-THE SYSTEM SHALL persist an operation-scoped obligation bound to that approval message
+THE SYSTEM SHALL persist an operation-scoped obligation bound to the complete identity of that approval message
+AND SHALL derive the approval sequence from the referenced message rather than storing a parallel sequence representation
 AND SHALL preserve the requesting state across process restart while that obligation remains pending
 AND SHALL retire the obligation when the first later agent response is durably stored or the conversation leaves `LlmRequesting`
 AND SHALL NOT treat the lifetime approved-task objective as ownership of later requests

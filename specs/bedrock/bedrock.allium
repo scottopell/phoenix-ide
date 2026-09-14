@@ -1165,10 +1165,13 @@ rule UserApprovesTaskCurrentConversation {
         --
         -- If capability publication fails after commit, actor retirement preserves the
         -- stream reservation and directly rematerializes the conversation from durable
-        -- state; unfinished-turn discovery is not the recovery owner.
+        -- state; unfinished-turn discovery is not the recovery owner. If bounded
+        -- rematerialization attempts fail, the reservation is released so clients
+        -- reconnect and can initiate reconstruction.
         --
-        -- An operation-scoped obligation, bound to the approval context message,
-        -- preserves the first post-approval request across restart. A later durable
+        -- An operation-scoped obligation, bound by foreign key to the approval context
+        -- message and deriving its sequence from that message, preserves the first
+        -- post-approval request across restart. A later durable
         -- agent message or any state progression out of LlmRequesting retires it;
         -- the lifetime approved objective never owns later requests.
         --

@@ -18,7 +18,6 @@ const GUIDANCE_FILE_NAMES: &[&str] = &["AGENTS.md", "AGENT.md"];
 // `ModeContext` is a domain-vocabulary type embedded in `ConvState`; it now
 // lives in phoenix-core. Re-export at the historical path.
 pub use phoenix_core::domain::mode_context::ModeContext;
-#[cfg(test)]
 use phoenix_core::domain::sm_state::ExploreBashCapability;
 
 // Skill discovery + metadata now live in the `phoenix-skills` crate. Re-export
@@ -117,6 +116,23 @@ pub fn build_coordinator_system_prompt(language: LlmLanguage) -> String {
     prompt.push_str("\n\n");
     prompt.push_str(llm_language::mermaid_rendering_hint(language));
     prompt
+}
+
+#[must_use]
+pub(crate) fn explore_bash_prompt_capability(
+    authority: crate::work_scope::ResourceAuthority,
+    mode: Option<&ModeContext>,
+    restricted_bash: ExploreBashCapability,
+) -> phoenix_core::llm_language::ExploreBashPromptCapability {
+    match (authority, mode) {
+        (crate::work_scope::ResourceAuthority::Work, Some(ModeContext::Explore { .. })) => {
+            phoenix_core::llm_language::ExploreBashPromptCapability::Unsandboxed
+        }
+        (crate::work_scope::ResourceAuthority::Restricted, Some(ModeContext::Explore { .. })) => {
+            restricted_bash.into()
+        }
+        _ => phoenix_core::llm_language::ExploreBashPromptCapability::Unavailable,
+    }
 }
 
 /// Build the complete system prompt for a conversation.
@@ -848,6 +864,29 @@ mod tests {
         // The Work block no longer hands out a taskmd ID prefix — task files
         // need not be taskmd files at all (task 13009).
         assert!(!prompt.contains("task ID prefix"));
+    }
+
+    #[test]
+    fn provider_and_introspection_share_approved_explore_projection() {
+        let mode = ModeContext::Explore {
+            next_taskmd_id_hint: None,
+        };
+        assert_eq!(
+            explore_bash_prompt_capability(
+                crate::work_scope::ResourceAuthority::Work,
+                Some(&mode),
+                ExploreBashCapability::Sandboxed,
+            ),
+            phoenix_core::llm_language::ExploreBashPromptCapability::Unsandboxed
+        );
+        assert_eq!(
+            explore_bash_prompt_capability(
+                crate::work_scope::ResourceAuthority::Restricted,
+                Some(&mode),
+                ExploreBashCapability::Sandboxed,
+            ),
+            phoenix_core::llm_language::ExploreBashPromptCapability::Sandboxed
+        );
     }
 
     #[test]
