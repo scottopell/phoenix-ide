@@ -21,6 +21,7 @@ import {
 import { ConversationNavStack } from '../components/ConversationNavStack';
 import {
   historyMergeEventCursorFloor,
+  historyResponseMatchesCurrentRequest,
   initialHistoryExpansionState,
   reduceHistoryExpansion,
   type HistoryIntent,
@@ -1034,12 +1035,14 @@ function ConversationPageContent({
       const currentView = historyViewRef.current;
       const authoritativeTranscriptGeneration = atomRef.current.transcriptGeneration;
       const responseTranscriptGeneration = result.conversation.transcript_generation ?? 1;
-      const requestIsCurrent = result.conversation.id === request.view.conversationId
-        && currentView.conversationId === request.view.conversationId
-        && currentView.generation === request.view.generation
-        && currentView.transcriptGeneration === request.view.transcriptGeneration
-        && authoritativeTranscriptGeneration === request.view.transcriptGeneration
-        && responseTranscriptGeneration === request.view.transcriptGeneration;
+      const requestIsCurrent = historyResponseMatchesCurrentRequest(
+        request,
+        historyRequestTokenRef.current,
+        currentView,
+        authoritativeTranscriptGeneration,
+        result.conversation.id,
+        responseTranscriptGeneration,
+      );
       if (!requestIsCurrent) {
         dispatchHistoryExpansion({
           type: 'history_failed',
