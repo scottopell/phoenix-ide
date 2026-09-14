@@ -311,6 +311,7 @@ class Launchctl:
             job,
             "loaded service configuration changed immediately before restart",
         )
+        verify_installed_artifacts(self.manifest)
         try:
             self.kill(job.pid, signal.SIGHUP)
         except OSError as exc:

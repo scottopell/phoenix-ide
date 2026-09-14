@@ -260,6 +260,38 @@ class RestartHelperTests(unittest.TestCase):
             status = json.loads(Path(manifest.status_path).read_text())
             self.assertEqual("precondition_failed", status["state"])
 
+    def test_artifact_change_during_identity_probe_is_rejected_before_signal(self):
+        class RevalidatingLaunchctl(FakeLaunchctl):
+            signal_hup = helper.Launchctl.signal_hup
+
+            def __init__(self, manifest):
+                super().__init__(manifest)
+                self.kill = mock.Mock()
+
+        with tempfile.TemporaryDirectory() as td:
+            manifest = make_manifest(Path(td))
+            launchctl = RevalidatingLaunchctl(manifest)
+
+            def replace_binary_during_probe(*_args, **_kwargs):
+                Path(manifest.binary_path).write_bytes(b"replaced")
+                return manifest.expected
+
+            with mock.patch.object(helper, "Launchctl", return_value=launchctl), \
+                 mock.patch.object(
+                     helper,
+                     "fetch_identity",
+                     side_effect=replace_binary_during_probe,
+                 ):
+                with self.assertRaisesRegex(
+                    helper.RestartError,
+                    "binary checksum mismatch",
+                ):
+                    helper.restart(manifest)
+
+            launchctl.kill.assert_not_called()
+            status = json.loads(Path(manifest.status_path).read_text())
+            self.assertEqual("precondition_failed", status["state"])
+
     def test_loaded_job_without_keepalive_is_rejected_before_signal(self):
         class NoKeepAliveLaunchctl(FakeLaunchctl):
             def inspect(self):
