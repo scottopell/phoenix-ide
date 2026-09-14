@@ -3764,6 +3764,72 @@ fn quarantine_has_writable_mappings(path: &Path) -> Result<ExternalWriterEvidenc
 }
 
 #[cfg(target_os = "linux")]
+fn linux_procfs_display_path(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut display = Vec::new();
+    for byte in path.as_os_str().as_bytes() {
+        if *byte == b'\n' {
+            display.extend_from_slice(b"\\012");
+        } else {
+            display.push(*byte);
+        }
+    }
+    display
+}
+
+#[cfg(target_os = "linux")]
+fn linux_writable_shared_mapping_path(
+    mapping: &str,
+    canonical: &Path,
+) -> Result<Option<String>, String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut fields = mapping
+        .splitn(6, char::is_whitespace)
+        .filter(|field| !field.is_empty());
+    let _address = fields.next();
+    let permissions = fields.next().unwrap_or_default();
+    let _offset = fields.next();
+    let _device = fields.next();
+    let _inode = fields.next();
+    let mapped_path = fields.next().unwrap_or_default().trim_start();
+    if permissions.as_bytes().get(1) != Some(&b'w') || permissions.as_bytes().get(3) != Some(&b's')
+    {
+        return Ok(None);
+    }
+    let canonical_display = linux_procfs_display_path(canonical);
+    if !path_is_within(
+        Path::new(std::ffi::OsStr::from_bytes(mapped_path.as_bytes())),
+        Path::new(std::ffi::OsStr::from_bytes(&canonical_display)),
+    ) {
+        return Ok(None);
+    }
+    if mapped_path
+        .as_bytes()
+        .windows(4)
+        .any(|bytes| bytes == b"\\012")
+    {
+        return Err("matching process mapping pathname has ambiguous procfs escaping".to_string());
+    }
+    Ok(Some(mapped_path.to_string()))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_revalidated_writer_identity(
+    before_incarnation: &str,
+    before_executable: &Path,
+    resource_still_matches: bool,
+    after_incarnation: &str,
+    after_executable: &Path,
+) -> Result<bool, String> {
+    if after_incarnation != before_incarnation || after_executable != before_executable {
+        return Err("matching writer identity changed during inspection".to_string());
+    }
+    Ok(resource_still_matches)
+}
+
+#[cfg(target_os = "linux")]
 fn quarantine_has_writable_mappings_in(
     path: &Path,
     proc_root: &Path,
@@ -3788,61 +3854,87 @@ fn quarantine_has_writable_mappings_in(
             Err(_) if !process.path().exists() => continue,
             Err(error) => return Err(error),
         };
-        let before_executable = match std::fs::read_link(process.path().join("exe")) {
-            Ok(executable) => executable,
-            Err(_) if !process.path().exists() => continue,
-            Err(error) => return Err(format!("cannot inspect process executable: {error}")),
-        };
         let mappings = match std::fs::read_to_string(process.path().join("maps")) {
             Ok(mappings) => mappings,
             Err(_) if !process.path().exists() => continue,
             Err(error) => return Err(format!("cannot inspect process mappings: {error}")),
         };
         for mapping in mappings.lines() {
-            let mut fields = mapping
-                .splitn(6, char::is_whitespace)
-                .filter(|field| !field.is_empty());
-            let _address = fields.next();
-            let permissions = fields.next().unwrap_or_default();
-            let _offset = fields.next();
-            let _device = fields.next();
-            let _inode = fields.next();
-            let mapped_path = fields.next().unwrap_or_default().trim_start();
-            if permissions.as_bytes().get(1) == Some(&b'w')
-                && permissions.as_bytes().get(3) == Some(&b's')
-                && path_is_within(Path::new(mapped_path), &canonical)
-            {
-                let after_incarnation = match linux_process_incarnation(&process.path()) {
-                    Ok(incarnation) => incarnation,
-                    Err(_) if !process.path().exists() => continue,
-                    Err(error) => return Err(error),
-                };
-                let Ok(after_executable) = std::fs::read_link(process.path().join("exe")) else {
-                    continue;
-                };
-                if after_incarnation != before_incarnation || after_executable != before_executable
-                {
-                    continue;
-                }
-                let process_id = process
-                    .file_name()
-                    .to_string_lossy()
-                    .parse::<i64>()
-                    .map_err(|error| format!("process id is malformed: {error}"))?;
-                return Ok(ExternalWriterEvidence::PositiveWriterFound(
-                    AmbientWriterEvidence {
-                        detector: AmbientWriterDetector::LinuxProcfs,
-                        process_id,
-                        process_incarnation: before_incarnation.clone(),
-                        executable: GitPathIdentity::from_bytes(
-                            before_executable.as_os_str().as_bytes().to_vec(),
-                        ),
-                        matched_path: GitPathIdentity::from_bytes(mapped_path.as_bytes().to_vec()),
-                        match_kind: AmbientWriterMatchKind::Mapping,
-                        access_mode: AmbientWriterAccessMode::WritableSharedMapping,
-                    },
-                ));
+            let Some(mapped_path) = linux_writable_shared_mapping_path(mapping, &canonical)? else {
+                continue;
+            };
+            let executable = match std::fs::read_link(process.path().join("exe")) {
+                Ok(executable) => executable,
+                Err(_) if !process.path().exists() => continue,
+                Err(error) => return Err(format!("cannot inspect process executable: {error}")),
+            };
+            let identity_incarnation = match linux_process_incarnation(&process.path()) {
+                Ok(incarnation) => incarnation,
+                Err(_) if !process.path().exists() => continue,
+                Err(error) => return Err(error),
+            };
+            if identity_incarnation != before_incarnation {
+                return Err("matching writer identity changed during inspection".to_string());
             }
+            let current_mappings = match std::fs::read_to_string(process.path().join("maps")) {
+                Ok(mappings) => mappings,
+                Err(_) if !process.path().exists() => continue,
+                Err(error) => return Err(format!("cannot inspect process mappings: {error}")),
+            };
+            let mut mapping_still_matches = false;
+            for current_mapping in current_mappings.lines() {
+                if linux_writable_shared_mapping_path(current_mapping, &canonical)?.as_deref()
+                    == Some(mapped_path.as_str())
+                {
+                    mapping_still_matches = true;
+                    break;
+                }
+            }
+            let after_incarnation = match linux_process_incarnation(&process.path()) {
+                Ok(incarnation) => incarnation,
+                Err(_) if !process.path().exists() => continue,
+                Err(error) => return Err(error),
+            };
+            let after_executable = match std::fs::read_link(process.path().join("exe")) {
+                Ok(executable) => executable,
+                Err(_) if !process.path().exists() => continue,
+                Err(error) => return Err(format!("cannot inspect process executable: {error}")),
+            };
+            if !linux_revalidated_writer_identity(
+                &before_incarnation,
+                &executable,
+                mapping_still_matches,
+                &after_incarnation,
+                &after_executable,
+            )? {
+                continue;
+            }
+            let final_incarnation = match linux_process_incarnation(&process.path()) {
+                Ok(incarnation) => incarnation,
+                Err(_) if !process.path().exists() => continue,
+                Err(error) => return Err(error),
+            };
+            if final_incarnation != after_incarnation {
+                return Err("matching writer identity changed during inspection".to_string());
+            }
+            let process_id = process
+                .file_name()
+                .to_string_lossy()
+                .parse::<i64>()
+                .map_err(|error| format!("process id is malformed: {error}"))?;
+            return Ok(ExternalWriterEvidence::PositiveWriterFound(
+                AmbientWriterEvidence {
+                    detector: AmbientWriterDetector::LinuxProcfs,
+                    process_id,
+                    process_incarnation: before_incarnation.clone(),
+                    executable: GitPathIdentity::from_bytes(
+                        executable.as_os_str().as_bytes().to_vec(),
+                    ),
+                    matched_path: GitPathIdentity::from_bytes(mapped_path.into_bytes()),
+                    match_kind: AmbientWriterMatchKind::Mapping,
+                    access_mode: AmbientWriterAccessMode::WritableSharedMapping,
+                },
+            ));
         }
     }
     Ok(ExternalWriterEvidence::NoPositiveEvidence)
@@ -4252,11 +4344,6 @@ fn quarantine_has_open_descriptors_in(
             Err(_) if !process.path().exists() => continue,
             Err(error) => return Err(error),
         };
-        let before_executable = match std::fs::read_link(process.path().join("exe")) {
-            Ok(executable) => executable,
-            Err(_) if !process.path().exists() => continue,
-            Err(error) => return Err(format!("cannot inspect process executable: {error}")),
-        };
         let descriptors = match std::fs::read_dir(process.path().join("fd")) {
             Ok(descriptors) => descriptors,
             Err(_) if !process.path().exists() => continue,
@@ -4294,6 +4381,34 @@ fn quarantine_has_open_descriptors_in(
                 Err(_) if !process.path().exists() => continue,
                 Err(error) => return Err(error),
             };
+            let executable = match std::fs::read_link(process.path().join("exe")) {
+                Ok(executable) => executable,
+                Err(_) if !process.path().exists() => continue,
+                Err(error) => return Err(format!("cannot inspect process executable: {error}")),
+            };
+            let identity_incarnation = match linux_process_incarnation(&process.path()) {
+                Ok(incarnation) => incarnation,
+                Err(_) if !process.path().exists() => continue,
+                Err(error) => return Err(error),
+            };
+            if identity_incarnation != before_incarnation {
+                return Err("matching writer identity changed during inspection".to_string());
+            }
+            let current_target = match std::fs::read_link(descriptor.path()) {
+                Ok(target) => target,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(format!("cannot inspect descriptor target: {error}")),
+            };
+            let current_access_mode = match linux_descriptor_access_mode(
+                &process.path().join("fdinfo").join(descriptor.file_name()),
+            ) {
+                Ok(mode) => classify_descriptor_access_mode(mode, target_metadata.is_dir()),
+                Err(_) if !process.path().exists() => continue,
+                Err(error) => return Err(error),
+            };
+            let resource_still_matches = current_target == target
+                && current_access_mode == Some(access_mode)
+                && linux_descriptor_target_is_within(Ok(current_target), &canonical);
             let after_incarnation = match linux_process_incarnation(&process.path()) {
                 Ok(incarnation) => incarnation,
                 Err(_) if !process.path().exists() => continue,
@@ -4304,8 +4419,22 @@ fn quarantine_has_open_descriptors_in(
                 Err(_) if !process.path().exists() => continue,
                 Err(error) => return Err(format!("cannot inspect process executable: {error}")),
             };
-            if after_incarnation != before_incarnation || after_executable != before_executable {
+            if !linux_revalidated_writer_identity(
+                &before_incarnation,
+                &executable,
+                resource_still_matches,
+                &after_incarnation,
+                &after_executable,
+            )? {
                 continue;
+            }
+            let final_incarnation = match linux_process_incarnation(&process.path()) {
+                Ok(incarnation) => incarnation,
+                Err(_) if !process.path().exists() => continue,
+                Err(error) => return Err(error),
+            };
+            if final_incarnation != after_incarnation {
+                return Err("matching writer identity changed during inspection".to_string());
             }
             let process_id = process
                 .file_name()
@@ -4318,7 +4447,7 @@ fn quarantine_has_open_descriptors_in(
                     process_id,
                     process_incarnation: before_incarnation.clone(),
                     executable: GitPathIdentity::from_bytes(
-                        before_executable.as_os_str().as_bytes().to_vec(),
+                        executable.as_os_str().as_bytes().to_vec(),
                     ),
                     matched_path: GitPathIdentity::from_bytes(
                         target.as_os_str().as_bytes().to_vec(),
@@ -7348,6 +7477,12 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn write_synthetic_process_identity(process: &Path, pid: i64) {
+        write_synthetic_process_credentials(process, pid);
+        std::os::unix::fs::symlink("/bin/writer", process.join("exe")).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_synthetic_process_credentials(process: &Path, pid: i64) {
         // SAFETY: `geteuid` has no preconditions.
         let effective_uid = unsafe { libc::geteuid() };
         std::fs::write(
@@ -7361,7 +7496,162 @@ mod tests {
             format!("{pid} (writer) S {fields} 4242\n"),
         )
         .unwrap();
-        std::os::unix::fs::symlink("/bin/writer", process.join("exe")).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unrelated_process_does_not_require_executable_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let quarantine = temp.path().join("quarantine");
+        let process = temp.path().join("proc/1276");
+        std::fs::create_dir_all(process.join("fd")).unwrap();
+        std::fs::create_dir_all(process.join("fdinfo")).unwrap();
+        std::fs::create_dir(&quarantine).unwrap();
+        write_synthetic_process_credentials(&process, 1276);
+        std::fs::write(process.join("maps"), "1000-2000 rw-s 0 00:00 0 /outside\n").unwrap();
+        std::os::unix::fs::symlink("/outside", process.join("fd/3")).unwrap();
+
+        assert_eq!(
+            super::quarantine_has_open_descriptors_in(
+                &quarantine,
+                temp.path().join("proc").as_path(),
+            )
+            .unwrap(),
+            super::ExternalWriterEvidence::NoPositiveEvidence,
+        );
+        assert_eq!(
+            super::quarantine_has_writable_mappings_in(
+                &quarantine,
+                temp.path().join("proc").as_path(),
+                unsafe { libc::geteuid() },
+            )
+            .unwrap(),
+            super::ExternalWriterEvidence::NoPositiveEvidence,
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn matching_resource_without_executable_identity_is_indeterminate() {
+        let temp = tempfile::tempdir().unwrap();
+        let quarantine = temp.path().join("quarantine");
+        let process = temp.path().join("proc/1277");
+        std::fs::create_dir_all(process.join("fd")).unwrap();
+        std::fs::create_dir_all(process.join("fdinfo")).unwrap();
+        std::fs::create_dir(&quarantine).unwrap();
+        let matched = quarantine.join("matched");
+        std::fs::write(&matched, "writer").unwrap();
+        write_synthetic_process_credentials(&process, 1277);
+        std::fs::write(
+            process.join("maps"),
+            format!("1000-2000 rw-s 0 00:00 0 {}\n", matched.display()),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&matched, process.join("fd/3")).unwrap();
+        std::fs::write(process.join("fdinfo/3"), "flags:\t00000001\n").unwrap();
+
+        assert!(super::quarantine_has_open_descriptors_in(
+            &quarantine,
+            temp.path().join("proc").as_path(),
+        )
+        .unwrap_err()
+        .contains("process executable"));
+        assert!(super::quarantine_has_writable_mappings_in(
+            &quarantine,
+            temp.path().join("proc").as_path(),
+            unsafe { libc::geteuid() },
+        )
+        .unwrap_err()
+        .contains("process executable"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn matching_writer_with_changed_identity_is_indeterminate() {
+        assert!(super::linux_revalidated_writer_identity(
+            "before",
+            Path::new("/bin/before"),
+            true,
+            "after",
+            Path::new("/bin/after"),
+        )
+        .unwrap_err()
+        .contains("identity changed"));
+        assert!(super::linux_revalidated_writer_identity(
+            "before",
+            Path::new("/bin/before"),
+            false,
+            "after",
+            Path::new("/bin/after"),
+        )
+        .unwrap_err()
+        .contains("identity changed"));
+        assert!(super::linux_revalidated_writer_identity(
+            "before",
+            Path::new("/bin/stable"),
+            true,
+            "after",
+            Path::new("/bin/stable"),
+        )
+        .unwrap_err()
+        .contains("identity changed"));
+        assert!(super::linux_revalidated_writer_identity(
+            "stable",
+            Path::new("/bin/before"),
+            true,
+            "stable",
+            Path::new("/bin/after"),
+        )
+        .unwrap_err()
+        .contains("identity changed"));
+        assert!(super::linux_revalidated_writer_identity(
+            "before",
+            Path::new("/bin/stable"),
+            false,
+            "after",
+            Path::new("/bin/stable"),
+        )
+        .unwrap_err()
+        .contains("identity changed"));
+        assert!(super::linux_revalidated_writer_identity(
+            "stable",
+            Path::new("/bin/before"),
+            false,
+            "stable",
+            Path::new("/bin/after"),
+        )
+        .unwrap_err()
+        .contains("identity changed"));
+        assert!(super::linux_revalidated_writer_identity(
+            "stable",
+            Path::new("/bin/stable"),
+            true,
+            "stable",
+            Path::new("/bin/stable"),
+        )
+        .unwrap());
+        assert!(!super::linux_revalidated_writer_identity(
+            "stable",
+            Path::new("/bin/stable"),
+            false,
+            "stable",
+            Path::new("/bin/stable"),
+        )
+        .unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn escaped_matching_mapping_path_is_indeterminate() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let canonical = Path::new(std::ffi::OsStr::from_bytes(b"/quarantine/line\nbreak"));
+        let mapping = "1000-2000 rw-s 0 00:00 0 /quarantine/line\\012break/file";
+        assert!(
+            super::linux_writable_shared_mapping_path(mapping, canonical)
+                .unwrap_err()
+                .contains("ambiguous procfs escaping")
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -7393,10 +7683,11 @@ mod tests {
         let ambient = proc_root.join("1273");
         std::fs::create_dir_all(&ambient).unwrap();
         std::fs::create_dir(&quarantine).unwrap();
+        write_synthetic_process_credentials(&ambient, 1273);
         std::fs::write(ambient.join("fd"), b"not a descriptor directory").unwrap();
 
         let error = super::quarantine_has_open_descriptors_in(&quarantine, &proc_root).unwrap_err();
-        assert!(error.contains("kernel credentials"));
+        assert!(error.contains("descriptor inventory"));
     }
 
     #[cfg(target_os = "linux")]
