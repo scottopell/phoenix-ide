@@ -14,16 +14,20 @@ submitted operation without silently substituting another draft.
 Pending questions now carry a server-generated `request_id` independently of
 provider `tool_use_id`. Web, CLI, native iOS, API admission, runtime events, and
 atomic SQLite consumption use the incarnation identity. Migration 097 preserves
-pending questions while assigning missing identities and preserves historical
-dismissal pauses. A durable pause row holds queued steering until acceptance of
+pending questions while assigning missing identities. Legacy dismissed conversations
+retain FIFO eligibility when their queue is nonempty; empty queues gain pause
+ownership. A durable pause row for new dismissals holds queued steering until acceptance of
 a new explicit user message; deferred objective delivery cannot release it.
 The next drain delivers queued inputs FIFO with one LLM dispatch. Local SQLite
 question commands use exact outcome classification and the existing fail-stop
 boundary. Browser behavior follows [ADR-053](../adrs/053_question-interactions-bind-explicit-answers-to-request-identity.md);
 [ADR-052](../adrs/052_question-incarnations-and-durable-dismissal-resumption.md)
-refines request identity and dismissal resumption ownership. Native iOS receives
-protocol adaptation, not the browser visual redesign. The legacy `design.md`
-remains historical and is not the redesign authority.
+refines request identity and dismissal resumption ownership. Web and native
+clients fetch authoritative conversation state after confirmed success or stale
+rejection; a failed refresh keeps the resolved question closed and offers a
+status check without another mutation. Native iOS receives protocol adaptation,
+not the browser visual redesign. The legacy `design.md` remains historical and is
+not the redesign authority.
 
 ## Status Summary
 

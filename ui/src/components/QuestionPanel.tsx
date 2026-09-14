@@ -11,14 +11,13 @@ export interface QuestionPanelProps {
   conversationId: string;
   requestId: string;
   showToast: (message: string, duration?: number) => void;
-  onAnswered: () => void;
-  onDismissed: () => void;
   onResolved: (state: ConversationState) => void;
   readOnly?: boolean;
 }
 type Operation = { kind: 'answer'; payload: ReturnType<typeof answerPayload> } | { kind: 'dismiss' };
 type Submission = { kind: 'editing' } | { kind: 'sending'; operation: Operation }
-  | { kind: 'uncertain'; operation: Operation; checked: boolean; message: string };
+  | { kind: 'uncertain'; operation: Operation; checked: boolean; message: string }
+  | { kind: 'resolved'; operation: Operation; message: string };
 const previewComponents = {
   pre: ({children}: {children?: ReactNode}) => <pre tabIndex={0} role="region" aria-label="Preview code" onKeyDown={event => {
     if (event.altKey || event.ctrlKey || event.metaKey || event.currentTarget.scrollWidth <= event.currentTarget.clientWidth) return;
@@ -40,7 +39,7 @@ export function QuestionPanel(props: QuestionPanelProps) {
   return <ActiveQuestionPanel key={`${props.conversationId}:${props.requestId}`} {...props} />;
 }
 
-function ActiveQuestionPanel({ questions, conversationId, requestId, showToast, onAnswered, onDismissed, onResolved }: QuestionPanelProps) {
+function ActiveQuestionPanel({ questions, conversationId, requestId, showToast, onResolved }: QuestionPanelProps) {
   useRegisterFocusScope('question-panel');
   const { activeScope } = useFocusScope();
   const id = useId();
@@ -138,7 +137,7 @@ function ActiveQuestionPanel({ questions, conversationId, requestId, showToast, 
     if (active instanceof HTMLElement && root.current?.contains(active)) active.scrollIntoView?.({ block: 'nearest' });
   }, [bounds.width, bounds.height]);
 
-  const reconcile = async (operation: Operation) => {
+  const reconcile = async (operation: Operation, knowledge: 'unknown' | 'consumed' = 'unknown') => {
     if (!mounted.current || inFlight.current) return;
     inFlight.current = true;
     try {
@@ -148,12 +147,15 @@ function ActiveQuestionPanel({ questions, conversationId, requestId, showToast, 
       const state = parseConversationState(rawState);
       if (!rawState || rawState.type !== state.type) throw new Error('Question status unavailable');
       if (state.type !== 'awaiting_user_response' || state.request_id !== requestId) {
-        showToast('This question is no longer awaiting an answer');
+        if (knowledge === 'unknown') showToast('This question is no longer awaiting an answer');
         onResolved(state);
-      } else setSubmission({ kind: 'uncertain', operation, checked: true,
+      } else if (knowledge === 'consumed') setSubmission({ kind: 'resolved', operation, message: 'This question has closed. Waiting for updated conversation status.' });
+      else setSubmission({ kind: 'uncertain', operation, checked: true,
         message: operation.kind === 'answer' ? 'Your original answer may still be processing. Retry sends the same answer.' : 'The dismissal may still be processing. Retry dismisses the same question.' });
     } catch {
-      if (mounted.current) setSubmission({ kind: 'uncertain', operation, checked: false, message: 'Could not check question status. Your original response remains unchanged.' });
+      if (mounted.current) setSubmission(knowledge === 'consumed'
+        ? { kind: 'resolved', operation, message: 'This question has closed, but the conversation status could not be refreshed. Check status again.' }
+        : { kind: 'uncertain', operation, checked: false, message: 'Could not check question status. Your original response remains unchanged.' });
     } finally { inFlight.current = false; }
   };
   const perform = async (operation: Operation) => {
@@ -164,11 +166,18 @@ function ActiveQuestionPanel({ questions, conversationId, requestId, showToast, 
       if (operation.kind === 'answer') await api.respondToQuestion(conversationId, requestId, operation.payload.answers, operation.payload.annotations);
       else await api.dismissQuestion(conversationId, requestId);
       if (!mounted.current) return;
-      if (operation.kind === 'answer') { onAnswered(); showToast('Answers sent'); }
-      else { onDismissed(); showToast('Questions dismissed. Send a message to continue.'); }
+      showToast(operation.kind === 'answer' ? 'Answers sent' : 'Questions dismissed. Send a message to continue.');
+      setSubmission({ kind: 'resolved', operation, message: 'Updating conversation status…' });
+      inFlight.current = false;
+      await reconcile(operation, 'consumed');
     } catch (err) {
       if (!mounted.current) return;
-      if (err instanceof QuestionMutationError && err.code === 'question_request_invalid' && !uncertain.current) {
+      if (err instanceof QuestionMutationError && err.code === 'question_request_stale') {
+        showToast('This question is no longer awaiting an answer');
+        setSubmission({ kind: 'resolved', operation, message: 'Updating conversation status…' });
+        inFlight.current = false;
+        await reconcile(operation, 'consumed');
+      } else if (err instanceof QuestionMutationError && err.code === 'question_request_invalid' && !uncertain.current) {
         setSubmission({ kind: 'editing' }); setError(err.message);
       } else {
         uncertain.current = true;
@@ -239,6 +248,11 @@ function ActiveQuestionPanel({ questions, conversationId, requestId, showToast, 
   };
   const idFor = (suffix: string) => `${id}-${step}-${suffix}`;
 
+  if (submission.kind === 'resolved') return <section className="question-panel" aria-label="Question response status">
+    <p role="status">{submission.message}</p>
+    <button type="button" onClick={() => void reconcile(submission.operation, 'consumed')}>Check status again</button>
+  </section>;
+
   return <section ref={root} className={`question-panel${expand ? ' question-panel--expanded' : ''}${short ? ' question-panel--short' : ''}`}
     style={{ '--question-available-height': `${bounds.height}px` } as CSSProperties}
     aria-label="Answer agent questions" onKeyDown={keyboard} onFocus={event => {
@@ -281,7 +295,7 @@ function ActiveQuestionPanel({ questions, conversationId, requestId, showToast, 
               onChange={event => update(value => ({ ...choose(value, otherIndex, true), other: event.target.value }))} /></label> : draft.other && <p className="question-draft-note">
                 {question.multiSelect ? 'Custom answer not included.' : 'Saved custom draft — not included.'} <button type="button" onClick={() => { update(value => choose(value, otherIndex)); onOtherEntry(); }}>Edit custom answer</button></p>}
             {otherSelected && !draft.other.trim() && <p id={idFor('other-help')}>Write a custom answer to include Other.</p>}
-            {narrow && previewMode && <button className="question-preview-link" type="button" disabled={!choice} onClick={() => {
+            {narrow && previewMode && <button className="question-preview-link" type="button" disabled={!choice && !otherSelected} onClick={() => {
               previewRef.current?.querySelector<HTMLElement>('h3')?.focus(); previewRef.current?.scrollIntoView?.({ block: 'nearest' });
             }}>Preview below</button>}
           </fieldset>

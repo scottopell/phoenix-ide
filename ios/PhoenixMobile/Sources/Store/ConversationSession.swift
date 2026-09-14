@@ -434,10 +434,11 @@ final class ConversationSession {
         case checkedPending
         case checking
         case resolvedWaitingForStream
+        case resolvedNeedsStatusCheck(String)
 
         var canCheckStatus: Bool {
             switch self {
-            case .needsStatusCheck, .checkedPending: return true
+            case .needsStatusCheck, .checkedPending, .resolvedNeedsStatusCheck: return true
             case .sending, .checking, .resolvedWaitingForStream: return false
             }
         }
@@ -482,15 +483,17 @@ final class ConversationSession {
     var actionInFlight: ConversationAction? { actionAttempt?.action }
 
     var questionResolvedWaitingForStream: Bool {
-        if case .resolvedWaitingForStream = actionAttempt?.phase { return true }
-        return false
+        switch actionAttempt?.phase {
+        case .resolvedWaitingForStream, .resolvedNeedsStatusCheck: return true
+        default: return false
+        }
     }
 
     var uncertainQuestionMessage: String? {
         guard let attempt = actionAttempt, attempt.action.questionRequestId != nil else { return nil }
         switch attempt.phase {
         case .sending: return nil
-        case .needsStatusCheck(let message): return message
+        case .needsStatusCheck(let message), .resolvedNeedsStatusCheck(let message): return message
         case .checkedPending: return "Your original action may still be processing. Retry sends only the same answer or dismissal."
         case .checking: return "Checking question status…"
         case .resolvedWaitingForStream: return "This question is no longer awaiting an answer. Refreshing…"
@@ -513,28 +516,45 @@ final class ConversationSession {
         executeAction(attempt.action, token: attempt.token, previouslyUncertain: true)
     }
 
-    func checkQuestionStatus() {
-        guard canCheckQuestionStatus, let attempt = actionAttempt,
-              let requestId = attempt.action.questionRequestId else { return }
-        actionAttempt?.phase = .checking
-        Task {
-            let result: Result<Conversation, Error>
-            do {
-                result = .success(try await api.getConversation(id: conversationId).conversation)
-            } catch {
-                result = .failure(error)
-            }
-            guard actionAttempt?.token == attempt.token else { return }
-            let phase = QuestionAttemptPhase.reconcile(
-                conversationId: conversationId, requestId: requestId, result: result)
-            actionAttempt?.phase = phase
-            if phase == .resolvedWaitingForStream {
-                streamTask?.cancel()
-                streamTask = nil
-                connection = .idle
-                resumeLiveTasks()
-            }
+    @discardableResult
+    func checkQuestionStatus() -> Task<Void, Never>? {
+        guard canCheckQuestionStatus, let attempt = actionAttempt else { return nil }
+        let knownResolved = questionResolvedWaitingForStream
+        actionAttempt?.phase = knownResolved ? .resolvedWaitingForStream : .checking
+        return Task { await reconcileQuestionOperation(attempt, knownResolved: knownResolved) }
+    }
+
+    private func reconcileQuestionOperation(_ attempt: ActionAttempt, knownResolved: Bool) async {
+        guard let requestId = attempt.action.questionRequestId else { return }
+        let result: Result<Conversation, Error>
+        do {
+            result = .success(try await api.getConversation(id: conversationId).conversation)
+        } catch {
+            result = .failure(error)
         }
+        guard actionAttempt?.token == attempt.token else { return }
+        let phase = QuestionAttemptPhase.reconcile(
+            conversationId: conversationId, requestId: requestId, result: result)
+        if phase == .resolvedWaitingForStream, case .success(let snapshot) = result {
+            conversation?.state = snapshot.state
+            clearResolvedActionIfStateAdvanced(currentState: typedState)
+            persistSnapshot()
+        } else if knownResolved {
+            actionAttempt?.phase = .resolvedNeedsStatusCheck(
+                "This question is no longer awaiting an answer. Could not refresh conversation status. Check status again.")
+        } else {
+            actionAttempt?.phase = phase
+        }
+        streamTask?.cancel()
+        streamTask = nil
+        connection = .idle
+        resumeLiveTasks()
+    }
+
+    private func resolveQuestionOperation(token: UUID) async {
+        guard let attempt = actionAttempt, attempt.token == token else { return }
+        actionAttempt?.phase = .resolvedWaitingForStream
+        await reconcileQuestionOperation(attempt, knownResolved: true)
     }
 
     /// Execute a session-scoped action per its declared delivery policy
@@ -589,14 +609,15 @@ final class ConversationSession {
                 }
                 guard actionAttempt?.token == token else { return }
                 if action.questionRequestId != nil {
-                    actionAttempt?.phase = .resolvedWaitingForStream
-                    streamTask?.cancel()
-                    streamTask = nil
-                    connection = .idle
-                    resumeLiveTasks()
+                    await resolveQuestionOperation(token: token)
                 }
             } catch {
                 guard actionAttempt?.token == token else { return }
+                if action.questionRequestId != nil,
+                   (error as? APIError)?.isStaleQuestionRejection == true {
+                    await resolveQuestionOperation(token: token)
+                    return
+                }
                 if action.questionRequestId != nil,
                    Self.questionFailureRemainsUncertain(error, previouslyUncertain: previouslyUncertain) {
                     actionAttempt?.phase = .needsStatusCheck("Could not confirm the action. Check status before continuing.")

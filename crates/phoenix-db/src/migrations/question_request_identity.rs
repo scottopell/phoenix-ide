@@ -2,7 +2,7 @@ use crate::{DbError, DbResult};
 use sqlx::{Row, Sqlite, Transaction};
 
 pub(super) async fn run(tx: &mut Transaction<'_, Sqlite>) -> DbResult<()> {
-    let dismissed = sqlx::query("SELECT c.id, m.content FROM conversations c JOIN messages m ON m.conversation_id = c.id WHERE c.state_kind = 'idle' AND m.message_type = 'system' AND m.sequence_id = (SELECT MAX(latest.sequence_id) FROM messages latest WHERE latest.conversation_id = c.id)").fetch_all(&mut **tx).await?;
+    let dismissed = sqlx::query("SELECT c.id, m.content FROM conversations c JOIN messages m ON m.conversation_id = c.id WHERE c.state_kind = 'idle' AND m.message_type = 'system' AND m.sequence_id = (SELECT MAX(latest.sequence_id) FROM messages latest WHERE latest.conversation_id = c.id) AND NOT EXISTS (SELECT 1 FROM steering_messages queued WHERE queued.conversation_id = c.id)").fetch_all(&mut **tx).await?;
     for row in dismissed {
         let content: crate::SystemContent =
             serde_json::from_str(row.try_get::<&str, _>("content")?)
@@ -52,6 +52,80 @@ pub(super) async fn run(tx: &mut Transaction<'_, Sqlite>) -> DbResult<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn migration_preserves_legacy_queued_resumption_on_both_sides_of_dismissal() {
+        let db = crate::Database::open_in_memory().await.unwrap();
+        sqlx::query("DROP TABLE question_dismissal_pauses")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM _migrations WHERE version = 97")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        for (id, queued_before) in [("before-dismissal", true), ("after-dismissal", false)] {
+            db.create_conversation(id, id, "/tmp", true, None, None)
+                .await
+                .unwrap();
+            for ordinal in 0..2 {
+                if ordinal == 0 && !queued_before {
+                    db.add_message_with_seq(
+                        &format!("{id}-dismiss"),
+                        id,
+                        1,
+                        &crate::MessageContent::system("[ask-user-question-dismissed]"),
+                        Some(&serde_json::json!({"hidden":true})),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                }
+                sqlx::query("INSERT INTO steering_messages (message_id, conversation_id, ordinal, text) VALUES (?1, ?2, ?3, ?4)")
+                    .bind(format!("{id}-{ordinal}")).bind(id).bind(ordinal).bind(format!("input {ordinal}"))
+                    .execute(db.pool()).await.unwrap();
+                sqlx::query("INSERT INTO steering_acceptance_receipts (conversation_id, message_id, request_fingerprint) VALUES (?1, ?2, ?3)")
+                    .bind(id).bind(format!("{id}-{ordinal}")).bind(format!("fingerprint-{ordinal}"))
+                    .execute(db.pool()).await.unwrap();
+                sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
+                    .bind(chrono::Utc::now().to_rfc3339())
+                    .bind(id)
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+            }
+            if queued_before {
+                db.add_message_with_seq(
+                    &format!("{id}-dismiss"),
+                    id,
+                    1,
+                    &crate::MessageContent::system("[ask-user-question-dismissed]"),
+                    Some(&serde_json::json!({"hidden":true})),
+                    None,
+                )
+                .await
+                .unwrap();
+            }
+        }
+
+        assert_eq!(crate::run_pending_migrations(db.pool()).await.unwrap(), 1);
+        for id in ["before-dismissal", "after-dismissal"] {
+            assert!(!db.question_dismissal_paused(id).await.unwrap());
+            let queue = db.get_steering_queue(id).await.unwrap();
+            assert_eq!(
+                queue
+                    .iter()
+                    .map(|entry| entry.text.as_str())
+                    .collect::<Vec<_>>(),
+                ["input 0", "input 1"]
+            );
+            assert!(db
+                .get_steering_acceptance_fingerprint(id, &format!("{id}-1"))
+                .await
+                .unwrap()
+                .is_some());
+        }
+    }
 
     #[tokio::test]
     async fn migration_backfills_only_latest_idle_question_dismissal_pause() {

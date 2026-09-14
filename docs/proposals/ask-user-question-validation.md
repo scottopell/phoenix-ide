@@ -70,8 +70,9 @@ CLI, and native iOS adaptations are included; older identity-free clients receiv
 an actionable rejection. Release the corresponding clients with the server;
 there is no silent legacy fallback.
 
-Migration 097 assigns durable identities to existing pending questions and
-preserves dismissed-question pause meaning. The provider's `tool_use_id` remains
+Migration 097 assigns durable identities to existing pending questions, preserves
+legacy queued-input eligibility, and pauses empty legacy dismissed queues.
+The provider's `tool_use_id` remains
 provenance; it does not authorize an answer to a later request that reuses it.
 
 ## PR review evidence
@@ -100,6 +101,31 @@ telemetry test, `two_connections_record_overlapping_native_reads`, failed its
 concurrency-peak assertion and stopped the Rust suite early. The remaining Rust
 coverage and the final correction require a follow-up run; this result is not
 reported as a clean full check.
+
+The follow-up on `8e8941073c10e962d58e259cae5a52cfb51afe33` passed all 19 local
+checks. The telemetry test also passed individually and with its 50-test module.
+Remote Rust CI encountered an unchanged terminal-server liveness-probe failure;
+the failed job was retried without changing the code.
+
+Codex reviewed that commit and returned five further findings. The migration
+finding exposed absent historical evidence: legacy queue rows record neither
+admission source nor acceptance time. Migration preserves their established FIFO
+restart eligibility instead of inferring an unprovable pause; empty legacy
+dismissed queues gain pause ownership, and all new dismissals use the exact
+transactional policy. The other corrections enable Other's narrow-layout preview
+shortcut and fetch authoritative web/native state after success or stale
+rejection. Failed refresh keeps the consumed question closed with status checking
+and no mutation retry. Regressions cover recovery errors after successful sends,
+composer eligibility without SSE, late refresh isolation, and legacy queues on
+both sides of dismissal. The focused follow-up passed 25 web/fixture tests,
+47 native simulator tests, three migration tests, and six frontend/spec gates.
+The updated Chromium/WebKit matrix passed all 160 journeys, including Other's
+narrow-layout preview focus and successful submission with authoritative refresh.
+
+Review moves added from these findings: inspect missing historical information
+before designing a migration predicate; follow a successful mutation through the
+next required control without SSE; and test every selected-state variant of
+secondary navigation actions.
 
 ## Qualification limits
 

@@ -28,6 +28,14 @@ enum APIError: Error, LocalizedError {
         }
     }
 
+    var isStaleQuestionRejection: Bool {
+        guard case .http(409, let body) = self,
+              let data = body.data(using: .utf8),
+              let payload = try? JSONDecoder().decode(JSONValue.self, from: data)
+        else { return false }
+        return payload["error_type"]?.stringValue == "question_request_stale"
+    }
+
     var isDefinitiveQuestionRejection: Bool {
         guard case .http(let status, let body) = self,
               let data = body.data(using: .utf8),

@@ -5,6 +5,7 @@ import XCTest
 
 private final class QuestionRequestProtocol: URLProtocol {
     static var captured: [URLRequest] = []
+    static var onGet: ((QuestionRequestProtocol) -> Void)?
     static var onRequest: ((QuestionRequestProtocol) -> Void)?
 
     override class func canInit(with request: URLRequest) -> Bool {
@@ -13,13 +14,18 @@ private final class QuestionRequestProtocol: URLProtocol {
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
         Self.captured.append(request)
-        if let onRequest = Self.onRequest { onRequest(self) } else { succeed() }
+        if request.httpMethod == "GET" {
+            if let onGet = Self.onGet { onGet(self) } else { snapshot() }
+        } else if let onRequest = Self.onRequest { onRequest(self) } else { succeed() }
     }
-    func succeed() {
-        let response = HTTPURLResponse(url: request.url!, statusCode: 200,
+    func snapshot(state: String = "{\"type\":\"idle\"}") {
+        succeed(body: "{\"conversation\":{\"id\":\"conversation-a\",\"slug\":\"test\",\"state\":\(state)},\"messages\":[]}")
+    }
+    func succeed(status: Int = 200, body: String = "{\"success\":true}") {
+        let response = HTTPURLResponse(url: request.url!, statusCode: status,
                                        httpVersion: nil, headerFields: ["Content-Type": "application/json"])!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: Data("{\"success\":true}".utf8))
+        client?.urlProtocol(self, didLoad: Data(body.utf8))
         client?.urlProtocolDidFinishLoading(self)
     }
     override func stopLoading() {}
@@ -55,7 +61,8 @@ final class QuestionRequestTests: XCTestCase {
             QuestionRequestProtocol.onRequest = nil
             let completion = try XCTUnwrap(session.perform(action))
             await completion.value
-            XCTAssertTrue(session.questionResolvedWaitingForStream)
+            XCTAssertNil(session.actionInFlight)
+            XCTAssertTrue(session.acceptsChatMessage)
             XCTAssertFalse(session.canRetryQuestionOperation)
             XCTAssertFalse(session.canCheckQuestionStatus)
 
@@ -78,9 +85,61 @@ final class QuestionRequestTests: XCTestCase {
             XCTAssertEqual(session.actionInFlight?.questionRequestId, "newest")
             heldNewest?.succeed()
             await newest.value
-            XCTAssertTrue(session.questionResolvedWaitingForStream)
-            XCTAssertEqual(session.actionInFlight?.questionRequestId, "newest")
+            XCTAssertNil(session.actionInFlight)
+            XCTAssertTrue(session.acceptsChatMessage)
         }
+    }
+
+    @MainActor
+    func testSuccessAndStaleMutationsStayResolvedThroughFailedRefreshAndCheckAgain() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [QuestionRequestProtocol.self]
+        let api = PhoenixAPI(baseURL: URL(string: "https://auq-protocol.invalid")!,
+                             password: nil, allowSelfSigned: false, configuration: configuration)!
+        defer { QuestionRequestProtocol.onRequest = nil; QuestionRequestProtocol.onGet = nil }
+        for status in [200, 409] {
+            for action in [ConversationAction.respondToQuestions(requestId: "original", answers: [:]),
+                           .dismissQuestion(requestId: "original")] {
+                let session = ConversationSession(conversationId: "conversation-a", api: api,
+                                                   connectivity: ConnectivityMonitor())
+                try seed(session, requestId: "original")
+                QuestionRequestProtocol.onRequest = { $0.succeed(status: status, body: status == 200 ? "{\"success\":true}" : "{\"error_type\":\"question_request_stale\"}") }
+                QuestionRequestProtocol.onGet = { $0.succeed(status: 503, body: "unavailable") }
+                try await XCTUnwrap(session.perform(action)).value
+                XCTAssertTrue(session.questionResolvedWaitingForStream)
+                XCTAssertNotNil(session.actionInFlight)
+                XCTAssertFalse(session.canRetryQuestionOperation)
+                XCTAssertTrue(session.canCheckQuestionStatus)
+                XCTAssertNil(session.perform(action))
+                QuestionRequestProtocol.onGet = nil
+                try await XCTUnwrap(session.checkQuestionStatus()).value
+                XCTAssertNil(session.actionInFlight)
+                XCTAssertTrue(session.acceptsChatMessage)
+            }
+        }
+    }
+
+    @MainActor
+    func testLateAuthoritativeRefreshCannotReplaceNewQuestion() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [QuestionRequestProtocol.self]
+        let api = PhoenixAPI(baseURL: URL(string: "https://auq-protocol.invalid")!,
+                             password: nil, allowSelfSigned: false, configuration: configuration)!
+        let session = ConversationSession(conversationId: "conversation-a", api: api,
+                                           connectivity: ConnectivityMonitor())
+        defer { QuestionRequestProtocol.onGet = nil }
+        try seed(session, requestId: "original")
+        let received = expectation(description: "authoritative refresh received")
+        var held: QuestionRequestProtocol?
+        QuestionRequestProtocol.onGet = { request in held = request; received.fulfill() }
+        let completion = try XCTUnwrap(session.perform(.dismissQuestion(requestId: "original")))
+        await fulfillment(of: [received], timeout: 3)
+        try seed(session, requestId: "newest")
+        held?.snapshot()
+        await completion.value
+        XCTAssertEqual(session.typedState, .awaitingUserResponse(requestId: "newest", questions: []))
+        XCTAssertNil(session.actionInFlight)
+        XCTAssertFalse(session.acceptsChatMessage)
     }
 
     func testBothMutationsCarryOriginatingRequestIdentity() async throws {

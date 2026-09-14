@@ -1,11 +1,12 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { api, QuestionMutationError, type UserQuestion } from '../api';
 import { QuestionPanel } from './QuestionPanel';
 
 const question: UserQuestion = { header: 'Scope', question: 'Where to search?', multiSelect: false, options: [{label: 'Current', preview: 'current preview'}, {label: 'Family'}] };
-const defaults = { questions: [question], conversationId: 'conv', requestId: 'request-1', showToast: vi.fn(), onAnswered: vi.fn(), onDismissed: vi.fn(), onResolved: vi.fn() };
+const defaults = { questions: [question], conversationId: 'conv', requestId: 'request-1', showToast: vi.fn(), onResolved: vi.fn() };
 const deferred = () => { let resolve!: (value: {success:boolean}) => void; let reject!: (error: Error) => void; const promise = new Promise<{success:boolean}>((yes,no) => { resolve=yes; reject=no; }); return {promise,resolve,reject}; };
+beforeEach(() => { vi.spyOn(api,'getConversation').mockResolvedValue({conversation:{state:{type:'idle'}}} as Awaited<ReturnType<typeof api.getConversation>>); });
 afterEach(() => { vi.restoreAllMocks(); vi.clearAllMocks(); });
 
 describe('QuestionPanel request and draft contract', () => {
@@ -97,7 +98,7 @@ describe('QuestionPanel request and draft contract', () => {
     expect(screen.getByRole('radio',{name:'Family'})).toBeEnabled();
   });
   it('freezes an uncertain operation and retries the identical snapshot even after a later rejection', async () => {
-    const send = vi.spyOn(api,'respondToQuestion').mockRejectedValueOnce(new Error('network')).mockRejectedValue(new QuestionMutationError('Stale','question_request_stale'));
+    const send = vi.spyOn(api,'respondToQuestion').mockRejectedValueOnce(new Error('network')).mockRejectedValue(new QuestionMutationError('Rejected','question_request_invalid'));
     vi.spyOn(api,'getConversation').mockResolvedValue({conversation:{state:{type:'awaiting_user_response',request_id: 'request-1', tool_use_id:'request-1',questions:[question]}}} as Awaited<ReturnType<typeof api.getConversation>>);
     render(<QuestionPanel {...defaults} />);
     fireEvent.click(screen.getByRole('radio',{name:'Current'}));
@@ -115,7 +116,7 @@ describe('QuestionPanel request and draft contract', () => {
     fireEvent.click(screen.getByRole('button',{name:'Send answer'}));
     rerender(<QuestionPanel {...defaults} requestId="request-2" />);
     await act(async () => pending.resolve({success:true}));
-    expect(defaults.onAnswered).not.toHaveBeenCalled();
+    expect(defaults.onResolved).not.toHaveBeenCalled();
     expect(screen.getByRole('radio',{name:'Current'})).not.toBeChecked();
   });
   it('presents static read-only content', () => {
@@ -126,6 +127,53 @@ describe('QuestionPanel request and draft contract', () => {
 });
 
 describe('AUQ failure and shortcut boundaries', () => {
+  it('focuses the Other preview from the narrow layout shortcut', () => {
+    render(<QuestionPanel {...defaults} />);
+    const link = screen.getByRole('button', {name:'Preview below'});
+    expect(link).toBeDisabled();
+    fireEvent.click(screen.getByRole('radio', {name:'Other'}));
+    expect(link).toBeEnabled();
+    fireEvent.click(link);
+    expect(screen.getByRole('heading', {name:'Preview — Other'})).toHaveFocus();
+  });
+  it('adopts authoritative recovery state after successful answer without SSE', async () => {
+    vi.spyOn(api,'respondToQuestion').mockResolvedValue({success:true});
+    vi.spyOn(api,'getConversation').mockResolvedValue({conversation:{state:{type:'recoverable_continuation_failure', failure:{message:'Projection failed',error_kind:'server_error',request:{operation_id:'op-1',attempt:1}}}}} as unknown as Awaited<ReturnType<typeof api.getConversation>>);
+    render(<QuestionPanel {...defaults} />);
+    fireEvent.click(screen.getByRole('radio',{name:'Current'}));
+    fireEvent.click(screen.getByRole('button',{name:'Send answer'}));
+    await waitFor(()=>expect(defaults.onResolved).toHaveBeenCalledWith({type:'recoverable_continuation_failure',message:'Projection failed',error_kind:'server_error',operation_id:'op-1',attempt:1}));
+    expect(defaults.showToast).toHaveBeenCalledWith('Answers sent');
+  });
+  it.each(['success','stale'] as const)('keeps %s closed when refresh fails, then checks without resending', async outcome => {
+    const send = vi.spyOn(api,'respondToQuestion');
+    if (outcome === 'success') send.mockResolvedValue({success:true});
+    else send.mockRejectedValue(new QuestionMutationError('Stale','question_request_stale'));
+    vi.spyOn(api,'getConversation').mockRejectedValueOnce(new Error('offline')).mockResolvedValue({conversation:{state:{type:'idle'}}} as Awaited<ReturnType<typeof api.getConversation>>);
+    render(<QuestionPanel {...defaults} />);
+    fireEvent.click(screen.getByRole('radio',{name:'Current'}));
+    fireEvent.click(screen.getByRole('button',{name:'Send answer'}));
+    await screen.findByText(/conversation status could not be refreshed/);
+    expect(screen.queryByRole('radio')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button',{name:'Retry same answer'})).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button',{name:'Check status again'}));
+    await waitFor(()=>expect(defaults.onResolved).toHaveBeenCalledWith({type:'idle'}));
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+  it('ignores a late successful refresh after a newer request appears', async () => {
+    vi.spyOn(api,'respondToQuestion').mockResolvedValue({success:true});
+    let resolve!: (value: Awaited<ReturnType<typeof api.getConversation>>) => void;
+    const get = vi.spyOn(api,'getConversation').mockReturnValue(new Promise(yes => {resolve=yes;}));
+    const {rerender}=render(<QuestionPanel {...defaults} />);
+    fireEvent.click(screen.getByRole('radio',{name:'Current'}));
+    fireEvent.click(screen.getByRole('button',{name:'Send answer'}));
+    await waitFor(()=>expect(get).toHaveBeenCalled());
+    rerender(<QuestionPanel {...defaults} requestId="request-2" />);
+    await act(async()=>resolve({conversation:{state:{type:'idle'}}} as Awaited<ReturnType<typeof api.getConversation>>));
+    expect(defaults.onResolved).not.toHaveBeenCalled();
+    expect(screen.getByRole('radio',{name:'Current'})).not.toBeChecked();
+  });
+
   it('reconciles a proven stale request without reopening editing', async () => {
     vi.spyOn(api,'respondToQuestion').mockRejectedValue(new QuestionMutationError('Stale','question_request_stale'));
     vi.spyOn(api,'getConversation').mockResolvedValue({conversation:{state:{type:'awaiting_user_response',request_id: 'request-2', tool_use_id:'request-2',questions:[question]}}} as Awaited<ReturnType<typeof api.getConversation>>);
@@ -133,7 +181,7 @@ describe('AUQ failure and shortcut boundaries', () => {
     fireEvent.click(screen.getByRole('radio',{name:'Current'}));
     fireEvent.click(screen.getByRole('button',{name:'Send answer'}));
     await waitFor(()=>expect(defaults.onResolved).toHaveBeenCalledWith({type:'awaiting_user_response',request_id: 'request-2', tool_use_id:'request-2',questions:[question]}));
-    expect(screen.getByRole('radio',{name:'Family'})).toBeDisabled();
+    expect(screen.queryByRole('radio')).not.toBeInTheDocument();
   });
   it.each([
     {type:'awaiting_user_response',questions:[question]},

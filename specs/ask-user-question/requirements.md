@@ -174,7 +174,9 @@ rows without requiring a process-local event
 
 WHEN upgrading an idle conversation whose latest transcript entry is a question
 dismissal marker
-THE SYSTEM SHALL preserve its paused meaning in durable pause ownership
+AND whose stored format has no durable dismissal pause ownership
+THE SYSTEM SHALL preserve existing queued inputs as eligible for FIFO resumption
+AND SHALL create durable pause ownership only when its steering queue is empty
 AND SHALL NOT infer a pause when a later user message exists
 
 **Rationale:** The agent needs structured response data to continue the task.
