@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 7d0ed3dd478a5938c8cad938d1ae4821e90c0b4f19106829d4eb9dd61ae0585d # shrinks to state = AwaitingTaskApproval { task_file: "tasks/00000-p0-ready--a.md", title: "a", priority: Priority(P0), plan: "." }, event = TaskApprovalDecided { outcome: Approved { handoff: ContinueInCurrentConversation } }

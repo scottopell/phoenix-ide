@@ -8453,24 +8453,40 @@ where
                 priority,
                 plan,
             );
-            let msg_id = uuid::Uuid::new_v4().to_string();
-            let content = MessageContent::User(crate::db::UserContent::meta(&approval_msg));
-            let seq = self.broadcast_tx.next_seq();
-            let msg = self
-                .storage
-                .add_message_with_seq(
-                    &msg_id,
+            let approval_message = Message {
+                message_id: uuid::Uuid::new_v4().to_string(),
+                conversation_id: self.context.conversation_id.clone(),
+                sequence_id: self.broadcast_tx.next_seq(),
+                message_type: MessageType::User,
+                content: MessageContent::User(crate::db::UserContent::meta(&approval_msg)),
+                display_data: None,
+                usage_data: None,
+                created_at: chrono::Utc::now(),
+            };
+            self.storage
+                .persist_approved_task_authority(
                     &self.context.conversation_id,
-                    seq,
-                    &content,
-                    None,
-                    None,
+                    &TaskApprovalHandoffData {
+                        task_id: reviewed.task_id,
+                        task_title: reviewed.task_title,
+                        title,
+                        priority,
+                        plan,
+                        task_file: reviewed.task_file,
+                        artifact_body: reviewed.artifact_body,
+                    },
+                    &approval_message,
+                    &self.state,
+                    self.state_updated_at,
                 )
-                .await?;
+                .await
+                .inspect_err(|_| {
+                    self.recovery_disposition = RuntimeRecoveryDisposition::RecreateFromDatabase;
+                })?;
             let _ = self
                 .broadcast_tx
                 .admitted_publication(admitted)
-                .persisted_message(msg);
+                .persisted_message(approval_message);
             return Ok(());
         }
         let cwd = self.context.filesystem_root().to_path_buf();
@@ -16270,6 +16286,65 @@ mod approve_task_failure_effect_tests {
         .expect("fresh handoff approval should succeed");
 
         assert_eq!(waiter.await.unwrap(), conv_id);
+    }
+
+    #[tokio::test]
+    async fn detached_approval_persists_state_and_message_without_generic_write() {
+        let (repo, repo_root) = init_repo();
+        let conv_id = "detached-approved-persistence";
+        let tasks_dir = repo_root.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        let task_filename = "12345-p0-in-progress--detached-approved.md";
+        std::fs::write(tasks_dir.join(task_filename), "Plan").unwrap();
+
+        let mut context = ConvContext::new(conv_id, repo_root.clone(), "test-model", 200_000);
+        context.mode_context = Some(ModeContext::DetachedApprovedTask {
+            base_branch: "main".to_string(),
+            worktree_path: repo_root.to_string_lossy().into_owned(),
+            task_id: "12345".to_string(),
+            task_title: "Detached approved".to_string(),
+        });
+        let (_event_tx, event_rx) = mpsc::channel(32);
+        let event_tx_dup = mpsc::channel::<Event>(1).0;
+        let storage = Arc::new(InMemoryStorage::new());
+        storage.set_fail_state_update(true);
+        let mut rt = ConversationRuntime::new(
+            context,
+            ConvState::AwaitingTaskApproval {
+                task_file: format!("tasks/{task_filename}"),
+                title: "Detached approved".to_string(),
+                priority: crate::task_source::Priority::P0,
+                plan: "Plan".to_string(),
+            },
+            storage.clone(),
+            Arc::new(MockLlmClient::new("test-model")),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx_dup,
+            SseBroadcaster::new(128, 0),
+        )
+        .with_fatal_local_authority_fence(crate::runtime::FatalLocalAuthorityFence::new());
+
+        rt.process_event(Event::TaskApprovalDecided {
+            outcome: TaskApprovalOutcome::Approved {
+                handoff: TaskApprovalHandoff::ContinueInCurrentConversation,
+            },
+        })
+        .await
+        .expect("detached approval persists atomically");
+
+        assert!(matches!(rt.state, ConvState::LlmRequesting { attempt: 1 }));
+        assert!(matches!(
+            storage.get_current_state(conv_id),
+            Some(ConvState::LlmRequesting { attempt: 1 })
+        ));
+        assert_eq!(storage.get_all_messages(conv_id).len(), 1);
+        drop(repo);
     }
 
     #[tokio::test]
