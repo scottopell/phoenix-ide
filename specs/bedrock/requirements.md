@@ -666,14 +666,24 @@ AND compare against model-specific context window size
 WHEN continuation flow is triggered
 THE SYSTEM SHALL request a session summary from the LLM
 AND the request SHALL NOT include any tool capabilities
-AND the request SHALL frame the summary as an operational handoff to a fresh agent that resumes in the same working directory with no memory of the session
+AND the request SHALL frame the summary as an operational handoff to a fresh agent with no memory of the session
+AND ordinary conversations SHALL use the work-handoff instructions covering goals, concrete changes, verification, repository state, next actions, and pitfalls
+AND the global Coordinator SHALL use the coordination-handoff instructions in [REQ-GR-013](../global-recall/requirements.md#req-gr-013-preserve-coordination-context-through-compaction), selected from its existing Coordinator identity without role inference or a purpose setting
 AND the request SHALL describe any tools that were requested but not executed, including their intended arguments
 AND the request SHALL preserve the prior tool history as text rather than discarding it
 AND the request SHALL be bounded to fit the context window and any request-shape limits declared by the selected provider route
-AND bounded history SHALL retain a contiguous newest suffix and begin with a user-role message when non-empty
+AND bounded history SHALL protect the full actual accepted predecessor handoff when its message identity is proven by continuation acceptance provenance and remains present in the frozen current-member prompt projection
+AND the protected handoff SHALL include the accepted user edits, occur exactly once by message identity, and SHALL NOT be clipped or replaced by the predecessor's generated summary
+AND remaining history SHALL retain a contiguous newest suffix within the remaining token and provider request-shape budgets, with the complete request history beginning with a user-role message when non-empty
+AND missing acceptance provenance or a handoff absent from the frozen projection SHALL result in bounded history without a guessed protected seed and with an explicit notice in the compaction input
+AND the system SHALL NOT resurrect reset or stale handoff text from another transcript member
 AND the continuation request SHALL freeze the current member conversation's persisted prompt projection before provider work begins
 AND SHALL compact that current member's history rather than flattening all ProductConversation transcript members into one aggregate prompt
 AND the system SHALL persist a stable operation identity and the retry inputs before requesting the summary
+
+WHEN the full protected handoff and mandatory request overhead, including the output reserve, cannot fit the selected route's budgets
+THE SYSTEM SHALL return a recoverable continuation failure before provider dispatch
+AND SHALL NOT clip the protected handoff, perform a secondary summarization, or introduce an alternate memory store to make the request fit
 
 IF continuation summary generation is interrupted by process restart
 THEN THE SYSTEM SHALL resume the persisted operation
@@ -694,7 +704,7 @@ THE SYSTEM SHALL reject the request as an invalid cancellation state
 AND SHALL NOT abort the in-flight continuation request
 AND SHALL remain awaiting the continuation summary
 
-**Rationale:** The summary's consumer is a fresh agent that restarts cold in the same worktree, so it is framed as an operational handoff — exact paths, repo state, and an honest verified-vs-assumed split — rather than a human-facing recap, and completeness is favored over brevity. Describing rejected tool calls with their arguments tells the next agent what was about to run, not merely which tool type. The current member's prior tool history is rendered as text rather than deleted so the summary can draw on the actual work record, while generation fencing prevents later appends from leaking into an already-frozen request and bounded suffix selection prevents overflow. An empty summary would silently seed a blank continuation, so it is treated as a recoverable failure. Stable operation identity permits provider calls to be retried while summary commit and continuation remain exactly once.
+**Rationale:** A fresh agent needs an actionable handoff suited to its conversation identity. Protecting the accepted predecessor handoff keeps earlier context available to the summarizer across successive continuations, including user corrections, without replaying the whole aggregate. Generation fencing prevents stale or reset text from reappearing. Remaining history is bounded, and generated summaries can omit facts: input protection is not a guarantee of lossless memory. An oversized protected input or empty output fails recoverably rather than silently discarding that baseline. Stable operation identity permits provider calls to be retried while summary commit and continuation remain exactly once.
 
 ---
 

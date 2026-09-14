@@ -38,7 +38,7 @@ Implements Elm Architecture with a typed-effect executor boundary. The SM has tw
 | **REQ-BED-018:** Sub-Agent Mode Enforcement | ✅ Complete | Sub-agent tool sets are restricted by the tool-registry builder (tested); sub-agents inherit the parent worktree |
 | **REQ-BED-018A:** Persisted Prompt Projection Authority | ✅ Complete | Strict transactionally hydrated snapshots, generation-fenced bounded tails, constant-shape child hydration, monotonic append enforcement, and fail-closed typed dispatch errors; wake adoption/transfer invalidate each affected member |
 | **REQ-BED-019:** Context Continuation Threshold | ✅ Complete | Check at 90%, reject tools, trigger continuation |
-| **REQ-BED-020:** Continuation Summary Generation | ✅ Complete | Durable operation identity and commit; current-member persisted projection freezes before provider spawn while preserving stale-tool clearing, bounded fitting, restart resume, transient retry, and recoverable failure |
+| **REQ-BED-020:** Continuation Summary Generation | 🟡 Partial | Durable operation identity, frozen current-member projection, retries, and atomic commit are implemented. Full accepted-handoff protection for all parent conversations and Coordinator-specific instructions are specified in ADR-049; implementation and focused validation are pending. |
 | **REQ-BED-021:** Context Exhausted State | ✅ Complete | Read-only terminal state |
 | **REQ-BED-022:** Model-Specific Context Limits | ✅ Complete | Per-model thresholds, conservative default |
 | **REQ-BED-023:** Context Warning Indicator | ✅ Complete | 80% warning, manual trigger option |

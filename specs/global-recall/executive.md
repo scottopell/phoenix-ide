@@ -33,8 +33,11 @@ Natural-language message search, bounded transcript reads, and the shared cross-
 | **REQ-GR-011:** Inject a Bounded Relational Snapshot | 🟡 Partial | Requests append transparent turn-current facts and active WorkScope paths, but do not yet expose first-class ProductConversation identity. |
 | **REQ-GR-011A:** Bound Database Integrity and Resource Use | ✅ Complete | Application data is readable; SQLite authority and resource budgets protect integrity and stability |
 | **REQ-GR-012:** Commit and Report One Message Outcome | ✅ Complete | HTTP chat and agent cross-conversation actions share typed delivery, steering, rejection, and self-target rejection outcomes |
+| **REQ-GR-013:** Preserve Coordination Context Through Compaction | 🟡 Pending | ADR-049 specifies Coordinator-specific instructions using the shared protected accepted-handoff pipeline. Implementation and repeated-compaction behavioral evaluation are pending. |
 
 ## Verification Summary
+
+Compaction verification must cover full accepted user-edited handoff retention, message-identity deduplication, absent provenance, reset/stale exclusion, provider budgets and pre-dispatch recoverable failure for all parent conversations. Coordinator evaluation must also exercise successive handoffs with unresolved and completed work, delegated ownership, corrections, authority limits, and historical status; no live-model quality result is claimed here.
 
 Coverage verifies operator-level application-data reads, read-only SQLite authority, denied internal/filesystem/mutation operations, statement cardinality, SQL/column/row/serialized-output/work bounds, typed results, raw continuation identities and active WorkScope paths, stable references, WorkScope target resolution and no-default behavior for Coordinator unsandboxed Bash, current-context app-local citation navigation with a Coordinator return origin, transcript paging, writing-versus-restricted tool boundaries, chat-only responsive layout, shared message acceptance semantics, and self-target rejection without dispatch.
 

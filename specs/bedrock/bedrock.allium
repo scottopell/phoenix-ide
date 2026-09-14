@@ -1320,6 +1320,21 @@ rule ContinuationFailureBecomesRecoverable {
     ensures: ContinuationRetryOffered(conversation, operation_id)
 }
 
+-- REQ-BED-020: request fitting protects the full proven accepted opening
+-- handoff from the frozen current-member projection for every parent kind.
+-- Request construction is specified in requirements.md; this boundary owns
+-- the observable failure when that handoff plus mandatory overhead cannot fit.
+rule ProtectedContinuationHandoffDoesNotFit {
+    when: ProtectedContinuationHandoffBudgetExceeded(conversation, operation_id, error)
+    requires: conversation.core_status = awaiting_continuation
+    requires: conversation.continuation_operation_id = operation_id
+    ensures: ContinuationRequestFailed(conversation, operation_id, error, non_retryable)
+    @guidance
+        -- Emit before provider dispatch. Do not truncate the protected handoff
+        -- or dispatch a secondary summarization to make it fit. The shared
+        -- failure transition retains the operation and offers explicit retry.
+}
+
 rule UserRetriesContinuation {
     when: UserTriggersContinuation(conversation, operation_id)
     requires: conversation.core_status = recoverable_continuation_failure

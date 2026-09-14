@@ -45,6 +45,9 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
+mod continuation;
+use continuation::{plan_with_handoff, CompactionPolicy, ContinuationHistory};
+
 enum AuthoritativeEffect {
     BroadcastAssistantMessage {
         message: crate::state_machine::AssistantMessage,
@@ -8074,24 +8077,45 @@ where
                 error_kind: crate::db::ErrorKind::InvalidRequest,
             }));
         }
+        let history = match self
+            .storage
+            .accepted_continuation_handoff_message_id(&conv_id)
+            .await
+            .and_then(|accepted_id| {
+                ContinuationHistory::from_projection(
+                    self.active_prompt_projection
+                        .as_ref()
+                        .expect("projection refreshed above")
+                        .messages
+                        .clone(),
+                    accepted_id.as_deref(),
+                )
+            }) {
+            Ok(history) => history,
+            Err(error) => {
+                return Ok(Some(Event::ContinuationFailed {
+                    operation_id,
+                    error,
+                    error_kind: crate::db::ErrorKind::InvalidRequest,
+                }));
+            }
+        };
+        let policy = CompactionPolicy::for_coordinator(self.context.is_coordinator);
+        let mut continuation_prompt = policy.instruction(&rejected_tool_calls);
+        continuation_prompt.push_str(&history.selection_notice(&conv_id));
+        let system_prompt = policy.system_prompt();
         let frozen_messages = assemble_cleared_messages(
             &self.storage,
-            &self.context.conversation_id,
-            &self
-                .active_prompt_projection
-                .as_ref()
-                .expect("projection refreshed above")
-                .messages,
+            &conv_id,
+            &history.recent,
             &self.clearable_names,
-            self.context.context_window,
+            context_window,
             &self.clear_watermark_cache,
         )
         .await;
 
-        // Build continuation prompt
-        let continuation_prompt = build_continuation_prompt(&rejected_tool_calls);
-
-        let rendered_count = frozen_messages.len();
+        let protected_handoff = history.handoff.is_some();
+        let rendered_count = frozen_messages.len() + usize::from(protected_handoff);
 
         // Complete continuation-specific flattening, image capping, budgeting,
         // and instruction injection before a provider task exists.
@@ -8100,24 +8124,30 @@ where
             CONTINUATION_MAX_REPLAYED_IMAGES,
         );
 
-        // Proactive overflow guard: continuation fires near the top of the
-        // window, so the flattened history can still exceed it. Keep the
-        // most-recent messages within a token budget, dropping oldest first,
-        // so the request can't 400 with ContextWindowExceeded and loop
-        // deterministically to the fallback summary. The budget reserves the
-        // model's reply plus the *actual* size of the continuation prompt
-        // and system text — both grow (the prompt with rejected-call args)
-        // and must not be allowed to push the request over the window after
-        // history has filled the budget.
         let fixed_tokens = estimate_text_tokens(&continuation_prompt)
-            + estimate_text_tokens(CONTINUATION_SYSTEM_PROMPT)
+            + estimate_text_tokens(system_prompt)
             + continuation_output_reserve
             + CONTINUATION_SAFETY_MARGIN_TOKENS;
         let history_item_cap = continuation_limits.max_history_messages(1);
-        let budget =
-            plan_continuation_history(messages, context_window, fixed_tokens, history_item_cap);
+        let budget = match plan_with_handoff(
+            messages,
+            history.handoff,
+            context_window,
+            fixed_tokens,
+            history_item_cap,
+        ) {
+            Ok(budget) => budget,
+            Err(error) => {
+                return Ok(Some(Event::ContinuationFailed {
+                    operation_id,
+                    error,
+                    error_kind: crate::db::ErrorKind::InvalidRequest,
+                }));
+            }
+        };
         tracing::debug!(
             rendered_count,
+            protected_handoff,
             retained_count = budget.messages.len(),
             history_item_cap,
             dropped_for_item_cap = budget.dropped_for_item_cap,
@@ -8140,7 +8170,7 @@ where
         let attempt_capture = phoenix_llm::LlmAttemptCapture::new();
         let request = LlmRequest {
             messages,
-            system: vec![SystemContent::new(CONTINUATION_SYSTEM_PROMPT)],
+            system: vec![SystemContent::new(system_prompt)],
             tools: vec![], // No tools for continuation
             // Handoff quality favors completeness; cap high enough that a
             // thorough summary is not truncated mid-thought.
@@ -9000,10 +9030,30 @@ fn plan_continuation_history(
     fixed_tokens: usize,
     history_item_cap: Option<usize>,
 ) -> ContinuationBudgetResult {
+    plan_continuation_suffix(
+        messages,
+        context_window,
+        fixed_tokens,
+        history_item_cap,
+        true,
+    )
+}
+
+fn plan_continuation_suffix(
+    messages: Vec<LlmMessage>,
+    context_window: usize,
+    fixed_tokens: usize,
+    history_item_cap: Option<usize>,
+    require_user_first: bool,
+) -> ContinuationBudgetResult {
     let input_budget = context_window.saturating_sub(fixed_tokens);
     let (messages, dropped_by_budget) = cap_messages_to_token_budget(messages, input_budget);
     let (messages, dropped_for_item_cap) = cap_messages_to_count(messages, history_item_cap);
-    let (mut messages, trimmed_for_user_first) = drop_leading_non_user(messages);
+    let (mut messages, trimmed_for_user_first) = if require_user_first {
+        drop_leading_non_user(messages)
+    } else {
+        (messages, 0)
+    };
 
     let target_history_budget = input_budget.saturating_sub(CONTINUATION_MIN_HEADROOM_TOKENS);
     let mut estimated_history_tokens = estimate_messages_tokens(&messages);
@@ -9011,9 +9061,11 @@ fn plan_continuation_history(
     while estimated_history_tokens > target_history_budget && !messages.is_empty() {
         messages.remove(0);
         dropped_for_headroom += 1;
-        let (user_first, trimmed) = drop_leading_non_user(messages);
-        messages = user_first;
-        dropped_for_headroom += trimmed;
+        if require_user_first {
+            let (user_first, trimmed) = drop_leading_non_user(messages);
+            messages = user_first;
+            dropped_for_headroom += trimmed;
+        }
         estimated_history_tokens = estimate_messages_tokens(&messages);
     }
 
@@ -12462,6 +12514,119 @@ mod authoritative_user_message_effect_tests {
             ConvState::Error { message, .. } if message == reason
         ));
         assert_eq!(rt.active_direct_turn, None);
+    }
+
+    #[tokio::test]
+    async fn continuation_preserves_accepted_handoff_for_both_variants() {
+        for coordinator in [false, true] {
+            let (mut rt, storage, _rx) = runtime(
+                DirectTurnMaterializationEligibility::StaleAuthority,
+                AuthoritativeUserMessageMaterialization::StaleAuthority,
+            );
+            rt.context.is_coordinator = coordinator;
+            rt.context.context_window = 20_000;
+            let conv = rt.context.conversation_id.clone();
+            let seed = "Edited handoff: Crick paused until Friday; Phoenix owns worker A. No deployment permission.";
+            storage
+                .add_message("accepted", &conv, &MessageContent::user(seed), None, None)
+                .await
+                .unwrap();
+            storage.set_accepted_continuation_handoff_message_id(&conv, "accepted");
+            for i in 0..60 {
+                storage
+                    .add_message(
+                        &format!("old-{i}"),
+                        &conv,
+                        &MessageContent::user(&"completed detail ".repeat(200)),
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+            storage
+                .add_message(
+                    "correction",
+                    &conv,
+                    &MessageContent::user(
+                        "Cancel Crick. Ask Phoenix for status before contacting worker A.",
+                    ),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                operation_id: "protected".to_string(),
+                rejected_tool_calls: vec![],
+                attempt: 1,
+            };
+            rt.state = ConvState::AwaitingContinuation {
+                request: request.clone(),
+            };
+            rt.execute_effect(Effect::RequestContinuation { request })
+                .await
+                .unwrap();
+            rt.llm_task_handle.take().unwrap().await.unwrap();
+            let requests = rt.llm_client.recorded_requests();
+            let request = requests.last().unwrap();
+            assert!(request.tools.is_empty());
+            assert_eq!(request.messages[0].content[0].render_text(), seed);
+            assert_eq!(
+                request
+                    .messages
+                    .iter()
+                    .filter(|m| m.content[0].render_text() == seed)
+                    .count(),
+                1
+            );
+            assert!(request.messages[request.messages.len() - 2].content[0]
+                .render_text()
+                .contains("Cancel Crick"));
+            assert_eq!(
+                request.system[0].text,
+                CompactionPolicy::for_coordinator(coordinator).system_prompt()
+            );
+            assert!(request.messages.len() < 63);
+        }
+    }
+
+    #[tokio::test]
+    async fn continuation_oversized_seed_fails_before_provider_dispatch() {
+        let (mut rt, storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        rt.context.context_window = 20_000;
+        let conv = rt.context.conversation_id.clone();
+        storage
+            .add_message(
+                "accepted",
+                &conv,
+                &MessageContent::user(&"seed ".repeat(20_000)),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        storage.set_accepted_continuation_handoff_message_id(&conv, "accepted");
+        let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+            operation_id: "oversized".to_string(),
+            rejected_tool_calls: vec![],
+            attempt: 1,
+        };
+        rt.state = ConvState::AwaitingContinuation {
+            request: request.clone(),
+        };
+        let generated = rt
+            .execute_effect(Effect::RequestContinuation { request })
+            .await
+            .unwrap();
+        assert!(rt.llm_task_handle.is_none());
+        assert!(rt.llm_client.recorded_requests().is_empty());
+        assert!(
+            matches!(generated, Some(Event::ContinuationFailed { operation_id, .. }) if operation_id == "oversized")
+        );
     }
 
     #[tokio::test]

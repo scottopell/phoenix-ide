@@ -183,7 +183,7 @@ THE briefing action SHALL preserve the user's draft and SHALL NOT create a separ
 
 ### REQ-GR-011: Inject a Bounded Relational Snapshot
 
-WHEN the Coordinator dispatches an LLM turn
+WHEN the Coordinator dispatches an ordinary agent turn
 THE SYSTEM SHALL attach a bounded current-activity snapshot after the stable cached Coordinator prompt
 
 THE snapshot SHALL expose raw current continuation leaves with ProductConversation, root transcript-row, and current transcript-row identifiers, state, state-update time, conversation-update time, available task metadata, WorkScope identity, and authoritative active WorkScope cwd and worktree paths
@@ -244,3 +244,27 @@ THE result SHALL describe acceptance only and SHALL NOT claim recipient understa
 
 WHEN several singular message calls occur in one agent turn
 THE SYSTEM SHALL commit and report each target independently without batch transaction semantics
+
+---
+
+### REQ-GR-013: Preserve Coordination Context Through Compaction
+
+WHEN the global Coordinator requests a continuation summary
+THE SYSTEM SHALL select coordination-focused handoff instructions through the existing Coordinator identity
+AND SHALL use the shared tool-free continuation pipeline and protected accepted-handoff contract in [REQ-BED-020](../bedrock/requirements.md#req-bed-020-continuation-summary-generation)
+AND SHALL describe its actual capability boundaries without promising an ambient working directory, conversation creation, or background monitoring
+AND SHALL NOT inject the ordinary turn's live activity snapshot into summary generation
+
+THE instructions SHALL prioritize unresolved workstreams, objectives, scoped user authority and preferences, corrections, decisions, blockers, dependencies, obligations, and next actions
+AND SHALL preserve owner identities and delegation relationships, with durable target references distinct from historical transcript references when available
+AND SHALL distinguish direct user instructions, delegate requests, Coordinator commitments, and historical observations without promoting a delegate request or inherited assertion into user authority
+AND SHALL distinguish delivery acceptance, acknowledgement, execution, and verified completion
+AND SHALL retain evidence provenance and last-observed timestamps when known, mark unknowns honestly, and direct the resumed Coordinator to refresh relevant live status before making current-state claims
+AND SHALL apply explicit corrections and supersession while preserving unresolved obligations, including paused work
+AND SHALL compress completed details before unresolved commitments, retaining only resolution context needed to avoid reopening settled work
+AND SHALL preserve relevant paths, verification evidence, unfinished edits, and pending tool arguments when the Coordinator performs hands-on work
+
+THE coordination policy SHALL NOT change the Coordinator's capabilities, lifecycle, WorkScope ownership, or message authority
+AND SHALL NOT infer a coordination role for ordinary conversations
+
+**Rationale:** Cross-conversation coordination depends on remembering ownership and unfinished obligations through interruptions. Historical memory guides the next inspection; it does not establish current state or new authorization. Prompt instructions guide generated content but do not guarantee lossless retention of unlimited obligations.
