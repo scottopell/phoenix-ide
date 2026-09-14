@@ -33,11 +33,11 @@ use crate::db::{
     AdoptCloseWorktreeCleanupPlanRequest, AmbientWriterAccessMode, AmbientWriterDetector,
     AmbientWriterEvidence, AmbientWriterMatchKind, BindCloseWorktreeFinalTombstoneObjectRequest,
     BindCloseWorktreeFinalTombstoneRequest, CaptureCloseRetirementInventoryRequest,
-    CaptureCloseRetirementInventoryScopeRequest, CloseWorktreeFinalTombstone,
-    RecordCloseAmbientWriterEvidenceRequest, RecordCloseRetirementDispatchRequest,
-    RecordCloseRetirementEvidenceRequest, RecordCloseWorktreeCleanupPlanRequest,
-    ReplaceCloseInspectionRequest, ReplaceCloseInspectionScopeRequest,
-    RouteCloseAttemptToRepairRequest,
+    CaptureCloseRetirementInventoryScopeRequest, CloseNeedsRepairCause,
+    CloseWorktreeFinalTombstone, RecordCloseAmbientWriterEvidenceRequest,
+    RecordCloseRetirementDispatchRequest, RecordCloseRetirementEvidenceRequest,
+    RecordCloseWorktreeCleanupPlanRequest, ReplaceCloseInspectionRequest,
+    ReplaceCloseInspectionScopeRequest, RouteCloseAttemptToRepairRequest,
 };
 
 /// Process-local capability retained from inventory sealing through per-resource
@@ -1764,6 +1764,44 @@ impl RuntimeManager {
     where
         E: From<String>,
     {
+        self.route_close_attempt_to_repair_with_cause(attempt_id, scope, reason, detail, None)
+            .await
+    }
+
+    pub(crate) async fn route_close_evidence_invariant_to_repair<T, E>(
+        &self,
+        attempt_id: &CloseAttemptId,
+        scope: &WorkScopeId,
+        invariant: &str,
+        relation: &str,
+    ) -> Result<T, E>
+    where
+        E: From<String>,
+    {
+        let cause = CloseNeedsRepairCause::evidence_invariant(invariant, relation)
+            .expect("static Close evidence identifiers are non-blank");
+        let detail = format!("Close evidence invariant {invariant} failed in {relation}");
+        self.route_close_attempt_to_repair_with_cause(
+            attempt_id,
+            scope,
+            RetirementFailureReason::ManualRepairRequired,
+            detail,
+            Some(cause),
+        )
+        .await
+    }
+
+    async fn route_close_attempt_to_repair_with_cause<T, E>(
+        &self,
+        attempt_id: &CloseAttemptId,
+        scope: &WorkScopeId,
+        reason: RetirementFailureReason,
+        detail: impl Into<String>,
+        cause: Option<CloseNeedsRepairCause>,
+    ) -> Result<T, E>
+    where
+        E: From<String>,
+    {
         let detail = detail.into();
         let captured = self
             .db()
@@ -1796,6 +1834,7 @@ impl RuntimeManager {
                 residual,
                 reason,
                 detail: detail.clone(),
+                cause,
             })
             .await
             .map_err(|error| error.to_string())?;
@@ -2703,10 +2742,7 @@ pub(crate) enum CloseRetirementError {
     #[error("{0}")]
     Message(String),
     #[error("Close evidence invariant {invariant} failed in {relation}")]
-    EvidenceInvariant {
-        invariant: &'static str,
-        relation: &'static str,
-    },
+    EvidenceInvariant { invariant: String, relation: String },
 }
 
 impl From<String> for CloseRetirementError {
@@ -2728,8 +2764,8 @@ fn map_close_retirement_db_error(error: crate::db::DbError) -> CloseRetirementEr
             relation,
             ..
         } => CloseRetirementError::EvidenceInvariant {
-            invariant,
-            relation,
+            invariant: invariant.to_string(),
+            relation: relation.to_string(),
         },
         error => CloseRetirementError::Message(error.to_string()),
     }

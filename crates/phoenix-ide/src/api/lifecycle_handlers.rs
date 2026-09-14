@@ -764,16 +764,35 @@ pub(crate) async fn retry_close_retirement(
                 .next()
                 .ok_or_else(|| AppError::Internal("Close retry has no captured scope".to_string()))?
                 .scope;
-            state
-                .runtime
-                .route_close_attempt_to_repair::<(), CloseRetirementError>(
-                    retried.attempt_id(),
-                    &scope,
-                    phoenix_core::domain::close::RetirementFailureReason::ManualRepairRequired,
-                    error.to_string(),
-                )
-                .await
-                .expect_err("repair routing returns the persisted repair detail");
+            match &error {
+                CloseRetirementError::EvidenceInvariant {
+                    invariant,
+                    relation,
+                } => {
+                    state
+                        .runtime
+                        .route_close_evidence_invariant_to_repair::<(), CloseRetirementError>(
+                            retried.attempt_id(),
+                            &scope,
+                            invariant,
+                            relation,
+                        )
+                        .await
+                        .expect_err("repair routing returns the persisted repair detail");
+                }
+                CloseRetirementError::Message(message) => {
+                    state
+                        .runtime
+                        .route_close_attempt_to_repair::<(), CloseRetirementError>(
+                            retried.attempt_id(),
+                            &scope,
+                            phoenix_core::domain::close::RetirementFailureReason::ManualRepairRequired,
+                            message,
+                        )
+                        .await
+                        .expect_err("repair routing returns the persisted repair detail");
+                }
+            }
         }
         return Err(AppError::Conflict(Box::new(
             close_retirement_conflict(&state.db, error, retried.attempt_id().as_str(), &id).await,
@@ -795,6 +814,31 @@ pub(crate) async fn retry_close_retirement(
 
 fn close_phase_allows_retry_guidance(phase: Option<ClosePhase>) -> bool {
     phase == Some(ClosePhase::NeedsRepair)
+}
+
+fn close_needs_repair_conflict(
+    cause: Option<phoenix_db::CloseNeedsRepairCause>,
+    attempt_id: &str,
+    active_transcript_id: &str,
+) -> ConflictErrorResponse {
+    let error = match cause {
+        Some(phoenix_db::CloseNeedsRepairCause::EvidenceInvariant(cause)) => {
+            CloseRetirementError::EvidenceInvariant {
+                invariant: cause.invariant().to_string(),
+                relation: cause.relation().to_string(),
+            }
+        }
+        None => CloseRetirementError::Message(
+            "Close retirement needs repair. Open the active transcript and retry the exact attempt."
+                .to_string(),
+        ),
+    };
+    close_retirement_conflict_for_phase(
+        error,
+        attempt_id,
+        active_transcript_id,
+        Some(ClosePhase::NeedsRepair),
+    )
 }
 
 fn inactive_close_transcript_conflict(
@@ -1020,16 +1064,16 @@ async fn run_legacy_close_compat(state: &AppState, id: &str, action: &str) -> Re
                 return Ok(());
             }
             ClosePhase::NeedsRepair => {
-                return Err(AppError::Conflict(Box::new(
-                    ConflictErrorResponse::new(
-                        "Close retirement needs repair. Open the active transcript and retry the exact attempt.",
-                        "close_retirement_needs_repair",
-                    )
-                    .with_close_recovery(
-                        obligation.attempt_id().as_str(),
-                        expected_latest_transcript.as_str(),
-                    ),
-                )));
+                let cause = state
+                    .db
+                    .close_needs_repair_cause(obligation.attempt_id())
+                    .await
+                    .map_err(|error| AppError::Internal(error.to_string()))?;
+                return Err(AppError::Conflict(Box::new(close_needs_repair_conflict(
+                    cause,
+                    obligation.attempt_id().as_str(),
+                    expected_latest_transcript.as_str(),
+                ))));
             }
             ClosePhase::Completed => {
                 return match obligation.close_outcome() {
@@ -1158,8 +1202,8 @@ mod tests {
     #[test]
     fn evidence_invariant_conflict_advertises_retry_only_from_needs_repair() {
         let error = || CloseRetirementError::EvidenceInvariant {
-            invariant: "target_dispatch_must_match_sealed_inventory",
-            relation: "close_retirement_resource_dispatches",
+            invariant: "target_dispatch_must_match_sealed_inventory".to_string(),
+            relation: "close_retirement_resource_dispatches".to_string(),
         };
         let response = close_retirement_conflict_for_phase(
             error(),

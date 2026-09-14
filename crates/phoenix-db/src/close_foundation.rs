@@ -10,7 +10,7 @@ use phoenix_core::domain::close::{
     OpaqueIdentity, ProductConversationId, RetiredResourceIdentity, RetiredResourceKind,
     RetirementFailureReason, RetirementOutcome, TranscriptConversationId, WorktreeIdentity,
 };
-use phoenix_core::domain::db_schema::MessageContent;
+use phoenix_core::domain::db_schema::{MessageContent, NonEmptyString};
 use phoenix_core::work_scope::{RuntimeRole, WorkScopeId};
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Connection, Row, Sqlite, Transaction};
@@ -705,6 +705,55 @@ pub struct RecordCloseRetirementEvidenceRequest {
     pub detail: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct CloseEvidenceInvariantCause {
+    invariant: NonEmptyString,
+    relation: NonEmptyString,
+}
+
+impl CloseEvidenceInvariantCause {
+    fn new(invariant: String, relation: String) -> Result<Self, &'static str> {
+        if invariant.trim().is_empty() || relation.trim().is_empty() {
+            return Err("Close evidence invariant cause fields must not be blank");
+        }
+        Ok(Self {
+            invariant: NonEmptyString::new(invariant)?,
+            relation: NonEmptyString::new(relation)?,
+        })
+    }
+
+    #[must_use]
+    pub fn invariant(&self) -> &str {
+        self.invariant.as_str()
+    }
+
+    #[must_use]
+    pub fn relation(&self) -> &str {
+        self.relation.as_str()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CloseNeedsRepairCause {
+    EvidenceInvariant(CloseEvidenceInvariantCause),
+}
+
+impl CloseNeedsRepairCause {
+    /// Constructs one structurally paired, non-blank evidence-invariant cause.
+    ///
+    /// # Errors
+    /// Returns an error when either stable identifier is empty or whitespace-only.
+    pub fn evidence_invariant(
+        invariant: impl Into<String>,
+        relation: impl Into<String>,
+    ) -> Result<Self, &'static str> {
+        Ok(Self::EvidenceInvariant(CloseEvidenceInvariantCause::new(
+            invariant.into(),
+            relation.into(),
+        )?))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RouteCloseAttemptToRepairRequest {
     pub attempt_id: CloseAttemptId,
@@ -712,6 +761,7 @@ pub struct RouteCloseAttemptToRepairRequest {
     pub residual: RetiredResourceIdentity,
     pub reason: RetirementFailureReason,
     pub detail: String,
+    pub cause: Option<CloseNeedsRepairCause>,
 }
 
 #[derive(Debug, Clone)]
@@ -869,6 +919,12 @@ async fn set_close_phase_tx(
         .bind(phase.as_str())
         .execute(&mut **tx)
         .await?;
+    if phase != ClosePhase::NeedsRepair {
+        sqlx::query("DELETE FROM close_needs_repair_causes WHERE attempt_id = ?1")
+            .bind(attempt_id)
+            .execute(&mut **tx)
+            .await?;
+    }
     Ok(())
 }
 
@@ -2564,6 +2620,7 @@ impl Database {
                                 "scope {} has unresolved captured worktree identity",
                                 scope.scope
                             ),
+                            cause: None,
                         },
                     )
                     .await?;
@@ -2754,6 +2811,7 @@ impl Database {
                                 "scope {} has unresolved captured worktree identity",
                                 scope.scope
                             ),
+                            cause: None,
                         },
                     )
                     .await?;
@@ -2865,6 +2923,35 @@ impl Database {
         route_close_attempt_to_repair_tx(&mut tx, &request).await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Returns the typed cause paired with an exact attempt's `NeedsRepair` phase.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] when persistence or typed decoding fails.
+    pub async fn close_needs_repair_cause(
+        &self,
+        attempt_id: &CloseAttemptId,
+    ) -> DbResult<Option<CloseNeedsRepairCause>> {
+        let row: Option<(String, String, String)> = sqlx::query_as(
+            "SELECT cause_kind, invariant, relation
+             FROM close_needs_repair_causes WHERE attempt_id=?1",
+        )
+        .bind(attempt_id.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(
+            |(cause_kind, invariant, relation)| match cause_kind.as_str() {
+                "evidence_invariant" => {
+                    CloseNeedsRepairCause::evidence_invariant(invariant, relation)
+                        .map_err(|error| DbError::Serialization(error.to_string()))
+                }
+                other => Err(DbError::Serialization(format!(
+                    "unknown Close needs-repair cause {other}"
+                ))),
+            },
+        )
+        .transpose()
     }
 
     /// Returns a pre-quarantine worktree snapshot mismatch to fresh inspection.
@@ -3252,6 +3339,32 @@ async fn route_close_attempt_to_repair_tx(
     }
     if obligation.phase() != ClosePhase::NeedsRepair {
         set_close_phase_tx(tx, request.attempt_id.as_str(), ClosePhase::NeedsRepair).await?;
+    }
+    match &request.cause {
+        Some(CloseNeedsRepairCause::EvidenceInvariant(cause)) => {
+            sqlx::query(
+                "INSERT INTO close_needs_repair_causes (
+                     attempt_id, cause_kind, invariant, relation, recorded_at_unix_micros
+                 ) VALUES (?1, 'evidence_invariant', ?2, ?3, ?4)
+                 ON CONFLICT(attempt_id) DO UPDATE SET
+                     cause_kind=excluded.cause_kind,
+                     invariant=excluded.invariant,
+                     relation=excluded.relation,
+                     recorded_at_unix_micros=excluded.recorded_at_unix_micros",
+            )
+            .bind(request.attempt_id.as_str())
+            .bind(cause.invariant())
+            .bind(cause.relation())
+            .bind(Utc::now().timestamp_micros())
+            .execute(&mut **tx)
+            .await?;
+        }
+        None => {
+            sqlx::query("DELETE FROM close_needs_repair_causes WHERE attempt_id=?1")
+                .bind(request.attempt_id.as_str())
+                .execute(&mut **tx)
+                .await?;
+        }
     }
     Ok(())
 }
@@ -7151,6 +7264,7 @@ mod tests {
             .unwrap(),
             reason: RetirementFailureReason::IdentityNotProven,
             detail: "captured worktree identity cannot be proven".to_string(),
+            cause: None,
         })
         .await
         .unwrap();
@@ -7184,6 +7298,115 @@ mod tests {
         assert_eq!(
             projection.residuals[0].detail.as_deref(),
             Some("captured worktree identity cannot be proven")
+        );
+    }
+
+    #[test]
+    fn close_evidence_invariant_cause_requires_paired_nonblank_identifiers() {
+        assert!(CloseNeedsRepairCause::evidence_invariant("invariant", "relation").is_ok());
+        for (invariant, relation) in [
+            ("", "relation"),
+            ("invariant", ""),
+            ("   ", "relation"),
+            ("invariant", "\t"),
+        ] {
+            assert!(CloseNeedsRepairCause::evidence_invariant(invariant, relation).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_close_repair_cause_persists_replaces_clears_retries_and_cascades() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root-repair-cause").await;
+        allocate_scope_worktree(&db, "root-repair-cause").await;
+        let attempt_id = CloseAttemptId::parse("attempt-repair-cause").unwrap();
+        db.begin_close_foundation(
+            &product_id("root-repair-cause"),
+            &transcript_id("root-repair-cause"),
+            attempt_id.as_str(),
+        )
+        .await
+        .unwrap();
+        let settling = db
+            .begin_close_idle_settlement(attempt_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(settling.phase(), ClosePhase::SettlingActiveWork);
+        let inspecting = db
+            .advance_close_settlement_when_quiescent(attempt_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(inspecting.phase(), ClosePhase::AwaitingRetirementInspection);
+        let captured = db
+            .list_close_attempt_scopes(attempt_id.as_str())
+            .await
+            .unwrap()
+            .remove(0);
+        let scope = captured.scope;
+        let CapturedWorktreeIdentity::Resolved(worktree) = captured.captured_worktree.unwrap()
+        else {
+            panic!("allocated scope must capture a resolved worktree");
+        };
+        let residual = RetiredResourceIdentity::parse(
+            RetiredResourceKind::Worktree,
+            LossItemIdentity::Worktree(worktree),
+        )
+        .unwrap();
+        let request = |cause| RouteCloseAttemptToRepairRequest {
+            attempt_id: attempt_id.clone(),
+            scope: scope.clone(),
+            residual: residual.clone(),
+            reason: RetirementFailureReason::ManualRepairRequired,
+            detail: "typed repair cause test".to_string(),
+            cause,
+        };
+
+        let first = CloseNeedsRepairCause::evidence_invariant(
+            "target_dispatch_must_match_sealed_inventory",
+            "close_retirement_resource_dispatches",
+        )
+        .unwrap();
+        db.route_close_attempt_to_repair(request(Some(first.clone())))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.close_needs_repair_cause(&attempt_id).await.unwrap(),
+            Some(first)
+        );
+
+        let replacement = CloseNeedsRepairCause::evidence_invariant(
+            "cleanup_plan_requires_dispatch_parent",
+            "close_worktree_cleanup_plans",
+        )
+        .unwrap();
+        db.route_close_attempt_to_repair(request(Some(replacement.clone())))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.close_needs_repair_cause(&attempt_id).await.unwrap(),
+            Some(replacement.clone())
+        );
+
+        db.route_close_attempt_to_repair(request(None))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.close_needs_repair_cause(&attempt_id).await.unwrap(),
+            None
+        );
+
+        db.route_close_attempt_to_repair(request(Some(replacement.clone())))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.close_needs_repair_cause(&attempt_id).await.unwrap(),
+            Some(replacement)
+        );
+        let retrying = db.retry_close_retirement(&attempt_id).await.unwrap();
+        assert_eq!(retrying.phase(), ClosePhase::AwaitingRetirementInspection);
+        assert_eq!(
+            db.close_needs_repair_cause(&attempt_id).await.unwrap(),
+            None
         );
     }
 
@@ -9894,6 +10117,7 @@ mod tests {
             residual: resource.clone(),
             reason: RetirementFailureReason::IdentityNotProven,
             detail: "retained quarantine requires exact-attempt retry".to_string(),
+            cause: None,
         })
         .await
         .unwrap();
@@ -10030,6 +10254,7 @@ mod tests {
                 residual: resource.clone(),
                 reason: RetirementFailureReason::IdentityNotProven,
                 detail: format!("retain before {generation}"),
+                cause: None,
             })
             .await
             .unwrap();
@@ -10080,6 +10305,7 @@ mod tests {
             residual: resource.clone(),
             reason: RetirementFailureReason::IdentityNotProven,
             detail: "retain before newest unadopted generation".to_string(),
+            cause: None,
         })
         .await
         .unwrap();
