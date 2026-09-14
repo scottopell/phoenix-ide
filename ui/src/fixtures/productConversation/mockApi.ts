@@ -30,6 +30,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   const originalGetConversationRoute = api.getConversationRoute;
   const originalGetConversationRouteBySlug = api.getConversationRouteBySlug;
   const originalGetConversation = api.getConversation;
+  const originalGetConversationStatus = api.getConversationStatus;
   const originalResolveCoordinatorRoute = api.resolveCoordinatorRoute;
   const originalListConversations = api.listConversations;
   const originalListArchivedConversations = api.listArchivedConversations;
@@ -107,6 +108,10 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
 
   api.getConversationRoute = async () => route;
   api.getConversationRouteBySlug = async () => route;
+  api.getConversationStatus = async id => {
+    const {conversation, agent_working, presentation_mode} = await api.getConversation(id);
+    return {conversation, agent_working, presentation_mode};
+  };
   api.getConversation = async () => ({
     conversation,
     messages,
@@ -291,6 +296,7 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     api.getConversationRoute = originalGetConversationRoute;
     api.getConversationRouteBySlug = originalGetConversationRouteBySlug;
     api.getConversation = originalGetConversation;
+    api.getConversationStatus = originalGetConversationStatus;
     api.resolveCoordinatorRoute = originalResolveCoordinatorRoute;
     api.listConversations = originalListConversations;
     api.listArchivedConversations = originalListArchivedConversations;

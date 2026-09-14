@@ -17,6 +17,7 @@ const manualRequest = (currentView: HistoryView, token = 1): ActiveHistoryReques
   token,
   view: currentView,
   snapshotStartedAtEventSeq: 4,
+  snapshotStartedAtPhase: {type:'idle'},
   intent: { kind: 'reader_expansion', restore: { kind: 'reader_anchor', messageId: 'm50', viewportStartOffset: 12 } },
 });
 
@@ -24,6 +25,7 @@ const deepLinkRequest = (currentView: HistoryView, token = 1): ActiveHistoryRequ
   token,
   view: currentView,
   snapshotStartedAtEventSeq: 4,
+  snapshotStartedAtPhase: {type:'idle'},
   intent: { kind: 'deep_link', targetMessageId: 'm1' },
 });
 

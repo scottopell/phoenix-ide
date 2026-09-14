@@ -300,7 +300,7 @@ struct PhoenixAPI: Sendable {
     }
 
     func getConversationStatus(id: String) async throws -> ConversationStatusResponse {
-        try await get("api/conversations/\(id)", as: ConversationStatusResponse.self)
+        try await get("api/conversations/\(id)/status", as: ConversationStatusResponse.self)
     }
 
     func getConversation(id: String, afterSequence: Int64 = 0) async throws

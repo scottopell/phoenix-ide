@@ -189,6 +189,63 @@ final class QuestionRequestTests: XCTestCase {
         }
     }
 
+    @MainActor
+    func testWellFormedNonQuestionStatusResolvesViaGETAndSSEButMalformedStaysFrozen() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [QuestionRequestProtocol.self]
+        let api = PhoenixAPI(baseURL: URL(string: "https://auq-protocol.invalid")!,
+                             password: nil, allowSelfSigned: false, configuration: configuration)!
+        defer { QuestionRequestProtocol.onGet = nil; QuestionRequestProtocol.onRequest = nil }
+        for (state, resolved) in [
+            (#"{"type":"recoverable_continuation_failure","failure":{"message":"Recovery failed"}}"#, true),
+            (#"{"type":"creation_cancelled","message":"Cancelled"}"#, true),
+            (#"{"type":"future_nonquestion_state","message":"Future failure"}"#, false),
+            (#"{}"#, false), (#"{"type":""}"#, false),
+            (#"{"type":"awaiting_user_response"}"#, false)
+        ] {
+            let json = try JSONDecoder().decode(JSONValue.self, from: Data(state.utf8))
+            QuestionRequestProtocol.onGet = { request in
+                XCTAssertEqual(request.request.url?.lastPathComponent, "status")
+                request.succeed(body: """
+                {"conversation":{"id":"conversation-a","slug":"test","state":\(state)},
+                 "agent_working":false,"presentation_mode":"error"}
+                """)
+            }
+            for fromStream in [false, true] {
+                let session = ConversationSession(conversationId: "conversation-a", api: api,
+                                                   connectivity: ConnectivityMonitor())
+                try seed(session, requestId: "original")
+                if fromStream {
+                    let received = expectation(description: "hold mutation until SSE")
+                    var held: QuestionRequestProtocol?
+                    QuestionRequestProtocol.onRequest = { request in held = request; received.fulfill() }
+                    let completion = try XCTUnwrap(session.perform(.dismissQuestion(requestId: "original")))
+                    await fulfillment(of: [received], timeout: 3)
+                    session.receive(.stateChange(seq: 1, state: json, presentationMode: "error", stateUpdatedAt: nil))
+                    XCTAssertEqual(session.actionInFlight == nil, resolved)
+                    held?.succeed()
+                    await completion.value
+                } else {
+                    QuestionRequestProtocol.onRequest = nil
+                    try await XCTUnwrap(session.perform(.dismissQuestion(requestId: "original"))).value
+                }
+                XCTAssertEqual(session.actionInFlight == nil, resolved)
+                XCTAssertFalse(session.canRetryQuestionOperation)
+                if resolved {
+                    XCTAssertFalse(session.questionResolvedWaitingForStream)
+                    XCTAssertEqual(session.presentationMode, "error")
+                    XCTAssertEqual(session.convState, json)
+                    XCTAssertFalse(ConversationSession.actionStillAwaitsOriginalState(
+                        action: .dismissQuestion(requestId: "original"), origin: nil, current: session.typedState))
+                } else {
+                    XCTAssertTrue(session.questionResolvedWaitingForStream)
+                    XCTAssertTrue(session.canCheckQuestionStatus)
+                    XCTAssertNil(session.perform(.dismissQuestion(requestId: "original")))
+                }
+            }
+        }
+    }
+
     func testBothMutationsCarryOriginatingRequestIdentity() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [QuestionRequestProtocol.self]

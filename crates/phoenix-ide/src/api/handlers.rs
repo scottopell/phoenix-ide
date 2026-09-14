@@ -34,17 +34,18 @@ use super::types::{
     ContinueConversationResponse, ContinueConversationStatus, ConversationListResponse,
     ConversationMessageRangeResponse, ConversationMessageSliceResponse,
     ConversationMessagesAroundResponse, ConversationResponse, ConversationRouteResponse,
-    ConversationSearchQuery, ConversationSearchResponse, ConversationWithMessagesResponse,
-    CreateConversationRequest, CreateProductConversationRequest, CredentialStatusApi,
-    DirectoryEntry, ErrorResponse, ExpansionErrorResponse, FileEntry, FileSearchEntry,
-    FileSearchQuery, FileSearchResponse, FileViewerKind, ListDirectoryResponse, ListFilesResponse,
-    ModelsResponse, NotificationSettingsRequest, ProductConversationCreateAcceptedResponse,
-    ProductConversationRouteResponse, ProjectFileSearchQuery, ProjectSkillsQuery,
-    ProjectTasksQuery, ReadFileResponse, RecentManagementRootSuggestion,
-    RecentManagementRootSuggestionsResponse, ReconcileAcceptedMessagesRequest,
-    ReconcileAcceptedMessagesResponse, RenameRequest, SkillEntry, SkillsResponse, SuccessResponse,
-    SuggestRequest, SuggestResponse, SystemPromptResponse, TaskCountQuery, TaskCountResponse,
-    TaskEntry, TasksResponse, UpgradeModelRequest, ValidateCwdResponse,
+    ConversationSearchQuery, ConversationSearchResponse, ConversationStatusResponse,
+    ConversationWithMessagesResponse, CreateConversationRequest, CreateProductConversationRequest,
+    CredentialStatusApi, DirectoryEntry, ErrorResponse, ExpansionErrorResponse, FileEntry,
+    FileSearchEntry, FileSearchQuery, FileSearchResponse, FileViewerKind, ListDirectoryResponse,
+    ListFilesResponse, ModelsResponse, NotificationSettingsRequest,
+    ProductConversationCreateAcceptedResponse, ProductConversationRouteResponse,
+    ProjectFileSearchQuery, ProjectSkillsQuery, ProjectTasksQuery, ReadFileResponse,
+    RecentManagementRootSuggestion, RecentManagementRootSuggestionsResponse,
+    ReconcileAcceptedMessagesRequest, ReconcileAcceptedMessagesResponse, RenameRequest, SkillEntry,
+    SkillsResponse, SuccessResponse, SuggestRequest, SuggestResponse, SystemPromptResponse,
+    TaskCountQuery, TaskCountResponse, TaskEntry, TasksResponse, UpgradeModelRequest,
+    ValidateCwdResponse,
 };
 use super::AppState;
 use crate::api::terminal_ws::{terminal_ws_global_handler, terminal_ws_handler};
@@ -193,6 +194,10 @@ pub fn create_router(state: AppState) -> Router {
         )
         // Conversation retrieval (REQ-API-003)
         .route("/api/conversations/:id", get(get_conversation))
+        .route(
+            "/api/conversations/:id/status",
+            get(get_conversation_status),
+        )
         .route(
             "/api/conversations/:id/browser-session",
             delete(stop_conversation_browser_session),
@@ -3162,6 +3167,32 @@ const DEFAULT_MESSAGE_HISTORY_LIMIT: i64 = 50;
 const MAX_MESSAGE_HISTORY_LIMIT: i64 = 500;
 const MAX_RENDER_UNIT_ALIGNED_RESPONSE_MESSAGES: usize = 2_048;
 
+async fn conversation_status_response(
+    state: &AppState,
+    conversation: &crate::db::Conversation,
+) -> Result<ConversationStatusResponse, AppError> {
+    Ok(ConversationStatusResponse {
+        conversation: conversation_to_json_with_seed(state, conversation, true).await?,
+        agent_working: conversation.is_agent_working(),
+        presentation_mode: conv_presentation_mode(conversation).to_string(),
+    })
+}
+
+async fn get_conversation_status(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<ConversationStatusResponse>, AppError> {
+    let conversation = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    Ok(Json(
+        conversation_status_response(&state, &conversation).await?,
+    ))
+}
+
 async fn get_conversation(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -3194,11 +3225,12 @@ async fn get_conversation(
         .next_back()
         .map_or(0, crate::db::UsageData::context_window_used);
 
+    let metadata = conversation_status_response(&state, &conversation).await?;
     Ok(Json(ConversationWithMessagesResponse {
-        conversation: conversation_to_json_with_seed(&state, &conversation, true).await?,
+        conversation: metadata.conversation,
         messages: enriched_msgs,
-        agent_working: conversation.is_agent_working(),
-        presentation_mode: conv_presentation_mode(&conversation).to_string(),
+        agent_working: metadata.agent_working,
+        presentation_mode: metadata.presentation_mode,
         context_window_size,
     }))
 }
@@ -13123,6 +13155,102 @@ pub(crate) mod hard_delete_cascade_tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn question_status_reads_metadata_without_loading_transcript() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+        let state = make_test_state().await;
+        let id = "question-status";
+        state
+            .db
+            .create_conversation(id, id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        state
+            .db
+            .update_conversation_state(
+                id,
+                &ConvState::AwaitingUserResponse {
+                    questions: vec![],
+                    tool_use_id: "provider".into(),
+                    request_id: "incarnation".into(),
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .add_message_with_seq(
+                "long-message",
+                id,
+                1,
+                &MessageContent::user("transcript ".repeat(100_000)),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let full = get_conversation(
+            State(state.clone()),
+            Path(id.into()),
+            Query(GetConversationQuery {
+                after_sequence: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        sqlx::query("ALTER TABLE messages RENAME TO unavailable_transcript")
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("CREATE VIEW messages AS SELECT conversation_id FROM unavailable_transcript")
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        assert!(get_conversation(
+            State(state.clone()),
+            Path(id.into()),
+            Query(GetConversationQuery {
+                after_sequence: None
+            })
+        )
+        .await
+        .is_err());
+
+        let response = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/conversations/{id}/status"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(bytes.len() < 10_000);
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["conversation"], full.conversation);
+        assert_eq!(body["agent_working"], full.agent_working);
+        assert_eq!(body["presentation_mode"], full.presentation_mode);
+        assert!(body.get("messages").is_none());
+        assert!(body.get("context_window_size").is_none());
+        assert_eq!(body["conversation"]["state"]["request_id"], "incarnation");
+        let missing = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/conversations/missing/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

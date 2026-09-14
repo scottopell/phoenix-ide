@@ -15,8 +15,8 @@ export function AskUserQuestionFixture({ scenario }: { scenario: AskUserQuestion
     document.documentElement.dataset['theme'] = 'light';
     const respond = api.respondToQuestion;
     const dismiss = api.dismissQuestion;
-    const getConversation = api.getConversation;
-    api.getConversation = async () => ({ conversation: { id: 'fixture-auq', state: { type: 'idle' } } as Conversation, messages: [], agent_working: false, presentation_mode: 'chat', context_window_size: 100000 });
+    const getConversation = api.getConversationStatus;
+    api.getConversationStatus = async () => ({ conversation: { id: 'fixture-auq', state: { type: 'idle' } } as Conversation, agent_working: false, presentation_mode: 'chat' });
     api.respondToQuestion = async (_id, requestId, answers, annotations) => {
       if (scenario.fail) throw new QuestionMutationError('Fixture: response rejected. Please retry.', 'question_request_invalid');
       setResult(JSON.stringify({ requestId, answers, annotations }, null, 2));
@@ -30,7 +30,7 @@ export function AskUserQuestionFixture({ scenario }: { scenario: AskUserQuestion
     return () => {
       api.respondToQuestion = respond;
       api.dismissQuestion = dismiss;
-      api.getConversation = getConversation;
+      api.getConversationStatus = getConversation;
       if (theme === undefined) delete document.documentElement.dataset['theme'];
       else document.documentElement.dataset['theme'] = theme;
     };

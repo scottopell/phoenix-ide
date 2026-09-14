@@ -1685,6 +1685,12 @@ export const api = {
     return (await resp.json()).conversation;
   },
 
+  async getConversationStatus(id: string): Promise<{ conversation: Conversation; agent_working: boolean; presentation_mode: string }> {
+    const resp = await fetch(`/api/conversations/${encodeURIComponent(id)}/status`);
+    if (!resp.ok) throw new Error('Failed to get conversation status');
+    return resp.json();
+  },
+
   async getConversation(id: string): Promise<{ conversation: Conversation; messages: Message[]; agent_working: boolean; presentation_mode: string; context_window_size: number }> {
     const resp = await fetch(`/api/conversations/${encodeURIComponent(id)}`);
     if (!resp.ok) {

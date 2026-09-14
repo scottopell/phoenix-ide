@@ -141,7 +141,7 @@ function ActiveQuestionPanel({ questions, conversationId, requestId, showToast, 
     if (!mounted.current || inFlight.current) return;
     inFlight.current = true;
     try {
-      const result = await api.getConversation(conversationId);
+      const result = await api.getConversationStatus(conversationId);
       if (!mounted.current) return;
       const rawState = result.conversation.state;
       const state = parseConversationState(rawState);

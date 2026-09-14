@@ -838,6 +838,7 @@ function ConversationPageContent({
     void (async () => {
       try {
         const snapshotStartedAtEventSeq = eventCursorRef.current;
+        const snapshotStartedAtPhase = atomRef.current.phase;
         const settledResults = await Promise.allSettled(
           Array.from({ length: Math.ceil(accepted.length / 100) }, (_, index) => {
             const chunk = accepted.slice(index * 100, (index + 1) * 100);
@@ -882,6 +883,7 @@ function ConversationPageContent({
             }),
             transcriptCoverage: current.transcriptCoverage,
             snapshotStartedAtEventSeq,
+            snapshotStartedAtPhase,
           });
           reconcileAuthoritative(persisted.map((entry) => entry.message_id));
         }
@@ -1020,6 +1022,7 @@ function ConversationPageContent({
       token: ++historyRequestTokenRef.current,
       view: historyExpansion.view,
       snapshotStartedAtEventSeq: eventCursorRef.current,
+      snapshotStartedAtPhase: atomRef.current.phase,
       intent,
     };
     const requestTranscriptGeneration = request.view.transcriptGeneration;
@@ -1062,6 +1065,7 @@ function ConversationPageContent({
         transcriptCoverage: 'complete',
         eventCursorFloor: historyMergeEventCursorFloor(request),
         snapshotStartedAtEventSeq: request.snapshotStartedAtEventSeq,
+        snapshotStartedAtPhase: request.snapshotStartedAtPhase,
       });
       dispatchHistoryExpansion({
         type: 'history_loaded',

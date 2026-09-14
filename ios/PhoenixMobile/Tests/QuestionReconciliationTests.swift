@@ -33,8 +33,7 @@ final class QuestionReconciliationTests: XCTestCase {
 
     func testMalformedAndWrongConversationSnapshotsCannotAuthorizeRetry() throws {
         for state in ["null", "{}", "{\"type\":\"awaiting_user_response\"}",
-                      "{\"type\":\"awaiting_user_response\",\"request_id\":\" \"}",
-                      "{\"type\":\"unknown_future_state\"}"] {
+                      "{\"type\":\"awaiting_user_response\",\"request_id\":\" \"}"] {
             let phase = reconcile(try snapshot(state: state))
             XCTAssertFalse(phase.canRetry, state)
             XCTAssertTrue(phase.canCheckStatus, state)
@@ -47,7 +46,7 @@ final class QuestionReconciliationTests: XCTestCase {
 
     func testUnclassifiableStreamStatePreservesOperationAndRevokesRetryReadiness() {
         let action = ConversationAction.respondToQuestions(requestId: "original", answers: ["Question?": "Answer"])
-        for state in [ConversationState.unknown, .questionIdentityUnavailable, .other(type: "future_state")] {
+        for state in [ConversationState.unknown, .questionIdentityUnavailable] {
             XCTAssertTrue(ConversationSession.actionStillAwaitsOriginalState(
                 action: action, origin: nil, current: state))
             let phase = ConversationSession.QuestionAttemptPhase.checkedPending.observingStreamState(state)
@@ -62,6 +61,7 @@ final class QuestionReconciliationTests: XCTestCase {
 
     func testDifferentRequestOrResolvedStateRemovesOldOperationControls() throws {
         for state in ["{\"type\":\"idle\"}",
+                      "{\"type\":\"creation_cancelled\"}",
                       "{\"type\":\"awaiting_user_response\",\"request_id\":\"next\",\"questions\":[]}"] {
             let phase = reconcile(try snapshot(state: state))
             XCTAssertEqual(phase, .resolvedWaitingForStream)

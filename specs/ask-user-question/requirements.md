@@ -391,6 +391,11 @@ THE SYSTEM SHALL apply success, error, focus restoration, reset, and control
 re-enabling only to the originating request
 AND leave a newer request's panel, draft, and focus intact
 
+WHEN a history snapshot request starts before authoritative question resolution
+AND its response arrives after the resolved phase is adopted
+THE SYSTEM SHALL merge its transcript without replacing the newer phase or
+reopening the consumed question
+
 **Rationale:** Identical question text does not authorize a stale client to
 answer a different request. Late responses must not erase the next question.
 
@@ -449,6 +454,10 @@ that every outstanding attempt cannot mutate
 
 WHEN reconciliation fails
 THE SYSTEM SHALL preserve the frozen operation and offer Check status again
+
+WHEN a client reads authoritative question status for reconciliation
+THE SYSTEM SHALL provide conversation metadata without loading or transferring
+the transcript
 
 WHEN authoritative state shows the originating request is no longer pending
 THE SYSTEM SHALL remove its stale editing surface and announce that it is no
