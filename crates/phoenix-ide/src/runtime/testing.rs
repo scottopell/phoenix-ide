@@ -633,6 +633,7 @@ pub struct InMemoryStorage {
     cwds: Mutex<HashMap<String, String>>,
     approved_task_authorities:
         Mutex<HashMap<String, phoenix_core::task_handoff::ApprovedTaskSnapshot>>,
+    fail_approved_task_authority: Mutex<bool>,
     next_msg_id: Mutex<u64>,
     accepted_continuation_handoff_message_ids: Mutex<HashMap<String, String>>,
     fail_continuation_handoff_provenance: Mutex<bool>,
@@ -702,6 +703,7 @@ impl InMemoryStorage {
             modes: Mutex::new(HashMap::new()),
             cwds: Mutex::new(HashMap::new()),
             approved_task_authorities: Mutex::new(HashMap::new()),
+            fail_approved_task_authority: Mutex::new(false),
             next_msg_id: Mutex::new(1),
             accepted_continuation_handoff_message_ids: Mutex::new(HashMap::new()),
             fail_continuation_handoff_provenance: Mutex::new(false),
@@ -761,6 +763,10 @@ impl InMemoryStorage {
             .lock()
             .unwrap()
             .contains_key(conv_id)
+    }
+
+    pub fn set_fail_approved_task_authority(&self, fail: bool) {
+        *self.fail_approved_task_authority.lock().unwrap() = fail;
     }
 
     pub fn set_fail_continuation_commit(&self, fail: bool) {
@@ -2105,6 +2111,9 @@ impl StateStore for InMemoryStorage {
         _state_updated_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), String> {
         let snapshot = phoenix_core::task_handoff::ApprovedTaskSnapshot::from(approval);
+        if *self.fail_approved_task_authority.lock().unwrap() {
+            return Err("injected approved authority failure".to_string());
+        }
         self.states
             .lock()
             .unwrap()

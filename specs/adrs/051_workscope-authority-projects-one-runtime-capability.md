@@ -38,6 +38,10 @@ Rejected as the primary contract. Reconstruction is necessary for crash recovery
 
 Rejected as the primary structure. Repeated checks can support defense, but they do not make provider definitions, prompt capability, dispatch, and admission one coherent snapshot.
 
+## Compatibility
+
+The authority projection change is forward-only. Migration 097 repairs legacy Direct WorkScopes that were incorrectly classified as Restricted Explore; rollback requires the ordinary offline paired database restore governed by `specs/compatibility/requirements.md` and is not otherwise guaranteed.
+
 ## Consequences
 
 - Explore-origin conversations with approved WorkScope authority receive unsandboxed Work Bash and may spawn one Work child under existing single-writer rules.

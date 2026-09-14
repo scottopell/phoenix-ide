@@ -238,17 +238,26 @@ pub fn build_system_prompt_with_options(
             ModeContext::Explore {
                 next_taskmd_id_hint,
             } => {
-                prompt.push_str(&llm_language::mode_explore(
-                    language,
-                    tasks_dir_name,
-                    explore_bash,
-                ));
-                if let Some(next_id) = next_taskmd_id_hint {
-                    prompt.push_str(&llm_language::next_taskmd_id_hint(
+                if explore_bash
+                    == phoenix_core::llm_language::ExploreBashPromptCapability::Unsandboxed
+                {
+                    prompt.push_str(&llm_language::mode_approved_explore_work(
+                        language,
+                        &working_dir.display().to_string(),
+                    ));
+                } else {
+                    prompt.push_str(&llm_language::mode_explore(
                         language,
                         tasks_dir_name,
-                        next_id,
+                        explore_bash,
                     ));
+                    if let Some(next_id) = next_taskmd_id_hint {
+                        prompt.push_str(&llm_language::next_taskmd_id_hint(
+                            language,
+                            tasks_dir_name,
+                            next_id,
+                        ));
+                    }
                 }
             }
             ModeContext::Work {
@@ -860,8 +869,12 @@ mod tests {
 
         assert!(prompt
             .contains("`bash` is available with the approved WorkScope's full write authority"));
-        assert!(prompt.contains("not restricted by the Explore sandbox"));
+        assert!(prompt.contains("retains Explore provenance"));
+        assert!(prompt.contains("approved WorkScope grants full write authority"));
+        assert!(prompt.contains("Execute the approved task directly"));
         assert!(!prompt.contains("`bash` is unavailable"));
+        assert!(!prompt.contains("The conversation mode remains Explore"));
+        assert!(!prompt.contains("you cannot modify code"));
     }
 
     #[test]

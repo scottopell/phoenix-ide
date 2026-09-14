@@ -2225,6 +2225,15 @@ impl ToolRegistryExecutor {
         self
     }
 
+    fn refresh_work_generation(&self) -> ToolCapabilitySnapshot {
+        let mut capability = self
+            .capability
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        capability.generation = capability.generation.next();
+        capability.snapshot()
+    }
+
     fn publish_work_registry(&self, registry: ToolRegistry) -> ToolCapabilitySnapshot {
         let clearable_names = Arc::new(registry.clearable_tool_names());
         let mut guard = self
@@ -2361,12 +2370,16 @@ impl ToolExecutor for ToolRegistryExecutor {
     }
 
     async fn upgrade_to_work_mode(&self) -> Result<ToolCapabilitySnapshot, String> {
+        let _transition = self.transition_barrier.write().await;
+        if self.capability_snapshot().authority == phoenix_core::work_scope::ResourceAuthority::Work
+        {
+            return Ok(self.refresh_work_generation());
+        }
         let mut registry =
             ToolRegistry::direct(self.agent_catalog.to_vec(), self.model_ids.to_vec());
         if let Some(tools) = self.writing_tools.clone() {
             registry = registry.try_with_writing_conversation_tools(tools)?;
         }
-        let _transition = self.transition_barrier.write().await;
         Ok(self.publish_work_registry(registry))
     }
 }
@@ -2506,6 +2519,34 @@ mod tool_registry_executor_tests {
             )
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn existing_work_registry_refresh_preserves_specialized_tools() {
+        let registry = ToolRegistry::coordinator(vec![Arc::new(NamedMarker("specialized"))]);
+        let executor = ToolRegistryExecutor::builtin_only(
+            phoenix_core::work_scope::ResourceAuthority::Work,
+            registry,
+            Arc::from(Vec::new()),
+        );
+        let before = executor.capability_snapshot();
+
+        let after = executor.upgrade_to_work_mode().await.unwrap();
+
+        assert_eq!(
+            after.authority,
+            phoenix_core::work_scope::ResourceAuthority::Work
+        );
+        assert_eq!(after.generation, before.generation.next());
+        assert!(executor
+            .definitions_for_generation(
+                after.generation,
+                crate::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap()
+            .iter()
+            .any(|definition| definition.name == "specialized"));
     }
 
     #[tokio::test]

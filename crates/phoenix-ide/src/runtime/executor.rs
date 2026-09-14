@@ -1528,8 +1528,8 @@ enum CreationSettlementDisposition {
     StaleAuthority,
 }
 
-#[derive(Debug)]
-struct ProposedDirectTurnState {
+#[derive(Debug, Clone)]
+struct ProposedAuthoritativeState {
     state: ConvState,
     updated_at: DateTime<Utc>,
 }
@@ -1841,7 +1841,7 @@ where
     local_terminal_authority: LocalTerminalAuthority,
     direct_turn_cancellation_initiated: bool,
     direct_turn_materialization_aborted: bool,
-    proposed_direct_turn_state: Option<ProposedDirectTurnState>,
+    proposed_authoritative_state: Option<ProposedAuthoritativeState>,
     fatal_local_authority_fence: Arc<crate::runtime::FatalLocalAuthorityFence>,
     handoff_completion_authority: Option<crate::runtime::AdmittedOperation>,
     handoff_completion_timestamp: Option<DateTime<Utc>>,
@@ -1990,7 +1990,7 @@ where
             grace_turn_started_at: None,
             parent_tool_cycle_count: 0,
             direct_turn_materialization_aborted: false,
-            proposed_direct_turn_state: None,
+            proposed_authoritative_state: None,
             fatal_local_authority_fence: crate::runtime::FatalLocalAuthorityFence::new(),
             handoff_completion_authority: None,
             handoff_completion_timestamp: None,
@@ -3201,7 +3201,7 @@ where
     ) -> Result<Vec<Event>, String> {
         let mut generated_events = Vec::new();
         self.direct_turn_materialization_aborted = false;
-        self.proposed_direct_turn_state = None;
+        self.proposed_authoritative_state = None;
         self.continuation_effect_disposition = ContinuationEffectDisposition::Continue;
         let terminal_subagent_transition = self.context.is_sub_agent
             && matches!(result.new_state.step_result(), StepResult::Terminal(_));
@@ -3231,11 +3231,20 @@ where
             .effects
             .iter()
             .any(|effect| matches!(effect, Effect::PersistAuthoritativeUserMessage { .. }));
+        let is_task_approval_adoption = result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::ApproveTask { .. }));
         let old_state = self.state.clone();
         let will_settle_active_direct_turn =
             self.active_direct_turn.is_some() && self.pending_direct_turn_terminal.is_some();
         if is_direct_turn_adoption {
-            self.proposed_direct_turn_state = Some(ProposedDirectTurnState {
+            self.proposed_authoritative_state = Some(ProposedAuthoritativeState {
+                state: result.new_state.clone(),
+                updated_at: Utc::now(),
+            });
+        } else if is_task_approval_adoption {
+            self.proposed_authoritative_state = Some(ProposedAuthoritativeState {
                 state: result.new_state.clone(),
                 updated_at: Utc::now(),
             });
@@ -5310,14 +5319,14 @@ where
                     sequence_id: reserved_seqs[0],
                     created_at: phoenix_workflow::Timestamp(now),
                     accepted_state: self
-                        .proposed_direct_turn_state
+                        .proposed_authoritative_state
                         .as_ref()
                         .map(|proposed| proposed.state.clone())
                         .ok_or_else(|| {
                             "authoritative materialization missing proposed state".to_string()
                         })?,
                     state_updated_at: self
-                        .proposed_direct_turn_state
+                        .proposed_authoritative_state
                         .as_ref()
                         .map(|proposed| proposed.updated_at)
                         .ok_or_else(|| {
@@ -5366,7 +5375,7 @@ where
                         active,
                     } => {
                         let proposed = self
-                            .proposed_direct_turn_state
+                            .proposed_authoritative_state
                             .take()
                             .ok_or_else(|| "committed direct turn missing proposed state".to_string())?;
                         self.state = proposed.state;
@@ -5384,12 +5393,12 @@ where
                     | crate::runtime::traits::AuthoritativeUserMessageMaterialization::NotCommitted
                     | crate::runtime::traits::AuthoritativeUserMessageMaterialization::StaleAuthority
                     | crate::runtime::traits::AuthoritativeUserMessageMaterialization::CommandRejected => {
-                        self.proposed_direct_turn_state = None;
+                        self.proposed_authoritative_state = None;
                         self.direct_turn_materialization_aborted = true;
                         Ok(None)
                     }
                     crate::runtime::traits::AuthoritativeUserMessageMaterialization::DurableFactUnclassified => {
-                        self.proposed_direct_turn_state = None;
+                        self.proposed_authoritative_state = None;
                         Err("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:direct_turn_materialization"
                             .to_string())
                     }
@@ -8432,6 +8441,10 @@ where
         plan: String,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<(), String> {
+        let proposed = self
+            .proposed_authoritative_state
+            .clone()
+            .ok_or_else(|| "task approval missing proposed state".to_string())?;
         if matches!(
             self.context.mode_context.as_ref(),
             Some(ModeContext::DetachedApprovedTask { .. })
@@ -8476,8 +8489,8 @@ where
                         artifact_body: reviewed.artifact_body,
                     },
                     &approval_message,
-                    &self.state,
-                    self.state_updated_at,
+                    &proposed.state,
+                    proposed.updated_at,
                 )
                 .await
                 .inspect_err(|_| {
@@ -8487,6 +8500,9 @@ where
                 .broadcast_tx
                 .admitted_publication(admitted)
                 .persisted_message(approval_message);
+            self.state = proposed.state;
+            self.state_updated_at = proposed.updated_at;
+            self.publish_live_state_admitted();
             return Ok(());
         }
         let cwd = self.context.filesystem_root().to_path_buf();
@@ -8566,8 +8582,8 @@ where
                             artifact_body: approval_result.artifact_body.clone(),
                         },
                         &approval_message,
-                        &self.state,
-                        self.state_updated_at,
+                        &proposed.state,
+                        proposed.updated_at,
                     )
                     .await;
                 if let Err(error) = persist_result {
@@ -8646,6 +8662,9 @@ where
                         },
                     });
 
+                self.state = proposed.state;
+                self.state_updated_at = proposed.updated_at;
+                self.publish_live_state_admitted();
                 Ok(())
             }
             Err(e) => {
@@ -12340,7 +12359,7 @@ mod authoritative_user_message_effect_tests {
             },
         );
 
-        rt.proposed_direct_turn_state = Some(ProposedDirectTurnState {
+        rt.proposed_authoritative_state = Some(ProposedAuthoritativeState {
             state: ConvState::LlmRequesting { attempt: 1 },
             updated_at: Utc::now(),
         });
@@ -14340,7 +14359,7 @@ mod authoritative_user_message_effect_tests {
     }
 
     #[tokio::test]
-    async fn proposed_direct_turn_state_is_not_observable_before_materialization_returns() {
+    async fn proposed_authoritative_state_is_not_observable_before_materialization_returns() {
         let (mut rt, storage, mut broadcast_rx) = runtime(
             DirectTurnMaterializationEligibility::Fresh,
             AuthoritativeUserMessageMaterialization::Materialized {
@@ -15203,7 +15222,7 @@ mod authoritative_user_message_effect_tests {
             let (mut rt, storage, mut rx) =
                 runtime(DirectTurnMaterializationEligibility::Fresh, materialize);
 
-            rt.proposed_direct_turn_state = Some(ProposedDirectTurnState {
+            rt.proposed_authoritative_state = Some(ProposedAuthoritativeState {
                 state: ConvState::LlmRequesting { attempt: 1 },
                 updated_at: Utc::now(),
             });
@@ -16345,6 +16364,65 @@ mod approve_task_failure_effect_tests {
         ));
         assert_eq!(storage.get_all_messages(conv_id).len(), 1);
         drop(repo);
+    }
+
+    #[tokio::test]
+    async fn failed_approval_never_publishes_destination_state() {
+        let (_repo, repo_root) = init_repo();
+        let conv_id = "private-approval-proposal";
+        let tasks_dir = repo_root.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        let task_filename = "12345-p0-in-progress--private-approval.md";
+        std::fs::write(tasks_dir.join(task_filename), "Plan").unwrap();
+
+        let mut context = ConvContext::new(conv_id, repo_root.clone(), "test-model", 200_000);
+        context.mode_context = Some(ModeContext::DetachedApprovedTask {
+            base_branch: "main".to_string(),
+            worktree_path: repo_root.to_string_lossy().into_owned(),
+            task_id: "12345".to_string(),
+            task_title: "Private approval".to_string(),
+        });
+        let (_event_tx, event_rx) = mpsc::channel(32);
+        let storage = Arc::new(InMemoryStorage::new());
+        storage.set_fail_approved_task_authority(true);
+        let mut rt = ConversationRuntime::new(
+            context,
+            ConvState::AwaitingTaskApproval {
+                task_file: format!("tasks/{task_filename}"),
+                title: "Private approval".to_string(),
+                priority: crate::task_source::Priority::P0,
+                plan: "Plan".to_string(),
+            },
+            storage,
+            Arc::new(MockLlmClient::new("test-model")),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            mpsc::channel(1).0,
+            SseBroadcaster::new(128, 0),
+        )
+        .with_fatal_local_authority_fence(crate::runtime::FatalLocalAuthorityFence::new());
+        let (state_tx, state_rx) = watch::channel(rt.state.clone());
+        rt = rt.with_state_watcher(state_tx);
+
+        assert!(rt
+            .process_event(Event::TaskApprovalDecided {
+                outcome: TaskApprovalOutcome::Approved {
+                    handoff: TaskApprovalHandoff::ContinueInCurrentConversation,
+                },
+            })
+            .await
+            .is_err());
+        assert!(matches!(rt.state, ConvState::AwaitingTaskApproval { .. }));
+        assert!(matches!(
+            *state_rx.borrow(),
+            ConvState::AwaitingTaskApproval { .. }
+        ));
+        assert!(!state_rx.has_changed().unwrap());
     }
 
     #[tokio::test]
