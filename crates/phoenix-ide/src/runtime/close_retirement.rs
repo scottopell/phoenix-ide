@@ -8325,22 +8325,6 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn descriptor_scan_reports_unreadable_live_inventory_as_indeterminate() {
-        let temp = tempfile::tempdir().unwrap();
-        let quarantine = temp.path().join("quarantine");
-        let proc_root = temp.path().join("proc");
-        let ambient = proc_root.join("1273");
-        std::fs::create_dir_all(&ambient).unwrap();
-        std::fs::create_dir(&quarantine).unwrap();
-        write_synthetic_process_credentials(&ambient, 1273);
-        std::fs::write(ambient.join("fd"), b"not a descriptor directory").unwrap();
-
-        let error = super::quarantine_has_open_descriptors_in(&quarantine, &proc_root).unwrap_err();
-        assert!(error.contains("descriptor inventory"));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
     fn non_directory_descriptor_inventory_emits_safe_indeterminate_diagnostic() {
         let temp = tempfile::tempdir().unwrap();
         let quarantine = temp.path().join("quarantine");
