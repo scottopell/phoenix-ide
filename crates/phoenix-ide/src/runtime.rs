@@ -7618,16 +7618,231 @@ mod scope_liveness_tests {
         ));
     }
 
+    struct StartupCleanupPlanFixture {
+        manager: Arc<RuntimeManager>,
+        repository: tempfile::TempDir,
+        worktree: std::path::PathBuf,
+        attempt_id: CloseAttemptId,
+        scope: WorkScopeId,
+        snapshot: phoenix_core::domain::close::CloseRetirementSnapshot,
+        resource: phoenix_core::domain::close::RetiredResourceIdentity,
+    }
+
+    fn close_test_worktree(branch: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let repository = tempfile::tempdir().unwrap();
+        let git = |arguments: &[&str]| {
+            let output = phoenix_core::git::command()
+                .args(arguments)
+                .current_dir(repository.path())
+                .env("GIT_AUTHOR_NAME", "Close Test")
+                .env("GIT_AUTHOR_EMAIL", "close@example.invalid")
+                .env("GIT_COMMITTER_NAME", "Close Test")
+                .env("GIT_COMMITTER_EMAIL", "close@example.invalid")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {arguments:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--quiet"]);
+        std::fs::write(repository.path().join("tracked"), "initial\n").unwrap();
+        git(&["add", "tracked"]);
+        git(&["commit", "--quiet", "-m", "initial"]);
+        let worktree = repository.path().join("worktree");
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            branch,
+            worktree.to_str().unwrap(),
+        ]);
+        (repository, worktree)
+    }
+
+    async fn settle_close_before_retirement_inspection(
+        manager: &RuntimeManager,
+        attempt_id: &CloseAttemptId,
+    ) {
+        manager
+            .db()
+            .confirm_close_stop_work(attempt_id.as_str())
+            .await
+            .unwrap();
+        manager
+            .db()
+            .begin_close_active_work_settlement(attempt_id.as_str())
+            .await
+            .unwrap();
+        manager
+            .db()
+            .advance_close_settlement_when_quiescent(attempt_id.as_str())
+            .await
+            .unwrap();
+    }
+
+    async fn prepare_startup_cleanup_plan_fixture(
+        conversation_id: &str,
+        attempt: &str,
+        branch: &str,
+    ) -> StartupCleanupPlanFixture {
+        use phoenix_core::domain::close::{
+            LossItemIdentity, RetiredResourceIdentity, RetiredResourceKind,
+        };
+        use phoenix_db::RecordCloseRetirementDispatchRequest;
+
+        let manager = Arc::new(
+            test_manager()
+                .await
+                .with_test_no_ambient_writers(Arc::new(std::sync::atomic::AtomicUsize::new(0))),
+        );
+        let (repository, worktree) = close_test_worktree(branch);
+        let ResourceScopeKey::Work(scope) = create_handleless_work_conv(
+            &manager,
+            conversation_id,
+            worktree.to_str().unwrap(),
+            None,
+        )
+        .await
+        else {
+            unreachable!()
+        };
+        sqlx::query("UPDATE conversations SET user_initiated = 1 WHERE id = ?1")
+            .bind(conversation_id)
+            .execute(manager.db().pool())
+            .await
+            .unwrap();
+        let conversation = manager
+            .db()
+            .get_conversation(conversation_id)
+            .await
+            .unwrap();
+        let attempt_id = CloseAttemptId::parse(attempt).unwrap();
+        manager
+            .db()
+            .begin_close_foundation(
+                &conversation.product_conversation_id,
+                &TranscriptConversationId::parse(&conversation.id).unwrap(),
+                attempt_id.as_str(),
+            )
+            .await
+            .unwrap();
+        settle_close_before_retirement_inspection(&manager, &attempt_id).await;
+        let snapshot = manager
+            .inspect_close_retirement_only(attempt_id.clone())
+            .await
+            .unwrap();
+        manager
+            .capture_close_retirement_inventory(attempt_id.clone(), snapshot.clone())
+            .await
+            .unwrap();
+        let captured = manager
+            .db()
+            .list_close_attempt_scopes(attempt_id.as_str())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.scope == scope)
+            .unwrap();
+        let CapturedWorktreeIdentity::Resolved(worktree_identity) =
+            captured.captured_worktree.unwrap()
+        else {
+            panic!("test worktree identity must resolve");
+        };
+        let resource = RetiredResourceIdentity::parse(
+            RetiredResourceKind::Worktree,
+            LossItemIdentity::Worktree(worktree_identity),
+        )
+        .unwrap();
+        manager
+            .db()
+            .record_close_retirement_dispatch(RecordCloseRetirementDispatchRequest {
+                attempt_id: attempt_id.clone(),
+                scope: scope.clone(),
+                snapshot: snapshot.clone(),
+                resource: resource.clone(),
+            })
+            .await
+            .unwrap();
+        StartupCleanupPlanFixture {
+            manager,
+            repository,
+            worktree,
+            attempt_id,
+            scope,
+            snapshot,
+            resource,
+        }
+    }
+
+    async fn seed_exact_current_cleanup_plan(fixture: &StartupCleanupPlanFixture) {
+        use phoenix_db::RecordCloseWorktreeCleanupPlanRequest;
+
+        let admin_dir = close_retirement::exact_worktree_administrative_dir(
+            &fixture.worktree,
+            &fixture.repository.path().join(".git"),
+        )
+        .unwrap();
+        let admin_dir_incarnation =
+            close_retirement::observe_administrative_dir_incarnation(&admin_dir).unwrap();
+        fixture
+            .manager
+            .db()
+            .record_close_worktree_cleanup_plan(RecordCloseWorktreeCleanupPlanRequest {
+                attempt_id: fixture.attempt_id.clone(),
+                scope: fixture.scope.clone(),
+                snapshot: fixture.snapshot.clone(),
+                resource: fixture.resource.clone(),
+                administrative_dir: admin_dir,
+                administrative_dir_incarnation: admin_dir_incarnation,
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_reuses_interrupted_initial_cleanup_plan_without_adoption_repair() {
+        let fixture = prepare_startup_cleanup_plan_fixture(
+            "startup-initial-cleanup-plan",
+            "startup-initial-cleanup-plan-attempt",
+            "startup-initial-cleanup-plan",
+        )
+        .await;
+        seed_exact_current_cleanup_plan(&fixture).await;
+
+        fixture
+            .manager
+            .resume_close_runtime_resources_on_startup(fixture.attempt_id.clone())
+            .await
+            .unwrap();
+
+        let adoptions: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_worktree_cleanup_adoptions WHERE attempt_id = ?1",
+        )
+        .bind(fixture.attempt_id.as_str())
+        .fetch_one(fixture.manager.db().pool())
+        .await
+        .unwrap();
+        assert_eq!(adoptions, 0);
+        assert!(fixture
+            .manager
+            .db()
+            .close_needs_repair_cause(&fixture.attempt_id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
-    async fn startup_adoption_conflict_routes_exact_worktree_to_repair_once() {
+    async fn startup_mismatched_current_cleanup_plan_fails_closed_without_adoption_repair() {
         use phoenix_core::domain::close::{
-            ClosePhase, LossItemIdentity, RetiredResourceIdentity, RetiredResourceKind,
-            RetirementOutcome,
+            LossItemIdentity, RetiredResourceIdentity, RetiredResourceKind,
         };
         use phoenix_db::{
-            CloseNeedsRepairCause, RecordCloseRetirementDispatchRequest,
-            RecordCloseWorktreeCleanupPlanRequest,
+            RecordCloseRetirementDispatchRequest, RecordCloseWorktreeCleanupPlanRequest,
         };
 
         let manager = Arc::new(test_manager().await);
@@ -7854,16 +8069,10 @@ mod scope_liveness_tests {
         let error = manager
             .resume_close_runtime_resources_on_startup(attempt_id.clone())
             .await
-            .expect_err("conflicting retained cleanup authority must fail startup resume");
+            .expect_err("mismatched current cleanup authority must fail startup resume");
         assert!(
-            matches!(
-                error,
-                close_retirement::CloseRetirementError::EvidenceInvariant {
-                    ref invariant,
-                    ref relation,
-                } if invariant == "idempotent_target_cleanup_plan_matches_source"
-                    && relation == "close_worktree_cleanup_plans"
-            ),
+            matches!(error, close_retirement::CloseRetirementError::Message(ref message)
+                if message.contains("administrative directory differs from durable cleanup plan")),
             "unexpected startup resume error: {error:?}"
         );
         let obligation = manager
@@ -7871,43 +8080,13 @@ mod scope_liveness_tests {
             .get_close_obligation(attempt_id.as_str())
             .await
             .unwrap();
-        assert_eq!(obligation.phase(), ClosePhase::NeedsRepair);
         assert_eq!(obligation.snapshot(), Some(&target_snapshot));
-        assert_eq!(
-            manager
-                .db()
-                .close_needs_repair_cause(&attempt_id)
-                .await
-                .unwrap(),
-            Some(
-                CloseNeedsRepairCause::evidence_invariant(
-                    "idempotent_target_cleanup_plan_matches_source",
-                    "close_worktree_cleanup_plans",
-                )
-                .unwrap()
-            )
-        );
-        let evidence = manager
+        assert!(manager
             .db()
-            .list_close_retirement_evidence(attempt_id.as_str())
+            .close_needs_repair_cause(&attempt_id)
             .await
-            .unwrap();
-        assert_eq!(evidence.len(), 1);
-        assert_eq!(evidence[0].scope, scope);
-        assert_eq!(evidence[0].resource, resource);
-        assert_eq!(
-            evidence[0].outcome,
-            RetirementOutcome::Residual {
-                residual_reason:
-                    phoenix_core::domain::close::RetirementFailureReason::ManualRepairRequired,
-            }
-        );
-        assert_eq!(
-            evidence[0].detail.as_deref(),
-            Some(
-                "Close evidence invariant idempotent_target_cleanup_plan_matches_source failed in close_worktree_cleanup_plans"
-            )
-        );
+            .unwrap()
+            .is_none());
         let mutation_counts = || async {
             sqlx::query_as::<_, (i64, i64, i64, i64)>(
                 "SELECT
@@ -7922,7 +8101,8 @@ mod scope_liveness_tests {
             .unwrap()
         };
         let after_first = mutation_counts().await;
-        assert_eq!(after_first, (0, 1, 1, 1));
+        assert_eq!(after_first.0, 0);
+        assert_eq!(after_first.3, 0);
         assert!(quarantine.exists());
         assert!(!worktree.exists());
         assert!(
@@ -7940,7 +8120,6 @@ mod scope_liveness_tests {
                 .await
                 .unwrap();
         assert_eq!(scope_lifecycle, "active");
-        assert_eq!(observer_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         let retained_plan: (String, String) = sqlx::query_as(
             "SELECT administrative_dir_value, administrative_dir_incarnation
              FROM close_worktree_cleanup_plans
@@ -7954,31 +8133,23 @@ mod scope_liveness_tests {
         .unwrap();
         assert_eq!(retained_plan.1, "conflicting-admin-incarnation");
 
-        assert_eq!(
-            manager
-                .resume_pending_close_runtime_retirements()
-                .await
-                .unwrap(),
-            0,
-            "NeedsRepair must not be startup-admitted"
+        let second_error = manager
+            .resume_close_runtime_resources_on_startup(attempt_id.clone())
+            .await
+            .expect_err("mismatched current cleanup authority remains fail-closed");
+        assert!(
+            matches!(second_error, close_retirement::CloseRetirementError::Message(ref message)
+                if message.contains("administrative directory differs from durable cleanup plan")),
+            "unexpected second startup resume error: {second_error:?}"
         );
         assert_eq!(mutation_counts().await, after_first);
-        assert_eq!(
-            manager
-                .db()
-                .close_needs_repair_cause(&attempt_id)
-                .await
-                .unwrap(),
-            Some(
-                CloseNeedsRepairCause::evidence_invariant(
-                    "idempotent_target_cleanup_plan_matches_source",
-                    "close_worktree_cleanup_plans",
-                )
-                .unwrap()
-            )
-        );
+        assert!(manager
+            .db()
+            .close_needs_repair_cause(&attempt_id)
+            .await
+            .unwrap()
+            .is_none());
         assert!(quarantine.exists());
-        assert_eq!(observer_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[allow(clippy::too_many_lines)]
