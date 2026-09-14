@@ -79,19 +79,20 @@ type ProductConversationOpenMeasurement = {
   startedAt: number;
   snapshotReceivedAt?: number;
   storeReadyAt?: number;
+  initiallyVisible: boolean;
   reported: boolean;
 };
 
-function reportProductConversationOpen(measurement: ProductConversationOpenMeasurement, paintedAt: number): void {
+function reportProductConversationOpen(measurement: ProductConversationOpenMeasurement, paintedAt: number | null): void {
   if (measurement.reported || measurement.snapshotReceivedAt === undefined || measurement.storeReadyAt === undefined) return;
   measurement.reported = true;
   void api.reportProductConversationOpen({
     open_id: measurement.openId,
     snapshot_received_ms: measurement.snapshotReceivedAt - measurement.startedAt,
     store_ready_ms: measurement.storeReadyAt - measurement.startedAt,
-    first_paint_ms: paintedAt - measurement.startedAt,
+    first_paint_ms: paintedAt === null ? null : paintedAt - measurement.startedAt,
     total_ms: performance.now() - measurement.startedAt,
-    visible: document.visibilityState === 'visible',
+    visible: measurement.initiallyVisible,
   }).catch(() => {});
 }
 
@@ -759,6 +760,7 @@ function ProductConversationPageInner() {
       routeReference: productConversationId,
       request: undefined,
       startedAt: performance.now(),
+      initiallyVisible: document.visibilityState === 'visible',
       reported: false,
     } : null;
   }
@@ -802,7 +804,11 @@ function ProductConversationPageInner() {
     setError(null);
     setOlderError(null);
 
-    const measurement = isBackgroundRefresh ? null : openMeasurementRef.current;
+    const candidateMeasurement = openMeasurementRef.current;
+    const measurement = candidateMeasurement && !candidateMeasurement.reported
+      && candidateMeasurement.snapshotReceivedAt === undefined
+      ? candidateMeasurement
+      : null;
     const request = measurement
       ? (measurement.request ??= api.getProductConversationSnapshot(productConversationId, {
           message_limit: PAGE_SIZE,
@@ -1001,6 +1007,10 @@ function ProductConversationPageInner() {
     const measurement = openMeasurementRef.current;
     if (!measurement || measurement.reported || !initialSnapshotReady) return;
     measurement.storeReadyAt ??= performance.now();
+    if (!measurement.initiallyVisible) {
+      reportProductConversationOpen(measurement, null);
+      return;
+    }
     let reportFrame = 0;
     const paintFrame = requestAnimationFrame(() => {
       reportFrame = requestAnimationFrame((paintedAt) => {

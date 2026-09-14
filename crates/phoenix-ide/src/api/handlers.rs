@@ -2920,10 +2920,19 @@ mod conversation_open_telemetry_tests {
                 .unwrap()
                 .has_valid_bounds()
         );
+        let mut hidden = valid.clone();
+        hidden["first_paint_ms"] = serde_json::Value::Null;
+        hidden["visible"] = serde_json::json!(false);
+        assert!(
+            serde_json::from_value::<super::ProductConversationOpenTelemetry>(hidden)
+                .unwrap()
+                .has_valid_bounds()
+        );
         for (field, value) in [
             ("store_ready_ms", serde_json::json!(9.0)),
             ("first_paint_ms", serde_json::json!(11.0)),
             ("total_ms", serde_json::json!(15.0)),
+            ("visible", serde_json::json!(false)),
         ] {
             let mut invalid = valid.clone();
             invalid[field] = value;
@@ -3025,7 +3034,7 @@ struct ProductConversationOpenTelemetry {
     open_id: uuid::Uuid,
     snapshot_received_ms: f64,
     store_ready_ms: f64,
-    first_paint_ms: f64,
+    first_paint_ms: Option<f64>,
     total_ms: f64,
     visible: bool,
 }
@@ -3036,11 +3045,13 @@ impl ProductConversationOpenTelemetry {
         let valid = |value: f64| value.is_finite() && (0.0..=MAX_DURATION_MS).contains(&value);
         valid(self.snapshot_received_ms)
             && valid(self.store_ready_ms)
-            && valid(self.first_paint_ms)
+            && self.first_paint_ms.is_none_or(valid)
             && valid(self.total_ms)
             && self.snapshot_received_ms <= self.store_ready_ms
-            && self.store_ready_ms <= self.first_paint_ms
-            && self.first_paint_ms <= self.total_ms
+            && (self.first_paint_ms.is_some() == self.visible)
+            && self.first_paint_ms.is_none_or(|first_paint| {
+                self.store_ready_ms <= first_paint && first_paint <= self.total_ms
+            })
     }
 }
 
@@ -3056,10 +3067,13 @@ async fn report_product_conversation_open(
         "open.id" = %report.open_id,
         "browser.snapshot_received_ms" = report.snapshot_received_ms,
         "browser.store_ready_ms" = report.store_ready_ms,
-        "browser.first_paint_ms" = report.first_paint_ms,
+        "browser.first_paint_ms" = tracing::field::Empty,
         "browser.total_ms" = report.total_ms,
         "browser.visible" = report.visible,
     );
+    if let Some(first_paint_ms) = report.first_paint_ms {
+        span.record("browser.first_paint_ms", first_paint_ms);
+    }
     let _entered = span.enter();
     StatusCode::NO_CONTENT
 }

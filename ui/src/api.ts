@@ -1741,7 +1741,7 @@ export const api = {
     open_id: string;
     snapshot_received_ms: number;
     store_ready_ms: number;
-    first_paint_ms: number;
+    first_paint_ms: number | null;
     total_ms: number;
     visible: boolean;
   }): Promise<void> {

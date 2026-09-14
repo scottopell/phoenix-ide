@@ -383,6 +383,19 @@ describe('ProductConversationPage', () => {
     });
   });
 
+  it('reports hidden-at-start opens without waiting for or fabricating paint', async () => {
+    const { api } = await import('../api');
+    const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden');
+    renderPage('/product-conversations/pc-hidden');
+    await waitForPageReady();
+    await waitFor(() => expect(api.reportProductConversationOpen).toHaveBeenCalledTimes(1));
+    expect(api.reportProductConversationOpen).toHaveBeenCalledWith(expect.objectContaining({
+      first_paint_ms: null,
+      visible: false,
+    }));
+    visibility.mockRestore();
+  });
+
   it('ignores a stale initial snapshot and open report after a route switch', async () => {
     const { api } = await import('../api');
     let resolveFirst: ((snapshot: ProductConversationSnapshotView) => void) | undefined;
@@ -403,6 +416,18 @@ describe('ProductConversationPage', () => {
     await Promise.resolve();
     expect(screen.queryByRole('heading', { name: 'Stale Alpha' })).not.toBeInTheDocument();
     expect(api.reportProductConversationOpen).toHaveBeenCalledTimes(1);
+  });
+
+  it('starts a new measured open when revisiting a cached product route', async () => {
+    const { api } = await import('../api');
+    renderPage('/product-conversations/pc-1', true);
+    await waitForPageReady();
+    const firstOpenId = vi.mocked(api.getProductConversationSnapshot).mock.calls[0]?.[1]?.open_id;
+    fireEvent.click(screen.getByRole('button', { name: 'open second product' }));
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(2));
+    const secondOpenId = vi.mocked(api.getProductConversationSnapshot).mock.calls[1]?.[1]?.open_id;
+    expect(secondOpenId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(secondOpenId).not.toBe(firstOpenId);
   });
 
   it('reuses one open id across StrictMode effect replay', async () => {
@@ -448,6 +473,8 @@ describe('ProductConversationPage', () => {
     expect(report).toBeDefined();
     if (!report) throw new Error('expected product conversation open report');
     expect(report.snapshot_received_ms).toBeLessThanOrEqual(report.store_ready_ms);
+    expect(report.first_paint_ms).not.toBeNull();
+    if (report.first_paint_ms === null) throw new Error('expected visible first paint');
     expect(report.store_ready_ms).toBeLessThanOrEqual(report.first_paint_ms);
     expect(report.first_paint_ms).toBeLessThanOrEqual(report.total_ms);
   });

@@ -179,12 +179,14 @@ pub async fn get_product_conversation(
                 snapshot.messages,
             )
             .instrument(tracing::info_span!(
+                target: "phoenix_ide::otel",
                 "product_conversation.post_snapshot_projection"
             ))
             .await?,
         ))
     }
     .instrument(tracing::info_span!(
+        target: "phoenix_ide::otel",
         "product_conversation.detail_get",
         "open.id" = open_id.map(|id| id.to_string()).as_deref(),
     ))
