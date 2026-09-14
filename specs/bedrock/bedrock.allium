@@ -1158,6 +1158,11 @@ rule UserApprovesTaskCurrentConversation {
         -- continuation topology, provenance, or branch/worktree state beyond the
         -- approval checkpoint itself.
         --
+        -- The approval adoption operation is the sole persistence owner for the
+        -- destination state, approved objective, Work authority, and approval
+        -- context message. They commit in one transaction before runtime capability
+        -- publication; no later generic state write repeats that committed state.
+        --
         -- ApprovalRereadSnapshot / ApprovalMatchesReviewedSnapshot bind approval to
         -- the reviewed repo-relative path, task kind, and content digest. The
         -- reread body may only be approved when all three still match the reviewed
