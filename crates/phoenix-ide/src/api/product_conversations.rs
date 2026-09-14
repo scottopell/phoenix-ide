@@ -7,6 +7,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use phoenix_core::domain::close::TranscriptConversationId;
 use phoenix_core::domain::product_conversation::OrdinaryProductConversationLifecycle;
 use serde::{Deserialize, Serialize};
+use tracing::Instrument;
 
 use super::handlers::AppError;
 use super::types::{
@@ -37,6 +38,7 @@ const PRODUCT_CONVERSATION_ROUTE_PREFIX: &str = "/product-conversations/";
 pub struct SnapshotQuery {
     pub before: Option<String>,
     pub message_limit: Option<usize>,
+    pub open_id: Option<uuid::Uuid>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -133,49 +135,60 @@ pub async fn get_product_conversation(
     Path(reference): Path<String>,
     Query(query): Query<SnapshotQuery>,
 ) -> Result<Json<ProductConversationSnapshotView>, AppError> {
-    let message_limit = message_limit(query.message_limit)?;
-    let cursor = query.before.as_deref().map(decode_cursor).transpose()?;
-    let segment_ceilings = cursor.as_ref().map(|cursor| {
-        cursor
-            .segment_ceilings
-            .iter()
-            .map(|ceiling| ProductConversationSegmentCeiling {
-                transcript_row_id: ceiling.transcript_row_id.clone(),
-                tail_sequence_id: ceiling.tail_sequence_id,
-                tail_message_id: ceiling.tail_message_id.clone(),
-            })
-            .collect::<Vec<_>>()
-    });
-    let snapshot = state
-        .db
-        .read_ordinary_product_conversation_snapshot(
-            &reference,
-            cursor.as_ref().map(|cursor| {
-                (
-                    cursor.before_segment_ordinal,
-                    cursor.before_sequence_id,
-                    cursor.before_message_id.clone(),
-                )
-            }),
-            segment_ceilings.as_deref(),
-            message_limit + 1,
-        )
-        .await
-        .map_err(db_to_app)?;
-    if let Some(cursor) = &cursor {
-        validate_cursor(&snapshot.aggregate, cursor)?;
+    let open_id = query.open_id;
+    async move {
+        let message_limit = message_limit(query.message_limit)?;
+        let cursor = query.before.as_deref().map(decode_cursor).transpose()?;
+        let segment_ceilings = cursor.as_ref().map(|cursor| {
+            cursor
+                .segment_ceilings
+                .iter()
+                .map(|ceiling| ProductConversationSegmentCeiling {
+                    transcript_row_id: ceiling.transcript_row_id.clone(),
+                    tail_sequence_id: ceiling.tail_sequence_id,
+                    tail_message_id: ceiling.tail_message_id.clone(),
+                })
+                .collect::<Vec<_>>()
+        });
+        let snapshot = state
+            .db
+            .read_ordinary_product_conversation_snapshot(
+                &reference,
+                cursor.as_ref().map(|cursor| {
+                    (
+                        cursor.before_segment_ordinal,
+                        cursor.before_sequence_id,
+                        cursor.before_message_id.clone(),
+                    )
+                }),
+                segment_ceilings.as_deref(),
+                message_limit + 1,
+            )
+            .await
+            .map_err(db_to_app)?;
+        if let Some(cursor) = &cursor {
+            validate_cursor(&snapshot.aggregate, cursor)?;
+        }
+        Ok(Json(
+            snapshot_view(
+                &state,
+                snapshot.aggregate,
+                snapshot.requested_transcript_row_id,
+                cursor,
+                message_limit,
+                snapshot.messages,
+            )
+            .instrument(tracing::info_span!(
+                "product_conversation.post_snapshot_projection"
+            ))
+            .await?,
+        ))
     }
-    Ok(Json(
-        snapshot_view(
-            &state,
-            snapshot.aggregate,
-            snapshot.requested_transcript_row_id,
-            cursor,
-            message_limit,
-            snapshot.messages,
-        )
-        .await?,
+    .instrument(tracing::info_span!(
+        "product_conversation.detail_get",
+        "open.id" = open_id.map(|id| id.to_string()).as_deref(),
     ))
+    .await
 }
 
 fn canonical_route(aggregate: &ProductConversationAggregate) -> String {

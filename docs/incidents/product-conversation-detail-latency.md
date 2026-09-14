@@ -2,9 +2,10 @@
 
 ## Incident evidence
 
-After deploying `ce66022db`, successful `GET /api/product-conversations/:reference`
-requests from 12:12–12:51Z had 100 samples: median 3,735 ms, p95 7,603 ms,
-and maximum 8,453 ms. The immutable source files are
+After deploying `ce66022db`, browser-observed successful
+`GET /api/product-conversations/:reference` requests from 12:12–12:51Z had 100
+samples: median 3,735 ms, p95 7,603 ms, and maximum 8,453 ms. These timings
+include browser/network effects and do not attribute production server stages. The immutable source files are
 `/tmp/phoenix-open-perf.ikefq5/http-samples.json` and `errors.json`; their
 SHA-256 digests were recorded before diagnosis:
 `a623926f389bb0850c0486f771aad0e571607a03765ff6f55196798cfbf74f0d` for
@@ -94,10 +95,10 @@ The candidate cold total is 41.006 ms. Warm p50/nearest-rank p95 are
 0.063/0.232 ms resolve, 14.848/16.754 ms aggregate, 25.455/34.123 ms page, and
 40.391/50.021 ms total.
 The page p50 falls 71%, and total p50 falls 61%, while aggregate hydration is
-unchanged within run noise. The production multi-second scale is consistent
-with the globally scanning plan under a 3.8 GiB, concurrently used database;
-browser/network and continuation-summary changes do not explain server-measured
-successful GET duration.
+unchanged within run noise. The local result proves the planner cliff and the bounded benefit on the
+representative fixture; it is not proof that this stage explains the
+browser-observed multi-second production duration. Production server-stage and
+browser store-to-first-paint attribution remain required.
 
 ## Bounded fix plan
 
@@ -115,12 +116,20 @@ successful GET duration.
 
 ## Remaining end-to-end stages
 
-The supplied evidence measures server HTTP duration, and the local fixture
-separates the transaction's SQLite stages. After that transaction,
+The supplied evidence measures browser-observed HTTP duration, and the local
+fixture separates the transaction's SQLite stages only in the local environment. After that transaction,
 `snapshot_view` performs close-projection, source-deletion, and writable-row
 lookups before serialization; these were not separable in the supplied capture.
-It also does not contain response-byte, serialization, SSE/store, or browser
-first-paint marks. Those stages remain unclaimed rather than being inferred from
-unrelated readiness work. Privacy-safe `open.id` plus
-durable product reference are the intended correlation keys for future traces;
-content and secrets are excluded.
+It also does not separate production pool wait, response-byte serialization,
+network transfer, browser store readiness, or first paint. Those stages remain
+unclaimed rather than being inferred from unrelated readiness work. Phoenix iOS
+is excluded because it is not a stable performance evidence surface. The implemented attribution surface passes an opaque UUID `open.id` on the
+initial detail request. The server records the resolved durable ProductConversation
+reference on the snapshot span; the later browser report carries only `open.id`,
+so it cannot inject or leak a route slug into telemetry.
+Server child spans separate pool wait, deferred transaction start, resolution,
+aggregate hydration, bounded page/attachment hydration, rollback, and
+post-snapshot projection. One bounded browser report adds snapshot receipt,
+committed store readiness, and first-paint offsets for the same open. Older-page
+loads and background refreshes do not create initial-open reports. Content, SQL,
+credentials, paths, and unbounded labels are excluded.

@@ -225,6 +225,10 @@ pub fn create_router(state: AppState) -> Router {
             "/api/telemetry/conversation-open",
             post(report_conversation_open),
         )
+        .route(
+            "/api/telemetry/product-conversation-open",
+            post(report_product_conversation_open),
+        )
         // Terminal WebSocket (REQ-TERM-001 through REQ-TERM-014)
         .route("/api/conversations/:id/terminal", get(terminal_ws_handler))
         // Global terminal WebSocket — singleton scope, unbound to any
@@ -2902,6 +2906,36 @@ mod conversation_open_telemetry_tests {
     use super::ConversationOpenTelemetry;
 
     #[test]
+    fn product_conversation_open_requires_bounded_ordered_phases() {
+        let valid = serde_json::json!({
+            "open_id": "550e8400-e29b-41d4-a716-446655440000",
+            "snapshot_received_ms": 10.0,
+            "store_ready_ms": 12.0,
+            "first_paint_ms": 16.0,
+            "total_ms": 17.0,
+            "visible": true
+        });
+        assert!(
+            serde_json::from_value::<super::ProductConversationOpenTelemetry>(valid.clone())
+                .unwrap()
+                .has_valid_bounds()
+        );
+        for (field, value) in [
+            ("store_ready_ms", serde_json::json!(9.0)),
+            ("first_paint_ms", serde_json::json!(11.0)),
+            ("total_ms", serde_json::json!(15.0)),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = value;
+            assert!(
+                !serde_json::from_value::<super::ProductConversationOpenTelemetry>(invalid)
+                    .unwrap()
+                    .has_valid_bounds()
+            );
+        }
+    }
+
+    #[test]
     fn rejects_unknown_network_effective_types() {
         let report = r#"{
             "open_id":"550e8400-e29b-41d4-a716-446655440000",
@@ -2984,6 +3018,50 @@ mod conversation_open_telemetry_tests {
                 .has_valid_bounds());
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct ProductConversationOpenTelemetry {
+    open_id: uuid::Uuid,
+    snapshot_received_ms: f64,
+    store_ready_ms: f64,
+    first_paint_ms: f64,
+    total_ms: f64,
+    visible: bool,
+}
+
+impl ProductConversationOpenTelemetry {
+    fn has_valid_bounds(&self) -> bool {
+        const MAX_DURATION_MS: f64 = 300_000.0;
+        let valid = |value: f64| value.is_finite() && (0.0..=MAX_DURATION_MS).contains(&value);
+        valid(self.snapshot_received_ms)
+            && valid(self.store_ready_ms)
+            && valid(self.first_paint_ms)
+            && valid(self.total_ms)
+            && self.snapshot_received_ms <= self.store_ready_ms
+            && self.store_ready_ms <= self.first_paint_ms
+            && self.first_paint_ms <= self.total_ms
+    }
+}
+
+async fn report_product_conversation_open(
+    Json(report): Json<ProductConversationOpenTelemetry>,
+) -> StatusCode {
+    if !report.has_valid_bounds() {
+        return StatusCode::BAD_REQUEST;
+    }
+    let span = tracing::info_span!(
+        target: "phoenix_ide::otel",
+        "browser.product_conversation_open",
+        "open.id" = %report.open_id,
+        "browser.snapshot_received_ms" = report.snapshot_received_ms,
+        "browser.store_ready_ms" = report.store_ready_ms,
+        "browser.first_paint_ms" = report.first_paint_ms,
+        "browser.total_ms" = report.total_ms,
+        "browser.visible" = report.visible,
+    );
+    let _entered = span.enter();
+    StatusCode::NO_CONTENT
 }
 
 async fn report_conversation_open(Json(report): Json<ConversationOpenTelemetry>) -> StatusCode {

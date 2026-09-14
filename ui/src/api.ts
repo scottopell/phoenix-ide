@@ -1737,9 +1737,26 @@ export const api = {
     if (!resp.ok) throw new Error('Failed to delete product creation');
   },
 
+  async reportProductConversationOpen(report: {
+    open_id: string;
+    snapshot_received_ms: number;
+    store_ready_ms: number;
+    first_paint_ms: number;
+    total_ms: number;
+    visible: boolean;
+  }): Promise<void> {
+    const resp = await fetch('/api/telemetry/product-conversation-open', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(report),
+      keepalive: true,
+    });
+    if (!resp.ok) throw new Error(await errorMessageFromResponse(resp, 'Failed to report product conversation open'));
+  },
+
   async getProductConversationSnapshot(
     productConversationId: string,
-    options?: { message_limit?: number; before?: string | null },
+    options?: { message_limit?: number; before?: string | null; open_id?: string },
   ): Promise<ProductConversationSnapshotViewType> {
     const params = new URLSearchParams();
     if (typeof options?.message_limit === 'number') {
@@ -1747,6 +1764,9 @@ export const api = {
     }
     if (typeof options?.before === 'string' && options.before.length > 0) {
       params.set('before', options.before);
+    }
+    if (typeof options?.open_id === 'string' && options.open_id.length > 0) {
+      params.set('open_id', options.open_id);
     }
     const query = params.toString();
     const resp = await fetch(

@@ -294,3 +294,17 @@ WHEN the request lacks a valid capability token
 THE SYSTEM SHALL reject it with `403` (the endpoint is exempt from the password middleware; the token is the sole gate)
 
 The endpoint's behaviour, auth model, and token lifecycle are specified in `specs/command-suggestion` (REQ-CSUG-001/002/003/004); this requirement records its place in the HTTP surface.
+
+### REQ-API-028: ProductConversation open-stage correlation
+
+WHEN the browser successfully completes an initial ProductConversation detail open
+THE SYSTEM SHALL assign an opaque per-open identifier and pass it with the detail request
+AND SHALL emit content-free server stage telemetry for pool wait, read-transaction start, reference resolution, aggregate hydration, bounded message-page hydration, read rollback, post-snapshot projection, and total detail handling
+AND SHALL correlate the detail request's server stages by the opaque open identifier and server-resolved durable product reference
+AND SHALL correlate the browser snapshot receipt, committed store readiness, and first-paint timing to that detail request by the opaque open identifier
+AND SHALL validate that browser durations are finite, non-negative, ordered, and no greater than five minutes
+AND SHALL permit only the opaque open identifier and server-resolved durable product reference as high-cardinality trace correlation attributes
+AND SHALL NOT emit message content, SQL text, credentials, filesystem paths, caller-defined trace attributes, or dynamic metric labels in this telemetry.
+
+WHEN the browser loads older ProductConversation pages or performs a background refresh
+THE SYSTEM SHALL NOT create an additional initial-open journey report.

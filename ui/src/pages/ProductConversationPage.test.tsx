@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { useEffect } from 'react';
+import { StrictMode, useEffect } from 'react';
 import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom';
 import { ProductConversationPage } from './ProductConversationPage';
 import { buildHistoricalUnits } from '../conversation/renderUnits';
@@ -174,6 +174,7 @@ vi.mock('../api', async () => {
     api: {
       ...actual.api,
       getProductConversationSnapshot: vi.fn(),
+      reportProductConversationOpen: vi.fn().mockResolvedValue(undefined),
       getPrStatus: vi.fn(),
       getChain: vi.fn(),
       submitChainQuestion: vi.fn(),
@@ -296,8 +297,8 @@ function NavigateToSecondProduct() {
   return <button onClick={() => navigate('/product-conversations/pc-2')}>open second product</button>;
 }
 
-function renderPage(initialEntry = '/product-conversations/pc-1', withRouteSwitch = false) {
-  return render(
+function renderPage(initialEntry = '/product-conversations/pc-1', withRouteSwitch = false, strict = false) {
+  const content = (
     <ConversationReadinessProvider>
       <MemoryRouter initialEntries={[initialEntry]}>
         <ViewerSlotProvider browserSessionActive={false}>
@@ -311,8 +312,9 @@ function renderPage(initialEntry = '/product-conversations/pc-1', withRouteSwitc
           </ChainProvider>
         </ViewerSlotProvider>
       </MemoryRouter>
-    </ConversationReadinessProvider>,
+    </ConversationReadinessProvider>
   );
+  return render(strict ? <StrictMode>{content}</StrictMode> : content);
 }
 
 function emitLatestProjection(overrides: Partial<Record<string, unknown>> = {}) {
@@ -368,6 +370,7 @@ describe('ProductConversationPage', () => {
     const { api } = await import('../api');
     vi.mocked(api.getProductConversationSnapshot).mockReset();
     vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(makeSnapshot());
+    vi.mocked(api.reportProductConversationOpen).mockClear();
     vi.mocked(api.getChain).mockReset();
     vi.mocked(api.getChain).mockResolvedValue(makeChain());
     vi.mocked(api.submitChainQuestion).mockReset();
@@ -378,6 +381,73 @@ describe('ProductConversationPage', () => {
       refresh: { state: 'fresh', stale: false, last_attempted_at: '2026-01-01T00:00:00Z' },
       work_change: { kind: 'clean' },
     });
+  });
+
+  it('ignores a stale initial snapshot and open report after a route switch', async () => {
+    const { api } = await import('../api');
+    let resolveFirst: ((snapshot: ProductConversationSnapshotView) => void) | undefined;
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveFirst = resolve; }))
+      .mockResolvedValueOnce(makeSnapshot({
+        product_conversation_id: 'pc-2',
+        canonical_route: '/product-conversations/pc-2',
+        presentation: { kind: 'state', display_name: 'Product Beta', presentation_mode: 'idle' },
+      }));
+    renderPage('/product-conversations/pc-1', true);
+    await waitFor(() => expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole('button', { name: 'open second product' }));
+    expect(await screen.findByRole('heading', { name: 'Product Beta' })).toBeInTheDocument();
+
+    await waitFor(() => expect(api.reportProductConversationOpen).toHaveBeenCalledTimes(1));
+    act(() => resolveFirst?.(makeSnapshot({ presentation: { kind: 'state', display_name: 'Stale Alpha', presentation_mode: 'idle' } })));
+    await Promise.resolve();
+    expect(screen.queryByRole('heading', { name: 'Stale Alpha' })).not.toBeInTheDocument();
+    expect(api.reportProductConversationOpen).toHaveBeenCalledTimes(1);
+  });
+
+  it('reuses one open id across StrictMode effect replay', async () => {
+    const { api } = await import('../api');
+    renderPage('/product-conversations/pc-strict', false, true);
+    await waitForPageReady();
+    const correlatedCalls = vi.mocked(api.getProductConversationSnapshot).mock.calls
+      .map(([, options]) => options?.open_id)
+      .filter(Boolean);
+    expect(api.getProductConversationSnapshot).toHaveBeenCalledTimes(1);
+    expect(new Set(correlatedCalls).size).toBe(1);
+    await waitFor(() => expect(api.reportProductConversationOpen).toHaveBeenCalledTimes(1));
+  });
+
+  it('reuses the open correlation when an initial snapshot retry succeeds', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockRejectedValueOnce(new Error('temporary failure'))
+      .mockResolvedValueOnce(makeSnapshot());
+    renderPage('/product-conversations/pc-retry');
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('temporary failure');
+    const firstOpenId = vi.mocked(api.getProductConversationSnapshot).mock.calls[0]?.[1]?.open_id;
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    await waitForPageReady();
+    expect(vi.mocked(api.getProductConversationSnapshot).mock.calls[1]?.[1]?.open_id).toBe(firstOpenId);
+    await waitFor(() => expect(api.reportProductConversationOpen).toHaveBeenCalledTimes(1));
+  });
+
+  it('correlates the initial snapshot with one bounded browser readiness report', async () => {
+    const { api } = await import('../api');
+    renderPage('/product-conversations/pc-telemetry');
+    await waitForPageReady();
+
+    const initialOptions = vi.mocked(api.getProductConversationSnapshot).mock.calls[0]?.[1];
+    expect(initialOptions?.open_id).toMatch(/^[0-9a-f-]{36}$/);
+    await waitFor(() => expect(api.reportProductConversationOpen).toHaveBeenCalledTimes(1));
+    expect(api.reportProductConversationOpen).toHaveBeenCalledWith(expect.objectContaining({
+      open_id: initialOptions?.open_id,
+      visible: true,
+    }));
+    const report = vi.mocked(api.reportProductConversationOpen).mock.calls[0]?.[0];
+    expect(report.snapshot_received_ms).toBeLessThanOrEqual(report.store_ready_ms);
+    expect(report.store_ready_ms).toBeLessThanOrEqual(report.first_paint_ms);
+    expect(report.first_paint_ms).toBeLessThanOrEqual(report.total_ms);
   });
 
   it('reconciles an aligned SSE prefix into monotonic latest-row chronology', async () => {

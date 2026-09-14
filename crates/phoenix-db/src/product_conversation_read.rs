@@ -6,6 +6,7 @@ use phoenix_core::domain::product_conversation::{
 use phoenix_core::work_scope::RuntimeRole;
 use serde::Serialize;
 use sqlx::{Executor, Row, SqliteConnection};
+use tracing::Instrument;
 
 use crate::{Database, DbError, DbResult, MessageContent, MessageType};
 
@@ -550,15 +551,29 @@ impl Database {
         segment_ceilings: Option<&[ProductConversationSegmentCeiling]>,
         limit: usize,
     ) -> DbResult<ProductConversationSnapshotRead> {
-        let mut connection = self.pool.acquire().await?;
-        connection.execute("BEGIN").await?;
+        let mut connection = self
+            .pool
+            .acquire()
+            .instrument(tracing::info_span!("product_conversation.pool_wait"))
+            .await?;
+        connection
+            .execute("BEGIN")
+            .instrument(tracing::info_span!("product_conversation.begin_read"))
+            .await?;
         let result = async {
             let resolved =
-                Self::resolve_ordinary_product_conversation_on(&mut connection, reference).await?;
+                Self::resolve_ordinary_product_conversation_on(&mut connection, reference)
+                    .instrument(tracing::info_span!("product_conversation.resolve"))
+                    .await?;
+            tracing::Span::current().record(
+                "product.reference",
+                resolved.product_conversation_id.as_str(),
+            );
             let aggregate = Self::get_ordinary_product_conversation_on(
                 &mut connection,
                 &resolved.product_conversation_id,
             )
+            .instrument(tracing::info_span!("product_conversation.aggregate"))
             .await?;
             let messages = Self::get_product_conversation_messages_page_on(
                 &mut connection,
@@ -567,6 +582,7 @@ impl Database {
                 segment_ceilings,
                 limit,
             )
+            .instrument(tracing::info_span!("product_conversation.message_page"))
             .await?;
             Ok(ProductConversationSnapshotRead {
                 aggregate,
@@ -574,8 +590,15 @@ impl Database {
                 requested_transcript_row_id: resolved.requested_transcript_row_id,
             })
         }
+        .instrument(tracing::info_span!(
+            "product_conversation.snapshot_read",
+            "product.reference" = tracing::field::Empty,
+        ))
         .await;
-        connection.execute("ROLLBACK").await?;
+        connection
+            .execute("ROLLBACK")
+            .instrument(tracing::info_span!("product_conversation.rollback_read"))
+            .await?;
         result
     }
 

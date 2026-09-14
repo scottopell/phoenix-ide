@@ -26,6 +26,7 @@ import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
 import { useIsWideDesktop } from '../hooks/useMediaQuery';
 import { EmbeddedConversationPage, type EmbeddedConversationProjection } from './ConversationPage';
 import { subscribeCloseSnapshotChanged } from '../notifications';
+import { generateUUID } from '../utils/uuid';
 import './ProductConversationPage.css';
 
 const PAGE_SIZE = 100;
@@ -70,6 +71,29 @@ type OwnedSnapshot = {
   productConversationId: string;
   value: ProductConversationSnapshotView;
 };
+
+type ProductConversationOpenMeasurement = {
+  openId: string;
+  routeReference: string;
+  request?: Promise<ProductConversationSnapshotView>;
+  startedAt: number;
+  snapshotReceivedAt?: number;
+  storeReadyAt?: number;
+  reported: boolean;
+};
+
+function reportProductConversationOpen(measurement: ProductConversationOpenMeasurement, paintedAt: number): void {
+  if (measurement.reported || measurement.snapshotReceivedAt === undefined || measurement.storeReadyAt === undefined) return;
+  measurement.reported = true;
+  void api.reportProductConversationOpen({
+    open_id: measurement.openId,
+    snapshot_received_ms: measurement.snapshotReceivedAt - measurement.startedAt,
+    store_ready_ms: measurement.storeReadyAt - measurement.startedAt,
+    first_paint_ms: paintedAt - measurement.startedAt,
+    total_ms: performance.now() - measurement.startedAt,
+    visible: document.visibilityState === 'visible',
+  }).catch(() => {});
+}
 
 type TaskApprovalOverlayState = {
   title: string;
@@ -728,6 +752,15 @@ function ProductConversationPageInner() {
   const [historyGeneration, setHistoryGeneration] = useState(0);
   const [restoreCommand, setRestoreCommand] = useState<TranscriptPositioningInput | null>(null);
   const routeGenerationRef = useRef(0);
+  const openMeasurementRef = useRef<ProductConversationOpenMeasurement | null>(null);
+  if (openMeasurementRef.current?.routeReference !== productConversationId) {
+    openMeasurementRef.current = productConversationId ? {
+      openId: generateUUID(),
+      routeReference: productConversationId,
+      startedAt: performance.now(),
+      reported: false,
+    } : null;
+  }
   const paginationRequestRef = useRef(0);
   const observedMemberProjectionRef = useRef<typeof latestProjection>(null);
   const currentLatestProjection = snapshot
@@ -768,9 +801,17 @@ function ProductConversationPageInner() {
     setError(null);
     setOlderError(null);
 
-    api.getProductConversationSnapshot(productConversationId, { message_limit: PAGE_SIZE })
+    const measurement = isBackgroundRefresh ? null : openMeasurementRef.current;
+    const request = measurement
+      ? (measurement.request ??= api.getProductConversationSnapshot(productConversationId, {
+          message_limit: PAGE_SIZE,
+          open_id: measurement.openId,
+        }))
+      : api.getProductConversationSnapshot(productConversationId, { message_limit: PAGE_SIZE });
+    request
       .then((next) => {
         if (cancelled) return;
+        if (measurement) measurement.snapshotReceivedAt = performance.now();
         setOwnedSnapshot((current) => ({
           productConversationId,
           value: current?.productConversationId === productConversationId
@@ -781,12 +822,17 @@ function ProductConversationPageInner() {
       })
       .catch((err) => {
         if (cancelled) return;
+        if (measurement && openMeasurementRef.current === measurement) {
+          measurement.request = undefined;
+        }
         setError(err instanceof Error ? err.message : 'Unable to open this product conversation.');
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
       });
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, [productConversationId, snapshotRetry]);
 
   useEffect(() => {
@@ -948,6 +994,25 @@ function ProductConversationPageInner() {
     : { kind: 'idle' as const, view: transcriptView });
   const isOpen = snapshot?.ordinary_lifecycle === 'open';
   const liveControlsEnabled = isOpen && !closeInProgress;
+  const initialSnapshotReady = snapshot !== null;
+
+  useEffect(() => {
+    const measurement = openMeasurementRef.current;
+    if (!measurement || measurement.reported || !initialSnapshotReady) return;
+    measurement.storeReadyAt ??= performance.now();
+    let reportFrame = 0;
+    const paintFrame = requestAnimationFrame(() => {
+      reportFrame = requestAnimationFrame((paintedAt) => {
+        if (openMeasurementRef.current === measurement) {
+          reportProductConversationOpen(measurement, paintedAt);
+        }
+      });
+    });
+    return () => {
+      cancelAnimationFrame(paintFrame);
+      cancelAnimationFrame(reportFrame);
+    };
+  }, [initialSnapshotReady, productConversationId]);
 
   useEffect(() => {
     if (!hashTargetMessageId || hashTargetLoaded || !snapshot?.has_older || loadingOlder || olderError) return;
