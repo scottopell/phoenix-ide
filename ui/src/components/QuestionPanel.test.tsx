@@ -4,11 +4,41 @@ import { api, QuestionMutationError, type UserQuestion } from '../api';
 import { QuestionPanel } from './QuestionPanel';
 
 const question: UserQuestion = { header: 'Scope', question: 'Where to search?', multiSelect: false, options: [{label: 'Current', preview: 'current preview'}, {label: 'Family'}] };
-const defaults = { questions: [question], conversationId: 'conv', toolUseId: 'request-1', showToast: vi.fn(), onAnswered: vi.fn(), onDismissed: vi.fn(), onResolved: vi.fn() };
+const defaults = { questions: [question], conversationId: 'conv', requestId: 'request-1', showToast: vi.fn(), onAnswered: vi.fn(), onDismissed: vi.fn(), onResolved: vi.fn() };
 const deferred = () => { let resolve!: (value: {success:boolean}) => void; let reject!: (error: Error) => void; const promise = new Promise<{success:boolean}>((yes,no) => { resolve=yes; reject=no; }); return {promise,resolve,reject}; };
 afterEach(() => { vi.restoreAllMocks(); vi.clearAllMocks(); });
 
 describe('QuestionPanel request and draft contract', () => {
+  it('closes open notes before dismissal from another control', () => {
+    render(<QuestionPanel {...defaults} />);
+    fireEvent.click(screen.getByRole('button', {name:'Add notes (optional)'}));
+    const choice = screen.getByRole('radio', {name:'Current'});
+    choice.focus();
+    fireEvent.keyDown(choice, {key:'Escape'});
+    expect(screen.queryByLabelText('Notes for the agent')).not.toBeInTheDocument();
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', {name:'Add notes (optional)'})).toHaveFocus();
+  });
+  it('normalizes nested REST state before resolving uncertainty', async () => {
+    vi.spyOn(api,'respondToQuestion').mockRejectedValue(new Error('network'));
+    vi.spyOn(api,'getConversation').mockResolvedValue({conversation:{state:{type:'recoverable_continuation_failure', failure:{message:'Summary failed',error_kind:'server_error',request:{operation_id:'continue-1',attempt:2}}}}} as unknown as Awaited<ReturnType<typeof api.getConversation>>);
+    render(<QuestionPanel {...defaults} />);
+    fireEvent.click(screen.getByRole('radio',{name:'Current'}));
+    fireEvent.click(screen.getByRole('button',{name:'Send answer'}));
+    await waitFor(()=>expect(defaults.onResolved).toHaveBeenCalledWith({type:'recoverable_continuation_failure',message:'Summary failed',error_kind:'server_error',operation_id:'continue-1',attempt:2}));
+  });
+  it('renders preview code as a separate block while sending the original preview', async () => {
+    const preview = 'Compare this code:\n\n```ts\nconst value = "long code";\n```';
+    const send = vi.spyOn(api,'respondToQuestion').mockResolvedValue({success:true});
+    const {container} = render(<QuestionPanel {...defaults} questions={[{...question,options:[{label:'Code',preview}]}]} />);
+    fireEvent.click(screen.getByRole('radio',{name:'Code'}));
+    expect(container.querySelector('.question-preview-text pre code')?.textContent).toBe('const value = "long code";\n');
+    const code = container.querySelector('.question-preview-text pre');
+    fireEvent.click(screen.getByRole('button',{name:'Add notes (optional)'}));
+    expect(container.querySelector('.question-preview-text pre')).toBe(code);
+    fireEvent.click(screen.getByRole('button',{name:'Send answer'}));
+    await waitFor(()=>expect(send).toHaveBeenCalledWith('conv','request-1',{'Where to search?':'Code'},{'Where to search?':{preview}}));
+  });
   it('starts unanswered, derives preview from selection, and includes collapsed notes', async () => {
     const send = vi.spyOn(api, 'respondToQuestion').mockResolvedValue({success:true});
     render(<QuestionPanel {...defaults} />);
@@ -68,7 +98,7 @@ describe('QuestionPanel request and draft contract', () => {
   });
   it('freezes an uncertain operation and retries the identical snapshot even after a later rejection', async () => {
     const send = vi.spyOn(api,'respondToQuestion').mockRejectedValueOnce(new Error('network')).mockRejectedValue(new QuestionMutationError('Stale','question_request_stale'));
-    vi.spyOn(api,'getConversation').mockResolvedValue({conversation:{state:{type:'awaiting_user_response',tool_use_id:'request-1',questions:[question]}}} as Awaited<ReturnType<typeof api.getConversation>>);
+    vi.spyOn(api,'getConversation').mockResolvedValue({conversation:{state:{type:'awaiting_user_response',request_id: 'request-1', tool_use_id:'request-1',questions:[question]}}} as Awaited<ReturnType<typeof api.getConversation>>);
     render(<QuestionPanel {...defaults} />);
     fireEvent.click(screen.getByRole('radio',{name:'Current'}));
     fireEvent.click(screen.getByRole('button',{name:'Send answer'}));
@@ -83,7 +113,7 @@ describe('QuestionPanel request and draft contract', () => {
     const {rerender} = render(<QuestionPanel {...defaults} />);
     fireEvent.click(screen.getByRole('radio',{name:'Current'}));
     fireEvent.click(screen.getByRole('button',{name:'Send answer'}));
-    rerender(<QuestionPanel {...defaults} toolUseId="request-2" />);
+    rerender(<QuestionPanel {...defaults} requestId="request-2" />);
     await act(async () => pending.resolve({success:true}));
     expect(defaults.onAnswered).not.toHaveBeenCalled();
     expect(screen.getByRole('radio',{name:'Current'})).not.toBeChecked();
@@ -98,16 +128,20 @@ describe('QuestionPanel request and draft contract', () => {
 describe('AUQ failure and shortcut boundaries', () => {
   it('reconciles a proven stale request without reopening editing', async () => {
     vi.spyOn(api,'respondToQuestion').mockRejectedValue(new QuestionMutationError('Stale','question_request_stale'));
-    vi.spyOn(api,'getConversation').mockResolvedValue({conversation:{state:{type:'awaiting_user_response',tool_use_id:'request-2',questions:[question]}}} as Awaited<ReturnType<typeof api.getConversation>>);
+    vi.spyOn(api,'getConversation').mockResolvedValue({conversation:{state:{type:'awaiting_user_response',request_id: 'request-2', tool_use_id:'request-2',questions:[question]}}} as Awaited<ReturnType<typeof api.getConversation>>);
     render(<QuestionPanel {...defaults} />);
     fireEvent.click(screen.getByRole('radio',{name:'Current'}));
     fireEvent.click(screen.getByRole('button',{name:'Send answer'}));
-    await waitFor(()=>expect(defaults.onResolved).toHaveBeenCalledWith({type:'awaiting_user_response',tool_use_id:'request-2',questions:[question]}));
+    await waitFor(()=>expect(defaults.onResolved).toHaveBeenCalledWith({type:'awaiting_user_response',request_id: 'request-2', tool_use_id:'request-2',questions:[question]}));
     expect(screen.getByRole('radio',{name:'Family'})).toBeDisabled();
   });
-  it('does not resolve uncertainty from a malformed pending identity', async () => {
+  it.each([
+    {type:'awaiting_user_response',questions:[question]},
+    {},
+    {type:'unrecognized_future_state'},
+  ])('does not resolve uncertainty from malformed or unknown state %j', async state => {
     vi.spyOn(api,'respondToQuestion').mockRejectedValue(new Error('network'));
-    vi.spyOn(api,'getConversation').mockResolvedValue({conversation:{state:{type:'awaiting_user_response',questions:[question]}}} as Awaited<ReturnType<typeof api.getConversation>>);
+    vi.spyOn(api,'getConversation').mockResolvedValue({conversation:{state}} as Awaited<ReturnType<typeof api.getConversation>>);
     render(<QuestionPanel {...defaults} />);
     fireEvent.click(screen.getByRole('radio',{name:'Current'}));
     fireEvent.click(screen.getByRole('button',{name:'Send answer'}));

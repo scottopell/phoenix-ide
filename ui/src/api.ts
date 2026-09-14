@@ -555,7 +555,7 @@ export type ConversationState =
   | { type: 'cancelling_tool'; current_tool: ToolCall }
   | { type: 'cancelling_sub_agents'; pending: PendingSubAgent[] }
   | { type: 'awaiting_task_approval'; title: string; priority: string; plan: string }
-  | { type: 'awaiting_user_response'; tool_use_id: string; questions: UserQuestion[] }
+  | { type: 'awaiting_user_response'; request_id: string; tool_use_id: string; questions: UserQuestion[] }
   | { type: 'context_exhausted'; summary: string }
   | { type: 'handed_off'; successor_conv_id: string }
   | { type: 'error'; message: string; error_kind: ErrorKind; error?: ErrorPresentation }
@@ -2523,23 +2523,23 @@ export const api = {
 
   async respondToQuestion(
     convId: string,
-    toolUseId: string,
+    requestId: string,
     answers: Record<string, string>,
     annotations?: Record<string, { notes?: string; preview?: string }>,
   ): Promise<{ success: boolean }> {
     const resp = await fetch(`/api/conversations/${convId}/respond`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ tool_use_id: toolUseId, answers, annotations }),
+      body: JSON.stringify({ request_id: requestId, answers, annotations }),
     });
     return questionMutationResult(resp);
   },
 
-  async dismissQuestion(convId: string, toolUseId: string): Promise<{ success: boolean }> {
+  async dismissQuestion(convId: string, requestId: string): Promise<{ success: boolean }> {
     const resp = await fetch(`/api/conversations/${convId}/dismiss-question`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ tool_use_id: toolUseId }),
+      body: JSON.stringify({ request_id: requestId }),
     });
     return questionMutationResult(resp);
   },

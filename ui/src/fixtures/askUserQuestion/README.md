@@ -6,13 +6,13 @@ the actual ProductConversationPage with its deterministic API fixture. No model,
 database, or running Phoenix backend is required.
 
 Run `LADLE_PORT=61137 ./dev.py qa ask-user-question` from the repository root.
-Set `PLAYWRIGHT_BROWSER=webkit` to run the same journey in WebKit. Nine scenarios
+Set `PLAYWRIGHT_BROWSER=webkit` to run the same journey in WebKit. Ten scenarios
 run at eight viewport sizes, including the 839/840 column boundary and 320 px
 usable height. Output defaults to `ui/qa-artifacts/ask-user-question/`.
 
 The capture command asserts native keyboard behavior, retained custom drafts,
 collapsed notes, selected previews, stationary choices, 44 px navigation targets,
-long-preview disclosure, expanded footer placement, modal isolation, and viewport
+long-preview disclosure, horizontally scrollable fenced code, expanded footer placement, modal isolation, and viewport
 bounds before taking screenshots. For manual interaction, run `pnpm ladle` in
 `ui/` and open the Ask user question stories. Reload resets each scenario.
 

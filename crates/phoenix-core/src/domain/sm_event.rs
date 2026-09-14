@@ -548,13 +548,13 @@ pub enum Event {
     // Ask user question events (REQ-AUQ-001)
     /// User answered the pending questions (POST /api/conversations/{id}/respond)
     UserQuestionResponse {
-        tool_use_id: String,
+        request_id: String,
         answers: HashMap<String, String>,
         annotations: Option<HashMap<String, QuestionAnnotation>>,
     },
     /// User dismissed the structured question UI without answering it.
     UserQuestionDismissed {
-        tool_use_id: String,
+        request_id: String,
     },
 
     /// User dismissed a persisted `Error` state, returning the conversation to
@@ -793,12 +793,12 @@ pub enum ParentOnlyEvent {
         successor_conv_id: String,
     },
     UserQuestionResponse {
-        tool_use_id: String,
+        request_id: String,
         answers: HashMap<String, String>,
         annotations: Option<HashMap<String, QuestionAnnotation>>,
     },
     UserQuestionDismissed {
-        tool_use_id: String,
+        request_id: String,
     },
     DismissError,
     CredentialBecameAvailable,
@@ -1003,16 +1003,16 @@ impl TryFrom<Event> for ParentEvent {
                 }))
             }
             Event::UserQuestionResponse {
-                tool_use_id,
+                request_id,
                 answers,
                 annotations,
             } => Ok(ParentEvent::Parent(ParentOnlyEvent::UserQuestionResponse {
-                tool_use_id,
+                request_id,
                 answers,
                 annotations,
             })),
-            Event::UserQuestionDismissed { tool_use_id } => Ok(ParentEvent::Parent(
-                ParentOnlyEvent::UserQuestionDismissed { tool_use_id },
+            Event::UserQuestionDismissed { request_id } => Ok(ParentEvent::Parent(
+                ParentOnlyEvent::UserQuestionDismissed { request_id },
             )),
             Event::DismissError => Ok(ParentEvent::Parent(ParentOnlyEvent::DismissError)),
             Event::CredentialBecameAvailable => Ok(ParentEvent::Parent(

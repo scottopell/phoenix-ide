@@ -11,7 +11,7 @@ function state(type: ConversationState['type']): ConversationState {
   if (type === 'terminal') return { type };
   if (type === 'context_exhausted') return { type, summary: 'Fixture summary hit context limit.' };
   if (type === 'awaiting_task_approval') return { type, title: 'Approve seeded task', priority: 'p2', plan: 'Seeded plan for sidebar QA.' };
-  if (type === 'awaiting_user_response') return { type, tool_use_id: 'fixture-question', questions: [] };
+  if (type === 'awaiting_user_response') return { type, request_id: 'fixture-request', tool_use_id: 'fixture-question', questions: [] };
   return { type } as ConversationState;
 }
 

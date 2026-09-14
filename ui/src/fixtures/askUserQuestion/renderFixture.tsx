@@ -15,9 +15,9 @@ export function AskUserQuestionFixture({ scenario }: { scenario: AskUserQuestion
     document.documentElement.dataset['theme'] = 'light';
     const respond = api.respondToQuestion;
     const dismiss = api.dismissQuestion;
-    api.respondToQuestion = async (_id, toolUseId, answers, annotations) => {
+    api.respondToQuestion = async (_id, requestId, answers, annotations) => {
       if (scenario.fail) throw new QuestionMutationError('Fixture: response rejected. Please retry.', 'question_request_invalid');
-      setResult(JSON.stringify({ toolUseId, answers, annotations }, null, 2));
+      setResult(JSON.stringify({ requestId, answers, annotations }, null, 2));
       return { success: true };
     };
     api.dismissQuestion = async () => {
@@ -41,7 +41,7 @@ export function AskUserQuestionFixture({ scenario }: { scenario: AskUserQuestion
           <pre aria-label="Captured response">{result}</pre>
           <p role="status">{toast}</p>
         </section>
-        {ready && !finished && <QuestionPanel questions={scenario.questions} conversationId="fixture-auq" toolUseId="fixture-question" onResolved={() => setFinished(true)} showToast={setToast} onAnswered={() => setFinished(true)} onDismissed={() => setFinished(true)} readOnly={scenario.readOnly ?? false} />}
+        {ready && !finished && <QuestionPanel questions={scenario.questions} conversationId="fixture-auq" requestId="fixture-question" onResolved={() => setFinished(true)} showToast={setToast} onAnswered={() => setFinished(true)} onDismissed={() => setFinished(true)} readOnly={scenario.readOnly ?? false} />}
         <footer style={{ padding: 12 }}>Fixture conversation · {finished ? 'Response handled' : 'Awaiting your reply'}</footer>
       </main>
     </FocusScopeProvider>

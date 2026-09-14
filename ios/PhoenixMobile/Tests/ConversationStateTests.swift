@@ -56,7 +56,7 @@ final class ConversationStateTests: XCTestCase {
 
     func testAwaitingUserResponseCarriesTypedQuestions() {
         let raw = """
-        {"type":"awaiting_user_response","tool_use_id":"question-1",
+        {"type":"awaiting_user_response","request_id":"question-1",
          "questions":[{"question":"Which db?","header":"DB",
                        "options":[{"label":"sqlite","description":"file-backed"},
                                   {"label":"postgres","description":""}],
@@ -65,7 +65,7 @@ final class ConversationStateTests: XCTestCase {
         """
         XCTAssertEqual(
             parse(raw),
-            .awaitingUserResponse(toolUseId: "question-1", questions: [
+            .awaitingUserResponse(requestId: "question-1", questions: [
                 UserQuestion(
                     question: "Which db?", header: "DB",
                     options: [
@@ -263,8 +263,8 @@ final class ConversationStateTests: XCTestCase {
     }
 
     func testPendingQuestionWithoutIdentityCannotBeAnswered() throws {
-        for identity in ["", ",\"tool_use_id\":\" \""] {
-            let data = Data("{\"type\":\"awaiting_user_response\",\"questions\":[]\(identity)}".utf8)
+        for identity in ["", ",\"request_id\":\" \""] {
+            let data = Data("{\"type\":\"awaiting_user_response\",\"tool_use_id\":\"provider-only\",\"questions\":[]\(identity)}".utf8)
             let state = ConversationState.parse(try JSONDecoder().decode(JSONValue.self, from: data))
             XCTAssertEqual(state, .questionIdentityUnavailable)
             XCTAssertFalse(state.acceptsChatMessage)
@@ -272,13 +272,13 @@ final class ConversationStateTests: XCTestCase {
     }
 
     func testQuestionActionUnlocksWhenPromptIdentityChanges() {
-        let original = ConversationState.awaitingUserResponse(toolUseId: "question-1", questions: [
+        let original = ConversationState.awaitingUserResponse(requestId: "question-1", questions: [
             UserQuestion(question: "First?", header: "One", options: [], multiSelect: false),
         ])
-        let followUp = ConversationState.awaitingUserResponse(toolUseId: "question-2", questions: [
+        let followUp = ConversationState.awaitingUserResponse(requestId: "question-2", questions: [
             UserQuestion(question: "First?", header: "One", options: [], multiSelect: false),
         ])
-        let action = ConversationAction.respondToQuestions(toolUseId: "question-1", answers: ["First?": "yes"])
+        let action = ConversationAction.respondToQuestions(requestId: "question-1", answers: ["First?": "yes"])
 
         XCTAssertTrue(ConversationSession.actionStillAwaitsOriginalState(
             action: action, origin: original, current: original))
@@ -301,7 +301,7 @@ final class ConversationStateTests: XCTestCase {
                 .acceptsChatMessage)
         XCTAssertTrue(ConversationState.llmRequesting(attempt: 1).acceptsChatMessage)
         XCTAssertFalse(
-            ConversationState.awaitingUserResponse(toolUseId: "question-1", questions: []).acceptsChatMessage)
+            ConversationState.awaitingUserResponse(requestId: "question-1", questions: []).acceptsChatMessage)
         XCTAssertFalse(
             ConversationState.awaitingTaskApproval(title: "", priority: "", plan: "")
                 .acceptsChatMessage)

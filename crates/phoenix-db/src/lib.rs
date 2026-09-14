@@ -10,6 +10,8 @@ mod message_attachments;
 mod migrations;
 mod product_creation;
 pub use product_creation::*;
+mod question_response;
+pub use question_response::{QuestionCommitOutcome, QuestionCommitResult};
 mod prompt_projection;
 pub use prompt_projection::{
     GenerationFencedPromptPosition, HydratedPromptSnapshot, HydratedPromptTail,
@@ -320,10 +322,16 @@ pub(crate) async fn persist_continuation_start_tx(
     Ok(ContinuationCommitOutcome::Applied)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SteeringAdmissionSource {
+    ExplicitUserMessage,
+    DeferredObjective,
+}
+
 pub(crate) async fn commit_question_response_tx(
     tx: &mut Transaction<'_, Sqlite>,
     conversation_id: &str,
-    tool_use_id: &str,
+    request_id: &str,
     message: &Message,
     completed_state: &ConvState,
     state_updated_at: DateTime<Utc>,
@@ -350,11 +358,15 @@ pub(crate) async fn commit_question_response_tx(
             .ok_or_else(|| DbError::ConversationNotFound(conversation_id.to_string()))?;
     let persisted: ConvState = serde_json::from_str(&persisted_json)
         .map_err(|error| DbError::Serialization(error.to_string()))?;
-    if !matches!(&persisted, ConvState::AwaitingUserResponse { tool_use_id: pending, .. } if pending == tool_use_id)
+    if !matches!(&persisted, ConvState::AwaitingUserResponse { request_id: pending, .. } if pending == request_id)
     {
         return Ok(false);
     }
     insert_message_tx(tx, message).await?;
+    if matches!(completed_state, ConvState::Idle) {
+        sqlx::query("INSERT INTO question_dismissal_pauses (conversation_id) VALUES (?1) ON CONFLICT(conversation_id) DO NOTHING")
+            .bind(conversation_id).execute(&mut **tx).await?;
+    }
     let completed_json = serde_json::to_string(completed_state)
         .map_err(|error| DbError::Serialization(error.to_string()))?;
     let updated = sqlx::query(
@@ -6397,10 +6409,10 @@ impl Database {
     /// # Errors
     /// Returns an error for invalid message ownership, denied conversation admission,
     /// malformed persisted state, or failure to commit the message and state together.
-    pub async fn commit_question_response(
+    pub(crate) async fn commit_question_response(
         &self,
         conversation_id: &str,
-        tool_use_id: &str,
+        request_id: &str,
         message: &Message,
         completed_state: &ConvState,
         state_updated_at: DateTime<Utc>,
@@ -6409,7 +6421,7 @@ impl Database {
         let committed = commit_question_response_tx(
             &mut tx,
             conversation_id,
-            tool_use_id,
+            request_id,
             message,
             completed_state,
             state_updated_at,
@@ -6601,6 +6613,7 @@ impl Database {
         id: &str,
         entry: &phoenix_core::domain::sm_event::SteerEntry,
         request_fingerprint: &str,
+        source: SteeringAdmissionSource,
     ) -> DbResult<usize> {
         let now = Utc::now();
         #[cfg(test)]
@@ -6653,6 +6666,12 @@ impl Database {
             .bind(id)
             .execute(&mut *tx)
             .await?;
+        if source == SteeringAdmissionSource::ExplicitUserMessage {
+            sqlx::query("DELETE FROM question_dismissal_pauses WHERE conversation_id = ?1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
         tx.commit().await?;
 
         usize::try_from(queue_position)
@@ -19569,7 +19588,12 @@ mod tests {
         let steering_begin_called = steering_latch.begin_called.notified();
         let steering = tokio::spawn(async move {
             steering_db
-                .append_steering_entry("close-steering", &entry, "refused-fingerprint")
+                .append_steering_entry(
+                    "close-steering",
+                    &entry,
+                    "refused-fingerprint",
+                    crate::SteeringAdmissionSource::ExplicitUserMessage,
+                )
                 .await
         });
         steering_before_begin.await;
@@ -19610,15 +19634,25 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            db.append_steering_entry("conv-append", &entry("a"), "fp-a")
-                .await
-                .unwrap(),
+            db.append_steering_entry(
+                "conv-append",
+                &entry("a"),
+                "fp-a",
+                crate::SteeringAdmissionSource::ExplicitUserMessage
+            )
+            .await
+            .unwrap(),
             0
         );
         assert_eq!(
-            db.append_steering_entry("conv-append", &entry("b"), "fp-b")
-                .await
-                .unwrap(),
+            db.append_steering_entry(
+                "conv-append",
+                &entry("b"),
+                "fp-b",
+                crate::SteeringAdmissionSource::ExplicitUserMessage
+            )
+            .await
+            .unwrap(),
             1
         );
         assert!(db.remove_steering_entry("conv-append", "a").await.unwrap());
@@ -19630,9 +19664,14 @@ mod tests {
             Some(SteeringAcceptanceFingerprint::Exact("fp-a".to_string()))
         );
         assert_eq!(
-            db.append_steering_entry("conv-append", &entry("c"), "fp-c")
-                .await
-                .unwrap(),
+            db.append_steering_entry(
+                "conv-append",
+                &entry("c"),
+                "fp-c",
+                crate::SteeringAdmissionSource::ExplicitUserMessage
+            )
+            .await
+            .unwrap(),
             1
         );
 
@@ -19657,15 +19696,21 @@ mod tests {
                 "capacity",
                 &steering_entry(&format!("entry-{index}")),
                 &format!("fingerprint-{index}"),
+                crate::SteeringAdmissionSource::ExplicitUserMessage,
             )
             .await
             .unwrap();
         }
 
         assert!(matches!(
-            db.append_steering_entry("capacity", &steering_entry("overflow"), "overflow")
-                .await
-                .unwrap_err(),
+            db.append_steering_entry(
+                "capacity",
+                &steering_entry("overflow"),
+                "overflow",
+                crate::SteeringAdmissionSource::ExplicitUserMessage
+            )
+            .await
+            .unwrap_err(),
             DbError::SteeringQueueFull
         ));
         assert_eq!(
@@ -19717,13 +19762,23 @@ mod tests {
         db.create_conversation("receipt-b", "receipt-b", "/tmp", true, None, None)
             .await
             .unwrap();
-        db.append_steering_entry("receipt-a", &steering_entry("shared"), "fp-a")
-            .await
-            .unwrap();
+        db.append_steering_entry(
+            "receipt-a",
+            &steering_entry("shared"),
+            "fp-a",
+            crate::SteeringAdmissionSource::ExplicitUserMessage,
+        )
+        .await
+        .unwrap();
 
-        db.append_steering_entry("receipt-b", &steering_entry("shared"), "fp-b")
-            .await
-            .expect_err("global queue identity conflict must abort append");
+        db.append_steering_entry(
+            "receipt-b",
+            &steering_entry("shared"),
+            "fp-b",
+            crate::SteeringAdmissionSource::ExplicitUserMessage,
+        )
+        .await
+        .expect_err("global queue identity conflict must abort append");
 
         assert_eq!(
             db.get_steering_acceptance_fingerprint("receipt-b", "shared")
@@ -19744,6 +19799,7 @@ mod tests {
             "receipt-legacy",
             &steering_entry("exact"),
             "exact-fingerprint",
+            crate::SteeringAdmissionSource::ExplicitUserMessage,
         )
         .await
         .unwrap();
@@ -19811,6 +19867,7 @@ mod tests {
         let pending = ConvState::AwaitingUserResponse {
             questions: vec![],
             tool_use_id: "first".into(),
+            request_id: "first".into(),
         };
         db.update_conversation_state(id, &pending).await.unwrap();
         let message = steering_drain_message(id, "answer", 1);
@@ -19840,6 +19897,7 @@ mod tests {
         let following = ConvState::AwaitingUserResponse {
             questions: vec![],
             tool_use_id: "second".into(),
+            request_id: "second".into(),
         };
         db.update_conversation_state(id, &following).await.unwrap();
         let mut dismissal = steering_drain_message(id, "dismissal", 2);
@@ -19876,6 +19934,7 @@ mod tests {
             let pending = ConvState::AwaitingUserResponse {
                 questions: vec![],
                 tool_use_id: "pending".into(),
+                request_id: "pending".into(),
             };
             db.update_conversation_state(id, &pending).await.unwrap();
             let trigger = if fail_message {
@@ -19918,6 +19977,7 @@ mod tests {
             &ConvState::AwaitingUserResponse {
                 questions: vec![],
                 tool_use_id: "pending".into(),
+                request_id: "pending".into(),
             },
         )
         .await

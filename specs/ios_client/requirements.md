@@ -552,16 +552,16 @@ online-only, no optimistic state (the server's state change clears the
 card; concurrent resolution from another client surfaces as the server's
 conflict), controls disabled while offline or in flight, and drafts
 preserved until success
-AND require the authoritative conversation ID and tool_use_id in both response
+AND require the authoritative conversation ID and request_id in both response
 and dismissal operations as defined in
 [Ask User Question](../ask-user-question/requirements.md#req-auq-011-request-bound-responses-and-dismissal)
 
-WHEN an authoritative snapshot replaces the pending tool_use_id
+WHEN an authoritative snapshot replaces the pending request_id
 THE SYSTEM SHALL treat it as a new decision and enable its controls
 AND SHALL discard selections and free text belonging to the previous prompt
 EVEN IF the question text and options are identical
 
-WHEN an authoritative snapshot retains the same pending tool_use_id
+WHEN an authoritative snapshot retains the same pending request_id
 THE SYSTEM SHALL retain that request's draft and unresolved operation state
 
 WHEN a response or dismissal outcome is uncertain
@@ -571,7 +571,7 @@ and reconciliation rules of
 AND SHALL NOT restore editing because a later retry was rejected while an
 earlier attempt remains uncertain
 
-WHEN an earlier request completes after a different pending tool_use_id is visible
+WHEN an earlier request completes after a different pending request_id is visible
 THE SYSTEM SHALL leave the newer question's controls and draft intact
 
 **Rationale:** A stalled agent is worth nothing until answered; this is

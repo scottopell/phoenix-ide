@@ -161,7 +161,7 @@ describe('browser desktop notifications', () => {
     notifyConversationStateChange(
       conversation(),
       { type: 'idle' },
-      { type: 'awaiting_user_response', tool_use_id: 'test-question', questions: [] },
+      { type: 'awaiting_user_response', request_id: 'test-question', tool_use_id: 'test-question', questions: [] },
     );
 
     expect(notifications).toHaveLength(0);
@@ -179,7 +179,7 @@ describe('browser desktop notifications', () => {
     notifyConversationStateChange(
       conversation(),
       { type: 'idle' },
-      { type: 'awaiting_user_response', tool_use_id: 'test-question', questions: [] },
+      { type: 'awaiting_user_response', request_id: 'test-question', tool_use_id: 'test-question', questions: [] },
     );
 
     expect(notifications).toHaveLength(0);
@@ -197,7 +197,7 @@ describe('browser desktop notifications', () => {
     notifyConversationStateChange(
       conversation(),
       { type: 'idle' },
-      { type: 'awaiting_user_response', tool_use_id: 'test-question', questions: [] },
+      { type: 'awaiting_user_response', request_id: 'test-question', tool_use_id: 'test-question', questions: [] },
     );
 
     expect(notifications).toHaveLength(1);
@@ -245,9 +245,9 @@ describe('browser desktop notifications', () => {
 
   it('live notification dedupes the following catch-up pass for the same blocking state', () => {
     grantSettings();
-    const blocked = conversation({ state: { type: 'awaiting_user_response', tool_use_id: 'test-question', questions: [] } });
+    const blocked = conversation({ state: { type: 'awaiting_user_response', request_id: 'test-question', tool_use_id: 'test-question', questions: [] } });
 
-    notifyConversationStateChange(blocked, { type: 'idle' }, { type: 'awaiting_user_response', tool_use_id: 'test-question', questions: [] });
+    notifyConversationStateChange(blocked, { type: 'idle' }, { type: 'awaiting_user_response', request_id: 'test-question', tool_use_id: 'test-question', questions: [] });
     notifyCatchUp([blocked]);
 
     expect(notifications).toHaveLength(1);
@@ -278,7 +278,7 @@ describe('browser desktop notifications', () => {
     expect(() => notifyConversationStateChange(
       conversation(),
       { type: 'idle' },
-      { type: 'awaiting_user_response', tool_use_id: 'test-question', questions: [] },
+      { type: 'awaiting_user_response', request_id: 'test-question', tool_use_id: 'test-question', questions: [] },
     )).not.toThrow();
   });
 
@@ -296,9 +296,9 @@ describe('browser desktop notifications', () => {
 
   it('live notification dedupes the following snapshot transition for the same blocking state', () => {
     grantSettings();
-    const blocked = conversation({ state: { type: 'awaiting_user_response', tool_use_id: 'test-question', questions: [] } });
+    const blocked = conversation({ state: { type: 'awaiting_user_response', request_id: 'test-question', tool_use_id: 'test-question', questions: [] } });
 
-    notifyConversationStateChange(blocked, { type: 'idle' }, { type: 'awaiting_user_response', tool_use_id: 'test-question', questions: [] });
+    notifyConversationStateChange(blocked, { type: 'idle' }, { type: 'awaiting_user_response', request_id: 'test-question', tool_use_id: 'test-question', questions: [] });
     notifyConversationSnapshotChange(blocked);
     notifyConversationSnapshotChange({ ...blocked, updated_at: '2026-01-01T00:01:00Z' });
 
@@ -323,7 +323,7 @@ describe('browser desktop notifications', () => {
     notifyConversationStateChange(
       conversation(),
       { type: 'idle' },
-      { type: 'awaiting_user_response', tool_use_id: 'test-question', questions: [] },
+      { type: 'awaiting_user_response', request_id: 'test-question', tool_use_id: 'test-question', questions: [] },
     );
     closeNotificationsForConversation('conv-1');
 
@@ -337,12 +337,12 @@ describe('browser desktop notifications', () => {
     notifyConversationStateChange(
       conversation({ id: 'conv-1', slug: 'conv-a' }),
       { type: 'idle' },
-      { type: 'awaiting_user_response', tool_use_id: 'test-question', questions: [] },
+      { type: 'awaiting_user_response', request_id: 'test-question', tool_use_id: 'test-question', questions: [] },
     );
     notifyConversationStateChange(
       conversation({ id: 'conv-2', slug: 'conv-b' }),
       { type: 'idle' },
-      { type: 'awaiting_user_response', tool_use_id: 'test-question', questions: [] },
+      { type: 'awaiting_user_response', request_id: 'test-question', tool_use_id: 'test-question', questions: [] },
     );
     closeNotificationsForConversation('conv-1');
 
@@ -357,7 +357,7 @@ describe('browser desktop notifications', () => {
     notifyConversationStateChange(
       conversation(),
       { type: 'idle' },
-      { type: 'awaiting_user_response', tool_use_id: 'test-question', questions: [] },
+      { type: 'awaiting_user_response', request_id: 'test-question', tool_use_id: 'test-question', questions: [] },
     );
     closeNotificationsForConversation('conv-1');
     closeNotificationsForConversation('conv-1');
@@ -372,17 +372,17 @@ describe('browser desktop notifications', () => {
     notifyConversationStateChange(
       conversation(),
       { type: 'idle' },
-      { type: 'awaiting_user_response', tool_use_id: 'test-question', questions: [] },
+      { type: 'awaiting_user_response', request_id: 'test-question', tool_use_id: 'test-question', questions: [] },
     );
     notifyConversationStateChange(
       conversation(),
-      { type: 'awaiting_user_response', tool_use_id: 'test-question', questions: [] },
+      { type: 'awaiting_user_response', request_id: 'test-question', tool_use_id: 'test-question', questions: [] },
       { type: 'idle' },
     );
     notifyConversationStateChange(
       conversation(),
       { type: 'idle' },
-      { type: 'awaiting_user_response', tool_use_id: 'test-question', questions: [] },
+      { type: 'awaiting_user_response', request_id: 'test-question', tool_use_id: 'test-question', questions: [] },
     );
 
     expect(notifications).toHaveLength(2);
@@ -402,7 +402,7 @@ describe('browser desktop notifications', () => {
     notifyConversationStateChange(
       conversation(),
       { type: 'idle' },
-      { type: 'awaiting_user_response', tool_use_id: 'test-question', questions: [] },
+      { type: 'awaiting_user_response', request_id: 'test-question', tool_use_id: 'test-question', questions: [] },
     );
     notifications[0]?.onclick?.();
     closeNotificationsForConversation('conv-1');

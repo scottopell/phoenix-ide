@@ -3164,6 +3164,7 @@ mod product_creation_tests {
                 skill_invocation: None,
             },
             "product-create:req-delivery-complete",
+            crate::SteeringAdmissionSource::ExplicitUserMessage,
         )
         .await
         .unwrap();

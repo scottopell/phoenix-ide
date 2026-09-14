@@ -496,7 +496,7 @@ private extension FixtureScenario {
                 streamingText: "",
                 statePayload: .object([
                     "type": .string("awaiting_user_response"),
-                    "tool_use_id": .string("fixture-question"),
+                    "request_id": .string("fixture-question"),
                     "questions": .array([
                         .object([
                             "question": .string("Which fixture state should ship first?"),

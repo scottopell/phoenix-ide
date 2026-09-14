@@ -26,11 +26,20 @@ runSurfaceCapture({
       assert.equal(await panel.locator('input:checked').count(), 0, 'Initial form must be unanswered');
       const controls = panel.locator('input[type=radio],input[type=checkbox]');
       await controls.first().check();
+      if (id === 'code-preview') {
+        const code = page.locator('.question-preview-text pre');
+        assert.ok(await code.evaluate(e => e.scrollWidth > e.clientWidth));
+        assert.equal(await code.evaluate(e => getComputedStyle(e).overflowX), 'auto');
+        assert.equal(await code.evaluate(e => getComputedStyle(e).whiteSpace), 'pre');
+        await code.focus();
+        await page.keyboard.press('ArrowRight');
+        await page.waitForFunction(() => document.querySelector('.question-preview-text pre')?.scrollLeft > 0);
+      }
       if (id === 'long-preview') {
         await page.getByRole('button',{name:'Show full preview'}).waitFor();
-        assert.ok(await page.locator('.question-preview-pane pre').evaluate(e=>e.clientHeight)<=168);
+        assert.ok(await page.locator('.question-preview-text').evaluate(e=>e.clientHeight)<=168);
         await page.getByRole('button',{name:'Show full preview'}).click();
-        assert.ok(await page.locator('.question-preview-pane pre').evaluate(e=>e.clientHeight)>168);
+        assert.ok(await page.locator('.question-preview-text').evaluate(e=>e.clientHeight)>168);
         await page.getByRole('button',{name:'Show less'}).click();
       }
       if (id === 'compact-headers') {

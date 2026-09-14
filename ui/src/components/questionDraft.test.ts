@@ -17,6 +17,6 @@ describe('AUQ draft payload', () => {
   it('fails closed on a pending snapshot without identity', () => {
     const state = parseConversationState({type:'awaiting_user_response',questions:[question]});
     expect(state.type).toBe('error');
-    expect(parseConversationState({type:'awaiting_user_response',tool_use_id:'q1',questions:[question]})).toEqual({type:'awaiting_user_response',tool_use_id:'q1',questions:[question]});
+    expect(parseConversationState({type:'awaiting_user_response',request_id: 'q1', tool_use_id:'q1',questions:[question]})).toEqual({type:'awaiting_user_response',request_id: 'q1', tool_use_id:'q1',questions:[question]});
   });
 });

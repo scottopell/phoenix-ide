@@ -216,7 +216,7 @@ pub enum Effect {
     PersistToolResults { results: Vec<ToolResult> },
 
     CommitQuestionRequest {
-        tool_use_id: String,
+        request_id: String,
         message_id: String,
         resolution: QuestionResolution,
     },
