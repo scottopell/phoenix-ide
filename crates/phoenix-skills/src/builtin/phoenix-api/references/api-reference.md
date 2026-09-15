@@ -21,7 +21,9 @@ ProductConversation references accepted by the read APIs may be a product-conver
 - `GET /api/product-conversations/{reference}/route` returns the canonical `transcript_row_id` for routing.
 - `GET /api/conversations/{id}` returns transcript state, messages, `agent_working`, and `presentation_mode`.
 
-For chat, cancel, or continuation, use the snapshot's current `writable_transcript_row_id`. If it is absent, Phoenix has not exposed a writable target; do not substitute `latest_transcript_row_id`. Re-resolve immediately before acting because continuation can change the writable transcript.
+For chat or cancel, use the snapshot's current `writable_transcript_row_id`. If it is absent, Phoenix has not exposed a writable target for those operations; do not substitute `latest_transcript_row_id`. Re-resolve immediately before acting because continuation can change the writable transcript.
+
+Continuation is different: a context-exhausted transcript is intentionally not writable. Resolve the topology's `latest_transcript_row_id`, read that transcript, and continue only after its state is verified as `ContextExhausted`. Do not require or target `writable_transcript_row_id` for continuation.
 
 ## Create a ProductConversation
 
@@ -76,7 +78,7 @@ Each entry is `persisted`, `steering_queued`, or `absent`; the response also rep
 
 ## Continue a context-exhausted transcript
 
-`POST /api/conversations/{writable_transcript_row_id}/continue`
+`POST /api/conversations/{latest_transcript_row_id}/continue`
 
 ```json
 {
@@ -86,7 +88,7 @@ Each entry is `persisted`, `steering_queued`, or `absent`; the response also rep
 }
 ```
 
-Reuse the same `message_id` for an exact uncertain retry. The response contains successor `conversation_id`, optional `slug`, and status `accepted`, `dispatch_failed`, or `already_exists`; `error` is present only when the successor exists but opening-message dispatch was not accepted. Preserve the returned successor identity even on `dispatch_failed`. Verify by re-reading the ProductConversation snapshot, confirming the new writable transcript, and reading the successor conversation. `accepted` and `already_exists` identify durable continuation outcomes; neither alone proves subsequent assistant execution completed.
+Before this request, re-resolve the ProductConversation topology and verify that `GET /api/conversations/{latest_transcript_row_id}` reports `ContextExhausted`. Reuse the same `message_id` for an exact uncertain retry. The response contains successor `conversation_id`, optional `slug`, and status `accepted`, `dispatch_failed`, or `already_exists`; `error` is present only when the successor exists but opening-message dispatch was not accepted. Preserve the returned successor identity even on `dispatch_failed`. Verify by re-reading the ProductConversation snapshot, confirming the new writable transcript, and reading the successor conversation. `accepted` and `already_exists` identify durable continuation outcomes; neither alone proves subsequent assistant execution completed.
 
 Do not fold automatic continuation policy into this workflow. Continue only when the user authorized it.
 

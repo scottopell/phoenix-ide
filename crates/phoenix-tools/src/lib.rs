@@ -234,6 +234,8 @@ pub enum ToolOutput {
         display_data: Option<Value>,
         llm_usage: Option<Box<ToolLlmUsage>>,
     },
+    /// Authenticated instructions emitted only by an audience-bound built-in skill.
+    TrustedInstructions { output: String },
     Error {
         output: String,
         images: Vec<ToolImage>,
@@ -252,6 +254,12 @@ impl ToolOutput {
         }
     }
 
+    pub fn trusted_instructions(output: impl Into<String>) -> Self {
+        Self::TrustedInstructions {
+            output: output.into(),
+        }
+    }
+
     pub fn error(message: impl Into<String>) -> Self {
         Self::Error {
             output: message.into(),
@@ -267,6 +275,7 @@ impl ToolOutput {
             Self::Success { display_data, .. } | Self::Error { display_data, .. } => {
                 *display_data = Some(data);
             }
+            Self::TrustedInstructions { .. } => {}
         }
         self
     }
@@ -274,7 +283,9 @@ impl ToolOutput {
     #[must_use]
     pub fn with_output(mut self, text: impl Into<String>) -> Self {
         match &mut self {
-            Self::Success { output, .. } | Self::Error { output, .. } => *output = text.into(),
+            Self::Success { output, .. }
+            | Self::TrustedInstructions { output }
+            | Self::Error { output, .. } => *output = text.into(),
         }
         self
     }
@@ -286,6 +297,7 @@ impl ToolOutput {
             Self::Success { llm_usage, .. } | Self::Error { llm_usage, .. } => {
                 *llm_usage = Some(Box::new(usage));
             }
+            Self::TrustedInstructions { .. } => {}
         }
         self
     }
@@ -295,6 +307,7 @@ impl ToolOutput {
             Self::Success { llm_usage, .. } | Self::Error { llm_usage, .. } => {
                 llm_usage.take().map(|usage| *usage)
             }
+            Self::TrustedInstructions { .. } => None,
         }
     }
 
@@ -302,6 +315,7 @@ impl ToolOutput {
     pub fn with_images(mut self, imgs: Vec<ToolImage>) -> Self {
         match &mut self {
             Self::Success { images, .. } | Self::Error { images, .. } => *images = imgs,
+            Self::TrustedInstructions { .. } => {}
         }
         self
     }
@@ -309,7 +323,10 @@ impl ToolOutput {
     /// Whether the tool reported success.
     #[must_use]
     pub fn is_success(&self) -> bool {
-        matches!(self, Self::Success { .. })
+        matches!(
+            self,
+            Self::Success { .. } | Self::TrustedInstructions { .. }
+        )
     }
 
     /// The tool's textual output — success payload or error message.
@@ -321,7 +338,9 @@ impl ToolOutput {
     #[must_use]
     pub fn output(&self) -> &str {
         match self {
-            Self::Success { output, .. } | Self::Error { output, .. } => output,
+            Self::Success { output, .. }
+            | Self::TrustedInstructions { output }
+            | Self::Error { output, .. } => output,
         }
     }
 
@@ -331,6 +350,7 @@ impl ToolOutput {
     pub fn images(&self) -> &[ToolImage] {
         match self {
             Self::Success { images, .. } | Self::Error { images, .. } => images,
+            Self::TrustedInstructions { .. } => &[],
         }
     }
 
@@ -342,6 +362,7 @@ impl ToolOutput {
             Self::Success { display_data, .. } | Self::Error { display_data, .. } => {
                 display_data.as_ref()
             }
+            Self::TrustedInstructions { .. } => None,
         }
     }
 }
@@ -1311,6 +1332,12 @@ mod tests {
         let out = ToolOutput::success("Error: command failed with exit code 1");
         assert!(out.is_success());
         assert!(matches!(out, ToolOutput::Success { .. }));
+    }
+    #[test]
+    fn trusted_instructions_are_structurally_distinct_from_ordinary_success() {
+        let out = ToolOutput::trusted_instructions("authenticated");
+        assert!(out.is_success());
+        assert!(matches!(out, ToolOutput::TrustedInstructions { .. }));
     }
 
     #[test]

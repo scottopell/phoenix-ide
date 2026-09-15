@@ -112,7 +112,7 @@ rule CollectNamespacedSubSkills {
 rule FilterSkillCatalogByAudience {
     when: AudienceCatalogRequested(audience, working_dir)
 
-    let catalog = collect_skills(working_dir)
+    let catalog = collect_skills(working_dir, audience: audience)
 
     ensures: for skill in catalog where skill.audience = audience:
         skill in audience_catalog
@@ -148,7 +148,7 @@ rule UserInvokesSkill {
 
     requires: exists token
 
-    let skill = find_skill(collect_skills(working_dir), token.name)
+    let skill = find_skill(collect_skills(working_dir, audience: "conversation"), token.name)
     -- find_skill: black box looking up a skill by exact name in a List<Skill>
 
     requires: exists skill
@@ -185,7 +185,7 @@ rule SkillTokenNotMatched {
 
     requires: exists token
 
-    let skill = find_skill(collect_skills(working_dir), token.name)
+    let skill = find_skill(collect_skills(working_dir, audience: "conversation"), token.name)
 
     requires: not exists skill
 
@@ -228,11 +228,12 @@ rule NoSlashToken {
 rule LlmCallsSkillTool {
     when: LlmToolCall(tool, skill_name, args, working_dir)
 
-    let skill = find_skill(collect_skills(working_dir), skill_name)
+    let audience = caller_audience(tool)
+    let catalog = collect_skills(working_dir, audience: audience)
+    let skill = find_skill(catalog, skill_name)
 
     requires: tool = "skill"
     requires: exists skill
-    requires: skill.audience = caller_audience(tool)
     -- caller_audience: black box returning the audience bound to this Skill tool
 
     ensures: ToolResult.created(
@@ -249,12 +250,14 @@ rule LlmCallsSkillTool {
 rule LlmCallsSkillToolNotFound {
     when: LlmToolCall(tool, skill_name, args, working_dir)
 
-    let skill = find_skill(collect_skills(working_dir), skill_name)
+    let audience = caller_audience(tool)
+    let catalog = collect_skills(working_dir, audience: audience)
+    let skill = find_skill(catalog, skill_name)
 
     requires: tool = "skill"
     requires: not exists skill
 
-    let available = skill_names_joined(collect_skills(working_dir))
+    let available = skill_names_joined(catalog)
     -- skill_names_joined: black box returning comma-separated skill names
 
     ensures: ToolResult.created(
@@ -385,9 +388,9 @@ rule StripFrontmatter {
 ------------------------------------------------------------
 
 rule InjectSkillCatalog {
-    when: SystemPromptBuilt(working_dir)
+    when: SystemPromptBuilt(working_dir, audience)
 
-    let catalog = collect_skills(working_dir)
+    let catalog = collect_skills(working_dir, audience: audience)
 
     requires: catalog.count > 0
 
