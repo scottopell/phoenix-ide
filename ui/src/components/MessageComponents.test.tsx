@@ -497,6 +497,40 @@ describe('inline tool timers', () => {
     expect(document.activeElement).toBe(screen.getByRole('button', { name: /read_file:.*expand tool detail/i }));
   });
 
+  it('restores collapse focus inside the owning group when tool use ids recur', () => {
+    mockDensity = 'compact';
+    const earlier = agentMessage('agent-duplicate-earlier', [
+      { type: 'tool_use', id: 'duplicate-tool', name: 'read_file', input: { path: 'earlier.md' } },
+    ], 2);
+    const later = agentMessage('agent-duplicate-later', [
+      { type: 'tool_use', id: 'duplicate-tool', name: 'read_file', input: { path: 'later.md' } },
+      { type: 'tool_use', id: 'later-tail', name: 'search', input: { pattern: 'tail' } },
+    ], 4);
+    Element.prototype.scrollIntoView = vi.fn();
+
+    render(<MemoryRouter>
+      <>
+        <ToolOnlyAgentTurnGroup members={[
+          { kind: 'agent_turn', key: earlier.message_id, agent: earlier, toolResultsByUseId: new Map(), isFirstInTurn: true },
+        ]} />
+        <ToolOnlyAgentTurnGroup members={[
+          { kind: 'agent_turn', key: later.message_id, agent: later, toolResultsByUseId: new Map(), isFirstInTurn: false },
+        ]} />
+      </>
+    </MemoryRouter>);
+
+    const laterButton = Array.from(screen.getAllByRole('button', { name: /read_file:.*expand tool detail/i }))
+      .find((button) => button.closest('[data-message-id="agent-duplicate-later"]'));
+    expect(laterButton).toBeDefined();
+    fireEvent.click(laterButton!);
+
+    fireEvent.click(screen.getByRole('button', { name: /collapse expanded tool detail/i }));
+
+    expect(document.activeElement).toHaveAccessibleName(/read_file:.*later\.md.*expand tool detail/i);
+    expect(document.activeElement?.closest('[data-message-id="agent-duplicate-later"]')).not.toBeNull();
+    expect(document.activeElement?.closest('[data-message-id="agent-duplicate-earlier"]')).toBeNull();
+  });
+
   it('renders response-level retry metadata once when one message owns multiple tools', () => {
     mockDensity = 'compact';
     const owner = { ...agentMessage('agent-retry-multi', [

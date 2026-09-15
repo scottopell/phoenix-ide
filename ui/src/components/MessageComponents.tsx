@@ -668,9 +668,22 @@ function CollapsibleTextImpl({
  * The inline mini pill-strip a compact-mode agent turn shows in place of its
  * tool blocks. Built purely from the turn's own tool_use blocks + paired
  * results (via `deriveToolStripItems`), never from phase state.
- * Clicking any pill calls `onExpand(toolId)` so the parent can reveal the full
- * tool detail and scroll the clicked tool into view.
+ * Clicking any pill calls `onExpand(target)` so the parent can reveal the full
+ * tool detail and scroll the clicked card within its owning group.
  */
+type CompactToolTarget = {
+  toolId: string;
+  ownerMessageId: string;
+};
+
+const sameCompactToolTarget = (left: CompactToolTarget | null, right: CompactToolTarget | null) => (
+  left?.toolId === right?.toolId && left?.ownerMessageId === right?.ownerMessageId
+);
+
+const compactToolCardSelector = ({ toolId, ownerMessageId }: CompactToolTarget) => (
+  `[data-message-id="${CSS.escape(ownerMessageId)}"][data-tool-id="${CSS.escape(toolId)}"]`
+);
+
 const CompactToolStrip = memo(CompactToolStripImpl);
 
 function CompactToolStripImpl({
@@ -679,7 +692,7 @@ function CompactToolStripImpl({
   copiedOwnerIds = new Set(),
 }: {
   items: ToolStripItem[];
-  onExpand: (toolId: string) => void;
+  onExpand: (target: CompactToolTarget) => void;
   copiedOwnerIds?: ReadonlySet<string>;
 }) {
   const hasRunningTimer = items.some((item) => !item.hasResult && item.startedAtMs !== null);
@@ -727,7 +740,7 @@ function CompactToolStripImpl({
             <button
               type="button"
               className="compact-tool-card-expand"
-              onClick={() => onExpand(item.toolId)}
+              onClick={() => onExpand({ toolId: item.toolId, ownerMessageId: item.ownerMessage.message_id })}
               aria-label={`${item.name}: ${item.commandIdentity ?? item.inputSummary} (${ariaStatus})${ariaSummary ? ` — ${ariaSummary}` : ''} — expand tool detail`}
             >
               <span className="compact-tool-card-header">
@@ -870,60 +883,64 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
   onRevealHandled,
 }: ToolOnlyAgentTurnGroupProps) {
   const { density } = useDensity();
-  const [expandedToolId, setExpandedToolId] = useState<string | null>(null);
-  const pendingScrollToolIdRef = useRef<string | null>(null);
-  const pendingFocusToolIdRef = useRef<string | null>(null);
+  const [expandedToolTarget, setExpandedToolTarget] = useState<CompactToolTarget | null>(null);
+  const groupRef = useRef<HTMLDivElement | null>(null);
+  const pendingScrollToolRef = useRef<CompactToolTarget | null>(null);
+  const pendingFocusToolRef = useRef<CompactToolTarget | null>(null);
   const items = useMemo(
     () => members.flatMap((member) => deriveToolStripItems(member.agent, member.toolResultsByUseId, liveBashProgress)),
     [liveBashProgress, members],
   );
 
-  const expand = useCallback((toolId: string) => {
-    pendingScrollToolIdRef.current = toolId || null;
-    setExpandedToolId(toolId || null);
+  const expand = useCallback((target: CompactToolTarget) => {
+    pendingScrollToolRef.current = target;
+    setExpandedToolTarget(target);
   }, []);
 
   useEffect(() => {
-    if (!expandedToolId) return;
-    const toolId = pendingScrollToolIdRef.current;
-    pendingScrollToolIdRef.current = null;
-    if (!toolId) return;
-    document.querySelector(`[data-tool-id="${CSS.escape(toolId)}"]`)
+    if (!expandedToolTarget) return;
+    const target = pendingScrollToolRef.current;
+    pendingScrollToolRef.current = null;
+    if (!target) return;
+    groupRef.current?.querySelector(`.compact-tool-selected-detail [data-tool-id="${CSS.escape(target.toolId)}"]`)
       ?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-  }, [expandedToolId]);
+  }, [expandedToolTarget]);
 
   useLayoutEffect(() => {
-    if (expandedToolId) return;
-    const toolId = pendingFocusToolIdRef.current;
-    pendingFocusToolIdRef.current = null;
-    if (!toolId) return;
-    document.querySelector<HTMLElement>(`[data-tool-id="${CSS.escape(toolId)}"] .compact-tool-card-expand`)
+    if (expandedToolTarget) return;
+    const target = pendingFocusToolRef.current;
+    pendingFocusToolRef.current = null;
+    if (!target) return;
+    groupRef.current?.querySelector<HTMLElement>(`${compactToolCardSelector(target)} .compact-tool-card-expand`)
       ?.focus();
-  }, [expandedToolId]);
+  }, [expandedToolTarget]);
 
   const collapseExpandedTool = useCallback(() => {
-    pendingFocusToolIdRef.current = expandedToolId;
-    setExpandedToolId(null);
-  }, [expandedToolId]);
+    pendingFocusToolRef.current = expandedToolTarget;
+    setExpandedToolTarget(null);
+  }, [expandedToolTarget]);
 
   useEffect(() => {
     if (density !== 'compact' || !revealRequest || revealRequest.revealTarget.kind === 'agent-text') return;
     const toolUseId = 'toolUseId' in revealRequest.revealTarget
       ? revealRequest.revealTarget.toolUseId
       : null;
-    if (!toolUseId || toolUseId === expandedToolId) return;
-    pendingScrollToolIdRef.current = toolUseId;
-    setExpandedToolId(toolUseId);
-  }, [density, expandedToolId, revealRequest]);
+    const targetItem = items.find((item) => item.toolId === toolUseId);
+    if (!targetItem) return;
+    const target = { toolId: targetItem.toolId, ownerMessageId: targetItem.ownerMessage.message_id };
+    if (sameCompactToolTarget(target, expandedToolTarget)) return;
+    pendingScrollToolRef.current = target;
+    setExpandedToolTarget(target);
+  }, [density, expandedToolTarget, items, revealRequest]);
 
   if (density === 'compact') {
     const first = members[0];
-    const expandedItemIndex = expandedToolId
-      ? items.findIndex((item) => item.toolId === expandedToolId)
+    const expandedItemIndex = expandedToolTarget
+      ? items.findIndex((item) => item.toolId === expandedToolTarget.toolId
+        && item.ownerMessage.message_id === expandedToolTarget.ownerMessageId)
       : -1;
-    const expandedMemberIndex = expandedToolId
-      ? members.findIndex((member) => Array.isArray(member.agent.content)
-        && member.agent.content.some((block) => block.type === 'tool_use' && block.id === expandedToolId))
+    const expandedMemberIndex = expandedToolTarget
+      ? members.findIndex((member) => member.agent.message_id === expandedToolTarget.ownerMessageId)
       : -1;
     const expandedMember = expandedMemberIndex >= 0 ? members[expandedMemberIndex] : undefined;
     const compactRuns: Array<{ key: string; items: ToolStripItem[] } | { key: string; expanded: true }> = [];
@@ -934,7 +951,7 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
       currentRun = [];
     };
     items.forEach((item, index) => {
-      if (expandedToolId && index === expandedItemIndex) {
+      if (expandedToolTarget && index === expandedItemIndex) {
         flushRun(`before-${item.toolId || index}`);
         compactRuns.push({ key: `expanded-${item.toolId || index}`, expanded: true });
       } else {
@@ -945,6 +962,7 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
     return (
       <div
         id={first ? `message-${first.agent.message_id}` : undefined}
+        ref={groupRef}
         className="message agent compact-tool-group"
         data-sequence-id={first?.agent.sequence_id}
       >
@@ -963,7 +981,7 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
           {(() => {
             const copiedOwnerIds = new Set<string>();
             return compactRuns.map((run) => 'expanded' in run ? (
-            expandedMember && expandedToolId ? (
+            expandedMember && expandedToolTarget ? (
               <div className="compact-tool-selected-detail" key={run.key}>
                 <button
                   type="button"
@@ -982,7 +1000,7 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
                   workScopeKey={workScopeKey}
                   activeToolUseId={activeToolUseId}
                   forceExpandedTools
-                  visibleToolUseId={expandedToolId}
+                  visibleToolUseId={expandedToolTarget.toolId}
                   suppressMessageCopy
                   isFirstInTurn={false}
                   isLatestAgentMessage={isLatestAgentMessage && expandedMemberIndex === members.length - 1}
@@ -1315,7 +1333,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
                   <CompactToolStrip
                     key="compact-tool-strip"
                     items={toolStripItems}
-                    onExpand={handleExpandTools}
+                    onExpand={({ toolId }) => handleExpandTools(toolId)}
                   />
                 );
               }
