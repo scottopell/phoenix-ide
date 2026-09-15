@@ -5089,12 +5089,22 @@ impl RuntimeManager {
                     self.db.clone(),
                     self.message_retriever.clone(),
                 );
+                let previous_binding = crate::api::global_read::PreviousTranscriptsBinding::new(
+                    conv.product_conversation_id.as_str().to_string(),
+                    conv.id.clone(),
+                );
+                let previous_tool = crate::coordinator_tools::previous_transcripts_tool(
+                    global_read.clone(),
+                    previous_binding.clone(),
+                );
+                let host_bound_tools = vec![previous_tool.clone()];
                 let send_chat =
                     Arc::new(crate::send_chat_service::SendChatApplicationService::new(
                         self.db.clone(),
                         self.clone(),
                     ));
-                let writing_tools = crate::coordinator_tools::writing_tools(global_read, send_chat);
+                let writing_tools =
+                    crate::coordinator_tools::writing_tools(global_read.clone(), send_chat);
                 let (registry, upgrade_writing_tools) = match conv.conv_mode {
                     ConvMode::Explore { .. } if approved_task_objective.is_some() => (
                         ToolRegistry::direct(agent_catalog.to_vec(), available_model_ids.clone())
@@ -5157,6 +5167,7 @@ impl RuntimeManager {
                     Arc::from(available_model_ids.clone()),
                 )
                 .with_writing_tools(upgrade_writing_tools)
+                .with_host_bound_tools(host_bound_tools)
             }
         };
 
@@ -5261,6 +5272,20 @@ impl RuntimeManager {
                 self.db.clone(),
                 self.message_retriever.clone(),
             ))
+        } else {
+            runtime
+        };
+        let runtime = if !is_sub_agent && !is_coordinator {
+            runtime.with_previous_transcripts(
+                crate::api::global_read::GlobalReadService::new(
+                    self.db.clone(),
+                    self.message_retriever.clone(),
+                ),
+                crate::api::global_read::PreviousTranscriptsBinding::new(
+                    conv.product_conversation_id.as_str().to_string(),
+                    conv.id.clone(),
+                ),
+            )
         } else {
             runtime
         };

@@ -2061,6 +2061,7 @@ pub struct ToolRegistryExecutor {
     agent_catalog: Arc<[phoenix_agents::AgentDefinition]>,
     model_ids: Arc<[String]>,
     writing_tools: Option<WritingConversationTools>,
+    host_bound_tools: Vec<std::sync::Arc<dyn crate::tools::Tool>>,
 }
 
 impl ToolRegistryExecutor {
@@ -2077,6 +2078,7 @@ impl ToolRegistryExecutor {
             agent_catalog,
             model_ids: Arc::from(Vec::new()),
             writing_tools: None,
+            host_bound_tools: Vec::new(),
         }
     }
 
@@ -2095,12 +2097,33 @@ impl ToolRegistryExecutor {
             agent_catalog,
             model_ids,
             writing_tools: None,
+            host_bound_tools: Vec::new(),
         }
     }
 
     #[must_use]
     pub fn with_writing_tools(mut self, tools: Option<WritingConversationTools>) -> Self {
         self.writing_tools = tools;
+        self
+    }
+
+    #[must_use]
+    pub fn with_host_bound_tools(
+        mut self,
+        tools: Vec<std::sync::Arc<dyn crate::tools::Tool>>,
+    ) -> Self {
+        {
+            let mut registry = self
+                .registry
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for tool in tools.iter().cloned() {
+                registry
+                    .try_add_host_bound_tool(tool)
+                    .expect("registry has no duplicate host-bound tool");
+            }
+        }
+        self.host_bound_tools = tools;
         self
     }
 
@@ -2215,6 +2238,11 @@ impl ToolExecutor for ToolRegistryExecutor {
         // agent_type enum the executor resolves against (REQ-AG-008).
         let mut registry =
             ToolRegistry::direct(self.agent_catalog.to_vec(), self.model_ids.to_vec());
+        for tool in self.host_bound_tools.iter().cloned() {
+            registry = registry
+                .try_with_host_bound_tool(tool)
+                .expect("fresh Work registry has no predecessor capability");
+        }
         if let Some(tools) = self.writing_tools.clone() {
             registry = registry
                 .try_with_writing_conversation_tools(tools)
@@ -2276,18 +2304,29 @@ mod tool_registry_executor_tests {
                 Arc::new(NamedMarker("send_conversation_message")),
             )
             .unwrap(),
-        ));
+        ))
+        .with_host_bound_tools(vec![Arc::new(NamedMarker("previous_transcripts"))]);
 
         assert!(!executor
             .definitions()
             .await
             .iter()
             .any(|definition| definition.name == "search_conversations"));
+        assert!(executor
+            .definitions()
+            .await
+            .iter()
+            .any(|definition| definition.name == "previous_transcripts"));
         executor.upgrade_to_work_mode();
         assert!(executor
             .definitions()
             .await
             .iter()
             .any(|definition| definition.name == "search_conversations"));
+        assert!(executor
+            .definitions()
+            .await
+            .iter()
+            .any(|definition| definition.name == "previous_transcripts"));
     }
 }
