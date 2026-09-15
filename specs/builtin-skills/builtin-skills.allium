@@ -86,6 +86,7 @@ rule ScanBuiltinExtractDir {
             name: frontmatter_name(child_dir),
             description: frontmatter_description(child_dir),
             argument_hint: frontmatter_argument_hint(child_dir),
+            audience: frontmatter_audience(child_dir, default: "conversation"),
             source: Builtin(path: child_dir + "/SKILL.md")
         )
     -- immediate_subdirectories / has_skill_md / current_builtin_name /
@@ -101,6 +102,21 @@ rule ScanBuiltinExtractDir {
         -- Implementation: collect_builtin_skills_from_dir() in
         -- src/system_prompt.rs, called from discover_skills_with_options
         -- after the walk-up + children + $HOME scans.
+}
+
+rule DiscoverCoordinatorBuiltin {
+    when: CoordinatorBuiltinCatalogRequested(builtin_dir)
+
+    ensures: for skill in builtins(builtin_dir)
+             where skill.audience = "global-coordinator":
+        skill in coordinator_catalog
+    ensures: for skill in builtins(builtin_dir)
+             where skill.audience != "global-coordinator":
+        skill not in coordinator_catalog
+
+    @guidance
+        -- Coordinator discovery scans only Phoenix's extracted built-ins. It
+        -- does not scan repository or user filesystem skill directories.
 }
 
 ------------------------------------------------------------

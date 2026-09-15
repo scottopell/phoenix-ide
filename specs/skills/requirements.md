@@ -152,3 +152,19 @@ on invocation, not preloaded)
 but preloading all skill bodies into the system prompt would waste context
 tokens. The catalog is a lightweight index; the full content is loaded on
 demand.
+
+---
+
+### REQ-SK-008: Bound Skills to Their Runtime Audience
+
+WHEN a skill has no audience metadata
+THE SYSTEM SHALL make it available only to ordinary conversation discovery and invocation
+
+WHEN a Phoenix built-in skill declares the `global-coordinator` audience
+THE SYSTEM SHALL include it only in the Global Coordinator catalog
+AND SHALL permit invocation only through the Global Coordinator's audience-bound Skill tool
+
+THE SYSTEM SHALL NOT allow a filesystem skill to grant itself Global Coordinator visibility through frontmatter
+
+WHEN no eligible Global Coordinator built-in is discoverable
+THE SYSTEM SHALL omit the Coordinator skill catalog and SHALL NOT refer to a missing skill

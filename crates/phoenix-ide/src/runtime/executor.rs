@@ -12609,6 +12609,14 @@ mod authoritative_user_message_effect_tests {
                 request.system[0].text,
                 CompactionPolicy::for_coordinator(coordinator).system_prompt()
             );
+            if coordinator {
+                assert!(!request.system[0]
+                    .text
+                    .contains("cannot create conversations"));
+                assert!(!request.system[0]
+                    .text
+                    .contains("NEVER call Phoenix HTTP API through Bash"));
+            }
             assert!(request.messages.len() < 63);
         }
     }

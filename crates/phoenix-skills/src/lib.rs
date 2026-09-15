@@ -20,6 +20,26 @@ use std::path::{Path, PathBuf};
 // events; it lives in phoenix-core. Re-export at the historical path.
 pub use phoenix_core::domain::skill_invocation::SkillInvocation;
 
+/// The runtime surface allowed to discover and invoke a skill.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SkillAudience {
+    /// Ordinary top-level conversations and user slash commands.
+    #[default]
+    Conversation,
+    /// The process-wide Global Coordinator.
+    GlobalCoordinator,
+}
+
+impl SkillAudience {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "conversation" => Some(Self::Conversation),
+            "global-coordinator" => Some(Self::GlobalCoordinator),
+            _ => None,
+        }
+    }
+}
+
 /// Where a skill came from. Filesystem skills come from user-installed
 /// directories (`.claude/skills/`, `.agents/skills/`); built-in skills are
 /// bundled with the phoenix binary and extracted to a real directory at
@@ -48,6 +68,7 @@ pub struct SkillMetadata {
     pub description: String,
     /// Optional argument hint shown in autocomplete (from `argument-hint:` frontmatter field)
     pub argument_hint: Option<String>,
+    pub audience: SkillAudience,
     pub source: SkillSource,
 }
 
@@ -93,9 +114,10 @@ struct SkillFrontmatter {
     name: String,
     description: String,
     argument_hint: Option<String>,
+    audience: Option<SkillAudience>,
 }
 
-/// Parse `name`, `description`, and optional `argument-hint` from SKILL.md YAML frontmatter.
+/// Parse skill metadata from SKILL.md YAML frontmatter.
 ///
 /// Expects the file to start with `---\n`, followed by `key: value` lines,
 /// closed by `\n---\n`. Returns `None` if either required field is missing or the
@@ -113,6 +135,7 @@ fn parse_skill_frontmatter(content: &str) -> Option<SkillFrontmatter> {
     let mut name: Option<String> = None;
     let mut description: Option<String> = None;
     let mut argument_hint: Option<String> = None;
+    let mut audience: Option<SkillAudience> = None;
 
     for line in frontmatter.lines() {
         if let Some(val) = line.strip_prefix("name:") {
@@ -124,6 +147,8 @@ fn parse_skill_frontmatter(content: &str) -> Option<SkillFrontmatter> {
             if !hint.is_empty() {
                 argument_hint = Some(hint);
             }
+        } else if let Some(val) = line.strip_prefix("audience:") {
+            audience = Some(SkillAudience::parse(val.trim())?);
         }
     }
 
@@ -131,6 +156,7 @@ fn parse_skill_frontmatter(content: &str) -> Option<SkillFrontmatter> {
         name: name?,
         description: description?,
         argument_hint,
+        audience,
     })
 }
 
@@ -191,6 +217,8 @@ fn collect_skills_from_dir(
                     name: full_name.clone(),
                     description: fm.description,
                     argument_hint: fm.argument_hint,
+                    // Filesystem skills cannot grant themselves Coordinator visibility.
+                    audience: SkillAudience::Conversation,
                     source: SkillSource::Filesystem {
                         path: skill_md,
                         source_dir: source.to_string(),
@@ -272,6 +300,7 @@ fn collect_builtin_skills_from_dir(
                     name: fm.name,
                     description: fm.description,
                     argument_hint: fm.argument_hint,
+                    audience: fm.audience.unwrap_or_default(),
                     source: SkillSource::Builtin { path: skill_md },
                 });
             }
@@ -298,7 +327,60 @@ fn collect_builtin_skills_from_dir(
 #[must_use]
 pub fn discover_skills(working_dir: &Path) -> Vec<SkillMetadata> {
     let builtin_dir = builtin::default_extract_dir();
-    discover_skills_with_options(working_dir, None, builtin_dir.as_deref())
+    discover_skills_for_audience_with_options(
+        working_dir,
+        None,
+        builtin_dir.as_deref(),
+        SkillAudience::Conversation,
+    )
+}
+
+/// Discover only skills admitted to one runtime audience.
+#[must_use]
+pub fn discover_skills_for_audience(
+    working_dir: &Path,
+    audience: SkillAudience,
+) -> Vec<SkillMetadata> {
+    let builtin_dir = builtin::default_extract_dir();
+    discover_skills_for_audience_with_options(working_dir, None, builtin_dir.as_deref(), audience)
+}
+
+/// Audience-filtered discovery with deterministic directory overrides.
+#[must_use]
+pub fn discover_skills_for_audience_with_options(
+    working_dir: &Path,
+    home_override: Option<&Path>,
+    builtin_dir: Option<&Path>,
+    audience: SkillAudience,
+) -> Vec<SkillMetadata> {
+    discover_all_skills_with_options(working_dir, home_override, builtin_dir)
+        .into_iter()
+        .filter(|skill| skill.audience == audience)
+        .collect()
+}
+
+/// Discover built-ins admitted to one audience without scanning a filesystem tree.
+#[must_use]
+pub fn discover_builtin_skills_for_audience(
+    builtin_dir: Option<&Path>,
+    audience: SkillAudience,
+) -> Vec<SkillMetadata> {
+    let mut skills = Vec::new();
+    let mut seen_names = HashSet::new();
+    let mut seen_paths = HashSet::new();
+    let mut seen_content = HashSet::new();
+    if let Some(dir) = builtin_dir.filter(|dir| dir.is_dir()) {
+        collect_builtin_skills_from_dir(
+            dir,
+            &mut skills,
+            &mut seen_names,
+            &mut seen_paths,
+            &mut seen_content,
+        );
+    }
+    skills.retain(|skill| skill.audience == audience);
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    skills
 }
 
 /// Discovery with explicit overrides for both `$HOME` and the built-in
@@ -307,6 +389,20 @@ pub fn discover_skills(working_dir: &Path) -> Vec<SkillMetadata> {
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn discover_skills_with_options(
+    working_dir: &Path,
+    home_override: Option<&Path>,
+    builtin_dir: Option<&Path>,
+) -> Vec<SkillMetadata> {
+    discover_skills_for_audience_with_options(
+        working_dir,
+        home_override,
+        builtin_dir,
+        SkillAudience::Conversation,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn discover_all_skills_with_options(
     working_dir: &Path,
     home_override: Option<&Path>,
     builtin_dir: Option<&Path>,
@@ -1074,6 +1170,58 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_audience_admits_only_marked_builtins() {
+        let tmp = TempDir::new().unwrap();
+        let extract_dir = tmp.path().join("builtin-skills");
+        builtin::extract_to(&extract_dir).unwrap();
+
+        let ordinary = discover_skills_for_audience_with_options(
+            tmp.path(),
+            Some(tmp.path()),
+            Some(&extract_dir),
+            SkillAudience::Conversation,
+        );
+        assert!(ordinary.iter().any(|skill| skill.name == "allium"));
+        assert!(!ordinary.iter().any(|skill| skill.name == "phoenix-api"));
+
+        let coordinator = discover_skills_for_audience_with_options(
+            tmp.path(),
+            Some(tmp.path()),
+            Some(&extract_dir),
+            SkillAudience::GlobalCoordinator,
+        );
+        assert_eq!(
+            coordinator
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["phoenix-api"]
+        );
+        assert!(invoke_skill("phoenix-api", "", &coordinator).is_ok());
+        assert!(invoke_skill("phoenix-api", "", &ordinary).is_err());
+    }
+
+    #[test]
+    fn filesystem_skill_cannot_self_promote_to_coordinator() {
+        let tmp = TempDir::new().unwrap();
+        let skill_dir = tmp.path().join(".agents/skills/impostor");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: impostor\ndescription: no\naudience: global-coordinator\n---\nbody",
+        )
+        .unwrap();
+
+        let coordinator = discover_skills_for_audience_with_options(
+            tmp.path(),
+            Some(tmp.path()),
+            None,
+            SkillAudience::GlobalCoordinator,
+        );
+        assert!(coordinator.is_empty());
+    }
+
+    #[test]
     fn test_skill_dir_for_builtin_is_extracted_parent() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("builtin-skills/spears/SKILL.md");
@@ -1081,6 +1229,7 @@ mod tests {
             name: "spears".to_string(),
             description: "x".to_string(),
             argument_hint: None,
+            audience: SkillAudience::Conversation,
             source: SkillSource::Builtin { path: path.clone() },
         };
         assert_eq!(

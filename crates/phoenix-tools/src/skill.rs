@@ -16,7 +16,26 @@ use serde_json::{json, Value};
 /// instructions autonomously; tool result is the correct delivery weight.
 /// The user `/skill` slash path delivers as a user-role message because
 /// the user is issuing a directive. See REQ-SK-002 in specs/skills/.
-pub struct SkillTool;
+pub struct SkillTool {
+    audience: phoenix_skills::SkillAudience,
+}
+
+impl Default for SkillTool {
+    fn default() -> Self {
+        Self {
+            audience: phoenix_skills::SkillAudience::Conversation,
+        }
+    }
+}
+
+impl SkillTool {
+    #[must_use]
+    pub const fn for_global_coordinator() -> Self {
+        Self {
+            audience: phoenix_skills::SkillAudience::GlobalCoordinator,
+        }
+    }
+}
 
 #[async_trait]
 impl Tool for SkillTool {
@@ -59,7 +78,21 @@ impl Tool for SkillTool {
             return ToolOutput::error("skill_name is required");
         }
 
-        let skills = phoenix_skills::discover_skills(ctx.working_dir());
+        let skills = match self.audience {
+            phoenix_skills::SkillAudience::Conversation => {
+                phoenix_skills::discover_skills_for_audience(
+                    ctx.working_dir(),
+                    phoenix_skills::SkillAudience::Conversation,
+                )
+            }
+            phoenix_skills::SkillAudience::GlobalCoordinator => {
+                let builtin_dir = phoenix_skills::builtin::default_extract_dir();
+                phoenix_skills::discover_builtin_skills_for_audience(
+                    builtin_dir.as_deref(),
+                    phoenix_skills::SkillAudience::GlobalCoordinator,
+                )
+            }
+        };
         match phoenix_skills::invoke_skill(skill_name, args, &skills) {
             Ok(invocation) => ToolOutput::success(invocation.body),
             Err(e) => ToolOutput::error(e),
@@ -105,7 +138,7 @@ mod tests {
     #[tokio::test]
     async fn test_skill_empty_name() {
         let tmp = TempDir::new().unwrap();
-        let tool = SkillTool;
+        let tool = SkillTool::default();
         let result = tool
             .run(
                 json!({"skill_name": ""}),
@@ -119,7 +152,7 @@ mod tests {
     #[tokio::test]
     async fn test_skill_missing_name() {
         let tmp = TempDir::new().unwrap();
-        let tool = SkillTool;
+        let tool = SkillTool::default();
         let result = tool
             .run(json!({}), test_context(tmp.path().to_path_buf()))
             .await;
@@ -132,7 +165,7 @@ mod tests {
     #[tokio::test]
     async fn test_skill_not_found() {
         let tmp = TempDir::new().unwrap();
-        let tool = SkillTool;
+        let tool = SkillTool::default();
         let result = tool
             .run(
                 json!({"skill_name": "nonexistent"}),
@@ -148,7 +181,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write_skill(tmp.path(), "build", "build", "Build stuff", "Build body.");
 
-        let tool = SkillTool;
+        let tool = SkillTool::default();
         let result = tool
             .run(
                 json!({"skill_name": "deploy"}),
@@ -170,7 +203,7 @@ mod tests {
             "Run cargo build.",
         );
 
-        let tool = SkillTool;
+        let tool = SkillTool::default();
         let result = tool
             .run(
                 json!({"skill_name": "build"}),
@@ -195,7 +228,7 @@ mod tests {
             "Please review $ARGUMENTS carefully.",
         );
 
-        let tool = SkillTool;
+        let tool = SkillTool::default();
         let result = tool
             .run(
                 json!({"skill_name": "review", "args": "src/main.rs"}),
