@@ -104,6 +104,31 @@ impl From<AutoContinueOnContextExhaustion> for bool {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ContinuationOpeningAuthority {
+    UserAuthorizedInstruction,
+    GeneratedPredecessorContext,
+}
+
+impl ContinuationOpeningAuthority {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UserAuthorizedInstruction => "user_authorized_instruction",
+            Self::GeneratedPredecessorContext => "generated_predecessor_context",
+        }
+    }
+
+    #[must_use]
+    pub fn from_db_str(value: &str) -> Option<Self> {
+        Some(match value {
+            "user_authorized_instruction" => Self::UserAuthorizedInstruction,
+            "generated_predecessor_context" => Self::GeneratedPredecessorContext,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OrdinaryProductConversationLifecycle {
@@ -222,6 +247,22 @@ mod tests {
             AutoContinueOnContextExhaustion::Enabled
         );
         assert!(bool::from(AutoContinueOnContextExhaustion::Enabled));
+    }
+
+    #[test]
+    fn continuation_opening_authority_has_no_implicit_fallback() {
+        assert_eq!(
+            ContinuationOpeningAuthority::from_db_str("user_authorized_instruction"),
+            Some(ContinuationOpeningAuthority::UserAuthorizedInstruction)
+        );
+        assert_eq!(
+            ContinuationOpeningAuthority::GeneratedPredecessorContext.as_str(),
+            "generated_predecessor_context"
+        );
+        assert_eq!(
+            ContinuationOpeningAuthority::from_db_str("unknown"),
+            None
+        );
     }
 
     #[test]
