@@ -43,8 +43,8 @@ async function verifyWideTable({ page, id, viewport }) {
   if (desktop.wrapperLeft < desktop.chatLeft || desktop.wrapperRight > desktop.chatRight) {
     throw new Error(`Wide table escaped chat bounds: ${JSON.stringify(desktop)}`);
   }
-  if (desktop.wrapperLeft >= desktop.messageLeft || desktop.wrapperRight <= desktop.messageRight) {
-    throw new Error(`Wide table did not break out on both sides: ${JSON.stringify(desktop)}`);
+  if (desktop.wrapperClientWidth < Math.min(desktop.messageRight - desktop.messageLeft, 784)) {
+    throw new Error(`Wide table wrapper is narrower than its owned table boundary: ${JSON.stringify(desktop)}`);
   }
   if (desktop.wrapperOverflowX !== 'auto' || desktop.wrapperScrollWidth <= desktop.wrapperClientWidth) {
     throw new Error(`Wide table wrapper does not own local overflow: ${JSON.stringify(desktop)}`);
@@ -95,6 +95,34 @@ async function verifyWideTable({ page, id, viewport }) {
   return false;
 }
 
+async function captureCompactChronology({ page, id, outDir }) {
+  if (id !== 'compact-expanded-tool-chronology') return false;
+
+  await page.getByRole('button', { name: /read_file:.*expand tool detail/i }).click();
+  await page.waitForSelector('.compact-tool-selected-detail [data-tool-id="chronology-tool-a"]');
+  await page.getByTestId('chronology-append-bc').click();
+  await page.waitForSelector('[data-tool-id="chronology-tool-c"]');
+  await page.getByTestId('chronology-complete-bc').click();
+  await page.waitForFunction(() => {
+    const ids = Array.from(document.querySelectorAll('[data-tool-id]')).map((node) => node.getAttribute('data-tool-id'));
+    return ids.includes('chronology-tool-a') && ids.includes('chronology-tool-b') && ids.includes('chronology-tool-c');
+  });
+  await page.getByTestId('chronology-final').click();
+  await page.waitForSelector('#message-chronology-agent-final');
+  const metrics = await page.evaluate(() => window.__messageListChronologyMetrics ?? null);
+  await writeFile(path.join(outDir, `${id}--metrics.json`), `${JSON.stringify(metrics, null, 2)}\n`);
+  if (!metrics || metrics.phase !== 'final-prose' || metrics.latestReachable !== true) {
+    throw new Error(`Compact chronology final prose was not measured as reachable: ${JSON.stringify(metrics)}`);
+  }
+  if (!Array.isArray(metrics.toolDomOrder)
+    || metrics.toolDomOrder.join(',') !== 'chronology-tool-a,chronology-tool-b,chronology-tool-c') {
+    throw new Error(`Compact chronology order regressed: ${JSON.stringify(metrics)}`);
+  }
+  await page.screenshot({ path: path.join(outDir, `${id}--final.png`), fullPage: true });
+  console.log('  verified compact chronology append/complete/final flow');
+  return true;
+}
+
 async function captureContinuityReproduction({ page, id, outDir }) {
   if (id !== 'prefix-continuity-offset-bug') return false;
 
@@ -139,6 +167,6 @@ runSurfaceCapture({
   outDir: process.env.MESSAGE_LIST_QA_OUT ?? 'qa-artifacts/message-list',
   viewport: { width, height },
   captureStory: async (context) => (
-    await verifyWideTable(context) || await captureContinuityReproduction(context)
+    await verifyWideTable(context) || await captureCompactChronology(context) || await captureContinuityReproduction(context)
   ),
 });

@@ -12,7 +12,7 @@
  * - SubAgentStatus: Renders sub-agent progress indicator
  */
 
-import React, { memo, useState, useMemo, useCallback, useRef, useEffect } from 'react';
+import React, { memo, useState, useMemo, useCallback, useRef, useEffect, useLayoutEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import ReactMarkdown from 'react-markdown';
 import type { Components } from 'react-markdown';
@@ -676,9 +676,11 @@ const CompactToolStrip = memo(CompactToolStripImpl);
 function CompactToolStripImpl({
   items,
   onExpand,
+  copiedOwnerIds = new Set(),
 }: {
   items: ToolStripItem[];
   onExpand: (toolId: string) => void;
+  copiedOwnerIds?: ReadonlySet<string>;
 }) {
   const hasRunningTimer = items.some((item) => !item.hasResult && item.startedAtMs !== null);
   const [nowMs, setNowMs] = useState(() => Date.now());
@@ -712,8 +714,8 @@ function CompactToolStripImpl({
         const ariaStatus = item.finalStatus ?? statusLabel;
         const ariaSummary = item.outputTail ?? summary;
         const isCompactBash = item.name === 'bash';
-        const isFirstCardForOwner = i === 0
-          || items[i - 1]?.ownerMessage.message_id !== item.ownerMessage.message_id;
+        const isFirstCardForOwner = !copiedOwnerIds.has(item.ownerMessage.message_id)
+          && (i === 0 || items[i - 1]?.ownerMessage.message_id !== item.ownerMessage.message_id);
         return (
           <div
             key={item.toolId || `${item.name}-${i}`}
@@ -806,6 +808,7 @@ interface AgentMessageProps {
   forceExpandedText?: boolean;
   forceExpandedTools?: boolean;
   visibleToolUseId?: string;
+  suppressMessageCopy?: boolean;
   isLatestAgentMessage?: boolean;
   unitKey?: string;
   revealRequest?: AgentTextRevealRequest | null;
@@ -869,6 +872,7 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
   const { density } = useDensity();
   const [expandedToolId, setExpandedToolId] = useState<string | null>(null);
   const pendingScrollToolIdRef = useRef<string | null>(null);
+  const pendingFocusToolIdRef = useRef<string | null>(null);
   const items = useMemo(
     () => members.flatMap((member) => deriveToolStripItems(member.agent, member.toolResultsByUseId, liveBashProgress)),
     [liveBashProgress, members],
@@ -886,6 +890,20 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
     if (!toolId) return;
     document.querySelector(`[data-tool-id="${CSS.escape(toolId)}"]`)
       ?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }, [expandedToolId]);
+
+  useLayoutEffect(() => {
+    if (expandedToolId) return;
+    const toolId = pendingFocusToolIdRef.current;
+    pendingFocusToolIdRef.current = null;
+    if (!toolId) return;
+    document.querySelector<HTMLElement>(`[data-tool-id="${CSS.escape(toolId)}"] .compact-tool-card-expand`)
+      ?.focus();
+  }, [expandedToolId]);
+
+  const collapseExpandedTool = useCallback(() => {
+    pendingFocusToolIdRef.current = expandedToolId;
+    setExpandedToolId(null);
   }, [expandedToolId]);
 
   useEffect(() => {
@@ -912,7 +930,7 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
     let currentRun: ToolStripItem[] = [];
     const flushRun = (key: string) => {
       if (currentRun.length === 0) return;
-      compactRuns.push({ key, items: currentRun });
+      compactRuns.push({ key, items: currentRun.map((item) => item) });
       currentRun = [];
     };
     items.forEach((item, index) => {
@@ -942,13 +960,15 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
           </div>
         )}
         <div className="message-content">
-          {compactRuns.map((run) => 'expanded' in run ? (
+          {(() => {
+            const copiedOwnerIds = new Set<string>();
+            return compactRuns.map((run) => 'expanded' in run ? (
             expandedMember && expandedToolId ? (
               <div className="compact-tool-selected-detail" key={run.key}>
                 <button
                   type="button"
                   className="compact-tool-detail-collapse"
-                  onClick={() => setExpandedToolId(null)}
+                  onClick={collapseExpandedTool}
                   aria-label="Collapse expanded tool detail"
                 >
                   Collapse
@@ -963,6 +983,7 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
                   activeToolUseId={activeToolUseId}
                   forceExpandedTools
                   visibleToolUseId={expandedToolId}
+                  suppressMessageCopy
                   isFirstInTurn={false}
                   isLatestAgentMessage={isLatestAgentMessage && expandedMemberIndex === members.length - 1}
                   {...(unitKey !== undefined ? { unitKey } : {})}
@@ -972,9 +993,12 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
                 />
               </div>
             ) : null
-          ) : (
-            <CompactToolStrip key={run.key} items={run.items} onExpand={expand} />
-          ))}
+          ) : (() => {
+            const runCopiedOwnerIds = new Set(copiedOwnerIds);
+            for (const item of run.items) copiedOwnerIds.add(item.ownerMessage.message_id);
+            return <CompactToolStrip key={run.key} items={run.items} onExpand={expand} copiedOwnerIds={runCopiedOwnerIds} />;
+          })())
+          })()}
           {members.some((member) => hasAgentRetries(member.agent)) && (
             <div className="compact-tool-group-audit" aria-label="Response retry audit">
               {members.filter((member) => hasAgentRetries(member.agent)).map((member) => (
@@ -1016,7 +1040,7 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
 
 export const AgentMessage = memo(AgentMessageImpl);
 
-function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, workScopeKey, activeToolUseId, liveBashProgress = {}, isFirstInTurn = true, forceExpandedText = false, forceExpandedTools = false, visibleToolUseId, isLatestAgentMessage = false, unitKey, revealRequest = null, activeHighlight = null, onRevealHandled }: AgentMessageProps) {
+function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, workScopeKey, activeToolUseId, liveBashProgress = {}, isFirstInTurn = true, forceExpandedText = false, forceExpandedTools = false, visibleToolUseId, suppressMessageCopy = false, isLatestAgentMessage = false, unitKey, revealRequest = null, activeHighlight = null, onRevealHandled }: AgentMessageProps) {
   const blocks = useMemo(
     () => (Array.isArray(message.content) ? (message.content as ContentBlock[]) : []),
     [message.content],
@@ -1237,7 +1261,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
 
   return (
     <div id={`message-${message.message_id}`} className="message agent" data-sequence-id={message.sequence_id}>
-      {!isFirstInTurn && (
+      {!suppressMessageCopy && !isFirstInTurn && (
         <div className="message-mobile-copy-row">
           <MessageCopyButton message={message} title="Copy Phoenix message" />
         </div>
@@ -1251,9 +1275,11 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
             </span>
           )}
           <AgentRetryBadge message={message} />
-          <span className="message-header-actions">
-            <MessageCopyButton message={message} title="Copy Phoenix message" />
-          </span>
+          {!suppressMessageCopy && (
+            <span className="message-header-actions">
+              <MessageCopyButton message={message} title="Copy Phoenix message" />
+            </span>
+          )}
         </div>
       )}
       <div className="message-content">
