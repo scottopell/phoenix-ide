@@ -4733,7 +4733,9 @@ fn linux_descriptor_writer_evidence(
         &process_path.join("fdinfo").join(descriptor.file_name()),
     )? {
         LinuxDescriptorAccess::Disappeared => return Ok(None),
-        LinuxDescriptorAccess::NoWrite => None,
+        LinuxDescriptorAccess::NoWrite => {
+            classify_descriptor_access_mode(None, target_is_directory)
+        }
         LinuxDescriptorAccess::Mode(access_mode) => {
             classify_descriptor_access_mode(Some(access_mode), target_is_directory)
         }
