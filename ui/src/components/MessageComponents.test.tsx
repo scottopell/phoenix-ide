@@ -457,6 +457,24 @@ describe('inline tool timers', () => {
     expect(document.querySelectorAll('.compact-tool-selected-detail .message-mobile-copy')).toHaveLength(0);
   });
 
+  it('keeps one owner copy action when expanding a singleton compact owner', () => {
+    mockDensity = 'compact';
+    const owner = agentMessage('agent-copy-singleton', [
+      { type: 'tool_use', id: 'copy-singleton-read', name: 'read_file', input: { path: 'only.md' } },
+    ], 2);
+
+    render(<MemoryRouter><ToolOnlyAgentTurnGroup members={[
+      { kind: 'agent_turn', key: owner.message_id, agent: owner, toolResultsByUseId: new Map(), isFirstInTurn: true },
+    ]} /></MemoryRouter>);
+
+    expect(document.querySelectorAll('.compact-tool-owner-copy .message-mobile-copy')).toHaveLength(1);
+
+    fireEvent.click(screen.getByRole('button', { name: /read_file:.*expand tool detail/i }));
+
+    expect(document.querySelectorAll('.compact-tool-owner-copy .message-mobile-copy')).toHaveLength(1);
+    expect(document.querySelectorAll('.compact-tool-selected-detail .message-mobile-copy')).toHaveLength(1);
+  });
+
   it('keeps an expanded older compact tool before newer appended tools in DOM chronology', () => {
     mockDensity = 'compact';
     const first = agentMessage('agent-chronology-a', [
@@ -529,6 +547,40 @@ describe('inline tool timers', () => {
     expect(document.activeElement).toHaveAccessibleName(/read_file:.*later\.md.*expand tool detail/i);
     expect(document.activeElement?.closest('[data-message-id="agent-duplicate-later"]')).not.toBeNull();
     expect(document.activeElement?.closest('[data-message-id="agent-duplicate-earlier"]')).toBeNull();
+  });
+
+  it('remounts expanded detail state when recurring tool use ids switch owners', () => {
+    mockDensity = 'compact';
+    const earlier = agentMessage('agent-recurring-key-earlier', [
+      { type: 'tool_use', id: 'recurring-key-tool', name: 'read_file', input: { path: 'earlier.md' } },
+    ], 2);
+    const later = agentMessage('agent-recurring-key-later', [
+      { type: 'tool_use', id: 'recurring-key-tool', name: 'read_file', input: { path: 'later.md' } },
+    ], 4);
+
+    render(<MemoryRouter><ToolOnlyAgentTurnGroup members={[
+      { kind: 'agent_turn', key: earlier.message_id, agent: earlier, toolResultsByUseId: new Map(), isFirstInTurn: true },
+      { kind: 'agent_turn', key: later.message_id, agent: later, toolResultsByUseId: new Map(), isFirstInTurn: false },
+    ]} /></MemoryRouter>);
+
+    const buttons = screen.getAllByRole('button', { name: /read_file:.*expand tool detail/i });
+    const earlierButton = buttons.find((button) => button.closest('[data-message-id="agent-recurring-key-earlier"]'));
+    expect(earlierButton).toBeDefined();
+
+    fireEvent.click(earlierButton!);
+    const earlierDetail = document.querySelector('.compact-tool-selected-detail');
+    const earlierAgentMessage = earlierDetail?.querySelector('#message-agent-recurring-key-earlier');
+    expect(earlierAgentMessage).not.toBeNull();
+
+    const laterButton = screen.getAllByRole('button', { name: /read_file:.*expand tool detail/i })
+      .find((button) => button.closest('[data-message-id="agent-recurring-key-later"]'));
+    expect(laterButton).toBeDefined();
+    fireEvent.click(laterButton!);
+    const laterDetail = document.querySelector('.compact-tool-selected-detail');
+    const laterAgentMessage = laterDetail?.querySelector('#message-agent-recurring-key-later');
+    expect(laterAgentMessage).not.toBeNull();
+    expect(laterAgentMessage).not.toBe(earlierAgentMessage);
+    expect(laterDetail?.querySelector('#message-agent-recurring-key-earlier')).toBeNull();
   });
 
   it('renders response-level retry metadata once when one message owns multiple tools', () => {

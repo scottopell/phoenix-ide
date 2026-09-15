@@ -53,7 +53,7 @@ export function MessageListFixture({ scenario }: Props) {
     const toolNodes = Array.from(document.querySelectorAll<HTMLElement>('[data-tool-id]'));
     const latest = phase === 'final-prose'
       ? document.querySelector<HTMLElement>('#message-chronology-agent-final')
-      : ['chronology-agent-c', 'chronology-agent-b', 'chronology-agent-a']
+      : ['chronology-agent-bc', 'chronology-agent-a']
         .map((id) => document.querySelector<HTMLElement>(`[data-message-id="${id}"]`))
         .find((node): node is HTMLElement => Boolean(node));
     const expanded = document.querySelector<HTMLElement>('[data-tool-id="chronology-tool-a"]');
@@ -187,17 +187,11 @@ export function MessageListFixture({ scenario }: Props) {
   };
 
   const completeChronologyTools = () => {
-    setMessages((current) => {
-      if (current.some((message) => message.message_id === 'chronology-result-b')) return current;
-      const resultB = compactChronologyCompletionMessages.find((message) => message.message_id === 'chronology-result-b');
-      const resultC = compactChronologyCompletionMessages.find((message) => message.message_id === 'chronology-result-c');
-      if (!resultB || !resultC) return current;
-      return current.flatMap((message) => (
-        message.message_id === 'chronology-agent-c'
-          ? [resultB, message, resultC]
-          : [message]
-      ));
-    });
+    setMessages((current) => (
+      current.some((message) => message.message_id === 'chronology-result-b')
+        ? current
+        : [...current, ...compactChronologyCompletionMessages]
+    ));
     requestAnimationFrame(() => recordChronologyMetrics('completed-bc'));
   };
 

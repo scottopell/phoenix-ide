@@ -80,7 +80,7 @@ export const compactChronologyInitialMessages: Message[] = [
 
 export const compactChronologyAppendMessages: Message[] = [
   {
-    message_id: 'chronology-agent-b',
+    message_id: 'chronology-agent-bc',
     conversation_id: 'fixture-message-list-compact-chronology',
     sequence_id: 4,
     type: 'agent',
@@ -88,17 +88,6 @@ export const compactChronologyAppendMessages: Message[] = [
     created_at: '2025-01-01T10:02:00.000Z',
     content: [
       { type: 'tool_use', id: 'chronology-tool-b', name: 'search', input: { pattern: 'newer B' } },
-    ],
-    display_data: {},
-  },
-  {
-    message_id: 'chronology-agent-c',
-    conversation_id: 'fixture-message-list-compact-chronology',
-    sequence_id: 5,
-    type: 'agent',
-    message_type: 'agent',
-    created_at: '2025-01-01T10:03:00.000Z',
-    content: [
       { type: 'tool_use', id: 'chronology-tool-c', name: 'bash', input: { op: 'run', cmd: 'echo newer C' } },
     ],
     display_data: {},
@@ -109,7 +98,7 @@ export const compactChronologyCompletionMessages: Message[] = [
   {
     message_id: 'chronology-result-b',
     conversation_id: 'fixture-message-list-compact-chronology',
-    sequence_id: 6,
+    sequence_id: 5,
     type: 'tool',
     message_type: 'tool',
     created_at: '2025-01-01T10:03:30.000Z',
@@ -119,7 +108,7 @@ export const compactChronologyCompletionMessages: Message[] = [
   {
     message_id: 'chronology-result-c',
     conversation_id: 'fixture-message-list-compact-chronology',
-    sequence_id: 7,
+    sequence_id: 6,
     type: 'tool',
     message_type: 'tool',
     created_at: '2025-01-01T10:04:00.000Z',
@@ -132,7 +121,7 @@ export const compactChronologyFinalMessages: Message[] = [
   {
     message_id: 'chronology-agent-final',
     conversation_id: 'fixture-message-list-compact-chronology',
-    sequence_id: 8,
+    sequence_id: 7,
     type: 'agent',
     message_type: 'agent',
     created_at: '2025-01-01T10:05:00.000Z',

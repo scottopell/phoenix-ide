@@ -731,7 +731,7 @@ function CompactToolStripImpl({
           && (i === 0 || items[i - 1]?.ownerMessage.message_id !== item.ownerMessage.message_id);
         return (
           <div
-            key={item.toolId || `${item.name}-${i}`}
+            key={`${item.ownerMessage.message_id}-${item.toolId || `${item.name}-${i}`}`}
             className={classNames}
             data-sequence-id={item.ownerMessage.sequence_id}
             data-message-id={item.ownerMessage.message_id}
@@ -953,7 +953,7 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
     items.forEach((item, index) => {
       if (expandedToolTarget && index === expandedItemIndex) {
         flushRun(`before-${item.toolId || index}`);
-        compactRuns.push({ key: `expanded-${item.toolId || index}`, expanded: true });
+        compactRuns.push({ key: `expanded-${item.ownerMessage.message_id}-${item.toolId || index}`, expanded: true });
       } else {
         currentRun.push(item);
       }
@@ -981,8 +981,20 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
           {(() => {
             const copiedOwnerIds = new Set<string>();
             return compactRuns.map((run) => 'expanded' in run ? (
-            expandedMember && expandedToolTarget ? (
+            expandedMember && expandedToolTarget ? (() => {
+              const ownerHasCompactCard = compactRuns.some((candidate) => !('expanded' in candidate)
+                && candidate.items.some((item) => item.ownerMessage.message_id === expandedToolTarget.ownerMessageId));
+              return (
               <div className="compact-tool-selected-detail" key={run.key}>
+                {!ownerHasCompactCard && (
+                  <span className="compact-tool-owner-copy message-mobile-copy-row">
+                    <MessageCopyButton
+                      message={expandedMember.agent}
+                      title="Copy Phoenix message"
+                      text={getToolOnlyMessageCopy(expandedMember.agent)}
+                    />
+                  </span>
+                )}
                 <button
                   type="button"
                   className="compact-tool-detail-collapse"
@@ -992,6 +1004,7 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
                   Collapse
                 </button>
                 <AgentMessage
+                  key={`${expandedToolTarget.ownerMessageId}-${expandedToolTarget.toolId}`}
                   message={expandedMember.agent}
                   toolResults={expandedMember.toolResultsByUseId}
                   liveBashProgress={liveBashProgress}
@@ -1010,7 +1023,8 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
                   {...(onRevealHandled ? { onRevealHandled } : {})}
                 />
               </div>
-            ) : null
+              );
+            })() : null
           ) : (() => {
             const runCopiedOwnerIds = new Set(copiedOwnerIds);
             for (const item of run.items) copiedOwnerIds.add(item.ownerMessage.message_id);
