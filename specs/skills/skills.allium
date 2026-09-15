@@ -22,6 +22,7 @@ external entity Skill {
     base_dir: String        -- absolute path to the skill's containing directory (filesystem path)
     argument_hint: String?  -- from frontmatter; shown in autocomplete after /name
     source: String          -- scanning location: ".claude/skills" | ".agents/skills"
+    audience: String        -- "conversation" | "global-coordinator"
 }
 
 -- Opaque types referenced by rules below; declared as external so the
@@ -106,6 +107,22 @@ rule CollectNamespacedSubSkills {
         -- Recursion continues: allium:distill could itself contain a skills/
         -- subdirectory producing allium:distill:grandchild.
         -- Implementation: collect_skills_from_dir() in src/system_prompt.rs.
+}
+
+rule FilterSkillCatalogByAudience {
+    when: AudienceCatalogRequested(audience, working_dir)
+
+    let catalog = collect_skills(working_dir)
+
+    ensures: for skill in catalog where skill.audience = audience:
+        skill in audience_catalog
+    ensures: for skill in catalog where skill.audience != audience:
+        skill not in audience_catalog
+
+    @guidance
+        -- Skills without audience metadata use the conversation audience.
+        -- Only Phoenix built-ins may declare global-coordinator. Filesystem
+        -- metadata cannot promote a skill into the Coordinator catalog.
 }
 
 ------------------------------------------------------------
@@ -215,6 +232,8 @@ rule LlmCallsSkillTool {
 
     requires: tool = "skill"
     requires: exists skill
+    requires: skill.audience = caller_audience(tool)
+    -- caller_audience: black box returning the audience bound to this Skill tool
 
     ensures: ToolResult.created(
         content: expand_skill(skill, args),
