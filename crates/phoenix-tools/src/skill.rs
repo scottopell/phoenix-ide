@@ -18,12 +18,14 @@ use serde_json::{json, Value};
 /// the user is issuing a directive. See REQ-SK-002 in specs/skills/.
 pub struct SkillTool {
     audience: phoenix_skills::SkillAudience,
+    builtin_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for SkillTool {
     fn default() -> Self {
         Self {
             audience: phoenix_skills::SkillAudience::Conversation,
+            builtin_dir: None,
         }
     }
 }
@@ -33,6 +35,7 @@ impl SkillTool {
     pub const fn for_global_coordinator() -> Self {
         Self {
             audience: phoenix_skills::SkillAudience::GlobalCoordinator,
+            builtin_dir: None,
         }
     }
 }
@@ -86,16 +89,29 @@ impl Tool for SkillTool {
                 )
             }
             phoenix_skills::SkillAudience::GlobalCoordinator => {
-                let builtin_dir = phoenix_skills::builtin::default_extract_dir();
+                let default_dir = phoenix_skills::builtin::default_extract_dir();
+                let builtin_dir = self.builtin_dir.as_deref().or(default_dir.as_deref());
                 phoenix_skills::discover_builtin_skills_for_audience(
-                    builtin_dir.as_deref(),
+                    builtin_dir,
                     phoenix_skills::SkillAudience::GlobalCoordinator,
                 )
             }
         };
-        match phoenix_skills::invoke_skill(skill_name, args, &skills) {
-            Ok(invocation) => ToolOutput::success(invocation.body),
-            Err(e) => ToolOutput::error(e),
+        let result = match self.audience {
+            phoenix_skills::SkillAudience::Conversation => {
+                phoenix_skills::invoke_skill(skill_name, args, self.audience, &skills)
+                    .map(|invocation| invocation.body)
+            }
+            phoenix_skills::SkillAudience::GlobalCoordinator => {
+                phoenix_skills::invoke_trusted_coordinator_builtin(skill_name, args, &skills)
+            }
+        };
+        match (self.audience, result) {
+            (phoenix_skills::SkillAudience::GlobalCoordinator, Ok(body)) => {
+                ToolOutput::trusted_instructions(body)
+            }
+            (phoenix_skills::SkillAudience::Conversation, Ok(body)) => ToolOutput::success(body),
+            (_, Err(e)) => ToolOutput::error(e),
         }
     }
 }
@@ -134,6 +150,27 @@ mod tests {
     }
 
     // -- Input validation (tool-level concerns) --
+
+    #[tokio::test]
+    async fn coordinator_skill_returns_authenticated_embedded_instructions() {
+        let temp = TempDir::new().unwrap();
+        phoenix_skills::builtin::extract_to(temp.path()).unwrap();
+        let tool = SkillTool {
+            audience: phoenix_skills::SkillAudience::GlobalCoordinator,
+            builtin_dir: Some(temp.path().to_path_buf()),
+        };
+        let result = tool
+            .run(
+                json!({"skill_name": "phoenix-api"}),
+                test_context(temp.path().to_path_buf()),
+            )
+            .await;
+
+        assert!(result.is_success());
+        assert!(result.output().contains("<trusted_builtin_skill"));
+        assert!(result.output().contains("Embedded reference"));
+        assert!(result.output().contains("ContextExhausted"));
+    }
 
     #[tokio::test]
     async fn test_skill_empty_name() {

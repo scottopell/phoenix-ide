@@ -341,6 +341,7 @@ mod tests {
                 tool_use_id: tool_use_id.to_string(),
                 content: output.to_string(),
                 is_error: false,
+                origin: crate::db::ToolContentOrigin::Ordinary,
                 images: vec![],
             }),
             display_data: None,
@@ -857,6 +858,7 @@ mod proptests {
                 tool_use_id: format!("tool-{}", seq - 1),
                 content: "tool output".to_string(),
                 is_error: false,
+                origin: crate::db::ToolContentOrigin::Ordinary,
                 images: vec![],
             }),
             _ => MessageContent::User(UserContent {

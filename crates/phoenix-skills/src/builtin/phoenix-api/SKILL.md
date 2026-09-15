@@ -6,7 +6,7 @@ audience: global-coordinator
 
 # Phoenix API for the Global Coordinator
 
-Use this skill only when the user has authorized a Phoenix lifecycle action. Read `references/api-reference.md` before acting.
+Use this skill only when the user has authorized a Phoenix lifecycle action. The authenticated API reference is included in this skill result; read it before acting and do not load a mutable filesystem copy.
 
 - Use scoped Bash in an active WorkScope and the documented Phoenix HTTP API; do not invent endpoints or guarantees.
 - Preserve normal Phoenix authorization. Discover whether auth is enabled without exposing credentials, and never print, persist, or place credentials in command arguments or tool output.

@@ -68,6 +68,42 @@ pub fn skill_names() -> Vec<String> {
     names.into_iter().collect()
 }
 
+/// Read a built-in asset from the binary's immutable embedded bytes.
+#[must_use]
+pub fn embedded_asset(path: &str) -> Option<String> {
+    let asset = BuiltinAssets::get(path)?;
+    std::str::from_utf8(asset.data.as_ref())
+        .ok()
+        .map(str::to_owned)
+}
+
+/// Read one built-in skill definition from immutable embedded bytes.
+#[must_use]
+pub fn embedded_skill(name: &str) -> Option<String> {
+    if !skill_names().iter().any(|candidate| candidate == name) {
+        return None;
+    }
+    embedded_asset(&format!("{name}/SKILL.md"))
+}
+
+/// Read every embedded text asset for one built-in skill, sorted by path.
+#[must_use]
+pub fn embedded_skill_assets(name: &str) -> Option<Vec<(String, String)>> {
+    if !skill_names().iter().any(|candidate| candidate == name) {
+        return None;
+    }
+    let prefix = format!("{name}/");
+    let mut assets = BuiltinAssets::iter()
+        .filter_map(|path| {
+            let path = path.into_owned();
+            path.strip_prefix(&prefix)?;
+            embedded_asset(&path).map(|content| (path, content))
+        })
+        .collect::<Vec<_>>();
+    assets.sort_by(|a, b| a.0.cmp(&b.0));
+    Some(assets)
+}
+
 /// Extract every embedded built-in file to `target_dir/<skill>/<...>`.
 /// Overwrites embedded files and removes every non-embedded file found under a
 /// currently bundled skill directory. The target directory is Phoenix-owned;
@@ -212,6 +248,16 @@ mod tests {
     }
 
     #[test]
+    fn embedded_skill_reads_immutable_asset() {
+        let content = embedded_skill("phoenix-api").unwrap();
+        assert!(content.contains("audience: global-coordinator"));
+        assert!(embedded_skill("missing").is_none());
+        assert!(embedded_asset("phoenix-api/references/api-reference.md")
+            .unwrap()
+            .contains("ContextExhausted"));
+    }
+
+    #[test]
     fn skill_names_excludes_nested_skill_md() {
         // Allium has references/ but no nested SKILL.md, so allium:foo
         // should not appear at this layer (it would only appear if we
@@ -259,6 +305,10 @@ mod tests {
         assert!(skill.contains("acceptance, not proof"));
         assert!(reference.contains("GET /api/auth/status"));
         assert!(reference.contains("writable_transcript_row_id"));
+        assert!(reference.contains("/{latest_transcript_row_id}/continue"));
+        assert!(reference.contains("verified as `ContextExhausted`"));
+        assert!(reference.contains("/{writable_transcript_row_id}/chat"));
+        assert!(reference.contains("/{writable_transcript_row_id}/cancel"));
         assert!(reference.contains("Reuse the same `message_id`"));
         assert!(reference.contains("messages/reconcile"));
         assert!(reference.contains("Current APIs do not provide"));
