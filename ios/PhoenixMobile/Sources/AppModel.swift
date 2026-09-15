@@ -214,7 +214,14 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
                 switch DiskStore.loadVersionedResult(
                     PersistedOutboxEnvelope.self,
                     source: source,
-                    version: schemaVersion)
+                    version: schemaVersion,
+                    migrate: { storedVersion, fileData in
+                        PersistedOutboxEnvelope.migrateLegacyEntries(
+                            storedVersion: storedVersion,
+                            fileData: fileData,
+                            scope: scope,
+                            aggregateAuthority: nil)
+                    })
                 {
                 case .missing:
                     return nil
@@ -246,7 +253,14 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
             guard case .value(let envelope) = DiskStore.loadVersionedResult(
                 PersistedOutboxEnvelope.self,
                 source: source,
-                version: Outbox.schemaVersion)
+                version: Outbox.schemaVersion,
+                migrate: { storedVersion, fileData in
+                    PersistedOutboxEnvelope.migrateLegacyEntries(
+                        storedVersion: storedVersion,
+                        fileData: fileData,
+                        scope: scope,
+                        aggregateAuthority: nil)
+                })
             else {
                 return nil
             }
@@ -318,7 +332,14 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
         switch DiskStore.loadVersionedResult(
             PersistedOutboxEnvelope.self,
             source: source,
-            version: Outbox.schemaVersion)
+            version: Outbox.schemaVersion,
+            migrate: { storedVersion, fileData in
+                PersistedOutboxEnvelope.migrateLegacyEntries(
+                    storedVersion: storedVersion,
+                    fileData: fileData,
+                    scope: nil,
+                    aggregateAuthority: nil)
+            })
         {
         case .missing:
             return OutboxStoreInspection(conversationId: conversationId, state: .missing)
@@ -345,7 +366,32 @@ struct DiskConversationPersistenceStore: ConversationPersistenceStore {
         let writer = context.writer(destinationURL: source, version: Outbox.schemaVersion)
         return OutboxPersistenceHandle(
             inspect: { requestedConversationId in
-                self.inspectOutbox(conversationId: requestedConversationId)
+                switch DiskStore.loadVersionedResult(
+                    PersistedOutboxEnvelope.self,
+                    source: source,
+                    version: Outbox.schemaVersion,
+                    migrate: { storedVersion, fileData in
+                        PersistedOutboxEnvelope.migrateLegacyEntries(
+                            storedVersion: storedVersion,
+                            fileData: fileData,
+                            scope: scope,
+                            aggregateAuthority: aggregateAuthority)
+                    })
+                {
+                case .missing:
+                    return OutboxStoreInspection(conversationId: requestedConversationId, state: .missing)
+                case .value(let envelope):
+                    return OutboxStoreInspection(
+                        conversationId: requestedConversationId,
+                        state: .accessible(
+                            scope: envelope.scope,
+                            aggregateAuthority: envelope.aggregateAuthority,
+                            entries: envelope.entries))
+                case .incompatible:
+                    return OutboxStoreInspection(conversationId: requestedConversationId, state: .incompatibleNewerVersion)
+                case .unreadable:
+                    return OutboxStoreInspection(conversationId: requestedConversationId, state: .inaccessible)
+                }
             },
             reserveRevision: { writer.reserveRevision() },
             save: { envelope, revision in await writer.save(envelope, revision: revision) },
@@ -748,19 +794,37 @@ final class AppModel {
         randomCredentialGenerationForTestsAndDefaults()
     }
 
-    private static func legacyCredentialGeneration(serverURL: String, password: String) -> String {
-        let scope = "\(PersistenceScopeIdentity(serverURL: serverURL, credentialGeneration: "").serverEndpoint)\u{1f}\(password)"
-        return "legacy-" + SHA256.hash(data: Data(scope.utf8))
-            .map { String(format: "%02x", $0) }
-            .joined()
-    }
-
     private static func loadCredentialRecord(from credentialStore: CredentialStore) -> CredentialRecord? {
         credentialStore.loadRecord(account: Self.credentialRecordAccount)
     }
 
     private static func saveCredentialRecord(_ record: CredentialRecord, to credentialStore: CredentialStore) throws {
         try credentialStore.saveRecord(record, account: Self.credentialRecordAccount)
+    }
+
+    private static func migrateLegacyCredentialIfNeeded(
+        persistedServerURL: String,
+        credentialStore: CredentialStore
+    ) -> (record: CredentialRecord?, legacyScope: PersistenceScopeIdentity?) {
+        if let record = loadCredentialRecord(from: credentialStore) {
+            return (record, nil)
+        }
+        guard let legacyPassword = credentialStore.loadLegacyPassword(account: Self.legacyPasswordAccount) else {
+            return (nil, nil)
+        }
+        let record = CredentialRecord(
+            password: legacyPassword,
+            generation: mintedCredentialGeneration())
+        let legacyScope = PersistenceScopeIdentity(
+            serverURL: persistedServerURL,
+            credentialGeneration: record.generation)
+        do {
+            try saveCredentialRecord(record, to: credentialStore)
+            credentialStore.deleteRecord(account: Self.legacyPasswordAccount)
+        } catch {
+            NSLog("Phoenix legacy credential migration could not persist versioned record")
+        }
+        return (record, legacyScope)
     }
 
     init(
@@ -778,28 +842,24 @@ final class AppModel {
         listStore = ConversationListStore(hasCachedSnapshot: self.hasCachedSnapshot, context: listContext)
         let persistedServerURL = UserDefaults.standard.string(forKey: Self.serverURLKey) ?? ""
         serverURLString = persistedServerURL
-        let credentialRecord = Self.loadCredentialRecord(from: credentialStore)
-        let legacyPassword = credentialRecord == nil
-            ? credentialStore.loadLegacyPassword(account: Self.legacyPasswordAccount)
-            : nil
-        password = credentialRecord?.password ?? legacyPassword ?? ""
-        let loadedCredentialGeneration = credentialRecord?.generation
-            ?? legacyPassword.map { Self.legacyCredentialGeneration(serverURL: persistedServerURL, password: $0) }
-            ?? ""
-        credentialGeneration = loadedCredentialGeneration
-        legacySnapshotPersistenceScope = legacyPassword.map { _ in
-            PersistenceScopeIdentity(
-                serverURL: persistedServerURL,
-                credentialGeneration: loadedCredentialGeneration)
-        }
+        let migratedCredential = Self.migrateLegacyCredentialIfNeeded(
+            persistedServerURL: persistedServerURL,
+            credentialStore: credentialStore)
+        password = migratedCredential.record?.password ?? ""
+        credentialGeneration = migratedCredential.record?.generation ?? ""
+        legacySnapshotPersistenceScope = migratedCredential.legacyScope
         trustSelfSigned = UserDefaults.standard.object(forKey: Self.trustSelfSignedKey) as? Bool ?? true
         attention = AttentionMonitor(
             currentConversations: listStore.conversations,
             transcriptToAggregate: listStore.transcriptToAggregate)
         rebuildAPI()
         _ = connectivity.addRestoreObserver { [weak self] in
-            self?.scheduleDeliveryTrigger(.connectivityRestore)
-            Task { await self?.refreshList() }
+            guard let self, !self.signOutInProgress else { return }
+            self.scheduleDeliveryTrigger(.connectivityRestore)
+            Task { [weak self] in
+                guard let self, !self.signOutInProgress else { return }
+                await self.refreshList()
+            }
         }
         notificationRouter.model = self
         UNUserNotificationCenter.current().delegate = notificationRouter
@@ -1012,8 +1072,10 @@ final class AppModel {
         }
         let previousConfigurationIdentity = api?.configurationIdentity
         api = configuredAPI
-        for session in sessions.values { session.invalidateConfiguration() }
-        for session in drainSessions.values { session.invalidateConfiguration() }
+        sessions.values.forEach { $0.revokeConfigurationForReplacement() }
+        drainSessions.values.forEach { $0.revokeConfigurationForReplacement() }
+        sessions.removeAll()
+        drainSessions.removeAll()
         let cachedDetails = Array(productConversationDetails.values)
         productConversationDetails.removeAll()
         for detail in cachedDetails {
@@ -1027,9 +1089,7 @@ final class AppModel {
         coordinatorConversationId = configuredAPI.flatMap {
             coordinatorIdentityStore.load(persistenceScope: $0.configurationIdentity.persistenceScope)?.conversationId
         }
-        guard let configuredAPI else { return }
-        for session in sessions.values { session.replaceAPI(configuredAPI) }
-        for session in drainSessions.values { session.replaceAPI(configuredAPI) }
+        guard configuredAPI != nil else { return }
         finishStartupHydration()
     }
 
@@ -1898,6 +1958,7 @@ final class AppModel {
                     staleCheckTiming: LiveSessionTiming(),
                     deliveryTriggerAllowed: { [weak self] in
                         self?.persistedOutboxHydrated == true
+                            && self?.signOutInProgress == false
                     },
                     legacySnapshotPersistenceScope: legacySnapshotPersistenceScope,
                     aggregateAuthority: owner.aggregateAuthority)

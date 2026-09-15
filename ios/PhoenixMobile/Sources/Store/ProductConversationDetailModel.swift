@@ -159,6 +159,19 @@ final class ProductConversationDetailModel {
         retainedFallbackSession
     }
 
+    var cacheSyncedAt: Date? {
+        let sessionDates = provenCachedMemberSessions().compactMap(\.snapshotSyncedAt)
+        if let oldest = sessionDates.min() { return oldest }
+        return retainedFallbackSession?.snapshotSyncedAt
+    }
+
+    var hasUnhealthyProjectedOutbox: Bool {
+        for transcriptRowId in visibleOutboxSessionIds {
+            if existingSession(transcriptRowId)?.outbox.persistenceHealthy == false { return true }
+        }
+        return retainedFallbackSession?.outbox.persistenceHealthy == false
+    }
+
     var displayTitle: String {
         if let snapshot {
             return snapshot.canonical_root.title ?? snapshot.canonical_root.slug ?? snapshot.product_conversation_id
@@ -397,7 +410,7 @@ final class ProductConversationDetailModel {
                 lastDelegatedConnection = connection
             }
         case .messagesChanged:
-            break
+            lastTranscriptMutation = .appendedLive
         case .outboxChanged:
             refreshPersistedOutboxDiscovery()
             syncObserversAndSessions()
