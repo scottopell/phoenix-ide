@@ -106,9 +106,7 @@ final class OutboxPersistenceHandle {
                     migrate: { storedVersion, fileData in
                         PersistedOutboxEnvelope.migrateLegacyEntries(
                             storedVersion: storedVersion,
-                            fileData: fileData,
-                            scope: scope,
-                            aggregateAuthority: aggregateAuthority)
+                            fileData: fileData)
                     })
                 {
                 case .missing:
@@ -132,6 +130,10 @@ final class OutboxPersistenceHandle {
     }
 }
 
+private struct LegacyVersionedOutboxEntries: Decodable {
+    let payload: [OutboxEntry]
+}
+
 struct PersistedOutboxEnvelope: Codable, Equatable, Sendable {
     let scope: PersistenceScopeIdentity?
     let aggregateAuthority: String?
@@ -141,16 +143,20 @@ struct PersistedOutboxEnvelope: Codable, Equatable, Sendable {
 extension PersistedOutboxEnvelope {
     static func migrateLegacyEntries(
         storedVersion: Int,
-        fileData: Data,
-        scope: PersistenceScopeIdentity?,
-        aggregateAuthority: String?
+        fileData: Data
     ) -> PersistedOutboxEnvelope? {
-        guard storedVersion <= 1,
-              let entries = try? JSONDecoder().decode([OutboxEntry].self, from: fileData)
-        else { return nil }
+        guard storedVersion <= 1 else { return nil }
+        let decoder = JSONDecoder()
+        let entries: [OutboxEntry]?
+        if storedVersion == 0 {
+            entries = try? decoder.decode([OutboxEntry].self, from: fileData)
+        } else {
+            entries = try? decoder.decode(LegacyVersionedOutboxEntries.self, from: fileData).payload
+        }
+        guard let entries else { return nil }
         return PersistedOutboxEnvelope(
-            scope: scope,
-            aggregateAuthority: aggregateAuthority,
+            scope: nil,
+            aggregateAuthority: nil,
             entries: entries)
     }
 }
