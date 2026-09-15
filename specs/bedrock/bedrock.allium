@@ -148,6 +148,18 @@ enum TaskApprovalDecision {
 }
 enum ModeKind { direct | managed | branch }
 enum EnvironmentKind { git_backed | chat_only }
+enum AutoContinuationPhase {
+    admitted
+    | successor_reserved
+    | ownership_transferred
+    | dispatch_accepted
+    | message_settled
+    | failed
+}
+enum ContinuationOpeningAuthority {
+    user_authorized_instruction
+    | generated_predecessor_context
+}
 enum ClosePhase {
     awaiting_blocker_resolution
     | awaiting_stop_work_confirmation
@@ -171,6 +183,7 @@ enum CloseOutcome { archived | cancelled }
 entity ProductConversation {
     kind: ordinary | coordinator
     lifecycle: open | history when kind = ordinary
+    auto_continue_on_context_exhaustion: Boolean = false
 
     -- Every durable conversation row has one aggregate membership. Parent rows
     -- form the user-visible transcript topology; subordinate execution rows are
@@ -186,6 +199,21 @@ entity ProductConversation {
 -- continuation topology. Where rules/surfaces need root/latest identity, they
 -- derive it from transcript_rows and continued_in_conv_id rather than storing
 -- parallel fields.
+
+-- REQ-BED-021: this durable admission is created only by the atomic
+-- continuation-summary/context-exhausted commit. The predecessor's persisted
+-- continuation_summary is the sole exact handoff-text authority; the admission
+-- carries only identities, provenance, and operation recovery state.
+entity AutoContinuationAdmission {
+    product_conversation: ProductConversation
+    predecessor: Parent
+    continuation_operation_id: String
+    continuation_summary_message_id: String
+    first_message_id: String
+    phase: AutoContinuationPhase = admitted
+    no_progress_attempts: Integer = 0
+    actionable_failure: String when phase = failed
+}
 
 entity CloseObligation {
     attempt_id: String
@@ -447,6 +475,7 @@ config {
     max_retry_attempts: Integer = 3
     context_warning_threshold: Decimal = 0.80
     context_continuation_threshold: Decimal = 0.90
+    max_auto_continuation_attempts_without_durable_progress: Integer = 3
     max_sub_agents_per_spawn: Integer = 10
     -- Backstop deadline for forced cancellation teardown (REQ-BED-005a). The
     -- cooperative interrupt (REQ-BED-005, within 100ms) is the happy path; this
@@ -1309,6 +1338,129 @@ rule ContinuationSummaryReceived {
         -- create a second committed summary.
 }
 
+-- REQ-BED-021: automatic continuation is admitted only at the atomic edge into
+-- context_exhausted. The stable aggregate setting is sampled in that commit;
+-- changing it later cannot create or revoke this admission.
+rule ContextExhaustionAdmitsAutomaticContinuation {
+    when: ContinuationSummaryReady(conversation, operation_id, summary)
+    requires: conversation.core_status = awaiting_continuation
+    requires: conversation.continuation_operation_id = operation_id
+    requires: conversation.kind = Parent
+    requires: conversation.product_conversation.auto_continue_on_context_exhaustion = true
+    requires: conversation.product_conversation.kind = coordinator
+        or conversation.product_lifecycle = open
+    ensures: exists AutoContinuationAdmission{
+        product_conversation: conversation.product_conversation,
+        predecessor: conversation,
+        continuation_operation_id: operation_id,
+        continuation_summary_message_id: continuation_summary_message_id(operation_id),
+        first_message_id: auto_continuation_first_message_id(operation_id),
+        phase: admitted,
+        no_progress_attempts: 0
+    }
+    @guidance
+        -- Create the admission in the same transaction as ContinuationCommitted.
+        -- The message identity proves which persisted predecessor summary was
+        -- accepted. Do not copy summary text into the admission.
+}
+
+rule ContextExhaustionDoesNotAdmitAutomaticContinuation {
+    when: ContinuationSummaryReady(conversation, operation_id, summary)
+    requires: conversation.core_status = awaiting_continuation
+    requires: conversation.continuation_operation_id = operation_id
+    requires: conversation.kind = Parent
+    requires: conversation.product_conversation.auto_continue_on_context_exhaustion = false
+    ensures: not exists AutoContinuationAdmission{predecessor: conversation}
+}
+
+rule ProspectiveAutoContinuationSettingChanged {
+    when: AutoContinuationSettingChanged(product_conversation, enabled)
+    requires: product_conversation.kind in { ordinary, coordinator }
+    ensures: product_conversation.auto_continue_on_context_exhaustion = enabled
+    ensures: AutoContinuationAdmissionsUnchanged(product_conversation)
+    ensures: not ContextExhaustedRowWokenBySettingChange(product_conversation)
+}
+
+rule AdmittedAutomaticContinuationUsesManualOperation {
+    when: AutomaticContinuationAdmissionRuns(admission, new_conv)
+    requires: admission.phase not in { message_settled, failed }
+    requires: admission.predecessor.parent_status = context_exhausted
+    requires: admission.no_progress_attempts < config.max_auto_continuation_attempts_without_durable_progress
+    ensures: ContinuationSuccessorOperationRuns(
+        admission.predecessor,
+        new_conv,
+        accepted_auto_continuation_payload(admission),
+        admission.first_message_id,
+        generated_predecessor_context)
+    @guidance
+        -- The predecessor field is the sole handoff-text read. Setting changes
+        -- after admission do not participate in dispatch. Crash retries and
+        -- concurrent manual requests use the predecessor's single-successor
+        -- compare-and-commit and resolve to its winner.
+}
+
+rule AutomaticContinuationDurablePhaseAdvances {
+    when: AutomaticContinuationDurableProgress(admission, phase)
+    requires: admission.phase not in { message_settled, failed }
+    requires: phase = next_auto_continuation_phase(admission.phase)
+    ensures: admission.phase = phase
+    ensures: admission.no_progress_attempts = 0
+}
+
+rule AutomaticContinuationRecoveryReconcilesDurableProgress {
+    when: AutomaticContinuationAdmissionRuns(admission, proposed_successor)
+    requires: durable_auto_continuation_phase(admission) != admission.phase
+    ensures: admission.phase = durable_auto_continuation_phase(admission)
+    ensures: admission.no_progress_attempts = previous(admission.no_progress_attempts)
+    ensures: not CompletedAutoContinuationEffectRedispatched(admission)
+}
+
+rule AutomaticContinuationAttemptWithoutDurableProgressIsBounded {
+    when: AutomaticContinuationAttemptMadeNoDurableProgress(admission, error)
+    requires: admission.phase != failed
+    requires: admission.no_progress_attempts + 1 < config.max_auto_continuation_attempts_without_durable_progress
+    ensures: admission.phase = previous(admission.phase)
+    ensures: admission.no_progress_attempts = previous(admission.no_progress_attempts) + 1
+}
+
+rule AutomaticContinuationBreakerPersistsActionableFailure {
+    when: AutomaticContinuationAttemptMadeNoDurableProgress(admission, error)
+    requires: admission.phase != failed
+    requires: admission.no_progress_attempts + 1 >= config.max_auto_continuation_attempts_without_durable_progress
+    ensures: admission.phase = failed
+    ensures: admission.no_progress_attempts = config.max_auto_continuation_attempts_without_durable_progress
+    ensures: admission.actionable_failure = error
+    ensures: SafeManualContinuationRetryOffered(admission)
+}
+
+rule FailedAutomaticContinuationUsesAcceptedManualPayload {
+    when: UserRetriesFailedAutomaticContinuation(admission, new_conv)
+    requires: admission.phase = failed
+    ensures: ContinuationSuccessorOperationRuns(
+        admission.predecessor,
+        new_conv,
+        accepted_auto_continuation_payload(admission),
+        admission.first_message_id,
+        generated_predecessor_context)
+}
+
+rule ServerRestartResumesAdmittedAutomaticContinuation {
+    when: ServerRestarted(conversation)
+    for admission in AutoContinuationAdmission where admission.predecessor = conversation and admission.phase not in { message_settled, failed }:
+        ensures: AutomaticContinuationAdmissionRuns(admission, auto_continuation_successor_identity(admission))
+}
+
+rule ConcurrentContinuationAttemptResolvesToSingleWinner {
+    when: ContinuationSuccessorAttemptLosesRace(conversation, requested_handoff, first_message_id)
+    requires: conversation.parent_status = context_exhausted
+    requires: conversation.continued_in_conv_id != absent
+    ensures: ExistingContinuationSuccessorReturned(conversation.continued_in_conv_id)
+    ensures: not SuccessorFirstUserMessageAccepted(
+        conversation.continued_in_conv_id,
+        requested_handoff,
+        first_message_id)
+}
+
 rule ContinuationFailureBecomesRecoverable {
     when: ContinuationRequestFailed(conversation, operation_id, error, error_class)
     requires: conversation.core_status = awaiting_continuation
@@ -1408,15 +1560,52 @@ rule UserStartsContinuationConversation {
         or conversation.product_lifecycle = open
     requires: not exists CloseObligation{product_conversation: conversation.product_conversation}
         where phase != completed
+    ensures: ContinuationSuccessorOperationRuns(
+        conversation,
+        new_conv,
+        handoff_text,
+        first_message_id,
+        user_authorized_instruction)
+}
+
+rule ContinuationSuccessorOperationCommits {
+    when: ContinuationSuccessorOperationRuns(
+        conversation,
+        new_conv,
+        handoff_text,
+        first_message_id,
+        opening_authority)
+    requires: conversation.parent_status = context_exhausted
+    requires: conversation.continued_in_conv_id = absent
+    requires:
+        conversation.product_conversation.kind = coordinator
+        or conversation.product_lifecycle = open
+    requires: not exists CloseObligation{product_conversation: conversation.product_conversation}
+        where phase != completed
     ensures: conversation.continued_in_conv_id = new_conv
     ensures: new_conv.product_conversation = conversation.product_conversation
     ensures: new_conv.mode = conversation.mode
+    ensures: new_conv.execution_authority = conversation.execution_authority
+    ensures: new_conv.mode_kind = conversation.mode_kind
+    ensures: new_conv.environment_kind = conversation.environment_kind
     ensures: new_conv.working_dir = conversation.working_dir
-    ensures: SuccessorFirstUserMessageAccepted(new_conv, handoff_text, first_message_id)
+    ensures: ContinuationWorkScopePreserved(conversation, new_conv)
+    ensures: UnconsumedSteeringTransferredExactlyOnce(conversation, new_conv)
+    ensures: DeferredContinuationWorkTransferredExactlyOnce(conversation, new_conv)
+    ensures: SuccessorOpeningHandoffAccepted(
+        new_conv,
+        handoff_text,
+        first_message_id,
+        opening_authority)
 }
 
 rule ContinuationHandoffBecomesBoundary {
-    when: UserStartsContinuationConversation(conversation, new_conv, handoff_text, first_message_id)
+    when: ContinuationSuccessorOperationRuns(
+        conversation,
+        new_conv,
+        handoff_text,
+        first_message_id,
+        opening_authority)
     requires: conversation.parent_status = context_exhausted
     requires: conversation.continued_in_conv_id = absent
     requires:
@@ -1436,7 +1625,12 @@ rule ContinuationHandoffBecomesBoundary {
 }
 
 rule ContinuationBoundaryPersistenceSignature {
-    when: UserStartsContinuationConversation(conversation, new_conv, handoff_text, first_message_id)
+    when: ContinuationSuccessorOperationRuns(
+        conversation,
+        new_conv,
+        handoff_text,
+        first_message_id,
+        opening_authority)
     requires: conversation.parent_status = context_exhausted
     requires: conversation.continued_in_conv_id = absent
     requires: conversation.product_conversation.kind = ordinary
@@ -2136,6 +2330,79 @@ rule ModeChangeNotification {
 --       identity alone is insufficient: the qualifying transcript tail and
 --       exact queue-row absence are both required.
 --
+--   continuation_summary_message_id(operation_id: String) -> String
+--       Returns the immutable identity of the predecessor summary message
+--       committed by that continuation operation.
+--
+--   auto_continuation_first_message_id(operation_id: String) -> String
+--       Returns one stable opening-message identity for every retry of the
+--       automatic continuation operation.
+--
+--   next_auto_continuation_phase(phase: AutoContinuationPhase)
+--       -> AutoContinuationPhase
+--       Advances admitted to successor_reserved, then ownership_transferred,
+--       dispatch_accepted, and message_settled. Failed and message_settled have
+--       no next phase.
+--
+--   durable_auto_continuation_phase(admission: AutoContinuationAdmission)
+--       -> AutoContinuationPhase
+--       Returns the latest phase proven by durable observable state: the sole
+--       successor topology reservation; exact-once transfer of predecessor work
+--       ownership; runtime acceptance of dispatch; or settlement of the opening
+--       message. It never infers progress from an in-memory attempt.
+--
+--   accepted_auto_continuation_payload(
+--       admission: AutoContinuationAdmission
+--   ) -> String
+--       Resolves the exact immutable payload of admission.continuation_summary_message_id
+--       from admission.predecessor's persisted continuation summary. It never
+--       stores, normalizes, or regenerates a second text representation.
+--
+
+--   CompletedAutoContinuationEffectRedispatched(
+--       admission: AutoContinuationAdmission
+--   ) -> Boolean
+--       True when reconciliation dispatches an effect whose durable phase is
+--       already proven for this admission.
+--
+--   SafeManualContinuationRetryOffered(
+--       admission: AutoContinuationAdmission
+--   ) -> Boolean
+--       True when the persisted actionable failure offers explicit retry or
+--       fallback through ContinuationSuccessorOperationRuns with the same
+--       predecessor summary, first-message identity, and generated-context
+--       authority.
+--
+--   auto_continuation_successor_identity(
+--       admission: AutoContinuationAdmission
+--   ) -> Parent
+--       Returns the deterministic proposed successor identity for this admission.
+--       Every crash retry proposes the same identity; if a manual request already
+--       committed the predecessor's sole successor, the shared operation resolves
+--       to that existing successor rather than committing the proposed identity.
+--
+--   SuccessorOpeningHandoffAccepted(
+--       successor: Parent,
+--       handoff_text: String,
+--       first_message_id: String,
+--       authority: ContinuationOpeningAuthority
+--   ) -> Boolean
+--       True exactly when the shared continuation operation durably accepts one
+--       opening payload with one authority kind. Provider projection delimits
+--       generated_predecessor_context so it cannot grant authority, approve work,
+--       or issue a new user command; user_authorized_instruction retains manual
+--       Continue semantics.
+--
+--   SuccessorOpeningAcceptedExactlyOnce(
+--       successor: Parent,
+--       first_message_id: String,
+--       predecessor_summary_message_id: String
+--   ) -> Boolean
+--       True exactly when the existing continuation-successor operation has one
+--       accepted generated-predecessor-context handoff on successor with this
+--       immutable identity and the exact payload read from that predecessor
+--       summary message, and no second accepted representation or authority kind.
+--
 --   continuation_predecessor(
 --       product_conversation: ProductConversation,
 --       transcript_row: Parent
@@ -2302,6 +2569,43 @@ invariant SpawnLimit {
 invariant LatestRowDerivedFromTopology {
     for c in Parent:
         c.is_latest_row = (c.continued_in_conv_id = absent)
+}
+
+invariant AutoContinuationAdmissionIsUniquePerPredecessor {
+    for predecessor in Parent:
+        count(AutoContinuationAdmission where predecessor = predecessor) <= 1
+}
+
+invariant AutoContinuationAdmissionProvenanceMatchesOperation {
+    for admission in AutoContinuationAdmission:
+        admission.continuation_summary_message_id =
+            continuation_summary_message_id(admission.continuation_operation_id)
+        and admission.first_message_id =
+            auto_continuation_first_message_id(admission.continuation_operation_id)
+}
+
+invariant SettledAutoContinuationHasExactlyOneSuccessorAcceptance {
+    for admission in AutoContinuationAdmission where admission.phase = message_settled:
+        admission.predecessor.continued_in_conv_id != absent
+        and count(Parent{product_conversation: admission.product_conversation}
+            where predecessor = admission.predecessor) = 1
+        and SuccessorOpeningAcceptedExactlyOnce(
+            admission.predecessor.continued_in_conv_id,
+            admission.first_message_id,
+            admission.continuation_summary_message_id)
+}
+
+invariant AutoContinuationAppliesOnlyToEligibleParents {
+    for admission in AutoContinuationAdmission:
+        admission.predecessor.product_conversation = admission.product_conversation
+        and admission.predecessor.kind = Parent
+        and admission.product_conversation.kind in { ordinary, coordinator }
+}
+
+invariant AutomaticContinuationBreakerIsPerAdmissionAndBounded {
+    for admission in AutoContinuationAdmission:
+        admission.no_progress_attempts >= 0
+        and admission.no_progress_attempts <= config.max_auto_continuation_attempts_without_durable_progress
 }
 
 invariant ProductConversationHasSingleRootRow {

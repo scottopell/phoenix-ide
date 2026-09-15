@@ -309,3 +309,16 @@ AND SHALL NOT emit message content, SQL text, credentials, filesystem paths, cal
 
 WHEN the browser loads older ProductConversation pages or performs a background refresh
 THE SYSTEM SHALL NOT create an additional initial-open journey report.
+
+---
+
+### REQ-API-029: Aggregate Automatic Continuation Preference
+
+WHEN an authorized client reads or changes automatic continuation for an ordinary ProductConversation or the Global Coordinator
+THE SYSTEM SHALL address the stable aggregate identity rather than a transcript-row identity
+AND SHALL return or atomically persist that aggregate's `auto_continue_on_context_exhaustion` value
+AND SHALL return OFF unless that exact aggregate has been enabled
+AND SHALL reject subordinate conversations, sub-agents, legacy row-only routes, and other aggregate kinds as setting targets
+AND SHALL treat the setting as prospective configuration only: changing it SHALL NOT admit, wake, revoke, or cancel successor work for a row that is already context exhausted
+
+**Rationale:** Automatic continuation configuration is aggregate-scoped so a continuation cannot silently replace the configured identity, and its write response does not claim that existing exhausted work was scheduled.

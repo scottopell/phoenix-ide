@@ -715,6 +715,48 @@ THE SYSTEM SHALL reject new user messages with explanatory error
 AND display the continuation summary prominently
 AND offer action to start new conversation
 
+EACH stable ordinary ProductConversation aggregate and THE stable Global Coordinator aggregate SHALL own one prospective `auto_continue_on_context_exhaustion` setting
+AND the setting SHALL default to OFF independently for each aggregate
+AND subordinate conversations, sub-agents, legacy row-only routes, and aggregates other than those two typed kinds SHALL NOT own or inherit that setting
+
+WHEN a continuation summary is committed and its latest parent transcript row enters context exhausted state
+THE SYSTEM SHALL sample the aggregate's setting exactly once in the same atomic commit
+AND SHALL durably admit automatic successor work only when the sampled setting is ON and the aggregate remains eligible for continuation
+AND SHALL bind admitted work by identity and provenance to that exact exhausted predecessor, its persisted continuation-summary message, and one idempotent successor-opening message identity
+AND SHALL NOT copy the handoff text into the admission because the predecessor's persisted `continuation_summary` is the sole exact-text authority
+AND SHALL NOT treat a later setting change as admission for an already context-exhausted row
+AND SHALL NOT wake, enqueue, or otherwise schedule work merely because the setting is enabled after that row entered context exhausted state
+AND SHALL NOT revoke, cancel, or suppress already-admitted work merely because the setting is later disabled
+
+WHEN automatic successor work is admitted
+THE SYSTEM SHALL invoke the continuation-successor operation shared with the manual Continue action
+AND SHALL read the predecessor's exact persisted `continuation_summary`, without normalization or regeneration, as the successor's opening handoff
+AND SHALL durably type that opening handoff as generated predecessor context rather than a user-authorized instruction
+AND SHALL project it to the successor's provider as delimited context that cannot itself grant authority, approve work, or issue a new user command
+AND SHALL keep manually accepted unchanged or edited handoffs typed as user-authorized instructions
+AND SHALL NOT introduce a second successor-creation, handoff-dispatch, or continuation-topology path
+
+WHEN manual continuation, automatic continuation, duplicate delivery, or crash recovery races for the same exhausted predecessor
+THE SYSTEM SHALL commit exactly one successor and exactly one opening-handoff acceptance with one durable authority kind
+AND every loser or retry SHALL resolve to that committed successor without accepting different handoff bytes, changing the winner's authority kind, or creating another topology edge
+
+EACH durably admitted automatic continuation operation SHALL own an independent finite no-progress attempt count
+AND that count SHALL bound only repeated recovery or dispatch attempts for that admission that produce no new durable progress
+AND SHALL NOT aggregate across successive automatically created conversations or disable a later healthy context exhaustion
+
+THE observable durable progress phases SHALL be successor reservation in continuation topology, exact-once ownership transfer of inherited work, runtime dispatch acceptance, and opening-message settlement
+WHEN recovery observes that a phase has already durably completed
+THE SYSTEM SHALL reconcile the admission to that phase without incrementing its no-progress count
+AND SHALL NOT redispatch the completed phase's effect
+
+WHEN an attempt produces no new durable progress below the finite bound
+THE SYSTEM SHALL increment only that admission's no-progress count
+WHEN the next no-progress attempt reaches the finite bound
+THE SYSTEM SHALL open the breaker for that admission
+AND SHALL persist an actionable failure on that admission
+AND SHALL stop automatic recovery or dispatch for that admission
+AND SHALL offer an explicit safe retry or fallback through the shared manual continuation operation using the same accepted predecessor summary and opening-message identity
+
 WHEN the user reviews a context-exhausted conversation with no successor
 THE SYSTEM SHALL preserve the generated continuation summary as an immutable handoff
 AND SHALL offer distinct actions to:
@@ -1026,13 +1068,15 @@ separate in-Phoenix merged-versus-abandoned lifecycle.
 
 ### REQ-BED-030: Context Continuation Inherits Parent Environment
 
-WHEN user initiates continuation from a context-exhausted conversation
+WHEN the existing continuation-successor operation is initiated manually or for admitted automatic work from a context-exhausted conversation
 THE SYSTEM SHALL create a new transcript row that explicitly belongs to the same ProductConversation and inherits:
   - the parent's execution authority, preserving whether the latest live row is read-only planning, write-capable against an attached `WorkScope`, or chat-only
   - the parent's working directory
   - the parent's worktree, if any, without destroy-and-recreate
   - any uncommitted changes in that worktree
   - any parent task/proposal context that remains part of the same live conversation authority
+  - every unconsumed steering entry, preserving its immutable acceptance identity, exact payload, attachments, and FIFO order without retaining a second pending copy on the predecessor
+  - deferred continuation work, including tool calls rejected at the context threshold, without executing it before the successor owns the handoff
 
 WHEN the current execution row has a worktree
 THE SYSTEM SHALL keep the same attached `WorkScope` atomically in a single database transaction while keeping the durable ProductConversation identity unchanged:
@@ -1089,6 +1133,9 @@ EACH ProductConversation SHALL have exactly one typed kind: ordinary or coordina
 AND THE SYSTEM SHALL model Open/History lifecycle for ordinary ProductConversations only
 AND SHALL make Open/History lifecycle structurally inapplicable to coordinator ProductConversations rather than representing coordinator lifecycle as an optionally absent ordinary value
 AND SHALL expose ProductConversation lifecycle through one writable authority rather than parallel writable aggregate and transcript-row values
+AND SHALL persist prospective automatic-continuation configuration on this same stable aggregate identity rather than on a replaceable transcript row
+AND SHALL preserve that configuration across continuation successors
+AND SHALL persist each automatic continuation operation's bounded no-progress recovery state on its own durable admission rather than on the aggregate
 
 WHEN persisted ordinary aggregate lifecycle disagrees with the latest parent transcript row's preserved legacy archived truth at compatibility upgrade
 THE SYSTEM SHALL reconcile every ordinary ProductConversation lifecycle from that preserved truth before aggregate lifecycle becomes reader authority
