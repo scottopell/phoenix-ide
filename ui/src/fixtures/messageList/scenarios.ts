@@ -76,13 +76,23 @@ export const compactChronologyInitialMessages: Message[] = [
     content: { tool_use_id: 'chronology-tool-a', content: 'Older A result\n'.repeat(20), is_error: false },
     display_data: {},
   },
+  {
+    message_id: 'chronology-agent-reader-spacer',
+    conversation_id: 'fixture-message-list-compact-chronology',
+    sequence_id: 4,
+    type: 'agent',
+    message_type: 'agent',
+    created_at: '2025-01-01T10:01:45.000Z',
+    content: [{ type: 'text', text: Array.from({ length: 80 }, (_, index) => `Reader-owned spacer line ${String(index + 1).padStart(2, '0')}`).join('\n') }],
+    display_data: {},
+  },
 ];
 
 export const compactChronologyAppendMessages: Message[] = [
   {
     message_id: 'chronology-agent-bc',
     conversation_id: 'fixture-message-list-compact-chronology',
-    sequence_id: 4,
+    sequence_id: 5,
     type: 'agent',
     message_type: 'agent',
     created_at: '2025-01-01T10:02:00.000Z',
@@ -98,7 +108,7 @@ export const compactChronologyCompletionMessages: Message[] = [
   {
     message_id: 'chronology-result-b',
     conversation_id: 'fixture-message-list-compact-chronology',
-    sequence_id: 5,
+    sequence_id: 6,
     type: 'tool',
     message_type: 'tool',
     created_at: '2025-01-01T10:03:30.000Z',
@@ -108,7 +118,7 @@ export const compactChronologyCompletionMessages: Message[] = [
   {
     message_id: 'chronology-result-c',
     conversation_id: 'fixture-message-list-compact-chronology',
-    sequence_id: 6,
+    sequence_id: 7,
     type: 'tool',
     message_type: 'tool',
     created_at: '2025-01-01T10:04:00.000Z',
@@ -121,7 +131,7 @@ export const compactChronologyFinalMessages: Message[] = [
   {
     message_id: 'chronology-agent-final',
     conversation_id: 'fixture-message-list-compact-chronology',
-    sequence_id: 7,
+    sequence_id: 8,
     type: 'agent',
     message_type: 'agent',
     created_at: '2025-01-01T10:05:00.000Z',

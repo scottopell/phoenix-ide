@@ -727,6 +727,7 @@ function CompactToolStripImpl({
         const ariaStatus = item.finalStatus ?? statusLabel;
         const ariaSummary = item.outputTail ?? summary;
         const isCompactBash = item.name === 'bash';
+        const canExpand = item.toolId.trim().length > 0;
         const isFirstCardForOwner = !copiedOwnerIds.has(item.ownerMessage.message_id)
           && (i === 0 || items[i - 1]?.ownerMessage.message_id !== item.ownerMessage.message_id);
         return (
@@ -740,7 +741,11 @@ function CompactToolStripImpl({
             <button
               type="button"
               className="compact-tool-card-expand"
-              onClick={() => onExpand({ toolId: item.toolId, ownerMessageId: item.ownerMessage.message_id })}
+              disabled={!canExpand}
+              onClick={() => {
+                if (!canExpand) return;
+                onExpand({ toolId: item.toolId, ownerMessageId: item.ownerMessage.message_id });
+              }}
               aria-label={`${item.name}: ${item.commandIdentity ?? item.inputSummary} (${ariaStatus})${ariaSummary ? ` — ${ariaSummary}` : ''} — expand tool detail`}
             >
               <span className="compact-tool-card-header">
@@ -893,6 +898,7 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
   );
 
   const expand = useCallback((target: CompactToolTarget) => {
+    if (target.toolId.trim().length === 0) return;
     pendingScrollToolRef.current = target;
     setExpandedToolTarget(target);
   }, []);
@@ -925,6 +931,7 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
     const toolUseId = 'toolUseId' in revealRequest.revealTarget
       ? revealRequest.revealTarget.toolUseId
       : null;
+    if (!toolUseId || toolUseId.trim().length === 0) return;
     const targetItem = items.find((item) => item.toolId === toolUseId);
     if (!targetItem) return;
     const target = { toolId: targetItem.toolId, ownerMessageId: targetItem.ownerMessage.message_id };

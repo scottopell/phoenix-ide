@@ -98,19 +98,68 @@ async function verifyWideTable({ page, id, viewport }) {
 async function captureCompactChronology({ page, id, outDir }) {
   if (id !== 'compact-expanded-tool-chronology') return false;
 
+  const measureExpandedA = async (label) => page.evaluate((sampleLabel) => {
+    const scroller = document.querySelector('.message-list-fixture-shell #messages');
+    const expanded = document.querySelector('[data-tool-id="chronology-tool-a"]');
+    if (!(scroller instanceof HTMLElement) || !(expanded instanceof HTMLElement)) {
+      throw new Error(`chronology A measurement target missing for ${sampleLabel}`);
+    }
+    const scrollerRect = scroller.getBoundingClientRect();
+    const expandedRect = expanded.getBoundingClientRect();
+    return {
+      label: sampleLabel,
+      top: expandedRect.top - scrollerRect.top,
+      bottom: expandedRect.bottom - scrollerRect.top,
+      scrollTop: scroller.scrollTop,
+      scrollHeight: scroller.scrollHeight,
+      clientHeight: scroller.clientHeight,
+      atTail: Math.abs(scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop) <= 4,
+    };
+  }, label);
+
+  const assertStableExpandedA = (before, after) => {
+    const drift = Math.abs(after.top - before.top);
+    if (drift > 4) {
+      throw new Error(`Expanded A viewport position drifted ${drift.toFixed(1)}px: ${JSON.stringify({ before, after })}`);
+    }
+    if (after.atTail) {
+      throw new Error(`Chronology capture returned to tail-follow instead of reader-owned scroll: ${JSON.stringify(after)}`);
+    }
+  };
+
   await page.getByRole('button', { name: /read_file:.*expand tool detail/i }).click();
   await page.waitForSelector('.compact-tool-selected-detail [data-tool-id="chronology-tool-a"]');
+  await page.locator('.message-list-fixture-shell #messages').evaluate((scroller) => {
+    const expanded = scroller.querySelector('[data-tool-id="chronology-tool-a"]');
+    if (!(expanded instanceof HTMLElement)) throw new Error('expanded chronology A is not mounted');
+    scroller.scrollTop = Math.max(0, expanded.offsetTop - 80);
+    scroller.dispatchEvent(new Event('scroll'));
+  });
+  await page.waitForFunction(() => {
+    const scroller = document.querySelector('.message-list-fixture-shell #messages');
+    if (!(scroller instanceof HTMLElement)) return false;
+    return Math.abs(scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop) > 4;
+  });
+  const expandedBeforeAppend = await measureExpandedA('before-append');
+
   await page.getByTestId('chronology-append-bc').click();
   await page.waitForSelector('[data-tool-id="chronology-tool-c"]');
+  const expandedAfterAppend = await measureExpandedA('after-append-bc');
+  assertStableExpandedA(expandedBeforeAppend, expandedAfterAppend);
+
   await page.getByTestId('chronology-complete-bc').click();
   await page.waitForFunction(() => {
     const ids = Array.from(document.querySelectorAll('[data-tool-id]')).map((node) => node.getAttribute('data-tool-id'));
     return ids.includes('chronology-tool-a') && ids.includes('chronology-tool-b') && ids.includes('chronology-tool-c');
   });
+  const expandedAfterComplete = await measureExpandedA('after-complete-bc');
+  assertStableExpandedA(expandedBeforeAppend, expandedAfterComplete);
   await page.getByTestId('chronology-final').click();
   await page.waitForSelector('#message-chronology-agent-final');
+  const expandedAfterFinal = await measureExpandedA('after-final-prose');
+  assertStableExpandedA(expandedBeforeAppend, expandedAfterFinal);
   const metrics = await page.evaluate(() => window.__messageListChronologyMetrics ?? null);
-  await writeFile(path.join(outDir, `${id}--metrics.json`), `${JSON.stringify(metrics, null, 2)}\n`);
+  await writeFile(path.join(outDir, `${id}--metrics.json`), `${JSON.stringify({ metrics, expandedA: [expandedBeforeAppend, expandedAfterAppend, expandedAfterComplete, expandedAfterFinal] }, null, 2)}\n`);
   if (!metrics || metrics.phase !== 'final-prose' || metrics.latestReachable !== true) {
     throw new Error(`Compact chronology final prose was not measured as reachable: ${JSON.stringify(metrics)}`);
   }

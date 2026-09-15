@@ -437,6 +437,29 @@ describe('inline tool timers', () => {
     expect(Element.prototype.scrollIntoView).toHaveBeenCalled();
   });
 
+  it('does not store an expansion target for a missing tool id', () => {
+    mockDensity = 'compact';
+    const owner = agentMessage('agent-missing-tool-id', [
+      { type: 'tool_use', name: 'read_file', input: { path: 'missing-id.md' } } as any,
+      { type: 'tool_use', id: 'present-tool-id', name: 'search', input: { pattern: 'present' } },
+    ], 2);
+
+    render(<MemoryRouter><ToolOnlyAgentTurnGroup members={[
+      { kind: 'agent_turn', key: owner.message_id, agent: owner, toolResultsByUseId: new Map(), isFirstInTurn: true },
+    ]} /></MemoryRouter>);
+
+    const missingIdButton = screen.getByRole('button', { name: /read_file:.*missing-id\.md.*expand tool detail/i });
+    expect(missingIdButton).toBeDisabled();
+    fireEvent.click(missingIdButton);
+
+    expect(document.querySelector('.compact-tool-selected-detail')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: /search:.*expand tool detail/i }));
+
+    expect(document.querySelector('.compact-tool-selected-detail [data-tool-id="present-tool-id"]')).not.toBeNull();
+    expect(document.querySelectorAll('.compact-tool-selected-detail [data-tool-id]')).toHaveLength(1);
+  });
+
   it('renders one copy action for an owning message when expanding a middle compact tool', () => {
     mockDensity = 'compact';
     const owner = agentMessage('agent-copy-split', [
