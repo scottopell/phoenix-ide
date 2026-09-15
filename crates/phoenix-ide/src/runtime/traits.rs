@@ -2161,6 +2161,7 @@ pub struct ToolRegistryExecutor {
     agent_catalog: Arc<[phoenix_agents::AgentDefinition]>,
     writing_tools: Option<WritingConversationTools>,
     coordinator_skill_catalog: Option<phoenix_skills::AuthenticatedCoordinatorSkillCatalog>,
+    host_bound_tools: Vec<std::sync::Arc<dyn crate::tools::Tool>>,
 }
 
 impl ToolRegistryExecutor {
@@ -2177,6 +2178,7 @@ impl ToolRegistryExecutor {
             agent_catalog,
             writing_tools: None,
             coordinator_skill_catalog: None,
+            host_bound_tools: Vec::new(),
         }
     }
 
@@ -2194,6 +2196,7 @@ impl ToolRegistryExecutor {
             agent_catalog,
             writing_tools: None,
             coordinator_skill_catalog: None,
+            host_bound_tools: Vec::new(),
         }
     }
 
@@ -2209,6 +2212,26 @@ impl ToolRegistryExecutor {
     #[must_use]
     pub fn with_writing_tools(mut self, tools: Option<WritingConversationTools>) -> Self {
         self.writing_tools = tools;
+        self
+    }
+
+    #[must_use]
+    pub fn with_host_bound_tools(
+        mut self,
+        tools: Vec<std::sync::Arc<dyn crate::tools::Tool>>,
+    ) -> Self {
+        {
+            let mut registry = self
+                .registry
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for tool in tools.iter().cloned() {
+                registry
+                    .try_add_host_bound_tool(tool)
+                    .expect("registry has no duplicate host-bound tool");
+            }
+        }
+        self.host_bound_tools = tools;
         self
     }
 
@@ -2321,13 +2344,18 @@ impl ToolExecutor for ToolRegistryExecutor {
     }
 
     fn upgrade_to_work_mode(&self) {
-        let registry = match self.writing_tools.clone() {
+        let mut registry = match self.writing_tools.clone() {
             Some(tools) => {
                 ToolRegistry::git_backed_writing_parent(self.agent_catalog.to_vec(), tools)
                     .expect("fresh Git-backed writing registry has no global writing capabilities")
             }
             None => ToolRegistry::direct(self.agent_catalog.to_vec()).with_propose_task(),
         };
+        for tool in self.host_bound_tools.iter().cloned() {
+            registry = registry
+                .try_with_host_bound_tool(tool)
+                .expect("fresh Work registry has no predecessor capability");
+        }
         self.swap_registry(registry);
         tracing::info!("Tool registry upgraded to Git-backed writing mode");
     }
@@ -2383,13 +2411,19 @@ mod tool_registry_executor_tests {
                 Arc::new(NamedMarker("send_conversation_message")),
             )
             .unwrap(),
-        ));
+        ))
+        .with_host_bound_tools(vec![Arc::new(NamedMarker("previous_transcripts"))]);
 
         assert!(!executor
             .definitions()
             .await
             .iter()
             .any(|definition| definition.name == "search_conversations"));
+        assert!(executor
+            .definitions()
+            .await
+            .iter()
+            .any(|definition| definition.name == "previous_transcripts"));
         executor.upgrade_to_work_mode();
         assert!(executor
             .definitions()
@@ -2401,6 +2435,11 @@ mod tool_registry_executor_tests {
             .await
             .iter()
             .any(|definition| definition.name == "propose_task"));
+        assert!(executor
+            .definitions()
+            .await
+            .iter()
+            .any(|definition| definition.name == "previous_transcripts"));
     }
 }
 
