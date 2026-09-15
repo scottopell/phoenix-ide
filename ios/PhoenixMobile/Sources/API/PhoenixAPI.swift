@@ -452,19 +452,26 @@ struct PhoenixAPI: Sendable {
     // Question response (awaiting_user_response): the server 409s when the
     // conversation isn't in that state — e.g. answered from another client.
 
+    private struct QuestionMutationResponse: Codable { let success: Bool? }
+
+    private func requireQuestionMutationSuccess(_ response: QuestionMutationResponse) throws {
+        guard response.success == true else {
+            throw APIError.decoding(underlying: DecodingError.dataCorrupted(
+                .init(codingPath: [], debugDescription: "Question mutation response did not confirm success")))
+        }
+    }
+
     func respondToQuestion(conversationId: String, requestId: String, answers: [String: String]) async throws {
-        struct SuccessResponse: Codable { var success: Bool? }
-        _ = try await post(
+        try requireQuestionMutationSuccess(try await post(
             "api/conversations/\(conversationId)/respond",
             body: ["request_id": requestId, "answers": answers],
-            as: SuccessResponse.self)
+            as: QuestionMutationResponse.self))
     }
 
     func dismissQuestion(conversationId: String, requestId: String) async throws {
-        struct SuccessResponse: Codable { var success: Bool? }
-        _ = try await post(
+        try requireQuestionMutationSuccess(try await post(
             "api/conversations/\(conversationId)/dismiss-question", body: ["request_id": requestId],
-            as: SuccessResponse.self)
+            as: QuestionMutationResponse.self))
     }
 
     /// Get-or-create the fleet Coordinator's writable transcript row. The

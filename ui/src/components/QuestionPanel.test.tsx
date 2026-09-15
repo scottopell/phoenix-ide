@@ -66,6 +66,21 @@ describe('QuestionPanel request and draft contract', () => {
     fireEvent.click(screen.getByRole('button', {name:'Edit custom answer'}));
     expect(screen.getByLabelText('Custom answer')).toHaveValue('Custom scope');
   });
+
+  it('keeps question navigation available in short multi-question layouts', () => {
+    const rect = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({
+      x: 0, y: 0, width: 500, height: 240, top: 0, left: 0, right: 500, bottom: 240,
+      toJSON: () => ({}),
+    } as DOMRect);
+    const width = vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(500);
+    render(<QuestionPanel {...defaults} questions={[question, {...question, question:'Second?', header:'Second'}]} />);
+
+    expect(screen.getByRole('navigation', {name:'Questions'})).toBeInTheDocument();
+    expect(screen.getByRole('button', {name:'Second, unanswered'})).toBeEnabled();
+
+    rect.mockRestore();
+    width.mockRestore();
+  });
   it('does not toggle multiselect Other when its editor is clicked; empty Other invalidates form', () => {
     render(<QuestionPanel {...defaults} questions={[{...question,multiSelect:true}]} />);
     fireEvent.click(screen.getByRole('checkbox', {name:'Current'}));

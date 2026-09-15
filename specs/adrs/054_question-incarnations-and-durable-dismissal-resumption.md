@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Date:** 2026-09-14
 - **Affects:** REQ-AUQ-004, REQ-AUQ-007, REQ-AUQ-011, REQ-AUQ-012, REQ-COMP-006
-- **Refines:** ADR-051 request identity and dismissal resumption
+- **Refines:** ADR-053 request-bound interaction identity and dismissal resumption
 
 ## Context
 

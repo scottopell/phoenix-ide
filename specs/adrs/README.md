@@ -64,7 +64,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [050](050_launchd-restart-preserves-installed-state.md) | launchd restart preserves installed state through an independent helper | Accepted | REQ-LDD-014 through REQ-LDD-016; `RestartTransaction` |
 | [051](051_predecessor-recall-is-bound-to-the-executing-transcript.md) | Predecessor recall is bound to the executing transcript | Accepted | REQ-RET-009, REQ-GR-007 |
 | [052](052_workers-and-tiers-resolve-usable-model-routes.md) | Workers and tiers resolve usable model routes | Accepted | REQ-AG-001–012, REQ-SA-007, REQ-SA-011 |
-| [053](053_question-interactions-bind-explicit-answers-to-request-identity.md) | Question interactions bind explicit answers to request identity | Accepted | REQ-AUQ-001–004/007/009–013, REQ-KB-001/004/008, REQ-COMP-006 |
+| [053](053_question-interactions-bind-explicit-answers-to-request-identity.md) | Question interactions bind explicit answers to request identity | Accepted; identity lineage superseded by ADR-054 | REQ-AUQ-001–004/007/009–013, REQ-KB-001/004/008, REQ-COMP-006 |
 | [054](054_question-incarnations-and-durable-dismissal-resumption.md) | Question incarnations and durable dismissal resumption | Accepted | REQ-AUQ-004/007/011/012, REQ-COMP-006 |
 
 ## For agents: which decisions bind your task
