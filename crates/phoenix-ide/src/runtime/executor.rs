@@ -583,6 +583,9 @@ fn tool_output_to_outcome(out: crate::tools::ToolOutput) -> ToolOutcome {
             display_data,
             images: convert(images),
         },
+        ToolOutput::TrustedInstructions { output } => ToolOutcome::TrustedInstructions {
+            output: cap_tool_output_text(output),
+        },
         ToolOutput::Error {
             output,
             images,
@@ -1320,6 +1323,7 @@ fn render_messages<'a>(
                 tool_use_id,
                 content,
                 is_error,
+                origin,
                 images,
             }) => {
                 // Cleared results render as a placeholder with no images; kept
@@ -1336,7 +1340,13 @@ fn render_messages<'a>(
                                 data: img.data.clone(),
                             })
                             .collect();
-                        (content.clone(), sources)
+                        let text = match origin {
+                            crate::db::ToolContentOrigin::Ordinary => content.clone(),
+                            crate::db::ToolContentOrigin::TrustedBuiltinInstructions => {
+                                format!("<trusted_builtin_skill>{content}</trusted_builtin_skill>")
+                            }
+                        };
+                        (text, sources)
                     };
 
                 // Tool results go in user message
@@ -6154,12 +6164,20 @@ where
 
             AuthoritativeEffect::PersistToolResults { results } => {
                 for result in results {
-                    let content = MessageContent::tool_with_images(
-                        &result.tool_use_id,
-                        result.output(),
-                        result.is_error(),
-                        result.images().to_vec(),
-                    );
+                    let content = match &result.outcome {
+                        ToolOutcome::TrustedInstructions { output } => {
+                            MessageContent::trusted_builtin_instructions(
+                                &result.tool_use_id,
+                                output,
+                            )
+                        }
+                        _ => MessageContent::tool_with_images(
+                            &result.tool_use_id,
+                            result.output(),
+                            result.is_error(),
+                            result.images().to_vec(),
+                        ),
+                    };
                     let tool_msg_id = uuid::Uuid::new_v4().to_string();
                     let seq = self.broadcast_tx.next_seq();
                     let msg = self
@@ -18866,9 +18884,9 @@ mod work_subagent_cwd_guard_tests {
 
     fn tool_result_text(result: &ToolResult) -> String {
         match &result.outcome {
-            ToolOutcome::Success { output, .. } | ToolOutcome::Error { output, .. } => {
-                output.clone()
-            }
+            ToolOutcome::Success { output, .. }
+            | ToolOutcome::TrustedInstructions { output }
+            | ToolOutcome::Error { output, .. } => output.clone(),
             ToolOutcome::Cancelled { message } => message.clone(),
         }
     }
@@ -19490,6 +19508,15 @@ mod tool_output_to_outcome_tests {
     use super::tool_output_to_outcome;
     use crate::db::ToolOutcome;
     use crate::tools::{ToolImage, ToolOutput};
+
+    #[test]
+    fn trusted_instructions_do_not_collapse_to_ordinary_success() {
+        let outcome = tool_output_to_outcome(ToolOutput::trusted_instructions("trusted"));
+        assert!(matches!(
+            outcome,
+            ToolOutcome::TrustedInstructions { ref output } if output == "trusted"
+        ));
+    }
 
     #[test]
     fn success_output_maps_to_success_outcome() {

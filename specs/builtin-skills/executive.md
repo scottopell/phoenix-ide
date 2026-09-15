@@ -47,6 +47,16 @@ audience is honored only for Phoenix built-ins: Coordinator discovery scans only
 the extracted built-in directory, and the audience-bound Skill tool enforces the
 same boundary during invocation. Filesystem skills cannot self-promote into the
 Coordinator catalog.
+Coordinator catalog entries are admitted only when the extracted definition
+matches the immutable bytes embedded in the binary. Invocation reads those
+embedded instructions and companion references directly and marks the result as
+trusted built-in skill content; it never trusts the mutable extraction cache.
+
+Extraction prunes unexpected files inside built-in directories that remain
+bundled. Directories for removed or renamed built-ins may remain on disk but are
+excluded by the embedded-name allowlist. Phoenix has no disable configuration;
+a valid filesystem skill with the same name replaces an ordinary built-in by
+normal precedence, while an invalid or empty definition does not disable it.
 
 ## Status Summary
 
