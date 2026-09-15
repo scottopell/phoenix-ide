@@ -102,7 +102,14 @@ final class OutboxPersistenceHandle {
                 switch DiskStore.loadVersionedResult(
                     PersistedOutboxEnvelope.self,
                     source: source,
-                    version: Outbox.schemaVersion)
+                    version: Outbox.schemaVersion,
+                    migrate: { storedVersion, fileData in
+                        PersistedOutboxEnvelope.migrateLegacyEntries(
+                            storedVersion: storedVersion,
+                            fileData: fileData,
+                            scope: scope,
+                            aggregateAuthority: aggregateAuthority)
+                    })
                 {
                 case .missing:
                     return OutboxStoreInspection(conversationId: requestedConversationId, state: .missing)
@@ -129,6 +136,23 @@ struct PersistedOutboxEnvelope: Codable, Equatable, Sendable {
     let scope: PersistenceScopeIdentity?
     let aggregateAuthority: String?
     let entries: [OutboxEntry]
+}
+
+extension PersistedOutboxEnvelope {
+    static func migrateLegacyEntries(
+        storedVersion: Int,
+        fileData: Data,
+        scope: PersistenceScopeIdentity?,
+        aggregateAuthority: String?
+    ) -> PersistedOutboxEnvelope? {
+        guard storedVersion <= 1,
+              let entries = try? JSONDecoder().decode([OutboxEntry].self, from: fileData)
+        else { return nil }
+        return PersistedOutboxEnvelope(
+            scope: scope,
+            aggregateAuthority: aggregateAuthority,
+            entries: entries)
+    }
 }
 
 /// A locally-authored message that has not yet been confirmed by

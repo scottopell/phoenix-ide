@@ -37,6 +37,23 @@ struct ProductConversationDetailView: View {
                     .padding(.top, 8)
                     .accessibilityIdentifier("productConversation.loadOlder")
                 }
+                TimelineView(.periodic(from: .now, by: 30)) { context in
+                    if let note = aggregateCacheAgeNote(at: context.date) {
+                        Text(note)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 2)
+                            .background(.thinMaterial)
+                            .accessibilityIdentifier("productConversation.cacheAge")
+                    }
+                }
+                if let error = detailModel.loadError {
+                    InlineErrorBanner(message: error) {}
+                        .padding(.horizontal, 12)
+                        .padding(.top, 4)
+                        .accessibilityIdentifier("productConversation.paginationError")
+                }
                 ProductConversationTranscriptView(
                     items: detailModel.transcriptItems,
                     toolIndex: detailModel.composedToolUseIndex,
@@ -50,7 +67,7 @@ struct ProductConversationDetailView: View {
                         isOnline: detailModel.delegatedConnectivityAllowsActions)
                 }
                 ProductConversationSegmentPicker(model: detailModel)
-                if let session = detailModel.currentOwnerSession, !session.outbox.persistenceHealthy {
+                if detailModel.hasUnhealthyProjectedOutbox {
                     HStack(spacing: 6) {
                         Image(systemName: "externaldrive.badge.exclamationmark")
                             .foregroundStyle(.orange)
@@ -95,6 +112,16 @@ struct ProductConversationDetailView: View {
 
     private var streamingText: String {
         detailModel.actionSession?.streamingText ?? ""
+    }
+
+    private func aggregateCacheAgeNote(at now: Date) -> String? {
+        guard (!model.connectivity.isOnline || detailModel.currentOwnerConnection != .live),
+              let syncedAt = detailModel.cacheSyncedAt,
+              now.timeIntervalSince(syncedAt) > 120
+        else { return nil }
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        return "Cached \(formatter.localizedString(for: syncedAt, relativeTo: now))"
     }
 }
 
