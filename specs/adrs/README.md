@@ -63,7 +63,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [049](049_compaction-protects-accepted-handoffs-and-coordinator-context.md) | Compaction protects accepted handoffs and Coordinator context | Accepted | REQ-BED-020, REQ-GR-011, REQ-GR-013 |
 | [050](050_launchd-restart-preserves-installed-state.md) | launchd restart preserves installed state through an independent helper | Accepted | REQ-LDD-014 through REQ-LDD-016; `RestartTransaction` |
 | [051](051_predecessor-recall-is-bound-to-the-executing-transcript.md) | Predecessor recall is bound to the executing transcript | Accepted | REQ-RET-009, REQ-GR-007 |
-| [052](052_ios-legacy-snapshots-render-read-only.md) | Proven same-installation legacy iOS snapshots render read-only | Accepted | REQ-IOS-002, REQ-IOS-005, compatibility requirements |
+| [054](054_ios-legacy-snapshots-render-read-only.md) | Proven same-installation legacy iOS snapshots render read-only | Accepted | REQ-IOS-002, REQ-IOS-005, compatibility requirements |
 
 ## For agents: which decisions bind your task
 
