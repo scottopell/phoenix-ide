@@ -2131,6 +2131,15 @@ impl RuntimeManager {
         self
     }
 
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn with_test_ambient_writer_observer(
+        mut self,
+        observer: close_retirement::AmbientWriterObserver,
+    ) -> Self {
+        self.ambient_writer_observer = observer;
+        self
+    }
+
     pub fn new_with_message_retriever(
         db: Database,
         llm_registry: Arc<ModelRegistry>,
@@ -8190,11 +8199,39 @@ mod scope_liveness_tests {
         }
         assert!(marker.exists(), "external writer became ready");
 
-        let error = manager
+        #[cfg(target_os = "linux")]
+        let (manager, _proc_fixture) = {
+            let proc_fixture = tempfile::tempdir().unwrap();
+            let proc_root = proc_fixture.path().join("proc");
+            std::fs::create_dir(&proc_root).unwrap();
+            std::os::unix::fs::symlink(
+                format!("/proc/{}", writer.id()),
+                proc_root.join(writer.id().to_string()),
+            )
+            .unwrap();
+            let manager = manager.with_test_ambient_writer_observer(
+                close_retirement::test_open_descriptor_ambient_writer_observer(proc_root),
+            );
+            (manager, proc_fixture)
+        };
+
+        manager
             .retire_close_runtime_resources(attempt_id.clone())
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("stable ambient writer"));
+        let ambient_evidence: (String, String) = sqlx::query_as(
+            "SELECT match_kind, access_mode
+             FROM close_ambient_writer_evidence
+             WHERE attempt_id=?1",
+        )
+        .bind(attempt_id.as_str())
+        .fetch_one(manager.db().pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            ambient_evidence,
+            ("descriptor".to_string(), "write_only".to_string())
+        );
         let obligation = manager
             .db()
             .get_close_obligation(attempt_id.as_str())

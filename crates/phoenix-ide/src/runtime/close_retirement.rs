@@ -3788,6 +3788,24 @@ pub(super) fn production_ambient_writer_observer() -> AmbientWriterObserver {
     })
 }
 
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn test_open_descriptor_ambient_writer_observer(
+    proc_root: PathBuf,
+) -> AmbientWriterObserver {
+    std::sync::Arc::new(move |path| {
+        inspect_ambient_writer_until_quiescent(
+            AmbientWriterObservationPolicy::production(),
+            || match quarantine_has_open_descriptors_in(path, &proc_root)? {
+                positive @ ExternalWriterEvidence::PositiveWriterFound(_) => Ok(positive),
+                ExternalWriterEvidence::NoPositiveEvidence => {
+                    Ok(ExternalWriterEvidence::NoPositiveEvidence)
+                }
+            },
+            std::thread::sleep,
+        )
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AmbientWriterObservationPolicy {
     max_observations: std::num::NonZeroUsize,
