@@ -51,7 +51,7 @@ export const compactChronologyInitialMessages: Message[] = [
     type: 'user',
     message_type: 'user',
     created_at: '2025-01-01T10:00:00.000Z',
-    content: { text: 'Run the compact chronology sequence.' },
+    content: { text: ['Run the compact chronology sequence.', ...Array.from({ length: 16 }, (_, index) => `Reader setup line ${String(index + 1).padStart(2, '0')}`)].join('\n') },
     display_data: {},
   },
   {
@@ -112,7 +112,7 @@ export const compactChronologyCompletionMessages: Message[] = [
     type: 'tool',
     message_type: 'tool',
     created_at: '2025-01-01T10:03:30.000Z',
-    content: { tool_use_id: 'chronology-tool-b', content: 'newer B result', is_error: false },
+    content: { tool_use_id: 'chronology-tool-b', content: 'B_OK', is_error: false },
     display_data: {},
   },
   {
@@ -122,7 +122,7 @@ export const compactChronologyCompletionMessages: Message[] = [
     type: 'tool',
     message_type: 'tool',
     created_at: '2025-01-01T10:04:00.000Z',
-    content: { tool_use_id: 'chronology-tool-c', content: JSON.stringify({ status: 'exited', exit_code: 0, lines: [{ offset: 0, bytes: 'newer C result' }] }), is_error: false },
+    content: { tool_use_id: 'chronology-tool-c', content: JSON.stringify({ status: 'exited', exit_code: 0, lines: [{ offset: 0, bytes: 'C_OK' }] }), is_error: false },
     display_data: {},
   },
 ];

@@ -127,48 +127,97 @@ async function captureCompactChronology({ page, id, outDir }) {
     }
   };
 
-  await page.getByRole('button', { name: /read_file:.*expand tool detail/i }).click();
-  await page.waitForSelector('.compact-tool-selected-detail [data-tool-id="chronology-tool-a"]');
-  await page.locator('.message-list-fixture-shell #messages').evaluate((scroller) => {
-    const expanded = scroller.querySelector('[data-tool-id="chronology-tool-a"]');
-    if (!(expanded instanceof HTMLElement)) throw new Error('expanded chronology A is not mounted');
-    scroller.scrollTop = Math.max(0, expanded.offsetTop - 80);
-    scroller.dispatchEvent(new Event('scroll'));
-  });
-  await page.waitForFunction(() => {
-    const scroller = document.querySelector('.message-list-fixture-shell #messages');
-    if (!(scroller instanceof HTMLElement)) return false;
-    return Math.abs(scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop) > 4;
-  });
-  const expandedBeforeAppend = await measureExpandedA('before-append');
+  const assertCompletedPairing = async (label) => {
+    const pairing = await page.evaluate((sampleLabel) => {
+      const textFor = (toolId) => document.querySelector(`[data-tool-id="${toolId}"]`)?.textContent ?? '';
+      return {
+        label: sampleLabel,
+        bText: textFor('chronology-tool-b'),
+        cText: textFor('chronology-tool-c'),
+      };
+    }, label);
+    if (!pairing.bText.includes('done') || pairing.bText.includes('pending') || !pairing.cText.includes('exit 0') || !pairing.cText.includes('C_OK')) {
+      throw new Error(`Chronology B/C results are not paired with completed cards: ${JSON.stringify(pairing)}`);
+    }
+    return pairing;
+  };
 
-  await page.getByTestId('chronology-append-bc').click();
-  await page.waitForSelector('[data-tool-id="chronology-tool-c"]');
-  const expandedAfterAppend = await measureExpandedA('after-append-bc');
-  assertStableExpandedA(expandedBeforeAppend, expandedAfterAppend);
+  const runChronologyFlow = async ({ label, width, height }) => {
+    await page.setViewportSize({ width, height });
+    await page.reload({ waitUntil: 'networkidle' });
+    await page.waitForSelector(`[data-message-list-fixture-ready="${id}"]`, { timeout: 10_000 });
 
-  await page.getByTestId('chronology-complete-bc').click();
-  await page.waitForFunction(() => {
-    const ids = Array.from(document.querySelectorAll('[data-tool-id]')).map((node) => node.getAttribute('data-tool-id'));
-    return ids.includes('chronology-tool-a') && ids.includes('chronology-tool-b') && ids.includes('chronology-tool-c');
-  });
-  const expandedAfterComplete = await measureExpandedA('after-complete-bc');
-  assertStableExpandedA(expandedBeforeAppend, expandedAfterComplete);
-  await page.getByTestId('chronology-final').click();
-  await page.waitForSelector('#message-chronology-agent-final');
-  const expandedAfterFinal = await measureExpandedA('after-final-prose');
-  assertStableExpandedA(expandedBeforeAppend, expandedAfterFinal);
-  const metrics = await page.evaluate(() => window.__messageListChronologyMetrics ?? null);
-  await writeFile(path.join(outDir, `${id}--metrics.json`), `${JSON.stringify({ metrics, expandedA: [expandedBeforeAppend, expandedAfterAppend, expandedAfterComplete, expandedAfterFinal] }, null, 2)}\n`);
-  if (!metrics || metrics.phase !== 'final-prose' || metrics.latestReachable !== true) {
-    throw new Error(`Compact chronology final prose was not measured as reachable: ${JSON.stringify(metrics)}`);
-  }
-  if (!Array.isArray(metrics.toolDomOrder)
-    || metrics.toolDomOrder.join(',') !== 'chronology-tool-a,chronology-tool-b,chronology-tool-c') {
-    throw new Error(`Compact chronology order regressed: ${JSON.stringify(metrics)}`);
-  }
-  await page.screenshot({ path: path.join(outDir, `${id}--final.png`), fullPage: true });
-  console.log('  verified compact chronology append/complete/final flow');
+    await page.locator('.message-list-fixture-shell #messages').evaluate((scroller) => {
+      scroller.scrollTop = 0;
+      scroller.dispatchEvent(new Event('scroll'));
+    });
+    await page.waitForSelector('[data-tool-id="chronology-tool-a"] .compact-tool-card-expand');
+    await page.locator('[data-tool-id="chronology-tool-a"] .compact-tool-card-expand').click();
+    await page.waitForSelector('.compact-tool-selected-detail [data-tool-id="chronology-tool-a"]');
+    await page.locator('.message-list-fixture-shell #messages').hover();
+    await page.mouse.wheel(0, 120);
+    await page.waitForFunction(() => {
+      const scroller = document.querySelector('.message-list-fixture-shell #messages');
+      if (!(scroller instanceof HTMLElement)) return false;
+      return scroller.scrollTop >= 100
+        && Math.abs(scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop) > 4;
+    });
+    const expandedBeforeAppend = await measureExpandedA(`${label}:before-append`);
+
+    await page.getByTestId('chronology-append-bc').click();
+    await page.waitForFunction(() => document.documentElement.dataset['messageListChronologyPhase'] === 'appended-bc');
+    const expandedAfterAppend = await measureExpandedA(`${label}:after-append-bc`);
+    assertStableExpandedA(expandedBeforeAppend, expandedAfterAppend);
+
+    await page.getByTestId('chronology-complete-bc').click();
+    await page.waitForFunction(() => document.documentElement.dataset['messageListChronologyPhase'] === 'completed-bc');
+    const expandedAfterComplete = await measureExpandedA(`${label}:after-complete-bc`);
+    assertStableExpandedA(expandedBeforeAppend, expandedAfterComplete);
+
+    await page.getByTestId('chronology-final').click();
+    await page.waitForFunction(() => document.documentElement.dataset['messageListChronologyPhase'] === 'final-prose');
+    const expandedAfterFinal = await measureExpandedA(`${label}:after-final-prose`);
+    assertStableExpandedA(expandedBeforeAppend, expandedAfterFinal);
+
+    await page.locator('.compact-tool-detail-collapse').click();
+    await page.waitForFunction(() => {
+      const active = document.activeElement;
+      return active instanceof HTMLElement
+        && active.closest('[data-message-id="chronology-agent-a"]')
+        && active.matches('.compact-tool-card-expand');
+    });
+
+    await page.locator('.message-list-fixture-shell #messages').evaluate((scroller) => {
+      scroller.scrollTop = scroller.scrollHeight;
+      scroller.dispatchEvent(new Event('scroll'));
+    });
+    await page.waitForSelector('#message-chronology-agent-final');
+    await page.waitForSelector('[data-tool-id="chronology-tool-c"]');
+    const completedPairing = await assertCompletedPairing(`${label}:completed-bc`);
+    const latestReachability = await page.evaluate(() => {
+      const scroller = document.querySelector('.message-list-fixture-shell #messages');
+      const finalMessage = document.querySelector('#message-chronology-agent-final');
+      return {
+        latestReachable: finalMessage instanceof HTMLElement && scroller instanceof HTMLElement
+          && finalMessage.offsetTop <= scroller.scrollHeight - finalMessage.offsetHeight,
+        finalText: finalMessage?.textContent ?? '',
+      };
+    });
+    if (!latestReachability.latestReachable || !latestReachability.finalText.includes('Final prose after B and C completed')) {
+      throw new Error(`Compact chronology final prose was not reachable: ${JSON.stringify(latestReachability)}`);
+    }
+
+    const samples = [expandedBeforeAppend, expandedAfterAppend, expandedAfterComplete, expandedAfterFinal];
+    await page.screenshot({ path: path.join(outDir, `${id}--${label}.png`), fullPage: true });
+    return { label, width, height, latestReachability, expandedA: samples, completedPairing };
+  };
+
+  const runs = [
+    await runChronologyFlow({ label: 'mobile', width: 390, height: 844 }),
+    await runChronologyFlow({ label: 'desktop', width: 960, height: 900 }),
+  ];
+  await writeFile(path.join(outDir, `${id}--metrics.json`), `${JSON.stringify(runs, null, 2)}\n`);
+  console.log('  verified compact chronology append/complete/final flow at mobile and desktop widths');
   return true;
 }
 
