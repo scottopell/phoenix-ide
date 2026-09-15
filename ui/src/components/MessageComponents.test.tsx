@@ -6,7 +6,7 @@ import { SubAgentStatus, AgentMessage, ToolOnlyAgentTurnGroup, UserMessage, Term
 import { FilePathContextMenu } from './FilePathContextMenu';
 import { MessageContextMenu, OPEN_MESSAGE_VIEWER_EVENT } from './MessageContextMenu';
 import { StreamingMessageView } from './StreamingMessage';
-import { api, ConflictError, type ConversationState, type Message, type ForkProposalSummary } from '../api';
+import { api, ConflictError, type ContentBlock, type ConversationState, type Message, type ForkProposalSummary } from '../api';
 import { copyToClipboard } from '../utils/clipboard';
 import { ForkProposalsProvider, useForkProposals } from '../contexts/ForkProposalsContext';
 import { ForkProposalReview } from './ForkProposalReview';
@@ -440,7 +440,7 @@ describe('inline tool timers', () => {
   it('does not store an expansion target for a missing tool id', () => {
     mockDensity = 'compact';
     const owner = agentMessage('agent-missing-tool-id', [
-      { type: 'tool_use', name: 'read_file', input: { path: 'missing-id.md' } } as any,
+      { type: 'tool_use', name: 'read_file', input: { path: 'missing-id.md' } } satisfies ContentBlock,
       { type: 'tool_use', id: 'present-tool-id', name: 'search', input: { pattern: 'present' } },
     ], 2);
 
