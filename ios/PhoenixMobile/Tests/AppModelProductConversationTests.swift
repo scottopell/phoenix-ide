@@ -55,8 +55,10 @@ private final class InMemoryCredentialStore: CredentialStore {
 
     var record: AppModel.CredentialRecord?
     var failNextSave = false
+    var legacyPassword: String?
     private(set) var deletedAccounts: [String] = []
 
+    func loadLegacyPassword(account: String) -> String? { legacyPassword }
     func loadRecord(account: String) -> AppModel.CredentialRecord? { record }
     func saveRecord(_ record: AppModel.CredentialRecord, account: String) throws {
         if failNextSave {
@@ -66,7 +68,11 @@ private final class InMemoryCredentialStore: CredentialStore {
         self.record = record
     }
     func deleteRecord(account: String) {
-        record = nil
+        if account == "server-password" {
+            legacyPassword = nil
+        } else {
+            record = nil
+        }
         deletedAccounts.append(account)
     }
 }
@@ -607,6 +613,7 @@ final class MutableTestConversationPersistenceStore: ConversationPersistenceStor
     var onPendingOutboxOwnerTranscriptRowIds: (() async -> Set<String>)?
     var hardDeleteFenceLoadResult: HardDeleteFenceLoadResult = .accessible([])
     var persistHardDeleteFenceResult = true
+    private(set) var persistedHardDeleteFences: [PersistedHardDeleteFence] = []
     private var deliveryPreparationGate: (entered: AsyncCandidateGate, completed: AsyncCandidateGate)?
     private var removeAllGate: AsyncCandidateGate?
     private(set) var hardDeleteFenceLoadCount = 0
@@ -685,7 +692,9 @@ final class MutableTestConversationPersistenceStore: ConversationPersistenceStor
         return true
     }
     func persistHardDeleteFence(_ fence: PersistedHardDeleteFence) async -> Bool {
-        persistHardDeleteFenceResult
+        guard persistHardDeleteFenceResult else { return false }
+        persistedHardDeleteFences.append(fence)
+        return true
     }
     func hardDeleteFences(persistenceScope: PersistenceScopeIdentity) -> HardDeleteFenceLoadResult {
         hardDeleteFenceLoadCount += 1
@@ -852,6 +861,49 @@ final class AppModelProductConversationTests: XCTestCase {
         } else {
             XCTFail("unexpected absent owner contents")
         }
+    }
+
+    @MainActor
+    func testSchemaV1OutboxDoesNotMintCurrentTenantDrainAuthority() async {
+        let baseDirectory = isolatedDiskDirectory()
+        let entry = makePendingOutboxEntry(conversationId: "row-legacy")
+        XCTAssertTrue(DiskStore.saveVersioned([entry], name: "outbox-row-legacy", version: 1))
+        let source = DiskStore.phoenixMobileDirectory(baseDirectory: baseDirectory)
+            .appendingPathComponent("outbox-row-legacy")
+            .appendingPathExtension("json")
+        let bytesBeforeInspection = try! Data(contentsOf: source)
+        let store = DiskConversationPersistenceStore(
+            baseDirectory: baseDirectory,
+            context: DiskStore.versionedContext(baseDirectory: baseDirectory))
+        let owners = await store.pendingOutboxOwners(scope: defaultPersistenceScope)
+
+        XCTAssertTrue(owners.isEmpty)
+        XCTAssertEqual(try! Data(contentsOf: source), bytesBeforeInspection)
+        if case .accessible(let scope, let aggregateAuthority, _) = store.inspectOutbox(conversationId: "row-legacy").state {
+            XCTAssertNil(scope)
+            XCTAssertNil(aggregateAuthority)
+        } else {
+            XCTFail("expected legacy queue to stay inspectable but authority-free")
+        }
+    }
+
+    @MainActor
+    func testFailedLegacyCredentialMigrationLeavesAppUnconfigured() {
+        let credentials = InMemoryCredentialStore()
+        credentials.legacyPassword = "legacy-secret"
+        credentials.failNextSave = true
+        UserDefaults.standard.set("https://example.com", forKey: "phoenix.serverURL")
+        defer { UserDefaults.standard.removeObject(forKey: "phoenix.serverURL") }
+
+        let model = AppModel(
+            conversationPersistenceStore: MutableTestConversationPersistenceStore(contentsByConversationId: [:]),
+            credentialStore: credentials)
+
+        XCTAssertFalse(model.isConfigured)
+        XCTAssertEqual(model.password, "")
+        XCTAssertEqual(model.credentialGeneration, "")
+        XCTAssertNil(credentials.record)
+        XCTAssertEqual(credentials.legacyPassword, "legacy-secret")
     }
 
     private func makeHTTPAPI(
@@ -1220,6 +1272,55 @@ final class AppModelProductConversationTests: XCTestCase {
             XCTFail("expected outbox entry to remain durable")
         }
         XCTAssertTrue(store.persistedOutboxOwnersSnapshot(scope: PersistenceScopeIdentity(serverURL: "https://example.com", credentialGeneration: "test-default")).contains("row-1"))
+    }
+
+    @MainActor
+    func testTrustOnlyRebuildKeepsPersistedOutboxDrainAuthorityWithoutAcceptingStaleLiveIdentity() async {
+        let baseDirectory = isolatedDiskDirectory()
+        let context = DiskStore.versionedContext(baseDirectory: baseDirectory)
+        let store = DiskConversationPersistenceStore(baseDirectory: baseDirectory, context: context)
+        let beforeTrustToggle = APIConfigurationIdentity(
+            serverURL: "https://trust-toggle.invalid",
+            credentialGeneration: "same-credential",
+            trustSelfSigned: false)
+        let afterTrustToggle = APIConfigurationIdentity(
+            serverURL: beforeTrustToggle.serverURL,
+            credentialGeneration: beforeTrustToggle.credentialGeneration,
+            trustSelfSigned: true)
+        let outbox = store.outboxPersistence(
+            conversationId: "row-1",
+            aggregateAuthority: "pc-1",
+            scope: beforeTrustToggle.persistenceScope)
+        _ = await outbox.save(
+            .init(
+                scope: beforeTrustToggle.persistenceScope,
+                aggregateAuthority: "pc-1",
+                entries: [makePendingOutboxEntry(conversationId: "row-1")]),
+            revision: outbox.reserveRevision())
+        let snapshot = ConversationSession.PersistedSnapshot(
+            conversation: conversation(id: "row-1", aggregateId: "pc-1"),
+            messages: [],
+            lastSequenceId: 0,
+            transcriptGeneration: 1,
+            syncedAt: Date(),
+            authoritative: .init(
+                configurationIdentity: beforeTrustToggle,
+                aggregateAuthority: "pc-1",
+                syncedAt: Date()))
+        let snapshotWriter = store.snapshotPersistence(conversationId: "row-1")
+        _ = await snapshotWriter.save(snapshot, revision: snapshotWriter.reserveRevision())
+        let probe = SendProbe()
+        let (api, registration) = makeHTTPAPI(
+            probe: probe,
+            host: "trust-toggle.invalid",
+            configurationIdentity: afterTrustToggle)
+        defer { TestURLProtocol.uninstall(host: "trust-toggle.invalid", owner: registration) }
+        let model = makeModel(conversationPersistenceStore: store)
+        model.connectivity.setOnlineForTesting(true)
+        model.replaceAPIForTesting(api)
+        _ = await model.awaitCurrentPersistedOutboxDrainForTesting()
+
+        XCTAssertEqual(probe.chatPostPaths, ["/api/conversations/row-1/chat"])
     }
 
     func testAuthoritativeReceiptUnlocksOneSendAndAwaitsReflection() async {
@@ -2368,11 +2469,50 @@ final class AppModelProductConversationTests: XCTestCase {
             pendingEvents: [], pendingTruncated: false)))
 
         session.receive(.conversationHardDeleted(seq: 1, conversationId: "row-1"))
+        await session.awaitHardDeleteReportForTesting()
         await model.awaitHardDeleteCleanupForTesting(conversationId: "row-1")
 
         XCTAssertNotNil(model.existingSession(for: "row-1"))
         XCTAssertFalse(model.listStore.conversations.isEmpty)
         XCTAssertFalse(store.inspectOutbox(conversationId: "row-1").visibleEntries.isEmpty)
+        XCTAssertNil(model.session(for: "row-1", aggregateAuthority: "pc-1"))
+    }
+
+    @MainActor
+    func testFailedInitialHardDeleteFenceSaveRetriesBeforeOutboxDrain() async throws {
+        let store = MutableTestConversationPersistenceStore(
+            owners: ["row-1"],
+            contentsByConversationId: ["row-1": .entries([makePendingOutboxEntry(conversationId: "row-1")])],
+            aggregateMembersById: ["pc-1": ["row-1"]])
+        store.persistHardDeleteFenceResult = false
+        let probe = SendProbe()
+        let (api, registration) = makeHTTPAPI(probe: probe)
+        defer { TestURLProtocol.uninstall(host: "phoenix.invalid", owner: registration) }
+        let model = makeModel(conversationPersistenceStore: store)
+        model.replaceAPIForTesting(api)
+        model.connectivity.setOnlineForTesting(true)
+        model.listStore.upsert(conversation(id: "row-1", aggregateId: "pc-1"))
+        let session = try XCTUnwrap(model.session(for: "row-1", aggregateAuthority: "pc-1"))
+        session.receive(.initSnapshot(.init(
+            conversation: conversation(id: "row-1", aggregateId: "pc-1"),
+            messages: [], agentWorking: false, presentationMode: "idle",
+            lastSequenceId: 0, pendingAnchorSequenceId: 0,
+            pendingEvents: [], pendingTruncated: false)))
+
+        session.receive(.conversationHardDeleted(seq: 1, conversationId: "row-1"))
+        await session.awaitHardDeleteReportForTesting()
+        model.triggerPersistedOutboxDrainIfNeededForTesting()
+        XCTAssertTrue(probe.chatPostPaths.isEmpty)
+        XCTAssertNil(model.session(for: "row-1", aggregateAuthority: "pc-1"))
+
+        store.persistHardDeleteFenceResult = true
+        model.triggerStartupHardDeleteRecoveryForTesting()
+        await model.awaitStartupHardDeleteRecoveryForTesting()
+
+        XCTAssertEqual(store.persistedHardDeleteFences.map(\.aggregateAuthority), ["pc-1"])
+        XCTAssertTrue(probe.chatPostPaths.isEmpty)
+        if case .missing = store.inspectOutbox(conversationId: "row-1").state {} else { XCTFail("expected retried fence cleanup to remove outbox") }
+        XCTAssertTrue(model.listStore.conversations.isEmpty)
     }
 
     func testHardDeleteClearsRetainedProductConversationProjection() async {
