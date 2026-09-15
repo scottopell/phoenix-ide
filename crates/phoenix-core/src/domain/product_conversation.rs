@@ -74,6 +74,36 @@ impl fmt::Display for ProductConversationIdError {
 
 impl std::error::Error for ProductConversationIdError {}
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum AutoContinueOnContextExhaustion {
+    #[default]
+    Disabled,
+    Enabled,
+}
+
+impl AutoContinueOnContextExhaustion {
+    #[must_use]
+    pub fn is_enabled(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
+impl From<bool> for AutoContinueOnContextExhaustion {
+    fn from(enabled: bool) -> Self {
+        if enabled {
+            Self::Enabled
+        } else {
+            Self::Disabled
+        }
+    }
+}
+
+impl From<AutoContinueOnContextExhaustion> for bool {
+    fn from(preference: AutoContinueOnContextExhaustion) -> Self {
+        preference.is_enabled()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OrdinaryProductConversationLifecycle {
@@ -179,6 +209,20 @@ impl ProductConversationKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_continuation_preference_defaults_off_and_converts_explicitly() {
+        assert_eq!(
+            AutoContinueOnContextExhaustion::default(),
+            AutoContinueOnContextExhaustion::Disabled
+        );
+        assert!(!AutoContinueOnContextExhaustion::default().is_enabled());
+        assert_eq!(
+            AutoContinueOnContextExhaustion::from(true),
+            AutoContinueOnContextExhaustion::Enabled
+        );
+        assert!(bool::from(AutoContinueOnContextExhaustion::Enabled));
+    }
 
     #[test]
     fn product_conversation_id_rejects_empty() {
