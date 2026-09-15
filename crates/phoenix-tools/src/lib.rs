@@ -917,12 +917,15 @@ fn parent_coordination_tools(agents: Vec<phoenix_agents::AgentDefinition>) -> Ve
     vec![
         Arc::new(SpawnAgentsTool::with_agents(agents)),
         Arc::new(AskUserQuestionTool),
-        Arc::new(SkillTool),
+        Arc::new(SkillTool::default()),
     ]
 }
 
 fn explore_coordination_tools() -> Vec<Arc<dyn Tool>> {
-    vec![Arc::new(AskUserQuestionTool), Arc::new(SkillTool)]
+    vec![
+        Arc::new(AskUserQuestionTool),
+        Arc::new(SkillTool::default()),
+    ]
 }
 
 /// Sub-agent terminal tools — how a sub-agent reports its result or error
@@ -998,10 +1001,12 @@ impl ToolRegistry {
     /// read tools, explicitly WorkScope-targeted unsandboxed Bash, and the
     /// singular cross-conversation text-message action. Browser, MCP, dedicated
     /// task/project/workspace mutation, creation, approval, and other lifecycle
-    /// tools are absent.
+    /// tools are absent; the existing skill tool exposes Coordinator-only reference
+    /// material.
     #[must_use]
     pub fn coordinator(mut global_read_tools: Vec<Arc<dyn Tool>>) -> Self {
         let mut tools: Vec<Arc<dyn Tool>> = vec![Arc::new(ThinkTool)];
+        tools.push(Arc::new(SkillTool::for_global_coordinator()));
         tools.append(&mut global_read_tools);
         Self { tools }
     }
@@ -1358,6 +1363,20 @@ mod tests {
         ExploreToolPolicy {
             bash: ExploreBashCapability::Unavailable,
         }
+    }
+
+    #[test]
+    fn coordinator_registry_adds_only_existing_skill_and_think_to_supplied_tools() {
+        let registry = ToolRegistry::coordinator(vec![Arc::new(ReadFileTool)]);
+        assert_eq!(
+            names(&registry),
+            BTreeSet::from([
+                "read_file".to_string(),
+                "skill".to_string(),
+                "think".to_string(),
+            ])
+        );
+        assert!(!names(&registry).contains("phoenix_operator"));
     }
 
     #[test]

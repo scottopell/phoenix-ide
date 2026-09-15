@@ -199,9 +199,16 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn skill_names_includes_spears_and_allium_only() {
+    fn skill_names_includes_all_embedded_skills() {
         let names = skill_names();
-        assert_eq!(names, vec!["allium".to_string(), "spears".to_string()]);
+        assert_eq!(
+            names,
+            vec![
+                "allium".to_string(),
+                "phoenix-api".to_string(),
+                "spears".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -230,6 +237,32 @@ mod tests {
         assert!(tmp.path().join("spears/SKILL.md").is_file());
         assert!(tmp.path().join("spears/references/discovery.md").is_file());
         assert!(tmp.path().join("spears/adrs/_TEMPLATE.md").is_file());
+        assert!(tmp.path().join("phoenix-api/SKILL.md").is_file());
+        assert!(tmp
+            .path()
+            .join("phoenix-api/references/api-reference.md")
+            .is_file());
+    }
+
+    #[test]
+    fn phoenix_api_content_preserves_authorization_and_verification_boundaries() {
+        let tmp = TempDir::new().unwrap();
+        extract_to(tmp.path()).unwrap();
+        let skill = std::fs::read_to_string(tmp.path().join("phoenix-api/SKILL.md")).unwrap();
+        let reference =
+            std::fs::read_to_string(tmp.path().join("phoenix-api/references/api-reference.md"))
+                .unwrap();
+
+        assert!(skill.contains("audience: global-coordinator"));
+        assert!(skill.contains("user has authorized"));
+        assert!(skill.contains("never print, persist"));
+        assert!(skill.contains("acceptance, not proof"));
+        assert!(reference.contains("GET /api/auth/status"));
+        assert!(reference.contains("writable_transcript_row_id"));
+        assert!(reference.contains("Reuse the same `message_id`"));
+        assert!(reference.contains("messages/reconcile"));
+        assert!(reference.contains("Current APIs do not provide"));
+        assert!(!reference.contains("NEVER call Phoenix HTTP API through Bash"));
     }
 
     #[test]
