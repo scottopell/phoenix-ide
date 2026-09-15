@@ -2,8 +2,9 @@
 // (Finding B). The page renders from `useConversationView`, which excludes the
 // two highest-frequency atom fields:
 //
-//   - `streamingBuffer` — churns on every `sse_token`
-//   - `lastSseEventAt`   — churns on every observed event (token + `ping`)
+//   - `streamingBuffer`      — churns on every `sse_token`
+//   - `lastSseEventAt`       — churns on every observed event (token + `ping`)
+//   - `lastAppliedEventSeq`  — cursor-only wire progress used via refs
 //
 // so neither a streaming token nor a heartbeat bump may re-render the page
 // body. The watchdog clock is consumed separately via `useLastSseEventAt`,
@@ -151,8 +152,8 @@ describe('useConversationView perf isolation (Finding B)', () => {
     expect(viewRenders.current).toBe(viewBaseline);
     expect(clockRenders.current).toBeGreaterThan(clockBaseline);
 
-    // A streaming token. Changes only streamingBuffer — neither subscriber
-    // that excludes it should re-render the page view.
+    // A streaming token advances the event cursor and changes only
+    // streamingBuffer — neither should re-render the page view.
     const viewAfterClock = viewRenders.current;
     act(() => {
       store!.dispatch(SLUG, {
@@ -172,13 +173,23 @@ describe('useConversationView perf isolation (Finding B)', () => {
     });
     expect(viewRenders.current).toBe(viewAfterClock);
 
+    const viewAfterTokens = viewRenders.current;
+    act(() => {
+      store!.dispatch(SLUG, {
+        type: 'sse_sequence_consumed',
+        epoch: 1,
+        sequenceId: 3,
+      });
+    });
+    expect(viewRenders.current).toBe(viewAfterTokens);
+
     // Sanity: a real page-relevant change (a new message) DOES re-render the
     // view — the isolation is selective, not a dead subscription.
     act(() => {
       store!.dispatch(SLUG, {
         type: 'sse_message',
         epoch: 1,
-        sequenceId: 3,
+        sequenceId: 4,
         message: {
           message_id: 'm1',
           message_type: 'assistant',
