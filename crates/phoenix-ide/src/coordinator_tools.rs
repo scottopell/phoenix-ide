@@ -1,5 +1,6 @@
 use crate::api::global_read::{
-    GlobalReadService, PreviousTranscriptsBinding, PreviousTranscriptsRequest,
+    serialize_previous_transcripts_output_bounded, GlobalReadService, PreviousTranscriptsBinding,
+    PreviousTranscriptsRequest,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -61,36 +62,29 @@ impl Tool for PreviousTranscripts {
 
     fn input_schema(&self) -> Value {
         json!({
-            "oneOf": [
-                {
-                    "type": "object",
-                    "properties": {
-                        "op": { "const": "list" },
-                        "cursor": { "type": "string" }
-                    },
-                    "required": ["op"],
-                    "additionalProperties": false
+            "type": "object",
+            "properties": {
+                "op": {
+                    "type": "string",
+                    "enum": ["list", "search", "read"]
                 },
-                {
-                    "type": "object",
-                    "properties": {
-                        "op": { "const": "search" },
-                        "query": { "type": "string", "minLength": 1 }
-                    },
-                    "required": ["op", "query"],
-                    "additionalProperties": false
+                "query": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Required only when op=search."
                 },
-                {
-                    "type": "object",
-                    "properties": {
-                        "op": { "const": "read" },
-                        "transcript_ref": { "type": "string", "minLength": 1 },
-                        "cursor": { "type": "string" }
-                    },
-                    "required": ["op", "transcript_ref"],
-                    "additionalProperties": false
+                "transcript_ref": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Required only when op=read."
+                },
+                "cursor": {
+                    "type": "string",
+                    "description": "Optional paging cursor for op=list or op=read."
                 }
-            ]
+            },
+            "required": ["op"],
+            "additionalProperties": false
         })
     }
 
@@ -109,7 +103,7 @@ impl Tool for PreviousTranscripts {
             .service
             .previous_transcripts(&self.binding, request)
             .await;
-        match serde_json::to_string_pretty(&output) {
+        match serialize_previous_transcripts_output_bounded(&output) {
             Ok(json) => ToolOutput::success(json),
             Err(error) => ToolOutput::error(format!(
                 "failed to encode previous_transcripts result: {error}"
@@ -571,6 +565,35 @@ mod tests {
             writing_tools(service.clone(), send_chat.clone()),
             tools(service, send_chat),
         )
+    }
+
+    #[tokio::test]
+    async fn previous_transcripts_schema_is_anthropic_compatible_and_inputs_remain_closed() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let service = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
+        let tool = PreviousTranscripts {
+            service,
+            binding: PreviousTranscriptsBinding::new("product".to_string(), "current".to_string()),
+        };
+        let schema = tool.input_schema();
+        assert_eq!(schema["type"], "object");
+        assert!(schema.get("oneOf").is_none());
+        assert_eq!(schema["required"], json!(["op"]));
+        assert_eq!(
+            schema["properties"]["op"]["enum"],
+            json!(["list", "search", "read"])
+        );
+
+        let invalid = serde_json::from_value::<PreviousTranscriptsRequest>(json!({
+            "op": "search",
+            "query": "needle",
+            "cursor": "not valid for search"
+        }));
+        assert!(invalid.is_err());
+        let missing = serde_json::from_value::<PreviousTranscriptsRequest>(json!({
+            "op": "read"
+        }));
+        assert!(missing.is_err());
     }
 
     async fn tool_and_context() -> (WorkScopeCoordinatorBash, ToolContext) {
