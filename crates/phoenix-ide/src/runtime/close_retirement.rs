@@ -8643,7 +8643,8 @@ mod tests {
         assert_ne!(mapping, libc::MAP_FAILED);
         drop(file);
 
-        let proc_root = temp.path().join("proc");
+        let proc_fixture = tempfile::tempdir().unwrap();
+        let proc_root = proc_fixture.path().join("proc");
         std::fs::create_dir(&proc_root).unwrap();
         let pid = std::process::id().to_string();
         std::os::unix::fs::symlink("/proc/self", proc_root.join(pid)).unwrap();
