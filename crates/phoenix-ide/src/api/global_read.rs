@@ -1409,7 +1409,7 @@ fn render_previous_message_line(conv: &Conversation, message: &crate::db::Messag
         href,
         conv.id,
         message.message_id,
-        render_full_message_text(message).trim()
+        render_full_message_text(message)
     )
 }
 
@@ -2043,7 +2043,7 @@ mod tests {
             "a-msg",
             "pred-a",
             1,
-            &crate::db::MessageContent::user("alpha only predecessor evidence"),
+            &crate::db::MessageContent::user("\t  alpha only predecessor evidence  "),
             None,
             None,
         )
@@ -2132,7 +2132,7 @@ mod tests {
         let PreviousTranscriptsOutput::ReadPage { content, .. } = output else {
             panic!("expected read page, got {output:?}");
         };
-        assert!(content.contains("alpha only predecessor evidence"));
+        assert!(content.contains("\n\t  alpha only predecessor evidence  \n\n"));
 
         let fragmented = service
             .previous_transcripts(
