@@ -153,6 +153,7 @@ final class ConversationSession {
     }
 
     private let aggregateAuthority: String
+    var aggregateAuthorityIdentity: String { aggregateAuthority }
 
     private static func receiptIdentity(
         for conversation: Conversation,
@@ -253,7 +254,7 @@ final class ConversationSession {
         if case .value(let snap) = loadedSnapshot,
            let persistedConversation = snap.conversation,
            let authority = snap.authoritative,
-           authority.configurationIdentity == api.configurationIdentity,
+           authority.configurationIdentity.persistenceScope == api.configurationIdentity.persistenceScope,
            authority.aggregateAuthority == self.aggregateAuthority,
            let receiptIdentity = Self.receiptIdentity(
                for: persistedConversation,
