@@ -340,6 +340,12 @@ final class ConversationSession {
         drainOutbox()
     }
 
+    func revokeConfigurationForReplacement() {
+        invalidateConfiguration()
+        snapshotPersistenceEnabled = false
+        stop()
+    }
+
     func revokeForHardDelete() {
         isHardDeleted = true
         isHardDeletePending = false
