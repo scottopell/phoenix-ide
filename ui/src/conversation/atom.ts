@@ -80,6 +80,7 @@ export interface ConversationAtom {
   phase: ConversationState;
   phaseLastAppliedEventSeq: number;
   questionStatusPhaseFenceEventSeq: number;
+  consumedQuestionRequestIds: readonly string[];
   conversationLastAppliedEventSeq: number;
   messages: Message[];
   /** Durable server-authoritative messages awaiting steering delivery. */
@@ -409,6 +410,7 @@ export function createInitialAtom(): ConversationAtom {
     phase: { type: 'idle' },
     phaseLastAppliedEventSeq: 0,
     questionStatusPhaseFenceEventSeq: 0,
+    consumedQuestionRequestIds: [],
     conversationLastAppliedEventSeq: 0,
     messages: [],
     steeringMessages: [],
@@ -751,6 +753,9 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
     case 'sse_state_change': {
       const phase =
         action.phase.type === 'error' && action.error ? { ...action.phase, error: action.error } : action.phase;
+      if (phase.type === 'awaiting_user_response' && atom.consumedQuestionRequestIds.includes(phase.request_id)) {
+        return atom;
+      }
       return {
         ...atom,
         phase,
@@ -1332,6 +1337,7 @@ export function conversationReducer(
         phase: p.phase,
         phaseLastAppliedEventSeq: initPhaseAuthoritySeq,
         questionStatusPhaseFenceEventSeq: 0,
+        consumedQuestionRequestIds: [],
         conversationLastAppliedEventSeq: 0,
         contextWindow: p.contextWindow,
         streamIncarnation: p.streamIncarnation,
@@ -1488,6 +1494,9 @@ export function conversationReducer(
         phase: action.phase,
         phaseStateUpdatedAt: action.stateUpdatedAt,
         questionStatusPhaseFenceEventSeq: Math.max(atom.questionStatusPhaseFenceEventSeq, action.phaseFreshnessEventSeq),
+        consumedQuestionRequestIds: atom.consumedQuestionRequestIds.includes(action.requestId)
+          ? atom.consumedQuestionRequestIds
+          : [...atom.consumedQuestionRequestIds, action.requestId],
       };
 
     case 'local_phase_change':

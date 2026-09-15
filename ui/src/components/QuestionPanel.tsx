@@ -261,7 +261,7 @@ function ActiveQuestionPanel({ questions, conversationId, requestId, showToast, 
     }}>
     <header className="question-context"><strong>{questions.length > 1 ? `Question ${step + 1} of ${questions.length} · ` : ''}{question.header}</strong>
       {bounds.width >= 480 && <button type="button" disabled={locked} onClick={() => setExpanded(value => !value)}>{expanded ? 'Restore conversation' : 'Expand questions'}</button>}
-      {questions.length > 1 && !short && <nav aria-label="Questions">{questions.map((q, i) => <button type="button" key={q.question} disabled={locked}
+      {questions.length > 1 && <nav aria-label="Questions">{questions.map((q, i) => <button type="button" key={q.question} disabled={locked}
         aria-current={step === i ? 'step' : undefined} aria-label={`${q.header}, ${isAnswered(q, drafts[i]!) ? 'answered' : 'unanswered'}`} onClick={() => setStep(i)}>
         {isAnswered(q, drafts[i]!) ? '✓ ' : ''}{q.header}</button>)}</nav>}
     </header>

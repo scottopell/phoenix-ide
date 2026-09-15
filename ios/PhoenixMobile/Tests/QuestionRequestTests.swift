@@ -246,6 +246,24 @@ final class QuestionRequestTests: XCTestCase {
         }
     }
 
+    func testQuestionMutationRejectsMalformedSuccessPayloads() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [QuestionRequestProtocol.self]
+        defer { QuestionRequestProtocol.onRequest = nil }
+        let api = PhoenixAPI(baseURL: URL(string: "https://auq-protocol.invalid")!,
+                             password: nil, allowSelfSigned: false, configuration: configuration)!
+        for body in ["{}", "{\"success\":false}"] {
+            QuestionRequestProtocol.onRequest = { $0.succeed(body: body) }
+            do {
+                try await api.dismissQuestion(conversationId: "conversation-a", requestId: "original")
+                XCTFail("Malformed question mutation success should throw")
+            } catch APIError.decoding {
+            } catch {
+                XCTFail("Expected decoding error, got \(error)")
+            }
+        }
+    }
+
     func testBothMutationsCarryOriginatingRequestIdentity() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [QuestionRequestProtocol.self]

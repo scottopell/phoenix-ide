@@ -1,6 +1,6 @@
 # ADR-053: Question interactions bind explicit answers to request identity
 
-- **Status:** Accepted
+- **Status:** Accepted; identity lineage superseded by ADR-052
 - **Date:** 2026-09-14
 - **Affects:** REQ-AUQ-001, REQ-AUQ-002, REQ-AUQ-003, REQ-AUQ-004,
   REQ-AUQ-007, REQ-AUQ-009, REQ-AUQ-010, REQ-AUQ-011, REQ-AUQ-012,
@@ -39,10 +39,12 @@ preview. One answer-body scroller and an in-flow footer at short heights avoid
 competing scrolling regions. Native keyboard behavior replaces timed advancement
 and Tab-based wizard navigation.
 
-Reuse `(conversation ID, tool_use_id)` through clients, API admission, and the
-consuming transition. Missing identity is an actionable no-mutation rejection,
-not a legacy fallback. Bind asynchronous completion and focus effects to the
-originating request, so a fast next question cannot be erased by an earlier POST.
+Bind clients, API admission, and the consuming transition to an explicit question
+request identity. ADR-052 supersedes this ADR's initial provider-identity sketch:
+`request_id` is the authoritative incarnation, while `tool_use_id` is provenance
+only. Missing request identity is an actionable no-mutation rejection, not a
+legacy fallback. Bind asynchronous completion and focus effects to the originating
+request, so a fast next question cannot be erased by an earlier POST.
 
 An uncertain operation retains its frozen snapshot. Explicit retries repeat only
 that snapshot or dismissal identity. A rejection of one retry cannot establish

@@ -2852,6 +2852,20 @@ describe('request-bound question callbacks', () => {
     expect(newer.phase.type).toBe('idle');
   });
 
+  it('keeps a consumed question closed when its original SSE state arrives late', () => {
+    const pending: ConversationAtom = {...createInitialAtom(),conversationId:'conv-1',conversation:testConversation,phase:{type:'awaiting_user_response',request_id:'question-1',tool_use_id:'tool',questions:[]},lastAppliedEventSeq:12};
+    const resolved = conversationReducer(pending,{type:'question_phase_change',expectedConversationId:'conv-1',requestId:'question-1',phase:{type:'llm_requesting',attempt:1},stateUpdatedAt:1234,phaseFreshnessEventSeq:pending.lastAppliedEventSeq});
+    const afterLateSse = conversationReducer(resolved, {
+      type: 'sse_state_change',
+      sequenceId: 13,
+      phase: {type:'awaiting_user_response',request_id:'question-1',tool_use_id:'tool',questions:[]},
+      stateUpdatedAt: 1200,
+    });
+
+    expect(afterLateSse.phase).toBe(resolved.phase);
+    expect(afterLateSse.lastAppliedEventSeq).toBe(13);
+  });
+
   it('adopts authoritative history phase when the snapshot cursor equals the phase event cursor', () => {
     const phaseAtRequestStart = { type: 'idle' } as const;
     const equalCursor: ConversationAtom = {

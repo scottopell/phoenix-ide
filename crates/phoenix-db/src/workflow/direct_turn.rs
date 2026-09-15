@@ -1367,6 +1367,17 @@ impl WorkflowRepository {
             tx.rollback().await?;
             return Ok(MaterializeAuthoritativeTurnOutcome::StaleAuthority);
         }
+        let deferred_steering_waiting = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM question_dismissal_pauses WHERE conversation_id = ?1)
+                    AND EXISTS(SELECT 1 FROM steering_messages WHERE conversation_id = ?1)",
+        )
+        .bind(&turn.conversation.0)
+        .fetch_one(&mut *tx.tx)
+        .await?;
+        if deferred_steering_waiting {
+            tx.rollback().await?;
+            return Ok(MaterializeAuthoritativeTurnOutcome::StaleAuthority);
+        }
         let message = insert_canonical_message_tx(
             &mut tx,
             &turn,
@@ -4250,6 +4261,51 @@ mod tests {
             .await,
             crate::workflow::LocalAuthorityResult::DurableFactUnclassified
         ));
+    }
+
+    #[tokio::test]
+    async fn materialization_refuses_to_release_dismissal_pause_when_steering_arrived() {
+        let repo = repo().await;
+        let (turn_id, workflow_id) = created_turn(&repo, "queued-beats-direct", 29).await;
+        let authority = repo
+            .claim_authoritative_turn(&claim_input(workflow_id, turn_id, 10))
+            .await
+            .unwrap()
+            .authority
+            .unwrap();
+        sqlx::query("INSERT INTO question_dismissal_pauses (conversation_id) VALUES ('conv-a')")
+            .execute(repo.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO steering_messages (message_id, conversation_id, ordinal, text)
+             VALUES ('queued-first', 'conv-a', 0, 'older queued objective')",
+        )
+        .execute(repo.pool())
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            repo.materialize_authoritative_turn(&materialize_input(
+                turn_id,
+                authority,
+                1,
+                1,
+                "message-conv-a-queued-beats-direct",
+                10,
+            ))
+            .await,
+            crate::workflow::LocalAuthorityResult::DurableFactEstablished(
+                MaterializeAuthoritativeTurnOutcome::StaleAuthority
+            )
+        ));
+        let pause_still_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM question_dismissal_pauses WHERE conversation_id = 'conv-a')",
+        )
+        .fetch_one(repo.pool())
+        .await
+        .unwrap();
+        assert!(pause_still_exists);
     }
 
     #[tokio::test]

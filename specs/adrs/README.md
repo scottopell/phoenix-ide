@@ -64,7 +64,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [050](050_launchd-restart-preserves-installed-state.md) | launchd restart preserves installed state through an independent helper | Accepted | REQ-LDD-014 through REQ-LDD-016; `RestartTransaction` |
 | [051](051_predecessor-recall-is-bound-to-the-executing-transcript.md) | Predecessor recall is bound to the executing transcript | Accepted | REQ-RET-009, REQ-GR-007 |
 | [052](052_question-incarnations-and-durable-dismissal-resumption.md) | Question incarnations and durable dismissal resumption | Accepted | REQ-AUQ-004/007/011/012, REQ-COMP-006 |
-| [053](053_question-interactions-bind-explicit-answers-to-request-identity.md) | Question interactions bind explicit answers to request identity | Accepted | REQ-AUQ-001–004/007/009–013, REQ-KB-001/004/008, REQ-COMP-006 |
+| [053](053_question-interactions-bind-explicit-answers-to-request-identity.md) | Question interactions bind explicit answers to request identity | Accepted; identity lineage superseded by ADR-052 | REQ-AUQ-001–004/007/009–013, REQ-KB-001/004/008, REQ-COMP-006 |
 
 ## For agents: which decisions bind your task
 
@@ -77,7 +77,7 @@ Consult the relevant ADRs before starting work of each kind.
 
 | Task type | Relevant ADRs |
 | --- | --- |
-| Changing question answer UX, responsive layout, or request mutation identity | 053, 052, 050, 034 |
+| Changing question answer UX, responsive layout, or request mutation identity | 052, 053, 050, 034 |
 | Creating or restructuring Phoenix spec artifacts | 000 |
 | Deciding whether to create a new `design.md` | 000 |
 | Migrating legacy `specs/*/design.md` content | 000, 001, 002, 003, 004, 005, 006 |
