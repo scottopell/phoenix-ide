@@ -1085,6 +1085,28 @@ impl ToolRegistry {
         Ok(self)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error when the registry already contains a tool with this name.
+    pub fn try_with_host_bound_tool(mut self, tool: Arc<dyn Tool>) -> Result<Self, String> {
+        self.try_add_host_bound_tool(tool)?;
+        Ok(self)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the registry already contains a tool with this name.
+    pub fn try_add_host_bound_tool(&mut self, tool: Arc<dyn Tool>) -> Result<(), String> {
+        let name = tool.name();
+        if self.tools.iter().any(|existing| existing.name() == name) {
+            return Err(format!(
+                "tool registry already contains host-bound capability {name}"
+            ));
+        }
+        self.tools.push(tool);
+        Ok(())
+    }
+
     /// Add `propose_task` to a writing-mode registry (Work, Branch, or
     /// Direct-in-a-git-repo), where it serves as the non-blocking fork
     /// proposal (REQ-PROJ-033/036). Unlike Explore, the writing modes keep
