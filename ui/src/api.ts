@@ -935,6 +935,28 @@ export class ExpansionError extends Error {
  *  when `error_type === 'continuation_exists'` (REQ-BED-031) so the UI can
  *  route to the continuation without parsing the error message. */
 export interface ConflictErrorDetail {
+  attempt_id?: string;
+  active_transcript_id?: string;
+  recovery_action?: {
+    method: 'POST';
+    path: string;
+  };
+  failed_invariant?: string;
+  failed_relation?: string;
+  ambient_writer_indeterminate?: {
+    detector: "native_process_inventory" | "macos_proc_pidinfo" | "linux_procfs";
+    operation:
+      | "observe_ambient_writer"
+      | "read_process_incarnation"
+      | "read_process_executable"
+      | "read_mappings"
+      | "enumerate_descriptors"
+      | "enumerate_descriptor"
+      | "read_descriptor_target"
+      | "read_descriptor_metadata"
+      | "read_descriptor_access_mode";
+    error_kind: "permission_denied" | "not_found" | "invalid_data" | "indeterminate" | "other";
+  };
   error: string;
   error_type: string;
   conflict_slug?: string;

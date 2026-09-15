@@ -1105,6 +1105,12 @@ pub struct ForkProposalListResponse {
     pub proposals: Vec<ForkProposalSummary>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CloseRecoveryAction {
+    pub method: String,
+    pub path: String,
+}
+
 /// 409 Conflict error with typed `error_type` for frontend dispatch
 #[derive(Debug, Serialize)]
 pub struct ConflictErrorResponse {
@@ -1125,6 +1131,19 @@ pub struct ConflictErrorResponse {
     /// the parent has been continued (`error_type = "continuation_exists"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub continuation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_transcript_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_action: Option<CloseRecoveryAction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_invariant: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_relation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ambient_writer_indeterminate:
+        Option<crate::runtime::close_retirement::AmbientWriterIndeterminateDiagnostic>,
 }
 
 impl ConflictErrorResponse {
@@ -1136,7 +1155,30 @@ impl ConflictErrorResponse {
             can_auto_stash: false,
             conflict_slug: None,
             continuation_id: None,
+            attempt_id: None,
+            active_transcript_id: None,
+            recovery_action: None,
+            failed_invariant: None,
+            failed_relation: None,
+            ambient_writer_indeterminate: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_close_recovery(
+        mut self,
+        attempt_id: impl Into<String>,
+        active_transcript_id: impl Into<String>,
+    ) -> Self {
+        let attempt_id = attempt_id.into();
+        let active_transcript_id = active_transcript_id.into();
+        self.recovery_action = Some(CloseRecoveryAction {
+            method: "POST".to_string(),
+            path: format!("/api/conversations/{active_transcript_id}/close/retry-retirement"),
+        });
+        self.attempt_id = Some(attempt_id);
+        self.active_transcript_id = Some(active_transcript_id);
+        self
     }
 
     pub fn with_conflict_slug(mut self, slug: impl Into<String>) -> Self {

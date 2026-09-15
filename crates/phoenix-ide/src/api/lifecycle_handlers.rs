@@ -12,10 +12,11 @@ use super::types::{
 use super::AppState;
 #[cfg(test)]
 use crate::db::Conversation;
+use crate::runtime::close_retirement::CloseRetirementError;
 use crate::runtime::fork_resolve::ForkResolveError;
 use crate::state_machine::state::TaskApprovalOutcome;
 use crate::state_machine::{ConvState, Event};
-use phoenix_core::domain::close::TranscriptConversationId;
+use phoenix_core::domain::close::{ClosePhase, TranscriptConversationId};
 
 use axum::{
     extract::{Path, State},
@@ -624,6 +625,56 @@ pub(crate) async fn cancel_close_before_retirement(
     Ok(Json(SuccessResponse { success: true }))
 }
 
+async fn close_retirement_conflict(
+    db: &phoenix_db::Database,
+    error: CloseRetirementError,
+    attempt_id: &str,
+    active_transcript_id: &str,
+) -> ConflictErrorResponse {
+    let phase = db
+        .get_close_obligation(attempt_id)
+        .await
+        .ok()
+        .map(|obligation| obligation.phase());
+    close_retirement_conflict_for_phase(error, attempt_id, active_transcript_id, phase)
+}
+
+fn close_retirement_conflict_for_phase(
+    error: CloseRetirementError,
+    attempt_id: &str,
+    active_transcript_id: &str,
+    phase: Option<ClosePhase>,
+) -> ConflictErrorResponse {
+    let (message, invariant, relation) = match error {
+        CloseRetirementError::EvidenceInvariant {
+            invariant,
+            relation,
+        } => (
+            "Close retirement evidence is inconsistent; retry cannot continue safely.".to_string(),
+            Some(invariant.clone()),
+            Some(relation.clone()),
+        ),
+        CloseRetirementError::Message(message) => (message, None, None),
+    };
+    let diagnostic =
+        crate::runtime::close_retirement::AmbientWriterIndeterminateDiagnostic::from_marker(
+            &message,
+        );
+    let safe_message = if diagnostic.is_some() {
+        "Close could not prove that the quarantined worktree has no ambient writer.".to_string()
+    } else {
+        message
+    };
+    let mut response = ConflictErrorResponse::new(safe_message, "close_retirement_needs_repair");
+    if close_phase_allows_retry_guidance(phase) {
+        response = response.with_close_recovery(attempt_id, active_transcript_id);
+    }
+    response.failed_invariant = invariant;
+    response.failed_relation = relation;
+    response.ambient_writer_indeterminate = diagnostic;
+    response
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn retry_close_retirement(
     State(state): State<AppState>,
@@ -690,6 +741,7 @@ pub(crate) async fn retry_close_retirement(
             .inspect_close_retirement(retried.attempt_id().clone())
             .await
             .map(|_| ())
+            .map_err(CloseRetirementError::Message)
     } else {
         state
             .runtime
@@ -712,21 +764,39 @@ pub(crate) async fn retry_close_retirement(
                 .next()
                 .ok_or_else(|| AppError::Internal("Close retry has no captured scope".to_string()))?
                 .scope;
-            state
-                .runtime
-                .route_close_attempt_to_repair::<()>(
-                    retried.attempt_id(),
-                    &scope,
-                    phoenix_core::domain::close::RetirementFailureReason::ManualRepairRequired,
-                    error.clone(),
-                )
-                .await
-                .expect_err("repair routing returns the persisted repair detail");
+            match &error {
+                CloseRetirementError::EvidenceInvariant {
+                    invariant,
+                    relation,
+                } => {
+                    state
+                        .runtime
+                        .route_close_evidence_invariant_to_repair::<(), CloseRetirementError>(
+                            retried.attempt_id(),
+                            &scope,
+                            invariant,
+                            relation,
+                        )
+                        .await
+                        .expect_err("repair routing returns the persisted repair detail");
+                }
+                CloseRetirementError::Message(message) => {
+                    state
+                        .runtime
+                        .route_close_attempt_to_repair::<(), CloseRetirementError>(
+                            retried.attempt_id(),
+                            &scope,
+                            phoenix_core::domain::close::RetirementFailureReason::ManualRepairRequired,
+                            message,
+                        )
+                        .await
+                        .expect_err("repair routing returns the persisted repair detail");
+                }
+            }
         }
-        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-            error,
-            "close_retirement_needs_repair",
-        ))));
+        return Err(AppError::Conflict(Box::new(
+            close_retirement_conflict(&state.db, error, retried.attempt_id().as_str(), &id).await,
+        )));
     }
     let authoritative = state
         .db
@@ -740,6 +810,53 @@ pub(crate) async fn retry_close_retirement(
         ))));
     }
     Ok(Json(SuccessResponse { success: true }))
+}
+
+fn close_phase_allows_retry_guidance(phase: Option<ClosePhase>) -> bool {
+    phase == Some(ClosePhase::NeedsRepair)
+}
+
+fn close_needs_repair_conflict(
+    cause: Option<phoenix_db::CloseNeedsRepairCause>,
+    attempt_id: &str,
+    active_transcript_id: &str,
+) -> ConflictErrorResponse {
+    let error = match cause {
+        Some(phoenix_db::CloseNeedsRepairCause::EvidenceInvariant(cause)) => {
+            CloseRetirementError::EvidenceInvariant {
+                invariant: cause.invariant().to_string(),
+                relation: cause.relation().to_string(),
+            }
+        }
+        None => CloseRetirementError::Message(
+            "Close retirement needs repair. Open the active transcript and retry the exact attempt."
+                .to_string(),
+        ),
+    };
+    close_retirement_conflict_for_phase(
+        error,
+        attempt_id,
+        active_transcript_id,
+        Some(ClosePhase::NeedsRepair),
+    )
+}
+
+fn inactive_close_transcript_conflict(
+    active_transcript: &str,
+    obligation: Option<&phoenix_core::domain::close::CloseObligation>,
+) -> ConflictErrorResponse {
+    let mut conflict = ConflictErrorResponse::new(
+        "Close is accepted only from the active aggregate transcript",
+        "inactive_close_transcript",
+    );
+    if let Some(obligation) = obligation {
+        if close_phase_allows_retry_guidance(Some(obligation.phase())) {
+            return conflict
+                .with_close_recovery(obligation.attempt_id().as_str(), active_transcript);
+        }
+    }
+    conflict.active_transcript_id = Some(active_transcript.to_string());
+    conflict
 }
 
 #[allow(clippy::too_many_lines, clippy::single_match_else)]
@@ -769,10 +886,17 @@ async fn run_legacy_close_compat(state: &AppState, id: &str, action: &str) -> Re
         .last()
         .map(|segment| segment.transcript_row.conversation.id.as_str());
     if active_transcript != Some(id) {
-        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-            "Close is accepted only from the active aggregate transcript",
-            "inactive_close_transcript",
-        ))));
+        let active_transcript = active_transcript.ok_or_else(|| {
+            AppError::Internal("ProductConversation has no active transcript".to_string())
+        })?;
+        let obligation = state
+            .db
+            .get_active_close_obligation_for_product(&transcript.product_conversation_id)
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+        return Err(AppError::Conflict(Box::new(
+            inactive_close_transcript_conflict(active_transcript, obligation.as_ref()),
+        )));
     }
     let expected_latest_transcript = TranscriptConversationId::parse(id.to_string())
         .map_err(|error| AppError::Internal(error.to_string()))?;
@@ -922,22 +1046,33 @@ async fn run_legacy_close_compat(state: &AppState, id: &str, action: &str) -> Re
                 ))));
             }
             ClosePhase::RetirementRequested => {
-                state
+                if let Err(error) = state
                     .runtime
                     .retire_close_runtime_resources(obligation.attempt_id().clone())
                     .await
-                    .map_err(|error| {
-                        AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                {
+                    return Err(AppError::Conflict(Box::new(
+                        close_retirement_conflict(
+                            &state.db,
                             error,
-                            "close_retirement_needs_repair",
-                        )))
-                    })?;
+                            obligation.attempt_id().as_str(),
+                            expected_latest_transcript.as_str(),
+                        )
+                        .await,
+                    )));
+                }
                 return Ok(());
             }
             ClosePhase::NeedsRepair => {
-                return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                    "Close retirement requires repair before it can continue",
-                    "close_retirement_needs_repair",
+                let cause = state
+                    .db
+                    .close_needs_repair_cause(obligation.attempt_id())
+                    .await
+                    .map_err(|error| AppError::Internal(error.to_string()))?;
+                return Err(AppError::Conflict(Box::new(close_needs_repair_conflict(
+                    cause,
+                    obligation.attempt_id().as_str(),
+                    expected_latest_transcript.as_str(),
                 ))));
             }
             ClosePhase::Completed => {
@@ -1023,6 +1158,115 @@ mod tests {
     use crate::db::{ConvMode, Conversation, NonEmptyString};
     use crate::state_machine::state::ConvState;
     use chrono::{TimeZone, Utc};
+
+    #[test]
+    fn ambient_writer_indeterminate_conflict_is_structured_and_safe() {
+        let diagnostic = crate::runtime::close_retirement::AmbientWriterIndeterminateDiagnostic {
+            detector: crate::runtime::close_retirement::AmbientWriterDiagnosticDetector::LinuxProcfs,
+            operation: crate::runtime::close_retirement::AmbientWriterDiagnosticOperation::EnumerateDescriptors,
+            error_kind: crate::runtime::close_retirement::AmbientWriterDiagnosticErrorKind::PermissionDenied,
+        };
+        let response = close_retirement_conflict_for_phase(
+            CloseRetirementError::Message(format!(
+                "worktree cannot be reinspected: {}",
+                diagnostic.marker(),
+            )),
+            "attempt-1",
+            "active-1",
+            Some(ClosePhase::NeedsRepair),
+        );
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(
+            json["ambient_writer_indeterminate"]["detector"],
+            "linux_procfs"
+        );
+        assert_eq!(
+            json["ambient_writer_indeterminate"]["operation"],
+            "enumerate_descriptors"
+        );
+        assert_eq!(
+            json["ambient_writer_indeterminate"]["error_kind"],
+            "permission_denied"
+        );
+        assert_eq!(
+            json["error"],
+            "Close could not prove that the quarantined worktree has no ambient writer."
+        );
+        assert!(!json.to_string().contains("argv"));
+        assert!(!json.to_string().contains("environment"));
+        assert!(!json.to_string().contains("/proc"));
+        assert!(!json.to_string().contains("process_id"));
+        assert!(!json.to_string().contains("uid"));
+    }
+
+    #[test]
+    fn evidence_invariant_conflict_advertises_retry_only_from_needs_repair() {
+        let error = || CloseRetirementError::EvidenceInvariant {
+            invariant: "target_dispatch_must_match_sealed_inventory".to_string(),
+            relation: "close_retirement_resource_dispatches".to_string(),
+        };
+        let response = close_retirement_conflict_for_phase(
+            error(),
+            "attempt-1",
+            "active-1",
+            Some(ClosePhase::NeedsRepair),
+        );
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["error_type"], "close_retirement_needs_repair");
+        assert_eq!(json["attempt_id"], "attempt-1");
+        assert_eq!(json["active_transcript_id"], "active-1");
+        assert_eq!(json["recovery_action"]["method"], "POST");
+        assert_eq!(
+            json["recovery_action"]["path"],
+            "/api/conversations/active-1/close/retry-retirement"
+        );
+        assert_eq!(
+            json["failed_invariant"],
+            "target_dispatch_must_match_sealed_inventory"
+        );
+        assert_eq!(
+            json["failed_relation"],
+            "close_retirement_resource_dispatches"
+        );
+        assert!(!json.to_string().contains("787"));
+        assert!(!json.to_string().contains("FOREIGN KEY"));
+
+        for phase in [
+            Some(ClosePhase::RetirementRequested),
+            Some(ClosePhase::Completed),
+            None,
+        ] {
+            let json = serde_json::to_value(close_retirement_conflict_for_phase(
+                error(),
+                "attempt-1",
+                "active-1",
+                phase,
+            ))
+            .unwrap();
+            assert!(json.get("recovery_action").is_none());
+            assert!(json.get("attempt_id").is_none());
+        }
+    }
+
+    #[test]
+    fn inactive_transcript_retry_guidance_requires_needs_repair() {
+        assert!(close_phase_allows_retry_guidance(Some(
+            ClosePhase::NeedsRepair
+        )));
+        for phase in [
+            Some(ClosePhase::RetirementRequested),
+            Some(ClosePhase::Completed),
+            None,
+        ] {
+            assert!(!close_phase_allows_retry_guidance(phase));
+        }
+        let without_obligation = inactive_close_transcript_conflict("active", None);
+        assert!(without_obligation.recovery_action.is_none());
+        assert_eq!(
+            without_obligation.active_transcript_id.as_deref(),
+            Some("active")
+        );
+    }
 
     fn fixture(id: &str, continued_in_conv_id: Option<String>) -> Conversation {
         let ts = Utc.with_ymd_and_hms(2026, 4, 23, 12, 0, 0).unwrap();

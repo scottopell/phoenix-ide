@@ -174,6 +174,12 @@ type CloseSnapshotChangedDetail = {
   source: CloseSnapshotInvalidationSource;
 };
 
+export type CloseRecoveryGuidance = {
+  attemptId: string;
+  activeTranscriptId: string;
+  retryPath: string;
+};
+
 export function notifyCloseSnapshotChanged(
   conversationId: string,
   source: CloseSnapshotInvalidationSource = 'close',
@@ -181,6 +187,17 @@ export function notifyCloseSnapshotChanged(
   window.dispatchEvent(new CustomEvent<CloseSnapshotChangedDetail>(CLOSE_SNAPSHOT_CHANGED_EVENT, {
     detail: { conversationId, source },
   }));
+}
+
+export function closeRecoveryGuidance(error: unknown): CloseRecoveryGuidance | null {
+  if (!(error instanceof ConflictError)) return null;
+  const { attempt_id, active_transcript_id, recovery_action } = error.detail;
+  if (!attempt_id || !active_transcript_id || recovery_action?.method !== 'POST') return null;
+  return {
+    attemptId: attempt_id,
+    activeTranscriptId: active_transcript_id,
+    retryPath: recovery_action.path,
+  };
 }
 
 export function notifyArchiveCloseConflict(conversationId: string, error: unknown): boolean {
@@ -195,7 +212,7 @@ export function notifyArchiveCloseConflict(conversationId: string, error: unknow
     'close_retirement_needs_repair',
     'stale_close_inspection',
   ].includes(error.detail.error_type)) return false;
-  notifyCloseSnapshotChanged(conversationId);
+  notifyCloseSnapshotChanged(closeRecoveryGuidance(error)?.activeTranscriptId ?? conversationId);
   notifyProductConversationListMayHaveChanged();
   return true;
 }

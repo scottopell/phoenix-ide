@@ -500,6 +500,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_llm_request_timed_out_outcome",
         sql: MIGRATION_096,
     },
+    Migration {
+        version: 97,
+        name: "persist_close_ambient_writer_evidence",
+        sql: MIGRATION_097,
+    },
+    Migration {
+        version: 98,
+        name: "persist_typed_close_repair_cause",
+        sql: MIGRATION_098,
+    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -8556,6 +8566,224 @@ mod migration_094_tests {
     }
 }
 
+const MIGRATION_097: &str = r"
+CREATE TABLE close_hard_delete_claims (
+    product_conversation_id TEXT PRIMARY KEY
+        REFERENCES product_conversations(id) ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX close_worktree_cleanup_plans_exact_identity
+ON close_worktree_cleanup_plans (
+    attempt_id, scope, inspection_generation, inspection_fingerprint,
+    resource_kind, identity_kind, identity_codec, identity_value
+);
+
+CREATE TABLE close_worktree_cleanup_adoptions (
+    attempt_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    source_inspection_generation TEXT NOT NULL,
+    source_inspection_fingerprint TEXT NOT NULL,
+    target_inspection_generation TEXT NOT NULL,
+    target_inspection_fingerprint TEXT NOT NULL,
+    resource_kind TEXT NOT NULL CHECK (resource_kind = 'worktree'),
+    identity_kind TEXT NOT NULL,
+    identity_codec TEXT NOT NULL,
+    identity_value TEXT NOT NULL,
+    adopted_at_unix_micros INTEGER NOT NULL
+        CHECK (typeof(adopted_at_unix_micros) = 'integer' AND adopted_at_unix_micros >= 0),
+    PRIMARY KEY (
+        attempt_id, scope, target_inspection_generation, target_inspection_fingerprint,
+        resource_kind, identity_kind, identity_codec, identity_value
+    ),
+    UNIQUE (
+        attempt_id, scope, source_inspection_generation, source_inspection_fingerprint,
+        resource_kind, identity_kind, identity_codec, identity_value
+    ),
+    FOREIGN KEY (
+        attempt_id, scope, source_inspection_generation, source_inspection_fingerprint,
+        resource_kind, identity_kind, identity_codec, identity_value
+    ) REFERENCES close_worktree_cleanup_plans (
+        attempt_id, scope, inspection_generation, inspection_fingerprint,
+        resource_kind, identity_kind, identity_codec, identity_value
+    ) ON DELETE RESTRICT,
+    FOREIGN KEY (
+        attempt_id, scope, target_inspection_generation, target_inspection_fingerprint,
+        resource_kind, identity_kind, identity_codec, identity_value
+    ) REFERENCES close_worktree_cleanup_plans (
+        attempt_id, scope, inspection_generation, inspection_fingerprint,
+        resource_kind, identity_kind, identity_codec, identity_value
+    ) ON DELETE RESTRICT
+);
+
+DROP TRIGGER close_retirement_inspections_reject_sealed_delete;
+CREATE TRIGGER close_retirement_inspections_reject_sealed_delete
+BEFORE DELETE ON close_retirement_inspections
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM close_obligations obligation
+    JOIN product_conversations root ON root.id = obligation.product_conversation_id
+    WHERE obligation.attempt_id = OLD.attempt_id
+      AND obligation.phase <> 'awaiting_retirement_inspection'
+      AND NOT EXISTS (
+          SELECT 1 FROM close_hard_delete_claims claim
+          WHERE claim.product_conversation_id = obligation.product_conversation_id
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'persisted close inspection snapshot is sealed');
+END;
+
+DROP TRIGGER close_retirement_losses_require_open_inspection_on_delete;
+CREATE TRIGGER close_retirement_losses_require_open_inspection_on_delete
+BEFORE DELETE ON close_retirement_losses
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM close_obligations obligation
+    JOIN product_conversations root ON root.id = obligation.product_conversation_id
+    WHERE obligation.attempt_id = OLD.attempt_id
+      AND obligation.phase <> 'awaiting_retirement_inspection'
+      AND NOT EXISTS (
+          SELECT 1 FROM close_hard_delete_claims claim
+          WHERE claim.product_conversation_id = obligation.product_conversation_id
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'close loss inventory is sealed outside inspection replacement');
+END;
+
+DROP TRIGGER close_retirement_resource_history_reject_delete;
+CREATE TRIGGER close_retirement_resource_history_reject_delete
+BEFORE DELETE ON close_retirement_resource_history
+WHEN EXISTS (
+    SELECT 1 FROM close_obligations obligation
+    WHERE obligation.attempt_id = OLD.attempt_id
+      AND NOT EXISTS (
+          SELECT 1 FROM close_hard_delete_claims claim
+          WHERE claim.product_conversation_id = obligation.product_conversation_id
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'retirement resource history belongs to its Close aggregate');
+END;
+
+DROP TRIGGER close_retirement_inventories_reject_standalone_delete;
+CREATE TRIGGER close_retirement_inventories_reject_standalone_delete
+BEFORE DELETE ON close_retirement_inventories
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM close_obligations obligation
+    JOIN product_conversations root ON root.id = obligation.product_conversation_id
+    WHERE obligation.attempt_id = OLD.attempt_id
+      AND NOT EXISTS (
+          SELECT 1 FROM close_hard_delete_claims claim
+          WHERE claim.product_conversation_id = obligation.product_conversation_id
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'captured retirement inventory can only be deleted with its root');
+END;
+
+DROP TRIGGER close_expected_retirement_resources_reject_standalone_delete;
+CREATE TRIGGER close_expected_retirement_resources_reject_standalone_delete
+BEFORE DELETE ON close_expected_retirement_resources
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM close_obligations obligation
+    JOIN product_conversations root ON root.id = obligation.product_conversation_id
+    WHERE obligation.attempt_id = OLD.attempt_id
+      AND NOT EXISTS (
+          SELECT 1 FROM close_hard_delete_claims claim
+          WHERE claim.product_conversation_id = obligation.product_conversation_id
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'expected retirement resource can only be deleted with its root');
+END;
+
+DROP TRIGGER close_retirement_resources_reject_standalone_delete;
+CREATE TRIGGER close_retirement_resources_reject_standalone_delete
+BEFORE DELETE ON close_retirement_resources
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM close_obligations obligation
+    JOIN product_conversations root ON root.id = obligation.product_conversation_id
+    WHERE obligation.attempt_id = OLD.attempt_id
+      AND NOT EXISTS (
+          SELECT 1 FROM close_hard_delete_claims claim
+          WHERE claim.product_conversation_id = obligation.product_conversation_id
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'retirement evidence can only be deleted with its root');
+END;
+
+CREATE TABLE close_ambient_writer_evidence (
+    attempt_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    inspection_generation TEXT NOT NULL,
+    inspection_fingerprint TEXT NOT NULL,
+    resource_kind TEXT NOT NULL CHECK (resource_kind = 'worktree'),
+    identity_kind TEXT NOT NULL,
+    identity_codec TEXT NOT NULL,
+    identity_value TEXT NOT NULL,
+    detector TEXT NOT NULL CHECK (detector IN ('macos_proc_pidinfo', 'linux_procfs')),
+    process_id INTEGER NOT NULL CHECK (typeof(process_id) = 'integer' AND process_id > 0),
+    process_incarnation TEXT NOT NULL CHECK (length(process_incarnation) > 0),
+    executable_codec TEXT NOT NULL,
+    executable_value TEXT NOT NULL,
+    matched_path_codec TEXT NOT NULL,
+    matched_path_value TEXT NOT NULL,
+    match_kind TEXT NOT NULL CHECK (match_kind IN ('descriptor', 'mapping', 'namespace_directory')),
+    access_mode TEXT NOT NULL CHECK (access_mode IN ('write_only', 'read_write', 'writable_shared_mapping', 'namespace_write')),
+    observed_at_unix_micros INTEGER NOT NULL
+        CHECK (typeof(observed_at_unix_micros) = 'integer' AND observed_at_unix_micros >= 0),
+    PRIMARY KEY (
+        attempt_id, scope, inspection_generation, inspection_fingerprint,
+        resource_kind, identity_kind, identity_codec, identity_value,
+        detector, process_id, process_incarnation,
+        executable_codec, executable_value,
+        matched_path_codec, matched_path_value, match_kind, access_mode
+    ),
+    FOREIGN KEY (
+        attempt_id, scope, inspection_generation, inspection_fingerprint,
+        resource_kind, identity_kind, identity_value
+    ) REFERENCES close_expected_retirement_resources (
+        attempt_id, scope, inspection_generation, inspection_fingerprint,
+        resource_kind, identity_kind, identity_value
+    ) ON DELETE RESTRICT
+);
+";
+
+const MIGRATION_098: &str = r"
+CREATE TABLE close_needs_repair_causes (
+    attempt_id TEXT PRIMARY KEY NOT NULL
+        REFERENCES close_obligations(attempt_id) ON DELETE CASCADE,
+    cause_kind TEXT NOT NULL CHECK (cause_kind = 'evidence_invariant'),
+    invariant TEXT NOT NULL CHECK (length(trim(invariant)) > 0),
+    relation TEXT NOT NULL CHECK (length(trim(relation)) > 0),
+    recorded_at_unix_micros INTEGER NOT NULL
+        CHECK (typeof(recorded_at_unix_micros) = 'integer' AND recorded_at_unix_micros >= 0)
+);
+
+CREATE TRIGGER close_needs_repair_cause_phase_changed
+AFTER UPDATE OF phase ON close_obligations
+WHEN OLD.phase <> NEW.phase
+BEGIN
+    DELETE FROM close_needs_repair_causes WHERE attempt_id = NEW.attempt_id;
+END;
+
+CREATE TRIGGER close_needs_repair_cause_requires_phase
+BEFORE INSERT ON close_needs_repair_causes
+WHEN NOT EXISTS (
+    SELECT 1 FROM close_obligations obligation
+    WHERE obligation.attempt_id = NEW.attempt_id
+      AND obligation.phase = 'needs_repair'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'typed close repair cause requires needs_repair phase');
+END;
+";
+
 const MIGRATION_095: &str = r"
 CREATE UNIQUE INDEX close_obligations_attempt_product_identity
 ON close_obligations(attempt_id, product_conversation_id);
@@ -10467,6 +10695,43 @@ mod tests {
 
     async fn setup_conversations_table(pool: &SqlitePool) {
         setup_legacy_conversations_table(pool).await;
+    }
+
+    async fn run_legacy_conversation_migration_with_triggers_suspended(
+        pool: &SqlitePool,
+        migration_sql: &str,
+    ) {
+        let triggers: Vec<(String, String)> = sqlx::query_as(
+            "SELECT name, sql
+             FROM sqlite_schema
+             WHERE type = 'trigger'
+               AND sql IS NOT NULL
+             ORDER BY name",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        for (name, _) in &triggers {
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "DROP TRIGGER IF EXISTS {name}"
+            )))
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        let migration_result = sqlx::raw_sql(sqlx::AssertSqlSafe(migration_sql.to_string()))
+            .execute(pool)
+            .await;
+
+        for (_, sql) in triggers {
+            sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+
+        migration_result.unwrap();
     }
 
     type ConversationTopologyRow = (
@@ -14696,6 +14961,52 @@ mod tests {
         assert_eq!(row.get::<i64, _>("chain_messages_at_answer"), 17);
     }
 
+    #[tokio::test]
+    async fn direct_legacy_conversation_migration_suspends_later_schema_triggers() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE conversations (
+                 id TEXT PRIMARY KEY,
+                 continued_in_conv_id TEXT,
+                 archived BOOLEAN NOT NULL DEFAULT 0
+             );
+             INSERT INTO conversations (id, continued_in_conv_id, archived) VALUES
+                 ('root', 'leaf', 0),
+                 ('leaf', NULL, 1);
+             CREATE TRIGGER test_later_conversation_shape_trigger
+             BEFORE UPDATE ON conversations
+             FOR EACH ROW
+             WHEN NEW.archived = 1
+             BEGIN
+                 SELECT later.product_conversation_id
+                 FROM conversations later
+                 WHERE later.id = NEW.id;
+             END;",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(sqlx::raw_sql(MIGRATION_006).execute(&pool).await.is_err());
+
+        run_legacy_conversation_migration_with_triggers_suspended(&pool, MIGRATION_006).await;
+
+        let archived: bool =
+            sqlx::query_scalar("SELECT archived FROM conversations WHERE id = 'root'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(archived);
+        let trigger_sql: Option<String> = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_schema
+             WHERE type = 'trigger' AND name = 'test_later_conversation_shape_trigger'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert!(trigger_sql.is_some());
+    }
+
     /// Migration 006: a chain with mixed `archived` state has every member
     /// flipped to archived; fully-archived and fully-unarchived chains are
     /// untouched; standalones are untouched.
@@ -14775,7 +15086,7 @@ mod tests {
 
         // Re-run the partial-archive cleanup directly so we exercise it on
         // the now-wired chain (the migration table thinks 006 is done).
-        sqlx::raw_sql(MIGRATION_006).execute(&pool).await.unwrap();
+        run_legacy_conversation_migration_with_triggers_suspended(&pool, MIGRATION_006).await;
 
         let archived_for = |id: &'static str| {
             let pool = pool.clone();
@@ -16371,6 +16682,119 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap());
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn migration_098_normalizes_typed_close_repair_causes() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "CREATE TABLE close_obligations (
+                 attempt_id TEXT PRIMARY KEY NOT NULL,
+                 phase TEXT NOT NULL
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(MIGRATION_098).execute(&pool).await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO close_obligations (attempt_id, phase)
+             VALUES ('cascade-parent', 'needs_repair')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO close_needs_repair_causes (
+                 attempt_id, cause_kind, invariant, relation, recorded_at_unix_micros
+             ) VALUES (
+                 'cascade-parent', 'evidence_invariant',
+                 'target_dispatch_must_match_sealed_inventory',
+                 'close_retirement_resource_dispatches', 1
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM close_obligations WHERE attempt_id = 'cascade-parent'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let cascaded_causes: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_needs_repair_causes
+             WHERE attempt_id = 'cascade-parent'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(cascaded_causes, 0);
+        let violations: Vec<(String, i64, String, i64)> =
+            sqlx::query_as("PRAGMA foreign_key_check")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(violations.is_empty());
+
+        let columns: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT name, \"notnull\", pk
+             FROM pragma_table_info('close_needs_repair_causes') ORDER BY cid",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            columns,
+            vec![
+                ("attempt_id".to_string(), 1, 1),
+                ("cause_kind".to_string(), 1, 0),
+                ("invariant".to_string(), 1, 0),
+                ("relation".to_string(), 1, 0),
+                ("recorded_at_unix_micros".to_string(), 1, 0),
+            ]
+        );
+        let foreign_keys: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT \"table\", \"from\", on_delete
+             FROM pragma_foreign_key_list('close_needs_repair_causes')",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            foreign_keys,
+            vec![(
+                "close_obligations".to_string(),
+                "attempt_id".to_string(),
+                "CASCADE".to_string(),
+            )]
+        );
+        let table_sql: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'table' AND name = 'close_needs_repair_causes'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(table_sql.contains("CHECK (cause_kind = 'evidence_invariant')"));
+        assert!(table_sql.contains("CHECK (length(trim(invariant)) > 0)"));
+        assert!(table_sql.contains("CHECK (length(trim(relation)) > 0)"));
+        let phase_trigger: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'trigger' AND name = 'close_needs_repair_cause_phase_changed'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(phase_trigger.contains("OLD.phase <> NEW.phase"));
+        let phase_guard: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'trigger' AND name = 'close_needs_repair_cause_requires_phase'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(phase_guard.contains("obligation.phase = 'needs_repair'"));
     }
 
     #[tokio::test]

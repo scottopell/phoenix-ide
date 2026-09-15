@@ -9309,19 +9309,29 @@ pub(crate) mod hard_delete_cascade_tests {
     /// works when the test wants to verify SSE events; conversations
     /// are otherwise inert (no LLM calls fire).
     pub(crate) async fn make_test_state() -> AppState {
+        make_test_state_with_no_ambient_writers(None).await
+    }
+
+    pub(crate) async fn make_test_state_with_no_ambient_writers(
+        observer_calls: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    ) -> AppState {
         let db = Database::open_in_memory().await.expect("open db");
         let llm_registry = Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(TestLlm)));
         let platform = PlatformCapability::None {
             details: "test".into(),
         };
         let mcp_manager = Arc::new(McpClientManager::new());
-        let runtime = Arc::new(RuntimeManager::new(
+        let runtime = RuntimeManager::new(
             db.clone(),
             llm_registry.clone(),
             platform.clone(),
             mcp_manager.clone(),
             None,
-        ));
+        );
+        let runtime = Arc::new(match observer_calls {
+            Some(calls) => runtime.with_test_no_ambient_writers(calls),
+            None => runtime,
+        });
         let terminals = runtime.terminals.clone();
         let message_retriever: std::sync::Arc<dyn crate::db::MessageRetriever> =
             std::sync::Arc::new(db.fts_retriever());
@@ -14076,6 +14086,105 @@ pub(crate) mod hard_delete_cascade_tests {
     }
 
     #[tokio::test]
+    async fn compatibility_archive_repeatedly_reports_persisted_typed_repair_cause() {
+        use phoenix_core::domain::close::{
+            CloseAttemptId, ClosePhase, LossItemIdentity, OpaqueIdentity, RetiredResourceIdentity,
+            RetiredResourceKind, RetirementFailureReason,
+        };
+        use phoenix_db::{CloseNeedsRepairCause, RouteCloseAttemptToRepairRequest};
+
+        let state = make_test_state().await;
+        let root = state
+            .db
+            .create_conversation(
+                "compat-typed-repair",
+                "compat-typed-repair",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let attempt_id = CloseAttemptId::parse("compat-typed-repair-attempt").unwrap();
+        state
+            .db
+            .begin_close_foundation(
+                &root.product_conversation_id,
+                &phoenix_core::domain::close::TranscriptConversationId::parse(root.id.clone())
+                    .unwrap(),
+                attempt_id.as_str(),
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .begin_close_idle_settlement(attempt_id.as_str())
+            .await
+            .unwrap();
+        let obligation = state
+            .db
+            .advance_close_settlement_when_quiescent(attempt_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(obligation.phase(), ClosePhase::AwaitingRetirementInspection);
+        let captured = state
+            .db
+            .list_close_attempt_scopes(attempt_id.as_str())
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let scope = captured.scope;
+        state
+            .db
+            .route_close_attempt_to_repair(RouteCloseAttemptToRepairRequest {
+                attempt_id: attempt_id.clone(),
+                scope: scope.clone(),
+                residual: RetiredResourceIdentity::parse(
+                    RetiredResourceKind::WorkScope,
+                    LossItemIdentity::Opaque(OpaqueIdentity::parse(scope.to_string()).unwrap()),
+                )
+                .unwrap(),
+                reason: RetirementFailureReason::ManualRepairRequired,
+                detail: "stored diagnostic text is not the response contract".to_string(),
+                cause: Some(
+                    CloseNeedsRepairCause::evidence_invariant(
+                        "target_dispatch_must_match_sealed_inventory",
+                        "close_retirement_resource_dispatches",
+                    )
+                    .unwrap(),
+                ),
+            })
+            .await
+            .unwrap();
+
+        for _ in 0..2 {
+            let AppError::Conflict(conflict) =
+                archive_conversation(State(state.clone()), Path(root.id.clone()))
+                    .await
+                    .expect_err("NeedsRepair remains a compatibility archive conflict")
+            else {
+                panic!("archive must return a structured conflict");
+            };
+            assert_eq!(conflict.attempt_id.as_deref(), Some(attempt_id.as_str()));
+            assert_eq!(
+                conflict.active_transcript_id.as_deref(),
+                Some(root.id.as_str())
+            );
+            assert_eq!(
+                conflict.failed_invariant.as_deref(),
+                Some("target_dispatch_must_match_sealed_inventory")
+            );
+            assert_eq!(
+                conflict.failed_relation.as_deref(),
+                Some("close_retirement_resource_dispatches")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn compatibility_archive_retry_does_not_restart_close_for_history() {
         let state = make_test_state().await;
         let root = state
@@ -14521,7 +14630,9 @@ pub(crate) mod hard_delete_cascade_tests {
     /// A first-pass Work-mode Close captures its inventory before retirement.
     #[tokio::test]
     async fn archive_chain_captures_first_pass_close_inventory() {
-        let state = make_test_state().await;
+        let observer_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let state =
+            make_test_state_with_no_ambient_writers(Some(Arc::clone(&observer_calls))).await;
         let ids = ["sc-a", "sc-a2", "sc-a3"];
         let (_tmp, repo, worktree, branch) =
             build_workmode_chain_with_shared_worktree(&state, &ids).await;
@@ -14544,6 +14655,7 @@ pub(crate) mod hard_delete_cascade_tests {
             crate::git_ops::run_git(&repo, &["rev-parse", "--verify", &branch]).is_ok(),
             "archive preserves the shared task branch"
         );
+        assert_eq!(observer_calls.load(std::sync::atomic::Ordering::SeqCst), 1,);
         for id in ids {
             let conv = state
                 .db
