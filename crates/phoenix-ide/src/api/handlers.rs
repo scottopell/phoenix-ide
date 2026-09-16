@@ -13978,6 +13978,11 @@ pub(crate) mod hard_delete_cascade_tests {
                 &ConvMode::Direct,
                 root.llm_language,
                 scope,
+                phoenix_db::SubAgentExecution {
+                    connection: "mock",
+                    effort: None,
+                    persona: None,
+                },
             )
             .await
             .expect("create subordinate participant");

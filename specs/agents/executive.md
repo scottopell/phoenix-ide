@@ -2,83 +2,57 @@
 
 ## Requirements Summary
 
-Named agents are reusable sub-agent personas stored as single Markdown files
-(`.claude/agents/*.md` or `.agents/agents/*.md`) with YAML frontmatter
-(`name`, `description`, optional `model` and `mode`) and a body that is the
-agent's persona instructions. They are discovered from the working-directory
-tree using the same walk-up, child-directory, `$HOME`, and dedup rules as
-skills. Discovered agents are surfaced to the LLM as a typed `agent_type`
-enumeration on the `spawn_agents` tool — not as system-prompt prose — so the
-model's trained prior for selecting a named sub-agent type drives reliable
-selection. When a spawn task selects an `agent_type`, the agent definition
-supplies the spawned sub-agent's persona (replacing the generic preamble) and
-its default model and mode, with explicit task fields taking precedence over the
-definition and the definition taking precedence over mode defaults. An unknown
-`agent_type` is rejected at spawn time. The agent enumeration is rendered
-deterministically so the cached spawn-tool definition is stable across a
-conversation's turns. Tool capability remains governed by Explore/Work mode;
-the `tools` frontmatter field is preserved but inert.
+Named workers are optional reusable personas defined inline in one versioned XDG
+TOML file. Workers and tiers carry ordered model/connection/effort preferences.
+The LLM can choose a named worker, a tier, or an exact model route; choosing a
+worker and execution are independent. Generic omission inherits the parent's
+whole execution choice. Worker definitions do not carry mode or tools.
+
+The callable catalog excludes unusable defaults and diagnoses configuration
+mistakes. Connection availability reflects configured backend routes, not model
+family names. Exact selections do not silently fall back. Filesystem-agent
+catalogs are retired; Skills remain the home for reusable expertise.
 
 ## Technical Summary
 
-The detailed behaviour is normative in [`agents.allium`](./agents.allium)
-(discovery, frontmatter, schema-enum, resolution, persona) and
-[`subagents.allium`](../subagents/subagents.allium) (spawn validation, including
-the unknown-`agent_type` rejection, and the resolution precedence that threads
-the persona into `SubAgentSpec`).
+[ADR-052](../adrs/052_workers-and-tiers-resolve-usable-model-routes.md) records the
+configuration and model-route boundary. Configuration is loaded once per parent
+runtime; usable routes refresh at request boundaries. The same resolved snapshot
+renders the tool schema and admits its response. Resolved child persona and
+execution are persisted for runtime recreation, without adding server-restart
+survival guarantees or connection endpoint/account lineage.
 
-- **Discovery** lives in a new `phoenix-agents` leaf crate that mirrors
-  `phoenix-skills` — same tree walk, same symlink/content/name dedup, same
-  `$HOME` fallback — returning a `Vec<AgentDefinition>` sorted by name.
-- **Schema-enum** injection makes `SpawnAgentsTool` stateful
-  (`SpawnAgentsTool::with_agents(catalog)`), constructed per-conversation where
-  the registry is built; `input_schema()` renders a sorted `agent_type` enum
-  with per-value descriptions, or omits it entirely when no agents exist.
-- **Resolution** extends `subagents.allium`'s `SubAgentSpecsResolved`:
-  `SubAgentTask` gains `agent_type`; `SubAgentSpec` gains `agent_name` and
-  `persona`; precedence is task field → agent definition → mode default.
-- **Persona composition** threads the persona into `build_system_prompt`, where
-  it replaces the base preamble while grounding, mode context, and the
-  result-submission suffix are retained. The persona is persisted in a
-  dedicated `sub_agent_personas` table and restored when a sub-agent runtime is
-  recreated mid-run, so a model-upgrade eviction does not demote a named agent
-  to the generic prompt.
-- **Capability** stays single-sourced in the Explore/Work mode registries; the
-  `tools` field is parsed-and-preserved for forward compatibility.
+[Configuration examples](../../docs/agents-config.md) show the public TOML and
+spawn selectors. [agents.allium](agents.allium) models catalog preparation and
+persona composition; [subagents.allium](../subagents/subagents.allium) owns spawn
+validation, authority, and child lifecycle seams.
 
 ## Status Summary
 
 | Requirement | Status | Notes |
-|-------------|--------|-------|
-| **REQ-AG-001:** Agent Definition Discovery | ✅ Implemented | `phoenix_agents::discover_agents` (walk-up + children + `$HOME`, sorted, deduped) |
-| **REQ-AG-002:** Agent Definition Format | ✅ Implemented | One `.md` per agent; `parse_agent_frontmatter` requires `name`/`description` |
-| **REQ-AG-003:** Frontmatter Separation | ✅ Implemented | `phoenix_agents::strip_frontmatter` |
-| **REQ-AG-004:** Agent Type as Typed Spawn Choice | ✅ Implemented | `SpawnAgentsTool::with_agents` renders the `agent_type` enum in `input_schema` |
-| **REQ-AG-005:** Spawn-Time Resolution and Precedence | ✅ Implemented | `handle_spawn_agents_tool` resolves task → agent def → mode default |
-| **REQ-AG-006:** Persona Composition | ✅ Implemented | `build_system_prompt` persona arg; persisted in `sub_agent_personas` and restored on resume |
-| **REQ-AG-007:** Unknown Agent Type Rejected | ✅ Implemented | `handle_spawn_agents_tool` rejects an unmatched `agent_type` before spawning |
-| **REQ-AG-008:** Prompt-Cache Stability | ✅ Implemented | Discovery sorts by name and dir entries sort before dedup; schema byte-stable |
-| **REQ-AG-009:** Capability from Mode, Not Definition | ✅ Implemented | Registry selected by mode; `tools` frontmatter parsed and preserved, not consulted |
+| --- | --- | --- |
+| **REQ-AG-001:** Agent Definition Discovery | Retired | Filesystem discovery replaced by REQ-AG-010; ADR-052 |
+| **REQ-AG-002:** Agent Definition Format | Retired | Markdown frontmatter replaced by inline TOML; ADR-052 |
+| **REQ-AG-003:** Frontmatter Separation | Retired | Inline instructions require no frontmatter parsing; ADR-052 |
+| **REQ-AG-004:** Agent Type as a Typed Spawn Choice | In progress | Eligible worker enum and diagnostics require implementation validation |
+| **REQ-AG-005:** Spawn-Time Resolution and Precedence | In progress | Worker/tier/explicit selection and parent inheritance contract updated |
+| **REQ-AG-006:** Persona Composition | Implemented baseline | Persisted persona restoration exists; inline-config integration requires validation |
+| **REQ-AG-007:** Unknown Agent Type Rejected | Implemented baseline | Atomic rejection exists; resolved catalog integration requires validation |
+| **REQ-AG-008:** Catalog Snapshot Consistency | In progress | Per-runtime config and per-request availability snapshot |
+| **REQ-AG-009:** Capability from Spawn Authority, Not Definition | In progress | Remove worker-owned mode/tools parsing |
+| **REQ-AG-010:** Single User Configuration | In progress | Version-1 XDG TOML and filesystem retirement |
+| **REQ-AG-011:** Ordered Atomic Execution Candidates | In progress | Availability fallback; incompatible effort diagnosed |
+| **REQ-AG-012:** Usable Model Routes | In progress | Logical backend connection identity through child creation/recreation |
 
-**Progress:** 9 of 9 implemented.
+**Progress:** 3 retired requirements; 2 existing behavioral baselines; 7 requirements
+under implementation. No completion claim is made before targeted validation.
 
-## Deferred refinements
+## Verification targets
 
-- **Per-agent tool allowlist:** an agent definition could narrow the sub-agent's
-  toolset below its mode default. The `tools` frontmatter field is parsed and
-  preserved so this can be added without a format change. Tracked as follow-up
-  work, not part of the current contract.
-- **User-initiated agent invocation:** launching a named agent directly from the
-  user (the analogue of `/skill`) is out of scope; named agents are a spawn-time
-  persona for LLM delegation only.
-
-## Cross-Spec References
-
-- `specs/subagents/` — owns the spawn lifecycle, mode/model/turn defaulting,
-  one-writer and cwd-scoping invariants, and (extended by this feature) the
-  unknown-`agent_type` rejection and persona threading.
-- `specs/bedrock/` — owns the conversation state machine that runs every
-  sub-agent regardless of persona.
-- `specs/skills/` — the discovery and frontmatter pattern named agents mirror;
-  REQ-SK-006 (discovery) and REQ-SK-001 (frontmatter) are the direct analogues
-  of REQ-AG-001 and REQ-AG-003.
+- Codex-only routes cannot advertise an Anthropic-only worker default.
+- Ordered candidates skip unavailable routes but diagnose known invalid effort.
+- Worker instructions survive explicit execution overrides and runtime recreation.
+- Generic inheritance carries model, connection, and effort together.
+- Invalid selection rejects a whole batch without partial child creation.
+- Config edits do not alter an active runtime's loaded definitions or an active
+  child's resolved execution; request catalog availability remains consistent.

@@ -41,11 +41,26 @@ use "../bedrock/bedrock.allium" as bedrock
 value SubAgentTask {
     task: String                  -- task description, required, non-empty
     cwd: String?                  -- working-directory override
-    execution_authority: SubAgentExecutionAuthority? -- absent => agent default, else read_only
-    model: String?                -- explicit model id (must exist in registry)
+    execution_authority: SubAgentExecutionAuthority? -- absent => read_only
+    execution: ExecutionSelector? -- one tier or exact model/connection choice
     max_turns: Integer?           -- override per-mode default
     agent_type: String?           -- named agent persona (see specs/agents/);
-                                  -- must match a discovered agent name
+                                  -- must match an eligible configured worker
+}
+
+-- Execution is one choice; named-worker instructions remain orthogonal.
+entity ExecutionSelector {
+    kind: TierExecution | ModelExecution
+}
+
+variant TierExecution : ExecutionSelector {
+    name: String
+}
+
+variant ModelExecution : ExecutionSelector {
+    model: String
+    connection: String
+    reasoning_effort: String?
 }
 
 -- The resolved spec the runtime spawns the sub-agent from.
@@ -57,7 +72,9 @@ value SubAgentSpec {
     cwd: String                   -- absolute path on disk
     timeout: Duration             -- mandatory (REQ-SA-006)
     execution_authority: SubAgentExecutionAuthority
-    model_id: String              -- exists in LLM registry
+    model_id: String              -- available through selected connection
+    connection: String            -- logical configured backend slot
+    reasoning_effort: String?     -- absent means model-native default
     max_turns: Integer            -- > 0
     agent_name: String?           -- named agent that produced this spec (see specs/agents/)
     persona: String?              -- resolved agent body; replaces the base preamble
@@ -181,45 +198,40 @@ rule SpawnRejectedWorkSubAgentAlreadyActive {
 -- 3. MODEL VALIDATION (REQ-PROJ-008, REQ-SA-007)
 -- ===========================================================
 
--- An explicit `model` field on a task must exist in the LLM registry.
--- Defaulting (Explore -> cheapest per provider; Work -> parent's model)
--- never produces an unknown model, so this only checks overrides.
-rule SpawnRejectedUnknownModel {
+-- REQ-SA-007, REQ-SA-011: selection is admitted against the request catalog.
+-- any_task_has_invalid_execution(tasks, parent): true if a selector is malformed,
+-- names an unavailable tier/model/connection, requests unsupported explicit
+-- effort, or its default cannot resolve in the parent's request snapshot.
+rule SpawnRejectedInvalidExecution {
     when: SpawnAgentsToolInvoked(parent, tasks)
-    requires: any_task_has_unknown_model(tasks)
+    requires: any_task_has_invalid_execution(tasks, parent)
     ensures: SpawnAgentsRejected(parent,
-        reason: "Unknown model in task spec")
+        reason: "Execution selection is unavailable or invalid")
 
     @guidance
-        -- Error message includes the offending model id and the list of
-        -- available model ids from the registry.
-        --
-        -- Defaulting (resolved before this check) is config:
-        --   t.execution_authority = read_only, t.model absent =>
-        --       LlmRegistry.cheap_model_for_provider(parent.model_id)
-        --   t.execution_authority = write_capable, t.model absent => parent.model_id
-        --   t.model present  => t.model (after this check)
+        -- Errors identify the invalid selection and usable alternatives from
+        -- the request catalog. No child is created for an invalid batch.
+        -- Exact model selections never silently fall back; missing explicit
+        -- effort uses that model's native default. Named and tier selections
+        -- carry their already-resolved model/connection/effort choice.
 }
 
--- An `agent_type` on a task must match a discovered agent name (see
+-- An `agent_type` on a task must match an eligible configured worker (see
 -- specs/agents/). Defaulting never invents an agent_type, so this only
--- checks the LLM-supplied value. Mirrors SpawnRejectedUnknownModel.
+-- checks the LLM-supplied value. Mirrors SpawnRejectedInvalidExecution.
 -- (REQ-AG-007)
 rule SpawnRejectedUnknownAgentType {
     when: SpawnAgentsToolInvoked(parent, tasks)
-    requires: any_task_has_unknown_agent_type(tasks, parent.working_dir)
+    requires: any_task_has_unknown_agent_type(tasks, parent)
     ensures: SpawnAgentsRejected(parent,
         reason: "Unknown agent_type in task spec")
 
     @guidance
-        -- any_task_has_unknown_agent_type(tasks, parent): black box — true iff
-        -- some task sets agent_type to a value absent from the parent
-        -- conversation's frozen agent catalog (the one that rendered the
-        -- spawn_agents schema; see agents.allium DiscoverAgentCatalog /
-        -- InjectAgentTypeEnum). Resolution reads the frozen catalog, not a fresh
-        -- filesystem scan, so an advertised agent_type cannot be rejected here
-        -- due to a mid-conversation file change (REQ-AG-008). The error message
-        -- names the offending agent_type and lists available agent names.
+        -- any_task_has_unknown_agent_type(tasks, parent): true iff a named
+        -- worker is absent from the resolved catalog for the parent's request.
+        -- The same snapshot renders the spawn schema and resolves the response;
+        -- configuration is not reread during admission. Errors name the invalid
+        -- worker and list eligible alternatives (REQ-AG-007, REQ-AG-008).
 }
 
 -- ===========================================================
@@ -315,8 +327,8 @@ rule SubAgentSpecsResolved {
     requires: work_task_count(tasks) <= 1
     requires: work_task_count(tasks) = 0
         or active_work_subagents(parent) = 0
-    requires: not any_task_has_unknown_model(tasks)
-    requires: not any_task_has_unknown_agent_type(tasks, parent.working_dir)
+    requires: not any_task_has_invalid_execution(tasks, parent)
+    requires: not any_task_has_unknown_agent_type(tasks, parent)
     requires: not any_task_effective_cwd_resolves_to_system_root(
         tasks, parent.working_dir)
     requires: parent.mode not in { work, branch }
@@ -329,32 +341,26 @@ rule SubAgentSpecsResolved {
         = previous(active_work_subagents(parent)) + work_task_count(tasks)
 
     @guidance
-        -- Per-task resolution (referenced as `resolve_*` helpers). When a task
-        -- sets agent_type, the matching agent definition (see specs/agents/) is
-        -- the middle precedence layer between the task's explicit fields and the
-        -- mode-based defaults. resolve_agent(t) = find_agent(frozen_catalog,
-        --   t.agent_type), or none when agent_type is absent. frozen_catalog is
-        -- the parent conversation's once-discovered catalog (the same one that
-        -- rendered the schema; agents.allium), not a fresh scan (REQ-AG-008).
-        --
-        --   resolve_execution_authority(t):
-        --     t.execution_authority.present        => t.execution_authority
-        --     resolve_agent(t).execution_authority => agent.execution_authority
-        --     else                  => read_only   (REQ-PROJ-008 default)
-        --
-        --   resolve_model_id(t, parent):
-        --     t.model.nonblank       => t.model
-        --     resolve_agent(t).model => agent.model
-        --     resolve_execution_authority(t)=read_only =>
-        --         LlmRegistry.cheap_model_for_provider(parent.model_id)
-        --     resolve_execution_authority(t)=write_capable => parent.model_id
-        --
-        --   resolve_persona(t)    => resolve_agent(t).body   (none when no agent)
-        --   resolve_agent_name(t) => resolve_agent(t).name   (none when no agent)
-        --   persona/agent_name populate SubAgentSpec; persona feeds
-        --   agents.allium ComposeSubAgentPersona. Execution-authority validation
-        --   (WorkSubAgentRequiresWriteableParent) runs on the *resolved* execution authority,
-        --   so an agent defaulting to write_capable from an Explore parent is rejected.
+        -- Per-task resolution uses the same resolved request catalog that
+        -- rendered the tool schema (REQ-AG-008). Config is loaded once per
+        -- parent runtime; usable routes refresh at parent request boundaries.
+        -- Helpers:
+        --   resolve_agent(t): selected eligible worker, or absent.
+        --   resolve_execution_authority(t): explicit authority, else read_only.
+        --     Worker and tier definitions never supply authority.
+        --   resolve_execution(t, parent): explicit selector wins; omitted selector
+        --     uses named candidates if present, else parent's entire execution.
+        --     Tier/named candidates are ordered atomic model+connection+effort
+        --     choices. Unavailable routes are skipped; a reached usable route
+        --     with known incompatible effort invalidates the selection. Missing
+        --     candidate effort uses that model's native default. Explicit model
+        --     selection never falls back and never inherits effort.
+        --   resolve_persona(t): selected worker's inline instructions or absent.
+        --   resolve_agent_name(t): selected worker's name or absent.
+        -- Resolved model, connection, effort, and persona are persisted before
+        -- child execution, and restored on runtime recreation. A missing route
+        -- fails without silent substitution. This does not change server-restart
+        -- survival or terminal repair contracts.
         --
         --   resolve_max_turns(t):
         --     t.max_turns.present => t.max_turns

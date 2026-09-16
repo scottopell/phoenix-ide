@@ -992,6 +992,11 @@ mod tests {
             &phoenix_db::ConvMode::Direct,
             phoenix_core::llm_language::LlmLanguage::default(),
             parent.attached_work_scope_id.as_ref(),
+            phoenix_db::SubAgentExecution {
+                connection: "mock",
+                effort: None,
+                persona: None,
+            },
         )
         .await
         .unwrap();

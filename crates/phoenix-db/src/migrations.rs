@@ -500,7 +500,20 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_llm_request_timed_out_outcome",
         sql: MIGRATION_096,
     },
+    Migration {
+        version: 97,
+        name: "persist_sub_agent_execution_connection",
+        sql: MIGRATION_097,
+    },
 ];
+
+const MIGRATION_097: &str = r"
+CREATE TABLE sub_agent_execution_routes (
+    conversation_id TEXT PRIMARY KEY NOT NULL
+        REFERENCES conversations(id) ON DELETE CASCADE,
+    connection TEXT NOT NULL CHECK (length(trim(connection)) > 0)
+);
+";
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
     MIGRATIONS

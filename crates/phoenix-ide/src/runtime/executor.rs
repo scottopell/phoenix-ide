@@ -1837,12 +1837,8 @@ where
     /// Credential helper for recovery settlement (REQ-BED-030).
     /// When the state is `AwaitingRecovery`, the select loop awaits `settled.notified()`.
     credential_helper: Option<Arc<phoenix_llm::CredentialHelper>>,
-    /// Named-agent catalog frozen at conversation start (parent conversations
-    /// only). The same catalog renders the `spawn_agents` `agent_type` enum and
-    /// resolves `agent_type` at spawn time, so the advertised choice and the
-    /// runtime resolution never diverge mid-conversation (REQ-AG-004/008).
-    /// Empty for sub-agents (which cannot spawn).
-    agent_catalog: Arc<[phoenix_agents::AgentDefinition]>,
+    agent_config: phoenix_agents::AgentConfig,
+    spawn_catalog: Option<super::agent_execution::SpawnCatalog>,
     /// Sender to the single serialized fork-resolution consumer, used solely to
     /// retire this conversation's still-pending fork proposals when it reaches a
     /// terminal state (`ForkProposalsRetiredOnOriginTerminal`, REQ-PROJ-035). Set
@@ -1983,7 +1979,8 @@ where
             direct_turn_cancellation_initiated: false,
             parent_tool_cycle_cap: parent_tool_cycle_cap_from_env(),
             credential_helper: None,
-            agent_catalog: Arc::from(Vec::new()),
+            agent_config: phoenix_agents::AgentConfig::default(),
+            spawn_catalog: None,
             fork_cmd_tx: None,
             state_watcher: None,
         }
@@ -2145,12 +2142,18 @@ where
         self
     }
 
-    /// Freeze the named-agent catalog used to render the `spawn_agents` schema
-    /// and resolve `agent_type` at spawn time. Set by the runtime manager for
-    /// parent conversations so both surfaces share one catalog (REQ-AG-008).
-    pub fn with_agent_catalog(mut self, catalog: Arc<[phoenix_agents::AgentDefinition]>) -> Self {
-        self.agent_catalog = catalog;
+    pub fn with_agent_config(mut self, config: phoenix_agents::AgentConfig) -> Self {
+        self.agent_config = config;
+        self.spawn_catalog = None;
         self
+    }
+
+    #[cfg(test)]
+    fn with_agent_catalog(self, catalog: Arc<[phoenix_agents::AgentDefinition]>) -> Self {
+        self.with_agent_config(phoenix_agents::AgentConfig {
+            agents: catalog.to_vec(),
+            tiers: Default::default(),
+        })
     }
 
     /// Set the spawn/cancel channels (for parent conversations)
@@ -4774,49 +4777,11 @@ where
         // so each round still starts clean without a destructive reassignment.
         self.sub_agent_result_buffer.reserve(input.tasks.len());
 
-        // --- Named-agent resolution (REQ-AG-005, REQ-AG-007) ---
-        // Resolve against the catalog frozen at conversation start — the same
-        // one that rendered the spawn_agents schema — so the advertised
-        // agent_type enum and this validation never diverge if agent files
-        // change mid-conversation (REQ-AG-008). Reject an unknown agent_type and
-        // resolve each task's effective mode (task field > agent default >
-        // Explore) up front, so the write-capability checks below run on the
-        // *resolved* mode.
-        let agents: &[phoenix_agents::AgentDefinition] = &self.agent_catalog;
-        let mut resolved_tasks: Vec<(Option<&phoenix_agents::AgentDefinition>, SubAgentMode)> =
-            Vec::with_capacity(input.tasks.len());
-        for task in &input.tasks {
-            let agent = if let Some(ref agent_type) = task.agent_type {
-                let Some(found) = phoenix_agents::find_agent(agents, agent_type) else {
-                    let available: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
-                    let result = ToolResult::error(
-                        tool_use_id.clone(),
-                        format!(
-                            "Unknown agent_type '{}'. Available: {}",
-                            agent_type,
-                            if available.is_empty() {
-                                "none".to_string()
-                            } else {
-                                available.join(", ")
-                            }
-                        ),
-                    );
-                    return Ok(Some(Event::ToolComplete {
-                        tool_use_id,
-                        result,
-                    }));
-                };
-                Some(found)
-            } else {
-                None
-            };
-            let mode = task
-                .mode
-                .or_else(|| agent.and_then(|a| a.mode))
-                .unwrap_or_default();
-            resolved_tasks.push((agent, mode));
-        }
-
+        let resolved_tasks: Vec<SubAgentMode> = input
+            .tasks
+            .iter()
+            .map(|task| task.mode.unwrap_or_default())
+            .collect();
         // --- Mode validation and one-writer constraint (REQ-PROJ-008) ---
         let parent_allows_work = match self.context.mode_context.as_ref() {
             Some(
@@ -4829,7 +4794,7 @@ where
         };
 
         let mut work_count_in_batch = 0u32;
-        for &(_, mode) in &resolved_tasks {
+        for &mode in &resolved_tasks {
             if mode == SubAgentMode::Work {
                 if !parent_allows_work {
                     let result = ToolResult::error(
@@ -4896,12 +4861,15 @@ where
         // tool call then reports failure instead of SpawnAgentsComplete) when a
         // later task's effective model is unknown. Build-and-validate first,
         // then send the whole batch.
-        let frozen_model_ids = self.tool_executor.subagent_model_ids();
-        let frozen_model_ids: std::collections::HashSet<&str> =
-            frozen_model_ids.iter().map(String::as_str).collect();
+        let catalog = self.spawn_catalog.get_or_insert_with(|| {
+            super::agent_execution::SpawnCatalog::resolve(
+                &self.agent_config,
+                self.llm_registry.available_execution_routes(),
+            )
+        });
         let mut specs: Vec<SubAgentSpec> = Vec::with_capacity(input.tasks.len());
 
-        for (task, &(agent, mode)) in input.tasks.iter().zip(&resolved_tasks) {
+        for (task, &mode) in input.tasks.iter().zip(&resolved_tasks) {
             let cwd_override = nonblank(task.cwd.as_deref());
             let cwd_path = cwd_override.map_or_else(
                 || self.context.filesystem_root().to_path_buf(),
@@ -4948,46 +4916,30 @@ where
                 }));
             }
 
-            // Resolve model: task field > agent default > mode default
-            // (REQ-AG-005, REQ-PROJ-008). An explicit model from either the
-            // task or the agent definition must exist in the registry.
-            let explicit_model = nonblank(task.model.as_deref())
-                .or_else(|| agent.and_then(|definition| nonblank(definition.model.as_deref())));
-            let resolved_model = if let Some(model) = explicit_model {
-                if !frozen_model_ids.contains(model) || self.llm_registry.get(model).is_none() {
-                    let result = ToolResult::error(
-                        tool_use_id.clone(),
-                        format!(
-                            "Unknown model '{}'. Available: {:?}",
-                            model,
-                            frozen_model_ids.iter().copied().collect::<Vec<_>>()
-                        ),
-                    );
+            let selected = match catalog.select(
+                task.agent_type.as_deref(),
+                task.execution.as_ref(),
+                &self.context.model_id,
+                self.context.effort,
+            ) {
+                Ok(selected) => selected,
+                Err(error) => {
                     return Ok(Some(Event::ToolComplete {
-                        tool_use_id,
-                        result,
-                    }));
-                }
-                model.to_string()
-            } else {
-                match mode {
-                    SubAgentMode::Explore => {
-                        let cheap_model = self
-                            .llm_registry
-                            .cheap_model_id_for_provider(&self.context.model_id);
-                        match self.context.effort {
-                            Some(effort)
-                                if !self.llm_registry.supports_effort(&cheap_model, effort) =>
-                            {
-                                self.context.model_id.clone()
-                            }
-                            _ => cheap_model,
-                        }
-                    }
-                    SubAgentMode::Work => self.context.model_id.clone(),
+                        tool_use_id: tool_use_id.clone(),
+                        result: ToolResult::error(tool_use_id, error),
+                    }))
                 }
             };
-
+            if let Err(error) = self.llm_registry.validate_execution_route(
+                &selected.execution.model,
+                &selected.execution.connection,
+                selected.execution.reasoning_effort,
+            ) {
+                return Ok(Some(Event::ToolComplete {
+                    tool_use_id: tool_use_id.clone(),
+                    result: ToolResult::error(tool_use_id, error),
+                }));
+            }
             // Resolve max turns (REQ-PROJ-008)
             let max_turns = task.max_turns.unwrap_or(match mode {
                 SubAgentMode::Explore => 20,
@@ -4996,7 +4948,8 @@ where
 
             tracing::debug!(
                 mode = ?mode,
-                model_source = if explicit_model.is_some() { "override" } else { "default" },
+                model = %selected.execution.model,
+                connection = %selected.execution.connection,
                 cwd_source = if cwd_override.is_some() { "override" } else { "parent" },
                 "resolved sub-agent spawn defaults"
             );
@@ -5007,10 +4960,12 @@ where
                 cwd,
                 timeout: DEFAULT_SUBAGENT_TIMEOUT,
                 mode,
-                model_id: resolved_model,
+                model_id: selected.execution.model,
+                connection: selected.execution.connection,
+                effort: selected.execution.reasoning_effort,
                 max_turns,
-                agent_name: agent.map(|a| a.name.clone()),
-                persona: agent.map(|a| a.body.clone()),
+                agent_name: selected.name,
+                persona: selected.persona,
             });
         }
 
@@ -6928,7 +6883,18 @@ where
         // Freeze the complete provider request before any provider or forwarding
         // task is spawned. Tool definitions, AGENTS-backed system prompt, and the
         // optional Coordinator capsule are request authority, not task-local inputs.
-        let available_tools = tool_executor.definitions_for_language(llm_language).await;
+        let mut available_tools = tool_executor.definitions_for_language(llm_language).await;
+        if let Some(tool) = available_tools
+            .iter_mut()
+            .find(|tool| tool.name == "spawn_agents")
+        {
+            let catalog = super::agent_execution::SpawnCatalog::resolve(
+                &self.agent_config,
+                self.llm_registry.available_execution_routes(),
+            );
+            tool.input_schema = catalog.schema();
+            self.spawn_catalog = Some(catalog);
+        }
         let explore_bash_capability =
             if matches!(mode_context.as_ref(), Some(ModeContext::Explore { .. })) {
                 explore_bash
@@ -18806,7 +18772,7 @@ mod work_subagent_cwd_guard_tests {
         let mut context = ConvContext::new(
             "cwd-guard-conv",
             working_dir.to_path_buf(),
-            "test-model",
+            "gpt-5.6-sol",
             200_000,
         );
         context.mode_context = Some(mode_context);
@@ -18820,12 +18786,15 @@ mod work_subagent_cwd_guard_tests {
             context,
             ConvState::Idle,
             storage,
-            Arc::new(MockLlmClient::new("test-model")),
-            Arc::new(MockToolExecutor::new().with_subagent_models(vec!["test-model".to_string()])),
+            Arc::new(MockLlmClient::new("gpt-5.6-sol")),
+            Arc::new(MockToolExecutor::new()),
             Arc::new(BrowserSessionManager::default()),
             Arc::new(crate::tools::BashHandleRegistry::new()),
             Arc::new(crate::tools::TmuxRegistry::new()),
-            Arc::new(ModelRegistry::new_empty()),
+            Arc::new(ModelRegistry::new(&phoenix_llm::LlmConfig {
+                openai_responses_key: Some("test-key".into()),
+                ..Default::default()
+            })),
             crate::terminal::ActiveTerminals::new(),
             event_rx,
             event_tx_dup,
@@ -18876,7 +18845,7 @@ mod work_subagent_cwd_guard_tests {
                     task: "inspect everything".to_string(),
                     cwd: Some("/".to_string()),
                     mode: Some(SubAgentMode::Explore),
-                    model: None,
+                    execution: None,
                     max_turns: None,
                     agent_type: None,
                 }],
@@ -18908,7 +18877,7 @@ mod work_subagent_cwd_guard_tests {
                     task: "inherit root".to_string(),
                     cwd: None,
                     mode: Some(SubAgentMode::Explore),
-                    model: None,
+                    execution: None,
                     max_turns: None,
                     agent_type: None,
                 }],
@@ -18940,7 +18909,7 @@ mod work_subagent_cwd_guard_tests {
                     task: "inspect project".to_string(),
                     cwd: Some(deep.to_string_lossy().to_string()),
                     mode: Some(SubAgentMode::Explore),
-                    model: None,
+                    execution: None,
                     max_turns: None,
                     agent_type: None,
                 }],
@@ -18977,7 +18946,7 @@ mod work_subagent_cwd_guard_tests {
                     task: "do unsafe writes".to_string(),
                     cwd: Some(outside.path().to_string_lossy().to_string()),
                     mode: Some(SubAgentMode::Work),
-                    model: None,
+                    execution: None,
                     max_turns: None,
                     agent_type: None,
                 }],
@@ -19015,7 +18984,7 @@ mod work_subagent_cwd_guard_tests {
                     task: "implement the fix".to_string(),
                     cwd: None,
                     mode: Some(SubAgentMode::Work),
-                    model: None,
+                    execution: None,
                     max_turns: None,
                     agent_type: None,
                 }],
@@ -19040,13 +19009,12 @@ mod work_subagent_cwd_guard_tests {
         assert_eq!(request.spec.mode, SubAgentMode::Work);
         assert_eq!(request.spec.agent_name, None);
         assert_eq!(request.spec.persona, None);
-        assert_eq!(request.spec.model_id, "test-model");
+        assert_eq!(request.spec.model_id, "gpt-5.6-sol");
+        assert_eq!(request.spec.connection, "openai_responses");
+        assert_eq!(request.spec.effort, None);
         assert_eq!(rt.active_work_subagents, 1);
     }
 
-    /// An `agent_type` that matches no discovered agent is rejected before any
-    /// sub-agent is spawned (REQ-AG-007). The empty worktree has no
-    /// `.claude/agents/`, so discovery returns nothing and the lookup fails.
     #[tokio::test]
     async fn rejects_unknown_agent_type() {
         let worktree = TempDir::new().expect("worktree tempdir");
@@ -19058,7 +19026,7 @@ mod work_subagent_cwd_guard_tests {
                     task: "review".to_string(),
                     cwd: None,
                     mode: None,
-                    model: None,
+                    execution: None,
                     max_turns: None,
                     agent_type: Some("ghost".to_string()),
                 }],
@@ -19074,7 +19042,7 @@ mod work_subagent_cwd_guard_tests {
                 );
                 let msg = tool_result_text(&result);
                 assert!(
-                    msg.contains("Unknown agent_type 'ghost'"),
+                    msg.contains("Unknown or unavailable agent_type 'ghost'"),
                     "error should name the unknown agent_type, got: {msg}"
                 );
             }
@@ -19103,7 +19071,7 @@ mod work_subagent_cwd_guard_tests {
                         task: "first".to_string(),
                         cwd: None,
                         mode: Some(SubAgentMode::Explore),
-                        model: None,
+                        execution: None,
                         max_turns: None,
                         agent_type: None,
                     },
@@ -19111,7 +19079,13 @@ mod work_subagent_cwd_guard_tests {
                         task: "second".to_string(),
                         cwd: None,
                         mode: Some(SubAgentMode::Explore),
-                        model: Some("ghost-model".to_string()),
+                        execution: Some(
+                            phoenix_core::domain::sm_state::ExecutionSelection::Model {
+                                model: "ghost-model".to_string(),
+                                connection: "openai_responses".into(),
+                                reasoning_effort: None,
+                            },
+                        ),
                         max_turns: None,
                         agent_type: None,
                     },
@@ -19138,8 +19112,13 @@ mod work_subagent_cwd_guard_tests {
     async fn advertised_model_removed_from_live_registry_is_rejected() {
         let parent = TempDir::new().expect("parent tempdir");
         let mut rt = runtime_in_direct_mode(parent.path());
+        rt.spawn_catalog = Some(super::super::agent_execution::SpawnCatalog::resolve(
+            &rt.agent_config,
+            rt.llm_registry.available_execution_routes(),
+        ));
+        rt.llm_registry = Arc::new(ModelRegistry::new_empty());
         assert!(
-            rt.llm_registry.get("test-model").is_none(),
+            rt.llm_registry.get("gpt-5.6-sol").is_none(),
             "test requires the live registry to disagree with the frozen snapshot"
         );
 
@@ -19149,7 +19128,11 @@ mod work_subagent_cwd_guard_tests {
                     task: "inspect".to_string(),
                     cwd: None,
                     mode: Some(SubAgentMode::Explore),
-                    model: Some("test-model".to_string()),
+                    execution: Some(phoenix_core::domain::sm_state::ExecutionSelection::Model {
+                        model: "gpt-5.6-sol".to_string(),
+                        connection: "openai_responses".into(),
+                        reasoning_effort: None,
+                    }),
                     max_turns: None,
                     agent_type: None,
                 }],
@@ -19161,7 +19144,7 @@ mod work_subagent_cwd_guard_tests {
             Some(Event::ToolComplete { result, .. }) => {
                 let message = tool_result_text(&result);
                 assert!(
-                    message.contains("Unknown model 'test-model'"),
+                    message.contains("gpt-5.6-sol") && message.contains("unavailable"),
                     "got: {message}"
                 );
             }
@@ -19170,9 +19153,12 @@ mod work_subagent_cwd_guard_tests {
     }
 
     #[tokio::test]
-    async fn blank_model_and_cwd_use_defaults() {
+    async fn omitted_execution_and_blank_cwd_use_defaults() {
         let parent = TempDir::new().expect("parent tempdir");
-        let mut rt = runtime_in_direct_mode(parent.path());
+        let (spawn_tx, mut spawn_rx) = mpsc::channel::<SubAgentSpawnRequest>(1);
+        let (cancel_tx, _cancel_rx) = mpsc::channel(1);
+        let mut rt = runtime_in_direct_mode(parent.path()).with_spawn_channels(spawn_tx, cancel_tx);
+        rt.context.effort = Some(phoenix_core::domain::llm_types::ModelEffort::High);
 
         let result = rt
             .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
@@ -19180,7 +19166,7 @@ mod work_subagent_cwd_guard_tests {
                     task: "inspect".to_string(),
                     cwd: Some("  ".to_string()),
                     mode: Some(SubAgentMode::Explore),
-                    model: Some(String::new()),
+                    execution: None,
                     max_turns: None,
                     agent_type: None,
                 }],
@@ -19188,15 +19174,16 @@ mod work_subagent_cwd_guard_tests {
             .await
             .expect("handle_spawn_agents_tool returned error");
 
-        match result {
-            Some(Event::ToolComplete { result, .. }) => {
-                let message = tool_result_text(&result);
-                assert!(!message.contains("Unknown model"), "got: {message}");
-                assert!(!message.contains("working directory"), "got: {message}");
-                assert!(message.contains("not configured"), "got: {message}");
-            }
-            other => panic!("expected missing-channel ToolComplete, got {other:?}"),
-        }
+        assert!(matches!(result, Some(Event::SpawnAgentsComplete { .. })));
+        let request = spawn_rx.try_recv().expect("spawn request sent");
+        assert_eq!(request.spec.model_id, "gpt-5.6-sol");
+        assert_eq!(request.spec.connection, "openai_responses");
+        assert_eq!(request.spec.effort, rt.context.effort);
+        assert_eq!(request.spec.mode, SubAgentMode::Explore);
+        assert_eq!(
+            std::fs::canonicalize(request.spec.cwd).unwrap(),
+            std::fs::canonicalize(parent.path()).unwrap()
+        );
     }
 
     #[tokio::test]
@@ -19211,7 +19198,7 @@ mod work_subagent_cwd_guard_tests {
                     task: "inspect".to_string(),
                     cwd: Some("nested".to_string()),
                     mode: Some(SubAgentMode::Explore),
-                    model: None,
+                    execution: None,
                     max_turns: None,
                     agent_type: None,
                 }],
@@ -19229,22 +19216,14 @@ mod work_subagent_cwd_guard_tests {
         }
     }
 
-    /// `agent_type` resolves against the catalog frozen on the runtime, not a
-    /// fresh filesystem scan (REQ-AG-008): the worktree has no `.claude/agents`,
-    /// yet a frozen-catalog agent resolves, so we reach the missing-spawn-channel
-    /// path rather than an "Unknown `agent_type`" rejection.
     #[tokio::test]
-    async fn agent_type_resolves_from_frozen_catalog_not_filesystem() {
+    async fn agent_type_resolves_from_loaded_config() {
         let worktree = TempDir::new().expect("worktree tempdir");
         let catalog = std::sync::Arc::from(vec![phoenix_agents::AgentDefinition {
             name: "reviewer".to_string(),
             description: "Reviews".to_string(),
             body: "You are a reviewer.".to_string(),
-            path: std::path::PathBuf::from("/virtual/reviewer.md"),
-            source_dir: ".claude/agents".to_string(),
-            model: None,
-            mode: None,
-            tools: None,
+            execution: None,
         }]);
         let mut rt = runtime_in_work_mode(worktree.path()).with_agent_catalog(catalog);
 
@@ -19254,7 +19233,7 @@ mod work_subagent_cwd_guard_tests {
                     task: "review".to_string(),
                     cwd: None,
                     mode: Some(SubAgentMode::Explore),
-                    model: None,
+                    execution: None,
                     max_turns: None,
                     agent_type: Some("reviewer".to_string()),
                 }],
@@ -19296,7 +19275,7 @@ mod work_subagent_cwd_guard_tests {
                     task: "do scoped writes".to_string(),
                     cwd: Some(nested.to_string_lossy().to_string()),
                     mode: Some(SubAgentMode::Work),
-                    model: None,
+                    execution: None,
                     max_turns: None,
                     agent_type: None,
                 }],
@@ -19339,7 +19318,7 @@ mod work_subagent_cwd_guard_tests {
                     task: "follow the symlink".to_string(),
                     cwd: Some(symlink.to_string_lossy().to_string()),
                     mode: Some(SubAgentMode::Work),
-                    model: None,
+                    execution: None,
                     max_turns: None,
                     agent_type: None,
                 }],
@@ -19455,7 +19434,7 @@ mod work_subagent_cwd_guard_tests {
                     task: "traverse out".to_string(),
                     cwd: Some(traversing),
                     mode: Some(SubAgentMode::Work),
-                    model: None,
+                    execution: None,
                     max_turns: None,
                     agent_type: None,
                 }],

@@ -1843,6 +1843,11 @@ mod tests {
                 &ConvMode::Direct,
                 LlmLanguage::default(),
                 Some(scope),
+                crate::SubAgentExecution {
+                    connection: "mock",
+                    effort: None,
+                    persona: None,
+                },
             )
             .await
             .unwrap();

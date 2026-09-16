@@ -5096,6 +5096,11 @@ mod tests {
                 &crate::ConvMode::Direct,
                 phoenix_core::llm_language::LlmLanguage::default(),
                 history_parent.attached_work_scope_id.as_ref(),
+                crate::SubAgentExecution {
+                    connection: "mock",
+                    effort: None,
+                    persona: None,
+                },
             )
             .await
             .expect_err("History aggregate must reject late participants");
@@ -5115,6 +5120,11 @@ mod tests {
             &crate::ConvMode::Direct,
             phoenix_core::llm_language::LlmLanguage::default(),
             cancelled_parent.attached_work_scope_id.as_ref(),
+            crate::SubAgentExecution {
+                connection: "mock",
+                effort: None,
+                persona: None,
+            },
         )
         .await
         .expect("completed-cancelled Open aggregate remains writable");
@@ -5358,6 +5368,11 @@ mod tests {
                     .unwrap()
                     .attached_work_scope_id
                     .as_ref(),
+                crate::SubAgentExecution {
+                    connection: "mock",
+                    effort: None,
+                    persona: None,
+                },
             )
             .await
             .unwrap_err();
@@ -5387,6 +5402,11 @@ mod tests {
                 .unwrap()
                 .attached_work_scope_id
                 .as_ref(),
+            crate::SubAgentExecution {
+                connection: "mock",
+                effort: None,
+                persona: None,
+            },
         )
         .await
         .unwrap();
@@ -5739,6 +5759,11 @@ mod tests {
                 .unwrap()
                 .attached_work_scope_id
                 .as_ref(),
+            crate::SubAgentExecution {
+                connection: "mock",
+                effort: None,
+                persona: None,
+            },
         )
         .await
         .unwrap();
@@ -8736,6 +8761,11 @@ mod tests {
                 .unwrap()
                 .attached_work_scope_id
                 .as_ref(),
+            crate::SubAgentExecution {
+                connection: "mock",
+                effort: None,
+                persona: None,
+            },
         )
         .await
         .unwrap();

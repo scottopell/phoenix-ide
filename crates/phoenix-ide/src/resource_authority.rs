@@ -179,6 +179,11 @@ pub(crate) mod tests {
                 },
                 phoenix_core::llm_language::LlmLanguage::default(),
                 None,
+                phoenix_db::SubAgentExecution {
+                    connection: "mock",
+                    effort: None,
+                    persona: None,
+                },
             )
             .await
             .unwrap();
@@ -216,6 +221,11 @@ pub(crate) mod tests {
                 },
                 phoenix_core::llm_language::LlmLanguage::default(),
                 Some(&scope),
+                phoenix_db::SubAgentExecution {
+                    connection: "mock",
+                    effort: None,
+                    persona: None,
+                },
             )
             .await
             .unwrap();

@@ -193,7 +193,6 @@ pub struct MockToolExecutor {
     outputs: HashMap<String, ToolOutput>,
     definitions: Vec<ToolDefinition>,
     clearable: std::collections::HashSet<String>,
-    model_ids: Arc<[String]>,
     /// Record of tool executions
     pub executions: Mutex<Vec<(String, Value)>>,
 }
@@ -205,7 +204,6 @@ impl MockToolExecutor {
             outputs: HashMap::new(),
             definitions: Vec::new(),
             clearable: std::collections::HashSet::new(),
-            model_ids: Arc::from(Vec::new()),
             executions: Mutex::new(Vec::new()),
         }
     }
@@ -226,11 +224,6 @@ impl MockToolExecutor {
     /// Mark `name` as a clearable tool (its stale results may be cleared).
     pub fn with_clearable_tool(mut self, name: impl Into<String>) -> Self {
         self.clearable.insert(name.into());
-        self
-    }
-
-    pub fn with_subagent_models(mut self, model_ids: Vec<String>) -> Self {
-        self.model_ids = Arc::from(model_ids);
         self
     }
 
@@ -260,10 +253,6 @@ impl ToolExecutor for MockToolExecutor {
 
     async fn definitions(&self) -> Vec<ToolDefinition> {
         self.definitions.clone()
-    }
-
-    fn subagent_model_ids(&self) -> Arc<[String]> {
-        self.model_ids.clone()
     }
 
     fn clearable_tool_names(&self) -> std::collections::HashSet<String> {
@@ -3523,7 +3512,7 @@ mod tests {
                 task: format!("task {i}"),
                 cwd: None,
                 mode: None,
-                model: None,
+                execution: None,
                 max_turns: None,
                 agent_type: None,
             })

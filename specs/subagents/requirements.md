@@ -7,18 +7,14 @@ tasks to parallel sub-agents so that complex operations complete faster and
 the agent can synthesize multiple perspectives without exhausting its own
 context window.
 
-> Detailed behaviour (states, transitions, invariants, mode rules,
-> one-writer constraint, cwd-scoping) lives in
-> [`subagents.allium`](./subagents.allium) and
-> [`bedrock.allium`](../bedrock/bedrock.allium). This file records user
-> need, rationale, and per-requirement status only.
+> Detailed behaviour (states, transitions, authority rules, one-writer
+> constraint, and cwd scoping) lives in [`subagents.allium`](./subagents.allium)
+> and [`bedrock.allium`](../bedrock/bedrock.allium).
 >
-> Named agents ([`../agents/`](../agents/requirements.md)) extend the spawn
-> path: a task may carry an `agent_type` that supplies the spawned sub-agent's
-> persona and its default model and mode. The unknown-`agent_type` rejection
-> and the resolution precedence (task field → agent definition → mode default)
-> are normative in [`subagents.allium`](./subagents.allium); persona discovery
-> and composition are normative in [`agents.allium`](../agents/agents.allium).
+> Named workers supply optional personas and execution preferences; see
+> [`../agents/requirements.md`](../agents/requirements.md). A task can select a
+> worker, a configured tier, or an exact model route. These choices do not grant
+> authority.
 
 ## Requirements
 
@@ -135,24 +131,37 @@ sub-agent work completes or fails within a bounded time.
 
 ### REQ-SA-007: Model Selection
 
-**Superseded by REQ-PROJ-008 (sub-agent execution authority).** The tier concept
-(`fast`/`capable`) is replaced by execution-authority-based defaults with optional
-explicit model override:
+THE SYSTEM SHALL accept one optional execution selector per task: a configured
+tier or an explicit model and connection with optional effort
+AND SHALL allow the selector independently of an optional named worker
+AND SHALL NOT accept simultaneous tier and explicit-model selections
 
-- Read-only sub-agent execution defaults to the cheapest available model for the
-  parent's provider family.
-- Write-capable sub-agent execution inherits the parent's model.
-- The `model` field on the task spec allows explicit override with any
-  registry model id; unknown ids are rejected at spawn time.
-- The tool schema exposes the deployment's registered model ids from the same
-  registry snapshot used for spawn-time validation.
-- An omitted or blank `model` selects the mode default rather than an invalid
-  explicit override.
+WHEN execution is omitted
+THE SYSTEM SHALL use the named worker's ordered candidates if declared,
+otherwise inherit the parent's model, connection, and effort as one choice
 
-**Rationale:** Mode-based defaults cover the same cost/capability
-trade-off that tiers addressed, while the explicit model override handles
-edge cases. Two layers of indirection (mode defaults + tier resolution)
-added complexity without benefit.
+WHEN explicit model execution omits effort
+THE SYSTEM SHALL use the selected model's native default, without inheriting
+worker, tier, or parent effort
+
+WHEN execution explicitly names a model and connection
+THE SYSTEM SHALL use that exact route or reject it, without fallback
+
+THE SYSTEM SHALL expose only usable model routes and eligible tiers, with
+explicit effort choices constrained to known supported values
+AND SHALL validate the whole batch before creating any child
+
+WHEN a child runtime is recreated during its run
+THE SYSTEM SHALL restore its resolved model, effort, connection, and persona
+without reapplying configuration preferences
+
+**Rationale:** Cost and capability are independent of permissions. Ordered
+preferences provide portable defaults; explicit choices remain exact. Logical
+connection identity binds a configured backend slot, not an account or endpoint
+across operator reconfiguration. Runtime recreation does not imply survival
+across server restart.
+
+**Dependencies:** REQ-AG-005, REQ-AG-008, REQ-AG-011, REQ-AG-012
 
 ---
 
@@ -282,19 +291,23 @@ model cannot spend its only grace response on an action Phoenix must reject.
 
 ### REQ-SA-011: Spawn Override Defaults and Path Base
 
-WHEN `model` or `cwd` is omitted, blank, or whitespace-only in a sub-agent task
-THE SYSTEM SHALL use the documented mode or parent default
+WHEN `cwd` is omitted, blank, or whitespace-only in a sub-agent task
+THE SYSTEM SHALL inherit the parent working directory
+
+WHEN execution is omitted
+THE SYSTEM SHALL use the default defined by REQ-SA-007
 
 WHEN a task supplies a relative `cwd` override
 THE SYSTEM SHALL resolve it from the parent conversation's working directory
 AND SHALL validate the resolved path with the same existence, non-root, symlink,
 and Work-worktree containment rules as an absolute override
 
-WHEN a task supplies a model override
-THE SYSTEM SHALL constrain the LLM-visible choices to the model ids registered for
-that conversation
-AND SHALL reject an unknown or stale id before spawning any task in the batch
+WHEN a task supplies an execution selector
+THE SYSTEM SHALL validate it against the same resolved catalog snapshot used to
+advertise choices for that request
+AND SHALL reject an invalid selection before spawning any task in the batch
 
-**Rationale:** Defaults should be the easiest valid representation. Empty
-placeholder strings and server-process-relative paths must not turn inheritance
-into a validation failure or move a child outside the parent's working context.
+**Rationale:** Defaults should be the easiest valid representation. Empty path
+placeholders and server-process-relative paths must not move a child outside the
+parent's working context. A callable selection must not depend on hidden defaults
+that differ between schema construction and admission.

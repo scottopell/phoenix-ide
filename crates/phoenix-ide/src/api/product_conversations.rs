@@ -1845,6 +1845,11 @@ mod tests {
                 &root.conv_mode,
                 phoenix_core::llm_language::LlmLanguage::default(),
                 root.attached_work_scope_id.as_ref(),
+                phoenix_db::SubAgentExecution {
+                    connection: "mock",
+                    effort: None,
+                    persona: None,
+                },
             )
             .await
             .unwrap();
