@@ -193,6 +193,72 @@ describe('ProductConversation presentation indicator', () => {
   });
 });
 
+describe('ProductConversation presentation transitions', () => {
+  it('rerenders working to needs action to done with exactly one indicator', () => {
+    const base = makeProductConversation('transition-row', { presentation: { kind: 'state', display_name: 'Working', presentation_mode: 'working' } });
+    const { container, rerender } = render(
+      <MemoryRouter>
+        <ConversationList {...defaultProps} conversations={[]} productConversations={[base]} />
+      </MemoryRouter>,
+    );
+    const row = () => container.querySelector('[data-product-conversation-id="transition-row"]') as HTMLElement;
+    expect(row().querySelectorAll('.conv-state-dot')).toHaveLength(1);
+    expect(within(row()).getByLabelText('Working')).toBeInTheDocument();
+
+    rerender(
+      <MemoryRouter>
+        <ConversationList {...defaultProps} conversations={[]} productConversations={[{ ...base, presentation: { kind: 'state', display_name: 'Needs Action', presentation_mode: 'needs_action' } }]} />
+      </MemoryRouter>,
+    );
+    expect(row().querySelectorAll('.conv-state-dot')).toHaveLength(1);
+    expect(within(row()).getByLabelText('Needs action')).toBeInTheDocument();
+
+    rerender(
+      <MemoryRouter>
+        <ConversationList {...defaultProps} conversations={[]} productConversations={[{ ...base, presentation: { kind: 'state', display_name: 'Done', presentation_mode: 'done' } }]} />
+      </MemoryRouter>,
+    );
+    expect(row().querySelectorAll('.conv-state-dot')).toHaveLength(1);
+    expect(within(row()).getByLabelText('Completed')).toBeInTheDocument();
+  });
+});
+
+describe('ProductConversation row actions', () => {
+  it('exposes keyboard/touch accessible row actions without triggering row navigation', () => {
+    const row = makeProductConversation('actions-open', { canonical_root: { transcript_row_id: 'root-actions', slug: 'Action Product', title: 'Action Product' } });
+    const onOpen = vi.fn();
+    const onRename = vi.fn();
+    const onClose = vi.fn();
+
+    const { getByRole } = render(
+      <MemoryRouter>
+        <ConversationList
+          {...defaultProps}
+          conversations={[]}
+          productConversations={[row]}
+          onProductConversationClick={onOpen}
+          onProductConversationRename={onRename}
+          onProductConversationClose={onClose}
+        />
+      </MemoryRouter>,
+    );
+
+    const rename = getByRole('button', { name: /Rename product conversation Action Product/ });
+    const close = getByRole('button', { name: /Close product conversation Action Product/ });
+    expect(rename).toBeInTheDocument();
+    expect(close).toBeInTheDocument();
+
+    rename.focus();
+    fireEvent.click(rename);
+    close.focus();
+    fireEvent.click(close);
+
+    expect(onRename).toHaveBeenCalledWith(row);
+    expect(onClose).toHaveBeenCalledWith(row);
+    expect(onOpen).not.toHaveBeenCalled();
+  });
+});
+
 describe('ConversationRow — cached PR badge', () => {
   const renderRow = (conv: Conversation) => render(
     <MemoryRouter>
