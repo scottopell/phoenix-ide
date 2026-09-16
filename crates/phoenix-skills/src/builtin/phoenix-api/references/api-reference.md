@@ -27,7 +27,7 @@ ProductConversation references accepted by the read APIs may be a product-conver
 
 For chat or cancel, use the snapshot's current `writable_transcript_row_id`. If it is absent, Phoenix has not exposed a writable target for those operations; do not substitute `latest_transcript_row_id`. Re-resolve immediately before acting because continuation can change the writable transcript.
 
-Continuation is different: a context-exhausted transcript is intentionally not writable. Resolve the topology's `latest_transcript_row_id`, read that transcript, and continue only after its state is verified as `ContextExhausted`. Do not require or target `writable_transcript_row_id` for continuation.
+Continuation is different: a context-exhausted transcript is intentionally not writable. Resolve the topology's `latest_transcript_row_id`, read that transcript, and continue only after `conversation.state.type == "context_exhausted"`. Do not require or target `writable_transcript_row_id` for continuation.
 
 ## Create a ProductConversation
 
