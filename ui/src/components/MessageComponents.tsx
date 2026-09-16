@@ -44,6 +44,7 @@ import { CONVERSATION_MARKDOWN_COMPONENTS, CONVERSATION_MARKDOWN_URL_TRANSFORM, 
 import { MermaidDiagram } from './MermaidDiagram';
 import { StreamingBlocks } from './StreamingMessage';
 import './ReadFileResultView.css';
+import './MessageComponents.css';
 import { UserMetaMessage } from './UserMetaMessage';
 
 const CheckIcon = () => (

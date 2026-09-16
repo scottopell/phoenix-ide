@@ -127,6 +127,26 @@ async function captureCompactChronology({ page, id, outDir }) {
     }
   };
 
+  const assertResizePreservedExpandedA = (before, after) => {
+    const drift = Math.abs(after.top - before.top);
+    if (drift > 160 || after.bottom <= 0 || after.top >= after.clientHeight) {
+      throw new Error(`Expanded A was not preserved through resize: ${JSON.stringify({ before, after, drift })}`);
+    }
+  };
+
+  const assertSameCompactGroup = async (label) => {
+    const order = await page.evaluate((sampleLabel) => ({
+      label: sampleLabel,
+      toolDomOrder: Array.from(document.querySelectorAll('[data-tool-id]')).map((node) => node.getAttribute('data-tool-id')),
+      groupCount: document.querySelectorAll('.compact-tool-group').length,
+    }));
+    const compactOrder = order.toolDomOrder.filter((toolId) => toolId?.startsWith('chronology-tool-'));
+    if (compactOrder.join(',') !== 'chronology-tool-a,chronology-tool-b,chronology-tool-c' || order.groupCount !== 1) {
+      throw new Error(`Chronology tools are not in one compact group: ${JSON.stringify(order)}`);
+    }
+    return order;
+  };
+
   const assertCompletedPairing = async (label) => {
     const pairing = await page.evaluate((sampleLabel) => {
       const textFor = (toolId) => document.querySelector(`[data-tool-id="${toolId}"]`)?.textContent ?? '';
@@ -142,42 +162,62 @@ async function captureCompactChronology({ page, id, outDir }) {
     return pairing;
   };
 
-  const runChronologyFlow = async ({ label, width, height }) => {
+  const runChronologyFlow = async ({ label, width, height, resizedWidth, resizedHeight }) => {
     await page.setViewportSize({ width, height });
     await page.reload({ waitUntil: 'networkidle' });
     await page.waitForSelector(`[data-message-list-fixture-ready="${id}"]`, { timeout: 10_000 });
 
-    await page.locator('.message-list-fixture-shell #messages').evaluate((scroller) => {
-      scroller.scrollTop = 0;
-      scroller.dispatchEvent(new Event('scroll'));
-    });
     await page.waitForSelector('[data-tool-id="chronology-tool-a"] .compact-tool-card-expand');
     await page.locator('[data-tool-id="chronology-tool-a"] .compact-tool-card-expand').click();
     await page.waitForSelector('.compact-tool-selected-detail [data-tool-id="chronology-tool-a"]');
-    await page.locator('.message-list-fixture-shell #messages').hover();
-    await page.mouse.wheel(0, 120);
+    await page.locator('.message-list-fixture-shell #messages').evaluate((scroller) => {
+      scroller.scrollTop = Math.max(1, scroller.scrollTop - 120);
+      scroller.dispatchEvent(new Event('scroll'));
+    });
     await page.waitForFunction(() => {
       const scroller = document.querySelector('.message-list-fixture-shell #messages');
       if (!(scroller instanceof HTMLElement)) return false;
-      return scroller.scrollTop >= 100
+      return scroller.scrollTop > 0
         && Math.abs(scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop) > 4;
     });
     const expandedBeforeAppend = await measureExpandedA(`${label}:before-append`);
 
+    if (await page.locator('.jump-to-newest').count() !== 0) {
+      throw new Error(`${label}: unread jump appeared before tail advanced`);
+    }
+    await page.setViewportSize({ width: resizedWidth, height: resizedHeight });
+    await page.waitForSelector('.compact-tool-selected-detail [data-tool-id="chronology-tool-a"]');
+    await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    const expandedAfterResize = await measureExpandedA(`${label}:after-mounted-resize`);
+    assertResizePreservedExpandedA(expandedBeforeAppend, expandedAfterResize);
+    if (await page.locator('.jump-to-newest').count() !== 0) {
+      throw new Error(`${label}: unread jump appeared during resize without tail advance`);
+    }
+    await page.locator('.message-list-fixture-shell #messages').hover();
+    await page.mouse.wheel(0, -160);
+    await page.waitForFunction(() => {
+      const scroller = document.querySelector('.message-list-fixture-shell #messages');
+      if (!(scroller instanceof HTMLElement)) return false;
+      return Math.abs(scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop) > 4;
+    });
+    const expandedAfterResizeReaderOwned = await measureExpandedA(`${label}:after-resize-reader-owned`);
+
     await page.getByTestId('chronology-append-bc').click();
     await page.waitForFunction(() => document.documentElement.dataset['messageListChronologyPhase'] === 'appended-bc');
+    const sameGroup = await assertSameCompactGroup(`${label}:appended-bc`);
     const expandedAfterAppend = await measureExpandedA(`${label}:after-append-bc`);
-    assertStableExpandedA(expandedBeforeAppend, expandedAfterAppend);
+    assertStableExpandedA(expandedAfterResizeReaderOwned, expandedAfterAppend);
 
     await page.getByTestId('chronology-complete-bc').click();
     await page.waitForFunction(() => document.documentElement.dataset['messageListChronologyPhase'] === 'completed-bc');
     const expandedAfterComplete = await measureExpandedA(`${label}:after-complete-bc`);
-    assertStableExpandedA(expandedBeforeAppend, expandedAfterComplete);
+    assertStableExpandedA(expandedAfterResizeReaderOwned, expandedAfterComplete);
 
     await page.getByTestId('chronology-final').click();
     await page.waitForFunction(() => document.documentElement.dataset['messageListChronologyPhase'] === 'final-prose');
+    await page.waitForSelector('.jump-to-newest');
     const expandedAfterFinal = await measureExpandedA(`${label}:after-final-prose`);
-    assertStableExpandedA(expandedBeforeAppend, expandedAfterFinal);
+    assertStableExpandedA(expandedAfterResizeReaderOwned, expandedAfterFinal);
 
     await page.locator('.compact-tool-detail-collapse').click();
     await page.waitForFunction(() => {
@@ -187,10 +227,11 @@ async function captureCompactChronology({ page, id, outDir }) {
         && active.matches('.compact-tool-card-expand');
     });
 
-    await page.locator('.message-list-fixture-shell #messages').evaluate((scroller) => {
-      scroller.scrollTop = scroller.scrollHeight;
-      scroller.dispatchEvent(new Event('scroll'));
+    await page.locator('.jump-to-newest').evaluate((button) => {
+      if (!(button instanceof HTMLButtonElement)) throw new Error('jump-to-newest is not a button');
+      button.click();
     });
+    await page.waitForFunction(() => !document.querySelector('.jump-to-newest'));
     await page.waitForSelector('#message-chronology-agent-final');
     await page.waitForSelector('[data-tool-id="chronology-tool-c"]');
     const completedPairing = await assertCompletedPairing(`${label}:completed-bc`);
@@ -207,14 +248,13 @@ async function captureCompactChronology({ page, id, outDir }) {
       throw new Error(`Compact chronology final prose was not reachable: ${JSON.stringify(latestReachability)}`);
     }
 
-    const samples = [expandedBeforeAppend, expandedAfterAppend, expandedAfterComplete, expandedAfterFinal];
+    const samples = [expandedBeforeAppend, expandedAfterResize, expandedAfterResizeReaderOwned, expandedAfterAppend, expandedAfterComplete, expandedAfterFinal];
     await page.screenshot({ path: path.join(outDir, `${id}--${label}.png`), fullPage: true });
-    return { label, width, height, latestReachability, expandedA: samples, completedPairing };
+    return { label, initialViewport: { width, height }, resizedViewport: { width: resizedWidth, height: resizedHeight }, latestReachability, expandedA: samples, completedPairing, sameGroup };
   };
 
   const runs = [
-    await runChronologyFlow({ label: 'mobile', width: 390, height: 844 }),
-    await runChronologyFlow({ label: 'desktop', width: 960, height: 900 }),
+    await runChronologyFlow({ label: 'mobile-to-desktop', width: 390, height: 900, resizedWidth: 960, resizedHeight: 900 }),
   ];
   await writeFile(path.join(outDir, `${id}--metrics.json`), `${JSON.stringify(runs, null, 2)}\n`);
   console.log('  verified compact chronology append/complete/final flow at mobile and desktop widths');
