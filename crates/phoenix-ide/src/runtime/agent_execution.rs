@@ -87,18 +87,38 @@ impl SpawnCatalog {
     }
 
     fn validate(&self, candidate: &ExecutionCandidate) -> Result<(), String> {
-        let route = self.route(&candidate.model, &candidate.connection).ok_or_else(|| {
-            format!("Model '{}' through '{}' was not advertised; select an available execution choice", candidate.model, candidate.connection)
-        })?;
+        let route = self
+            .route(&candidate.model, &candidate.connection)
+            .ok_or_else(|| {
+                self.execution_error(&format!(
+                    "Model '{}' through '{}' was not advertised",
+                    candidate.model, candidate.connection
+                ))
+            })?;
         if let Some(effort) = candidate.reasoning_effort {
             if !route.supported_efforts.supports(effort) {
-                return Err(format!(
+                return Err(self.execution_error(&format!(
                     "Model '{}' through '{}' does not support effort '{effort}'",
                     candidate.model, candidate.connection
-                ));
+                )));
             }
         }
         Ok(())
+    }
+
+    fn execution_error(&self, reason: &str) -> String {
+        let tiers = self.tiers.keys().cloned().collect::<Vec<_>>().join(", ");
+        let models = self
+            .routes
+            .iter()
+            .map(|route| format!("{} through {}", route.model, route.connection))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "{reason}. Callable tiers: {}. Explicit model/connection choices: {}. Omit reasoning_effort for the selected model's native default.",
+            if tiers.is_empty() { "none" } else { &tiers },
+            if models.is_empty() { "none" } else { &models },
+        )
     }
 
     pub fn select(
@@ -125,11 +145,11 @@ impl SpawnCatalog {
             })
             .transpose()?;
         let execution = match selection {
-            Some(ExecutionSelection::Tier { name }) => self
-                .tiers
-                .get(name)
-                .cloned()
-                .ok_or_else(|| format!("Unknown or unavailable execution tier '{name}'"))?,
+            Some(ExecutionSelection::Tier { name }) => {
+                self.tiers.get(name).cloned().ok_or_else(|| {
+                    self.execution_error(&format!("Unknown or unavailable execution tier '{name}'"))
+                })?
+            }
             Some(ExecutionSelection::Model {
                 model,
                 connection,
@@ -147,7 +167,11 @@ impl SpawnCatalog {
                         .routes
                         .iter()
                         .find(|route| route.model == parent_model)
-                        .ok_or_else(|| format!("Parent model '{parent_model}' is unavailable"))?;
+                        .ok_or_else(|| {
+                            self.execution_error(&format!(
+                                "Parent model '{parent_model}' is unavailable"
+                            ))
+                        })?;
                     ExecutionCandidate {
                         model: route.model.clone(),
                         connection: route.connection.clone(),
@@ -289,6 +313,72 @@ execution = [{model = "luna", connection = "codex", reasoning_effort = "low"}]
             "Unknown or unavailable agent_type 'ghost'. No named workers are callable. Omit agent_type for a generic worker."
         );
         assert!(catalog.select(None, None, "sol", None).is_ok());
+    }
+
+    #[test]
+    fn invalid_execution_suggests_only_advertised_tiers_and_routes() {
+        let catalog = SpawnCatalog::resolve(&config(), vec![route("luna", "codex")]);
+        for selection in [
+            ExecutionSelection::Tier {
+                name: "stale".into(),
+            },
+            ExecutionSelection::Model {
+                model: "luna".into(),
+                connection: "anthropic".into(),
+                reasoning_effort: None,
+            },
+            ExecutionSelection::Model {
+                model: "luna".into(),
+                connection: "codex".into(),
+                reasoning_effort: Some(ModelEffort::Max),
+            },
+        ] {
+            let error = catalog
+                .select(None, Some(&selection), "luna", None)
+                .err()
+                .unwrap();
+            let suggestions = error.split_once("Callable tiers:").unwrap().1;
+            assert!(suggestions.contains("fast"));
+            assert!(suggestions.contains("luna through codex"));
+            assert!(!suggestions.contains("opus"));
+            assert!(!suggestions.contains("anthropic"));
+            assert!(catalog
+                .select(
+                    None,
+                    Some(&ExecutionSelection::Tier {
+                        name: "fast".into()
+                    }),
+                    "luna",
+                    None
+                )
+                .is_ok());
+        }
+        let catalog = SpawnCatalog::resolve(&AgentConfig::default(), vec![route("luna", "codex")]);
+        let error = catalog
+            .select(
+                None,
+                Some(&ExecutionSelection::Tier {
+                    name: "stale".into(),
+                }),
+                "luna",
+                None,
+            )
+            .err()
+            .unwrap();
+        assert!(error.contains("Callable tiers: none"));
+        assert!(error.contains("Explicit model/connection choices: luna through codex"));
+        assert!(catalog
+            .select(
+                None,
+                Some(&ExecutionSelection::Model {
+                    model: "luna".into(),
+                    connection: "codex".into(),
+                    reasoning_effort: None,
+                }),
+                "luna",
+                None
+            )
+            .is_ok());
     }
 
     #[test]
