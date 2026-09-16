@@ -19,5 +19,5 @@ export interface SidebarFixtureData {
   projects: Project[];
   conversations: Conversation[];
   archivedConversations: Conversation[];
-  productConversations?: ProductConversationListRow[];
+  productConversations?: Partial<Record<SidebarScenarioId, ProductConversationListRow[]>>;
 }

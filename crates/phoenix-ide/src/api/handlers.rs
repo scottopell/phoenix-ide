@@ -25,6 +25,7 @@ use super::lifecycle_handlers::{
 };
 use super::product_conversations::{
     get_product_conversation, list_product_conversation_creations, list_product_conversations,
+    rename_product_conversation,
 };
 use super::sse::{sse_stream, SseInitTrace};
 use super::types::{
@@ -144,6 +145,10 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/product-conversations/:reference",
             get(get_product_conversation),
+        )
+        .route(
+            "/api/product-conversations/:reference/title",
+            axum::routing::patch(rename_product_conversation),
         )
         .route(
             "/api/product-conversations/:reference/route",
