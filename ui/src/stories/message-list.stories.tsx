@@ -14,6 +14,9 @@ CompactLatestExpanded.storyName = 'compact-latest-expanded';
 export const CompactToolStrip = storyFor('compact-tool-strip');
 CompactToolStrip.storyName = 'compact-tool-strip';
 
+export const CompactExpandedToolChronology = storyFor('compact-expanded-tool-chronology');
+CompactExpandedToolChronology.storyName = 'compact-expanded-tool-chronology';
+
 export const ScrollPolicyLong = storyFor('scroll-policy-long');
 ScrollPolicyLong.storyName = 'scroll-policy-long';
 

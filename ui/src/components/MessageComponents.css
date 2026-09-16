@@ -1,0 +1,22 @@
+.compact-tool-selected-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.compact-tool-detail-collapse {
+  align-self: flex-end;
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+  line-height: 1.2;
+  padding: 0.2rem 0.55rem;
+}
+
+.compact-tool-detail-collapse:hover,
+.compact-tool-detail-collapse:focus-visible {
+  color: var(--text-primary);
+  border-color: var(--accent-blue);
+}

@@ -43,6 +43,93 @@ const baseMessages: Message[] = [
     display_data: {},
   },
 ];
+export const compactChronologyInitialMessages: Message[] = [
+  {
+    message_id: 'chronology-user-1',
+    conversation_id: 'fixture-message-list-compact-chronology',
+    sequence_id: 1,
+    type: 'user',
+    message_type: 'user',
+    created_at: '2025-01-01T10:00:00.000Z',
+    content: { text: ['Run the compact chronology sequence.', ...Array.from({ length: 300 }, (_, index) => `Reader setup line ${String(index + 1).padStart(2, '0')}`)].join('\n') },
+    display_data: {},
+  },
+  {
+    message_id: 'chronology-agent-a',
+    conversation_id: 'fixture-message-list-compact-chronology',
+    sequence_id: 2,
+    type: 'agent',
+    message_type: 'agent',
+    created_at: '2025-01-01T10:01:00.000Z',
+    content: [
+      { type: 'tool_use', id: 'chronology-tool-a', name: 'read_file', input: { path: 'older-a.md' } },
+    ],
+    display_data: {},
+  },
+  {
+    message_id: 'chronology-result-a',
+    conversation_id: 'fixture-message-list-compact-chronology',
+    sequence_id: 3,
+    type: 'tool',
+    message_type: 'tool',
+    created_at: '2025-01-01T10:01:30.000Z',
+    content: { tool_use_id: 'chronology-tool-a', content: 'Older A result\n'.repeat(20), is_error: false },
+    display_data: {},
+  },
+];
+
+export const compactChronologyAppendMessages: Message[] = [
+  {
+    message_id: 'chronology-agent-bc',
+    conversation_id: 'fixture-message-list-compact-chronology',
+    sequence_id: 4,
+    type: 'agent',
+    message_type: 'agent',
+    created_at: '2025-01-01T10:02:00.000Z',
+    content: [
+      { type: 'tool_use', id: 'chronology-tool-b', name: 'search', input: { pattern: 'newer B' } },
+      { type: 'tool_use', id: 'chronology-tool-c', name: 'bash', input: { op: 'run', cmd: 'echo newer C' } },
+    ],
+    display_data: {},
+  },
+];
+
+export const compactChronologyCompletionMessages: Message[] = [
+  {
+    message_id: 'chronology-result-b',
+    conversation_id: 'fixture-message-list-compact-chronology',
+    sequence_id: 5,
+    type: 'tool',
+    message_type: 'tool',
+    created_at: '2025-01-01T10:03:30.000Z',
+    content: { tool_use_id: 'chronology-tool-b', content: 'B_OK', is_error: false },
+    display_data: {},
+  },
+  {
+    message_id: 'chronology-result-c',
+    conversation_id: 'fixture-message-list-compact-chronology',
+    sequence_id: 6,
+    type: 'tool',
+    message_type: 'tool',
+    created_at: '2025-01-01T10:04:00.000Z',
+    content: { tool_use_id: 'chronology-tool-c', content: JSON.stringify({ status: 'exited', exit_code: 0, lines: [{ offset: 0, bytes: 'C_OK' }] }), is_error: false },
+    display_data: {},
+  },
+];
+
+export const compactChronologyFinalMessages: Message[] = [
+  {
+    message_id: 'chronology-agent-final',
+    conversation_id: 'fixture-message-list-compact-chronology',
+    sequence_id: 7,
+    type: 'agent',
+    message_type: 'agent',
+    created_at: '2025-01-01T10:05:00.000Z',
+    content: [{ type: 'text', text: 'Final prose after B and C completed. The latest message must remain reachable without losing the older expanded A detail.' }],
+    display_data: {},
+  },
+];
+
 const toolStripMessages: Message[] = [
   {
     message_id: 'user-tool-1',
@@ -199,7 +286,7 @@ const markdownImageMessages: Message[] = [
       text: [
         'Here is the Markdown screenshot preview using the same syntax agents paste into conversations:',
         '',
-        '![file-tree-dark-single-slot](http://127.0.0.1:61123/qa/message-list/markdown-image-fixture.svg)',
+        '![file-tree-dark-single-slot](/qa/message-list/markdown-image-fixture.svg)',
         '',
         'The image is constrained to the message column and keeps its aspect ratio.',
       ].join('\n'),
@@ -310,6 +397,12 @@ export const messageListScenarios = [
     theme: 'dark',
   },
   {
+    id: 'compact-expanded-tool-chronology',
+    title: 'Compact expanded-tool chronology',
+    description: 'Interactive compact-mode sequence: expand older A, append B/C, complete, then final prose.',
+    theme: 'dark',
+  },
+  {
     id: 'scroll-policy-long',
     title: 'Scroll policy long conversation',
     description: 'Long deterministic conversation with controls for real VirtualTranscript tail-follow QA.',
@@ -352,7 +445,9 @@ export function getMessageListScenario(id: MessageListScenarioId): MessageListSc
 export function messageListFixtureData(scenario: MessageListScenario): MessageListFixtureData {
   const messages = scenario.id === 'compact-tool-strip'
     ? toolStripMessages
-    : scenario.id === 'markdown-image-dark'
+    : scenario.id === 'compact-expanded-tool-chronology'
+      ? compactChronologyInitialMessages
+      : scenario.id === 'markdown-image-dark'
       ? markdownImageMessages
       : scenario.id === 'wide-markdown-table' || scenario.id === 'wide-markdown-table-light'
         ? wideMarkdownTableMessages

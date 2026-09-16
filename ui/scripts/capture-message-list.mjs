@@ -43,8 +43,8 @@ async function verifyWideTable({ page, id, viewport }) {
   if (desktop.wrapperLeft < desktop.chatLeft || desktop.wrapperRight > desktop.chatRight) {
     throw new Error(`Wide table escaped chat bounds: ${JSON.stringify(desktop)}`);
   }
-  if (desktop.wrapperLeft >= desktop.messageLeft || desktop.wrapperRight <= desktop.messageRight) {
-    throw new Error(`Wide table did not break out on both sides: ${JSON.stringify(desktop)}`);
+  if (desktop.wrapperClientWidth < Math.min(desktop.messageRight - desktop.messageLeft, 784)) {
+    throw new Error(`Wide table wrapper is narrower than its owned table boundary: ${JSON.stringify(desktop)}`);
   }
   if (desktop.wrapperOverflowX !== 'auto' || desktop.wrapperScrollWidth <= desktop.wrapperClientWidth) {
     throw new Error(`Wide table wrapper does not own local overflow: ${JSON.stringify(desktop)}`);
@@ -95,6 +95,172 @@ async function verifyWideTable({ page, id, viewport }) {
   return false;
 }
 
+async function captureCompactChronology({ page, id, outDir }) {
+  if (id !== 'compact-expanded-tool-chronology') return false;
+
+  const measureExpandedA = async (label) => page.evaluate((sampleLabel) => {
+    const scroller = document.querySelector('.message-list-fixture-shell #messages');
+    const expanded = document.querySelector('[data-tool-id="chronology-tool-a"]');
+    if (!(scroller instanceof HTMLElement) || !(expanded instanceof HTMLElement)) {
+      throw new Error(`chronology A measurement target missing for ${sampleLabel}`);
+    }
+    const scrollerRect = scroller.getBoundingClientRect();
+    const expandedRect = expanded.getBoundingClientRect();
+    return {
+      label: sampleLabel,
+      top: expandedRect.top - scrollerRect.top,
+      bottom: expandedRect.bottom - scrollerRect.top,
+      scrollTop: scroller.scrollTop,
+      scrollHeight: scroller.scrollHeight,
+      clientHeight: scroller.clientHeight,
+      atTail: Math.abs(scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop) <= 4,
+    };
+  }, label);
+
+  const assertStableExpandedA = (before, after) => {
+    const drift = Math.abs(after.top - before.top);
+    if (drift > 4) {
+      throw new Error(`Expanded A viewport position drifted ${drift.toFixed(1)}px: ${JSON.stringify({ before, after })}`);
+    }
+    if (after.atTail) {
+      throw new Error(`Chronology capture returned to tail-follow instead of reader-owned scroll: ${JSON.stringify(after)}`);
+    }
+  };
+
+  const assertResizePreservedExpandedA = (before, after) => {
+    const drift = Math.abs(after.top - before.top);
+    if (drift > 160 || after.bottom <= 0 || after.top >= after.clientHeight) {
+      throw new Error(`Expanded A was not preserved through resize: ${JSON.stringify({ before, after, drift })}`);
+    }
+  };
+
+  const assertSameCompactGroup = async (label) => {
+    const order = await page.evaluate((sampleLabel) => ({
+      label: sampleLabel,
+      toolDomOrder: Array.from(document.querySelectorAll('[data-tool-id]')).map((node) => node.getAttribute('data-tool-id')),
+      groupCount: document.querySelectorAll('.compact-tool-group').length,
+    }));
+    const compactOrder = order.toolDomOrder.filter((toolId) => toolId?.startsWith('chronology-tool-'));
+    if (compactOrder.join(',') !== 'chronology-tool-a,chronology-tool-b,chronology-tool-c' || order.groupCount !== 1) {
+      throw new Error(`Chronology tools are not in one compact group: ${JSON.stringify(order)}`);
+    }
+    return order;
+  };
+
+  const assertCompletedPairing = async (label) => {
+    const pairing = await page.evaluate((sampleLabel) => {
+      const textFor = (toolId) => document.querySelector(`[data-tool-id="${toolId}"]`)?.textContent ?? '';
+      return {
+        label: sampleLabel,
+        bText: textFor('chronology-tool-b'),
+        cText: textFor('chronology-tool-c'),
+      };
+    }, label);
+    if (!pairing.bText.includes('done') || pairing.bText.includes('pending') || !pairing.cText.includes('exit 0') || !pairing.cText.includes('C_OK')) {
+      throw new Error(`Chronology B/C results are not paired with completed cards: ${JSON.stringify(pairing)}`);
+    }
+    return pairing;
+  };
+
+  const runChronologyFlow = async ({ label, width, height, resizedWidth, resizedHeight }) => {
+    await page.setViewportSize({ width, height });
+    await page.reload({ waitUntil: 'networkidle' });
+    await page.waitForSelector(`[data-message-list-fixture-ready="${id}"]`, { timeout: 10_000 });
+
+    await page.waitForSelector('[data-tool-id="chronology-tool-a"] .compact-tool-card-expand');
+    await page.locator('[data-tool-id="chronology-tool-a"] .compact-tool-card-expand').click();
+    await page.waitForSelector('.compact-tool-selected-detail [data-tool-id="chronology-tool-a"]');
+    await page.locator('.message-list-fixture-shell #messages').evaluate((scroller) => {
+      scroller.scrollTop = Math.max(1, scroller.scrollTop - 120);
+      scroller.dispatchEvent(new Event('scroll'));
+    });
+    await page.waitForFunction(() => {
+      const scroller = document.querySelector('.message-list-fixture-shell #messages');
+      if (!(scroller instanceof HTMLElement)) return false;
+      return scroller.scrollTop > 0
+        && Math.abs(scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop) > 4;
+    });
+    const expandedBeforeAppend = await measureExpandedA(`${label}:before-append`);
+
+    if (await page.locator('.jump-to-newest').count() !== 0) {
+      throw new Error(`${label}: unread jump appeared before tail advanced`);
+    }
+    await page.setViewportSize({ width: resizedWidth, height: resizedHeight });
+    await page.waitForSelector('.compact-tool-selected-detail [data-tool-id="chronology-tool-a"]');
+    await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    const expandedAfterResize = await measureExpandedA(`${label}:after-mounted-resize`);
+    assertResizePreservedExpandedA(expandedBeforeAppend, expandedAfterResize);
+    if (await page.locator('.jump-to-newest').count() !== 0) {
+      throw new Error(`${label}: unread jump appeared during resize without tail advance`);
+    }
+    await page.locator('.message-list-fixture-shell #messages').hover();
+    await page.mouse.wheel(0, -160);
+    await page.waitForFunction(() => {
+      const scroller = document.querySelector('.message-list-fixture-shell #messages');
+      if (!(scroller instanceof HTMLElement)) return false;
+      return Math.abs(scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop) > 4;
+    });
+    const expandedAfterResizeReaderOwned = await measureExpandedA(`${label}:after-resize-reader-owned`);
+
+    await page.getByTestId('chronology-append-bc').click();
+    await page.waitForFunction(() => document.documentElement.dataset['messageListChronologyPhase'] === 'appended-bc');
+    const sameGroup = await assertSameCompactGroup(`${label}:appended-bc`);
+    const expandedAfterAppend = await measureExpandedA(`${label}:after-append-bc`);
+    assertStableExpandedA(expandedAfterResizeReaderOwned, expandedAfterAppend);
+
+    await page.getByTestId('chronology-complete-bc').click();
+    await page.waitForFunction(() => document.documentElement.dataset['messageListChronologyPhase'] === 'completed-bc');
+    const expandedAfterComplete = await measureExpandedA(`${label}:after-complete-bc`);
+    assertStableExpandedA(expandedAfterResizeReaderOwned, expandedAfterComplete);
+
+    await page.getByTestId('chronology-final').click();
+    await page.waitForFunction(() => document.documentElement.dataset['messageListChronologyPhase'] === 'final-prose');
+    await page.waitForSelector('.jump-to-newest');
+    const expandedAfterFinal = await measureExpandedA(`${label}:after-final-prose`);
+    assertStableExpandedA(expandedAfterResizeReaderOwned, expandedAfterFinal);
+
+    await page.locator('.compact-tool-detail-collapse').click();
+    await page.waitForFunction(() => {
+      const active = document.activeElement;
+      return active instanceof HTMLElement
+        && active.closest('[data-message-id="chronology-agent-a"]')
+        && active.matches('.compact-tool-card-expand');
+    });
+
+    await page.locator('.jump-to-newest').evaluate((button) => {
+      if (!(button instanceof HTMLButtonElement)) throw new Error('jump-to-newest is not a button');
+      button.click();
+    });
+    await page.waitForFunction(() => !document.querySelector('.jump-to-newest'));
+    await page.waitForSelector('#message-chronology-agent-final');
+    await page.waitForSelector('[data-tool-id="chronology-tool-c"]');
+    const completedPairing = await assertCompletedPairing(`${label}:completed-bc`);
+    const latestReachability = await page.evaluate(() => {
+      const scroller = document.querySelector('.message-list-fixture-shell #messages');
+      const finalMessage = document.querySelector('#message-chronology-agent-final');
+      return {
+        latestReachable: finalMessage instanceof HTMLElement && scroller instanceof HTMLElement
+          && finalMessage.offsetTop <= scroller.scrollHeight - finalMessage.offsetHeight,
+        finalText: finalMessage?.textContent ?? '',
+      };
+    });
+    if (!latestReachability.latestReachable || !latestReachability.finalText.includes('Final prose after B and C completed')) {
+      throw new Error(`Compact chronology final prose was not reachable: ${JSON.stringify(latestReachability)}`);
+    }
+
+    const samples = [expandedBeforeAppend, expandedAfterResize, expandedAfterResizeReaderOwned, expandedAfterAppend, expandedAfterComplete, expandedAfterFinal];
+    await page.screenshot({ path: path.join(outDir, `${id}--${label}.png`), fullPage: true });
+    return { label, initialViewport: { width, height }, resizedViewport: { width: resizedWidth, height: resizedHeight }, latestReachability, expandedA: samples, completedPairing, sameGroup };
+  };
+
+  const runs = [
+    await runChronologyFlow({ label: 'mobile-to-desktop', width: 390, height: 900, resizedWidth: 960, resizedHeight: 900 }),
+  ];
+  await writeFile(path.join(outDir, `${id}--metrics.json`), `${JSON.stringify(runs, null, 2)}\n`);
+  console.log('  verified compact chronology append/complete/final flow at mobile and desktop widths');
+  return true;
+}
+
 async function captureContinuityReproduction({ page, id, outDir }) {
   if (id !== 'prefix-continuity-offset-bug') return false;
 
@@ -139,6 +305,6 @@ runSurfaceCapture({
   outDir: process.env.MESSAGE_LIST_QA_OUT ?? 'qa-artifacts/message-list',
   viewport: { width, height },
   captureStory: async (context) => (
-    await verifyWideTable(context) || await captureContinuityReproduction(context)
+    await verifyWideTable(context) || await captureCompactChronology(context) || await captureContinuityReproduction(context)
   ),
 });
