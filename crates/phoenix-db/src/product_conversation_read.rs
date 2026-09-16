@@ -295,6 +295,70 @@ impl Database {
         })
     }
 
+    /// Sets the user-visible title on the canonical root transcript row for one ordinary aggregate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::ConversationNotFound`] when the reference is absent or excluded,
+    /// and a database or decode error when persisted aggregate data is invalid.
+    pub async fn set_ordinary_product_conversation_title(
+        &self,
+        reference: &str,
+        title: &str,
+    ) -> DbResult<()> {
+        let now = chrono::Utc::now();
+        let mut connection = self.pool.acquire().await?;
+        connection.execute("BEGIN").await?;
+        let result = async {
+            let resolved =
+                Self::resolve_ordinary_product_conversation_on(&mut connection, reference).await?;
+            let row = sqlx::query(
+                "SELECT root.id
+                 FROM conversations root
+                 WHERE root.product_conversation_id = ?1
+                   AND root.user_initiated = 1
+                   AND root.runtime_role = 'user'
+                   AND root.parent_conversation_id IS NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM conversations predecessor
+                       WHERE predecessor.product_conversation_id = root.product_conversation_id
+                         AND predecessor.continued_in_conv_id = root.id
+                   )
+                 ORDER BY root.id ASC
+                 LIMIT 1",
+            )
+            .bind(resolved.product_conversation_id.as_str())
+            .fetch_optional(&mut *connection)
+            .await?;
+            let Some(row) = row else {
+                return Err(DbError::ConversationNotFound(reference.to_string()));
+            };
+            let root_id: String = row.try_get("id")?;
+            let result =
+                sqlx::query("UPDATE conversations SET title = ?1, updated_at = ?2 WHERE id = ?3")
+                    .bind(title)
+                    .bind(now.to_rfc3339())
+                    .bind(root_id)
+                    .execute(&mut *connection)
+                    .await?;
+            if result.rows_affected() == 0 {
+                return Err(DbError::ConversationNotFound(reference.to_string()));
+            }
+            Ok::<(), DbError>(())
+        }
+        .await;
+        match result {
+            Ok(()) => {
+                connection.execute("COMMIT").await?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = connection.execute("ROLLBACK").await;
+                Err(error)
+            }
+        }
+    }
+
     /// Lists the one-row sidebar projection for every ordinary product conversation.
     /// This deliberately does not hydrate each aggregate's transcript or handoff history.
     ///

@@ -2,7 +2,8 @@ import { useState, useCallback, useContext, useEffect, useRef, useSyncExternalSt
 import { useNavigate, useLocation } from 'react-router-dom';
 import { api, getConvDisplayState } from '../api';
 import type { Conversation, ProductConversationListRow } from '../api';
-import { ConversationList, productConversationPresentationIndicator } from './ConversationList';
+import { ConversationList } from './ConversationList';
+import { productConversationPresentationIndicator } from './ConversationList.presentation';
 import { ConfirmDialog } from './ConfirmDialog';
 import { RenameDialog } from './RenameDialog';
 import { SettingsDropdown } from './SettingsDropdown';
@@ -272,7 +273,7 @@ export function Sidebar({
   const handleProductRename = useCallback(async (newName: string) => {
     if (!productRenameTarget) return;
     try {
-      await api.renameConversation(productRenameTarget.canonical_root.transcript_row_id, newName);
+      await api.renameProductConversation(productRenameTarget.product_conversation_id, newName);
       setProductRenameTarget(null);
       setProductRenameError(undefined);
       onConversationCreated();
@@ -317,12 +318,14 @@ export function Sidebar({
   const handleProductClose = useCallback(async () => {
     if (!productCloseTarget) return;
     try {
-      await api.archiveConversation(productCloseTarget.latest_transcript_row_id);
+      await api.archiveChain(productCloseTarget.canonical_root.transcript_row_id);
       setProductCloseTarget(null);
       onConversationCreated();
       setProductConversationsRetry((revision) => revision + 1);
     } catch (err) {
-      notifyArchiveCloseConflict(productCloseTarget.latest_transcript_row_id, err);
+      if (notifyArchiveCloseConflict(productCloseTarget.canonical_root.transcript_row_id, err)) {
+        setProductCloseTarget(null);
+      }
       console.error('Failed to close product conversation:', err);
     }
   }, [productCloseTarget, onConversationCreated]);
@@ -536,7 +539,7 @@ export function Sidebar({
       <ConfirmDialog
         visible={productCloseTarget !== null}
         title="Close Product Conversation"
-        message={`Close "${productCloseTarget?.presentation.display_name}"? This will close the current continuation.`}
+        message={`Close "${productCloseTarget?.presentation.display_name}"? This will close the full product conversation.`}
         confirmText="Close"
         danger
         onConfirm={handleProductClose}
@@ -544,9 +547,12 @@ export function Sidebar({
       />
       <RenameDialog
         visible={productRenameTarget !== null}
-        currentName={productRenameTarget?.canonical_root.slug ?? productRenameTarget?.presentation.display_name ?? ''}
+        currentName={productRenameTarget?.canonical_root.title ?? productRenameTarget?.presentation.display_name ?? ''}
         error={productRenameError ?? undefined}
         onRename={handleProductRename}
+        normalizeInput={(value) => value}
+        isValidName={(value) => value.trim().length > 0}
+        helpText="Enter a title"
         onCancel={() => { setProductRenameTarget(null); setProductRenameError(undefined); }}
       />
       <RenameDialog

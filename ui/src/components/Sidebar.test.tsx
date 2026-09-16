@@ -21,6 +21,7 @@ const { apiMock } = vi.hoisted(() => ({
     deleteChain: vi.fn(),
     deleteConversation: vi.fn(),
     renameConversation: vi.fn(),
+    renameProductConversation: vi.fn(),
   },
 }));
 
@@ -200,15 +201,15 @@ describe('Sidebar — ProductConversation navigation', () => {
     await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-continued"]')).not.toBeNull());
     fireEvent.click(getByRole('button', { name: /Rename product conversation Old Product/ }));
     const input = getByRole('textbox');
-    fireEvent.change(input, { target: { value: 'renamed-product' } });
+    fireEvent.change(input, { target: { value: 'Renamed Product Title' } });
     fireEvent.click(getByRole('button', { name: 'Rename' }));
 
-    await waitFor(() => expect(apiMock.renameConversation).toHaveBeenCalledWith('canonical-root-row', 'renamed-product'));
-    expect(apiMock.renameConversation).not.toHaveBeenCalledWith('latest-continuation-row', expect.anything());
+    await waitFor(() => expect(apiMock.renameProductConversation).toHaveBeenCalledWith('pc-continued', 'Renamed Product Title'));
+    expect(apiMock.renameConversation).not.toHaveBeenCalled();
   });
 
-  it('closes product conversations through the latest continuation id', async () => {
-    apiMock.archiveConversation.mockResolvedValue(undefined);
+  it('closes product conversations through the canonical root chain', async () => {
+    apiMock.archiveChain.mockResolvedValue(undefined);
     const row = makeProductConversation('pc-continued', {
       canonical_root: { transcript_row_id: 'canonical-root-row', slug: 'old-product', title: 'Old Product' },
       latest_transcript_row_id: 'latest-continuation-row',
@@ -225,8 +226,8 @@ describe('Sidebar — ProductConversation navigation', () => {
     fireEvent.click(getByRole('button', { name: /Close product conversation Old Product/ }));
     fireEvent.click(getByRole('button', { name: 'Close' }));
 
-    await waitFor(() => expect(apiMock.archiveConversation).toHaveBeenCalledWith('latest-continuation-row'));
-    expect(apiMock.archiveConversation).not.toHaveBeenCalledWith('canonical-root-row');
+    await waitFor(() => expect(apiMock.archiveChain).toHaveBeenCalledWith('canonical-root-row'));
+    expect(apiMock.archiveConversation).not.toHaveBeenCalled();
   });
 
   it('does not expose product conversation actions for history rows', async () => {
@@ -246,7 +247,7 @@ describe('Sidebar — ProductConversation navigation', () => {
   });
 
   it('keeps product rename dialog open and unchanged on conflict', async () => {
-    apiMock.renameConversation.mockRejectedValue(new ConflictError({ error_type: 'conflict', error: 'stale rename' }));
+    apiMock.renameProductConversation.mockRejectedValue(new ConflictError({ error_type: 'conflict', error: 'stale rename' }));
     apiMock.listProductConversations.mockResolvedValue({
       product_conversations: [makeProductConversation('pc-conflict', { canonical_root: { transcript_row_id: 'root-conflict', slug: 'old-product', title: 'Old Product' } })],
     });
@@ -264,6 +265,31 @@ describe('Sidebar — ProductConversation navigation', () => {
 
     expect(await findByText('stale rename')).toBeInTheDocument();
     expect(container.querySelector('[data-product-conversation-id="pc-conflict"]')).not.toBeNull();
+  });
+
+  it('clears the starter close target when durable product close reports a typed conflict', async () => {
+    apiMock.archiveChain.mockRejectedValueOnce(new ConflictError({
+      error: 'close loss confirmation required',
+      error_type: 'close_loss_confirmation_required',
+    }));
+    apiMock.listProductConversations.mockResolvedValue({
+      product_conversations: [makeProductConversation('pc-close-conflict', {
+        canonical_root: { transcript_row_id: 'root-close-conflict', slug: 'close-product', title: 'Close Product' },
+      })],
+    });
+
+    const { getByRole, queryByRole, container } = render(
+      <MemoryRouter initialEntries={['/product-conversations/pc-close-conflict']}>
+        <Sidebar collapsed={false} onToggle={vi.fn()} conversations={[]} archivedConversations={[]} activeSlug="pc-close-conflict" onConversationCreated={vi.fn()} />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-close-conflict"]')).not.toBeNull());
+    fireEvent.click(getByRole('button', { name: /Close product conversation Close Product/ }));
+    fireEvent.click(getByRole('button', { name: 'Close' }));
+
+    await waitFor(() => expect(apiMock.archiveChain).toHaveBeenCalledWith('root-close-conflict'));
+    await waitFor(() => expect(queryByRole('dialog', { name: 'Close Product Conversation' })).toBeNull());
   });
 
   it('ignores older product-list responses after a newer refresh wins', async () => {

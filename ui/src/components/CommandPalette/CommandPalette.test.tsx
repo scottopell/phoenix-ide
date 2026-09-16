@@ -150,7 +150,7 @@ describe('CommandPalette lifecycle availability', () => {
     expect(screen.getByText('Close Current Conversation')).toBeInTheDocument();
   });
 
-  it('closes an Open canonical aggregate from the active atom when drift hides its row', async () => {
+  it('closes an Open canonical aggregate through its root when drift hides its row', async () => {
     const latest = makeConversation({ id: 'latest-id', slug: 'latest', archived: true });
     render(
       <MemoryRouter initialEntries={['/product-conversations/product-1']}>
@@ -174,8 +174,8 @@ describe('CommandPalette lifecycle availability', () => {
     fireEvent.change(screen.getByRole('textbox'), { target: { value: '> close' } });
     fireEvent.click(screen.getByText('Close Current Conversation'));
 
-    await waitFor(() => expect(mocks.archiveConversation).toHaveBeenCalledWith('latest-id'));
-    expect(mocks.archiveChain).not.toHaveBeenCalled();
+    await waitFor(() => expect(mocks.archiveChain).toHaveBeenCalledWith('latest-id'));
+    expect(mocks.archiveConversation).not.toHaveBeenCalled();
   });
 
   it('uses the canonical chain root when drift hides continuation members', async () => {

@@ -246,7 +246,7 @@
 }
 
 @media (hover: hover) and (pointer: fine) {
-  .sidebar-mode .conv-action-btn {
+  .sidebar-mode .conversation-list-row:not(.product-conversation-list-row) .conv-action-btn {
     min-width: 32px;
     min-height: 32px;
     border-radius: 6px;

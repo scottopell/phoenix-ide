@@ -17,7 +17,7 @@ function SidebarFixtureBody({ scenario }: Props) {
     localStorage.removeItem('phoenix:sidebar-project-filter');
   }
 
-  const restoreApi = useMemo(() => installSidebarFixtureApi(sidebarFixtureData), []);
+  const restoreApi = useMemo(() => installSidebarFixtureApi(sidebarFixtureData, scenario.id), [scenario.id]);
   const [collapsed, setCollapsed] = useState(scenario.collapsed);
 
   useEffect(() => restoreApi, [restoreApi]);
@@ -49,7 +49,7 @@ function SidebarFixtureBody({ scenario }: Props) {
 
 export function SidebarFixture({ scenario }: Props) {
   return (
-    <MemoryRouter initialEntries={scenario.activeSlug ? [`/c/${scenario.activeSlug}`] : ['/']}>
+    <MemoryRouter initialEntries={scenario.activeSlug ? [scenario.id === 'product-actions-continued' ? `/product-conversations/${scenario.activeSlug}` : `/c/${scenario.activeSlug}`] : ['/']}>
       <SidebarFixtureBody scenario={scenario} />
     </MemoryRouter>
   );

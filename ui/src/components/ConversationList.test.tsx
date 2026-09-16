@@ -36,7 +36,8 @@ vi.mock('../utils', async () => {
   };
 });
 
-import { ConversationList, ConversationRow, ChainBlock, productConversationPresentationIndicator } from './ConversationList';
+import { ConversationList, ConversationRow, ChainBlock } from './ConversationList';
+import { productConversationPresentationIndicator } from './ConversationList.presentation';
 
 describe('ConversationList — global navigation', () => {
   it('exposes a labeled Coordinator entry from the mobile list header', () => {
