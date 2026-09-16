@@ -54,7 +54,7 @@ impl SpawnCatalog {
                     catalog.tiers.insert(name.clone(), candidate);
                 }
                 Err(error) => {
-                    tracing::warn!(tier = %name, %error, "execution tier unavailable; excluded from spawn choices")
+                    tracing::warn!(tier = %name, %error, "execution tier unavailable; excluded from spawn choices");
                 }
             }
         }
@@ -130,9 +130,10 @@ impl SpawnCatalog {
                 connection: connection.clone(),
                 reasoning_effort: *reasoning_effort,
             },
-            None => match agent.and_then(|agent| agent.execution.clone()) {
-                Some(execution) => execution,
-                None => {
+            None => {
+                if let Some(execution) = agent.and_then(|agent| agent.execution.clone()) {
+                    execution
+                } else {
                     let route = self
                         .routes
                         .iter()
@@ -144,7 +145,7 @@ impl SpawnCatalog {
                         reasoning_effort: parent_effort,
                     }
                 }
-            },
+            }
         };
         self.validate(&execution)?;
         Ok(SelectedWorker {

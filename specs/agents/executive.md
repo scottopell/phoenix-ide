@@ -34,25 +34,26 @@ validation, authority, and child lifecycle seams.
 | **REQ-AG-001:** Agent Definition Discovery | Retired | Filesystem discovery replaced by REQ-AG-010; ADR-052 |
 | **REQ-AG-002:** Agent Definition Format | Retired | Markdown frontmatter replaced by inline TOML; ADR-052 |
 | **REQ-AG-003:** Frontmatter Separation | Retired | Inline instructions require no frontmatter parsing; ADR-052 |
-| **REQ-AG-004:** Agent Type as a Typed Spawn Choice | In progress | Eligible worker enum and diagnostics require implementation validation |
-| **REQ-AG-005:** Spawn-Time Resolution and Precedence | In progress | Worker/tier/explicit selection and parent inheritance contract updated |
-| **REQ-AG-006:** Persona Composition | Implemented baseline | Persisted persona restoration exists; inline-config integration requires validation |
-| **REQ-AG-007:** Unknown Agent Type Rejected | Implemented baseline | Atomic rejection exists; resolved catalog integration requires validation |
-| **REQ-AG-008:** Catalog Snapshot Consistency | In progress | Per-runtime config and per-request availability snapshot |
-| **REQ-AG-009:** Capability from Spawn Authority, Not Definition | In progress | Remove worker-owned mode/tools parsing |
-| **REQ-AG-010:** Single User Configuration | In progress | Version-1 XDG TOML and filesystem retirement |
-| **REQ-AG-011:** Ordered Atomic Execution Candidates | In progress | Availability fallback; incompatible effort diagnosed |
-| **REQ-AG-012:** Usable Model Routes | In progress | Logical backend connection identity through child creation/recreation |
+| **REQ-AG-004:** Agent Type as a Typed Spawn Choice | Implemented | `codex_only_catalog_prevents_hidden_opus_failure` verifies filtering and advertised choices |
+| **REQ-AG-005:** Spawn-Time Resolution and Precedence | Implemented | `generic_omission_inherits_parent_execution`; `override_replaces_execution_and_keeps_persona` |
+| **REQ-AG-006:** Persona Composition | Implemented | `agent_type_resolves_from_loaded_config`; `unattached_sub_agent_persists_selection_without_parent_effort_leak` verifies persisted persona |
+| **REQ-AG-007:** Unknown Agent Type Rejected | Implemented | `rejects_unknown_agent_type`; `unknown_model_on_later_task_rejected_before_any_spawn` |
+| **REQ-AG-008:** Catalog Snapshot Consistency | Implemented | `advertisement_snapshot_does_not_reresolve_a_worker`; `schema_is_byte_stable_across_calls` |
+| **REQ-AG-009:** Capability from Spawn Authority, Not Definition | Implemented | `rejects_invalid_and_legacy_fields`; `mode_guidance_separates_permissions_from_execution` |
+| **REQ-AG-010:** Single User Configuration | Implemented | `config_location_uses_only_xdg_or_home`; `missing_config_does_not_load_legacy_files` |
+| **REQ-AG-011:** Ordered Atomic Execution Candidates | Implemented | `parses_ordered_atomic_candidates_and_inline_instructions`; `invalid_reached_effort_does_not_fall_through` |
+| **REQ-AG-012:** Usable Model Routes | Implemented | `execution_routes_follow_connections_not_display_families`; `pinned_route_mismatch_is_not_a_retryable_network_failure` |
 
-**Progress:** 3 retired requirements; 2 existing behavioral baselines; 7 requirements
-under implementation. No completion claim is made before targeted validation.
+**Progress:** 9 active requirements implemented; 3 filesystem requirements retired.
 
-## Verification targets
+## Verification
 
-- Codex-only routes cannot advertise an Anthropic-only worker default.
-- Ordered candidates skip unavailable routes but diagnose known invalid effort.
-- Worker instructions survive explicit execution overrides and runtime recreation.
-- Generic inheritance carries model, connection, and effort together.
-- Invalid selection rejects a whole batch without partial child creation.
-- Config edits do not alter an active runtime's loaded definitions or an active
-  child's resolved execution; request catalog availability remains consistent.
+Validation on devmbp passed the full Rust suite, compilation, code generation,
+generated-file staleness, Allium, spec shape, spec anchors, end-to-end tests, and
+dev.py tests at `caab8290d`.
+
+The tests above cover unavailable defaults, atomic candidate resolution, exact
+connection selection, parent inheritance, persona persistence, and shared catalog
+snapshots. `schema_pins_each_model_to_its_connection_and_efforts` checks the
+advertised route/effort combinations; `sub_agent_selection_failure_rolls_back_conversation_and_persona`
+checks that persistence failure leaves no partial child or persona.

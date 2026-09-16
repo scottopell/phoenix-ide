@@ -2310,9 +2310,8 @@ mod registry_llm_client_tests {
         let (_dir, registry) = codex_registry();
         let client = RegistryLlmClient::new(registry.clone(), "gpt-5.5".to_string())
             .with_connection(Some("openai_responses".to_string()));
-        let error = match client.service() {
-            Ok(_) => panic!("must not substitute Codex for the selected direct connection"),
-            Err(error) => error,
+        let Err(error) = client.service() else {
+            panic!("must not substitute Codex for the selected direct connection");
         };
         assert_eq!(error.kind, phoenix_llm::LlmErrorKind::InvalidRequest);
         assert!(!error.kind.is_auto_retryable());

@@ -2149,10 +2149,10 @@ where
     }
 
     #[cfg(test)]
-    fn with_agent_catalog(self, catalog: Arc<[phoenix_agents::AgentDefinition]>) -> Self {
+    fn with_agent_catalog(self, catalog: &[phoenix_agents::AgentDefinition]) -> Self {
         self.with_agent_config(phoenix_agents::AgentConfig {
             agents: catalog.to_vec(),
-            tiers: Default::default(),
+            tiers: std::collections::BTreeMap::default(),
         })
     }
 
@@ -19225,7 +19225,7 @@ mod work_subagent_cwd_guard_tests {
             body: "You are a reviewer.".to_string(),
             execution: None,
         }]);
-        let mut rt = runtime_in_work_mode(worktree.path()).with_agent_catalog(catalog);
+        let mut rt = runtime_in_work_mode(worktree.path()).with_agent_catalog(&catalog);
 
         let result = rt
             .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
