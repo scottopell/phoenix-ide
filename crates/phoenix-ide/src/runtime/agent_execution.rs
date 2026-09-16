@@ -110,9 +110,18 @@ impl SpawnCatalog {
     ) -> Result<SelectedWorker, String> {
         let agent = agent_type
             .map(|name| {
-                self.agents
-                    .get(name)
-                    .ok_or_else(|| format!("Unknown or unavailable agent_type '{name}'"))
+                self.agents.get(name).ok_or_else(|| {
+                    let alternatives = if self.agents.is_empty() {
+                        "No named workers are callable. Omit agent_type for a generic worker."
+                            .to_string()
+                    } else {
+                        format!(
+                            "Callable agents: {}. Omit agent_type for a generic worker.",
+                            self.agents.keys().cloned().collect::<Vec<_>>().join(", ")
+                        )
+                    };
+                    format!("Unknown or unavailable agent_type '{name}'. {alternatives}")
+                })
             })
             .transpose()?;
         let execution = match selection {
@@ -252,6 +261,34 @@ execution = [{model = "luna", connection = "codex", reasoning_effort = "low"}]
         assert_eq!(selected.execution.connection, "codex");
         assert_eq!(selected.execution.reasoning_effort, Some(ModelEffort::High));
         assert!(selected.persona.is_none());
+    }
+
+    #[test]
+    fn unknown_worker_lists_only_callable_alternatives() {
+        let catalog = SpawnCatalog::resolve(&config(), vec![route("sol", "codex")]);
+        let error = catalog
+            .select(Some("ghost"), None, "sol", None)
+            .err()
+            .expect("unknown worker must be rejected");
+        assert_eq!(
+            error,
+            "Unknown or unavailable agent_type 'ghost'. Callable agents: reviewer. Omit agent_type for a generic worker."
+        );
+        assert!(catalog.select(Some("reviewer"), None, "sol", None).is_ok());
+    }
+
+    #[test]
+    fn unknown_worker_with_empty_catalog_explains_generic_selection() {
+        let catalog = SpawnCatalog::resolve(&AgentConfig::default(), vec![route("sol", "codex")]);
+        let error = catalog
+            .select(Some("ghost"), None, "sol", None)
+            .err()
+            .expect("unknown worker must be rejected");
+        assert_eq!(
+            error,
+            "Unknown or unavailable agent_type 'ghost'. No named workers are callable. Omit agent_type for a generic worker."
+        );
+        assert!(catalog.select(None, None, "sol", None).is_ok());
     }
 
     #[test]

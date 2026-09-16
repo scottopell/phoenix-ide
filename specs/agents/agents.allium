@@ -130,4 +130,6 @@ contract CallableSelection {
         -- retains its resolved persona and execution through runtime recreation;
         -- it does not consult named-worker or tier preferences again. A missing
         -- route is an error, never silent provider or model substitution.
+        -- An explicit user model change atomically replaces the selected model,
+        -- effort, and connection while preserving the persona.
 }

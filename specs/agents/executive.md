@@ -31,9 +31,9 @@ validation, authority, and child lifecycle seams.
 
 | Requirement | Status | Notes |
 | --- | --- | --- |
-| **REQ-AG-001:** Agent Definition Discovery | Retired | Filesystem discovery replaced by REQ-AG-010; ADR-052 |
-| **REQ-AG-002:** Agent Definition Format | Retired | Markdown frontmatter replaced by inline TOML; ADR-052 |
-| **REQ-AG-003:** Frontmatter Separation | Retired | Inline instructions require no frontmatter parsing; ADR-052 |
+| **REQ-AG-001:** Agent Definition Discovery | Retired | Filesystem discovery replaced by REQ-AG-010; original contract archived in ADR-052 |
+| **REQ-AG-002:** Agent Definition Format | Retired | Markdown frontmatter replaced by inline TOML; original contract archived in ADR-052 |
+| **REQ-AG-003:** Frontmatter Separation | Retired | Inline instructions require no frontmatter parsing; original contract archived in ADR-052 |
 | **REQ-AG-004:** Agent Type as a Typed Spawn Choice | Implemented | `codex_only_catalog_prevents_hidden_opus_failure` verifies filtering and advertised choices |
 | **REQ-AG-005:** Spawn-Time Resolution and Precedence | Implemented | `generic_omission_inherits_parent_execution`; `override_replaces_execution_and_keeps_persona` |
 | **REQ-AG-006:** Persona Composition | Implemented | `agent_type_resolves_from_loaded_config`; `unattached_sub_agent_persists_selection_without_parent_effort_leak` verifies persisted persona |

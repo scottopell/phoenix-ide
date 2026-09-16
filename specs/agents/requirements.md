@@ -14,85 +14,9 @@ boundaries, fan-in, cancellation, and timeout are governed by
 
 ## Requirements
 
-### REQ-AG-001: Agent Definition Discovery
-
-**Deprecated:** Superseded by REQ-AG-010 and ADR-052. The following
-text is retained as historical contract, not an active requirement.
-
-THE SYSTEM SHALL discover agent definitions by scanning `.claude/agents/` and
-`.agents/agents/` directories at each level from the conversation's working
-directory up to the filesystem root
-
-THE SYSTEM SHALL also scan immediate child directories of the working directory
-for agent definitions (handling the "projects directory" case)
-
-THE SYSTEM SHALL also scan `$HOME/.claude/agents/` and `$HOME/.agents/agents/`
-when `$HOME` is not an ancestor of the working directory
-
-WHEN the same agent name appears at multiple levels
-THE SYSTEM SHALL use the one closest to the working directory (more specific
-overrides parent)
-
-WHEN two paths resolve to the same file (via symlinks)
-THE SYSTEM SHALL count them as one agent (first discovered wins)
-
-WHEN two different files have identical content
-THE SYSTEM SHALL count them as one agent (content-hash dedup)
-
-**Rationale:** Agents are contextual in exactly the way skills are — a
-project-level `reviewer` agent overrides a user-level `reviewer` because it is
-more specific. Mirroring the skill discovery walk (REQ-SK-006) keeps a single
-mental model and lets the implementation reuse the proven walk-up and dedup
-logic.
-
----
-
-### REQ-AG-002: Agent Definition Format
-
-**Deprecated:** Superseded by REQ-AG-010 and ADR-052. The following
-text is retained as historical contract, not an active requirement.
-
-THE SYSTEM SHALL represent each agent as a single Markdown file in an agents
-directory, where the file's YAML frontmatter carries the agent's metadata and
-the file body is the agent's persona instructions
-
-THE SYSTEM SHALL require the frontmatter fields `name` and `description`
-
-THE SYSTEM SHALL accept the optional frontmatter fields `model` (a default
-model id) and `mode` (`explore` or `work`)
-
-WHEN an agents directory contains a file whose frontmatter is missing a
-required field
-THE SYSTEM SHALL skip that file without registering an agent and without
-aborting discovery of the others
-
-**Rationale:** One file per agent (not a directory-with-manifest like skills)
-matches the layout the ecosystem already uses for agent definitions, so author
-muscle memory and existing `.claude/agents/*.md` files drop in unchanged.
-`name`/`description` are the minimum needed for a typed spawn choice; `model`
-and `mode` let an agent encode its intended cost/capability profile so the LLM
-need not restate it.
-
----
-
-### REQ-AG-003: Frontmatter Separation
-
-**Deprecated:** Superseded by REQ-AG-010 and ADR-052. The following
-text is retained as historical contract, not an active requirement.
-
-WHEN an agent definition is loaded
-THE SYSTEM SHALL strip the YAML frontmatter block before using the file body as
-the agent's persona
-
-THE SYSTEM SHALL NOT include raw YAML frontmatter (`---` delimited blocks) in
-the persona delivered to the sub-agent's system prompt
-
-**Rationale:** Frontmatter is machine metadata for discovery and the spawn-tool
-schema, not instructions for the model. Including it wastes context tokens and
-confuses the persona with key-value pairs it cannot act on. This mirrors
-REQ-SK-001 for skills.
-
----
+Identifiers REQ-AG-001 through REQ-AG-003 are reserved. Their historical contracts
+are preserved in [ADR-052](../adrs/052_workers-and-tiers-resolve-usable-model-routes.md#historical-requirements).
+The user-configuration source contract is REQ-AG-010.
 
 ### REQ-AG-004: Agent Type as a Typed Spawn Choice
 
@@ -250,6 +174,11 @@ connections exist
 
 WHEN the selected connection cannot be used
 THE SYSTEM SHALL report failure without silently rerouting the child
+
+WHEN a user explicitly changes a child's model through the conversation model
+change operation
+THE SYSTEM SHALL update its selected connection together with the model and effort
+AND SHALL preserve its resolved instructions
 
 **Rationale:** A Codex-only installation must not advertise Anthropic choices.
 Connection identity names the configured backend slot; it is not a guarantee

@@ -8843,7 +8843,7 @@ impl Database {
         Ok(false)
     }
 
-    /// Atomically update the model, effort, and service tier.
+    /// Atomically update model settings and the connection of an already-pinned child.
     ///
     /// # Errors
     ///
@@ -8854,8 +8854,10 @@ impl Database {
         model: &str,
         effort: Option<ModelEffort>,
         service_tier: ServiceTier,
+        connection: &str,
     ) -> DbResult<()> {
         let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             "UPDATE conversations SET model = ?1, effort = ?2, service_tier = ?3, updated_at = ?4 WHERE id = ?5",
         )
@@ -8864,11 +8866,19 @@ impl Database {
         .bind(service_tier.as_wire_name())
         .bind(now.to_rfc3339())
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
+        sqlx::query(
+            "UPDATE sub_agent_execution_routes SET connection = ?1 WHERE conversation_id = ?2",
+        )
+        .bind(connection)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -16889,6 +16899,7 @@ mod tests {
             "gpt-5.4",
             Some(ModelEffort::Low),
             ServiceTier::Fast,
+            "codex",
         )
         .await
         .unwrap();
@@ -16917,12 +16928,24 @@ mod tests {
         db.create_conversation("tier-cas", "tier-cas", "/tmp", true, None, None)
             .await
             .unwrap();
-        db.update_conversation_model_and_effort("tier-cas", "gpt-5.4", None, ServiceTier::Fast)
-            .await
-            .unwrap();
-        db.update_conversation_model_and_effort("tier-cas", "gpt-5.6-sol", None, ServiceTier::Fast)
-            .await
-            .unwrap();
+        db.update_conversation_model_and_effort(
+            "tier-cas",
+            "gpt-5.4",
+            None,
+            ServiceTier::Fast,
+            "codex",
+        )
+        .await
+        .unwrap();
+        db.update_conversation_model_and_effort(
+            "tier-cas",
+            "gpt-5.6-sol",
+            None,
+            ServiceTier::Fast,
+            "codex",
+        )
+        .await
+        .unwrap();
 
         let normalized = db
             .compare_and_set_conversation_service_tier(
@@ -21742,6 +21765,7 @@ mod tests {
             "gpt-5.4",
             Some(ModelEffort::High),
             ServiceTier::Standard,
+            "codex",
         )
         .await
         .unwrap();
@@ -21778,6 +21802,7 @@ mod tests {
             "gpt-5.4",
             Some(ModelEffort::High),
             ServiceTier::Standard,
+            "codex",
         )
         .await
         .unwrap();
@@ -21882,6 +21907,77 @@ mod tests {
                 .await
                 .unwrap(),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn child_model_upgrade_updates_connection_atomically_without_pinning_parent() {
+        let db = Database::open_in_memory().await.unwrap();
+        let parent = db
+            .get_or_create_coordinator(
+                Some("gpt-5.4"),
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+        let child = db
+            .create_subagent_conversation(
+                "route-upgrade-child",
+                "route-upgrade-child",
+                "/tmp",
+                &parent.id,
+                "gpt-5.4",
+                &ConvMode::Explore {
+                    worktree_path: None,
+                    next_taskmd_id_hint: None,
+                },
+                phoenix_core::llm_language::LlmLanguage::default(),
+                None,
+                SubAgentExecution {
+                    connection: "codex",
+                    effort: Some(ModelEffort::High),
+                    persona: None,
+                },
+            )
+            .await
+            .unwrap();
+        for id in [&child.id, &parent.id] {
+            db.update_conversation_model_and_effort(
+                id,
+                "claude-sonnet-5",
+                Some(ModelEffort::Low),
+                ServiceTier::Standard,
+                "anthropic",
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            db.get_sub_agent_execution_connection(&parent.id)
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(db
+            .update_conversation_model_and_effort(
+                &child.id,
+                "gpt-5.4",
+                Some(ModelEffort::High),
+                ServiceTier::Fast,
+                " ",
+            )
+            .await
+            .is_err());
+        let child = db.get_conversation(&child.id).await.unwrap();
+        assert_eq!(child.model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(child.effort, Some(ModelEffort::Low));
+        assert_eq!(child.service_tier, ServiceTier::Standard);
+        assert_eq!(
+            db.get_sub_agent_execution_connection(&child.id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("anthropic")
         );
     }
 
@@ -21994,6 +22090,7 @@ mod tests {
             "gpt-5.4",
             Some(ModelEffort::High),
             ServiceTier::Standard,
+            "codex",
         )
         .await
         .unwrap();
@@ -22411,6 +22508,7 @@ mod tests {
             "claude-opus-test",
             Some(ModelEffort::High),
             ServiceTier::Standard,
+            "anthropic",
         )
         .await
         .unwrap();
